@@ -5,6 +5,7 @@
 import Foundation
 
 public final class URLSessionBoundedDownloader: NSObject,
+    RemoteResourceDownloading,
     URLSessionDataDelegate,
     @unchecked Sendable {
     private final class Transfer: @unchecked Sendable {

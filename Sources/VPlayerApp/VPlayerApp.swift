@@ -6,6 +6,7 @@ import SwiftUI
 
 @main
 struct VPlayerApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     private let dependencies: VPlayerDependencies
 
     init() {
@@ -14,12 +15,29 @@ struct VPlayerApp: App {
 
     init(dependencies: VPlayerDependencies) {
         self.dependencies = dependencies
+        dependencies.backgroundRefreshRegistrar.register()
         dependencies.launch()
     }
 
     var body: some Scene {
         WindowGroup {
             RootView()
+        }
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            handleScenePhase(phase)
+        }
+    }
+
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            dependencies.foregroundRefreshDriver.activate()
+        case .inactive, .background:
+            dependencies.foregroundRefreshDriver.deactivate()
+            dependencies.backgroundRefreshRegistrar.scheduleNext()
+        @unknown default:
+            dependencies.foregroundRefreshDriver.deactivate()
+            dependencies.backgroundRefreshRegistrar.scheduleNext()
         }
     }
 }

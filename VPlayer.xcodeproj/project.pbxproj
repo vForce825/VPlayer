@@ -9,9 +9,11 @@
 /* Begin PBXBuildFile section */
 		03C2431CE143F84391408374 /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; };
 		079771228F4B60F9A3DF01D8 /* RepositorySpy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64C377C392800022FACE5ABD /* RepositorySpy.swift */; };
+		0F11E690D62302C3B5C72E86 /* RefreshSchedulePlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C69A53B57D2AE090EE69FF10 /* RefreshSchedulePlannerTests.swift */; };
 		1505DD0FB967752D2662C271 /* SourceProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C20F5E5ABD832EF5433B511 /* SourceProfile.swift */; };
 		16C47C091EC6C2F1E1CA6FE4 /* EPGModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E2D28FAA96259C6BA18B6D3 /* EPGModels.swift */; };
 		1C0E74475C42B940305CB753 /* EPGNameNormalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DB63A8123D009E49DFE7F62 /* EPGNameNormalizer.swift */; };
+		1F132F22A9DD9F45E47647D0 /* RefreshLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEBE3B30C45DB2BF522BC9D0 /* RefreshLifecycleTests.swift */; };
 		23210BD210A50F0CF2B42131 /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
 		290B8EF57BFE20A0C85264ED /* PlaybackSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28CBFE07860F14CBAFCDC9C7 /* PlaybackSettingsStore.swift */; };
 		2B1AA18D36EB95C46CE2D73C /* VPlayerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 639B3B5F5E1964B95399C8A4 /* VPlayerApp.swift */; };
@@ -43,6 +45,8 @@
 		88EE4D6EB5C53CBF06806476 /* NetworkFailureMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BC07E59D5A77AEDA7743492 /* NetworkFailureMapper.swift */; };
 		891C5AAB506FE4CA07A334BA /* XMLTVParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = C99D8B80186539B2A8231C30 /* XMLTVParser.swift */; };
 		9025D4FC1DD44853D28BDC36 /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
+		A3098C1B5C42F7256681B090 /* ForegroundRefreshDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 831A88667C84AB1FB4B236ED /* ForegroundRefreshDriver.swift */; };
+		A79BA2EED45A2F4C09618A98 /* RefreshSchedulePlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F75BA0166609F1B99110EEE2 /* RefreshSchedulePlanner.swift */; };
 		AA94794B3899CF50A6475DF0 /* VPlayerPlayback.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AD16087EFB0A780317C69870 /* RemoteResourceDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 776A443BF009806F2461634E /* RemoteResourceDownloader.swift */; };
 		AE5F5F87B9AB412130D84582 /* StreamProtocolPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BD849891A41E876402BADA1 /* StreamProtocolPolicy.swift */; };
@@ -51,6 +55,7 @@
 		CF8C42C2AD93FE06D5E4E8CB /* URLSessionBoundedDownloaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */; };
 		D5BA6C5EBE7447F85C0B146D /* URLSessionBoundedDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 571D62BE7259ACB20E1FA4D0 /* URLSessionBoundedDownloader.swift */; };
 		DA94714F6F72EEFE0CDAFF44 /* VPlayerPlayback.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		DFC4CAEA21A686600E575881 /* BackgroundRefreshRegistrar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E5EE57E19FE06FCEEE441B9 /* BackgroundRefreshRegistrar.swift */; };
 		E5B997E005CE0E4A110A9A43 /* RedactedURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = E06EC3BAD31415A9EDE7701D /* RedactedURL.swift */; };
 		E601A3612F4CD4996F1B777B /* VPlayerCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 236D71D3D61B0D1A240B639D /* VPlayerCore.swift */; };
 		EC428FCDA3FDB59AF2C77783 /* RefreshTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8962CD0CAB958608B6C759D /* RefreshTypes.swift */; };
@@ -173,19 +178,24 @@
 		6DB63A8123D009E49DFE7F62 /* EPGNameNormalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGNameNormalizer.swift; sourceTree = "<group>"; };
 		776A443BF009806F2461634E /* RemoteResourceDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteResourceDownloader.swift; sourceTree = "<group>"; };
 		78EFE7B618BDBB2FA8DF46CE /* playlists */ = {isa = PBXFileReference; lastKnownFileType = folder; name = playlists; path = Tests/Fixtures/playlists; sourceTree = SOURCE_ROOT; };
+		831A88667C84AB1FB4B236ED /* ForegroundRefreshDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ForegroundRefreshDriver.swift; sourceTree = "<group>"; };
 		9A310932D1DA088CF7E99CCF /* VPlayerAppStartupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerAppStartupTests.swift; sourceTree = "<group>"; };
+		9E5EE57E19FE06FCEEE441B9 /* BackgroundRefreshRegistrar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundRefreshRegistrar.swift; sourceTree = "<group>"; };
 		A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URLSessionBoundedDownloaderTests.swift; sourceTree = "<group>"; };
 		A3DC6FBBF870004CB37402A6 /* EPGMatcherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGMatcherTests.swift; sourceTree = "<group>"; };
 		A661E9919B5D9A88432C46D6 /* M3UParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UParser.swift; sourceTree = "<group>"; };
+		C69A53B57D2AE090EE69FF10 /* RefreshSchedulePlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshSchedulePlannerTests.swift; sourceTree = "<group>"; };
 		C99D8B80186539B2A8231C30 /* XMLTVParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XMLTVParser.swift; sourceTree = "<group>"; };
 		CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsStoreTests.swift; sourceTree = "<group>"; };
 		CCD4A4570708418C5EB6D3E2 /* VPlayer.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = VPlayerCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		DEBE3B30C45DB2BF522BC9D0 /* RefreshLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshLifecycleTests.swift; sourceTree = "<group>"; };
 		E06EC3BAD31415A9EDE7701D /* RedactedURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RedactedURL.swift; sourceTree = "<group>"; };
 		E14A9D1886717725B786B415 /* XMLTVParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XMLTVParserTests.swift; sourceTree = "<group>"; };
 		E153CF816236DBE07FDC2A07 /* XMLTVTimeParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XMLTVTimeParser.swift; sourceTree = "<group>"; };
 		E8C84A23131BECD2EE7F1AB9 /* SchemaModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SchemaModels.swift; sourceTree = "<group>"; };
 		E9021619CDF96872E511E25E /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		F75BA0166609F1B99110EEE2 /* RefreshSchedulePlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshSchedulePlanner.swift; sourceTree = "<group>"; };
 		F766ADE2FFF00B2A2273489F /* FixtureLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureLoader.swift; sourceTree = "<group>"; };
 		F83B421173E1978DA035BF40 /* VPlayerUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerUITests.swift; sourceTree = "<group>"; };
 		F8962CD0CAB958608B6C759D /* RefreshTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshTypes.swift; sourceTree = "<group>"; };
@@ -276,6 +286,7 @@
 			isa = PBXGroup;
 			children = (
 				3E8424C82A7C430CDF059354 /* RefreshCoordinator.swift */,
+				F75BA0166609F1B99110EEE2 /* RefreshSchedulePlanner.swift */,
 			);
 			path = Refresh;
 			sourceTree = "<group>";
@@ -345,12 +356,23 @@
 				CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */,
 				68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */,
 				52AD46A713A5BB7C228BDDAC /* RefreshCoordinatorTests.swift */,
+				DEBE3B30C45DB2BF522BC9D0 /* RefreshLifecycleTests.swift */,
+				C69A53B57D2AE090EE69FF10 /* RefreshSchedulePlannerTests.swift */,
 				045FB91A2CE5CE4A1C669071 /* SwiftDataLibraryStoreTests.swift */,
 				A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */,
 				9A310932D1DA088CF7E99CCF /* VPlayerAppStartupTests.swift */,
 				E14A9D1886717725B786B415 /* XMLTVParserTests.swift */,
 			);
 			path = VPlayerTests;
+			sourceTree = "<group>";
+		};
+		ADB3FA7EB42D9BDEC6027311 /* Lifecycle */ = {
+			isa = PBXGroup;
+			children = (
+				9E5EE57E19FE06FCEEE441B9 /* BackgroundRefreshRegistrar.swift */,
+				831A88667C84AB1FB4B236ED /* ForegroundRefreshDriver.swift */,
+			);
+			path = Lifecycle;
 			sourceTree = "<group>";
 		};
 		B10DCB7755FA58BC65AD3371 = {
@@ -396,6 +418,7 @@
 		F79D6F74C711B4F773BCF864 /* VPlayerApp */ = {
 			isa = PBXGroup;
 			children = (
+				ADB3FA7EB42D9BDEC6027311 /* Lifecycle */,
 				F9BBD733025E50B49E7BEF7B /* Views */,
 				2FE81A60ECC3F3F1EB27A4BA /* AppDependencies.swift */,
 				639B3B5F5E1964B95399C8A4 /* VPlayerApp.swift */,
@@ -570,6 +593,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				4778479CFB7605256F5FF863 /* AppDependencies.swift in Sources */,
+				DFC4CAEA21A686600E575881 /* BackgroundRefreshRegistrar.swift in Sources */,
+				A3098C1B5C42F7256681B090 /* ForegroundRefreshDriver.swift in Sources */,
 				4BE2000825436D6D3CA2B1EA /* RootView.swift in Sources */,
 				2B1AA18D36EB95C46CE2D73C /* VPlayerApp.swift in Sources */,
 			);
@@ -590,6 +615,7 @@
 				F23A8BBED3A47568702AC0F8 /* PlaylistTextDecoder.swift in Sources */,
 				E5B997E005CE0E4A110A9A43 /* RedactedURL.swift in Sources */,
 				BD0915983FDEEEA04D4E067D /* RefreshCoordinator.swift in Sources */,
+				A79BA2EED45A2F4C09618A98 /* RefreshSchedulePlanner.swift in Sources */,
 				EC428FCDA3FDB59AF2C77783 /* RefreshTypes.swift in Sources */,
 				AD16087EFB0A780317C69870 /* RemoteResourceDownloader.swift in Sources */,
 				642EC1779963E3CE1163705A /* SchemaModels.swift in Sources */,
@@ -615,6 +641,8 @@
 				86F079E90934D8EB19E328D4 /* PlaybackSettingsStoreTests.swift in Sources */,
 				810B6A3316A6341043193CD1 /* ProjectConfigurationTests.swift in Sources */,
 				7175563E28A200746A1CCB19 /* RefreshCoordinatorTests.swift in Sources */,
+				1F132F22A9DD9F45E47647D0 /* RefreshLifecycleTests.swift in Sources */,
+				0F11E690D62302C3B5C72E86 /* RefreshSchedulePlannerTests.swift in Sources */,
 				079771228F4B60F9A3DF01D8 /* RepositorySpy.swift in Sources */,
 				C985594FCA4643772D7C81AC /* StubURLProtocol.swift in Sources */,
 				79379A5791D426270201B2DD /* SwiftDataLibraryStoreTests.swift in Sources */,

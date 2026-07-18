@@ -55,21 +55,77 @@ actor LibraryStartup {
     }
 }
 
-struct VPlayerDependencies: Sendable {
-    typealias LibraryMaintenanceFactory = @Sendable () throws -> any LibrarySnapshotMaintenance
-
+@MainActor
+struct VPlayerDependencies {
     let libraryStartup: LibraryStartup
+    let foregroundRefreshDriver: ForegroundRefreshDriver
+    let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
 
-    static func production(
-        makeLibraryMaintenance: @escaping LibraryMaintenanceFactory = {
+    init(
+        libraryStartup: LibraryStartup,
+        foregroundRefreshDriver: ForegroundRefreshDriver,
+        backgroundRefreshRegistrar: BackgroundRefreshRegistrar
+    ) {
+        self.libraryStartup = libraryStartup
+        self.foregroundRefreshDriver = foregroundRefreshDriver
+        self.backgroundRefreshRegistrar = backgroundRefreshRegistrar
+    }
+
+    static func production() -> Self {
+        do {
             let container = try VPlayerModelContainer.make()
-            return SwiftDataLibraryStore(modelContainer: container)
+            let repository = SwiftDataLibraryStore(modelContainer: container)
+            let coordinator = RefreshCoordinator(
+                repository: repository,
+                downloader: URLSessionBoundedDownloader()
+            )
+            let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
+                try await repository.profiles()
+            }
+            let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            }
+
+            return Self(
+                libraryStartup: LibraryStartup {
+                    try await repository.purgeUnreferencedSnapshots()
+                },
+                foregroundRefreshDriver: ForegroundRefreshDriver(
+                    loadProfiles: loadProfiles,
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                ),
+                backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                    loadProfiles: loadProfiles,
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                )
+            )
+        } catch {
+            let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
+                throw ProductionDependencyError.libraryUnavailable
+            }
+            let refresh: ForegroundRefreshDriver.Refresh = { _, _, _ in [] }
+            return Self(
+                libraryStartup: LibraryStartup {
+                    throw ProductionDependencyError.libraryUnavailable
+                },
+                foregroundRefreshDriver: ForegroundRefreshDriver(
+                    loadProfiles: loadProfiles,
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                ),
+                backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                    loadProfiles: loadProfiles,
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                )
+            )
         }
-    ) -> Self {
-        Self(libraryStartup: LibraryStartup {
-            let maintenance = try makeLibraryMaintenance()
-            try await maintenance.purgeUnreferencedSnapshots()
-        })
     }
 
     @discardableResult
@@ -82,4 +138,8 @@ struct VPlayerDependencies: Sendable {
             _ = await start()
         }
     }
+}
+
+private enum ProductionDependencyError: Error {
+    case libraryUnavailable
 }

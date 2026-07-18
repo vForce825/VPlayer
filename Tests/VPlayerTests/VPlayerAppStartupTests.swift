@@ -9,9 +9,7 @@ import XCTest
 final class VPlayerAppStartupTests: XCTestCase {
     func testProductionAppStartupPurgesLibrarySnapshotsOnceAfterRepeatedStartRequests() async {
         let probe = StartupMaintenanceProbe()
-        let dependencies = VPlayerDependencies.production {
-            probe
-        }
+        let dependencies = makeDependencies(maintenance: probe)
 
         _ = VPlayerApp(dependencies: dependencies)
         await probe.waitUntilAttempted()
@@ -37,6 +35,75 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertEqual(retryOutcome, .completed)
         XCTAssertEqual(repeatedOutcome, .alreadyCompleted)
         XCTAssertEqual(attemptCount, 2)
+    }
+
+    func testAppInitializationRegistersBackgroundRefreshExactlyOnce() {
+        let scheduler = StartupBackgroundSchedulerSpy()
+        let dependencies = makeDependencies(
+            maintenance: StartupMaintenanceProbe(),
+            scheduler: scheduler
+        )
+
+        _ = VPlayerApp(dependencies: dependencies)
+
+        XCTAssertEqual(scheduler.registrationCount, 1)
+    }
+
+    func testScenePhaseRoutesActiveThenBackgroundLifecycle() async {
+        let loopProbe = StartupLoopProbe()
+        let scheduler = StartupBackgroundSchedulerSpy()
+        let dependencies = makeDependencies(
+            maintenance: StartupMaintenanceProbe(),
+            scheduler: scheduler,
+            sleep: {
+                await loopProbe.recordSleepStarted()
+                do {
+                    try await Task.sleep(for: .seconds(3_600))
+                } catch {
+                    await loopProbe.recordCancellation()
+                    throw error
+                }
+            }
+        )
+        let app = VPlayerApp(dependencies: dependencies)
+
+        app.handleScenePhase(.active)
+        await loopProbe.waitUntilSleeping()
+        app.handleScenePhase(.background)
+        await loopProbe.waitUntilCancelled()
+        await scheduler.waitUntilCancelled()
+
+        let cancellationCount = await loopProbe.cancellationCountValue()
+        XCTAssertEqual(cancellationCount, 1)
+        XCTAssertEqual(scheduler.cancelledIdentifiers, [BackgroundRefreshRegistrar.identifier])
+    }
+
+    private func makeDependencies(
+        maintenance: any LibrarySnapshotMaintenance,
+        scheduler: StartupBackgroundSchedulerSpy = StartupBackgroundSchedulerSpy(),
+        sleep: @escaping ForegroundRefreshDriver.Sleep = {
+            try await ContinuousClock().sleep(for: .seconds(60))
+        }
+    ) -> VPlayerDependencies {
+        let foreground = ForegroundRefreshDriver(
+            loadProfiles: { [] },
+            refresh: { _, _, _ in [] },
+            sleep: sleep,
+            reportStatus: { _ in }
+        )
+        let background = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { [] },
+            refresh: { _, _, _ in [] },
+            reportStatus: { _ in }
+        )
+        return VPlayerDependencies(
+            libraryStartup: LibraryStartup {
+                try await maintenance.purgeUnreferencedSnapshots()
+            },
+            foregroundRefreshDriver: foreground,
+            backgroundRefreshRegistrar: background
+        )
     }
 }
 
@@ -68,4 +135,67 @@ private actor StartupMaintenanceProbe: LibrarySnapshotMaintenance {
 
 private enum StartupProbeError: Error {
     case expected
+}
+
+private actor StartupLoopProbe {
+    private var sleepCount = 0
+    private var cancellationCount = 0
+
+    func recordSleepStarted() {
+        sleepCount += 1
+    }
+
+    func recordCancellation() {
+        cancellationCount += 1
+    }
+
+    func waitUntilSleeping() async {
+        for _ in 0..<1_000 {
+            if sleepCount > 0 { return }
+            await Task.yield()
+        }
+    }
+
+    func waitUntilCancelled() async {
+        for _ in 0..<1_000 {
+            if cancellationCount > 0 { return }
+            await Task.yield()
+        }
+    }
+
+    func cancellationCountValue() -> Int {
+        cancellationCount
+    }
+}
+
+@MainActor
+private final class StartupBackgroundSchedulerSpy: BackgroundRefreshScheduling {
+    private(set) var registrationCount = 0
+    private(set) var cancelledIdentifiers: [String] = []
+
+    func register(
+        identifier: String,
+        handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void
+    ) -> Bool {
+        _ = identifier
+        _ = handler
+        registrationCount += 1
+        return true
+    }
+
+    func cancel(identifier: String) {
+        cancelledIdentifiers.append(identifier)
+    }
+
+    func submit(identifier: String, earliestBeginDate: Date) throws {
+        _ = identifier
+        _ = earliestBeginDate
+    }
+
+    func waitUntilCancelled() async {
+        for _ in 0..<1_000 {
+            if !cancelledIdentifiers.isEmpty { return }
+            await Task.yield()
+        }
+    }
 }
