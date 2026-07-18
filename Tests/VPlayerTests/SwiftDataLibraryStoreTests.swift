@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import Foundation
 import SwiftData
 import XCTest
 @testable import VPlayerCore
@@ -82,7 +83,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
         let duplicate = channel(profileID: profile.id, name: "Duplicate", path: "duplicate")
 
-        await XCTAssertThrowsErrorAsync {
+        _ = await XCTAssertThrowsErrorAsync {
             try await store.installPlaylist(
                 profileID: profile.id,
                 channels: [duplicate, duplicate],
@@ -115,7 +116,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
         XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 1))
 
-        await XCTAssertThrowsErrorAsync {
+        _ = await XCTAssertThrowsErrorAsync {
             _ = try await store.installEPG(
                 profileID: profile.id,
                 fileURL: self.fixtureURL("epg/malformed.xml"),
@@ -158,7 +159,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
         try await store.recordSuccess(profileID: profile.id, resource: .epg, at: date(25))
 
-        await XCTAssertThrowsErrorAsync {
+        _ = await XCTAssertThrowsErrorAsync {
             _ = try await store.installEPG(
                 profileID: profile.id,
                 fileURL: duplicateURL,
@@ -170,11 +171,17 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let profiles = try await store.profiles()
         let currentProfile = try XCTUnwrap(profiles.first)
         let snapshotHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
+        let inventory = try snapshotInventory(container)
         XCTAssertEqual(activeChannels.map(\.id), ["original"])
         XCTAssertEqual(currentProfile.epgStatus.state, .succeeded)
         XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(25))
         XCTAssertEqual(snapshotHeaders.count, 1)
         XCTAssertEqual(snapshotHeaders.first?.channelCount, 1)
+        XCTAssertEqual(inventory.playlistHeaderIDs, [])
+        XCTAssertEqual(inventory.channels, [])
+        XCTAssertEqual(inventory.epgHeaderIDs, snapshotHeaders.map(\.id))
+        XCTAssertEqual(inventory.epgChannels.map(\.valueID), ["original"])
+        XCTAssertEqual(inventory.programmes, [])
     }
 
     func testDuplicateXMLTVProgrammeStableIDsRejectReplacementAndCleanStaging() async throws {
@@ -214,7 +221,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
         try await store.recordSuccess(profileID: profile.id, resource: .epg, at: date(25))
 
-        await XCTAssertThrowsErrorAsync {
+        _ = await XCTAssertThrowsErrorAsync {
             _ = try await store.installEPG(
                 profileID: profile.id,
                 fileURL: duplicateURL,
@@ -231,12 +238,18 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let profiles = try await store.profiles()
         let currentProfile = try XCTUnwrap(profiles.first)
         let snapshotHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
+        let inventory = try snapshotInventory(container)
         XCTAssertEqual(activeChannels.map(\.id), ["original"])
         XCTAssertEqual(activeProgrammes.map(\.title), ["Original Show"])
         XCTAssertEqual(currentProfile.epgStatus.state, .succeeded)
         XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(25))
         XCTAssertEqual(snapshotHeaders.count, 1)
         XCTAssertEqual(snapshotHeaders.first?.programmeCount, 1)
+        XCTAssertEqual(inventory.playlistHeaderIDs, [])
+        XCTAssertEqual(inventory.channels, [])
+        XCTAssertEqual(inventory.epgHeaderIDs, snapshotHeaders.map(\.id))
+        XCTAssertEqual(inventory.epgChannels.map(\.valueID), ["original"])
+        XCTAssertEqual(inventory.programmes.map(\.valueID), [activeProgrammes[0].id])
     }
 
     func testFailedProfileUpdateRollsBackBeforeUnrelatedSave() async throws {
@@ -246,13 +259,14 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let second = try await initialStore.createProfile(input(name: "Second"), now: date(20))
         let failingStore = makeStore(container: container, failingSave: .profileUpdate)
 
-        await XCTAssertThrowsErrorAsync {
+        let error = await XCTAssertThrowsErrorAsync {
             try await failingStore.updateProfile(
                 id: first.id,
                 input: self.input(name: "Leaked update"),
                 now: self.date(30)
             )
         }
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
 
         let afterFailure = try await failingStore.profiles()
         XCTAssertEqual(afterFailure.map(\.name), ["First", "Second"])
@@ -262,6 +276,126 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let afterUnrelatedSave = try await verificationStore.profiles()
         XCTAssertEqual(afterUnrelatedSave.map(\.name), ["First", "Second"])
         XCTAssertEqual(afterUnrelatedSave[1].epgStatus.state, .refreshing)
+    }
+
+    func testPlaylistPointerSaveFailurePreservesOldPointerAndRemovesAllStagingRows() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let original = channel(profileID: profile.id, name: "Original", path: "original")
+        let replacement = channel(profileID: profile.id, name: "Replacement", path: "replacement")
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [original],
+            fetchedAt: date(20)
+        )
+        let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalInventory = try snapshotInventory(container)
+        let failingStore = makeStore(container: container, failingSave: .playlistPointer)
+
+        let error = await XCTAssertThrowsErrorAsync {
+            try await failingStore.installPlaylist(
+                profileID: profile.id,
+                channels: [replacement],
+                fetchedAt: self.date(30)
+            )
+        }
+
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
+        let pointersAfterFailure = try snapshotPointers(container, profileID: profile.id)
+        let channelsAfterFailure = try await failingStore.channels(profileID: profile.id)
+        XCTAssertEqual(pointersAfterFailure.playlist, originalPointers.playlist)
+        XCTAssertEqual(channelsAfterFailure, [original])
+        assertInventory(try snapshotInventory(container), equals: originalInventory)
+    }
+
+    func testEPGPointerSaveFailurePreservesOldPointerAndRemovesAllStagingRows() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let originalURL = try temporaryXML(singleProgrammeXMLTV(channelID: "original", title: "Original"))
+        let replacementURL = try temporaryXML(
+            singleProgrammeXMLTV(channelID: "replacement", title: "Replacement")
+        )
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: replacementURL)
+        }
+        _ = try await initialStore.installEPG(
+            profileID: profile.id,
+            fileURL: originalURL,
+            fetchedAt: date(20)
+        )
+        let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalInventory = try snapshotInventory(container)
+        let failingStore = makeStore(container: container, failingSave: .epgPointer)
+
+        let error = await XCTAssertThrowsErrorAsync {
+            _ = try await failingStore.installEPG(
+                profileID: profile.id,
+                fileURL: replacementURL,
+                fetchedAt: self.date(30)
+            )
+        }
+
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
+        let pointersAfterFailure = try snapshotPointers(container, profileID: profile.id)
+        let channelsAfterFailure = try await failingStore.epgChannels(profileID: profile.id)
+        XCTAssertEqual(pointersAfterFailure.epg, originalPointers.epg)
+        XCTAssertEqual(channelsAfterFailure.map(\.id), ["original"])
+        assertInventory(try snapshotInventory(container), equals: originalInventory)
+    }
+
+    func testEPGBatchSaveFailureAbortsInstallAndPreservesLastKnownGoodState() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let originalURL = try temporaryXML(singleProgrammeXMLTV(channelID: "original", title: "Original"))
+        let replacementURL = try temporaryXML(batchedXMLTV(programmeCount: 499))
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: replacementURL)
+        }
+        let playlist = channel(profileID: profile.id, name: "Live", path: "live")
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [playlist],
+            fetchedAt: date(20)
+        )
+        _ = try await initialStore.installEPG(
+            profileID: profile.id,
+            fileURL: originalURL,
+            fetchedAt: date(30)
+        )
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .playlist, at: date(35))
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .epg, at: date(40))
+        let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalInventory = try snapshotInventory(container)
+        let failingStore = makeStore(container: container, failingSave: .epgBatch)
+
+        let error = await XCTAssertThrowsErrorAsync {
+            _ = try await failingStore.installEPG(
+                profileID: profile.id,
+                fileURL: replacementURL,
+                fetchedAt: self.date(50)
+            )
+        }
+
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
+        let pointersAfterFailure = try snapshotPointers(container, profileID: profile.id)
+        let playlistAfterFailure = try await failingStore.channels(profileID: profile.id)
+        let epgAfterFailure = try await failingStore.epgChannels(profileID: profile.id)
+        let profilesAfterFailure = try await failingStore.profiles()
+        let currentProfile = try XCTUnwrap(profilesAfterFailure.first)
+        XCTAssertEqual(pointersAfterFailure.playlist, originalPointers.playlist)
+        XCTAssertEqual(pointersAfterFailure.epg, originalPointers.epg)
+        XCTAssertEqual(playlistAfterFailure, [playlist])
+        XCTAssertEqual(epgAfterFailure.map(\.id), ["original"])
+        XCTAssertEqual(currentProfile.m3uStatus.state, .succeeded)
+        XCTAssertEqual(currentProfile.m3uStatus.lastSuccessAt, date(35))
+        XCTAssertEqual(currentProfile.epgStatus.state, .succeeded)
+        XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(40))
+        assertInventory(try snapshotInventory(container), equals: originalInventory)
     }
 
     func testPlaylistCleanupSaveFailureStillReportsInstallSuccessAndDefersPurge() async throws {
@@ -388,15 +522,23 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
         try await initialStore.recordSuccess(profileID: profile.id, resource: .playlist, at: date(35))
         try await initialStore.recordSuccess(profileID: profile.id, resource: .epg, at: date(40))
-        let failingStore = makeStore(container: container, failingSave: .epgStaging)
+        let phaseRecorder = SavePhaseRecorder(failingAt: .epgStaging)
+        let failingStore = SwiftDataLibraryStore(modelContainer: container) { phase in
+            try phaseRecorder.record(phase)
+        }
 
-        await XCTAssertThrowsErrorAsync {
+        let error = await XCTAssertThrowsErrorAsync {
             _ = try await failingStore.installEPG(
                 profileID: profile.id,
                 fileURL: replacementEPGURL,
                 fetchedAt: self.date(50)
             )
         }
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
+        XCTAssertEqual(
+            phaseRecorder.recorded.filter { $0 == .epgBatch || $0 == .epgStaging },
+            [.epgBatch, .epgStaging]
+        )
 
         let activeEPGChannels = try await failingStore.epgChannels(profileID: profile.id)
         let activeProgrammes = try await failingStore.programmes(
@@ -421,6 +563,13 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             try ModelContext(container).fetch(FetchDescriptor<ProgrammeRecord>()).count,
             1
         )
+        let pointers = try snapshotPointers(container, profileID: profile.id)
+        let inventory = try snapshotInventory(container)
+        XCTAssertEqual(inventory.playlistHeaderIDs, [try XCTUnwrap(pointers.playlist)])
+        XCTAssertEqual(inventory.channels.map(\.valueID), [playlist.id])
+        XCTAssertEqual(inventory.epgHeaderIDs, [try XCTUnwrap(pointers.epg)])
+        XCTAssertEqual(inventory.epgChannels.map(\.valueID), ["original"])
+        XCTAssertEqual(inventory.programmes.map(\.valueID), [activeProgrammes[0].id])
     }
 
     func testStatusUpdatesAffectOnlyRequestedResourceAndTruncateFailureSummary() async throws {
@@ -556,6 +705,53 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         }
     }
 
+    private func snapshotPointers(
+        _ container: ModelContainer,
+        profileID: UUID
+    ) throws -> (playlist: UUID?, epg: UUID?) {
+        let id = profileID
+        let record = try XCTUnwrap(try ModelContext(container).fetch(
+            FetchDescriptor<SourceProfileRecord>(predicate: #Predicate { $0.id == id })
+        ).first)
+        return (record.playlistSnapshotID, record.epgSnapshotID)
+    }
+
+    private func snapshotInventory(_ container: ModelContainer) throws -> SnapshotInventory {
+        let context = ModelContext(container)
+        return SnapshotInventory(
+            playlistHeaderIDs: try context.fetch(FetchDescriptor<PlaylistSnapshotRecord>())
+                .map(\.id).sorted(by: uuidOrder),
+            channels: try context.fetch(FetchDescriptor<ChannelRecord>())
+                .map { SnapshotChildIdentity(snapshotID: $0.snapshotID, valueID: $0.stableID) }
+                .sorted(),
+            epgHeaderIDs: try context.fetch(FetchDescriptor<EPGSnapshotRecord>())
+                .map(\.id).sorted(by: uuidOrder),
+            epgChannels: try context.fetch(FetchDescriptor<EPGChannelRecord>())
+                .map { SnapshotChildIdentity(snapshotID: $0.snapshotID, valueID: $0.xmltvID) }
+                .sorted(),
+            programmes: try context.fetch(FetchDescriptor<ProgrammeRecord>())
+                .map { SnapshotChildIdentity(snapshotID: $0.snapshotID, valueID: $0.stableID) }
+                .sorted()
+        )
+    }
+
+    private func assertInventory(
+        _ actual: SnapshotInventory,
+        equals expected: SnapshotInventory,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.playlistHeaderIDs, expected.playlistHeaderIDs, file: file, line: line)
+        XCTAssertEqual(actual.channels, expected.channels, file: file, line: line)
+        XCTAssertEqual(actual.epgHeaderIDs, expected.epgHeaderIDs, file: file, line: line)
+        XCTAssertEqual(actual.epgChannels, expected.epgChannels, file: file, line: line)
+        XCTAssertEqual(actual.programmes, expected.programmes, file: file, line: line)
+    }
+
+    private func uuidOrder(_ lhs: UUID, _ rhs: UUID) -> Bool {
+        lhs.uuidString < rhs.uuidString
+    }
+
     private func input(name: String) throws -> ValidatedSourceProfileInput {
         try SourceProfileInput(
             name: name,
@@ -615,10 +811,65 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         </tv>
         """
     }
+
+    private func singleProgrammeXMLTV(channelID: String, title: String) -> String {
+        """
+        <tv>
+          <channel id="\(channelID)"><display-name>\(channelID)</display-name></channel>
+          <programme channel="\(channelID)" start="20260718150000 Z" stop="20260718160000 Z">
+            <title>\(title)</title>
+          </programme>
+        </tv>
+        """
+    }
 }
 
-private enum InjectedSaveError: Error {
+private struct SnapshotInventory: Equatable {
+    let playlistHeaderIDs: [UUID]
+    let channels: [SnapshotChildIdentity]
+    let epgHeaderIDs: [UUID]
+    let epgChannels: [SnapshotChildIdentity]
+    let programmes: [SnapshotChildIdentity]
+}
+
+private struct SnapshotChildIdentity: Comparable {
+    let snapshotID: UUID
+    let valueID: String
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        (lhs.snapshotID.uuidString, lhs.valueID) < (rhs.snapshotID.uuidString, rhs.valueID)
+    }
+}
+
+private final class SavePhaseRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failingPhase: LibraryStoreSavePhase
+    private var phases: [LibraryStoreSavePhase] = []
+
+    init(failingAt phase: LibraryStoreSavePhase) {
+        failingPhase = phase
+    }
+
+    var recorded: [LibraryStoreSavePhase] {
+        lock.withLock { phases }
+    }
+
+    func record(_ phase: LibraryStoreSavePhase) throws {
+        try lock.withLock {
+            phases.append(phase)
+            if phase == failingPhase {
+                throw InjectedSaveError.expected
+            }
+        }
+    }
+}
+
+private enum InjectedSaveError: Error, Equatable {
     case expected
+}
+
+private enum AsyncThrowAssertionError: Error {
+    case didNotThrow
 }
 
 @MainActor
@@ -626,9 +877,12 @@ private func XCTAssertThrowsErrorAsync(
     _ expression: @MainActor () async throws -> Void,
     file: StaticString = #filePath,
     line: UInt = #line
-) async {
+) async -> any Error {
     do {
         try await expression()
         XCTFail("Expected expression to throw", file: file, line: line)
-    } catch {}
+        return AsyncThrowAssertionError.didNotThrow
+    } catch {
+        return error
+    }
 }

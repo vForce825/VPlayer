@@ -6,6 +6,17 @@ import SwiftUI
 
 @main
 struct VPlayerApp: App {
+    private let dependencies: VPlayerDependencies
+
+    init() {
+        self.init(dependencies: .production())
+    }
+
+    init(dependencies: VPlayerDependencies) {
+        self.dependencies = dependencies
+        dependencies.launch()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()
