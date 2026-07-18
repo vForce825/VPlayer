@@ -5,19 +5,35 @@
 import Foundation
 import SwiftData
 
+enum EPGPersistenceSinkError: Error, Equatable, Sendable {
+    case duplicateChannelID
+    case duplicateProgrammeID
+}
+
 final class EPGPersistenceSink: XMLTVEventSink {
     private static let saveBatchSize = 500
 
     private let modelContext: ModelContext
     private let snapshotID: UUID
+    private let saveBatch: () throws -> Void
     private var pendingEventCount = 0
+    private var channelIDs: Set<String> = []
+    private var programmeIDs: Set<String> = []
 
-    init(modelContext: ModelContext, snapshotID: UUID) {
+    init(
+        modelContext: ModelContext,
+        snapshotID: UUID,
+        saveBatch: @escaping () throws -> Void
+    ) {
         self.modelContext = modelContext
         self.snapshotID = snapshotID
+        self.saveBatch = saveBatch
     }
 
     func accept(channel: EPGChannel) throws {
+        guard channelIDs.insert(channel.id).inserted else {
+            throw EPGPersistenceSinkError.duplicateChannelID
+        }
         modelContext.insert(EPGChannelRecord(
             snapshotID: snapshotID,
             xmltvID: channel.id,
@@ -28,6 +44,9 @@ final class EPGPersistenceSink: XMLTVEventSink {
     }
 
     func accept(programme: Programme) throws {
+        guard programmeIDs.insert(programme.id).inserted else {
+            throw EPGPersistenceSinkError.duplicateProgrammeID
+        }
         modelContext.insert(ProgrammeRecord(
             snapshotID: snapshotID,
             stableID: programme.id,
@@ -45,7 +64,7 @@ final class EPGPersistenceSink: XMLTVEventSink {
     private func saveBatchIfNeeded() throws {
         pendingEventCount += 1
         guard pendingEventCount == Self.saveBatchSize else { return }
-        try modelContext.save()
+        try saveBatch()
         pendingEventCount = 0
     }
 }

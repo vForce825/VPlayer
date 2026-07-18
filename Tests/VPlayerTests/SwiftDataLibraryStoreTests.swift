@@ -133,6 +133,296 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(programmes.map(\.title), ["Bulletin"])
     }
 
+    func testDuplicateXMLTVChannelIDsRejectReplacementAndCleanStaging() async throws {
+        let (container, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        let originalURL = try temporaryXML(
+            "<tv><channel id=\"original\"><display-name>Original</display-name></channel></tv>"
+        )
+        let duplicateURL = try temporaryXML(
+            """
+            <tv>
+              <channel id="duplicate"><display-name>First</display-name></channel>
+              <channel id="duplicate"><display-name>Second</display-name></channel>
+            </tv>
+            """
+        )
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: duplicateURL)
+        }
+        _ = try await store.installEPG(
+            profileID: profile.id,
+            fileURL: originalURL,
+            fetchedAt: date(20)
+        )
+        try await store.recordSuccess(profileID: profile.id, resource: .epg, at: date(25))
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.installEPG(
+                profileID: profile.id,
+                fileURL: duplicateURL,
+                fetchedAt: self.date(30)
+            )
+        }
+
+        let activeChannels = try await store.epgChannels(profileID: profile.id)
+        let profiles = try await store.profiles()
+        let currentProfile = try XCTUnwrap(profiles.first)
+        let snapshotHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
+        XCTAssertEqual(activeChannels.map(\.id), ["original"])
+        XCTAssertEqual(currentProfile.epgStatus.state, .succeeded)
+        XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(25))
+        XCTAssertEqual(snapshotHeaders.count, 1)
+        XCTAssertEqual(snapshotHeaders.first?.channelCount, 1)
+    }
+
+    func testDuplicateXMLTVProgrammeStableIDsRejectReplacementAndCleanStaging() async throws {
+        let (container, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        let originalURL = try temporaryXML(
+            """
+            <tv>
+              <channel id="original"><display-name>Original</display-name></channel>
+              <programme channel="original" start="20260718150000 Z" stop="20260718160000 Z">
+                <title>Original Show</title>
+              </programme>
+            </tv>
+            """
+        )
+        let duplicateURL = try temporaryXML(
+            """
+            <tv>
+              <channel id="replacement"><display-name>Replacement</display-name></channel>
+              <programme channel="replacement" start="20260718150000 Z" stop="20260718160000 Z">
+                <title>Duplicated Show</title>
+              </programme>
+              <programme channel="replacement" start="20260718150000 Z" stop="20260718160000 Z">
+                <title>Duplicated Show</title>
+              </programme>
+            </tv>
+            """
+        )
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: duplicateURL)
+        }
+        _ = try await store.installEPG(
+            profileID: profile.id,
+            fileURL: originalURL,
+            fetchedAt: date(20)
+        )
+        try await store.recordSuccess(profileID: profile.id, resource: .epg, at: date(25))
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.installEPG(
+                profileID: profile.id,
+                fileURL: duplicateURL,
+                fetchedAt: self.date(30)
+            )
+        }
+
+        let activeChannels = try await store.epgChannels(profileID: profile.id)
+        let activeProgrammes = try await store.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "original",
+            overlapping: date(0)..<date(2_000_000_000)
+        )
+        let profiles = try await store.profiles()
+        let currentProfile = try XCTUnwrap(profiles.first)
+        let snapshotHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
+        XCTAssertEqual(activeChannels.map(\.id), ["original"])
+        XCTAssertEqual(activeProgrammes.map(\.title), ["Original Show"])
+        XCTAssertEqual(currentProfile.epgStatus.state, .succeeded)
+        XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(25))
+        XCTAssertEqual(snapshotHeaders.count, 1)
+        XCTAssertEqual(snapshotHeaders.first?.programmeCount, 1)
+    }
+
+    func testFailedProfileUpdateRollsBackBeforeUnrelatedSave() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let first = try await initialStore.createProfile(input(name: "First"), now: date(10))
+        let second = try await initialStore.createProfile(input(name: "Second"), now: date(20))
+        let failingStore = makeStore(container: container, failingSave: .profileUpdate)
+
+        await XCTAssertThrowsErrorAsync {
+            try await failingStore.updateProfile(
+                id: first.id,
+                input: self.input(name: "Leaked update"),
+                now: self.date(30)
+            )
+        }
+
+        let afterFailure = try await failingStore.profiles()
+        XCTAssertEqual(afterFailure.map(\.name), ["First", "Second"])
+
+        try await failingStore.recordAttempt(profileID: second.id, resource: .epg, at: date(40))
+        let verificationStore = SwiftDataLibraryStore(modelContainer: container)
+        let afterUnrelatedSave = try await verificationStore.profiles()
+        XCTAssertEqual(afterUnrelatedSave.map(\.name), ["First", "Second"])
+        XCTAssertEqual(afterUnrelatedSave[1].epgStatus.state, .refreshing)
+    }
+
+    func testPlaylistCleanupSaveFailureStillReportsInstallSuccessAndDefersPurge() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let original = channel(profileID: profile.id, name: "Original", path: "original")
+        let replacement = channel(profileID: profile.id, name: "Replacement", path: "replacement")
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [original],
+            fetchedAt: date(20)
+        )
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .playlist, at: date(25))
+        let failingStore = makeStore(container: container, failingSave: .playlistCleanup)
+
+        try await failingStore.installPlaylist(
+            profileID: profile.id,
+            channels: [replacement],
+            fetchedAt: date(30)
+        )
+
+        let installedChannels = try await failingStore.channels(profileID: profile.id)
+        let profiles = try await failingStore.profiles()
+        XCTAssertEqual(installedChannels, [replacement])
+        XCTAssertEqual(profiles.first?.m3uStatus.state, .succeeded)
+        try await failingStore.setManualMapping(
+            profileID: profile.id,
+            channelID: replacement.id,
+            xmltvChannelID: "unrelated-save"
+        )
+        XCTAssertEqual(
+            try ModelContext(container).fetch(FetchDescriptor<PlaylistSnapshotRecord>()).count,
+            2
+        )
+
+        try await failingStore.purgeUnreferencedSnapshots()
+
+        let remainingHeaders = try ModelContext(container).fetch(FetchDescriptor<PlaylistSnapshotRecord>())
+        let channelsAfterPurge = try await failingStore.channels(profileID: profile.id)
+        XCTAssertEqual(remainingHeaders.count, 1)
+        XCTAssertEqual(remainingHeaders.first?.channelCount, 1)
+        XCTAssertEqual(channelsAfterPurge, [replacement])
+    }
+
+    func testEPGCleanupSaveFailureStillReportsInstallSuccessAndDefersPurge() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let originalURL = try temporaryXML(
+            "<tv><channel id=\"original\"><display-name>Original</display-name></channel></tv>"
+        )
+        let replacementURL = try temporaryXML(
+            "<tv><channel id=\"replacement\"><display-name>Replacement</display-name></channel></tv>"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: replacementURL)
+        }
+        _ = try await initialStore.installEPG(
+            profileID: profile.id,
+            fileURL: originalURL,
+            fetchedAt: date(20)
+        )
+        let failingStore = makeStore(container: container, failingSave: .epgCleanup)
+
+        let summary = try await failingStore.installEPG(
+            profileID: profile.id,
+            fileURL: replacementURL,
+            fetchedAt: date(30)
+        )
+
+        let installedChannels = try await failingStore.epgChannels(profileID: profile.id)
+        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 0))
+        XCTAssertEqual(installedChannels.map(\.id), ["replacement"])
+        try await failingStore.setManualMapping(
+            profileID: profile.id,
+            channelID: "unrelated-channel",
+            xmltvChannelID: "replacement"
+        )
+        XCTAssertEqual(
+            try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>()).count,
+            2
+        )
+
+        try await failingStore.purgeUnreferencedSnapshots()
+
+        let remainingHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
+        let channelsAfterPurge = try await failingStore.epgChannels(profileID: profile.id)
+        XCTAssertEqual(remainingHeaders.count, 1)
+        XCTAssertEqual(remainingHeaders.first?.channelCount, 1)
+        XCTAssertEqual(channelsAfterPurge.map(\.id), ["replacement"])
+    }
+
+    func testEPGFinalSaveFailureAfterBatchStagingCleansStagingAndPreservesResources() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let originalEPGURL = try temporaryXML(
+            """
+            <tv>
+              <channel id="original"><display-name>Original</display-name></channel>
+              <programme channel="original" start="20260718150000 Z" stop="20260718160000 Z">
+                <title>Original Show</title>
+              </programme>
+            </tv>
+            """
+        )
+        let replacementEPGURL = try temporaryXML(batchedXMLTV(programmeCount: 499))
+        defer {
+            try? FileManager.default.removeItem(at: originalEPGURL)
+            try? FileManager.default.removeItem(at: replacementEPGURL)
+        }
+        let playlist = channel(profileID: profile.id, name: "Live", path: "live")
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [playlist],
+            fetchedAt: date(20)
+        )
+        _ = try await initialStore.installEPG(
+            profileID: profile.id,
+            fileURL: originalEPGURL,
+            fetchedAt: date(30)
+        )
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .playlist, at: date(35))
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .epg, at: date(40))
+        let failingStore = makeStore(container: container, failingSave: .epgStaging)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await failingStore.installEPG(
+                profileID: profile.id,
+                fileURL: replacementEPGURL,
+                fetchedAt: self.date(50)
+            )
+        }
+
+        let activeEPGChannels = try await failingStore.epgChannels(profileID: profile.id)
+        let activeProgrammes = try await failingStore.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "original",
+            overlapping: date(0)..<date(2_000_000_000)
+        )
+        let profiles = try await failingStore.profiles()
+        let activePlaylist = try await failingStore.channels(profileID: profile.id)
+        XCTAssertEqual(activeEPGChannels.map(\.id), ["original"])
+        XCTAssertEqual(activeProgrammes.map(\.title), ["Original Show"])
+        XCTAssertEqual(activePlaylist, [playlist])
+        XCTAssertEqual(profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(profiles.first?.m3uStatus.lastSuccessAt, date(35))
+        XCTAssertEqual(profiles.first?.epgStatus.state, .succeeded)
+        XCTAssertEqual(profiles.first?.epgStatus.lastSuccessAt, date(40))
+        XCTAssertEqual(
+            try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>()).count,
+            1
+        )
+        XCTAssertEqual(
+            try ModelContext(container).fetch(FetchDescriptor<ProgrammeRecord>()).count,
+            1
+        )
+    }
+
     func testStatusUpdatesAffectOnlyRequestedResourceAndTruncateFailureSummary() async throws {
         let (_, store) = try makeStore()
         let profile = try await store.createProfile(input(name: "Home"), now: date(10))
@@ -256,6 +546,16 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         return (container, SwiftDataLibraryStore(modelContainer: container))
     }
 
+    private func makeStore(
+        container: ModelContainer,
+        failingSave phase: LibraryStoreSavePhase
+    ) -> SwiftDataLibraryStore {
+        SwiftDataLibraryStore(modelContainer: container) { actualPhase in
+            guard actualPhase == phase else { return }
+            throw InjectedSaveError.expected
+        }
+    }
+
     private func input(name: String) throws -> ValidatedSourceProfileInput {
         try SourceProfileInput(
             name: name,
@@ -299,6 +599,26 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         try Data(xml.utf8).write(to: url)
         return url
     }
+
+    private func batchedXMLTV(programmeCount: Int) -> String {
+        let programmes = (0..<programmeCount).map { index in
+            """
+            <programme channel="replacement" start="20260718150000 Z" stop="20260718160000 Z">
+              <title>Show \(index)</title>
+            </programme>
+            """
+        }.joined()
+        return """
+        <tv>
+          <channel id="replacement"><display-name>Replacement</display-name></channel>
+          \(programmes)
+        </tv>
+        """
+    }
+}
+
+private enum InjectedSaveError: Error {
+    case expected
 }
 
 @MainActor

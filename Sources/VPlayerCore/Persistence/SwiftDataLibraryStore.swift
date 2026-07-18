@@ -5,8 +5,39 @@
 import Foundation
 import SwiftData
 
+enum LibraryStoreSavePhase: Equatable, Sendable {
+    case profileCreate
+    case profileUpdate
+    case profileDelete
+    case activeProfile
+    case manualMapping
+    case playlistStaging
+    case playlistPointer
+    case playlistCleanup
+    case epgBatch
+    case epgStaging
+    case epgPointer
+    case epgCleanup
+    case status
+    case purge
+}
+
+typealias LibraryStoreSaveFault = @Sendable (LibraryStoreSavePhase) throws -> Void
+
 @ModelActor
 public actor SwiftDataLibraryStore: LibraryRepository {
+    private var saveFault: LibraryStoreSaveFault?
+
+    init(
+        modelContainer: ModelContainer,
+        saveFault: @escaping LibraryStoreSaveFault
+    ) {
+        let modelContext = ModelContext(modelContainer)
+        self.modelExecutor = DefaultSerialModelExecutor(modelContext: modelContext)
+        self.modelContainer = modelContainer
+        self.saveFault = saveFault
+    }
+
     public func profiles() throws -> [SourceProfile] {
         let records = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
             .sorted(by: Self.profileOrder)
@@ -22,23 +53,25 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         _ input: ValidatedSourceProfileInput,
         now: Date
     ) throws -> SourceProfile {
-        let record = SourceProfileRecord(
-            id: UUID(),
-            name: input.name,
-            m3uURLString: input.m3uURL.absoluteString,
-            epgURLString: input.epgURL.absoluteString,
-            m3uRefreshIntervalRaw: input.m3uRefreshInterval.rawValue,
-            epgRefreshIntervalRaw: input.epgRefreshInterval.rawValue,
-            createdAt: now,
-            updatedAt: now
-        )
-        modelContext.insert(record)
-        let state = try requiredStateRecord()
-        if state.activeProfileID == nil {
-            state.activeProfileID = record.id
+        let profileID = UUID()
+        try commit(.profileCreate) {
+            let record = SourceProfileRecord(
+                id: profileID,
+                name: input.name,
+                m3uURLString: input.m3uURL.absoluteString,
+                epgURLString: input.epgURL.absoluteString,
+                m3uRefreshIntervalRaw: input.m3uRefreshInterval.rawValue,
+                epgRefreshIntervalRaw: input.epgRefreshInterval.rawValue,
+                createdAt: now,
+                updatedAt: now
+            )
+            modelContext.insert(record)
+            let state = try requiredStateRecord()
+            if state.activeProfileID == nil {
+                state.activeProfileID = profileID
+            }
         }
-        try modelContext.save()
-        return try Self.profile(from: record)
+        return try Self.profile(from: profileRecord(id: profileID))
     }
 
     public func updateProfile(
@@ -46,47 +79,50 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         input: ValidatedSourceProfileInput,
         now: Date
     ) throws {
-        let record = try profileRecord(id: id)
-        record.name = input.name
-        record.m3uURLString = input.m3uURL.absoluteString
-        record.epgURLString = input.epgURL.absoluteString
-        record.m3uRefreshIntervalRaw = input.m3uRefreshInterval.rawValue
-        record.epgRefreshIntervalRaw = input.epgRefreshInterval.rawValue
-        record.updatedAt = now
-        try modelContext.save()
+        try commit(.profileUpdate) {
+            let record = try profileRecord(id: id)
+            record.name = input.name
+            record.m3uURLString = input.m3uURL.absoluteString
+            record.epgURLString = input.epgURL.absoluteString
+            record.m3uRefreshIntervalRaw = input.m3uRefreshInterval.rawValue
+            record.epgRefreshIntervalRaw = input.epgRefreshInterval.rawValue
+            record.updatedAt = now
+        }
     }
 
     public func deleteProfile(id: UUID) throws {
-        let record = try profileRecord(id: id)
-        if let snapshotID = record.playlistSnapshotID {
-            try deletePlaylistSnapshot(id: snapshotID)
-        }
-        if let snapshotID = record.epgSnapshotID {
-            try deleteEPGSnapshot(id: snapshotID)
-        }
-        let profileID = id
-        for mapping in try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>(
-            predicate: #Predicate { $0.sourceProfileID == profileID }
-        )) {
-            modelContext.delete(mapping)
-        }
-        modelContext.delete(record)
+        try commit(.profileDelete) {
+            let record = try profileRecord(id: id)
+            if let snapshotID = record.playlistSnapshotID {
+                try deletePlaylistSnapshot(id: snapshotID)
+            }
+            if let snapshotID = record.epgSnapshotID {
+                try deleteEPGSnapshot(id: snapshotID)
+            }
+            let profileID = id
+            for mapping in try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>(
+                predicate: #Predicate { $0.sourceProfileID == profileID }
+            )) {
+                modelContext.delete(mapping)
+            }
+            modelContext.delete(record)
 
-        let state = try requiredStateRecord()
-        if state.activeProfileID == id {
-            let remaining = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
-                .filter { $0.id != id }
-                .sorted(by: Self.profileOrder)
-            state.activeProfileID = remaining.first?.id
+            let state = try requiredStateRecord()
+            if state.activeProfileID == id {
+                let remaining = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
+                    .filter { $0.id != id }
+                    .sorted(by: Self.profileOrder)
+                state.activeProfileID = remaining.first?.id
+            }
         }
-        try modelContext.save()
     }
 
     public func setActiveProfile(id: UUID) throws {
-        _ = try profileRecord(id: id)
-        let state = try requiredStateRecord()
-        state.activeProfileID = id
-        try modelContext.save()
+        try commit(.activeProfile) {
+            _ = try profileRecord(id: id)
+            let state = try requiredStateRecord()
+            state.activeProfileID = id
+        }
     }
 
     public func channels(profileID: UUID) throws -> [Channel] {
@@ -146,22 +182,23 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         channelID: String,
         xmltvChannelID: String?
     ) throws {
-        _ = try profileRecord(id: profileID)
-        let existing = try mappingRecord(profileID: profileID, channelID: channelID)
-        if let xmltvChannelID {
-            if let existing {
-                existing.xmltvChannelID = xmltvChannelID
-            } else {
-                modelContext.insert(ManualEPGMappingRecord(
-                    sourceProfileID: profileID,
-                    channelID: channelID,
-                    xmltvChannelID: xmltvChannelID
-                ))
+        try commit(.manualMapping) {
+            _ = try profileRecord(id: profileID)
+            let existing = try mappingRecord(profileID: profileID, channelID: channelID)
+            if let xmltvChannelID {
+                if let existing {
+                    existing.xmltvChannelID = xmltvChannelID
+                } else {
+                    modelContext.insert(ManualEPGMappingRecord(
+                        sourceProfileID: profileID,
+                        channelID: channelID,
+                        xmltvChannelID: xmltvChannelID
+                    ))
+                }
+            } else if let existing {
+                modelContext.delete(existing)
             }
-        } else if let existing {
-            modelContext.delete(existing)
         }
-        try modelContext.save()
     }
 
     public func installPlaylist(
@@ -179,53 +216,54 @@ public actor SwiftDataLibraryStore: LibraryRepository {
 
         let snapshotID = UUID()
         do {
-            modelContext.insert(PlaylistSnapshotRecord(
-                id: snapshotID,
-                sourceProfileID: profileID,
-                fetchedAt: fetchedAt,
-                channelCount: channels.count
-            ))
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            for channel in channels {
-                modelContext.insert(ChannelRecord(
-                    snapshotID: snapshotID,
+            try commit(.playlistStaging) {
+                modelContext.insert(PlaylistSnapshotRecord(
+                    id: snapshotID,
                     sourceProfileID: profileID,
-                    stableID: channel.id,
-                    displayName: channel.displayName,
-                    streamURLString: channel.streamURL.absoluteString,
-                    tvgID: channel.tvgID,
-                    tvgName: channel.tvgName,
-                    logoURLString: channel.logoURL?.absoluteString,
-                    groupTitle: channel.groupTitle,
-                    attributesJSON: try encoder.encode(channel.attributes),
-                    order: channel.order
+                    fetchedAt: fetchedAt,
+                    channelCount: channels.count
                 ))
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                for channel in channels {
+                    modelContext.insert(ChannelRecord(
+                        snapshotID: snapshotID,
+                        sourceProfileID: profileID,
+                        stableID: channel.id,
+                        displayName: channel.displayName,
+                        streamURLString: channel.streamURL.absoluteString,
+                        tvgID: channel.tvgID,
+                        tvgName: channel.tvgName,
+                        logoURLString: channel.logoURL?.absoluteString,
+                        groupTitle: channel.groupTitle,
+                        attributesJSON: try encoder.encode(channel.attributes),
+                        order: channel.order
+                    ))
+                }
             }
-            try modelContext.save()
         } catch {
             let stagingError = error
-            modelContext.rollback()
-            try? removePlaylistStaging(id: snapshotID)
+            try? cleanupPlaylistSnapshot(id: snapshotID)
             throw stagingError
         }
 
         let oldSnapshotID: UUID?
         do {
-            let profile = try profileRecord(id: profileID)
-            oldSnapshotID = profile.playlistSnapshotID
-            profile.playlistSnapshotID = snapshotID
-            try modelContext.save()
+            var previousSnapshotID: UUID?
+            try commit(.playlistPointer) {
+                let profile = try profileRecord(id: profileID)
+                previousSnapshotID = profile.playlistSnapshotID
+                profile.playlistSnapshotID = snapshotID
+            }
+            oldSnapshotID = previousSnapshotID
         } catch {
             let pointerError = error
-            modelContext.rollback()
-            try? removePlaylistStaging(id: snapshotID)
+            try? cleanupPlaylistSnapshot(id: snapshotID)
             throw pointerError
         }
 
         if let oldSnapshotID, oldSnapshotID != snapshotID {
-            try deletePlaylistSnapshot(id: oldSnapshotID)
-            try modelContext.save()
+            try? cleanupPlaylistSnapshot(id: oldSnapshotID)
         }
     }
 
@@ -246,37 +284,42 @@ public actor SwiftDataLibraryStore: LibraryRepository {
                 programmeCount: 0
             )
             modelContext.insert(header)
-            let sink = EPGPersistenceSink(modelContext: modelContext, snapshotID: snapshotID)
+            let sink = EPGPersistenceSink(
+                modelContext: modelContext,
+                snapshotID: snapshotID,
+                saveBatch: { try self.save(.epgBatch) }
+            )
             summary = try XMLTVParser().parse(fileURL: fileURL, into: sink)
             guard summary.channelCount > 0 else {
                 throw LibraryRepositoryError.epgHasNoChannels
             }
             header.channelCount = summary.channelCount
             header.programmeCount = summary.programmeCount
-            try modelContext.save()
+            try save(.epgStaging)
         } catch {
             let stagingError = error
             modelContext.rollback()
-            try? removeEPGStaging(id: snapshotID)
+            try? cleanupEPGSnapshot(id: snapshotID)
             throw stagingError
         }
 
         let oldSnapshotID: UUID?
         do {
-            let profile = try profileRecord(id: profileID)
-            oldSnapshotID = profile.epgSnapshotID
-            profile.epgSnapshotID = snapshotID
-            try modelContext.save()
+            var previousSnapshotID: UUID?
+            try commit(.epgPointer) {
+                let profile = try profileRecord(id: profileID)
+                previousSnapshotID = profile.epgSnapshotID
+                profile.epgSnapshotID = snapshotID
+            }
+            oldSnapshotID = previousSnapshotID
         } catch {
             let pointerError = error
-            modelContext.rollback()
-            try? removeEPGStaging(id: snapshotID)
+            try? cleanupEPGSnapshot(id: snapshotID)
             throw pointerError
         }
 
         if let oldSnapshotID, oldSnapshotID != snapshotID {
-            try deleteEPGSnapshot(id: oldSnapshotID)
-            try modelContext.save()
+            try? cleanupEPGSnapshot(id: oldSnapshotID)
         }
         return summary
     }
@@ -286,19 +329,20 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         resource: RefreshResource,
         at: Date
     ) throws {
-        let profile = try profileRecord(id: profileID)
-        switch resource {
-        case .playlist:
-            profile.m3uLastAttemptAt = at
-            profile.m3uStateRaw = RefreshState.refreshing.rawValue
-            profile.m3uErrorSummary = nil
-        case .epg:
-            profile.epgLastAttemptAt = at
-            profile.epgStateRaw = RefreshState.refreshing.rawValue
-            profile.epgErrorSummary = nil
+        try commit(.status) {
+            let profile = try profileRecord(id: profileID)
+            switch resource {
+            case .playlist:
+                profile.m3uLastAttemptAt = at
+                profile.m3uStateRaw = RefreshState.refreshing.rawValue
+                profile.m3uErrorSummary = nil
+            case .epg:
+                profile.epgLastAttemptAt = at
+                profile.epgStateRaw = RefreshState.refreshing.rawValue
+                profile.epgErrorSummary = nil
+            }
+            profile.updatedAt = at
         }
-        profile.updatedAt = at
-        try modelContext.save()
     }
 
     public func recordSuccess(
@@ -306,19 +350,20 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         resource: RefreshResource,
         at: Date
     ) throws {
-        let profile = try profileRecord(id: profileID)
-        switch resource {
-        case .playlist:
-            profile.m3uLastSuccessAt = at
-            profile.m3uStateRaw = RefreshState.succeeded.rawValue
-            profile.m3uErrorSummary = nil
-        case .epg:
-            profile.epgLastSuccessAt = at
-            profile.epgStateRaw = RefreshState.succeeded.rawValue
-            profile.epgErrorSummary = nil
+        try commit(.status) {
+            let profile = try profileRecord(id: profileID)
+            switch resource {
+            case .playlist:
+                profile.m3uLastSuccessAt = at
+                profile.m3uStateRaw = RefreshState.succeeded.rawValue
+                profile.m3uErrorSummary = nil
+            case .epg:
+                profile.epgLastSuccessAt = at
+                profile.epgStateRaw = RefreshState.succeeded.rawValue
+                profile.epgErrorSummary = nil
+            }
+            profile.updatedAt = at
         }
-        profile.updatedAt = at
-        try modelContext.save()
     }
 
     public func recordFailure(
@@ -327,46 +372,48 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         summary: String,
         at: Date
     ) throws {
-        let profile = try profileRecord(id: profileID)
         let truncatedSummary = String(summary.prefix(240))
-        switch resource {
-        case .playlist:
-            profile.m3uStateRaw = RefreshState.failed.rawValue
-            profile.m3uErrorSummary = truncatedSummary
-        case .epg:
-            profile.epgStateRaw = RefreshState.failed.rawValue
-            profile.epgErrorSummary = truncatedSummary
+        try commit(.status) {
+            let profile = try profileRecord(id: profileID)
+            switch resource {
+            case .playlist:
+                profile.m3uStateRaw = RefreshState.failed.rawValue
+                profile.m3uErrorSummary = truncatedSummary
+            case .epg:
+                profile.epgStateRaw = RefreshState.failed.rawValue
+                profile.epgErrorSummary = truncatedSummary
+            }
+            profile.updatedAt = at
         }
-        profile.updatedAt = at
-        try modelContext.save()
     }
 
     public func purgeUnreferencedSnapshots() throws {
-        let profiles = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
-        let playlistIDs = Set(profiles.compactMap(\.playlistSnapshotID))
-        let epgIDs = Set(profiles.compactMap(\.epgSnapshotID))
+        try commit(.purge) {
+            let profiles = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
+            let playlistIDs = Set(profiles.compactMap(\.playlistSnapshotID))
+            let epgIDs = Set(profiles.compactMap(\.epgSnapshotID))
 
-        for record in try modelContext.fetch(FetchDescriptor<ChannelRecord>())
-        where !playlistIDs.contains(record.snapshotID) {
-            modelContext.delete(record)
+            for record in try modelContext.fetch(FetchDescriptor<ChannelRecord>())
+            where !playlistIDs.contains(record.snapshotID) {
+                modelContext.delete(record)
+            }
+            for record in try modelContext.fetch(FetchDescriptor<PlaylistSnapshotRecord>())
+            where !playlistIDs.contains(record.id) {
+                modelContext.delete(record)
+            }
+            for record in try modelContext.fetch(FetchDescriptor<EPGChannelRecord>())
+            where !epgIDs.contains(record.snapshotID) {
+                modelContext.delete(record)
+            }
+            for record in try modelContext.fetch(FetchDescriptor<ProgrammeRecord>())
+            where !epgIDs.contains(record.snapshotID) {
+                modelContext.delete(record)
+            }
+            for record in try modelContext.fetch(FetchDescriptor<EPGSnapshotRecord>())
+            where !epgIDs.contains(record.id) {
+                modelContext.delete(record)
+            }
         }
-        for record in try modelContext.fetch(FetchDescriptor<PlaylistSnapshotRecord>())
-        where !playlistIDs.contains(record.id) {
-            modelContext.delete(record)
-        }
-        for record in try modelContext.fetch(FetchDescriptor<EPGChannelRecord>())
-        where !epgIDs.contains(record.snapshotID) {
-            modelContext.delete(record)
-        }
-        for record in try modelContext.fetch(FetchDescriptor<ProgrammeRecord>())
-        where !epgIDs.contains(record.snapshotID) {
-            modelContext.delete(record)
-        }
-        for record in try modelContext.fetch(FetchDescriptor<EPGSnapshotRecord>())
-        where !epgIDs.contains(record.id) {
-            modelContext.delete(record)
-        }
-        try modelContext.save()
     }
 
     private func stateRecord() throws -> LibraryStateRecord? {
@@ -407,14 +454,39 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         )).first
     }
 
-    private func removePlaylistStaging(id: UUID) throws {
-        try deletePlaylistSnapshot(id: id)
-        try modelContext.save()
+    private func cleanupPlaylistSnapshot(id: UUID) throws {
+        try commit(.playlistCleanup) {
+            try deletePlaylistSnapshot(id: id)
+        }
     }
 
-    private func removeEPGStaging(id: UUID) throws {
-        try deleteEPGSnapshot(id: id)
-        try modelContext.save()
+    private func cleanupEPGSnapshot(id: UUID) throws {
+        try commit(.epgCleanup) {
+            try deleteEPGSnapshot(id: id)
+        }
+    }
+
+    private func commit(
+        _ phase: LibraryStoreSavePhase,
+        changes: () throws -> Void
+    ) throws {
+        do {
+            try changes()
+            try save(phase)
+        } catch {
+            modelContext.rollback()
+            throw error
+        }
+    }
+
+    private func save(_ phase: LibraryStoreSavePhase) throws {
+        do {
+            try saveFault?(phase)
+            try modelContext.save()
+        } catch {
+            modelContext.rollback()
+            throw error
+        }
     }
 
     private func deletePlaylistSnapshot(id: UUID) throws {
