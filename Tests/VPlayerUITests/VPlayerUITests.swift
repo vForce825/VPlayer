@@ -40,6 +40,7 @@ final class VPlayerUITests: XCTestCase {
         XCUIRemote.shared.press(.down)
         XCTAssertTrue(app.buttons["channel.udp"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
         XCUIRemote.shared.press(.select)
+        XCTAssertTrue(app.alerts["无法播放"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.alerts.staticTexts["首版暂不支持组播地址"].waitForExistence(timeout: 3))
         XCTAssertFalse(app.otherElements["playback.placeholder"].exists)
         XCUIRemote.shared.press(.select)
@@ -59,7 +60,6 @@ final class VPlayerUITests: XCTestCase {
     private func launchSeededApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = [
-            "-ui-testing",
             "-ui-fixture", "seeded",
             "-uiTestResetPlaybackSettings"
         ]

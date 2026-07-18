@@ -12,7 +12,8 @@ struct RootView: View {
         self.dependencies = dependencies
         _model = State(initialValue: AppModel(
             repository: dependencies.repository,
-            refresh: dependencies.refresh
+            refresh: dependencies.refresh,
+            libraryChanges: dependencies.libraryChanges
         ))
     }
 
@@ -40,7 +41,7 @@ struct RootView: View {
             guard !Task.isCancelled else { return }
             await model.reload()
         }
-        .alert("无法播放", isPresented: Binding(
+        .alert(model.alertTitle, isPresented: Binding(
             get: { model.alertMessage != nil },
             set: { isPresented in
                 if !isPresented {

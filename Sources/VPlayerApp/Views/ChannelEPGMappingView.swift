@@ -22,24 +22,35 @@ struct ChannelEPGMappingView: View {
     var body: some View {
         NavigationStack {
             List {
-                Button {
-                    selection = nil
-                } label: {
-                    mappingLabel(title: "清除手动映射", selected: selection == nil)
-                }
-                .accessibilityIdentifier("mapping.clear")
-
-                ForEach(model.epgChannels) { epgChannel in
+                if model.manualEPGChannelID(for: channel) != nil {
                     Button {
-                        selection = epgChannel.id
+                        selection = nil
                     } label: {
-                        mappingLabel(
-                            title: epgChannel.displayNames.first ?? epgChannel.id,
-                            subtitle: epgChannel.id,
-                            selected: selection == epgChannel.id
-                        )
+                        mappingLabel(title: "清除手动映射", selected: selection == nil)
                     }
-                    .accessibilityIdentifier("mapping.\(epgChannel.id)")
+                    .accessibilityIdentifier("mapping.clear")
+                }
+
+                if model.epgChannels.isEmpty {
+                    ContentUnavailableView(
+                        "没有可用的 EPG 频道",
+                        systemImage: "list.bullet.rectangle",
+                        description: Text("请先刷新当前数据源的 EPG。")
+                    )
+                    .accessibilityIdentifier("mapping.empty")
+                } else {
+                    ForEach(model.epgChannels) { epgChannel in
+                        Button {
+                            selection = epgChannel.id
+                        } label: {
+                            mappingLabel(
+                                title: epgChannel.displayNames.first ?? epgChannel.id,
+                                subtitle: epgChannel.id,
+                                selected: selection == epgChannel.id
+                            )
+                        }
+                        .accessibilityIdentifier("mapping.\(epgChannel.id)")
+                    }
                 }
             }
             .navigationTitle("为“\(channel.displayName)”设置 EPG")

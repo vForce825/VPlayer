@@ -66,6 +66,7 @@ struct AppDependencies {
     let refresh: Refresh
     let prepare: Prepare
     let playbackSettings: PlaybackSettingsStore
+    let libraryChanges: LibraryChangeSignal
     let libraryStartup: LibraryStartup
     let foregroundRefreshDriver: ForegroundRefreshDriver
     let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
@@ -79,12 +80,14 @@ struct AppDependencies {
             resources.map { RefreshOutcome(resource: $0, succeeded: false, message: nil) }
         },
         prepare: @escaping Prepare = {},
-        playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore()
+        playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore(),
+        libraryChanges: LibraryChangeSignal = LibraryChangeSignal()
     ) {
         self.repository = repository
         self.refresh = refresh
         self.prepare = prepare
         self.playbackSettings = playbackSettings
+        self.libraryChanges = libraryChanges
         self.libraryStartup = libraryStartup
         self.foregroundRefreshDriver = foregroundRefreshDriver
         self.backgroundRefreshRegistrar = backgroundRefreshRegistrar
@@ -149,6 +152,8 @@ struct AppDependencies {
             let repository = SwiftDataLibraryStore(modelContainer: container)
             let seeder = SeededLibrarySeeder(repository: repository)
             let refresh = fixtureRefresh(repository: repository)
+            let libraryChanges = LibraryChangeSignal()
+            let lifecycleRefresh = notifyingRefresh(refresh, libraryChanges: libraryChanges)
             let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
                 try await repository.profiles()
             }
@@ -158,20 +163,21 @@ struct AppDependencies {
                 },
                 foregroundRefreshDriver: ForegroundRefreshDriver(
                     loadProfiles: loadProfiles,
-                    refresh: refresh,
+                    refresh: lifecycleRefresh,
                     reportStatus: { _ in }
                 ),
                 backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
                     scheduler: InertBackgroundRefreshScheduler(),
                     loadProfiles: loadProfiles,
-                    refresh: refresh,
+                    refresh: lifecycleRefresh,
                     reportStatus: { _ in }
                 ),
                 repository: repository,
                 refresh: refresh,
                 prepare: {
                     await seeder.seed()
-                }
+                },
+                libraryChanges: libraryChanges
             )
         } catch {
             let repository = UnavailableLibraryRepository()
@@ -213,6 +219,8 @@ struct AppDependencies {
         refresh: @escaping Refresh,
         libraryStartup: LibraryStartup
     ) -> Self {
+        let libraryChanges = LibraryChangeSignal()
+        let lifecycleRefresh = notifyingRefresh(refresh, libraryChanges: libraryChanges)
         let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
             try await repository.profiles()
         }
@@ -220,17 +228,33 @@ struct AppDependencies {
             libraryStartup: libraryStartup,
             foregroundRefreshDriver: ForegroundRefreshDriver(
                 loadProfiles: loadProfiles,
-                refresh: refresh,
+                refresh: lifecycleRefresh,
                 reportStatus: { _ in }
             ),
             backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
                 loadProfiles: loadProfiles,
-                refresh: refresh,
+                refresh: lifecycleRefresh,
                 reportStatus: { _ in }
             ),
             repository: repository,
-            refresh: refresh
+            refresh: refresh,
+            libraryChanges: libraryChanges
         )
+    }
+
+    static func notifyingRefresh(
+        _ refresh: @escaping Refresh,
+        libraryChanges: LibraryChangeSignal
+    ) -> Refresh {
+        { profileID, resources, trigger in
+            let outcomes = await refresh(profileID, resources, trigger)
+            if !outcomes.isEmpty {
+                await MainActor.run {
+                    libraryChanges.notify()
+                }
+            }
+            return outcomes
+        }
     }
 
     private static func fixtureRefresh(

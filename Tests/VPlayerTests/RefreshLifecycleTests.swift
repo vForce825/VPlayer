@@ -134,7 +134,8 @@ final class RefreshLifecycleTests: XCTestCase {
         try scheduler.launch(task)
         await probe.waitUntilRefreshed()
         task.expire()
-        await probe.waitUntilCancelled()
+        let observedCancellation = await probe.waitUntilCancelled()
+        XCTAssertTrue(observedCancellation, "Timed out waiting for cancelled background work")
         await eventually { task.completions.count == 1 }
         await Task.yield()
 
@@ -399,12 +400,13 @@ private actor BackgroundWorkProbe {
         }
     }
 
-    func waitUntilCancelled() async {
-        guard suspendRefresh else { return }
-        for _ in 0..<1_000 {
-            if cancellationCount > 0 { return }
-            await Task.yield()
+    func waitUntilCancelled() async -> Bool {
+        guard suspendRefresh else { return true }
+        for _ in 0..<100 {
+            if cancellationCount > 0 { return true }
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        return cancellationCount > 0
     }
 }
 

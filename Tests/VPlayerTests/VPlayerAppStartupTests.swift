@@ -7,6 +7,35 @@ import XCTest
 
 @MainActor
 final class VPlayerAppStartupTests: XCTestCase {
+    func testLaunchArgumentsSelectOnlyTheExactSeededFixturePair() {
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: ["VPlayer", "-ui-fixture", "seeded"]).mode,
+            .seededFixture
+        )
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: ["VPlayer", "-ui-testing"]).mode,
+            .live
+        )
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: ["VPlayer", "-ui-fixture"]).mode,
+            .live
+        )
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: ["VPlayer", "-ui-fixture", "unknown"]).mode,
+            .live
+        )
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: [
+                "VPlayer", "-ui-fixture", "unknown", "-ui-fixture", "seeded",
+            ]).mode,
+            .live
+        )
+        XCTAssertTrue(
+            AppLaunchConfiguration(arguments: ["VPlayer", "-uiTestResetPlaybackSettings"])
+                .resetsPlaybackSettings
+        )
+    }
+
     func testProductionAppStartupPurgesLibrarySnapshotsOnceAfterRepeatedStartRequests() async {
         let probe = StartupMaintenanceProbe()
         let dependencies = makeDependencies(maintenance: probe)
