@@ -128,6 +128,263 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testEmptyManualRefreshOutcomeSynthesizesGenericFailureOverlay() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, _, _ in
+                try? await repository.recordAttempt(
+                    profileID: profileID,
+                    resource: .playlist,
+                    at: now
+                )
+                return []
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        _ = await model.reload()
+
+        let repositorySnapshot = await repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新未完成，请稍后重试。")
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
+    }
+
+    func testWrongResourceManualRefreshOutcomeSynthesizesRequestedResourceFailureOverlay() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, _, _ in
+                try? await repository.recordAttempt(
+                    profileID: profileID,
+                    resource: .playlist,
+                    at: now
+                )
+                return [RefreshOutcome(resource: .epg, succeeded: true, message: nil)]
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新未完成，请稍后重试。")
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .never)
+    }
+
+    func testOlderManualRefreshFailureCannotOverrideBlockedNewerAttempt() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: now
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        let older = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+        let newer = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 2)
+
+        await gate.release(resource: .playlist, ordinal: 1, result: .failure("older failure"))
+        await older.value
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+
+        await gate.release(resource: .playlist, ordinal: 2, result: .success)
+        await newer.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+
+        try await repository.recordFailure(
+            profileID: profile.id,
+            resource: .playlist,
+            summary: "later terminal truth",
+            at: now.addingTimeInterval(60)
+        )
+        _ = await model.reload()
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "later terminal truth")
+    }
+
+    func testCancelledOlderManualRefreshCannotOverrideBlockedNewerAttempt() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: now
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        let older = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+        let newer = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 2)
+
+        older.cancel()
+        await gate.release(resource: .playlist, ordinal: 1, result: .cancellation)
+        await older.value
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+
+        await gate.release(resource: .playlist, ordinal: 2, result: .success)
+        await newer.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+    }
+
+    func testOlderEmptyAndWrongResourceResultsCannotOverrideNewerAttempts() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: now
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        for (resource, staleResult) in [
+            (RefreshResource.playlist, AppModelConcurrentRefreshGate.Result.empty),
+            (RefreshResource.epg, AppModelConcurrentRefreshGate.Result.wrongResource),
+        ] {
+            let older = Task { await model.refresh(profileID: profile.id, resource: resource) }
+            await gate.waitUntilStarted(resource: resource, ordinal: 1)
+            let newer = Task { await model.refresh(profileID: profile.id, resource: resource) }
+            await gate.waitUntilStarted(resource: resource, ordinal: 2)
+
+            await gate.release(resource: resource, ordinal: 1, result: staleResult)
+            await older.value
+            _ = await model.reload()
+
+            let state = resource == .playlist
+                ? model.profiles.first?.m3uStatus.state
+                : model.profiles.first?.epgStatus.state
+            XCTAssertEqual(state, .refreshing)
+
+            await gate.release(resource: resource, ordinal: 2, result: .success)
+            await newer.value
+        }
+    }
+
+    func testProfileDisappearanceRevokesSuspendedManualRefreshAttempt() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: now
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        let suspended = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+        try await repository.deleteProfile(id: profile.id)
+        _ = await model.reload()
+
+        var reappeared = profile
+        reappeared.m3uStatus = ResourceRefreshStatus(lastAttemptAt: now, state: .refreshing)
+        await repository.replaceProfiles([reappeared], activeProfileID: profile.id)
+        _ = await model.reload()
+
+        await gate.release(resource: .playlist, ordinal: 1, result: .failure("revoked failure"))
+        await suspended.value
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+    }
+
+    func testManualRefreshAttemptGenerationsAreIndependentAcrossResources() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: now
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        let oldPlaylist = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+        let epg = Task { await model.refresh(profileID: profile.id, resource: .epg) }
+        await gate.waitUntilStarted(resource: .epg, ordinal: 1)
+        let newPlaylist = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 2)
+
+        await gate.release(resource: .epg, ordinal: 1, result: .failure("epg failure"))
+        await epg.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .failed)
+
+        await gate.release(resource: .playlist, ordinal: 1, result: .failure("old playlist failure"))
+        await oldPlaylist.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .failed)
+
+        await gate.release(resource: .playlist, ordinal: 2, result: .success)
+        await newPlaylist.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .failed)
+    }
+
     func testManualRefreshKeepsReturnedFailureTerminalWhenFailurePersistenceFails() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
@@ -1104,6 +1361,93 @@ private actor AppModelManualRefreshGate {
     func releaseSecondAttempt() {
         secondAttemptRelease?.resume()
         secondAttemptRelease = nil
+    }
+}
+
+private actor AppModelConcurrentRefreshGate {
+    enum Result: Sendable {
+        case success
+        case failure(String)
+        case cancellation
+        case empty
+        case wrongResource
+    }
+
+    private struct Key: Hashable, Sendable {
+        let resource: RefreshResource
+        let ordinal: Int
+    }
+
+    private var invocationCounts: [RefreshResource: Int] = [:]
+    private var started: Set<Key> = []
+    private var startWaiters: [Key: [CheckedContinuation<Void, Never>]] = [:]
+    private var resultWaiters: [Key: CheckedContinuation<Result, Never>] = [:]
+    private var pendingResults: [Key: Result] = [:]
+
+    func outcomes(
+        repository: RepositorySpy,
+        profileID: UUID,
+        resources: Set<RefreshResource>,
+        now: Date
+    ) async -> [RefreshOutcome] {
+        guard let resource = resources.first else { return [] }
+        let ordinal = invocationCounts[resource, default: 0] + 1
+        invocationCounts[resource] = ordinal
+        let key = Key(resource: resource, ordinal: ordinal)
+        let attemptAt = now.addingTimeInterval(TimeInterval(ordinal))
+        try? await repository.recordAttempt(
+            profileID: profileID,
+            resource: resource,
+            at: attemptAt
+        )
+
+        started.insert(key)
+        for waiter in startWaiters.removeValue(forKey: key) ?? [] {
+            waiter.resume()
+        }
+        let result = await withCheckedContinuation { continuation in
+            if let pendingResult = pendingResults.removeValue(forKey: key) {
+                continuation.resume(returning: pendingResult)
+            } else {
+                resultWaiters[key] = continuation
+            }
+        }
+
+        switch result {
+        case .success:
+            try? await repository.recordSuccess(
+                profileID: profileID,
+                resource: resource,
+                at: attemptAt
+            )
+            return [RefreshOutcome(resource: resource, succeeded: true, message: nil)]
+        case let .failure(message):
+            return [RefreshOutcome(resource: resource, succeeded: false, message: message)]
+        case .cancellation:
+            return [RefreshOutcome(resource: resource, succeeded: false, message: "刷新已取消。")]
+        case .empty:
+            return []
+        case .wrongResource:
+            let wrongResource: RefreshResource = resource == .playlist ? .epg : .playlist
+            return [RefreshOutcome(resource: wrongResource, succeeded: true, message: nil)]
+        }
+    }
+
+    func waitUntilStarted(resource: RefreshResource, ordinal: Int) async {
+        let key = Key(resource: resource, ordinal: ordinal)
+        guard !started.contains(key) else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters[key, default: []].append(continuation)
+        }
+    }
+
+    func release(resource: RefreshResource, ordinal: Int, result: Result) {
+        let key = Key(resource: resource, ordinal: ordinal)
+        if let waiter = resultWaiters.removeValue(forKey: key) {
+            waiter.resume(returning: result)
+        } else {
+            pendingResults[key] = result
+        }
     }
 }
 

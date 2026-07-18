@@ -39,6 +39,7 @@ final class AppModel {
     private var activeCreationAttemptIDs: Set<UUID> = []
     private var cancelledCreationAttemptIDs: Set<UUID> = []
     private var terminalRefreshOverlays: [RefreshKey: TerminalRefreshOverlay] = [:]
+    private var manualRefreshAttemptIDs: [RefreshKey: UUID] = [:]
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private var alertKind = AlertKind.operation
 
@@ -292,9 +293,17 @@ final class AppModel {
     }
 
     func refresh(profileID: UUID, resource: RefreshResource) async {
+        let key = RefreshKey(profileID: profileID, resource: resource)
+        let attemptID = UUID()
+        manualRefreshAttemptIDs[key] = attemptID
         markRefreshing(profileID: profileID, resource: resource)
         let outcomes = await refreshResources(profileID, [resource], .manual)
-        let outcome = outcomes.first { $0.resource == resource }
+        guard manualRefreshAttemptIDs[key] == attemptID else { return }
+        let outcome = outcomes.first { $0.resource == resource } ?? RefreshOutcome(
+            resource: resource,
+            succeeded: false,
+            message: "刷新未完成，请稍后重试。"
+        )
         let completedAt = now()
         reconcileRefreshOutcome(
             profileID: profileID,
@@ -302,10 +311,11 @@ final class AppModel {
             outcome: outcome,
             completedAt: completedAt
         )
-        if let outcome {
-            terminalRefreshOverlays[RefreshKey(profileID: profileID, resource: resource)] =
-                TerminalRefreshOverlay(outcome: outcome, completedAt: completedAt)
-        }
+        terminalRefreshOverlays[key] = TerminalRefreshOverlay(
+            outcome: outcome,
+            completedAt: completedAt
+        )
+        manualRefreshAttemptIDs[key] = nil
         guard !Task.isCancelled else { return }
         _ = await reload()
     }
@@ -393,6 +403,7 @@ final class AppModel {
     ) -> Bool {
         guard reloadID == currentReloadID else { return false }
         var profiles = profiles
+        invalidateManualRefreshAttempts(missingFrom: profiles)
         reconcileTerminalRefreshOverlays(in: &profiles)
         self.profiles = profiles
         if let activeProfile,
@@ -523,7 +534,7 @@ final class AppModel {
     private func reconcileRefreshOutcome(
         profileID: UUID,
         resource: RefreshResource,
-        outcome: RefreshOutcome?,
+        outcome: RefreshOutcome,
         completedAt: Date
     ) {
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
@@ -579,17 +590,25 @@ final class AppModel {
     }
 
     private static func applyRefreshOutcome(
-        _ outcome: RefreshOutcome?,
+        _ outcome: RefreshOutcome,
         completedAt: Date,
         to status: inout ResourceRefreshStatus
     ) {
-        if outcome?.succeeded == true {
+        if outcome.succeeded {
             status.lastSuccessAt = completedAt
             status.state = .succeeded
             status.errorSummary = nil
         } else {
             status.state = .failed
-            status.errorSummary = outcome?.message ?? "刷新未完成，请稍后重试。"
+            status.errorSummary = outcome.message ?? "刷新未完成，请稍后重试。"
+        }
+    }
+
+    private func invalidateManualRefreshAttempts(missingFrom profiles: [SourceProfile]) {
+        let loadedProfileIDs = Set(profiles.map(\.id))
+        for key in Array(manualRefreshAttemptIDs.keys)
+        where !loadedProfileIDs.contains(key.profileID) {
+            manualRefreshAttemptIDs[key] = nil
         }
     }
 
