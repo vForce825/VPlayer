@@ -112,6 +112,21 @@ final class XMLTVParserTests: XCTestCase {
         XCTAssertTrue(sink.programmes.isEmpty)
     }
 
+    func testPreservesProgrammeSinkError() throws {
+        let xml = """
+            <tv><programme channel="one" start="20260718150000 Z" stop="20260718160000 Z">
+              <title>Sink failure</title>
+            </programme></tv>
+            """
+        let sink = ProgrammeFailingXMLTVSink()
+
+        try withTemporaryXML(xml) {
+            XCTAssertThrowsError(try XMLTVParser().parse(fileURL: $0, into: sink)) {
+                XCTAssertEqual($0 as? XMLTVTimeError, .invalid("programme sink failure"))
+            }
+        }
+    }
+
     func testPreservesBuiltInEntityTextWithoutTreatingItAsADeclaration() throws {
         let xml = """
             <tv><programme channel="one" start="20260718150000 Z" stop="20260718160000 Z">
@@ -156,5 +171,13 @@ private final class CollectingXMLTVSink: XMLTVEventSink {
 
     func accept(programme: Programme) throws {
         programmes.append(programme)
+    }
+}
+
+private final class ProgrammeFailingXMLTVSink: XMLTVEventSink {
+    func accept(channel: EPGChannel) throws {}
+
+    func accept(programme: Programme) throws {
+        throw XMLTVTimeError.invalid("programme sink failure")
     }
 }

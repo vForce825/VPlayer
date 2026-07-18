@@ -270,6 +270,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
             return
         }
         self.programme = nil
+        let emittedProgramme: Programme
         do {
             guard let channelID = nonEmpty(programme.channelID),
                   let rawStart = programme.rawStart,
@@ -286,7 +287,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
             let digest = SHA256.hash(data: Data(identity.utf8))
             let id = digest.map { String(format: "%02x", $0) }.joined()
             _ = programme.iconURL
-            try sink.accept(programme: Programme(
+            emittedProgramme = Programme(
                 id: id,
                 xmltvChannelID: channelID,
                 start: start,
@@ -295,12 +296,21 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
                 subtitle: programme.subtitle,
                 summary: programme.summary,
                 categories: programme.categories
-            ))
-            programmeCount += 1
+            )
         } catch let error as XMLTVParserError {
             fail(error, parser: parser)
+            return
         } catch is XMLTVTimeError {
             fail(XMLTVParserError.invalidProgramme, parser: parser)
+            return
+        } catch {
+            fail(error, parser: parser)
+            return
+        }
+
+        do {
+            try sink.accept(programme: emittedProgramme)
+            programmeCount += 1
         } catch {
             fail(error, parser: parser)
         }
