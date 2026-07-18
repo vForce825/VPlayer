@@ -65,6 +65,7 @@ final class ForegroundRefreshDriver {
                 } catch is CancellationError {
                     return
                 } catch {
+                    guard !Task.isCancelled else { return }
                     reportStatus(Self.sanitizedProfileLoadError(error))
                 }
 

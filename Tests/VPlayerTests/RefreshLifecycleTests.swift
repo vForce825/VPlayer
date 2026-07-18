@@ -38,6 +38,36 @@ final class RefreshLifecycleTests: XCTestCase {
         XCTAssertEqual(cancellationCount, 2)
     }
 
+    func testForegroundReplacementDoesNotReportLoadErrorFromCancelledLoop() async {
+        let loadGate = ForegroundLoadFailureGate()
+        var reportedStatuses: [String] = []
+        let driver = ForegroundRefreshDriver(
+            loadProfiles: {
+                try await loadGate.load()
+            },
+            refresh: { _, _, _ in [] },
+            sleep: {
+                try await Task.sleep(for: .seconds(3_600))
+            },
+            reportStatus: { message in
+                reportedStatuses.append(message)
+            }
+        )
+
+        driver.activate()
+        await loadGate.waitForLoadCount(1)
+        driver.activate()
+        await loadGate.waitForLoadCount(2)
+        await loadGate.failFirstLoad()
+        await loadGate.waitUntilFirstLoadReturned()
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        driver.deactivate()
+
+        XCTAssertEqual(reportedStatuses, [])
+    }
+
     func testBackgroundRegistrationIsIdempotentAndSchedulesBeforeRefreshing() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(now: now)
@@ -113,6 +143,98 @@ final class RefreshLifecycleTests: XCTestCase {
         XCTAssertEqual(task.completions, [false])
     }
 
+    func testSystemExpirationBeforeMainActorLaunchCompletesFalseWithoutStartingWork() async throws {
+        let scheduler = BackgroundSchedulerSpy()
+        let loadProbe = BackgroundLoadProbe()
+        var completions: [Bool] = []
+        let bridge = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { success in
+                completions.append(success)
+            }
+        )
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: {
+                await loadProbe.recordLoad()
+                return []
+            },
+            refresh: { _, _, _ in [] },
+            reportStatus: { _ in }
+        )
+
+        registrar.register()
+        await Task.detached {
+            bridge.systemDidExpire()
+            bridge.systemDidExpire()
+        }.value
+        try scheduler.launch(bridge)
+        await eventually { completions.count == 1 }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+
+        let loadCount = await loadProbe.loadCount
+        XCTAssertEqual(loadCount, 0)
+        XCTAssertEqual(completions, [false])
+    }
+
+    func testSystemExpirationRacingSuccessCompletesFalseExactlyOnce() async {
+        var expirationCount = 0
+        var completions: [Bool] = []
+        let bridge = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { success in
+                completions.append(success)
+            }
+        )
+        bridge.setExpirationHandler {
+            expirationCount += 1
+        }
+
+        await Task.detached {
+            bridge.systemDidExpire()
+            bridge.systemDidExpire()
+        }.value
+        bridge.setTaskCompleted(success: true)
+        await eventually { expirationCount == 1 }
+        bridge.setTaskCompleted(success: false)
+
+        XCTAssertEqual(expirationCount, 1)
+        XCTAssertEqual(completions, [false])
+    }
+
+    func testSystemBridgeOrdinarySuccessCompletesOnceAndReleasesOwnership() async throws {
+        let scheduler = BackgroundSchedulerSpy()
+        var clearCount = 0
+        var completions: [Bool] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { [] },
+            refresh: { _, _, _ in [] },
+            reportStatus: { _ in }
+        )
+        var bridge: SystemBackgroundRefreshTaskBridge? = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {
+                clearCount += 1
+            },
+            completeSystemTask: { success in
+                completions.append(success)
+            }
+        )
+        weak let weakBridge = bridge
+
+        registrar.register()
+        try scheduler.launch(bridge!)
+        await eventually { completions.count == 1 }
+        bridge = nil
+        await eventually { weakBridge == nil }
+
+        XCTAssertEqual(clearCount, 1)
+        XCTAssertEqual(completions, [true])
+        XCTAssertNil(weakBridge)
+    }
+
     private func makeProfile(now: Date) -> SourceProfile {
         SourceProfile(
             id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
@@ -168,6 +290,45 @@ private actor ForegroundLoopProbe {
     }
 }
 
+private actor ForegroundLoadFailureGate {
+    private var loadCount = 0
+    private var firstLoadContinuation: CheckedContinuation<[SourceProfile], any Error>?
+    private var firstLoadReturned = false
+
+    func load() async throws -> [SourceProfile] {
+        loadCount += 1
+        guard loadCount == 1 else { return [] }
+
+        do {
+            return try await withCheckedThrowingContinuation { continuation in
+                firstLoadContinuation = continuation
+            }
+        } catch {
+            firstLoadReturned = true
+            throw error
+        }
+    }
+
+    func failFirstLoad() {
+        firstLoadContinuation?.resume(throwing: LifecycleTestError.loadFailed)
+        firstLoadContinuation = nil
+    }
+
+    func waitForLoadCount(_ expected: Int) async {
+        for _ in 0..<1_000 {
+            if loadCount >= expected { return }
+            await Task.yield()
+        }
+    }
+
+    func waitUntilFirstLoadReturned() async {
+        for _ in 0..<1_000 {
+            if firstLoadReturned { return }
+            await Task.yield()
+        }
+    }
+}
+
 private actor BackgroundWorkProbe {
     private(set) var resources: Set<RefreshResource> = []
     private(set) var trigger: RefreshTrigger?
@@ -200,6 +361,14 @@ private actor BackgroundWorkProbe {
             if cancellationCount > 0 { return }
             await Task.yield()
         }
+    }
+}
+
+private actor BackgroundLoadProbe {
+    private(set) var loadCount = 0
+
+    func recordLoad() {
+        loadCount += 1
     }
 }
 
@@ -265,4 +434,5 @@ private final class BackgroundTaskSpy: BackgroundRefreshTask {
 
 private enum LifecycleTestError: Error {
     case notRegistered
+    case loadFailed
 }

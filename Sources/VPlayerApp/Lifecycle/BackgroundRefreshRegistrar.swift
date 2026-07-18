@@ -6,11 +6,10 @@
 import Foundation
 import VPlayerCore
 
-@MainActor
-protocol BackgroundRefreshTask: AnyObject {
-    func setExpirationHandler(_ handler: @escaping @MainActor @Sendable () -> Void)
-    func clearExpirationHandler()
-    func setTaskCompleted(success: Bool)
+protocol BackgroundRefreshTask: AnyObject, Sendable {
+    @MainActor func setExpirationHandler(_ handler: @escaping @MainActor @Sendable () -> Void)
+    @MainActor func clearExpirationHandler()
+    @MainActor func setTaskCompleted(success: Bool)
 }
 
 @MainActor
@@ -190,6 +189,7 @@ private final class BackgroundRefreshExecution {
     }
 
     func start(work: @escaping @Sendable () async -> Bool) {
+        guard !isCompleted else { return }
         workTask = Task { @MainActor [weak self] in
             let succeeded = await work()
             guard let self else { return }
@@ -222,8 +222,19 @@ private final class SystemBackgroundRefreshScheduler: BackgroundRefreshSchedulin
                 return
             }
             let taskBox = UncheckedSendableBox(appRefreshTask)
+            let taskBridge = SystemBackgroundRefreshTaskBridge(
+                clearSystemExpirationHandler: {
+                    taskBox.value.expirationHandler = nil
+                },
+                completeSystemTask: { success in
+                    taskBox.value.setTaskCompleted(success: success)
+                }
+            )
+            appRefreshTask.expirationHandler = { [weak taskBridge] in
+                taskBridge?.systemDidExpire()
+            }
             Task { @MainActor in
-                handler(SystemBackgroundRefreshTask(task: taskBox.value))
+                handler(taskBridge)
             }
         }
     }
@@ -239,28 +250,101 @@ private final class SystemBackgroundRefreshScheduler: BackgroundRefreshSchedulin
     }
 }
 
-@MainActor
-private final class SystemBackgroundRefreshTask: BackgroundRefreshTask {
-    private let task: BGAppRefreshTask
+final class SystemBackgroundRefreshTaskBridge: BackgroundRefreshTask, @unchecked Sendable {
+    typealias MainActorAction = @MainActor @Sendable () -> Void
+    typealias CompleteSystemTask = @MainActor @Sendable (Bool) -> Void
 
-    init(task: BGAppRefreshTask) {
-        self.task = task
+    private struct State {
+        var didSystemExpire = false
+        var didDeliverExpiration = false
+        var didClearSystemExpirationHandler = false
+        var didComplete = false
+        var expirationHandler: MainActorAction?
     }
 
-    func setExpirationHandler(_ handler: @escaping @MainActor @Sendable () -> Void) {
-        task.expirationHandler = {
-            Task { @MainActor in
-                handler()
+    private let lock = NSLock()
+    private var state = State()
+    private let clearSystemExpirationHandler: MainActorAction
+    private let completeSystemTask: CompleteSystemTask
+
+    init(
+        clearSystemExpirationHandler: @escaping MainActorAction,
+        completeSystemTask: @escaping CompleteSystemTask
+    ) {
+        self.clearSystemExpirationHandler = clearSystemExpirationHandler
+        self.completeSystemTask = completeSystemTask
+    }
+
+    nonisolated func systemDidExpire() {
+        let handler: MainActorAction? = withLock { state in
+            guard !state.didSystemExpire else { return nil }
+            state.didSystemExpire = true
+            guard
+                !state.didComplete,
+                !state.didDeliverExpiration,
+                let handler = state.expirationHandler
+            else {
+                return nil
             }
+            state.didDeliverExpiration = true
+            return handler
+        }
+
+        guard let handler else { return }
+        Task { @MainActor in
+            handler()
         }
     }
 
-    func clearExpirationHandler() {
-        task.expirationHandler = nil
+    @MainActor
+    func setExpirationHandler(_ handler: @escaping MainActorAction) {
+        let pendingHandler: MainActorAction? = withLock { state in
+            guard !state.didComplete else { return nil }
+            state.expirationHandler = handler
+            guard state.didSystemExpire, !state.didDeliverExpiration else {
+                return nil
+            }
+            state.didDeliverExpiration = true
+            return handler
+        }
+
+        pendingHandler?()
     }
 
+    @MainActor
+    func clearExpirationHandler() {
+        let shouldClear = withLock { state in
+            state.expirationHandler = nil
+            guard !state.didClearSystemExpirationHandler else { return false }
+            state.didClearSystemExpirationHandler = true
+            return true
+        }
+
+        if shouldClear {
+            clearSystemExpirationHandler()
+        }
+    }
+
+    @MainActor
     func setTaskCompleted(success: Bool) {
-        task.setTaskCompleted(success: success)
+        let completion = withLock { state -> Bool? in
+            guard !state.didComplete else { return nil }
+            state.didComplete = true
+            state.expirationHandler = nil
+            return success && !state.didSystemExpire
+        }
+
+        if let completion {
+            completeSystemTask(completion)
+        }
+    }
+
+    private nonisolated func withLock<Result>(
+        _ body: (inout State) -> Result
+    ) -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&state)
     }
 }
 
