@@ -72,6 +72,149 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
     }
 
+    func testConditionalManualMappingRejectsInactiveProfile() async throws {
+        let (_, store) = try makeStore()
+        _ = try await store.createProfile(input(name: "Active"), now: date(10))
+        let inactive = try await store.createProfile(input(name: "Inactive"), now: date(20))
+        let inactiveChannel = channel(profileID: inactive.id, name: "Inactive", path: "inactive")
+        try await store.installPlaylist(
+            profileID: inactive.id,
+            channels: [inactiveChannel],
+            fetchedAt: date(30)
+        )
+
+        let persisted = try await store.setManualMappingIfCurrentChannel(
+            profileID: inactive.id,
+            channelID: inactiveChannel.id,
+            xmltvChannelID: "inactive-epg"
+        )
+        let mapping = try await store.manualMapping(
+            profileID: inactive.id,
+            channelID: inactiveChannel.id
+        )
+
+        XCTAssertFalse(persisted)
+        XCTAssertNil(mapping)
+    }
+
+    func testConditionalManualMappingRejectsAbsentAndOldSnapshotChannels() async throws {
+        let (_, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        let oldChannel = channel(profileID: profile.id, name: "Old", path: "old")
+        let currentChannel = channel(profileID: profile.id, name: "Current", path: "current")
+        try await store.installPlaylist(
+            profileID: profile.id,
+            channels: [oldChannel],
+            fetchedAt: date(20)
+        )
+        try await store.installPlaylist(
+            profileID: profile.id,
+            channels: [currentChannel],
+            fetchedAt: date(30)
+        )
+
+        let oldPersisted = try await store.setManualMappingIfCurrentChannel(
+            profileID: profile.id,
+            channelID: oldChannel.id,
+            xmltvChannelID: "old-epg"
+        )
+        let absentPersisted = try await store.setManualMappingIfCurrentChannel(
+            profileID: profile.id,
+            channelID: "missing-channel",
+            xmltvChannelID: "missing-epg"
+        )
+        let oldMapping = try await store.manualMapping(
+            profileID: profile.id,
+            channelID: oldChannel.id
+        )
+        let absentMapping = try await store.manualMapping(
+            profileID: profile.id,
+            channelID: "missing-channel"
+        )
+
+        XCTAssertFalse(oldPersisted)
+        XCTAssertFalse(absentPersisted)
+        XCTAssertNil(oldMapping)
+        XCTAssertNil(absentMapping)
+    }
+
+    func testConditionalManualMappingSetsAndClearsCurrentChannel() async throws {
+        let (_, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        let currentChannel = channel(profileID: profile.id, name: "Current", path: "current")
+        try await store.installPlaylist(
+            profileID: profile.id,
+            channels: [currentChannel],
+            fetchedAt: date(20)
+        )
+
+        let setPersisted = try await store.setManualMappingIfCurrentChannel(
+            profileID: profile.id,
+            channelID: currentChannel.id,
+            xmltvChannelID: "current-epg"
+        )
+        let setMapping = try await store.manualMapping(
+            profileID: profile.id,
+            channelID: currentChannel.id
+        )
+        let clearPersisted = try await store.setManualMappingIfCurrentChannel(
+            profileID: profile.id,
+            channelID: currentChannel.id,
+            xmltvChannelID: nil
+        )
+        let clearedMapping = try await store.manualMapping(
+            profileID: profile.id,
+            channelID: currentChannel.id
+        )
+
+        XCTAssertTrue(setPersisted)
+        XCTAssertEqual(setMapping?.xmltvChannelID, "current-epg")
+        XCTAssertTrue(clearPersisted)
+        XCTAssertNil(clearedMapping)
+    }
+
+    func testConditionalManualMappingSaveFailureRollsBackSetAndClear() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let currentChannel = channel(profileID: profile.id, name: "Current", path: "current")
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [currentChannel],
+            fetchedAt: date(20)
+        )
+        try await initialStore.setManualMapping(
+            profileID: profile.id,
+            channelID: currentChannel.id,
+            xmltvChannelID: "original-epg"
+        )
+        let failingStore = makeStore(container: container, failingSave: .manualMapping)
+
+        let setError = await XCTAssertThrowsErrorAsync {
+            _ = try await failingStore.setManualMappingIfCurrentChannel(
+                profileID: profile.id,
+                channelID: currentChannel.id,
+                xmltvChannelID: "replacement-epg"
+            )
+        }
+        let clearError = await XCTAssertThrowsErrorAsync {
+            _ = try await failingStore.setManualMappingIfCurrentChannel(
+                profileID: profile.id,
+                channelID: currentChannel.id,
+                xmltvChannelID: nil
+            )
+        }
+        let verificationStore = SwiftDataLibraryStore(modelContainer: container)
+        let mapping = try await verificationStore.manualMapping(
+            profileID: profile.id,
+            channelID: currentChannel.id
+        )
+
+        XCTAssertEqual(setError as? InjectedSaveError, .expected)
+        XCTAssertEqual(clearError as? InjectedSaveError, .expected)
+        XCTAssertEqual(mapping?.xmltvChannelID, "original-epg")
+    }
+
     func testFailedPlaylistStagingLeavesPreviousSnapshotQueryable() async throws {
         let (_, store) = try makeStore()
         let profile = try await store.createProfile(input(name: "Home"), now: date(10))

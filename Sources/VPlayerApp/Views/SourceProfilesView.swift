@@ -5,6 +5,30 @@
 import SwiftUI
 import VPlayerCore
 
+enum ResourceRefreshStatusPresentation {
+    static func timestamp(for status: ResourceRefreshStatus) -> Date? {
+        switch status.state {
+        case .never:
+            nil
+        case .refreshing, .failed:
+            status.lastAttemptAt
+        case .succeeded:
+            status.lastSuccessAt
+        }
+    }
+
+    static func text(for status: ResourceRefreshStatus) -> String {
+        let label = switch status.state {
+        case .never: "尚未刷新"
+        case .refreshing: "正在刷新"
+        case .succeeded: "刷新成功"
+        case .failed: "刷新失败"
+        }
+        guard let date = timestamp(for: status) else { return label }
+        return "\(label) · \(date.formatted(date: .abbreviated, time: .shortened))"
+    }
+}
+
 struct SourceProfilesView: View {
     @Bindable var model: AppModel
     @State private var editedProfile: SourceProfile?
@@ -128,7 +152,7 @@ struct SourceProfilesView: View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(title)
-                Text(statusText(status))
+                Text(ResourceRefreshStatusPresentation.text(for: status))
                     .font(.caption)
                     .foregroundStyle(status.state == .failed ? .red : .secondary)
                 if let error = status.errorSummary {
@@ -146,18 +170,6 @@ struct SourceProfilesView: View {
             .disabled(status.state == .refreshing)
             .accessibilityIdentifier(refreshIdentifier)
         }
-    }
-
-    private func statusText(_ status: ResourceRefreshStatus) -> String {
-        let state: String
-        switch status.state {
-        case .never: state = "尚未刷新"
-        case .refreshing: state = "正在刷新"
-        case .succeeded: state = "刷新成功"
-        case .failed: state = "刷新失败"
-        }
-        guard let date = status.lastSuccessAt else { return state }
-        return "\(state) · \(date.formatted(date: .abbreviated, time: .shortened))"
     }
 
     private func activeIdentifier(_ profile: SourceProfile) -> String {

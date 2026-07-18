@@ -293,13 +293,19 @@ final class AppModel {
     func refresh(profileID: UUID, resource: RefreshResource) async {
         markRefreshing(profileID: profileID, resource: resource)
         let outcomes = await refreshResources(profileID, [resource], .manual)
+        let outcome = outcomes.first { $0.resource == resource }
         reconcileRefreshOutcome(
             profileID: profileID,
             resource: resource,
-            outcome: outcomes.first { $0.resource == resource }
+            outcome: outcome
         )
         guard !Task.isCancelled else { return }
-        _ = await reload()
+        guard await reload() else { return }
+        preserveReturnedTerminalRefreshOutcome(
+            profileID: profileID,
+            resource: resource,
+            outcome: outcome
+        )
     }
 
     @discardableResult
@@ -530,6 +536,25 @@ final class AppModel {
         if activeProfile?.id == profileID {
             activeProfile = profiles[index]
         }
+    }
+
+    private func preserveReturnedTerminalRefreshOutcome(
+        profileID: UUID,
+        resource: RefreshResource,
+        outcome: RefreshOutcome?
+    ) {
+        guard let outcome,
+              let profile = profiles.first(where: { $0.id == profileID }) else { return }
+        let persistedState = switch resource {
+        case .playlist: profile.m3uStatus.state
+        case .epg: profile.epgStatus.state
+        }
+        guard persistedState == .refreshing else { return }
+        reconcileRefreshOutcome(
+            profileID: profileID,
+            resource: resource,
+            outcome: outcome
+        )
     }
 
     private func presentOperationMessage(_ message: String) {

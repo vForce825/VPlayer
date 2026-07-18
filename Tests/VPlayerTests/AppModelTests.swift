@@ -128,6 +128,114 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testManualRefreshKeepsReturnedFailureTerminalWhenFailurePersistenceFails() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(
+            profiles: [profile],
+            failsRecordFailure: true
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { now }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertNotNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
+    }
+
+    func testManualRefreshKeepsTerminalRepositoryTruthOverReturnedOutcome() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                try? await repository.recordSuccess(
+                    profileID: profileID,
+                    resource: .playlist,
+                    at: now
+                )
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "stale returned failure")
+                }
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .succeeded)
+    }
+
+    func testRefreshStatusPresentationUsesStateSpecificTimestampsAndExactChineseLabels() {
+        let attempt = Date(timeIntervalSince1970: 2_000_000_000)
+        let success = Date(timeIntervalSince1970: 1_900_000_000)
+        let never = ResourceRefreshStatus(
+            lastAttemptAt: attempt,
+            lastSuccessAt: success,
+            state: .never
+        )
+        let refreshing = ResourceRefreshStatus(
+            lastAttemptAt: attempt,
+            lastSuccessAt: success,
+            state: .refreshing
+        )
+        let succeeded = ResourceRefreshStatus(
+            lastAttemptAt: attempt,
+            lastSuccessAt: success,
+            state: .succeeded
+        )
+        let failed = ResourceRefreshStatus(
+            lastAttemptAt: attempt,
+            lastSuccessAt: success,
+            state: .failed,
+            errorSummary: "failed"
+        )
+        let attemptText = attempt.formatted(date: .abbreviated, time: .shortened)
+        let successText = success.formatted(date: .abbreviated, time: .shortened)
+
+        XCTAssertNil(ResourceRefreshStatusPresentation.timestamp(for: never))
+        XCTAssertEqual(ResourceRefreshStatusPresentation.text(for: never), "尚未刷新")
+        XCTAssertEqual(ResourceRefreshStatusPresentation.timestamp(for: refreshing), attempt)
+        XCTAssertEqual(
+            ResourceRefreshStatusPresentation.text(for: refreshing),
+            "正在刷新 · \(attemptText)"
+        )
+        XCTAssertEqual(ResourceRefreshStatusPresentation.timestamp(for: succeeded), success)
+        XCTAssertEqual(
+            ResourceRefreshStatusPresentation.text(for: succeeded),
+            "刷新成功 · \(successText)"
+        )
+        XCTAssertEqual(ResourceRefreshStatusPresentation.timestamp(for: failed), attempt)
+        XCTAssertEqual(
+            ResourceRefreshStatusPresentation.text(for: failed),
+            "刷新失败 · \(attemptText)"
+        )
+        XCTAssertFalse(ResourceRefreshStatusPresentation.text(for: failed).contains(successText))
+    }
+
     func testPersistenceTerminalSignalReloadsVisibleChannelsWithoutManualUIAction() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
