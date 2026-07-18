@@ -284,12 +284,37 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
         let original = channel(profileID: profile.id, name: "Original", path: "original")
         let replacement = channel(profileID: profile.id, name: "Replacement", path: "replacement")
+        let originalEPGURL = try temporaryXML(
+            singleProgrammeXMLTV(channelID: "original-epg", title: "Original EPG")
+        )
+        defer { try? FileManager.default.removeItem(at: originalEPGURL) }
         try await initialStore.installPlaylist(
             profileID: profile.id,
             channels: [original],
             fetchedAt: date(20)
         )
+        _ = try await initialStore.installEPG(
+            profileID: profile.id,
+            fileURL: originalEPGURL,
+            fetchedAt: date(25)
+        )
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .playlist, at: date(30))
+        try await initialStore.recordFailure(
+            profileID: profile.id,
+            resource: .epg,
+            summary: "EPG refresh failed after the valid snapshot",
+            at: date(35)
+        )
         let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalProfiles = try await initialStore.profiles()
+        let originalProfile = try XCTUnwrap(originalProfiles.first)
+        let originalPlaylist = try await initialStore.channels(profileID: profile.id)
+        let originalEPGChannels = try await initialStore.epgChannels(profileID: profile.id)
+        let originalProgrammes = try await initialStore.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "original-epg",
+            overlapping: date(0)..<date(2_000_000_000)
+        )
         let originalInventory = try snapshotInventory(container)
         let failingStore = makeStore(container: container, failingSave: .playlistPointer)
 
@@ -303,9 +328,22 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
 
         XCTAssertEqual(error as? InjectedSaveError, .expected)
         let pointersAfterFailure = try snapshotPointers(container, profileID: profile.id)
-        let channelsAfterFailure = try await failingStore.channels(profileID: profile.id)
+        let profilesAfterFailure = try await failingStore.profiles()
+        let profileAfterFailure = try XCTUnwrap(profilesAfterFailure.first)
+        let playlistAfterFailure = try await failingStore.channels(profileID: profile.id)
+        let epgChannelsAfterFailure = try await failingStore.epgChannels(profileID: profile.id)
+        let programmesAfterFailure = try await failingStore.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "original-epg",
+            overlapping: date(0)..<date(2_000_000_000)
+        )
         XCTAssertEqual(pointersAfterFailure.playlist, originalPointers.playlist)
-        XCTAssertEqual(channelsAfterFailure, [original])
+        XCTAssertEqual(pointersAfterFailure.epg, originalPointers.epg)
+        XCTAssertEqual(profileAfterFailure.m3uStatus, originalProfile.m3uStatus)
+        XCTAssertEqual(profileAfterFailure.epgStatus, originalProfile.epgStatus)
+        XCTAssertEqual(playlistAfterFailure, originalPlaylist)
+        XCTAssertEqual(epgChannelsAfterFailure, originalEPGChannels)
+        XCTAssertEqual(programmesAfterFailure, originalProgrammes)
         assertInventory(try snapshotInventory(container), equals: originalInventory)
     }
 
@@ -313,6 +351,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let container = try VPlayerModelContainer.make(inMemory: true)
         let initialStore = SwiftDataLibraryStore(modelContainer: container)
         let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let originalPlaylist = channel(profileID: profile.id, name: "Original playlist", path: "original")
         let originalURL = try temporaryXML(singleProgrammeXMLTV(channelID: "original", title: "Original"))
         let replacementURL = try temporaryXML(
             singleProgrammeXMLTV(channelID: "replacement", title: "Replacement")
@@ -321,12 +360,33 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             try? FileManager.default.removeItem(at: originalURL)
             try? FileManager.default.removeItem(at: replacementURL)
         }
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [originalPlaylist],
+            fetchedAt: date(20)
+        )
         _ = try await initialStore.installEPG(
             profileID: profile.id,
             fileURL: originalURL,
-            fetchedAt: date(20)
+            fetchedAt: date(25)
+        )
+        try await initialStore.recordSuccess(profileID: profile.id, resource: .playlist, at: date(30))
+        try await initialStore.recordFailure(
+            profileID: profile.id,
+            resource: .epg,
+            summary: "EPG refresh failed after the valid snapshot",
+            at: date(35)
         )
         let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalProfiles = try await initialStore.profiles()
+        let originalProfile = try XCTUnwrap(originalProfiles.first)
+        let originalPlaylistResults = try await initialStore.channels(profileID: profile.id)
+        let originalEPGChannels = try await initialStore.epgChannels(profileID: profile.id)
+        let originalProgrammes = try await initialStore.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "original",
+            overlapping: date(0)..<date(2_000_000_000)
+        )
         let originalInventory = try snapshotInventory(container)
         let failingStore = makeStore(container: container, failingSave: .epgPointer)
 
@@ -340,9 +400,22 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
 
         XCTAssertEqual(error as? InjectedSaveError, .expected)
         let pointersAfterFailure = try snapshotPointers(container, profileID: profile.id)
-        let channelsAfterFailure = try await failingStore.epgChannels(profileID: profile.id)
+        let profilesAfterFailure = try await failingStore.profiles()
+        let profileAfterFailure = try XCTUnwrap(profilesAfterFailure.first)
+        let playlistAfterFailure = try await failingStore.channels(profileID: profile.id)
+        let epgChannelsAfterFailure = try await failingStore.epgChannels(profileID: profile.id)
+        let programmesAfterFailure = try await failingStore.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "original",
+            overlapping: date(0)..<date(2_000_000_000)
+        )
+        XCTAssertEqual(pointersAfterFailure.playlist, originalPointers.playlist)
         XCTAssertEqual(pointersAfterFailure.epg, originalPointers.epg)
-        XCTAssertEqual(channelsAfterFailure.map(\.id), ["original"])
+        XCTAssertEqual(profileAfterFailure.m3uStatus, originalProfile.m3uStatus)
+        XCTAssertEqual(profileAfterFailure.epgStatus, originalProfile.epgStatus)
+        XCTAssertEqual(playlistAfterFailure, originalPlaylistResults)
+        XCTAssertEqual(epgChannelsAfterFailure, originalEPGChannels)
+        XCTAssertEqual(programmesAfterFailure, originalProgrammes)
         assertInventory(try snapshotInventory(container), equals: originalInventory)
     }
 
