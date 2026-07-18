@@ -5,7 +5,12 @@
 import Foundation
 @testable import VPlayerCore
 
-actor RepositorySpy: LibraryRepository {
+actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
+    enum InjectedError: Error, Sendable {
+        case refreshCommit
+        case recordFailure
+    }
+
     enum Event: Equatable, Sendable {
         case installPlaylist(UUID)
         case installEPG(UUID)
@@ -33,17 +38,23 @@ actor RepositorySpy: LibraryRepository {
     private var profileLookupCount = 0
     private var playlistInstallCount = 0
     private var epgInstallCount = 0
+    private let failedRefreshCommits: Set<RefreshResource>
+    private let failsRecordFailure: Bool
 
     init(
         profiles: [SourceProfile],
         channels: [UUID: [Channel]] = [:],
         epgChannels: [UUID: [EPGChannel]] = [:],
-        programmes: [UUID: [Programme]] = [:]
+        programmes: [UUID: [Programme]] = [:],
+        failedRefreshCommits: Set<RefreshResource> = [],
+        failsRecordFailure: Bool = false
     ) {
         storedProfiles = profiles
         storedChannels = channels
         storedEPGChannels = epgChannels
         storedProgrammes = programmes
+        self.failedRefreshCommits = failedRefreshCommits
+        self.failsRecordFailure = failsRecordFailure
     }
 
     func snapshot() -> Snapshot {
@@ -169,6 +180,35 @@ actor RepositorySpy: LibraryRepository {
         return summary
     }
 
+    func commitPlaylistRefresh(
+        profileID: UUID,
+        channels: [Channel],
+        fetchedAt: Date
+    ) throws {
+        guard !failedRefreshCommits.contains(.playlist) else {
+            throw InjectedError.refreshCommit
+        }
+        try installPlaylist(profileID: profileID, channels: channels, fetchedAt: fetchedAt)
+        try recordSuccess(profileID: profileID, resource: .playlist, at: fetchedAt)
+    }
+
+    func commitEPGRefresh(
+        profileID: UUID,
+        fileURL: URL,
+        fetchedAt: Date
+    ) throws -> XMLTVParseSummary {
+        guard !failedRefreshCommits.contains(.epg) else {
+            throw InjectedError.refreshCommit
+        }
+        let summary = try installEPG(
+            profileID: profileID,
+            fileURL: fileURL,
+            fetchedAt: fetchedAt
+        )
+        try recordSuccess(profileID: profileID, resource: .epg, at: fetchedAt)
+        return summary
+    }
+
     func recordAttempt(profileID: UUID, resource: RefreshResource, at: Date) throws {
         let index = try profileIndex(profileID)
         updateStatus(index: index, resource: resource) { status in
@@ -180,6 +220,9 @@ actor RepositorySpy: LibraryRepository {
     }
 
     func recordSuccess(profileID: UUID, resource: RefreshResource, at: Date) throws {
+        guard !failedRefreshCommits.contains(resource) else {
+            throw InjectedError.refreshCommit
+        }
         let index = try profileIndex(profileID)
         updateStatus(index: index, resource: resource) { status in
             status.lastSuccessAt = at
@@ -195,6 +238,7 @@ actor RepositorySpy: LibraryRepository {
         summary: String,
         at: Date
     ) throws {
+        guard !failsRecordFailure else { throw InjectedError.recordFailure }
         let index = try profileIndex(profileID)
         let sanitized = String(summary.prefix(240))
         updateStatus(index: index, resource: resource) { status in

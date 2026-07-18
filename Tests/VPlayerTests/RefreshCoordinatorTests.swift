@@ -97,6 +97,93 @@ final class RefreshCoordinatorTests: XCTestCase {
         await assertTemporaryDownloadsWereDeleted(downloader)
     }
 
+    func testPlaylistCommitSaveFailureCannotActivateNewSnapshotWithFailedStatus() async {
+        let original = [channel(name: "Original")]
+        let repository = RepositorySpy(
+            profiles: [makeProfile()],
+            channels: [profileID: original],
+            failedRefreshCommits: [.playlist]
+        )
+        let downloader = FakeRemoteDownloader(
+            data: [.playlist: validPlaylist(name: "Replacement")]
+        )
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+
+        let outcomes = await coordinator.refresh(
+            profileID: profileID,
+            resources: [.playlist],
+            trigger: .manual
+        )
+
+        XCTAssertEqual(outcomes.map(\.succeeded), [false])
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.channels[profileID], original)
+        XCTAssertEqual(snapshot.playlistInstallCount, 0)
+        XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 0)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .failed)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.lastSuccessAt, makeProfile().m3uStatus.lastSuccessAt)
+        await assertTemporaryDownloadsWereDeleted(downloader)
+    }
+
+    func testEPGCommitSaveFailureCannotActivateNewSnapshotWithFailedStatus() async {
+        let original = [EPGChannel(id: "original", displayNames: ["Original"], iconURL: nil)]
+        let repository = RepositorySpy(
+            profiles: [makeProfile()],
+            epgChannels: [profileID: original],
+            failedRefreshCommits: [.epg]
+        )
+        let downloader = FakeRemoteDownloader(data: [.epg: validEPG()])
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+
+        let outcomes = await coordinator.refresh(
+            profileID: profileID,
+            resources: [.epg],
+            trigger: .manual
+        )
+
+        XCTAssertEqual(outcomes.map(\.succeeded), [false])
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.epgChannels[profileID], original)
+        XCTAssertEqual(snapshot.epgInstallCount, 0)
+        XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .epg) }.count, 0)
+        XCTAssertEqual(snapshot.profiles[0].epgStatus.state, .failed)
+        XCTAssertEqual(snapshot.profiles[0].epgStatus.lastSuccessAt, makeProfile().epgStatus.lastSuccessAt)
+        await assertTemporaryDownloadsWereDeleted(downloader)
+    }
+
+    func testRecordFailureSaveFaultReturnsSanitizedFailureWithoutActivatingSnapshot() async throws {
+        let sensitiveURL = URL(string: "https://user:pass@example.test/list?token=secret")!
+        let original = [channel(name: "Original")]
+        let repository = RepositorySpy(
+            profiles: [makeProfile(m3uURL: sensitiveURL)],
+            channels: [profileID: original],
+            failedRefreshCommits: [.playlist],
+            failsRecordFailure: true
+        )
+        let downloader = FakeRemoteDownloader(
+            data: [.playlist: validPlaylist(name: "Replacement")]
+        )
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+
+        let outcomes = await coordinator.refresh(
+            profileID: profileID,
+            resources: [.playlist],
+            trigger: .manual
+        )
+
+        let outcome = try XCTUnwrap(outcomes.first)
+        XCTAssertFalse(outcome.succeeded)
+        let message = try XCTUnwrap(outcome.message)
+        XCTAssertTrue(message.contains("https://example.test/list"))
+        XCTAssertFalse(message.contains("secret"))
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.channels[profileID], original)
+        XCTAssertEqual(snapshot.playlistInstallCount, 0)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .refreshing)
+        XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 0)
+        await assertTemporaryDownloadsWereDeleted(downloader)
+    }
+
     func testSimultaneousSameProfileResourceRefreshesShareOneInFlightTask() async {
         let repository = RepositorySpy(profiles: [makeProfile()])
         let downloader = FakeRemoteDownloader(
@@ -125,6 +212,166 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.events.filter { $0 == .attempt(profileID, .playlist) }.count, 1)
         XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 1)
         await assertTemporaryDownloadsWereDeleted(downloader)
+    }
+
+    func testCancellingSoleWaiterReturnsPromptlyAndCancelsSharedWork() async throws {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(
+            data: [.playlist: validPlaylist(name: "Unused")],
+            isSuspended: true
+        )
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let completion = OutcomeProbe()
+        let caller = Task {
+            let outcomes = await coordinator.refresh(
+                profileID: profileID,
+                resources: [.playlist],
+                trigger: .manual
+            )
+            await completion.record(outcomes)
+        }
+        await waitUntil { await downloader.invocationCount(for: .playlist) == 1 }
+
+        caller.cancel()
+
+        await waitUntil(timeout: .milliseconds(250)) { await completion.value != nil }
+        let completedOutcomes = await completion.value
+        let promptOutcome = try XCTUnwrap(completedOutcomes?.first)
+        XCTAssertFalse(promptOutcome.succeeded)
+        XCTAssertEqual(promptOutcome.message, "刷新已取消。")
+        await waitUntil { await downloader.cancellationCount(for: .playlist) == 1 }
+        await waitUntil {
+            let snapshot = await repository.snapshot()
+            return snapshot.events.contains {
+                if case .failure(self.profileID, .playlist, _) = $0 { return true }
+                return false
+            }
+        }
+
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.playlistInstallCount, 0)
+        XCTAssertEqual(snapshot.events.filter { $0 == .attempt(profileID, .playlist) }.count, 1)
+        XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 0)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .failed)
+        await assertTemporaryDownloadsWereDeleted(downloader)
+        _ = await caller.result
+    }
+
+    func testRefreshArrivingWhileCancelledFlightDrainsStartsFreshWork() async throws {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(
+            data: [.playlist: validPlaylist(name: "Retry")],
+            isSuspended: true,
+            cancellationDelay: .milliseconds(150)
+        )
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let firstCompletion = OutcomeProbe()
+        let retryCompletion = OutcomeProbe()
+        let first = Task {
+            let outcomes = await coordinator.refresh(
+                profileID: profileID,
+                resources: [.playlist],
+                trigger: .manual
+            )
+            await firstCompletion.record(outcomes)
+        }
+        await waitUntil { await downloader.invocationCount(for: .playlist) == 1 }
+        first.cancel()
+        await waitUntil(timeout: .milliseconds(250)) { await firstCompletion.value != nil }
+
+        let retry = Task {
+            let outcomes = await coordinator.refresh(
+                profileID: profileID,
+                resources: [.playlist],
+                trigger: .manual
+            )
+            await retryCompletion.record(outcomes)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let invocationCountWhileDraining = await downloader.invocationCount(for: .playlist)
+        let prematureRetryOutcomes = await retryCompletion.value
+        XCTAssertEqual(invocationCountWhileDraining, 1)
+        XCTAssertNil(prematureRetryOutcomes)
+
+        await waitUntil { await downloader.invocationCount(for: .playlist) == 2 }
+        await downloader.resume(.playlist)
+        await waitUntil { await retryCompletion.value != nil }
+
+        let firstOutcomes = await firstCompletion.value
+        let retryOutcomes = await retryCompletion.value
+        XCTAssertEqual(firstOutcomes?.first?.succeeded, false)
+        XCTAssertEqual(firstOutcomes?.first?.message, "刷新已取消。")
+        XCTAssertEqual(retryOutcomes?.first?.succeeded, true)
+        XCTAssertNil(retryOutcomes?.first?.message)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.playlistInstallCount, 1)
+        XCTAssertEqual(snapshot.events.filter { $0 == .attempt(profileID, .playlist) }.count, 2)
+        XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 1)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .succeeded)
+        let cancellationCount = await downloader.cancellationCount(for: .playlist)
+        XCTAssertEqual(cancellationCount, 1)
+        await assertTemporaryDownloadsWereDeleted(downloader)
+        _ = await first.result
+        _ = await retry.result
+    }
+
+    func testCancellingOneOfTwoWaitersDoesNotCancelSharedWork() async throws {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(
+            data: [.playlist: validPlaylist(name: "Shared")],
+            isSuspended: true
+        )
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let firstCompletion = OutcomeProbe()
+        let secondCompletion = OutcomeProbe()
+        let first = Task {
+            let outcomes = await coordinator.refresh(
+                profileID: profileID,
+                resources: [.playlist],
+                trigger: .manual
+            )
+            await firstCompletion.record(outcomes)
+        }
+        await waitUntil { await downloader.invocationCount(for: .playlist) == 1 }
+        let second = Task {
+            let outcomes = await coordinator.refresh(
+                profileID: profileID,
+                resources: [.playlist],
+                trigger: .background
+            )
+            await secondCompletion.record(outcomes)
+        }
+        try await Task.sleep(for: .milliseconds(30))
+
+        first.cancel()
+
+        await waitUntil(timeout: .milliseconds(250)) { await firstCompletion.value != nil }
+        let firstOutcomes = await firstCompletion.value
+        let cancelledOutcome = try XCTUnwrap(firstOutcomes?.first)
+        XCTAssertFalse(cancelledOutcome.succeeded)
+        XCTAssertEqual(cancelledOutcome.message, "刷新已取消。")
+        let prematureSecondOutcomes = await secondCompletion.value
+        let invocationCount = await downloader.invocationCount(for: .playlist)
+        let cancellationCount = await downloader.cancellationCount(for: .playlist)
+        XCTAssertNil(prematureSecondOutcomes)
+        XCTAssertEqual(invocationCount, 1)
+        XCTAssertEqual(cancellationCount, 0)
+
+        await downloader.resume(.playlist)
+        await waitUntil { await secondCompletion.value != nil }
+        let secondOutcomes = await secondCompletion.value
+        let successfulOutcome = try XCTUnwrap(secondOutcomes?.first)
+        XCTAssertTrue(successfulOutcome.succeeded)
+        XCTAssertNil(successfulOutcome.message)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.playlistInstallCount, 1)
+        XCTAssertEqual(snapshot.events.filter { $0 == .attempt(profileID, .playlist) }.count, 1)
+        XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 1)
+        XCTAssertEqual(snapshot.events.compactMap(\.resource).filter { $0 == .playlist }.count, 3)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .succeeded)
+        await assertTemporaryDownloadsWereDeleted(downloader)
+        _ = await first.result
+        _ = await second.result
     }
 
     func testPlaylistAndEPGUseIndependentInFlightKeys() async {
@@ -336,6 +583,17 @@ final class RefreshCoordinatorTests: XCTestCase {
             line: line
         )
     }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        condition: () async -> Bool
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !(await condition()), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
 }
 
 private actor FakeRemoteDownloader: RemoteResourceDownloading {
@@ -347,41 +605,67 @@ private actor FakeRemoteDownloader: RemoteResourceDownloading {
     private let data: [RefreshResource: Data]
     private let failures: [RefreshResource: Failure]
     private let delay: Duration?
+    private let isSuspended: Bool
+    private let cancellationDelay: Duration?
     private var invocationCounts: [RefreshResource: Int] = [:]
+    private var cancellationCounts: [RefreshResource: Int] = [:]
+    private var resumedResources: Set<RefreshResource> = []
     private var files: [URL] = []
 
     init(
         data: [RefreshResource: Data],
         failures: [RefreshResource: Failure] = [:],
-        delay: Duration? = nil
+        delay: Duration? = nil,
+        isSuspended: Bool = false,
+        cancellationDelay: Duration? = nil
     ) {
         self.data = data
         self.failures = failures
         self.delay = delay
+        self.isSuspended = isSuspended
+        self.cancellationDelay = cancellationDelay
     }
 
     func download(_ request: RemoteResourceRequest) async throws -> DownloadedResource {
         invocationCounts[request.resource, default: 0] += 1
-        if let delay {
-            try await Task.sleep(for: delay)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FakeRemoteDownloader-\(UUID().uuidString)")
+        try Data("partial".utf8).write(to: url, options: .atomic)
+        files.append(url)
+        do {
+            if let delay {
+                try await Task.sleep(for: delay)
+            }
+            while isSuspended, !resumedResources.contains(request.resource) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        } catch is CancellationError {
+            cancellationCounts[request.resource, default: 0] += 1
+            if let cancellationDelay {
+                await Task.detached {
+                    try? await Task.sleep(for: cancellationDelay)
+                }.value
+            }
+            try? FileManager.default.removeItem(at: url)
+            throw CancellationError()
         }
         switch failures[request.resource] {
         case .connection:
+            try? FileManager.default.removeItem(at: url)
             throw LeakyDownloadError(
                 description: "could not load \(request.url.absoluteString) token=secret"
             )
         case .cancelled:
+            try? FileManager.default.removeItem(at: url)
             throw RemoteDownloadError.cancelled
         case nil:
             break
         }
         guard let payload = data[request.resource] else {
+            try? FileManager.default.removeItem(at: url)
             throw URLError(.resourceUnavailable)
         }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("FakeRemoteDownloader-\(UUID().uuidString)")
         try payload.write(to: url, options: .atomic)
-        files.append(url)
         return DownloadedResource(temporaryFileURL: url, byteCount: Int64(payload.count))
     }
 
@@ -389,8 +673,24 @@ private actor FakeRemoteDownloader: RemoteResourceDownloading {
         invocationCounts[resource, default: 0]
     }
 
+    func cancellationCount(for resource: RefreshResource) -> Int {
+        cancellationCounts[resource, default: 0]
+    }
+
+    func resume(_ resource: RefreshResource) {
+        resumedResources.insert(resource)
+    }
+
     func producedFiles() -> [URL] {
         files
+    }
+}
+
+private actor OutcomeProbe {
+    private(set) var value: [RefreshOutcome]?
+
+    func record(_ outcomes: [RefreshOutcome]) {
+        value = outcomes
     }
 }
 

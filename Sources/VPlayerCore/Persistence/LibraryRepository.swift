@@ -41,6 +41,20 @@ public protocol LibraryRepository: Sendable {
     func purgeUnreferencedSnapshots() async throws
 }
 
+/// Commits a refresh snapshot and its successful resource status as one repository transaction.
+public protocol RefreshSnapshotCommitting: Sendable {
+    func commitPlaylistRefresh(
+        profileID: UUID,
+        channels: [Channel],
+        fetchedAt: Date
+    ) async throws
+    func commitEPGRefresh(
+        profileID: UUID,
+        fileURL: URL,
+        fetchedAt: Date
+    ) async throws -> XMLTVParseSummary
+}
+
 public enum LibraryRepositoryError: Error, Equatable, Sendable {
     case profileNotFound
     case invalidChannelProfile

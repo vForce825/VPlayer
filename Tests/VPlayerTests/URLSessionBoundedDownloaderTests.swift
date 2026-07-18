@@ -14,7 +14,10 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
     override func setUpWithError() throws {
         StubURLProtocol.reset()
         downloadsDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("URLSessionBoundedDownloaderTests-(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                "URLSessionBoundedDownloaderTests-\(UUID().uuidString)",
+                isDirectory: true
+            )
     }
 
     override func tearDownWithError() throws {
@@ -90,15 +93,22 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
     }
 
     func testCancellationClosesAndRemovesPartialFile() async {
-        StubURLProtocol.enqueue(.init(chunks: [Data("partial".utf8)], completes: false))
+        StubURLProtocol.enqueue(.init(
+            chunks: [Data("partial".utf8), Data("late".utf8), Data("later".utf8)],
+            completes: false,
+            callbackDelay: 0.05
+        ))
         let (downloader, _) = makeDownloader(limit: 100)
         let operation = Task { try await downloader.download(request()) }
-        await waitUntil { !self.downloadedFiles().isEmpty }
+        await waitUntil { StubURLProtocol.deliveredChunkCount == 1 }
 
         operation.cancel()
         let error = await captureError { try await operation.value }
+        try? await Task.sleep(for: .milliseconds(150))
 
         XCTAssertEqual(error as? RemoteDownloadError, .cancelled)
+        XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 1)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
         await assertDownloadsDirectoryBecomesEmpty()
     }
 
@@ -113,6 +123,54 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
 
         XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse)
         XCTAssertTrue(StubURLProtocol.requests.isEmpty)
+        await assertDownloadsDirectoryBecomesEmpty()
+    }
+
+    func testValidRemoteRedirectIsFollowedAndDownloaded() async throws {
+        let redirectedURL = URL(string: "https://cdn.example.test/list.m3u")!
+        StubURLProtocol.enqueue(.init(response: .redirect(location: redirectedURL)))
+        StubURLProtocol.enqueue(.init(chunks: [Data("redirected".utf8)]))
+        let (downloader, _) = makeDownloader(limit: 10)
+
+        let result = try await downloader.download(request())
+
+        XCTAssertEqual(try Data(contentsOf: result.temporaryFileURL), Data("redirected".utf8))
+        XCTAssertEqual(StubURLProtocol.requests.compactMap(\.url), [request().url, redirectedURL])
+        try FileManager.default.removeItem(at: result.temporaryFileURL)
+    }
+
+    func testFileCustomAndHostlessRedirectsAreRejectedBeforeWriting() async {
+        let invalidTargets = [
+            URL(fileURLWithPath: "/tmp/redirected-list.m3u"),
+            URL(string: "vplayer://receiver/list.m3u")!,
+            URL(string: "https:/missing-host/list.m3u")!
+        ]
+
+        for target in invalidTargets {
+            StubURLProtocol.enqueue(.init(response: .redirect(location: target)))
+            let (downloader, _) = makeDownloader(limit: 10)
+
+            let error = await captureError { try await downloader.download(self.request()) }
+
+            XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse, target.absoluteString)
+            await assertDownloadsDirectoryBecomesEmpty()
+        }
+        XCTAssertEqual(StubURLProtocol.requests.count, invalidTargets.count)
+    }
+
+    func testFinalHTTPResponseURLMustRemainRemoteBeforeWriting() async {
+        StubURLProtocol.enqueue(.init(
+            response: .httpAt(
+                url: URL(fileURLWithPath: "/tmp/final-list.m3u"),
+                statusCode: 200
+            ),
+            chunks: [Data("must-not-be-written".utf8)]
+        ))
+        let (downloader, _) = makeDownloader(limit: 100)
+
+        let error = await captureError { try await downloader.download(self.request()) }
+
+        XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse)
         await assertDownloadsDirectoryBecomesEmpty()
     }
 

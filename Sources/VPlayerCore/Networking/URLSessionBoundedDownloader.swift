@@ -98,9 +98,7 @@ public final class URLSessionBoundedDownloader: NSObject,
     }
 
     public func download(_ request: RemoteResourceRequest) async throws -> DownloadedResource {
-        guard let scheme = request.url.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              request.url.host != nil else {
+        guard Self.isRemoteHTTPURL(request.url) else {
             throw RemoteDownloadError.invalidResponse
         }
 
@@ -144,6 +142,10 @@ public final class URLSessionBoundedDownloader: NSObject,
                 transfer.terminalError = RemoteDownloadError.invalidResponse
                 return .cancel
             }
+            guard Self.isRemoteHTTPURL(response.url) else {
+                transfer.terminalError = RemoteDownloadError.invalidResponse
+                return .cancel
+            }
             guard (200..<300).contains(response.statusCode) else {
                 transfer.terminalError = RemoteDownloadError.httpStatus(response.statusCode)
                 return .cancel
@@ -159,6 +161,28 @@ public final class URLSessionBoundedDownloader: NSObject,
             return .allow
         }
         completionHandler(disposition)
+    }
+
+    public func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        let shouldFollow = lock.withLock {
+            guard let transfer = transfers[task.taskIdentifier],
+                  transfer.terminalError == nil else { return false }
+            guard Self.isRemoteHTTPURL(request.url) else {
+                transfer.terminalError = RemoteDownloadError.invalidResponse
+                return false
+            }
+            return true
+        }
+        completionHandler(shouldFollow ? request : nil)
+        if !shouldFollow {
+            task.cancel()
+        }
     }
 
     public func urlSession(
@@ -312,5 +336,13 @@ public final class URLSessionBoundedDownloader: NSObject,
             try? fileManager.removeItem(at: fileURL)
             throw error
         }
+    }
+
+    private static func isRemoteHTTPURL(_ url: URL?) -> Bool {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host,
+              !host.isEmpty else { return false }
+        return scheme == "http" || scheme == "https"
     }
 }

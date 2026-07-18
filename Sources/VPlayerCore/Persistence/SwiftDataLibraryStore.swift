@@ -25,7 +25,7 @@ enum LibraryStoreSavePhase: Equatable, Sendable {
 typealias LibraryStoreSaveFault = @Sendable (LibraryStoreSavePhase) throws -> Void
 
 @ModelActor
-public actor SwiftDataLibraryStore: LibraryRepository {
+public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting {
     private var saveFault: LibraryStoreSaveFault?
 
     init(
@@ -206,6 +206,34 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         channels: [Channel],
         fetchedAt: Date
     ) throws {
+        try installPlaylistSnapshot(
+            profileID: profileID,
+            channels: channels,
+            fetchedAt: fetchedAt,
+            recordsSuccess: false
+        )
+    }
+
+    public func commitPlaylistRefresh(
+        profileID: UUID,
+        channels: [Channel],
+        fetchedAt: Date
+    ) throws {
+        try installPlaylistSnapshot(
+            profileID: profileID,
+            channels: channels,
+            fetchedAt: fetchedAt,
+            recordsSuccess: true
+        )
+    }
+
+    private func installPlaylistSnapshot(
+        profileID: UUID,
+        channels: [Channel],
+        fetchedAt: Date,
+        recordsSuccess: Bool
+    ) throws {
+        try Task.checkCancellation()
         _ = try profileRecord(id: profileID)
         guard channels.allSatisfy({ $0.sourceProfileID == profileID }) else {
             throw LibraryRepositoryError.invalidChannelProfile
@@ -249,11 +277,15 @@ public actor SwiftDataLibraryStore: LibraryRepository {
 
         let oldSnapshotID: UUID?
         do {
+            try Task.checkCancellation()
             var previousSnapshotID: UUID?
             try commit(.playlistPointer) {
                 let profile = try profileRecord(id: profileID)
                 previousSnapshotID = profile.playlistSnapshotID
                 profile.playlistSnapshotID = snapshotID
+                if recordsSuccess {
+                    updateSuccessStatus(profile, resource: .playlist, at: fetchedAt)
+                }
             }
             oldSnapshotID = previousSnapshotID
         } catch {
@@ -272,6 +304,34 @@ public actor SwiftDataLibraryStore: LibraryRepository {
         fileURL: URL,
         fetchedAt: Date
     ) throws -> XMLTVParseSummary {
+        try installEPGSnapshot(
+            profileID: profileID,
+            fileURL: fileURL,
+            fetchedAt: fetchedAt,
+            recordsSuccess: false
+        )
+    }
+
+    public func commitEPGRefresh(
+        profileID: UUID,
+        fileURL: URL,
+        fetchedAt: Date
+    ) throws -> XMLTVParseSummary {
+        try installEPGSnapshot(
+            profileID: profileID,
+            fileURL: fileURL,
+            fetchedAt: fetchedAt,
+            recordsSuccess: true
+        )
+    }
+
+    private func installEPGSnapshot(
+        profileID: UUID,
+        fileURL: URL,
+        fetchedAt: Date,
+        recordsSuccess: Bool
+    ) throws -> XMLTVParseSummary {
+        try Task.checkCancellation()
         _ = try profileRecord(id: profileID)
         let snapshotID = UUID()
         let summary: XMLTVParseSummary
@@ -305,11 +365,15 @@ public actor SwiftDataLibraryStore: LibraryRepository {
 
         let oldSnapshotID: UUID?
         do {
+            try Task.checkCancellation()
             var previousSnapshotID: UUID?
             try commit(.epgPointer) {
                 let profile = try profileRecord(id: profileID)
                 previousSnapshotID = profile.epgSnapshotID
                 profile.epgSnapshotID = snapshotID
+                if recordsSuccess {
+                    updateSuccessStatus(profile, resource: .epg, at: fetchedAt)
+                }
             }
             oldSnapshotID = previousSnapshotID
         } catch {
@@ -352,17 +416,7 @@ public actor SwiftDataLibraryStore: LibraryRepository {
     ) throws {
         try commit(.status) {
             let profile = try profileRecord(id: profileID)
-            switch resource {
-            case .playlist:
-                profile.m3uLastSuccessAt = at
-                profile.m3uStateRaw = RefreshState.succeeded.rawValue
-                profile.m3uErrorSummary = nil
-            case .epg:
-                profile.epgLastSuccessAt = at
-                profile.epgStateRaw = RefreshState.succeeded.rawValue
-                profile.epgErrorSummary = nil
-            }
-            profile.updatedAt = at
+            updateSuccessStatus(profile, resource: resource, at: at)
         }
     }
 
@@ -452,6 +506,24 @@ public actor SwiftDataLibraryStore: LibraryRepository {
                 $0.sourceProfileID == profileID && $0.channelID == channelID
             }
         )).first
+    }
+
+    private func updateSuccessStatus(
+        _ profile: SourceProfileRecord,
+        resource: RefreshResource,
+        at: Date
+    ) {
+        switch resource {
+        case .playlist:
+            profile.m3uLastSuccessAt = at
+            profile.m3uStateRaw = RefreshState.succeeded.rawValue
+            profile.m3uErrorSummary = nil
+        case .epg:
+            profile.epgLastSuccessAt = at
+            profile.epgStateRaw = RefreshState.succeeded.rawValue
+            profile.epgErrorSummary = nil
+        }
+        profile.updatedAt = at
     }
 
     private func cleanupPlaylistSnapshot(id: UUID) throws {

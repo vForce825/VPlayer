@@ -8,6 +8,8 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     struct Plan: @unchecked Sendable {
         enum Response: @unchecked Sendable {
             case http(statusCode: Int, headers: [String: String] = [:])
+            case httpAt(url: URL, statusCode: Int, headers: [String: String] = [:])
+            case redirect(statusCode: Int = 302, location: URL)
             case nonHTTP
             case none
         }
@@ -16,17 +18,20 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         var chunks: [Data]
         var error: NSError?
         var completes: Bool
+        var callbackDelay: TimeInterval
 
         init(
             response: Response = .http(statusCode: 200),
             chunks: [Data] = [],
             error: NSError? = nil,
-            completes: Bool = true
+            completes: Bool = true,
+            callbackDelay: TimeInterval = 0.001
         ) {
             self.response = response
             self.chunks = chunks
             self.error = error
             self.completes = completes
+            self.callbackDelay = callbackDelay
         }
     }
 
@@ -35,6 +40,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         private var plans: [Plan] = []
         private var requests: [URLRequest] = []
         private var stopCount = 0
+        private var deliveredChunkCount = 0
 
         func enqueue(_ plan: Plan) {
             lock.withLock { plans.append(plan) }
@@ -52,8 +58,12 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             lock.withLock { stopCount += 1 }
         }
 
-        func snapshot() -> (requests: [URLRequest], stopCount: Int) {
-            lock.withLock { (requests, stopCount) }
+        func recordDeliveredChunk() {
+            lock.withLock { deliveredChunkCount += 1 }
+        }
+
+        func snapshot() -> (requests: [URLRequest], stopCount: Int, deliveredChunkCount: Int) {
+            lock.withLock { (requests, stopCount, deliveredChunkCount) }
         }
 
         func reset() {
@@ -61,11 +71,18 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
                 plans = []
                 requests = []
                 stopCount = 0
+                deliveredChunkCount = 0
             }
         }
     }
 
     private static let state = State()
+    private static let callbackQueue = DispatchQueue(
+        label: "VPlayerTests.StubURLProtocol.callbacks",
+        attributes: .concurrent
+    )
+    private let deliveryLock = NSLock()
+    private var isStopped = false
 
     static func enqueue(_ plan: Plan) {
         state.enqueue(plan)
@@ -77,6 +94,10 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
 
     static var stopLoadingCount: Int {
         state.snapshot().stopCount
+    }
+
+    static var deliveredChunkCount: Int {
+        state.snapshot().deliveredChunkCount
     }
 
     static func reset() {
@@ -100,6 +121,13 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
 
+        schedule(after: plan.callbackDelay) { [self] in
+            deliverResponse(for: plan)
+        }
+    }
+
+    private func deliverResponse(for plan: Plan) {
+        guard !stopped else { return }
         switch plan.response {
         case let .http(statusCode, headers):
             let response = HTTPURLResponse(
@@ -109,6 +137,27 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
                 headerFields: headers
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        case let .httpAt(url, statusCode, headers):
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        case let .redirect(statusCode, location):
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": location.absoluteString]
+            )!
+            client?.urlProtocol(
+                self,
+                wasRedirectedTo: URLRequest(url: location),
+                redirectResponse: response
+            )
+            return
         case .nonHTTP:
             client?.urlProtocol(
                 self,
@@ -124,17 +173,40 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             break
         }
 
-        for chunk in plan.chunks {
-            client?.urlProtocol(self, didLoad: chunk)
+        deliver(plan: plan, chunkAt: 0)
+    }
+
+    private func deliver(plan: Plan, chunkAt index: Int) {
+        guard !stopped else { return }
+        guard index < plan.chunks.count else {
+            if let error = plan.error {
+                client?.urlProtocol(self, didFailWithError: error)
+            } else if plan.completes {
+                client?.urlProtocolDidFinishLoading(self)
+            }
+            return
         }
-        if let error = plan.error {
-            client?.urlProtocol(self, didFailWithError: error)
-        } else if plan.completes {
-            client?.urlProtocolDidFinishLoading(self)
+
+        Self.state.recordDeliveredChunk()
+        client?.urlProtocol(self, didLoad: plan.chunks[index])
+        schedule(after: plan.callbackDelay) { [self] in
+            deliver(plan: plan, chunkAt: index + 1)
         }
     }
 
     override func stopLoading() {
+        deliveryLock.withLock { isStopped = true }
         Self.state.recordStop()
+    }
+
+    private var stopped: Bool {
+        deliveryLock.withLock { isStopped }
+    }
+
+    private func schedule(
+        after delay: TimeInterval,
+        operation: @escaping @Sendable () -> Void
+    ) {
+        Self.callbackQueue.asyncAfter(deadline: .now() + delay, execute: operation)
     }
 }

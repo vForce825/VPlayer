@@ -28,22 +28,25 @@ public actor RefreshCoordinator {
         let resource: RefreshResource
     }
 
-    private struct InFlight: Sendable {
+    private struct InFlight {
         let id: UUID
         let task: Task<RefreshOutcome, Never>
+        var waiters: [UUID: CheckedContinuation<RefreshOutcome, Never>]
+        var drainWaiters: [UUID: CheckedContinuation<Bool, Never>]
+        var isDraining: Bool
     }
 
     private enum CoordinatorError: Error, Sendable {
         case unsupportedRemoteURL
     }
 
-    private let repository: any LibraryRepository
+    private let repository: any LibraryRepository & RefreshSnapshotCommitting
     private let downloader: any RemoteResourceDownloading
     private let now: @Sendable () -> Date
     private var inFlight: [RefreshKey: InFlight] = [:]
 
     public init(
-        repository: any LibraryRepository,
+        repository: any LibraryRepository & RefreshSnapshotCommitting,
         downloader: any RemoteResourceDownloading,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
@@ -76,34 +79,156 @@ public actor RefreshCoordinator {
         profileID: UUID,
         resource: RefreshResource
     ) async -> RefreshOutcome {
-        let key = RefreshKey(profileID: profileID, resource: resource)
-        if let existing = inFlight[key] {
-            return await existing.task.value
+        if Task.isCancelled {
+            return Self.cancellationOutcome(resource: resource)
         }
 
-        let repository = repository
-        let downloader = downloader
-        let timestamp = now()
-        let id = UUID()
-        let task = Task {
-            await Self.performRefresh(
-                repository: repository,
-                downloader: downloader,
-                profileID: profileID,
-                resource: resource,
-                timestamp: timestamp
+        let key = RefreshKey(profileID: profileID, resource: resource)
+        if let existing = inFlight[key], existing.isDraining {
+            let shouldRetry = await waitForDrain(key: key, flightID: existing.id)
+            guard shouldRetry else {
+                return Self.cancellationOutcome(resource: resource)
+            }
+            return await refreshOne(profileID: profileID, resource: resource)
+        }
+
+        let flightID: UUID
+        if let existing = inFlight[key] {
+            flightID = existing.id
+        } else {
+            let repository = repository
+            let downloader = downloader
+            let timestamp = now()
+            let id = UUID()
+            let task = Task {
+                let outcome = await Self.performRefresh(
+                    repository: repository,
+                    downloader: downloader,
+                    profileID: profileID,
+                    resource: resource,
+                    timestamp: timestamp
+                )
+                self.completeFlight(key: key, id: id, outcome: outcome)
+                return outcome
+            }
+            inFlight[key] = InFlight(
+                id: id,
+                task: task,
+                waiters: [:],
+                drainWaiters: [:],
+                isDraining: false
             )
+            flightID = id
         }
-        inFlight[key] = InFlight(id: id, task: task)
-        let outcome = await task.value
-        if inFlight[key]?.id == id {
-            inFlight[key] = nil
+
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard var flight = inFlight[key], flight.id == flightID else {
+                    continuation.resume(returning: Self.cancellationOutcome(resource: resource))
+                    return
+                }
+                if Task.isCancelled {
+                    if flight.waiters.isEmpty {
+                        flight.isDraining = true
+                        flight.task.cancel()
+                    }
+                    inFlight[key] = flight
+                    continuation.resume(returning: Self.cancellationOutcome(resource: resource))
+                    return
+                }
+                flight.waiters[waiterID] = continuation
+                inFlight[key] = flight
+            }
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(
+                    key: key,
+                    flightID: flightID,
+                    waiterID: waiterID,
+                    resource: resource
+                )
+            }
         }
-        return outcome
+    }
+
+    private func cancelWaiter(
+        key: RefreshKey,
+        flightID: UUID,
+        waiterID: UUID,
+        resource: RefreshResource
+    ) {
+        guard var flight = inFlight[key],
+              flight.id == flightID,
+              let waiter = flight.waiters.removeValue(forKey: waiterID) else { return }
+        if flight.waiters.isEmpty {
+            flight.isDraining = true
+            flight.task.cancel()
+        }
+        inFlight[key] = flight
+        waiter.resume(returning: Self.cancellationOutcome(resource: resource))
+    }
+
+    private func waitForDrain(
+        key: RefreshKey,
+        flightID: UUID
+    ) async -> Bool {
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard var flight = inFlight[key],
+                      flight.id == flightID,
+                      flight.isDraining else {
+                    continuation.resume(returning: true)
+                    return
+                }
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                flight.drainWaiters[waiterID] = continuation
+                inFlight[key] = flight
+            }
+        } onCancel: {
+            Task {
+                await self.cancelDrainWaiter(
+                    key: key,
+                    flightID: flightID,
+                    waiterID: waiterID
+                )
+            }
+        }
+    }
+
+    private func cancelDrainWaiter(
+        key: RefreshKey,
+        flightID: UUID,
+        waiterID: UUID
+    ) {
+        guard var flight = inFlight[key],
+              flight.id == flightID,
+              let waiter = flight.drainWaiters.removeValue(forKey: waiterID) else { return }
+        inFlight[key] = flight
+        waiter.resume(returning: false)
+    }
+
+    private func completeFlight(
+        key: RefreshKey,
+        id: UUID,
+        outcome: RefreshOutcome
+    ) {
+        guard let flight = inFlight[key], flight.id == id else { return }
+        inFlight[key] = nil
+        for waiter in flight.waiters.values {
+            waiter.resume(returning: outcome)
+        }
+        for waiter in flight.drainWaiters.values {
+            waiter.resume(returning: true)
+        }
     }
 
     private nonisolated static func performRefresh(
-        repository: any LibraryRepository,
+        repository: any LibraryRepository & RefreshSnapshotCommitting,
         downloader: any RemoteResourceDownloading,
         profileID: UUID,
         resource: RefreshResource,
@@ -111,12 +236,14 @@ public actor RefreshCoordinator {
     ) async -> RefreshOutcome {
         var resourceURL: URL?
         do {
+            try Task.checkCancellation()
             guard let profile = try await repository.profiles().first(where: { $0.id == profileID }) else {
                 throw LibraryRepositoryError.profileNotFound
             }
             let url = resource == .playlist ? profile.m3uURL : profile.epgURL
             resourceURL = url
             try await repository.recordAttempt(profileID: profileID, resource: resource, at: timestamp)
+            try Task.checkCancellation()
             guard isRemoteHTTPURL(url) else { throw CoordinatorError.unsupportedRemoteURL }
 
             let downloaded = try await downloader.download(RemoteResourceRequest(
@@ -124,6 +251,7 @@ public actor RefreshCoordinator {
                 resource: resource
             ))
             defer { try? FileManager.default.removeItem(at: downloaded.temporaryFileURL) }
+            try Task.checkCancellation()
 
             switch resource {
             case .playlist:
@@ -133,23 +261,20 @@ public actor RefreshCoordinator {
                     sourceURL: url,
                     profileID: profileID
                 )
-                try await repository.installPlaylist(
+                try Task.checkCancellation()
+                try await repository.commitPlaylistRefresh(
                     profileID: profileID,
                     channels: channels,
                     fetchedAt: timestamp
                 )
             case .epg:
-                _ = try await repository.installEPG(
+                try Task.checkCancellation()
+                _ = try await repository.commitEPGRefresh(
                     profileID: profileID,
                     fileURL: downloaded.temporaryFileURL,
                     fetchedAt: timestamp
                 )
             }
-            try await repository.recordSuccess(
-                profileID: profileID,
-                resource: resource,
-                at: timestamp
-            )
             return RefreshOutcome(resource: resource, succeeded: true, message: nil)
         } catch is CancellationError {
             let summary = "刷新已取消。"
@@ -226,11 +351,19 @@ public actor RefreshCoordinator {
     }
 
     private nonisolated static func isRemoteHTTPURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), url.host != nil else { return false }
+        guard let scheme = url.scheme?.lowercased(),
+              let host = url.host,
+              !host.isEmpty else { return false }
         return scheme == "http" || scheme == "https"
     }
 
     private nonisolated static func order(_ resource: RefreshResource) -> Int {
         resource == .playlist ? 0 : 1
+    }
+
+    private nonisolated static func cancellationOutcome(
+        resource: RefreshResource
+    ) -> RefreshOutcome {
+        RefreshOutcome(resource: resource, succeeded: false, message: "刷新已取消。")
     }
 }

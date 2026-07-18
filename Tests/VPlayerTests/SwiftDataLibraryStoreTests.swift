@@ -471,6 +471,104 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         assertInventory(try snapshotInventory(container), equals: originalInventory)
     }
 
+    func testAtomicPlaylistRefreshCommitSaveFailureRollsBackPointerAndSuccessStatus() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let original = channel(profileID: profile.id, name: "Original", path: "original")
+        let replacement = channel(profileID: profile.id, name: "Replacement", path: "replacement")
+        try await initialStore.installPlaylist(
+            profileID: profile.id,
+            channels: [original],
+            fetchedAt: date(20)
+        )
+        try await initialStore.recordSuccess(
+            profileID: profile.id,
+            resource: .playlist,
+            at: date(30)
+        )
+        try await initialStore.recordAttempt(
+            profileID: profile.id,
+            resource: .playlist,
+            at: date(40)
+        )
+        let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalInventory = try snapshotInventory(container)
+        let failingStore = makeStore(container: container, failingSave: .playlistPointer)
+
+        let error = await XCTAssertThrowsErrorAsync {
+            try await failingStore.commitPlaylistRefresh(
+                profileID: profile.id,
+                channels: [replacement],
+                fetchedAt: self.date(50)
+            )
+        }
+
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
+        XCTAssertEqual(try snapshotPointers(container, profileID: profile.id).playlist, originalPointers.playlist)
+        let activeChannels = try await failingStore.channels(profileID: profile.id)
+        let profiles = try await failingStore.profiles()
+        let currentProfile = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(activeChannels, [original])
+        XCTAssertEqual(currentProfile.m3uStatus.state, .refreshing)
+        XCTAssertEqual(currentProfile.m3uStatus.lastAttemptAt, date(40))
+        XCTAssertEqual(currentProfile.m3uStatus.lastSuccessAt, date(30))
+        assertInventory(try snapshotInventory(container), equals: originalInventory)
+    }
+
+    func testAtomicEPGRefreshCommitSaveFailureRollsBackPointerAndSuccessStatus() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let initialStore = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await initialStore.createProfile(input(name: "Home"), now: date(10))
+        let originalURL = try temporaryXML(
+            "<tv><channel id=\"original\"><display-name>Original</display-name></channel></tv>"
+        )
+        let replacementURL = try temporaryXML(
+            "<tv><channel id=\"replacement\"><display-name>Replacement</display-name></channel></tv>"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: replacementURL)
+        }
+        _ = try await initialStore.installEPG(
+            profileID: profile.id,
+            fileURL: originalURL,
+            fetchedAt: date(20)
+        )
+        try await initialStore.recordSuccess(
+            profileID: profile.id,
+            resource: .epg,
+            at: date(30)
+        )
+        try await initialStore.recordAttempt(
+            profileID: profile.id,
+            resource: .epg,
+            at: date(40)
+        )
+        let originalPointers = try snapshotPointers(container, profileID: profile.id)
+        let originalInventory = try snapshotInventory(container)
+        let failingStore = makeStore(container: container, failingSave: .epgPointer)
+
+        let error = await XCTAssertThrowsErrorAsync {
+            _ = try await failingStore.commitEPGRefresh(
+                profileID: profile.id,
+                fileURL: replacementURL,
+                fetchedAt: self.date(50)
+            )
+        }
+
+        XCTAssertEqual(error as? InjectedSaveError, .expected)
+        XCTAssertEqual(try snapshotPointers(container, profileID: profile.id).epg, originalPointers.epg)
+        let activeChannels = try await failingStore.epgChannels(profileID: profile.id)
+        let profiles = try await failingStore.profiles()
+        let currentProfile = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(activeChannels.map(\.id), ["original"])
+        XCTAssertEqual(currentProfile.epgStatus.state, .refreshing)
+        XCTAssertEqual(currentProfile.epgStatus.lastAttemptAt, date(40))
+        XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(30))
+        assertInventory(try snapshotInventory(container), equals: originalInventory)
+    }
+
     func testPlaylistCleanupSaveFailureStillReportsInstallSuccessAndDefersPurge() async throws {
         let container = try VPlayerModelContainer.make(inMemory: true)
         let initialStore = SwiftDataLibraryStore(modelContainer: container)
