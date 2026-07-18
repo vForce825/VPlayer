@@ -1,0 +1,105 @@
+name: VPlayer
+options:
+  bundleIdPrefix: com.vplayer
+  deploymentTarget:
+    tvOS: "18.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: true
+    ENABLE_USER_SCRIPT_SANDBOXING: true
+    CLANG_ENABLE_MODULES: true
+targets:
+  VPlayerCore:
+    type: framework
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources/VPlayerCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core
+        DEFINES_MODULE: true
+        GENERATE_INFOPLIST_FILE: true
+  VPlayerPlayback:
+    type: framework
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources/VPlayerPlayback
+    dependencies:
+      - target: VPlayerCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback
+        DEFINES_MODULE: true
+        GENERATE_INFOPLIST_FILE: true
+  VPlayer:
+    type: application
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources/VPlayerApp
+        excludes:
+          - Resources/Info.plist
+    dependencies:
+      - target: VPlayerCore
+      - target: VPlayerPlayback
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.app
+        PRODUCT_NAME: VPlayer
+        INFOPLIST_FILE: Sources/VPlayerApp/Resources/Info.plist
+        CODE_SIGN_STYLE: Automatic
+  VPlayerTests:
+    type: bundle.unit-test
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests/VPlayerTests
+    resources:
+      - path: Tests/Fixtures
+    dependencies:
+      - target: VPlayerCore
+      - target: VPlayerPlayback
+      - target: VPlayer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.tests
+        GENERATE_INFOPLIST_FILE: true
+  VPlayerUITests:
+    type: bundle.ui-testing
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests/VPlayerUITests
+    dependencies:
+      - target: VPlayer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.uitests
+        GENERATE_INFOPLIST_FILE: true
+        TEST_TARGET_NAME: VPlayer
+schemes:
+  VPlayer:
+    build:
+      targets:
+        VPlayerCore: all
+        VPlayerPlayback: all
+        VPlayer: all
+        VPlayerTests: [test]
+        VPlayerUITests: [test]
+    test:
+      gatherCoverageData: true
+      targets:
+        - name: VPlayerTests
+          parallelizable: true
+        - name: VPlayerUITests
+          parallelizable: false
+    run:
+      config: Debug
+    archive:
+      config: Release
