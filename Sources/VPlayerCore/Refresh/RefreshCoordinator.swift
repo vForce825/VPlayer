@@ -1,0 +1,236 @@
+// SPDX-FileCopyrightText: 2026 VPlayer contributors
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
+
+import Foundation
+
+public enum RefreshTrigger: Sendable {
+    case manual
+    case foreground
+    case background
+}
+
+public struct RefreshOutcome: Equatable, Sendable {
+    public let resource: RefreshResource
+    public let succeeded: Bool
+    public let message: String?
+
+    public init(resource: RefreshResource, succeeded: Bool, message: String?) {
+        self.resource = resource
+        self.succeeded = succeeded
+        self.message = message
+    }
+}
+
+public actor RefreshCoordinator {
+    private struct RefreshKey: Hashable, Sendable {
+        let profileID: UUID
+        let resource: RefreshResource
+    }
+
+    private struct InFlight: Sendable {
+        let id: UUID
+        let task: Task<RefreshOutcome, Never>
+    }
+
+    private enum CoordinatorError: Error, Sendable {
+        case unsupportedRemoteURL
+    }
+
+    private let repository: any LibraryRepository
+    private let downloader: any RemoteResourceDownloading
+    private let now: @Sendable () -> Date
+    private var inFlight: [RefreshKey: InFlight] = [:]
+
+    public init(
+        repository: any LibraryRepository,
+        downloader: any RemoteResourceDownloading,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
+        self.repository = repository
+        self.downloader = downloader
+        self.now = now
+    }
+
+    public func refresh(
+        profileID: UUID,
+        resources: Set<RefreshResource>,
+        trigger: RefreshTrigger
+    ) async -> [RefreshOutcome] {
+        _ = trigger
+        return await withTaskGroup(of: RefreshOutcome.self) { group in
+            for resource in resources {
+                group.addTask {
+                    await self.refreshOne(profileID: profileID, resource: resource)
+                }
+            }
+            var outcomes: [RefreshOutcome] = []
+            for await outcome in group {
+                outcomes.append(outcome)
+            }
+            return outcomes.sorted { Self.order($0.resource) < Self.order($1.resource) }
+        }
+    }
+
+    private func refreshOne(
+        profileID: UUID,
+        resource: RefreshResource
+    ) async -> RefreshOutcome {
+        let key = RefreshKey(profileID: profileID, resource: resource)
+        if let existing = inFlight[key] {
+            return await existing.task.value
+        }
+
+        let repository = repository
+        let downloader = downloader
+        let timestamp = now()
+        let id = UUID()
+        let task = Task {
+            await Self.performRefresh(
+                repository: repository,
+                downloader: downloader,
+                profileID: profileID,
+                resource: resource,
+                timestamp: timestamp
+            )
+        }
+        inFlight[key] = InFlight(id: id, task: task)
+        let outcome = await task.value
+        if inFlight[key]?.id == id {
+            inFlight[key] = nil
+        }
+        return outcome
+    }
+
+    private nonisolated static func performRefresh(
+        repository: any LibraryRepository,
+        downloader: any RemoteResourceDownloading,
+        profileID: UUID,
+        resource: RefreshResource,
+        timestamp: Date
+    ) async -> RefreshOutcome {
+        var resourceURL: URL?
+        do {
+            guard let profile = try await repository.profiles().first(where: { $0.id == profileID }) else {
+                throw LibraryRepositoryError.profileNotFound
+            }
+            let url = resource == .playlist ? profile.m3uURL : profile.epgURL
+            resourceURL = url
+            try await repository.recordAttempt(profileID: profileID, resource: resource, at: timestamp)
+            guard isRemoteHTTPURL(url) else { throw CoordinatorError.unsupportedRemoteURL }
+
+            let downloaded = try await downloader.download(RemoteResourceRequest(
+                url: url,
+                resource: resource
+            ))
+            defer { try? FileManager.default.removeItem(at: downloaded.temporaryFileURL) }
+
+            switch resource {
+            case .playlist:
+                let data = try Data(contentsOf: downloaded.temporaryFileURL)
+                let channels = try M3UParser().parse(
+                    data: data,
+                    sourceURL: url,
+                    profileID: profileID
+                )
+                try await repository.installPlaylist(
+                    profileID: profileID,
+                    channels: channels,
+                    fetchedAt: timestamp
+                )
+            case .epg:
+                _ = try await repository.installEPG(
+                    profileID: profileID,
+                    fileURL: downloaded.temporaryFileURL,
+                    fetchedAt: timestamp
+                )
+            }
+            try await repository.recordSuccess(
+                profileID: profileID,
+                resource: resource,
+                at: timestamp
+            )
+            return RefreshOutcome(resource: resource, succeeded: true, message: nil)
+        } catch is CancellationError {
+            let summary = "刷新已取消。"
+            try? await repository.recordFailure(
+                profileID: profileID,
+                resource: resource,
+                summary: summary,
+                at: timestamp
+            )
+            return RefreshOutcome(resource: resource, succeeded: false, message: summary)
+        } catch RemoteDownloadError.cancelled {
+            let summary = "刷新已取消。"
+            try? await repository.recordFailure(
+                profileID: profileID,
+                resource: resource,
+                summary: summary,
+                at: timestamp
+            )
+            return RefreshOutcome(resource: resource, succeeded: false, message: summary)
+        } catch {
+            let summary = sanitizedSummary(error: error, url: resourceURL)
+            try? await repository.recordFailure(
+                profileID: profileID,
+                resource: resource,
+                summary: summary,
+                at: timestamp
+            )
+            return RefreshOutcome(resource: resource, succeeded: false, message: summary)
+        }
+    }
+
+    private nonisolated static func sanitizedSummary(error: any Error, url: URL?) -> String {
+        let reason: String
+        switch error {
+        case RemoteDownloadError.invalidResponse:
+            reason = "服务器返回了无效响应。"
+        case let RemoteDownloadError.httpStatus(status):
+            reason = "服务器返回 HTTP \(status)。"
+        case let RemoteDownloadError.responseTooLarge(limit):
+            reason = "下载内容超过大小限制（\(limit) 字节）。"
+        case CoordinatorError.unsupportedRemoteURL:
+            reason = "仅支持 HTTP 或 HTTPS 远程资源。"
+        case LibraryRepositoryError.profileNotFound:
+            reason = "找不到源配置。"
+        case is M3UParserError, is PlaylistTextDecodingError:
+            reason = "播放列表格式无效。"
+        case is XMLTVParserError, LibraryRepositoryError.epgHasNoChannels:
+            reason = "EPG 格式无效。"
+        default:
+            if let url, isNetworkError(error) {
+                reason = NetworkFailureMapper.map(error, for: url).message
+            } else {
+                reason = "资源处理失败。"
+            }
+        }
+
+        let summary: String
+        if let url {
+            summary = "刷新 \(RedactedURL.string(url)) 失败：\(reason)"
+        } else {
+            summary = "刷新失败：\(reason)"
+        }
+        return String(summary.prefix(240))
+    }
+
+    private nonisolated static func isNetworkError(_ error: any Error) -> Bool {
+        let nsError = error as NSError
+        if error is URLError
+            || nsError.domain == NSURLErrorDomain
+            || nsError.domain == NSPOSIXErrorDomain {
+            return true
+        }
+        return nsError.userInfo[NSUnderlyingErrorKey] != nil
+    }
+
+    private nonisolated static func isRemoteHTTPURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), url.host != nil else { return false }
+        return scheme == "http" || scheme == "https"
+    }
+
+    private nonisolated static func order(_ resource: RefreshResource) -> Int {
+        resource == .playlist ? 0 : 1
+    }
+}
