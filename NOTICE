@@ -1,0 +1,14 @@
+VPlayer
+Copyright (C) 2026 VPlayer contributors
+
+VPlayer is free software licensed under GNU General Public License
+version 3 only (GPL-3.0-only). The unmodified license text is in LICENSE.
+
+Distribution through an Apple App Store is additionally permitted only
+under LICENSE.APPSTORE-EXCEPTION. That file is a project-specific
+exception, not a standard SPDX exception identifier and not permission
+to distribute closed-source versions.
+
+Third-party components retain their own copyright and license terms; see
+THIRD_PARTY_NOTICES and the reproducible dependency/build records shipped
+with each release.

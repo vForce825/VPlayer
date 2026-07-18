@@ -1,0 +1,9 @@
+# Local-only design and planning documents
+/docs/
+/.superpowers/
+
+# macOS and Xcode user state
+.DS_Store
+DerivedData/
+xcuserdata/
+*.xcuserstate

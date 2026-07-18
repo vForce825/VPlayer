@@ -1,0 +1,9 @@
+VPlayer Third-Party Notices
+
+Phase 1 distributes no third-party runtime source or binary component.
+XcodeGen and Mint are development-only tools and are not linked into or
+distributed inside the VPlayer application.
+
+Before adding FFmpeg or derived YADIF material, record the project URL,
+exact revision, license, local modifications, build configuration, and
+required relinking/source materials in this file.

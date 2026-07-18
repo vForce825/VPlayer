@@ -1,0 +1,24 @@
+VPlayer App Store Distribution Exception, version 1.0
+
+As a special exception to GNU General Public License version 3, the
+copyright holders of VPlayer give you permission to convey an unmodified
+or modified copy of VPlayer through an application distribution service
+operated by Apple Inc. (an “Apple App Store”), even if that service's
+mandatory signing, digital rights management, or contractual conditions
+would otherwise conflict with GPLv3 sections 6 or 10.
+
+This exception applies only to restrictions that Apple requires as a
+condition of distribution through an Apple App Store. It does not grant
+permission to make VPlayer proprietary, to withhold Corresponding Source,
+to add restrictions outside that distribution channel, or to relicense
+VPlayer under different terms. You must comply with GPLv3 in every other
+respect, including providing the complete Corresponding Source and all
+installation information required by GPLv3.
+
+This exception does not alter the license obligations of any third-party
+component. In particular, it does not change the terms of FFmpeg or any
+other separately licensed dependency.
+
+If you modify VPlayer, you may extend this exception to your version, but
+you are not required to do so. If you do not wish to extend it, delete this
+exception statement from your version.
