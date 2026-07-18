@@ -8,6 +8,7 @@ import Foundation
 actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     enum InjectedError: Error, Sendable {
         case refreshCommit
+        case recordAttempt
         case recordFailure
         case read
     }
@@ -74,6 +75,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var blockedMappingWriteContinuation: CheckedContinuation<Void, Never>?
     private var mappingWriteReleaseContinuation: CheckedContinuation<Void, Never>?
     private let failedRefreshCommits: Set<RefreshResource>
+    private let failsRecordAttempt: Bool
     private let failsRecordFailure: Bool
 
     init(
@@ -84,6 +86,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         programmes: [UUID: [Programme]] = [:],
         manualMappings: [UUID: [String: String]] = [:],
         failedRefreshCommits: Set<RefreshResource> = [],
+        failsRecordAttempt: Bool = false,
         failsRecordFailure: Bool = false
     ) {
         storedProfiles = profiles
@@ -93,6 +96,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         storedProgrammes = programmes
         storedManualMappings = manualMappings
         self.failedRefreshCommits = failedRefreshCommits
+        self.failsRecordAttempt = failsRecordAttempt
         self.failsRecordFailure = failsRecordFailure
     }
 
@@ -434,6 +438,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     }
 
     func recordAttempt(profileID: UUID, resource: RefreshResource, at: Date) throws {
+        guard !failsRecordAttempt else { throw InjectedError.recordAttempt }
         let index = try profileIndex(profileID)
         updateStatus(index: index, resource: resource) { status in
             status.lastAttemptAt = at

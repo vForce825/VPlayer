@@ -623,6 +623,185 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
     }
 
+    func testRealCoordinatorFailureOverlaySurvivesOldTerminalRepositoryTruth() async {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let priorAt = startedAt.addingTimeInterval(-600)
+        let scenarios: [(name: String, status: ResourceRefreshStatus)] = [
+            (
+                "succeeded",
+                ResourceRefreshStatus(
+                    lastAttemptAt: priorAt,
+                    lastSuccessAt: priorAt,
+                    state: .succeeded
+                )
+            ),
+            (
+                "failed",
+                ResourceRefreshStatus(
+                    lastAttemptAt: priorAt,
+                    state: .failed,
+                    errorSummary: "prior terminal failure"
+                )
+            )
+        ]
+
+        for scenario in scenarios {
+            let clock = AppModelTestClock(startedAt)
+            var profile = makeProfile(
+                id: "00000000-0000-0000-0000-000000000001",
+                name: "Source",
+                now: startedAt
+            )
+            profile.m3uStatus = scenario.status
+            let repository = RepositorySpy(
+                profiles: [profile],
+                failsRecordAttempt: true,
+                failsRecordFailure: true
+            )
+            let coordinator = RefreshCoordinator(
+                repository: repository,
+                downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+                now: { clock.value }
+            )
+            let model = AppModel(
+                repository: repository,
+                refresh: { profileID, resources, trigger in
+                    await coordinator.refresh(
+                        profileID: profileID,
+                        resources: resources,
+                        trigger: trigger
+                    )
+                },
+                now: { clock.value }
+            )
+
+            await model.reload()
+            await model.refresh(profileID: profile.id, resource: .playlist)
+            let currentFailure = model.profiles.first?.m3uStatus.errorSummary
+
+            let snapshot = await repository.snapshot()
+            XCTAssertEqual(snapshot.profiles.first?.m3uStatus, scenario.status, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed, scenario.name)
+            XCTAssertNotNil(currentFailure, scenario.name)
+            XCTAssertNotEqual(currentFailure, scenario.status.errorSummary, scenario.name)
+
+            clock.value = startedAt.addingTimeInterval(3_600)
+            let firstLaterReloadSucceeded = await model.reload()
+            let secondLaterReloadSucceeded = await model.reload()
+            XCTAssertTrue(firstLaterReloadSucceeded, scenario.name)
+            XCTAssertTrue(secondLaterReloadSucceeded, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, currentFailure, scenario.name)
+            XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt, scenario.name)
+        }
+    }
+
+    func testSynthesizedFailureOverlaysSurviveOldTerminalRepositoryTruth() async {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let priorAt = startedAt.addingTimeInterval(-600)
+        let scenarios: [(name: String, status: ResourceRefreshStatus, outcomes: [RefreshOutcome])] = [
+            (
+                "empty over succeeded",
+                ResourceRefreshStatus(
+                    lastAttemptAt: priorAt,
+                    lastSuccessAt: priorAt,
+                    state: .succeeded
+                ),
+                []
+            ),
+            (
+                "wrong resource over failed",
+                ResourceRefreshStatus(
+                    lastAttemptAt: priorAt,
+                    state: .failed,
+                    errorSummary: "prior terminal failure"
+                ),
+                [RefreshOutcome(resource: .epg, succeeded: true, message: nil)]
+            )
+        ]
+
+        for scenario in scenarios {
+            var profile = makeProfile(
+                id: "00000000-0000-0000-0000-000000000001",
+                name: "Source",
+                now: startedAt
+            )
+            profile.m3uStatus = scenario.status
+            let repository = RepositorySpy(profiles: [profile])
+            let model = AppModel(
+                repository: repository,
+                refresh: { _, _, _ in scenario.outcomes },
+                now: { startedAt }
+            )
+
+            await model.reload()
+            await model.refresh(profileID: profile.id, resource: .playlist)
+            let laterReloadSucceeded = await model.reload()
+            XCTAssertTrue(laterReloadSucceeded, scenario.name)
+
+            XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed, scenario.name)
+            XCTAssertEqual(
+                model.profiles.first?.m3uStatus.errorSummary,
+                "刷新未完成，请稍后重试。",
+                scenario.name
+            )
+            XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt, scenario.name)
+        }
+    }
+
+    func testCurrentCancellationOverlaySurvivesOldTerminalRepositoryTruth() async {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let priorAt = startedAt.addingTimeInterval(-600)
+        let clock = AppModelTestClock(startedAt)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: startedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: priorAt,
+            lastSuccessAt: priorAt,
+            state: .succeeded
+        )
+        let repository = RepositorySpy(profiles: [profile])
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: clock.value,
+                    recordsAttempt: false
+                )
+            },
+            now: { clock.value }
+        )
+
+        await model.reload()
+        let refresh = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+        refresh.cancel()
+        await gate.release(resource: .playlist, ordinal: 1, result: .cancellation)
+        await refresh.value
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+        clock.value = startedAt.addingTimeInterval(3_600)
+        let firstLaterReloadSucceeded = await model.reload()
+        let secondLaterReloadSucceeded = await model.reload()
+        XCTAssertTrue(firstLaterReloadSucceeded)
+        XCTAssertTrue(secondLaterReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+        XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt)
+    }
+
     func testManualRefreshTerminalOverlayKeepsOriginalCompletionTimeAcrossLaterReloads() async {
         let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
         let clock = AppModelTestClock(startedAt)
@@ -1586,18 +1765,21 @@ private actor AppModelConcurrentRefreshGate {
         repository: RepositorySpy,
         profileID: UUID,
         resources: Set<RefreshResource>,
-        now: Date
+        now: Date,
+        recordsAttempt: Bool = true
     ) async -> [RefreshOutcome] {
         guard let resource = resources.first else { return [] }
         let ordinal = invocationCounts[resource, default: 0] + 1
         invocationCounts[resource] = ordinal
         let key = Key(resource: resource, ordinal: ordinal)
         let attemptAt = now.addingTimeInterval(TimeInterval(ordinal))
-        try? await repository.recordAttempt(
-            profileID: profileID,
-            resource: resource,
-            at: attemptAt
-        )
+        if recordsAttempt {
+            try? await repository.recordAttempt(
+                profileID: profileID,
+                resource: resource,
+                at: attemptAt
+            )
+        }
 
         started.insert(key)
         for waiter in startWaiters.removeValue(forKey: key) ?? [] {

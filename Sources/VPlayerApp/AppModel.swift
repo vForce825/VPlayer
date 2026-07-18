@@ -603,12 +603,12 @@ final class AppModel {
                 terminalRefreshOverlays[key] = nil
                 continue
             }
-            let persistedState = switch key.resource {
-            case .playlist: profiles[index].m3uStatus.state
-            case .epg: profiles[index].epgStatus.state
+            let persistedStatus = switch key.resource {
+            case .playlist: profiles[index].m3uStatus
+            case .epg: profiles[index].epgStatus
             }
-            if (persistedState == .succeeded || persistedState == .failed),
-               overlayIDsAtReloadStart[key] == overlay.id {
+            if overlayIDsAtReloadStart[key] == overlay.id,
+               Self.isTerminalStatus(persistedStatus, freshSince: overlay.startedAt) {
                 terminalRefreshOverlays[key] = nil
                 continue
             }
@@ -628,6 +628,20 @@ final class AppModel {
                     to: &profiles[index].epgStatus
                 )
             }
+        }
+    }
+
+    private static func isTerminalStatus(
+        _ status: ResourceRefreshStatus,
+        freshSince startedAt: Date
+    ) -> Bool {
+        switch status.state {
+        case .succeeded:
+            status.lastSuccessAt.map { $0 >= startedAt } ?? false
+        case .failed:
+            status.lastAttemptAt.map { $0 >= startedAt } ?? false
+        case .never, .refreshing:
+            false
         }
     }
 
