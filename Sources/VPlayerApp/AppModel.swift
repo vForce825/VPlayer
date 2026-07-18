@@ -36,6 +36,8 @@ final class AppModel {
     private var manualMappingByChannelID: [String: String] = [:]
     private var reloadID: UUID?
     private var pendingCreation: PendingCreation?
+    private var activeCreationAttemptIDs: Set<UUID> = []
+    private var cancelledCreationAttemptIDs: Set<UUID> = []
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private var alertKind = AlertKind.operation
 
@@ -146,27 +148,71 @@ final class AppModel {
     }
 
     @discardableResult
-    func create(input: SourceProfileInput) async -> Bool {
+    func create(input: SourceProfileInput, attemptID: UUID) async -> Bool {
+        activeCreationAttemptIDs.insert(attemptID)
+        defer {
+            activeCreationAttemptIDs.remove(attemptID)
+            cancelledCreationAttemptIDs.remove(attemptID)
+        }
         do {
             let validatedInput = try input.validated()
             let createdProfile: SourceProfile
-            if let pendingCreation, pendingCreation.input == validatedInput {
-                createdProfile = pendingCreation.profile
+            if let pendingCreation, pendingCreation.attemptID == attemptID {
+                let updatedAt = now()
+                try await repository.updateProfile(
+                    id: pendingCreation.profile.id,
+                    input: validatedInput,
+                    now: updatedAt
+                )
+                createdProfile = Self.updatedProfile(
+                    pendingCreation.profile,
+                    input: validatedInput,
+                    updatedAt: updatedAt
+                )
             } else {
                 createdProfile = try await repository.createProfile(validatedInput, now: now())
-                pendingCreation = PendingCreation(input: validatedInput, profile: createdProfile)
             }
+            guard !cancelledCreationAttemptIDs.contains(attemptID) else {
+                reconcileCreatedProfile(createdProfile)
+                _ = await reload()
+                return false
+            }
+            pendingCreation = PendingCreation(attemptID: attemptID, profile: createdProfile)
             reconcileCreatedProfile(createdProfile)
             guard await reload() else {
+                guard !cancelledCreationAttemptIDs.contains(attemptID) else {
+                    pendingCreation = nil
+                    return false
+                }
                 reconcileCreatedProfile(createdProfile)
                 presentOperationMessage("数据源已保存，但界面未能重新读取。请重试；再次保存不会重复创建。")
                 return false
             }
-            pendingCreation = nil
+            guard !cancelledCreationAttemptIDs.contains(attemptID) else {
+                pendingCreation = nil
+                return false
+            }
+            guard profiles.contains(where: { $0.id == createdProfile.id }) else {
+                pendingCreation = nil
+                presentOperationMessage("数据源已保存，但已无法在资料库中找到。请重新添加。")
+                return false
+            }
+            if pendingCreation?.attemptID == attemptID {
+                pendingCreation = nil
+            }
             return true
         } catch {
             presentOperationError(error)
             return false
+        }
+    }
+
+    func cancelCreateAttempt(_ attemptID: UUID) {
+        if activeCreationAttemptIDs.contains(attemptID) {
+            cancelledCreationAttemptIDs.insert(attemptID)
+        }
+        if pendingCreation?.attemptID == attemptID {
+            pendingCreation = nil
         }
     }
 
@@ -176,6 +222,7 @@ final class AppModel {
             let validatedInput = try input.validated()
             let updatedAt = now()
             try await repository.updateProfile(id: profileID, input: validatedInput, now: updatedAt)
+            clearPendingCreation(profileID: profileID)
             reconcileUpdatedProfile(id: profileID, input: validatedInput, updatedAt: updatedAt)
             guard await reload() else {
                 reconcileUpdatedProfile(id: profileID, input: validatedInput, updatedAt: updatedAt)
@@ -198,9 +245,7 @@ final class AppModel {
         }
         do {
             try await repository.deleteProfile(id: profileID)
-            if pendingCreation?.profile.id == profileID {
-                pendingCreation = nil
-            }
+            clearPendingCreation(profileID: profileID)
             profiles.removeAll { $0.id == profileID }
             if deletedActiveProfile {
                 clearActiveBoundState()
@@ -257,20 +302,32 @@ final class AppModel {
         _ = await reload()
     }
 
-    func saveMapping(channel: Channel, xmltvChannelID: String?) async {
-        guard activeProfile?.id == channel.sourceProfileID else {
-            presentOperationMessage("当前数据源已更改，请重试。")
-            return
+    @discardableResult
+    func saveMapping(channel: Channel, xmltvChannelID: String?) async -> Bool {
+        guard isCurrentMappingTarget(channel) else {
+            await rejectStaleMappingTarget()
+            return false
         }
         do {
-            try await repository.setManualMapping(
+            let persisted = try await repository.setManualMappingIfCurrentChannel(
                 profileID: channel.sourceProfileID,
                 channelID: channel.id,
                 xmltvChannelID: xmltvChannelID
             )
-            await reload()
+            guard persisted else {
+                await rejectStaleMappingTarget()
+                return false
+            }
+            guard await reload() else {
+                presentOperationMessage("映射已保存，但界面未能重新读取。请稍后重试。")
+                return false
+            }
+            return true
         } catch {
             presentOperationError(error)
+            _ = await reload()
+            presentOperationMessage("无法保存映射，请刷新频道后重试。")
+            return false
         }
     }
 
@@ -334,6 +391,10 @@ final class AppModel {
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
+        if let pendingCreation,
+           !profiles.contains(where: { $0.id == pendingCreation.profile.id }) {
+            self.pendingCreation = nil
+        }
         finishLoading(reloadID: currentReloadID)
         return true
     }
@@ -406,6 +467,26 @@ final class AppModel {
         }
     }
 
+    private func clearPendingCreation(profileID: UUID) {
+        guard pendingCreation?.profile.id == profileID else { return }
+        pendingCreation = nil
+    }
+
+    private static func updatedProfile(
+        _ profile: SourceProfile,
+        input: ValidatedSourceProfileInput,
+        updatedAt: Date
+    ) -> SourceProfile {
+        var profile = profile
+        profile.name = input.name
+        profile.m3uURL = input.m3uURL
+        profile.epgURL = input.epgURL
+        profile.m3uRefreshInterval = input.m3uRefreshInterval
+        profile.epgRefreshInterval = input.epgRefreshInterval
+        profile.updatedAt = updatedAt
+        return profile
+    }
+
     private func reconcileUpdatedProfile(
         id: UUID,
         input: ValidatedSourceProfileInput,
@@ -455,6 +536,19 @@ final class AppModel {
         alertKind = .operation
         alertMessage = message
     }
+
+    private func isCurrentMappingTarget(_ channel: Channel) -> Bool {
+        !isLoading
+            && activeProfile?.id == channel.sourceProfileID
+            && channels.contains(where: {
+                $0.id == channel.id && $0.sourceProfileID == channel.sourceProfileID
+            })
+    }
+
+    private func rejectStaleMappingTarget() async {
+        _ = await reload()
+        presentOperationMessage("频道列表已更改，请重新选择频道后再保存映射。")
+    }
 }
 
 private extension AppModel {
@@ -464,7 +558,7 @@ private extension AppModel {
     }
 
     struct PendingCreation {
-        let input: ValidatedSourceProfileInput
+        let attemptID: UUID
         let profile: SourceProfile
     }
 }

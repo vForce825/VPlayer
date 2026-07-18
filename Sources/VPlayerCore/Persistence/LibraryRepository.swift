@@ -24,6 +24,12 @@ public protocol LibraryRepository: Sendable {
         channelID: String,
         xmltvChannelID: String?
     ) async throws
+    /// Persists only when the profile is active and the channel belongs to its current playlist snapshot.
+    func setManualMappingIfCurrentChannel(
+        profileID: UUID,
+        channelID: String,
+        xmltvChannelID: String?
+    ) async throws -> Bool
     func installPlaylist(profileID: UUID, channels: [Channel], fetchedAt: Date) async throws
     func installEPG(
         profileID: UUID,

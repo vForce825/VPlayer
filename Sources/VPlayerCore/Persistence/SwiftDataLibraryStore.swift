@@ -201,6 +201,32 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         }
     }
 
+    public func setManualMappingIfCurrentChannel(
+        profileID: UUID,
+        channelID: String,
+        xmltvChannelID: String?
+    ) throws -> Bool {
+        guard try stateRecord()?.activeProfileID == profileID,
+              let snapshotID = try profileRecord(id: profileID).playlistSnapshotID else {
+            return false
+        }
+        let expectedProfileID = profileID
+        let expectedChannelID = channelID
+        var descriptor = FetchDescriptor<ChannelRecord>(predicate: #Predicate {
+            $0.snapshotID == snapshotID
+                && $0.sourceProfileID == expectedProfileID
+                && $0.stableID == expectedChannelID
+        })
+        descriptor.fetchLimit = 1
+        guard try !modelContext.fetch(descriptor).isEmpty else { return false }
+        try setManualMapping(
+            profileID: profileID,
+            channelID: channelID,
+            xmltvChannelID: xmltvChannelID
+        )
+        return true
+    }
+
     public func installPlaylist(
         profileID: UUID,
         channels: [Channel],

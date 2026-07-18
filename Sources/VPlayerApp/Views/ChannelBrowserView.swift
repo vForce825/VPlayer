@@ -12,27 +12,37 @@ struct ChannelBrowserView: View {
 
     var body: some View {
         Group {
-            if model.isLoading && model.profiles.isEmpty {
+            switch contentState {
+            case .loading:
                 ProgressView("正在读取频道…")
-            } else if model.activeProfile == nil {
+                    .accessibilityIdentifier("channel.loading")
+            case .noSource:
                 ContentUnavailableView(
                     "还没有数据源",
                     systemImage: "externaldrive.badge.plus",
                     description: Text("请前往“数据源”添加 M3U 和 EPG 地址。")
                 )
-            } else if model.channels.isEmpty {
+            case .noChannels:
                 ContentUnavailableView(
                     "没有频道",
                     systemImage: "tv.slash",
                     description: Text("请在“数据源”中刷新播放列表。")
                 )
-            } else {
+            case .channels:
                 channelList
             }
         }
         .sheet(item: $mappingChannel) { channel in
             ChannelEPGMappingView(model: model, channel: channel)
         }
+    }
+
+    private var contentState: ChannelBrowserContentState {
+        ChannelBrowserContentState.resolve(
+            isLoading: model.isLoading,
+            hasActiveProfile: model.activeProfile != nil,
+            hasChannels: !model.channels.isEmpty
+        )
     }
 
     private var channelList: some View {
@@ -80,6 +90,24 @@ struct ChannelBrowserView: View {
 
     private func channelIdentifier(_ channel: Channel) -> String {
         channel.attributes["ui-test-id"] ?? "channel.\(channel.id)"
+    }
+}
+
+enum ChannelBrowserContentState: Equatable {
+    case loading
+    case noSource
+    case noChannels
+    case channels
+
+    static func resolve(
+        isLoading: Bool,
+        hasActiveProfile: Bool,
+        hasChannels: Bool
+    ) -> Self {
+        if isLoading { return .loading }
+        if !hasActiveProfile { return .noSource }
+        if !hasChannels { return .noChannels }
+        return .channels
     }
 }
 

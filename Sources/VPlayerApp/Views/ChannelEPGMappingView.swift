@@ -94,10 +94,15 @@ struct ChannelEPGMappingView: View {
     private func save() {
         isSaving = true
         Task {
-            await model.saveMapping(channel: channel, xmltvChannelID: selection)
+            let succeeded = await model.saveMapping(
+                channel: channel,
+                xmltvChannelID: selection
+            )
             guard !Task.isCancelled else { return }
             isSaving = false
-            dismiss()
+            if succeeded {
+                dismiss()
+            }
         }
     }
 }

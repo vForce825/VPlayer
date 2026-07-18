@@ -23,6 +23,8 @@ public struct RefreshOutcome: Equatable, Sendable {
 }
 
 public actor RefreshCoordinator {
+    public typealias PersistedOutcomeHandler = @Sendable (UUID, RefreshOutcome) async -> Void
+
     private struct RefreshKey: Hashable, Sendable {
         let profileID: UUID
         let resource: RefreshResource
@@ -40,19 +42,27 @@ public actor RefreshCoordinator {
         case unsupportedRemoteURL
     }
 
+    private struct PerformedRefresh: Sendable {
+        let outcome: RefreshOutcome
+        let didPersistTerminalStatus: Bool
+    }
+
     private let repository: any LibraryRepository & RefreshSnapshotCommitting
     private let downloader: any RemoteResourceDownloading
     private let now: @Sendable () -> Date
+    private let onPersistedOutcome: PersistedOutcomeHandler?
     private var inFlight: [RefreshKey: InFlight] = [:]
 
     public init(
         repository: any LibraryRepository & RefreshSnapshotCommitting,
         downloader: any RemoteResourceDownloading,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        onPersistedOutcome: PersistedOutcomeHandler? = nil
     ) {
         self.repository = repository
         self.downloader = downloader
         self.now = now
+        self.onPersistedOutcome = onPersistedOutcome
     }
 
     public func refresh(
@@ -98,18 +108,22 @@ public actor RefreshCoordinator {
         } else {
             let repository = repository
             let downloader = downloader
+            let onPersistedOutcome = onPersistedOutcome
             let timestamp = now()
             let id = UUID()
             let task = Task {
-                let outcome = await Self.performRefresh(
+                let performed = await Self.performRefresh(
                     repository: repository,
                     downloader: downloader,
                     profileID: profileID,
                     resource: resource,
                     timestamp: timestamp
                 )
-                self.completeFlight(key: key, id: id, outcome: outcome)
-                return outcome
+                if performed.didPersistTerminalStatus, let onPersistedOutcome {
+                    await onPersistedOutcome(profileID, performed.outcome)
+                }
+                self.completeFlight(key: key, id: id, outcome: performed.outcome)
+                return performed.outcome
             }
             inFlight[key] = InFlight(
                 id: id,
@@ -233,7 +247,7 @@ public actor RefreshCoordinator {
         profileID: UUID,
         resource: RefreshResource,
         timestamp: Date
-    ) async -> RefreshOutcome {
+    ) async -> PerformedRefresh {
         var resourceURL: URL?
         do {
             try Task.checkCancellation()
@@ -275,34 +289,69 @@ public actor RefreshCoordinator {
                     fetchedAt: timestamp
                 )
             }
-            return RefreshOutcome(resource: resource, succeeded: true, message: nil)
+            return PerformedRefresh(
+                outcome: RefreshOutcome(resource: resource, succeeded: true, message: nil),
+                didPersistTerminalStatus: true
+            )
         } catch is CancellationError {
             let summary = "刷新已取消。"
-            try? await repository.recordFailure(
+            let persisted = await recordFailure(
+                repository: repository,
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
                 at: timestamp
             )
-            return RefreshOutcome(resource: resource, succeeded: false, message: summary)
+            return PerformedRefresh(
+                outcome: RefreshOutcome(resource: resource, succeeded: false, message: summary),
+                didPersistTerminalStatus: persisted
+            )
         } catch RemoteDownloadError.cancelled {
             let summary = "刷新已取消。"
-            try? await repository.recordFailure(
+            let persisted = await recordFailure(
+                repository: repository,
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
                 at: timestamp
             )
-            return RefreshOutcome(resource: resource, succeeded: false, message: summary)
+            return PerformedRefresh(
+                outcome: RefreshOutcome(resource: resource, succeeded: false, message: summary),
+                didPersistTerminalStatus: persisted
+            )
         } catch {
             let summary = sanitizedSummary(error: error, url: resourceURL)
-            try? await repository.recordFailure(
+            let persisted = await recordFailure(
+                repository: repository,
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
                 at: timestamp
             )
-            return RefreshOutcome(resource: resource, succeeded: false, message: summary)
+            return PerformedRefresh(
+                outcome: RefreshOutcome(resource: resource, succeeded: false, message: summary),
+                didPersistTerminalStatus: persisted
+            )
+        }
+    }
+
+    private nonisolated static func recordFailure(
+        repository: any LibraryRepository,
+        profileID: UUID,
+        resource: RefreshResource,
+        summary: String,
+        at timestamp: Date
+    ) async -> Bool {
+        do {
+            try await repository.recordFailure(
+                profileID: profileID,
+                resource: resource,
+                summary: summary,
+                at: timestamp
+            )
+            return true
+        } catch {
+            return false
         }
     }
 

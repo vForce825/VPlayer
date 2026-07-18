@@ -128,7 +128,7 @@ final class AppModelTests: XCTestCase {
         }
     }
 
-    func testLifecycleRefreshSignalReloadsVisibleChannelsWithoutManualUIAction() async {
+    func testPersistenceTerminalSignalReloadsVisibleChannelsWithoutManualUIAction() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
         let oldChannel = makeChannel(profileID: profile.id, url: "https://example.test/old", tvgID: nil, order: 0)
@@ -144,22 +144,30 @@ final class AppModelTests: XCTestCase {
             libraryChanges: changes,
             now: { now }
         )
-        let lifecycleRefresh = AppDependencies.notifyingRefresh(
-            { _, resources, _ in
-                await repository.replaceChannels(profileID: profile.id, channels: [refreshedChannel])
-                return resources.map { RefreshOutcome(resource: $0, succeeded: true, message: nil) }
-            },
-            libraryChanges: changes
+        let downloader = AppModelRefreshDownloader(
+            payload: Data("""
+            #EXTM3U
+            #EXTINF:-1,Refreshed
+            https://example.test/new
+            """.utf8)
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { now },
+            onPersistedOutcome: { _, _ in
+                await MainActor.run { changes.notify() }
+            }
         )
 
         await model.reload()
-        _ = await lifecycleRefresh(profile.id, [.playlist], .foreground)
-        await eventually { model.channels == [refreshedChannel] }
+        _ = await coordinator.refresh(profileID: profile.id, resources: [.playlist], trigger: .foreground)
+        await eventually { model.channels.map(\.streamURL) == [refreshedChannel.streamURL] }
 
-        XCTAssertEqual(model.channels, [refreshedChannel])
+        XCTAssertEqual(model.channels.map(\.streamURL), [refreshedChannel.streamURL])
     }
 
-    func testLifecycleFailureSignalReloadsVisibleRefreshStatus() async {
+    func testPersistenceTerminalSignalReloadsVisibleFailureStatus() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
         let repository = RepositorySpy(profiles: [profile])
@@ -170,29 +178,23 @@ final class AppModelTests: XCTestCase {
             libraryChanges: changes,
             now: { now }
         )
-        let lifecycleRefresh = AppDependencies.notifyingRefresh(
-            { _, resources, _ in
-                try? await repository.recordFailure(
-                    profileID: profile.id,
-                    resource: .playlist,
-                    summary: "后台刷新失败。",
-                    at: now
-                )
-                return resources.map {
-                    RefreshOutcome(resource: $0, succeeded: false, message: "后台刷新失败。")
-                }
-            },
-            libraryChanges: changes
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { now },
+            onPersistedOutcome: { _, _ in
+                await MainActor.run { changes.notify() }
+            }
         )
 
         await model.reload()
-        _ = await lifecycleRefresh(profile.id, [.playlist], .background)
+        _ = await coordinator.refresh(profileID: profile.id, resources: [.playlist], trigger: .background)
         await eventually { model.profiles.first?.m3uStatus.state == .failed }
 
-        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "后台刷新失败。")
+        XCTAssertNotNil(model.profiles.first?.m3uStatus.errorSummary)
     }
 
-    func testCancelledLifecycleOutcomeStillSignalsPersistedFailure() async {
+    func testCancelledLifecycleReloadOccursOnlyAfterTerminalFailureIsPersisted() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
         let repository = RepositorySpy(profiles: [profile])
@@ -203,30 +205,36 @@ final class AppModelTests: XCTestCase {
             libraryChanges: changes,
             now: { now }
         )
-        let lifecycleRefresh = AppDependencies.notifyingRefresh(
-            { _, resources, _ in
-                try? await repository.recordFailure(
-                    profileID: profile.id,
-                    resource: .playlist,
-                    summary: "刷新已取消。",
-                    at: now
-                )
-                return resources.map {
-                    RefreshOutcome(resource: $0, succeeded: false, message: "刷新已取消。")
-                }
-            },
-            libraryChanges: changes
+        let downloader = AppModelRefreshDownloader(gatesCancellation: true)
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { now },
+            onPersistedOutcome: { _, _ in
+                await MainActor.run { changes.notify() }
+            }
         )
 
         await model.reload()
         let lifecycleTask = Task {
-            await lifecycleRefresh(profile.id, [.playlist], .background)
+            await coordinator.refresh(profileID: profile.id, resources: [.playlist], trigger: .background)
         }
+        await downloader.waitUntilStarted()
         lifecycleTask.cancel()
-        _ = await lifecycleTask.value
+        let promptOutcomes = await lifecycleTask.value
+        let promptOutcome = try XCTUnwrap(promptOutcomes.first)
+        XCTAssertEqual(promptOutcome.message, "刷新已取消。")
+        await downloader.waitUntilCancellationIsBlocked()
+
+        XCTAssertEqual(changes.generation, 0)
+        XCTAssertNotEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+
+        await downloader.releaseCancellation()
         await eventually { model.profiles.first?.m3uStatus.state == .failed }
 
         XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+        let snapshot = await repository.snapshot()
+        XCTAssertFalse(snapshot.profileReadPlaylistStates.contains(.refreshing))
     }
 
     func testLibraryChangeObservationDoesNotRetainModelAndStaleReloadCannotOverwriteNewerState() async {
@@ -259,7 +267,65 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(weakModel)
     }
 
-    func testCreateAndUpdateReportReconciliationFailureWithoutDuplicatingCreateRetry() async {
+    func testLibraryChangeNotificationsDuringReloadCoalesceToOneLatestFollowUp() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let channel = makeChannel(profileID: profile.id, url: "https://example.test/live", tvgID: nil, order: 0)
+        let repository = RepositorySpy(profiles: [profile], channels: [profile.id: [channel]])
+        let changes = LibraryChangeSignal()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            libraryChanges: changes,
+            now: { now }
+        )
+
+        await model.reload()
+        await repository.gateNextChannelRead()
+        changes.notify()
+        await repository.waitUntilChannelReadIsBlocked()
+
+        await repository.gateNextChannelRead()
+        for _ in 0..<1_000 {
+            changes.notify()
+        }
+        await repository.releaseChannelRead()
+        await repository.waitUntilChannelReadIsBlocked()
+
+        var snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileLookupCount, 3)
+
+        await repository.gateNextChannelRead()
+        await repository.releaseChannelRead()
+        try await Task.sleep(for: .milliseconds(100))
+        snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileLookupCount, 3)
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.channels, [channel])
+
+        if snapshot.profileLookupCount > 3 {
+            await repository.releaseChannelRead()
+        }
+    }
+
+    func testLibraryChangeStreamCatchesUpAndBuffersOnlyNewestGeneration() async {
+        let changes = LibraryChangeSignal()
+        changes.notify()
+        let stream = changes.changes(after: 0)
+        var iterator = stream.makeAsyncIterator()
+
+        let catchUpGeneration = await iterator.next()
+        XCTAssertEqual(catchUpGeneration, 1)
+
+        for _ in 0..<1_000 {
+            changes.notify()
+        }
+        let newestGeneration = await iterator.next()
+        XCTAssertEqual(newestGeneration, changes.generation)
+        XCTAssertEqual(newestGeneration, 1_001)
+    }
+
+    func testCreateRetryIdentityUpdatesCommittedProfileWhenInputChanges() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let repository = RepositorySpy(profiles: [])
         let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
@@ -271,38 +337,35 @@ final class AppModelTests: XCTestCase {
             epgRefreshInterval: .manual
         )
 
+        let attemptID = UUID()
         await repository.setReadFailure(true)
-        let firstCreateSucceeded = await model.create(input: input)
-        let retryCreateSucceeded = await model.create(input: input)
-        XCTAssertFalse(firstCreateSucceeded)
-        XCTAssertFalse(retryCreateSucceeded)
-        var snapshot = await repository.snapshot()
-        XCTAssertEqual(snapshot.profileCreateCount, 1)
-        XCTAssertEqual(model.profiles.map(\.name), ["Created"])
-        XCTAssertEqual(model.alertTitle, "操作失败")
-
-        await repository.setReadFailure(false)
-        let reconciledCreateSucceeded = await model.create(input: input)
-        XCTAssertTrue(reconciledCreateSucceeded)
-        snapshot = await repository.snapshot()
-        XCTAssertEqual(snapshot.profileCreateCount, 1)
-
-        let updatedInput = SourceProfileInput(
-            name: "Updated",
-            m3uURLString: input.m3uURLString,
+        let firstCreateSucceeded = await model.create(input: input, attemptID: attemptID)
+        let changedInput = SourceProfileInput(
+            name: "Changed while retrying",
+            m3uURLString: "https://example.test/changed.m3u",
             epgURLString: input.epgURLString,
             m3uRefreshInterval: .hourly,
             epgRefreshInterval: .daily
         )
-        let createdID = try! XCTUnwrap(model.profiles.first?.id)
-        await repository.setReadFailure(true)
-        let updateSucceeded = await model.update(profileID: createdID, input: updatedInput)
-        XCTAssertFalse(updateSucceeded)
-        XCTAssertEqual(model.profiles.first?.name, "Updated")
+        let retryCreateSucceeded = await model.create(input: changedInput, attemptID: attemptID)
+        XCTAssertFalse(firstCreateSucceeded)
+        XCTAssertFalse(retryCreateSucceeded)
+        var snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileCreateCount, 1)
+        XCTAssertEqual(snapshot.profileUpdateCount, 1)
+        XCTAssertEqual(snapshot.profiles.map(\.name), ["Changed while retrying"])
+        XCTAssertEqual(model.profiles.map(\.name), ["Changed while retrying"])
         XCTAssertEqual(model.alertTitle, "操作失败")
+
+        await repository.setReadFailure(false)
+        let reconciledCreateSucceeded = await model.create(input: changedInput, attemptID: attemptID)
+        XCTAssertTrue(reconciledCreateSucceeded)
+        snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileCreateCount, 1)
+        XCTAssertEqual(snapshot.profileUpdateCount, 2)
     }
 
-    func testDeletingPendingCreationAllowsIntentionalRecreation() async {
+    func testCancellingCreateAttemptAllowsIntentionalIdenticalCreationFromNewSheet() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let repository = RepositorySpy(profiles: [])
         let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
@@ -314,16 +377,128 @@ final class AppModelTests: XCTestCase {
             epgRefreshInterval: .manual
         )
 
+        let firstAttemptID = UUID()
         await repository.setReadFailure(true)
-        _ = await model.create(input: input)
-        let firstID = try! XCTUnwrap(model.profiles.first?.id)
-        _ = await model.delete(profileID: firstID)
-        _ = await model.create(input: input)
+        _ = await model.create(input: input, attemptID: firstAttemptID)
+        model.cancelCreateAttempt(firstAttemptID)
+        _ = await model.create(input: input, attemptID: UUID())
 
         let snapshot = await repository.snapshot()
         XCTAssertEqual(snapshot.profileCreateCount, 2)
+        XCTAssertEqual(snapshot.profiles.count, 2)
+        XCTAssertEqual(Set(snapshot.profiles.map(\.name)), ["Created"])
+    }
+
+    func testUpdateAndDeleteClearPendingCreateAttemptOwnership() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+        let attemptID = UUID()
+
+        await repository.setReadFailure(true)
+        _ = await model.create(input: input, attemptID: attemptID)
+        let firstID = try XCTUnwrap(model.profiles.first?.id)
+        _ = await model.update(profileID: firstID, input: input)
+        _ = await model.create(input: input, attemptID: attemptID)
+        var snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileCreateCount, 2)
+
+        let secondID = try XCTUnwrap(snapshot.profiles.last?.id)
+        _ = await model.delete(profileID: secondID)
+        _ = await model.create(input: input, attemptID: attemptID)
+        snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileCreateCount, 3)
+        XCTAssertFalse(snapshot.profiles.contains { $0.id == secondID })
+    }
+
+    func testExternalDeletionReconciledByReloadClearsPendingCreateAttempt() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+        let attemptID = UUID()
+
+        await repository.setReadFailure(true)
+        _ = await model.create(input: input, attemptID: attemptID)
+        let createdID = try XCTUnwrap(model.profiles.first?.id)
+        try await repository.deleteProfile(id: createdID)
+        await repository.setReadFailure(false)
+        let reloadSucceeded = await model.reload()
+        XCTAssertTrue(reloadSucceeded)
+
+        await repository.setReadFailure(true)
+        _ = await model.create(input: input, attemptID: attemptID)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileCreateCount, 2)
         XCTAssertEqual(snapshot.profiles.count, 1)
-        XCTAssertNotEqual(snapshot.profiles.first?.id, firstID)
+        XCTAssertNotEqual(snapshot.profiles.first?.id, createdID)
+    }
+
+    func testCreateDoesNotReportSuccessWhenCreatedProfileDisappearsDuringReload() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+
+        await repository.gateNextProfileRead()
+        let creation = Task { await model.create(input: input, attemptID: UUID()) }
+        await repository.waitUntilProfileReadIsBlocked()
+        let blockedSnapshot = await repository.snapshot()
+        let createdID = try XCTUnwrap(blockedSnapshot.profiles.first?.id)
+        try await repository.deleteProfile(id: createdID)
+        await repository.releaseProfileRead()
+
+        let creationSucceeded = await creation.value
+        XCTAssertFalse(creationSucceeded)
+        XCTAssertTrue(model.profiles.isEmpty)
+        XCTAssertEqual(model.alertTitle, "操作失败")
+    }
+
+    func testDismissDuringSuspendedCreateCannotInstallPendingAttemptAfterward() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+        let attemptID = UUID()
+
+        await repository.gateNextCreate()
+        let dismissedCreation = Task { await model.create(input: input, attemptID: attemptID) }
+        await repository.waitUntilCreateIsBlocked()
+        model.cancelCreateAttempt(attemptID)
+        await repository.setReadFailure(true)
+        await repository.releaseCreate()
+        let dismissedCreationSucceeded = await dismissedCreation.value
+        XCTAssertFalse(dismissedCreationSucceeded)
+
+        await repository.setReadFailure(false)
+        _ = await model.create(input: input, attemptID: attemptID)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profileCreateCount, 2)
     }
 
     func testDeleteAndActivateClearUnsafeActiveStateWhenReloadFails() async {
@@ -374,6 +549,63 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
         XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "测试刷新失败。")
         XCTAssertNotEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+    }
+
+    func testMappingSaveRejectsChannelRemovedFromRepositoryWhileSheetWasOpen() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let channel = makeChannel(profileID: profile.id, url: "https://example.test/live", tvgID: nil, order: 0)
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [channel]],
+            epgChannels: [profile.id: [EPGChannel(id: "manual", displayNames: ["Manual"], iconURL: nil)]]
+        )
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        await model.reload()
+        await repository.replaceChannels(profileID: profile.id, channels: [])
+        let succeeded = await model.saveMapping(channel: channel, xmltvChannelID: "manual")
+
+        let snapshot = await repository.snapshot()
+        XCTAssertFalse(succeeded)
+        XCTAssertNil(snapshot.manualMappings[profile.id]?[channel.id])
+        XCTAssertEqual(model.alertTitle, "操作失败")
+        XCTAssertNotNil(model.alertMessage)
+        XCTAssertTrue(model.channels.isEmpty)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testMappingSaveRechecksMembershipAtAtomicWriteBoundary() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let channel = makeChannel(profileID: profile.id, url: "https://example.test/live", tvgID: nil, order: 0)
+        let repository = RepositorySpy(profiles: [profile], channels: [profile.id: [channel]])
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        await model.reload()
+        await repository.gateNextMappingWrite()
+        let save = Task { await model.saveMapping(channel: channel, xmltvChannelID: "manual") }
+        await repository.waitUntilMappingWriteIsBlocked()
+        await repository.replaceChannels(profileID: profile.id, channels: [])
+        await repository.releaseMappingWrite()
+
+        let saveSucceeded = await save.value
+        XCTAssertFalse(saveSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertNil(snapshot.manualMappings[profile.id]?[channel.id])
+        XCTAssertTrue(model.channels.isEmpty)
+        XCTAssertEqual(model.alertTitle, "操作失败")
+    }
+
+    func testChannelBrowserUsesLoadingStateWheneverActiveDataIsMasked() {
+        XCTAssertEqual(
+            ChannelBrowserContentState.resolve(
+                isLoading: true,
+                hasActiveProfile: false,
+                hasChannels: false
+            ),
+            .loading
+        )
     }
 
     func testActivationMasksOldChannelsImmediatelyAndSelectionRejectsStaleOrForeignChannels() async {
@@ -482,5 +714,80 @@ private actor RefreshCallProbe {
 
     func record(profileID: UUID, resources: Set<RefreshResource>, trigger: RefreshTrigger) {
         calls.append(Call(profileID: profileID, resources: resources, trigger: trigger))
+    }
+}
+
+private actor AppModelRefreshDownloader: RemoteResourceDownloading {
+    private let payload: Data?
+    private let error: URLError.Code?
+    private let gatesCancellation: Bool
+    private var isStarted = false
+    private var isCancellationBlocked = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationBlockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationRelease: CheckedContinuation<Void, Never>?
+
+    init(
+        payload: Data? = nil,
+        error: URLError.Code? = nil,
+        gatesCancellation: Bool = false
+    ) {
+        self.payload = payload
+        self.error = error
+        self.gatesCancellation = gatesCancellation
+    }
+
+    func download(_ request: RemoteResourceRequest) async throws -> DownloadedResource {
+        isStarted = true
+        for waiter in startWaiters {
+            waiter.resume()
+        }
+        startWaiters = []
+
+        if gatesCancellation {
+            do {
+                try await Task.sleep(for: .seconds(3_600))
+            } catch is CancellationError {
+                isCancellationBlocked = true
+                for waiter in cancellationBlockedWaiters {
+                    waiter.resume()
+                }
+                cancellationBlockedWaiters = []
+                await withCheckedContinuation { continuation in
+                    cancellationRelease = continuation
+                }
+                throw CancellationError()
+            }
+        }
+        if let error {
+            throw URLError(error)
+        }
+        guard let payload else {
+            throw URLError(.resourceUnavailable)
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppModelRefreshDownloader-\(UUID().uuidString)")
+        try payload.write(to: url, options: .atomic)
+        _ = request
+        return DownloadedResource(temporaryFileURL: url, byteCount: Int64(payload.count))
+    }
+
+    func waitUntilStarted() async {
+        guard !isStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilCancellationIsBlocked() async {
+        guard !isCancellationBlocked else { return }
+        await withCheckedContinuation { continuation in
+            cancellationBlockedWaiters.append(continuation)
+        }
+    }
+
+    func releaseCancellation() {
+        cancellationRelease?.resume()
+        cancellationRelease = nil
     }
 }

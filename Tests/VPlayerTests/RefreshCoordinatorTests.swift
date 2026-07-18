@@ -498,6 +498,67 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.profiles[0].epgStatus.errorSummary, "刷新已取消。")
     }
 
+    func testPersistedOutcomeHookRunsAfterSuccessAndFailureReachTerminalStatus() async {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(data: [
+            .playlist: validPlaylist(name: "Success"),
+            .epg: Data("<tv><channel".utf8),
+        ])
+        let probe = PersistedOutcomeProbe()
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { fixedNow },
+            onPersistedOutcome: { profileID, outcome in
+                let snapshot = await repository.snapshot()
+                let profile = snapshot.profiles.first { $0.id == profileID }
+                let status = outcome.resource == .playlist
+                    ? profile?.m3uStatus.state
+                    : profile?.epgStatus.state
+                await probe.record(outcome: outcome, observedStatus: status)
+            }
+        )
+
+        _ = await coordinator.refresh(
+            profileID: profileID,
+            resources: [.playlist, .epg],
+            trigger: .foreground
+        )
+
+        let records = await probe.records
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(records.first { $0.outcome.resource == .playlist }?.observedStatus, .succeeded)
+        XCTAssertEqual(records.first { $0.outcome.resource == .epg }?.observedStatus, .failed)
+    }
+
+    func testPersistedOutcomeHookDoesNotRunWhenFailureStatusCannotBePersisted() async {
+        let repository = RepositorySpy(
+            profiles: [makeProfile()],
+            failsRecordFailure: true
+        )
+        let downloader = FakeRemoteDownloader(data: [.playlist: Data("invalid".utf8)])
+        let probe = PersistedOutcomeProbe()
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { fixedNow },
+            onPersistedOutcome: { _, outcome in
+                await probe.record(outcome: outcome, observedStatus: nil)
+            }
+        )
+
+        _ = await coordinator.refresh(
+            profileID: profileID,
+            resources: [.playlist],
+            trigger: .foreground
+        )
+
+        let records = await probe.records
+        XCTAssertTrue(records.isEmpty)
+    }
+
     private func makeCoordinator(
         repository: RepositorySpy,
         downloader: FakeRemoteDownloader
@@ -691,6 +752,19 @@ private actor OutcomeProbe {
 
     func record(_ outcomes: [RefreshOutcome]) {
         value = outcomes
+    }
+}
+
+private actor PersistedOutcomeProbe {
+    struct Record: Sendable {
+        let outcome: RefreshOutcome
+        let observedStatus: RefreshState?
+    }
+
+    private(set) var records: [Record] = []
+
+    func record(outcome: RefreshOutcome, observedStatus: RefreshState?) {
+        records.append(Record(outcome: outcome, observedStatus: observedStatus))
     }
 }
 

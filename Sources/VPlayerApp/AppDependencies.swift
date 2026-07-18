@@ -97,9 +97,15 @@ struct AppDependencies {
         do {
             let container = try VPlayerModelContainer.make()
             let repository = SwiftDataLibraryStore(modelContainer: container)
+            let libraryChanges = LibraryChangeSignal()
             let coordinator = RefreshCoordinator(
                 repository: repository,
-                downloader: URLSessionBoundedDownloader()
+                downloader: URLSessionBoundedDownloader(),
+                onPersistedOutcome: { [weak libraryChanges] _, _ in
+                    await MainActor.run {
+                        libraryChanges?.notify()
+                    }
+                }
             )
             let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in
                 await coordinator.refresh(
@@ -112,6 +118,7 @@ struct AppDependencies {
             return make(
                 repository: repository,
                 refresh: refresh,
+                libraryChanges: libraryChanges,
                 libraryStartup: LibraryStartup {
                     try await repository.purgeUnreferencedSnapshots()
                 }
@@ -151,9 +158,11 @@ struct AppDependencies {
             let container = try VPlayerModelContainer.make(inMemory: true)
             let repository = SwiftDataLibraryStore(modelContainer: container)
             let seeder = SeededLibrarySeeder(repository: repository)
-            let refresh = fixtureRefresh(repository: repository)
             let libraryChanges = LibraryChangeSignal()
-            let lifecycleRefresh = notifyingRefresh(refresh, libraryChanges: libraryChanges)
+            let refresh = fixtureRefresh(
+                repository: repository,
+                libraryChanges: libraryChanges
+            )
             let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
                 try await repository.profiles()
             }
@@ -163,13 +172,13 @@ struct AppDependencies {
                 },
                 foregroundRefreshDriver: ForegroundRefreshDriver(
                     loadProfiles: loadProfiles,
-                    refresh: lifecycleRefresh,
+                    refresh: refresh,
                     reportStatus: { _ in }
                 ),
                 backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
                     scheduler: InertBackgroundRefreshScheduler(),
                     loadProfiles: loadProfiles,
-                    refresh: lifecycleRefresh,
+                    refresh: refresh,
                     reportStatus: { _ in }
                 ),
                 repository: repository,
@@ -217,10 +226,9 @@ struct AppDependencies {
     private static func make(
         repository: any LibraryRepository & RefreshSnapshotCommitting,
         refresh: @escaping Refresh,
+        libraryChanges: LibraryChangeSignal,
         libraryStartup: LibraryStartup
     ) -> Self {
-        let libraryChanges = LibraryChangeSignal()
-        let lifecycleRefresh = notifyingRefresh(refresh, libraryChanges: libraryChanges)
         let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
             try await repository.profiles()
         }
@@ -228,12 +236,12 @@ struct AppDependencies {
             libraryStartup: libraryStartup,
             foregroundRefreshDriver: ForegroundRefreshDriver(
                 loadProfiles: loadProfiles,
-                refresh: lifecycleRefresh,
+                refresh: refresh,
                 reportStatus: { _ in }
             ),
             backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
                 loadProfiles: loadProfiles,
-                refresh: lifecycleRefresh,
+                refresh: refresh,
                 reportStatus: { _ in }
             ),
             repository: repository,
@@ -242,28 +250,15 @@ struct AppDependencies {
         )
     }
 
-    static func notifyingRefresh(
-        _ refresh: @escaping Refresh,
-        libraryChanges: LibraryChangeSignal
-    ) -> Refresh {
-        { profileID, resources, trigger in
-            let outcomes = await refresh(profileID, resources, trigger)
-            if !outcomes.isEmpty {
-                await MainActor.run {
-                    libraryChanges.notify()
-                }
-            }
-            return outcomes
-        }
-    }
-
     private static func fixtureRefresh(
-        repository: any LibraryRepository
+        repository: any LibraryRepository,
+        libraryChanges: LibraryChangeSignal
     ) -> Refresh {
         { profileID, resources, _ in
             let timestamp = Date()
             var outcomes: [RefreshOutcome] = []
             for resource in resources.sorted(by: { $0.rawValue < $1.rawValue }) {
+                let outcome: RefreshOutcome
                 do {
                     try await repository.recordAttempt(
                         profileID: profileID,
@@ -275,13 +270,24 @@ struct AppDependencies {
                         resource: resource,
                         at: timestamp
                     )
-                    outcomes.append(RefreshOutcome(resource: resource, succeeded: true, message: nil))
+                    outcome = RefreshOutcome(resource: resource, succeeded: true, message: nil)
                 } catch {
-                    outcomes.append(RefreshOutcome(
+                    let message = "测试刷新失败。"
+                    try? await repository.recordFailure(
+                        profileID: profileID,
+                        resource: resource,
+                        summary: message,
+                        at: timestamp
+                    )
+                    outcome = RefreshOutcome(
                         resource: resource,
                         succeeded: false,
-                        message: "测试刷新失败。"
-                    ))
+                        message: message
+                    )
+                }
+                outcomes.append(outcome)
+                await MainActor.run {
+                    libraryChanges.notify()
                 }
             }
             return outcomes
@@ -446,6 +452,16 @@ private actor UnavailableLibraryRepository: LibraryRepository {
         throw ProductionDependencyError.libraryUnavailable
     }
     func setManualMapping(profileID: UUID, channelID: String, xmltvChannelID: String?) throws {
+        _ = profileID
+        _ = channelID
+        _ = xmltvChannelID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func setManualMappingIfCurrentChannel(
+        profileID: UUID,
+        channelID: String,
+        xmltvChannelID: String?
+    ) throws -> Bool {
         _ = profileID
         _ = channelID
         _ = xmltvChannelID

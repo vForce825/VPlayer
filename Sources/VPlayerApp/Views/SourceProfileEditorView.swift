@@ -17,6 +17,7 @@ struct SourceProfileEditorView: View {
     @State private var epgRefreshInterval: RefreshInterval
     @State private var validationMessage: String?
     @State private var isSaving = false
+    @State private var createAttemptID: UUID
 
     init(model: AppModel, profile: SourceProfile?) {
         self.model = model
@@ -26,6 +27,7 @@ struct SourceProfileEditorView: View {
         _epgURLString = State(initialValue: profile?.epgURL.absoluteString ?? "")
         _m3uRefreshInterval = State(initialValue: profile?.m3uRefreshInterval ?? .sixHours)
         _epgRefreshInterval = State(initialValue: profile?.epgRefreshInterval ?? .daily)
+        _createAttemptID = State(initialValue: UUID())
     }
 
     var body: some View {
@@ -54,7 +56,7 @@ struct SourceProfileEditorView: View {
             .navigationTitle(profile == nil ? "添加数据源" : "编辑数据源")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
+                    Button("取消") { cancel() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { save() }
@@ -62,6 +64,10 @@ struct SourceProfileEditorView: View {
                         .accessibilityIdentifier("source.editor.save")
                 }
             }
+        }
+        .onDisappear {
+            guard profile == nil else { return }
+            model.cancelCreateAttempt(createAttemptID)
         }
     }
 
@@ -98,7 +104,7 @@ struct SourceProfileEditorView: View {
             if let profile {
                 succeeded = await model.update(profileID: profile.id, input: input)
             } else {
-                succeeded = await model.create(input: input)
+                succeeded = await model.create(input: input, attemptID: createAttemptID)
             }
             guard !Task.isCancelled else { return }
             isSaving = false
@@ -106,6 +112,13 @@ struct SourceProfileEditorView: View {
                 dismiss()
             }
         }
+    }
+
+    private func cancel() {
+        if profile == nil {
+            model.cancelCreateAttempt(createAttemptID)
+        }
+        dismiss()
     }
 
     private func validationMessage(for error: any Error) -> String {

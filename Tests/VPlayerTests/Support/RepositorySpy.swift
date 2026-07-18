@@ -39,6 +39,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         let playlistInstallCount: Int
         let epgInstallCount: Int
         let profileCreateCount: Int
+        let profileUpdateCount: Int
+        let profileReadPlaylistStates: [RefreshState]
     }
 
     private var storedProfiles: [SourceProfile]
@@ -53,6 +55,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var playlistInstallCount = 0
     private var epgInstallCount = 0
     private var profileCreateCount = 0
+    private var profileUpdateCount = 0
+    private var profileReadPlaylistStates: [RefreshState] = []
     private var failsReads = false
     private var shouldGateNextChannelRead = false
     private var blockedChannelReadContinuation: CheckedContinuation<Void, Never>?
@@ -60,6 +64,15 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var shouldGateNextActivation = false
     private var blockedActivationContinuation: CheckedContinuation<Void, Never>?
     private var activationReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var shouldGateNextProfileRead = false
+    private var blockedProfileReadContinuation: CheckedContinuation<Void, Never>?
+    private var profileReadReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var shouldGateNextCreate = false
+    private var blockedCreateContinuation: CheckedContinuation<Void, Never>?
+    private var createReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var shouldGateNextMappingWrite = false
+    private var blockedMappingWriteContinuation: CheckedContinuation<Void, Never>?
+    private var mappingWriteReleaseContinuation: CheckedContinuation<Void, Never>?
     private let failedRefreshCommits: Set<RefreshResource>
     private let failsRecordFailure: Bool
 
@@ -96,7 +109,9 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             profileLookupCount: profileLookupCount,
             playlistInstallCount: playlistInstallCount,
             epgInstallCount: epgInstallCount,
-            profileCreateCount: profileCreateCount
+            profileCreateCount: profileCreateCount,
+            profileUpdateCount: profileUpdateCount,
+            profileReadPlaylistStates: profileReadPlaylistStates
         )
     }
 
@@ -110,6 +125,57 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
 
     func gateNextChannelRead() {
         shouldGateNextChannelRead = true
+    }
+
+    func gateNextProfileRead() {
+        shouldGateNextProfileRead = true
+    }
+
+    func waitUntilProfileReadIsBlocked() async {
+        if profileReadReleaseContinuation != nil { return }
+        guard shouldGateNextProfileRead else { return }
+        await withCheckedContinuation { continuation in
+            blockedProfileReadContinuation = continuation
+        }
+    }
+
+    func releaseProfileRead() {
+        profileReadReleaseContinuation?.resume()
+        profileReadReleaseContinuation = nil
+    }
+
+    func gateNextCreate() {
+        shouldGateNextCreate = true
+    }
+
+    func waitUntilCreateIsBlocked() async {
+        if createReleaseContinuation != nil { return }
+        guard shouldGateNextCreate else { return }
+        await withCheckedContinuation { continuation in
+            blockedCreateContinuation = continuation
+        }
+    }
+
+    func releaseCreate() {
+        createReleaseContinuation?.resume()
+        createReleaseContinuation = nil
+    }
+
+    func gateNextMappingWrite() {
+        shouldGateNextMappingWrite = true
+    }
+
+    func waitUntilMappingWriteIsBlocked() async {
+        if mappingWriteReleaseContinuation != nil { return }
+        guard shouldGateNextMappingWrite else { return }
+        await withCheckedContinuation { continuation in
+            blockedMappingWriteContinuation = continuation
+        }
+    }
+
+    func releaseMappingWrite() {
+        mappingWriteReleaseContinuation?.resume()
+        mappingWriteReleaseContinuation = nil
     }
 
     func waitUntilChannelReadIsBlocked() async {
@@ -142,9 +208,18 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         activationReleaseContinuation = nil
     }
 
-    func profiles() throws -> [SourceProfile] {
+    func profiles() async throws -> [SourceProfile] {
         if failsReads { throw InjectedError.read }
         profileLookupCount += 1
+        profileReadPlaylistStates.append(contentsOf: storedProfiles.map(\.m3uStatus.state))
+        if shouldGateNextProfileRead {
+            shouldGateNextProfileRead = false
+            blockedProfileReadContinuation?.resume()
+            blockedProfileReadContinuation = nil
+            await withCheckedContinuation { continuation in
+                profileReadReleaseContinuation = continuation
+            }
+        }
         return storedProfiles
     }
 
@@ -154,7 +229,15 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         return storedProfiles.first { $0.id == storedActiveProfileID }
     }
 
-    func createProfile(_ input: ValidatedSourceProfileInput, now: Date) throws -> SourceProfile {
+    func createProfile(_ input: ValidatedSourceProfileInput, now: Date) async throws -> SourceProfile {
+        if shouldGateNextCreate {
+            shouldGateNextCreate = false
+            blockedCreateContinuation?.resume()
+            blockedCreateContinuation = nil
+            await withCheckedContinuation { continuation in
+                createReleaseContinuation = continuation
+            }
+        }
         let profile = SourceProfile(
             id: UUID(),
             name: input.name,
@@ -183,6 +266,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         storedProfiles[index].m3uRefreshInterval = input.m3uRefreshInterval
         storedProfiles[index].epgRefreshInterval = input.epgRefreshInterval
         storedProfiles[index].updatedAt = now
+        profileUpdateCount += 1
     }
 
     func deleteProfile(id: UUID) throws {
@@ -266,9 +350,27 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         profileID: UUID,
         channelID: String,
         xmltvChannelID: String?
-    ) throws {
+    ) async throws {
+        await waitAtMappingWriteGateIfNeeded()
         _ = try profileIndex(profileID)
         storedManualMappings[profileID, default: [:]][channelID] = xmltvChannelID
+    }
+
+    func setManualMappingIfCurrentChannel(
+        profileID: UUID,
+        channelID: String,
+        xmltvChannelID: String?
+    ) async throws -> Bool {
+        await waitAtMappingWriteGateIfNeeded()
+        _ = try profileIndex(profileID)
+        guard storedActiveProfileID == profileID,
+              storedChannels[profileID, default: []].contains(where: {
+                  $0.id == channelID && $0.sourceProfileID == profileID
+              }) else {
+            return false
+        }
+        storedManualMappings[profileID, default: [:]][channelID] = xmltvChannelID
+        return true
     }
 
     func installPlaylist(profileID: UUID, channels: [Channel], fetchedAt: Date) throws {
@@ -372,6 +474,16 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             throw LibraryRepositoryError.profileNotFound
         }
         return index
+    }
+
+    private func waitAtMappingWriteGateIfNeeded() async {
+        guard shouldGateNextMappingWrite else { return }
+        shouldGateNextMappingWrite = false
+        blockedMappingWriteContinuation?.resume()
+        blockedMappingWriteContinuation = nil
+        await withCheckedContinuation { continuation in
+            mappingWriteReleaseContinuation = continuation
+        }
     }
 
     private func updateStatus(

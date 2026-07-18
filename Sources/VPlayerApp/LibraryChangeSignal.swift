@@ -22,7 +22,9 @@ final class LibraryChangeSignal {
 
     func changes(after observedGeneration: Int) -> AsyncStream<Int> {
         let id = UUID()
-        let (stream, continuation) = AsyncStream<Int>.makeStream()
+        let (stream, continuation) = AsyncStream<Int>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
         continuations[id] = continuation
         continuation.onTermination = { @Sendable [weak self] _ in
             Task { @MainActor [weak self] in
