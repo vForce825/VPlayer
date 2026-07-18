@@ -123,6 +123,11 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         storedChannels[profileID] = channels
     }
 
+    func replaceProfiles(_ profiles: [SourceProfile], activeProfileID: UUID?) {
+        storedProfiles = profiles
+        storedActiveProfileID = activeProfileID
+    }
+
     func gateNextChannelRead() {
         shouldGateNextChannelRead = true
     }

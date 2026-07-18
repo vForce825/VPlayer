@@ -160,6 +160,215 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
         XCTAssertNotNil(model.profiles.first?.m3uStatus.errorSummary)
         XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
+
+        let laterReloadSucceeded = await model.reload()
+        XCTAssertTrue(laterReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertNotNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
+    }
+
+    func testManualRefreshTerminalOverlayKeepsOriginalCompletionTimeAcrossLaterReloads() async {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let clock = AppModelTestClock(startedAt)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: startedAt)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                try? await repository.recordAttempt(
+                    profileID: profileID,
+                    resource: .playlist,
+                    at: clock.value
+                )
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: true, message: nil)
+                }
+            },
+            now: { clock.value }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        let originalCompletion = model.profiles.first?.m3uStatus.lastSuccessAt
+        XCTAssertEqual(originalCompletion, startedAt)
+        clock.value = startedAt.addingTimeInterval(3_600)
+
+        let laterReloadSucceeded = await model.reload()
+
+        XCTAssertTrue(laterReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastSuccessAt, originalCompletion)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.lastSuccessAt, originalCompletion)
+    }
+
+    func testWinningOverlappingReloadAppliesTerminalOverlayWhenRefreshReloadIsSuperseded() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                try? await repository.recordAttempt(
+                    profileID: profileID,
+                    resource: .playlist,
+                    at: now
+                )
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "returned failure")
+                }
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await repository.gateNextProfileRead()
+        let refreshTask = Task {
+            await model.refresh(profileID: profile.id, resource: .playlist)
+        }
+        await repository.waitUntilProfileReadIsBlocked()
+
+        let winningReloadSucceeded = await model.reload()
+        await repository.releaseProfileRead()
+        await refreshTask.value
+
+        XCTAssertTrue(winningReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "returned failure")
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
+    }
+
+    func testTerminalRepositoryTruthClearsRefreshOverlaysForBothResources() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let terminalAt = now.addingTimeInterval(60)
+        let nextAttemptAt = terminalAt.addingTimeInterval(60)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                for resource in resources {
+                    try? await repository.recordAttempt(
+                        profileID: profileID,
+                        resource: resource,
+                        at: now
+                    )
+                }
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "overlay failure")
+                }
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        await model.refresh(profileID: profile.id, resource: .epg)
+        try await repository.recordSuccess(
+            profileID: profile.id,
+            resource: .playlist,
+            at: terminalAt
+        )
+        try await repository.recordFailure(
+            profileID: profile.id,
+            resource: .epg,
+            summary: "persisted failure",
+            at: terminalAt
+        )
+
+        _ = await model.reload()
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastSuccessAt, terminalAt)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.epgStatus.errorSummary, "persisted failure")
+
+        try await repository.recordAttempt(
+            profileID: profile.id,
+            resource: .playlist,
+            at: nextAttemptAt
+        )
+        try await repository.recordAttempt(
+            profileID: profile.id,
+            resource: .epg,
+            at: nextAttemptAt
+        )
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .refreshing)
+    }
+
+    func testMissingProfileClearsTerminalOverlayBeforeSameIdentityReappears() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                try? await repository.recordAttempt(
+                    profileID: profileID,
+                    resource: .playlist,
+                    at: now
+                )
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "overlay failure")
+                }
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        try await repository.deleteProfile(id: profile.id)
+        _ = await model.reload()
+        XCTAssertTrue(model.profiles.isEmpty)
+
+        var reappeared = profile
+        reappeared.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(60),
+            state: .refreshing
+        )
+        await repository.replaceProfiles([reappeared], activeProfileID: profile.id)
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+    }
+
+    func testNewManualAttemptClearsOlderTerminalOverlayBeforeItCompletes() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let repository = RepositorySpy(profiles: [profile])
+        let refreshGate = AppModelManualRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await refreshGate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: now
+                )
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+
+        let secondRefresh = Task {
+            await model.refresh(profileID: profile.id, resource: .playlist)
+        }
+        await refreshGate.waitUntilSecondAttemptStarts()
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+
+        await refreshGate.releaseSecondAttempt()
+        await secondRefresh.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
     }
 
     func testManualRefreshKeepsTerminalRepositoryTruthOverReturnedOutcome() async {
@@ -822,6 +1031,79 @@ private actor RefreshCallProbe {
 
     func record(profileID: UUID, resources: Set<RefreshResource>, trigger: RefreshTrigger) {
         calls.append(Call(profileID: profileID, resources: resources, trigger: trigger))
+    }
+}
+
+private final class AppModelTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: Date
+
+    init(_ value: Date) {
+        storedValue = value
+    }
+
+    var value: Date {
+        get { lock.withLock { storedValue } }
+        set { lock.withLock { storedValue = newValue } }
+    }
+}
+
+private actor AppModelManualRefreshGate {
+    private var invocationCount = 0
+    private var secondAttemptStarted = false
+    private var secondAttemptWaiters: [CheckedContinuation<Void, Never>] = []
+    private var secondAttemptRelease: CheckedContinuation<Void, Never>?
+
+    func outcomes(
+        repository: RepositorySpy,
+        profileID: UUID,
+        resources: Set<RefreshResource>,
+        now: Date
+    ) async -> [RefreshOutcome] {
+        invocationCount += 1
+        for resource in resources {
+            try? await repository.recordAttempt(
+                profileID: profileID,
+                resource: resource,
+                at: now
+            )
+        }
+        guard invocationCount > 1 else {
+            return resources.map {
+                RefreshOutcome(resource: $0, succeeded: false, message: "first failure")
+            }
+        }
+
+        secondAttemptStarted = true
+        for waiter in secondAttemptWaiters {
+            waiter.resume()
+        }
+        secondAttemptWaiters = []
+        await withCheckedContinuation { continuation in
+            secondAttemptRelease = continuation
+        }
+        for resource in resources {
+            try? await repository.recordSuccess(
+                profileID: profileID,
+                resource: resource,
+                at: now
+            )
+        }
+        return resources.map {
+            RefreshOutcome(resource: $0, succeeded: true, message: nil)
+        }
+    }
+
+    func waitUntilSecondAttemptStarts() async {
+        guard !secondAttemptStarted else { return }
+        await withCheckedContinuation { continuation in
+            secondAttemptWaiters.append(continuation)
+        }
+    }
+
+    func releaseSecondAttempt() {
+        secondAttemptRelease?.resume()
+        secondAttemptRelease = nil
     }
 }
 

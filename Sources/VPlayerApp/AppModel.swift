@@ -38,6 +38,7 @@ final class AppModel {
     private var pendingCreation: PendingCreation?
     private var activeCreationAttemptIDs: Set<UUID> = []
     private var cancelledCreationAttemptIDs: Set<UUID> = []
+    private var terminalRefreshOverlays: [RefreshKey: TerminalRefreshOverlay] = [:]
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private var alertKind = AlertKind.operation
 
@@ -294,18 +295,19 @@ final class AppModel {
         markRefreshing(profileID: profileID, resource: resource)
         let outcomes = await refreshResources(profileID, [resource], .manual)
         let outcome = outcomes.first { $0.resource == resource }
+        let completedAt = now()
         reconcileRefreshOutcome(
             profileID: profileID,
             resource: resource,
-            outcome: outcome
+            outcome: outcome,
+            completedAt: completedAt
         )
+        if let outcome {
+            terminalRefreshOverlays[RefreshKey(profileID: profileID, resource: resource)] =
+                TerminalRefreshOverlay(outcome: outcome, completedAt: completedAt)
+        }
         guard !Task.isCancelled else { return }
-        guard await reload() else { return }
-        preserveReturnedTerminalRefreshOutcome(
-            profileID: profileID,
-            resource: resource,
-            outcome: outcome
-        )
+        _ = await reload()
     }
 
     @discardableResult
@@ -390,8 +392,15 @@ final class AppModel {
         programmes: [String: [Programme]]
     ) -> Bool {
         guard reloadID == currentReloadID else { return false }
+        var profiles = profiles
+        reconcileTerminalRefreshOverlays(in: &profiles)
         self.profiles = profiles
-        self.activeProfile = activeProfile
+        if let activeProfile,
+           let reconciledActiveProfile = profiles.first(where: { $0.id == activeProfile.id }) {
+            self.activeProfile = reconciledActiveProfile
+        } else {
+            self.activeProfile = activeProfile
+        }
         self.channels = channels
         self.epgChannels = epgChannels
         self.matchByChannelID = matches
@@ -411,6 +420,7 @@ final class AppModel {
     }
 
     private func markRefreshing(profileID: UUID, resource: RefreshResource) {
+        terminalRefreshOverlays[RefreshKey(profileID: profileID, resource: resource)] = nil
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
         switch resource {
         case .playlist:
@@ -513,48 +523,74 @@ final class AppModel {
     private func reconcileRefreshOutcome(
         profileID: UUID,
         resource: RefreshResource,
-        outcome: RefreshOutcome?
+        outcome: RefreshOutcome?,
+        completedAt: Date
     ) {
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
-        let completedAt = now()
-        func update(_ status: inout ResourceRefreshStatus) {
-            if outcome?.succeeded == true {
-                status.lastSuccessAt = completedAt
-                status.state = .succeeded
-                status.errorSummary = nil
-            } else {
-                status.state = .failed
-                status.errorSummary = outcome?.message ?? "刷新未完成，请稍后重试。"
-            }
-        }
         switch resource {
         case .playlist:
-            update(&profiles[index].m3uStatus)
+            Self.applyRefreshOutcome(
+                outcome,
+                completedAt: completedAt,
+                to: &profiles[index].m3uStatus
+            )
         case .epg:
-            update(&profiles[index].epgStatus)
+            Self.applyRefreshOutcome(
+                outcome,
+                completedAt: completedAt,
+                to: &profiles[index].epgStatus
+            )
         }
         if activeProfile?.id == profileID {
             activeProfile = profiles[index]
         }
     }
 
-    private func preserveReturnedTerminalRefreshOutcome(
-        profileID: UUID,
-        resource: RefreshResource,
-        outcome: RefreshOutcome?
-    ) {
-        guard let outcome,
-              let profile = profiles.first(where: { $0.id == profileID }) else { return }
-        let persistedState = switch resource {
-        case .playlist: profile.m3uStatus.state
-        case .epg: profile.epgStatus.state
+    private func reconcileTerminalRefreshOverlays(in profiles: inout [SourceProfile]) {
+        for key in Array(terminalRefreshOverlays.keys) {
+            guard let overlay = terminalRefreshOverlays[key],
+                  let index = profiles.firstIndex(where: { $0.id == key.profileID }) else {
+                terminalRefreshOverlays[key] = nil
+                continue
+            }
+            let persistedState = switch key.resource {
+            case .playlist: profiles[index].m3uStatus.state
+            case .epg: profiles[index].epgStatus.state
+            }
+            guard persistedState == .refreshing else {
+                terminalRefreshOverlays[key] = nil
+                continue
+            }
+            switch key.resource {
+            case .playlist:
+                Self.applyRefreshOutcome(
+                    overlay.outcome,
+                    completedAt: overlay.completedAt,
+                    to: &profiles[index].m3uStatus
+                )
+            case .epg:
+                Self.applyRefreshOutcome(
+                    overlay.outcome,
+                    completedAt: overlay.completedAt,
+                    to: &profiles[index].epgStatus
+                )
+            }
         }
-        guard persistedState == .refreshing else { return }
-        reconcileRefreshOutcome(
-            profileID: profileID,
-            resource: resource,
-            outcome: outcome
-        )
+    }
+
+    private static func applyRefreshOutcome(
+        _ outcome: RefreshOutcome?,
+        completedAt: Date,
+        to status: inout ResourceRefreshStatus
+    ) {
+        if outcome?.succeeded == true {
+            status.lastSuccessAt = completedAt
+            status.state = .succeeded
+            status.errorSummary = nil
+        } else {
+            status.state = .failed
+            status.errorSummary = outcome?.message ?? "刷新未完成，请稍后重试。"
+        }
     }
 
     private func presentOperationMessage(_ message: String) {
@@ -585,5 +621,15 @@ private extension AppModel {
     struct PendingCreation {
         let attemptID: UUID
         let profile: SourceProfile
+    }
+
+    struct RefreshKey: Hashable {
+        let profileID: UUID
+        let resource: RefreshResource
+    }
+
+    struct TerminalRefreshOverlay {
+        let outcome: RefreshOutcome
+        let completedAt: Date
     }
 }
