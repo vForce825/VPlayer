@@ -1,0 +1,10 @@
+#EXTM3U
+
+#EXTINF:-1 group-title="A",First spelling
+HTTP://Example.COM:80/live?id=1
+#EXTINF:-1 group-title="B",Duplicate spelling
+http://example.com/live?id=1
+#EXTINF:-1,UDP visible
+udp://233.1.1.1:1234
+#EXTINF:-1,RTP visible
+rtp://233.1.1.2:1234

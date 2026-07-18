@@ -60,8 +60,9 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: Tests/VPlayerTests
-    resources:
-      - path: Tests/Fixtures
+      - path: Tests/Fixtures/playlists
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: VPlayerCore
       - target: VPlayerPlayback

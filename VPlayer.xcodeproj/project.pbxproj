@@ -16,10 +16,13 @@
 		2C63EB537A927F0D9EDD575A /* DomainTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C06659A8D23E58B934CA205 /* DomainTests.swift */; };
 		2E40E02301DFAA15A465F81C /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; };
 		4BE2000825436D6D3CA2B1EA /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9021619CDF96872E511E25E /* RootView.swift */; };
+		52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */; };
 		5681E70A62EE0F3ADD9E9E3A /* VPlayerCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		65B88FED397CA6E730F3E3D0 /* PlaybackContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 522B8D587AE1285AE62DAC45 /* PlaybackContracts.swift */; };
 		70F366BE14A6E747945E194E /* Channel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E54A2D2F4C5510D3E98D86F /* Channel.swift */; };
+		7C690E439B501C8315CE11BD /* M3UParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A661E9919B5D9A88432C46D6 /* M3UParser.swift */; };
 		7EB4861905622CE49F87216F /* VPlayerCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		80D40D0CACC559050F555C87 /* playlists in Resources */ = {isa = PBXBuildFile; fileRef = 78EFE7B618BDBB2FA8DF46CE /* playlists */; };
 		810B6A3316A6341043193CD1 /* ProjectConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */; };
 		849637FE454BDD01737C072F /* VPlayerUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F83B421173E1978DA035BF40 /* VPlayerUITests.swift */; };
 		86F079E90934D8EB19E328D4 /* PlaybackSettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */; };
@@ -29,6 +32,8 @@
 		DA94714F6F72EEFE0CDAFF44 /* VPlayerPlayback.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		E601A3612F4CD4996F1B777B /* VPlayerCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 236D71D3D61B0D1A240B639D /* VPlayerCore.swift */; };
 		EC428FCDA3FDB59AF2C77783 /* RefreshTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8962CD0CAB958608B6C759D /* RefreshTypes.swift */; };
+		F23A8BBED3A47568702AC0F8 /* PlaylistTextDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3875C2090EE6FA7DA9F56E77 /* PlaylistTextDecoder.swift */; };
+		FD5802BCAA5B6626EBCD1529 /* FixtureLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = F766ADE2FFF00B2A2273489F /* FixtureLoader.swift */; };
 		FE2044038713D72497DCF740 /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
 /* End PBXBuildFile section */
 
@@ -112,10 +117,12 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UParserTests.swift; sourceTree = "<group>"; };
 		0C06659A8D23E58B934CA205 /* DomainTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainTests.swift; sourceTree = "<group>"; };
 		236D71D3D61B0D1A240B639D /* VPlayerCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerCore.swift; sourceTree = "<group>"; };
 		238998CD555F7F1A2BCCCEFC /* VPlayerTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		28CBFE07860F14CBAFCDC9C7 /* PlaybackSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsStore.swift; sourceTree = "<group>"; };
+		3875C2090EE6FA7DA9F56E77 /* PlaylistTextDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistTextDecoder.swift; sourceTree = "<group>"; };
 		3BD849891A41E876402BADA1 /* StreamProtocolPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProtocolPolicy.swift; sourceTree = "<group>"; };
 		4C20F5E5ABD832EF5433B511 /* SourceProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceProfile.swift; sourceTree = "<group>"; };
 		522B8D587AE1285AE62DAC45 /* PlaybackContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContracts.swift; sourceTree = "<group>"; };
@@ -125,10 +132,13 @@
 		5E54A2D2F4C5510D3E98D86F /* Channel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Channel.swift; sourceTree = "<group>"; };
 		639B3B5F5E1964B95399C8A4 /* VPlayerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerApp.swift; sourceTree = "<group>"; };
 		68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectConfigurationTests.swift; sourceTree = "<group>"; };
+		78EFE7B618BDBB2FA8DF46CE /* playlists */ = {isa = PBXFileReference; lastKnownFileType = folder; name = playlists; path = Tests/Fixtures/playlists; sourceTree = SOURCE_ROOT; };
+		A661E9919B5D9A88432C46D6 /* M3UParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UParser.swift; sourceTree = "<group>"; };
 		CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsStoreTests.swift; sourceTree = "<group>"; };
 		CCD4A4570708418C5EB6D3E2 /* VPlayer.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = VPlayerCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		E9021619CDF96872E511E25E /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		F766ADE2FFF00B2A2273489F /* FixtureLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureLoader.swift; sourceTree = "<group>"; };
 		F83B421173E1978DA035BF40 /* VPlayerUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerUITests.swift; sourceTree = "<group>"; };
 		F8962CD0CAB958608B6C759D /* RefreshTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshTypes.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -184,9 +194,27 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		262815F870519A83B1F36F83 /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				F766ADE2FFF00B2A2273489F /* FixtureLoader.swift */,
+			);
+			path = Support;
+			sourceTree = "<group>";
+		};
+		2CCB28B2C32693B0011AA820 /* Parsing */ = {
+			isa = PBXGroup;
+			children = (
+				A661E9919B5D9A88432C46D6 /* M3UParser.swift */,
+				3875C2090EE6FA7DA9F56E77 /* PlaylistTextDecoder.swift */,
+			);
+			path = Parsing;
+			sourceTree = "<group>";
+		};
 		79BD6FC652CE1AC3047142C9 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
+				A208A2B119AEDC13F7BF71F9 /* Fixtures */,
 				A9366909CA36CFE970C44C9A /* VPlayerTests */,
 				E081343600BA13B815B5C7CA /* VPlayerUITests */,
 			);
@@ -209,6 +237,7 @@
 			isa = PBXGroup;
 			children = (
 				97134EE6CB34C576B22FDC17 /* Domain */,
+				2CCB28B2C32693B0011AA820 /* Parsing */,
 				236D71D3D61B0D1A240B639D /* VPlayerCore.swift */,
 			);
 			path = VPlayerCore;
@@ -224,10 +253,20 @@
 			path = Sources;
 			sourceTree = "<group>";
 		};
+		A208A2B119AEDC13F7BF71F9 /* Fixtures */ = {
+			isa = PBXGroup;
+			children = (
+				78EFE7B618BDBB2FA8DF46CE /* playlists */,
+			);
+			path = Fixtures;
+			sourceTree = "<group>";
+		};
 		A9366909CA36CFE970C44C9A /* VPlayerTests */ = {
 			isa = PBXGroup;
 			children = (
+				262815F870519A83B1F36F83 /* Support */,
 				0C06659A8D23E58B934CA205 /* DomainTests.swift */,
+				05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */,
 				CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */,
 				68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */,
 			);
@@ -276,6 +315,7 @@
 			buildConfigurationList = E497DA2ED74A5CC89968D1BF /* Build configuration list for PBXNativeTarget "VPlayerTests" */;
 			buildPhases = (
 				6A9DC9FADD3D64293A7D612F /* Sources */,
+				E9C70108B7DE8D74757D2432 /* Resources */,
 				2540CE3FFBE17DA66BAED7CE /* Frameworks */,
 				AEF65264D45E17430E22B87F /* Embed Frameworks */,
 			);
@@ -408,6 +448,17 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		E9C70108B7DE8D74757D2432 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				80D40D0CACC559050F555C87 /* playlists in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		01C27813F844D12D317707B6 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -424,6 +475,8 @@
 			files = (
 				70F366BE14A6E747945E194E /* Channel.swift in Sources */,
 				16C47C091EC6C2F1E1CA6FE4 /* EPGModels.swift in Sources */,
+				7C690E439B501C8315CE11BD /* M3UParser.swift in Sources */,
+				F23A8BBED3A47568702AC0F8 /* PlaylistTextDecoder.swift in Sources */,
 				EC428FCDA3FDB59AF2C77783 /* RefreshTypes.swift in Sources */,
 				1505DD0FB967752D2662C271 /* SourceProfile.swift in Sources */,
 				AE5F5F87B9AB412130D84582 /* StreamProtocolPolicy.swift in Sources */,
@@ -436,6 +489,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				2C63EB537A927F0D9EDD575A /* DomainTests.swift in Sources */,
+				FD5802BCAA5B6626EBCD1529 /* FixtureLoader.swift in Sources */,
+				52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */,
 				86F079E90934D8EB19E328D4 /* PlaybackSettingsStoreTests.swift in Sources */,
 				810B6A3316A6341043193CD1 /* ProjectConfigurationTests.swift in Sources */,
 			);
