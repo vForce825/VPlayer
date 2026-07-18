@@ -212,30 +212,22 @@ private final class BackgroundRefreshExecution {
 
 @MainActor
 private final class SystemBackgroundRefreshScheduler: BackgroundRefreshScheduling {
+    private let handoff = SystemBackgroundRefreshTaskHandoff()
+
     func register(
         identifier: String,
         handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void
     ) -> Bool {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
+        let handoff = handoff
+        return BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
             guard let appRefreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
                 return
             }
-            let taskBox = UncheckedSendableBox(appRefreshTask)
-            let taskBridge = SystemBackgroundRefreshTaskBridge(
-                clearSystemExpirationHandler: {
-                    taskBox.value.expirationHandler = nil
-                },
-                completeSystemTask: { success in
-                    taskBox.value.setTaskCompleted(success: success)
-                }
+            handoff.handoff(
+                systemTask: BGAppRefreshTaskSystemTask(appRefreshTask),
+                handler: handler
             )
-            appRefreshTask.expirationHandler = { [weak taskBridge] in
-                taskBridge?.systemDidExpire()
-            }
-            Task { @MainActor in
-                handler(taskBridge)
-            }
         }
     }
 
@@ -247,6 +239,72 @@ private final class SystemBackgroundRefreshScheduler: BackgroundRefreshSchedulin
         let request = BGAppRefreshTaskRequest(identifier: identifier)
         request.earliestBeginDate = earliestBeginDate
         try BGTaskScheduler.shared.submit(request)
+    }
+}
+
+protocol SystemBackgroundRefreshSystemTask: AnyObject, Sendable {
+    func installSystemExpirationHandler(_ handler: @escaping @Sendable () -> Void)
+    @MainActor func clearSystemExpirationHandler()
+    @MainActor func completeSystemTask(success: Bool)
+}
+
+final class SystemBackgroundRefreshTaskHandoff: Sendable {
+    typealias MainActorDispatch = @Sendable (
+        @escaping @MainActor @Sendable () -> Void
+    ) -> Void
+
+    private let mainActorDispatch: MainActorDispatch
+
+    init(
+        mainActorDispatch: @escaping MainActorDispatch = { action in
+            Task { @MainActor in
+                action()
+            }
+        }
+    ) {
+        self.mainActorDispatch = mainActorDispatch
+    }
+
+    func handoff(
+        systemTask: any SystemBackgroundRefreshSystemTask,
+        handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void
+    ) {
+        let taskBridge = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {
+                systemTask.clearSystemExpirationHandler()
+            },
+            completeSystemTask: { success in
+                systemTask.completeSystemTask(success: success)
+            }
+        )
+        systemTask.installSystemExpirationHandler { [weak taskBridge] in
+            taskBridge?.systemDidExpire()
+        }
+        mainActorDispatch {
+            handler(taskBridge)
+        }
+    }
+}
+
+private final class BGAppRefreshTaskSystemTask: SystemBackgroundRefreshSystemTask, @unchecked Sendable {
+    private let task: BGAppRefreshTask
+
+    init(_ task: BGAppRefreshTask) {
+        self.task = task
+    }
+
+    func installSystemExpirationHandler(_ handler: @escaping @Sendable () -> Void) {
+        task.expirationHandler = handler
+    }
+
+    @MainActor
+    func clearSystemExpirationHandler() {
+        task.expirationHandler = nil
+    }
+
+    @MainActor
+    func completeSystemTask(success: Bool) {
+        task.setTaskCompleted(success: success)
     }
 }
 
@@ -345,13 +403,5 @@ final class SystemBackgroundRefreshTaskBridge: BackgroundRefreshTask, @unchecked
         lock.lock()
         defer { lock.unlock() }
         return body(&state)
-    }
-}
-
-private final class UncheckedSendableBox<Value>: @unchecked Sendable {
-    let value: Value
-
-    init(_ value: Value) {
-        self.value = value
     }
 }

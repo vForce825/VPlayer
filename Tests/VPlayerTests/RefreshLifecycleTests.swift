@@ -179,6 +179,50 @@ final class RefreshLifecycleTests: XCTestCase {
         XCTAssertEqual(completions, [false])
     }
 
+    func testSystemHandoffInstallsExpirationBeforeDispatchAndPreventsWorkAfterEarlyExpiration() async throws {
+        let scheduler = BackgroundSchedulerSpy()
+        let loadProbe = BackgroundLoadProbe()
+        let systemTask = SystemTaskSurfaceSpy()
+        let dispatchCapture = MainActorDispatchCapture()
+        let handoff = SystemBackgroundRefreshTaskHandoff(
+            mainActorDispatch: { action in
+                dispatchCapture.capture(
+                    action,
+                    expirationInstalled: systemTask.hasExpirationHandler
+                )
+            }
+        )
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: {
+                await loadProbe.recordLoad()
+                return []
+            },
+            refresh: { _, _, _ in [] },
+            reportStatus: { _ in }
+        )
+
+        registrar.register()
+        handoff.handoff(systemTask: systemTask) { task in
+            try? scheduler.launch(task)
+        }
+
+        XCTAssertTrue(systemTask.hasExpirationHandler)
+        XCTAssertEqual(dispatchCapture.expirationInstalledBeforeCapture, true)
+        XCTAssertEqual(dispatchCapture.count, 1)
+        systemTask.expire()
+        systemTask.expire()
+        dispatchCapture.runFirst()
+        await eventually { systemTask.completions.count == 1 }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+
+        let loadCount = await loadProbe.loadCount
+        XCTAssertEqual(loadCount, 0)
+        XCTAssertEqual(systemTask.completions, [false])
+    }
+
     func testSystemExpirationRacingSuccessCompletesFalseExactlyOnce() async {
         var expirationCount = 0
         var completions: [Bool] = []
@@ -369,6 +413,87 @@ private actor BackgroundLoadProbe {
 
     func recordLoad() {
         loadCount += 1
+    }
+}
+
+private final class SystemTaskSurfaceSpy: SystemBackgroundRefreshSystemTask, @unchecked Sendable {
+    private let lock = NSLock()
+
+    var hasExpirationHandler: Bool {
+        withLock { $0.expirationHandler != nil }
+    }
+
+    var completions: [Bool] {
+        withLock { $0.completionValues }
+    }
+
+    func installSystemExpirationHandler(_ handler: @escaping @Sendable () -> Void) {
+        withLock { $0.expirationHandler = handler }
+    }
+
+    @MainActor
+    func clearSystemExpirationHandler() {
+        withLock { $0.expirationHandler = nil }
+    }
+
+    @MainActor
+    func completeSystemTask(success: Bool) {
+        withLock { $0.completionValues.append(success) }
+    }
+
+    func expire() {
+        let handler = withLock { $0.expirationHandler }
+        handler?()
+    }
+
+    private func withLock<Result>(_ body: (inout State) -> Result) -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&state)
+    }
+
+    private struct State {
+        var expirationHandler: (@Sendable () -> Void)?
+        var completionValues: [Bool] = []
+    }
+
+    private var state = State()
+}
+
+private final class MainActorDispatchCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var actions: [@MainActor @Sendable () -> Void] = []
+    private var recordedExpirationInstalled: Bool?
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return actions.count
+    }
+
+    var expirationInstalledBeforeCapture: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedExpirationInstalled
+    }
+
+    func capture(
+        _ action: @escaping @MainActor @Sendable () -> Void,
+        expirationInstalled: Bool
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedExpirationInstalled = expirationInstalled
+        actions.append(action)
+    }
+
+    @MainActor
+    func runFirst() {
+        let action: (@MainActor @Sendable () -> Void)?
+        lock.lock()
+        action = actions.isEmpty ? nil : actions.removeFirst()
+        lock.unlock()
+        action?()
     }
 }
 
