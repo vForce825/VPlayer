@@ -63,6 +63,9 @@ targets:
       - path: Tests/Fixtures/playlists
         type: folder
         buildPhase: resources
+      - path: Tests/Fixtures/epg
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: VPlayerCore
       - target: VPlayerPlayback

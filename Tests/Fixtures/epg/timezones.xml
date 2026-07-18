@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="1287"><display-name>五星体育频道</display-name><icon src="https://img.example/1287.png"/></channel>
+  <programme start="20260718233000 +0800" stop="20260719010000 +0800" channel="1287">
+    <title>深夜体育</title><sub-title>直播</sub-title><desc>跨日节目</desc><category>体育</category>
+  </programme>
+</tv>

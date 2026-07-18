@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE tv [
+  <!ENTITY forbidden "must not be expanded">
+]>
+<tv>
+  <channel id="entity"><display-name>&forbidden;</display-name></channel>
+</tv>
