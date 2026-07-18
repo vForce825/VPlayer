@@ -385,6 +385,204 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.profiles.first?.epgStatus.state, .failed)
     }
 
+    func testReloadCapturedBeforeSameResourceAttemptPreservesActiveRefreshingMetadata() async {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let oldAttemptAt = startedAt.addingTimeInterval(-300)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: startedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: oldAttemptAt,
+            state: .failed,
+            errorSummary: "old playlist failure"
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [channel]]
+        )
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: startedAt
+                )
+            },
+            now: { startedAt }
+        )
+
+        await model.reload()
+        await repository.gateNextChannelRead()
+        let staleReload = Task { await model.reload() }
+        await repository.waitUntilChannelReadIsBlocked()
+        let refresh = Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+
+        await repository.releaseChannelRead()
+        let staleReloadSucceeded = await staleReload.value
+
+        XCTAssertTrue(staleReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .refreshing)
+
+        await gate.release(resource: .playlist, ordinal: 1, result: .success)
+        await refresh.value
+    }
+
+    func testReloadPreservesCrossResourceAttemptWhileAcceptingOtherResourceSnapshot() async throws {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let playlistSuccessAt = startedAt.addingTimeInterval(-60)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: startedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: startedAt.addingTimeInterval(-600),
+            state: .failed,
+            errorSummary: "old playlist failure"
+        )
+        profile.epgStatus = ResourceRefreshStatus(
+            lastAttemptAt: startedAt.addingTimeInterval(-300),
+            state: .failed,
+            errorSummary: "old epg failure"
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [channel]]
+        )
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: startedAt
+                )
+            },
+            now: { startedAt }
+        )
+
+        await model.reload()
+        try await repository.recordSuccess(
+            profileID: profile.id,
+            resource: .playlist,
+            at: playlistSuccessAt
+        )
+        await repository.gateNextChannelRead()
+        let capturedReload = Task { await model.reload() }
+        await repository.waitUntilChannelReadIsBlocked()
+        let epgRefresh = Task { await model.refresh(profileID: profile.id, resource: .epg) }
+        await gate.waitUntilStarted(resource: .epg, ordinal: 1)
+
+        await repository.releaseChannelRead()
+        let capturedReloadSucceeded = await capturedReload.value
+
+        XCTAssertTrue(capturedReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastSuccessAt, playlistSuccessAt)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.profiles.first?.epgStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.epgStatus.errorSummary)
+
+        await gate.release(resource: .epg, ordinal: 1, result: .success)
+        await epgRefresh.value
+    }
+
+    func testReloadStartedBeforeCancellationOverlayCannotClearOrOverwriteIt() async throws {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: startedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: startedAt.addingTimeInterval(-300),
+            state: .failed,
+            errorSummary: "stale terminal failure"
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [channel]]
+        )
+        let gate = AppModelConcurrentRefreshGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await gate.outcomes(
+                    repository: repository,
+                    profileID: profileID,
+                    resources: resources,
+                    now: startedAt
+                )
+            },
+            now: { startedAt }
+        )
+
+        await model.reload()
+        await repository.gateNextChannelRead()
+        let staleReload = Task { await model.reload() }
+        await repository.waitUntilChannelReadIsBlocked()
+        let cancelledRefresh = Task {
+            await model.refresh(profileID: profile.id, resource: .playlist)
+        }
+        await gate.waitUntilStarted(resource: .playlist, ordinal: 1)
+        cancelledRefresh.cancel()
+        await gate.release(resource: .playlist, ordinal: 1, result: .cancellation)
+        await cancelledRefresh.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+
+        await repository.releaseChannelRead()
+        let staleReloadSucceeded = await staleReload.value
+
+        XCTAssertTrue(staleReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+        XCTAssertEqual(model.activeProfile?.m3uStatus.errorSummary, "刷新已取消。")
+
+        try await repository.recordFailure(
+            profileID: profile.id,
+            resource: .playlist,
+            summary: "persisted terminal truth",
+            at: startedAt.addingTimeInterval(60)
+        )
+        _ = await model.reload()
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "persisted terminal truth")
+        XCTAssertEqual(model.activeProfile?.m3uStatus.errorSummary, "persisted terminal truth")
+    }
+
     func testManualRefreshKeepsReturnedFailureTerminalWhenFailurePersistenceFails() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)

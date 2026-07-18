@@ -39,7 +39,7 @@ final class AppModel {
     private var activeCreationAttemptIDs: Set<UUID> = []
     private var cancelledCreationAttemptIDs: Set<UUID> = []
     private var terminalRefreshOverlays: [RefreshKey: TerminalRefreshOverlay] = [:]
-    private var manualRefreshAttemptIDs: [RefreshKey: UUID] = [:]
+    private var manualRefreshAttempts: [RefreshKey: ManualRefreshAttempt] = [:]
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private var alertKind = AlertKind.operation
 
@@ -71,6 +71,7 @@ final class AppModel {
     @discardableResult
     func reload() async -> Bool {
         let currentReloadID = UUID()
+        let terminalRefreshOverlayIDsAtStart = terminalRefreshOverlays.mapValues(\.id)
         reloadID = currentReloadID
         isLoading = true
         clearActiveBoundState()
@@ -90,7 +91,8 @@ final class AppModel {
                     epgChannels: [],
                     matches: [:],
                     manualMappings: [:],
-                    programmes: [:]
+                    programmes: [:],
+                    terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
                 )
             }
 
@@ -136,7 +138,8 @@ final class AppModel {
                 epgChannels: loadedEPGChannels,
                 matches: matches,
                 manualMappings: manualMappings,
-                programmes: programmes
+                programmes: programmes,
+                terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
             )
         } catch is CancellationError {
             finishLoading(reloadID: currentReloadID)
@@ -294,11 +297,15 @@ final class AppModel {
 
     func refresh(profileID: UUID, resource: RefreshResource) async {
         let key = RefreshKey(profileID: profileID, resource: resource)
-        let attemptID = UUID()
-        manualRefreshAttemptIDs[key] = attemptID
-        markRefreshing(profileID: profileID, resource: resource)
+        let attempt = ManualRefreshAttempt(id: UUID(), startedAt: now())
+        manualRefreshAttempts[key] = attempt
+        markRefreshing(
+            profileID: profileID,
+            resource: resource,
+            startedAt: attempt.startedAt
+        )
         let outcomes = await refreshResources(profileID, [resource], .manual)
-        guard manualRefreshAttemptIDs[key] == attemptID else { return }
+        guard manualRefreshAttempts[key]?.id == attempt.id else { return }
         let outcome = outcomes.first { $0.resource == resource } ?? RefreshOutcome(
             resource: resource,
             succeeded: false,
@@ -312,10 +319,12 @@ final class AppModel {
             completedAt: completedAt
         )
         terminalRefreshOverlays[key] = TerminalRefreshOverlay(
+            id: UUID(),
+            startedAt: attempt.startedAt,
             outcome: outcome,
             completedAt: completedAt
         )
-        manualRefreshAttemptIDs[key] = nil
+        manualRefreshAttempts[key] = nil
         guard !Task.isCancelled else { return }
         _ = await reload()
     }
@@ -399,12 +408,17 @@ final class AppModel {
         epgChannels: [EPGChannel],
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
-        programmes: [String: [Programme]]
+        programmes: [String: [Programme]],
+        terminalRefreshOverlayIDsAtStart: [RefreshKey: UUID]
     ) -> Bool {
         guard reloadID == currentReloadID else { return false }
         var profiles = profiles
         invalidateManualRefreshAttempts(missingFrom: profiles)
-        reconcileTerminalRefreshOverlays(in: &profiles)
+        reconcileActiveManualRefreshAttempts(in: &profiles)
+        reconcileTerminalRefreshOverlays(
+            in: &profiles,
+            presentAtReloadStart: terminalRefreshOverlayIDsAtStart
+        )
         self.profiles = profiles
         if let activeProfile,
            let reconciledActiveProfile = profiles.first(where: { $0.id == activeProfile.id }) {
@@ -430,16 +444,20 @@ final class AppModel {
         isLoading = false
     }
 
-    private func markRefreshing(profileID: UUID, resource: RefreshResource) {
+    private func markRefreshing(
+        profileID: UUID,
+        resource: RefreshResource,
+        startedAt: Date
+    ) {
         terminalRefreshOverlays[RefreshKey(profileID: profileID, resource: resource)] = nil
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
         switch resource {
         case .playlist:
-            profiles[index].m3uStatus.lastAttemptAt = now()
+            profiles[index].m3uStatus.lastAttemptAt = startedAt
             profiles[index].m3uStatus.state = .refreshing
             profiles[index].m3uStatus.errorSummary = nil
         case .epg:
-            profiles[index].epgStatus.lastAttemptAt = now()
+            profiles[index].epgStatus.lastAttemptAt = startedAt
             profiles[index].epgStatus.state = .refreshing
             profiles[index].epgStatus.errorSummary = nil
         }
@@ -557,7 +575,28 @@ final class AppModel {
         }
     }
 
-    private func reconcileTerminalRefreshOverlays(in profiles: inout [SourceProfile]) {
+    private func reconcileActiveManualRefreshAttempts(in profiles: inout [SourceProfile]) {
+        for (key, attempt) in manualRefreshAttempts {
+            guard let index = profiles.firstIndex(where: { $0.id == key.profileID }) else {
+                continue
+            }
+            switch key.resource {
+            case .playlist:
+                profiles[index].m3uStatus.lastAttemptAt = attempt.startedAt
+                profiles[index].m3uStatus.state = .refreshing
+                profiles[index].m3uStatus.errorSummary = nil
+            case .epg:
+                profiles[index].epgStatus.lastAttemptAt = attempt.startedAt
+                profiles[index].epgStatus.state = .refreshing
+                profiles[index].epgStatus.errorSummary = nil
+            }
+        }
+    }
+
+    private func reconcileTerminalRefreshOverlays(
+        in profiles: inout [SourceProfile],
+        presentAtReloadStart overlayIDsAtReloadStart: [RefreshKey: UUID]
+    ) {
         for key in Array(terminalRefreshOverlays.keys) {
             guard let overlay = terminalRefreshOverlays[key],
                   let index = profiles.firstIndex(where: { $0.id == key.profileID }) else {
@@ -568,18 +607,21 @@ final class AppModel {
             case .playlist: profiles[index].m3uStatus.state
             case .epg: profiles[index].epgStatus.state
             }
-            guard persistedState == .refreshing else {
+            if (persistedState == .succeeded || persistedState == .failed),
+               overlayIDsAtReloadStart[key] == overlay.id {
                 terminalRefreshOverlays[key] = nil
                 continue
             }
             switch key.resource {
             case .playlist:
+                profiles[index].m3uStatus.lastAttemptAt = overlay.startedAt
                 Self.applyRefreshOutcome(
                     overlay.outcome,
                     completedAt: overlay.completedAt,
                     to: &profiles[index].m3uStatus
                 )
             case .epg:
+                profiles[index].epgStatus.lastAttemptAt = overlay.startedAt
                 Self.applyRefreshOutcome(
                     overlay.outcome,
                     completedAt: overlay.completedAt,
@@ -606,9 +648,9 @@ final class AppModel {
 
     private func invalidateManualRefreshAttempts(missingFrom profiles: [SourceProfile]) {
         let loadedProfileIDs = Set(profiles.map(\.id))
-        for key in Array(manualRefreshAttemptIDs.keys)
+        for key in Array(manualRefreshAttempts.keys)
         where !loadedProfileIDs.contains(key.profileID) {
-            manualRefreshAttemptIDs[key] = nil
+            manualRefreshAttempts[key] = nil
         }
     }
 
@@ -647,7 +689,14 @@ private extension AppModel {
         let resource: RefreshResource
     }
 
+    struct ManualRefreshAttempt {
+        let id: UUID
+        let startedAt: Date
+    }
+
     struct TerminalRefreshOverlay {
+        let id: UUID
+        let startedAt: Date
         let outcome: RefreshOutcome
         let completedAt: Date
     }
