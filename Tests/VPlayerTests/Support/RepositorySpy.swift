@@ -20,10 +20,19 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     }
 
     struct Snapshot: Sendable {
+        struct ProgrammeRequest: Equatable, Sendable {
+            let profileID: UUID
+            let xmltvChannelID: String
+            let overlapping: Range<Date>
+        }
+
         let profiles: [SourceProfile]
+        let activeProfileID: UUID?
         let channels: [UUID: [Channel]]
         let epgChannels: [UUID: [EPGChannel]]
         let programmes: [UUID: [Programme]]
+        let manualMappings: [UUID: [String: String]]
+        let programmeRequests: [ProgrammeRequest]
         let events: [Event]
         let profileLookupCount: Int
         let playlistInstallCount: Int
@@ -31,9 +40,12 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     }
 
     private var storedProfiles: [SourceProfile]
+    private var storedActiveProfileID: UUID?
     private var storedChannels: [UUID: [Channel]]
     private var storedEPGChannels: [UUID: [EPGChannel]]
     private var storedProgrammes: [UUID: [Programme]]
+    private var storedManualMappings: [UUID: [String: String]]
+    private var programmeRequests: [Snapshot.ProgrammeRequest] = []
     private var recordedEvents: [Event] = []
     private var profileLookupCount = 0
     private var playlistInstallCount = 0
@@ -43,16 +55,20 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
 
     init(
         profiles: [SourceProfile],
+        activeProfileID: UUID? = nil,
         channels: [UUID: [Channel]] = [:],
         epgChannels: [UUID: [EPGChannel]] = [:],
         programmes: [UUID: [Programme]] = [:],
+        manualMappings: [UUID: [String: String]] = [:],
         failedRefreshCommits: Set<RefreshResource> = [],
         failsRecordFailure: Bool = false
     ) {
         storedProfiles = profiles
+        storedActiveProfileID = activeProfileID ?? profiles.first?.id
         storedChannels = channels
         storedEPGChannels = epgChannels
         storedProgrammes = programmes
+        storedManualMappings = manualMappings
         self.failedRefreshCommits = failedRefreshCommits
         self.failsRecordFailure = failsRecordFailure
     }
@@ -60,9 +76,12 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     func snapshot() -> Snapshot {
         Snapshot(
             profiles: storedProfiles,
+            activeProfileID: storedActiveProfileID,
             channels: storedChannels,
             epgChannels: storedEPGChannels,
             programmes: storedProgrammes,
+            manualMappings: storedManualMappings,
+            programmeRequests: programmeRequests,
             events: recordedEvents,
             profileLookupCount: profileLookupCount,
             playlistInstallCount: playlistInstallCount,
@@ -76,7 +95,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     }
 
     func activeProfile() throws -> SourceProfile? {
-        storedProfiles.first
+        guard let storedActiveProfileID else { return nil }
+        return storedProfiles.first { $0.id == storedActiveProfileID }
     }
 
     func createProfile(_ input: ValidatedSourceProfileInput, now: Date) throws -> SourceProfile {
@@ -93,6 +113,9 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             updatedAt: now
         )
         storedProfiles.append(profile)
+        if storedActiveProfileID == nil {
+            storedActiveProfileID = profile.id
+        }
         return profile
     }
 
@@ -112,10 +135,15 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         storedChannels[id] = nil
         storedEPGChannels[id] = nil
         storedProgrammes[id] = nil
+        storedManualMappings[id] = nil
+        if storedActiveProfileID == id {
+            storedActiveProfileID = storedProfiles.first?.id
+        }
     }
 
     func setActiveProfile(id: UUID) throws {
         _ = try profileIndex(id)
+        storedActiveProfileID = id
     }
 
     func channels(profileID: UUID) throws -> [Channel] {
@@ -134,6 +162,11 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         overlapping: Range<Date>
     ) throws -> [Programme] {
         _ = try profileIndex(profileID)
+        programmeRequests.append(Snapshot.ProgrammeRequest(
+            profileID: profileID,
+            xmltvChannelID: xmltvChannelID,
+            overlapping: overlapping
+        ))
         return storedProgrammes[profileID, default: []].filter {
             $0.xmltvChannelID == xmltvChannelID
                 && $0.start < overlapping.upperBound
@@ -143,7 +176,13 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
 
     func manualMapping(profileID: UUID, channelID: String) throws -> ManualEPGMapping? {
         _ = try profileIndex(profileID)
-        return nil
+        return storedManualMappings[profileID]?[channelID].map {
+            ManualEPGMapping(
+                sourceProfileID: profileID,
+                channelID: channelID,
+                xmltvChannelID: $0
+            )
+        }
     }
 
     func setManualMapping(
@@ -152,6 +191,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         xmltvChannelID: String?
     ) throws {
         _ = try profileIndex(profileID)
+        storedManualMappings[profileID, default: [:]][channelID] = xmltvChannelID
     }
 
     func installPlaylist(profileID: UUID, channels: [Channel], fetchedAt: Date) throws {

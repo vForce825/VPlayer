@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import SwiftUI
+import VPlayerPlayback
 
 @main
 struct VPlayerApp: App {
@@ -10,7 +11,11 @@ struct VPlayerApp: App {
     private let dependencies: VPlayerDependencies
 
     init() {
-        self.init(dependencies: .production())
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-uiTestResetPlaybackSettings") {
+            UserDefaults.standard.removeObject(forKey: PlaybackSettingsStore.storageKey)
+        }
+        self.init(dependencies: arguments.contains("-ui-testing") ? .uiTesting() : .live())
     }
 
     init(dependencies: VPlayerDependencies) {
@@ -21,7 +26,7 @@ struct VPlayerApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(dependencies: dependencies)
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             handleScenePhase(phase)

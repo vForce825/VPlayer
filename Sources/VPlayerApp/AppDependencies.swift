@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import Foundation
 import VPlayerCore
+import VPlayerPlayback
 
 protocol LibrarySnapshotMaintenance: Sendable {
     func purgeUnreferencedSnapshots() async throws
@@ -56,7 +58,14 @@ actor LibraryStartup {
 }
 
 @MainActor
-struct VPlayerDependencies {
+struct AppDependencies {
+    typealias Refresh = AppModel.Refresh
+    typealias Prepare = @Sendable () async -> Void
+
+    let repository: any LibraryRepository
+    let refresh: Refresh
+    let prepare: Prepare
+    let playbackSettings: PlaybackSettingsStore
     let libraryStartup: LibraryStartup
     let foregroundRefreshDriver: ForegroundRefreshDriver
     let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
@@ -64,14 +73,24 @@ struct VPlayerDependencies {
     init(
         libraryStartup: LibraryStartup,
         foregroundRefreshDriver: ForegroundRefreshDriver,
-        backgroundRefreshRegistrar: BackgroundRefreshRegistrar
+        backgroundRefreshRegistrar: BackgroundRefreshRegistrar,
+        repository: any LibraryRepository = UnavailableLibraryRepository(),
+        refresh: @escaping Refresh = { _, resources, _ in
+            resources.map { RefreshOutcome(resource: $0, succeeded: false, message: nil) }
+        },
+        prepare: @escaping Prepare = {},
+        playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore()
     ) {
+        self.repository = repository
+        self.refresh = refresh
+        self.prepare = prepare
+        self.playbackSettings = playbackSettings
         self.libraryStartup = libraryStartup
         self.foregroundRefreshDriver = foregroundRefreshDriver
         self.backgroundRefreshRegistrar = backgroundRefreshRegistrar
     }
 
-    static func production() -> Self {
+    static func live() -> Self {
         do {
             let container = try VPlayerModelContainer.make()
             let repository = SwiftDataLibraryStore(modelContainer: container)
@@ -79,9 +98,6 @@ struct VPlayerDependencies {
                 repository: repository,
                 downloader: URLSessionBoundedDownloader()
             )
-            let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
-                try await repository.profiles()
-            }
             let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in
                 await coordinator.refresh(
                     profileID: profileID,
@@ -90,22 +106,15 @@ struct VPlayerDependencies {
                 )
             }
 
-            return Self(
+            return make(
+                repository: repository,
+                refresh: refresh,
                 libraryStartup: LibraryStartup {
                     try await repository.purgeUnreferencedSnapshots()
-                },
-                foregroundRefreshDriver: ForegroundRefreshDriver(
-                    loadProfiles: loadProfiles,
-                    refresh: refresh,
-                    reportStatus: { _ in }
-                ),
-                backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
-                    loadProfiles: loadProfiles,
-                    refresh: refresh,
-                    reportStatus: { _ in }
-                )
+                }
             )
         } catch {
+            let repository = UnavailableLibraryRepository()
             let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
                 throw ProductionDependencyError.libraryUnavailable
             }
@@ -123,7 +132,67 @@ struct VPlayerDependencies {
                     loadProfiles: loadProfiles,
                     refresh: refresh,
                     reportStatus: { _ in }
-                )
+                ),
+                repository: repository,
+                refresh: refresh
+            )
+        }
+    }
+
+    static func production() -> Self {
+        live()
+    }
+
+    static func uiTesting() -> Self {
+        do {
+            let container = try VPlayerModelContainer.make(inMemory: true)
+            let repository = SwiftDataLibraryStore(modelContainer: container)
+            let seeder = SeededLibrarySeeder(repository: repository)
+            let refresh = fixtureRefresh(repository: repository)
+            let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
+                try await repository.profiles()
+            }
+            return Self(
+                libraryStartup: LibraryStartup {
+                    try await repository.purgeUnreferencedSnapshots()
+                },
+                foregroundRefreshDriver: ForegroundRefreshDriver(
+                    loadProfiles: loadProfiles,
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                ),
+                backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                    scheduler: InertBackgroundRefreshScheduler(),
+                    loadProfiles: loadProfiles,
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                ),
+                repository: repository,
+                refresh: refresh,
+                prepare: {
+                    await seeder.seed()
+                }
+            )
+        } catch {
+            let repository = UnavailableLibraryRepository()
+            let refresh: Refresh = { _, resources, _ in
+                resources.map { RefreshOutcome(resource: $0, succeeded: false, message: nil) }
+            }
+            return Self(
+                libraryStartup: LibraryStartup {},
+                foregroundRefreshDriver: ForegroundRefreshDriver(
+                    loadProfiles: { [] },
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                ),
+                backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                    scheduler: InertBackgroundRefreshScheduler(),
+                    loadProfiles: { [] },
+                    refresh: refresh,
+                    reportStatus: { _ in }
+                ),
+                repository: repository,
+                refresh: refresh
             )
         }
     }
@@ -138,8 +207,256 @@ struct VPlayerDependencies {
             _ = await start()
         }
     }
+
+    private static func make(
+        repository: any LibraryRepository & RefreshSnapshotCommitting,
+        refresh: @escaping Refresh,
+        libraryStartup: LibraryStartup
+    ) -> Self {
+        let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
+            try await repository.profiles()
+        }
+        return Self(
+            libraryStartup: libraryStartup,
+            foregroundRefreshDriver: ForegroundRefreshDriver(
+                loadProfiles: loadProfiles,
+                refresh: refresh,
+                reportStatus: { _ in }
+            ),
+            backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                loadProfiles: loadProfiles,
+                refresh: refresh,
+                reportStatus: { _ in }
+            ),
+            repository: repository,
+            refresh: refresh
+        )
+    }
+
+    private static func fixtureRefresh(
+        repository: any LibraryRepository
+    ) -> Refresh {
+        { profileID, resources, _ in
+            let timestamp = Date()
+            var outcomes: [RefreshOutcome] = []
+            for resource in resources.sorted(by: { $0.rawValue < $1.rawValue }) {
+                do {
+                    try await repository.recordAttempt(
+                        profileID: profileID,
+                        resource: resource,
+                        at: timestamp
+                    )
+                    try await repository.recordSuccess(
+                        profileID: profileID,
+                        resource: resource,
+                        at: timestamp
+                    )
+                    outcomes.append(RefreshOutcome(resource: resource, succeeded: true, message: nil))
+                } catch {
+                    outcomes.append(RefreshOutcome(
+                        resource: resource,
+                        succeeded: false,
+                        message: "测试刷新失败。"
+                    ))
+                }
+            }
+            return outcomes
+        }
+    }
 }
+
+typealias VPlayerDependencies = AppDependencies
 
 private enum ProductionDependencyError: Error {
     case libraryUnavailable
+}
+
+@MainActor
+private final class InertBackgroundRefreshScheduler: BackgroundRefreshScheduling {
+    func register(
+        identifier: String,
+        handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void
+    ) -> Bool {
+        _ = identifier
+        _ = handler
+        return true
+    }
+
+    func cancel(identifier: String) {
+        _ = identifier
+    }
+
+    func submit(identifier: String, earliestBeginDate: Date) throws {
+        _ = identifier
+        _ = earliestBeginDate
+    }
+}
+
+private actor SeededLibrarySeeder {
+    private let repository: any LibraryRepository
+    private var didSeed = false
+
+    init(repository: any LibraryRepository) {
+        self.repository = repository
+    }
+
+    func seed() async {
+        guard !didSeed else { return }
+        didSeed = true
+        let now = Date()
+
+        do {
+            let profile = try await repository.createProfile(
+                SourceProfileInput(
+                    name: "测试数据源",
+                    m3uURLString: "https://fixture.invalid/playlist.m3u",
+                    epgURLString: "https://fixture.invalid/epg.xml",
+                    m3uRefreshInterval: .manual,
+                    epgRefreshInterval: .manual
+                ).validated(),
+                now: now
+            )
+            try await repository.installPlaylist(
+                profileID: profile.id,
+                channels: [
+                    Channel(
+                        sourceProfileID: profile.id,
+                        displayName: "测试频道",
+                        streamURL: URL(string: "https://relay.fixture.invalid/rtp/239.1.1.1:5000")!,
+                        tvgID: "fixture-channel",
+                        tvgName: "测频道",
+                        logoURL: nil,
+                        groupTitle: "测试分组",
+                        attributes: ["ui-test-id": "channel.http"],
+                        order: 0
+                    ),
+                    Channel(
+                        sourceProfileID: profile.id,
+                        displayName: "组播频道",
+                        streamURL: URL(string: "udp://239.1.1.1:5000")!,
+                        tvgID: nil,
+                        tvgName: nil,
+                        logoURL: nil,
+                        groupTitle: "测试分组",
+                        attributes: ["ui-test-id": "channel.udp"],
+                        order: 1
+                    ),
+                ],
+                fetchedAt: now
+            )
+            let temporaryURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("vplayer-ui-fixture-\(UUID().uuidString).xml")
+            try Self.epgData(now: now).write(to: temporaryURL, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            _ = try await repository.installEPG(
+                profileID: profile.id,
+                fileURL: temporaryURL,
+                fetchedAt: now
+            )
+        } catch {
+            return
+        }
+    }
+
+    private static func epgData(now: Date) -> Data {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMddHHmmss Z"
+        let currentStart = formatter.string(from: now.addingTimeInterval(-900))
+        let currentStop = formatter.string(from: now.addingTimeInterval(900))
+        let nextStop = formatter.string(from: now.addingTimeInterval(2_700))
+        return Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <tv>
+          <channel id="fixture-channel"><display-name>测试频道</display-name></channel>
+          <programme channel="fixture-channel" start="\(currentStart)" stop="\(currentStop)">
+            <title>正在播出</title>
+          </programme>
+          <programme channel="fixture-channel" start="\(currentStop)" stop="\(nextStop)">
+            <title>接下来</title>
+          </programme>
+        </tv>
+        """.utf8)
+    }
+}
+
+private actor UnavailableLibraryRepository: LibraryRepository {
+    func profiles() throws -> [SourceProfile] { throw ProductionDependencyError.libraryUnavailable }
+    func activeProfile() throws -> SourceProfile? { throw ProductionDependencyError.libraryUnavailable }
+    func createProfile(_ input: ValidatedSourceProfileInput, now: Date) throws -> SourceProfile {
+        _ = input
+        _ = now
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func updateProfile(id: UUID, input: ValidatedSourceProfileInput, now: Date) throws {
+        _ = id
+        _ = input
+        _ = now
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func deleteProfile(id: UUID) throws { _ = id; throw ProductionDependencyError.libraryUnavailable }
+    func setActiveProfile(id: UUID) throws { _ = id; throw ProductionDependencyError.libraryUnavailable }
+    func channels(profileID: UUID) throws -> [Channel] {
+        _ = profileID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func epgChannels(profileID: UUID) throws -> [EPGChannel] {
+        _ = profileID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func programmes(
+        profileID: UUID,
+        xmltvChannelID: String,
+        overlapping: Range<Date>
+    ) throws -> [Programme] {
+        _ = profileID
+        _ = xmltvChannelID
+        _ = overlapping
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func manualMapping(profileID: UUID, channelID: String) throws -> ManualEPGMapping? {
+        _ = profileID
+        _ = channelID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func setManualMapping(profileID: UUID, channelID: String, xmltvChannelID: String?) throws {
+        _ = profileID
+        _ = channelID
+        _ = xmltvChannelID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func installPlaylist(profileID: UUID, channels: [Channel], fetchedAt: Date) throws {
+        _ = profileID
+        _ = channels
+        _ = fetchedAt
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func installEPG(profileID: UUID, fileURL: URL, fetchedAt: Date) throws -> XMLTVParseSummary {
+        _ = profileID
+        _ = fileURL
+        _ = fetchedAt
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func recordAttempt(profileID: UUID, resource: RefreshResource, at: Date) throws {
+        _ = profileID
+        _ = resource
+        _ = at
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func recordSuccess(profileID: UUID, resource: RefreshResource, at: Date) throws {
+        _ = profileID
+        _ = resource
+        _ = at
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func recordFailure(profileID: UUID, resource: RefreshResource, summary: String, at: Date) throws {
+        _ = profileID
+        _ = resource
+        _ = summary
+        _ = at
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func purgeUnreferencedSnapshots() throws { throw ProductionDependencyError.libraryUnavailable }
 }
