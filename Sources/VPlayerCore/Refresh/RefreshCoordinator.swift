@@ -14,11 +14,18 @@ public struct RefreshOutcome: Equatable, Sendable {
     public let resource: RefreshResource
     public let succeeded: Bool
     public let message: String?
+    public let attemptID: UUID?
 
-    public init(resource: RefreshResource, succeeded: Bool, message: String?) {
+    public init(
+        resource: RefreshResource,
+        succeeded: Bool,
+        message: String?,
+        attemptID: UUID? = nil
+    ) {
         self.resource = resource
         self.succeeded = succeeded
         self.message = message
+        self.attemptID = attemptID
     }
 }
 
@@ -97,7 +104,7 @@ public actor RefreshCoordinator {
         if let existing = inFlight[key], existing.isDraining {
             let shouldRetry = await waitForDrain(key: key, flightID: existing.id)
             guard shouldRetry else {
-                return Self.cancellationOutcome(resource: resource)
+                return Self.cancellationOutcome(resource: resource, attemptID: existing.id)
             }
             return await refreshOne(profileID: profileID, resource: resource)
         }
@@ -117,7 +124,8 @@ public actor RefreshCoordinator {
                     downloader: downloader,
                     profileID: profileID,
                     resource: resource,
-                    timestamp: timestamp
+                    timestamp: timestamp,
+                    attemptID: id
                 )
                 if performed.didPersistTerminalStatus, let onPersistedOutcome {
                     await onPersistedOutcome(profileID, performed.outcome)
@@ -139,7 +147,10 @@ public actor RefreshCoordinator {
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard var flight = inFlight[key], flight.id == flightID else {
-                    continuation.resume(returning: Self.cancellationOutcome(resource: resource))
+                    continuation.resume(returning: Self.cancellationOutcome(
+                        resource: resource,
+                        attemptID: flightID
+                    ))
                     return
                 }
                 if Task.isCancelled {
@@ -148,7 +159,10 @@ public actor RefreshCoordinator {
                         flight.task.cancel()
                     }
                     inFlight[key] = flight
-                    continuation.resume(returning: Self.cancellationOutcome(resource: resource))
+                    continuation.resume(returning: Self.cancellationOutcome(
+                        resource: resource,
+                        attemptID: flightID
+                    ))
                     return
                 }
                 flight.waiters[waiterID] = continuation
@@ -180,7 +194,10 @@ public actor RefreshCoordinator {
             flight.task.cancel()
         }
         inFlight[key] = flight
-        waiter.resume(returning: Self.cancellationOutcome(resource: resource))
+        waiter.resume(returning: Self.cancellationOutcome(
+            resource: resource,
+            attemptID: flightID
+        ))
     }
 
     private func waitForDrain(
@@ -246,7 +263,8 @@ public actor RefreshCoordinator {
         downloader: any RemoteResourceDownloading,
         profileID: UUID,
         resource: RefreshResource,
-        timestamp: Date
+        timestamp: Date,
+        attemptID: UUID
     ) async -> PerformedRefresh {
         var resourceURL: URL?
         do {
@@ -256,7 +274,12 @@ public actor RefreshCoordinator {
             }
             let url = resource == .playlist ? profile.m3uURL : profile.epgURL
             resourceURL = url
-            try await repository.recordAttempt(profileID: profileID, resource: resource, at: timestamp)
+            try await repository.recordAttempt(
+                profileID: profileID,
+                resource: resource,
+                at: timestamp,
+                attemptID: attemptID
+            )
             try Task.checkCancellation()
             guard isRemoteHTTPURL(url) else { throw CoordinatorError.unsupportedRemoteURL }
 
@@ -279,18 +302,25 @@ public actor RefreshCoordinator {
                 try await repository.commitPlaylistRefresh(
                     profileID: profileID,
                     channels: channels,
-                    fetchedAt: timestamp
+                    fetchedAt: timestamp,
+                    attemptID: attemptID
                 )
             case .epg:
                 try Task.checkCancellation()
                 _ = try await repository.commitEPGRefresh(
                     profileID: profileID,
                     fileURL: downloaded.temporaryFileURL,
-                    fetchedAt: timestamp
+                    fetchedAt: timestamp,
+                    attemptID: attemptID
                 )
             }
             return PerformedRefresh(
-                outcome: RefreshOutcome(resource: resource, succeeded: true, message: nil),
+                outcome: RefreshOutcome(
+                    resource: resource,
+                    succeeded: true,
+                    message: nil,
+                    attemptID: attemptID
+                ),
                 didPersistTerminalStatus: true
             )
         } catch is CancellationError {
@@ -300,10 +330,16 @@ public actor RefreshCoordinator {
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
-                at: timestamp
+                at: timestamp,
+                attemptID: attemptID
             )
             return PerformedRefresh(
-                outcome: RefreshOutcome(resource: resource, succeeded: false, message: summary),
+                outcome: RefreshOutcome(
+                    resource: resource,
+                    succeeded: false,
+                    message: summary,
+                    attemptID: attemptID
+                ),
                 didPersistTerminalStatus: persisted
             )
         } catch RemoteDownloadError.cancelled {
@@ -313,10 +349,16 @@ public actor RefreshCoordinator {
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
-                at: timestamp
+                at: timestamp,
+                attemptID: attemptID
             )
             return PerformedRefresh(
-                outcome: RefreshOutcome(resource: resource, succeeded: false, message: summary),
+                outcome: RefreshOutcome(
+                    resource: resource,
+                    succeeded: false,
+                    message: summary,
+                    attemptID: attemptID
+                ),
                 didPersistTerminalStatus: persisted
             )
         } catch {
@@ -326,10 +368,16 @@ public actor RefreshCoordinator {
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
-                at: timestamp
+                at: timestamp,
+                attemptID: attemptID
             )
             return PerformedRefresh(
-                outcome: RefreshOutcome(resource: resource, succeeded: false, message: summary),
+                outcome: RefreshOutcome(
+                    resource: resource,
+                    succeeded: false,
+                    message: summary,
+                    attemptID: attemptID
+                ),
                 didPersistTerminalStatus: persisted
             )
         }
@@ -340,14 +388,16 @@ public actor RefreshCoordinator {
         profileID: UUID,
         resource: RefreshResource,
         summary: String,
-        at timestamp: Date
+        at timestamp: Date,
+        attemptID: UUID
     ) async -> Bool {
         do {
             try await repository.recordFailure(
                 profileID: profileID,
                 resource: resource,
                 summary: summary,
-                at: timestamp
+                at: timestamp,
+                attemptID: attemptID
             )
             return true
         } catch {
@@ -411,8 +461,14 @@ public actor RefreshCoordinator {
     }
 
     private nonisolated static func cancellationOutcome(
-        resource: RefreshResource
+        resource: RefreshResource,
+        attemptID: UUID? = nil
     ) -> RefreshOutcome {
-        RefreshOutcome(resource: resource, succeeded: false, message: "刷新已取消。")
+        RefreshOutcome(
+            resource: resource,
+            succeeded: false,
+            message: "刷新已取消。",
+            attemptID: attemptID
+        )
     }
 }

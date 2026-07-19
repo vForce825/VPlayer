@@ -912,6 +912,49 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertNil(updated.epgStatus.errorSummary)
     }
 
+    func testRefreshAttemptIdentityPersistsThroughTerminalStatusAndAtomicSnapshotSuccess() async throws {
+        let (_, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        let failedAttemptID = UUID(uuidString: "00000000-0000-0000-0000-000000000901")!
+        let successfulAttemptID = UUID(uuidString: "00000000-0000-0000-0000-000000000902")!
+
+        try await store.recordAttempt(
+            profileID: profile.id,
+            resource: .playlist,
+            at: date(20),
+            attemptID: failedAttemptID
+        )
+        try await store.recordFailure(
+            profileID: profile.id,
+            resource: .playlist,
+            summary: "failed",
+            at: date(20),
+            attemptID: failedAttemptID
+        )
+        var profiles = try await store.profiles()
+        var updated = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(updated.m3uStatus.state, .failed)
+        XCTAssertEqual(updated.m3uStatus.attemptID, failedAttemptID)
+        XCTAssertNil(updated.epgStatus.attemptID)
+
+        try await store.recordAttempt(
+            profileID: profile.id,
+            resource: .playlist,
+            at: date(30),
+            attemptID: successfulAttemptID
+        )
+        try await store.commitPlaylistRefresh(
+            profileID: profile.id,
+            channels: [channel(profileID: profile.id, name: "Current", path: "current")],
+            fetchedAt: date(30),
+            attemptID: successfulAttemptID
+        )
+        profiles = try await store.profiles()
+        updated = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(updated.m3uStatus.state, .succeeded)
+        XCTAssertEqual(updated.m3uStatus.attemptID, successfulAttemptID)
+    }
+
     func testDeletingActiveProfileSelectsOldestRemainingThenNil() async throws {
         let (_, store) = try makeStore()
         let first = try await store.createProfile(input(name: "First"), now: date(10))

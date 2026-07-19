@@ -36,13 +36,24 @@ public protocol LibraryRepository: Sendable {
         fileURL: URL,
         fetchedAt: Date
     ) async throws -> XMLTVParseSummary
-    func recordAttempt(profileID: UUID, resource: RefreshResource, at: Date) async throws
-    func recordSuccess(profileID: UUID, resource: RefreshResource, at: Date) async throws
+    func recordAttempt(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date,
+        attemptID: UUID?
+    ) async throws
+    func recordSuccess(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date,
+        attemptID: UUID?
+    ) async throws
     func recordFailure(
         profileID: UUID,
         resource: RefreshResource,
         summary: String,
-        at: Date
+        at: Date,
+        attemptID: UUID?
     ) async throws
     func purgeUnreferencedSnapshots() async throws
 }
@@ -52,13 +63,86 @@ public protocol RefreshSnapshotCommitting: Sendable {
     func commitPlaylistRefresh(
         profileID: UUID,
         channels: [Channel],
-        fetchedAt: Date
+        fetchedAt: Date,
+        attemptID: UUID?
     ) async throws
     func commitEPGRefresh(
         profileID: UUID,
         fileURL: URL,
-        fetchedAt: Date
+        fetchedAt: Date,
+        attemptID: UUID?
     ) async throws -> XMLTVParseSummary
+}
+
+public extension LibraryRepository {
+    func recordAttempt(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date
+    ) async throws {
+        try await recordAttempt(
+            profileID: profileID,
+            resource: resource,
+            at: at,
+            attemptID: nil
+        )
+    }
+
+    func recordSuccess(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date
+    ) async throws {
+        try await recordSuccess(
+            profileID: profileID,
+            resource: resource,
+            at: at,
+            attemptID: nil
+        )
+    }
+
+    func recordFailure(
+        profileID: UUID,
+        resource: RefreshResource,
+        summary: String,
+        at: Date
+    ) async throws {
+        try await recordFailure(
+            profileID: profileID,
+            resource: resource,
+            summary: summary,
+            at: at,
+            attemptID: nil
+        )
+    }
+}
+
+public extension RefreshSnapshotCommitting {
+    func commitPlaylistRefresh(
+        profileID: UUID,
+        channels: [Channel],
+        fetchedAt: Date
+    ) async throws {
+        try await commitPlaylistRefresh(
+            profileID: profileID,
+            channels: channels,
+            fetchedAt: fetchedAt,
+            attemptID: nil
+        )
+    }
+
+    func commitEPGRefresh(
+        profileID: UUID,
+        fileURL: URL,
+        fetchedAt: Date
+    ) async throws -> XMLTVParseSummary {
+        try await commitEPGRefresh(
+            profileID: profileID,
+            fileURL: fileURL,
+            fetchedAt: fetchedAt,
+            attemptID: nil
+        )
+    }
 }
 
 public enum LibraryRepositoryError: Error, Equatable, Sendable {

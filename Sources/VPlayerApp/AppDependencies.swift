@@ -258,31 +258,41 @@ struct AppDependencies {
             let timestamp = Date()
             var outcomes: [RefreshOutcome] = []
             for resource in resources.sorted(by: { $0.rawValue < $1.rawValue }) {
+                let attemptID = UUID()
                 let outcome: RefreshOutcome
                 do {
                     try await repository.recordAttempt(
                         profileID: profileID,
                         resource: resource,
-                        at: timestamp
+                        at: timestamp,
+                        attemptID: attemptID
                     )
                     try await repository.recordSuccess(
                         profileID: profileID,
                         resource: resource,
-                        at: timestamp
+                        at: timestamp,
+                        attemptID: attemptID
                     )
-                    outcome = RefreshOutcome(resource: resource, succeeded: true, message: nil)
+                    outcome = RefreshOutcome(
+                        resource: resource,
+                        succeeded: true,
+                        message: nil,
+                        attemptID: attemptID
+                    )
                 } catch {
                     let message = "测试刷新失败。"
                     try? await repository.recordFailure(
                         profileID: profileID,
                         resource: resource,
                         summary: message,
-                        at: timestamp
+                        at: timestamp,
+                        attemptID: attemptID
                     )
                     outcome = RefreshOutcome(
                         resource: resource,
                         succeeded: false,
-                        message: message
+                        message: message,
+                        attemptID: attemptID
                     )
                 }
                 outcomes.append(outcome)
@@ -479,23 +489,42 @@ private actor UnavailableLibraryRepository: LibraryRepository {
         _ = fetchedAt
         throw ProductionDependencyError.libraryUnavailable
     }
-    func recordAttempt(profileID: UUID, resource: RefreshResource, at: Date) throws {
+    func recordAttempt(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date,
+        attemptID: UUID?
+    ) throws {
         _ = profileID
         _ = resource
         _ = at
+        _ = attemptID
         throw ProductionDependencyError.libraryUnavailable
     }
-    func recordSuccess(profileID: UUID, resource: RefreshResource, at: Date) throws {
+    func recordSuccess(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date,
+        attemptID: UUID?
+    ) throws {
         _ = profileID
         _ = resource
         _ = at
+        _ = attemptID
         throw ProductionDependencyError.libraryUnavailable
     }
-    func recordFailure(profileID: UUID, resource: RefreshResource, summary: String, at: Date) throws {
+    func recordFailure(
+        profileID: UUID,
+        resource: RefreshResource,
+        summary: String,
+        at: Date,
+        attemptID: UUID?
+    ) throws {
         _ = profileID
         _ = resource
         _ = summary
         _ = at
+        _ = attemptID
         throw ProductionDependencyError.libraryUnavailable
     }
     func purgeUnreferencedSnapshots() throws { throw ProductionDependencyError.libraryUnavailable }

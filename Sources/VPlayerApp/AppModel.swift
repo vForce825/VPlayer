@@ -40,6 +40,13 @@ final class AppModel {
     private var cancelledCreationAttemptIDs: Set<UUID> = []
     private var terminalRefreshOverlays: [RefreshKey: TerminalRefreshOverlay] = [:]
     private var manualRefreshAttempts: [RefreshKey: ManualRefreshAttempt] = [:]
+    @ObservationIgnored private var activeReloadIDs: Set<UUID> = []
+    @ObservationIgnored private var reloadCompletionWaiters: [
+        UUID: [CheckedContinuation<Void, Never>]
+    ] = [:]
+    @ObservationIgnored private var refreshReconciliationTasks: [
+        RefreshKey: RefreshReconciliationTask
+    ] = [:]
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private var alertKind = AlertKind.operation
 
@@ -66,11 +73,16 @@ final class AppModel {
 
     deinit {
         libraryChangeTask?.cancel()
+        for reconciliation in refreshReconciliationTasks.values {
+            reconciliation.task.cancel()
+        }
     }
 
     @discardableResult
     func reload() async -> Bool {
         let currentReloadID = UUID()
+        activeReloadIDs.insert(currentReloadID)
+        defer { completeReload(currentReloadID) }
         let terminalRefreshOverlayIDsAtStart = terminalRefreshOverlays.mapValues(\.id)
         reloadID = currentReloadID
         isLoading = true
@@ -299,8 +311,7 @@ final class AppModel {
         let key = RefreshKey(profileID: profileID, resource: resource)
         let attempt = ManualRefreshAttempt(
             id: UUID(),
-            startedAt: now(),
-            baselineStatus: refreshStatus(profileID: profileID, resource: resource)
+            startedAt: now()
         )
         manualRefreshAttempts[key] = attempt
         markRefreshing(
@@ -325,13 +336,20 @@ final class AppModel {
         terminalRefreshOverlays[key] = TerminalRefreshOverlay(
             id: UUID(),
             startedAt: attempt.startedAt,
-            baselineStatus: attempt.baselineStatus,
+            expectedAttemptID: outcome.attemptID,
             outcome: outcome,
             completedAt: completedAt
         )
+        let overlayID = terminalRefreshOverlays[key]?.id
         manualRefreshAttempts[key] = nil
+        let reconciliationTask: Task<Void, Never>?
+        if let overlayID, outcome.attemptID != nil || !Task.isCancelled {
+            reconciliationTask = scheduleRefreshReconciliation(key: key, overlayID: overlayID)
+        } else {
+            reconciliationTask = nil
+        }
         guard !Task.isCancelled else { return }
-        _ = await reload()
+        await reconciliationTask?.value
     }
 
     @discardableResult
@@ -454,31 +472,24 @@ final class AppModel {
         resource: RefreshResource,
         startedAt: Date
     ) {
-        terminalRefreshOverlays[RefreshKey(profileID: profileID, resource: resource)] = nil
+        let key = RefreshKey(profileID: profileID, resource: resource)
+        cancelRefreshReconciliation(for: key)
+        terminalRefreshOverlays[key] = nil
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
         switch resource {
         case .playlist:
             profiles[index].m3uStatus.lastAttemptAt = startedAt
             profiles[index].m3uStatus.state = .refreshing
             profiles[index].m3uStatus.errorSummary = nil
+            profiles[index].m3uStatus.attemptID = nil
         case .epg:
             profiles[index].epgStatus.lastAttemptAt = startedAt
             profiles[index].epgStatus.state = .refreshing
             profiles[index].epgStatus.errorSummary = nil
+            profiles[index].epgStatus.attemptID = nil
         }
         if activeProfile?.id == profileID {
             activeProfile = profiles[index]
-        }
-    }
-
-    private func refreshStatus(
-        profileID: UUID,
-        resource: RefreshResource
-    ) -> ResourceRefreshStatus? {
-        guard let profile = profiles.first(where: { $0.id == profileID }) else { return nil }
-        return switch resource {
-        case .playlist: profile.m3uStatus
-        case .epg: profile.epgStatus
         }
     }
 
@@ -601,10 +612,12 @@ final class AppModel {
                 profiles[index].m3uStatus.lastAttemptAt = attempt.startedAt
                 profiles[index].m3uStatus.state = .refreshing
                 profiles[index].m3uStatus.errorSummary = nil
+                profiles[index].m3uStatus.attemptID = nil
             case .epg:
                 profiles[index].epgStatus.lastAttemptAt = attempt.startedAt
                 profiles[index].epgStatus.state = .refreshing
                 profiles[index].epgStatus.errorSummary = nil
+                profiles[index].epgStatus.attemptID = nil
             }
         }
     }
@@ -626,7 +639,7 @@ final class AppModel {
             if overlayIDsAtReloadStart[key] == overlay.id,
                Self.isTerminalStatus(
                    persistedStatus,
-                   differentFrom: overlay.baselineStatus,
+                   expectedAttemptID: overlay.expectedAttemptID,
                    orFreshSince: overlay.startedAt
                ) {
                 terminalRefreshOverlays[key] = nil
@@ -653,11 +666,13 @@ final class AppModel {
 
     private static func isTerminalStatus(
         _ status: ResourceRefreshStatus,
-        differentFrom baselineStatus: ResourceRefreshStatus?,
+        expectedAttemptID: UUID?,
         orFreshSince startedAt: Date
     ) -> Bool {
         guard status.state == .succeeded || status.state == .failed else { return false }
-        if let baselineStatus, status != baselineStatus { return true }
+        if let expectedAttemptID {
+            return status.attemptID == expectedAttemptID
+        }
         return switch status.state {
         case .succeeded:
             status.lastSuccessAt.map { $0 >= startedAt } ?? false
@@ -673,6 +688,7 @@ final class AppModel {
         completedAt: Date,
         to status: inout ResourceRefreshStatus
     ) {
+        status.attemptID = outcome.attemptID
         if outcome.succeeded {
             status.lastSuccessAt = completedAt
             status.state = .succeeded
@@ -688,6 +704,67 @@ final class AppModel {
         for key in Array(manualRefreshAttempts.keys)
         where !loadedProfileIDs.contains(key.profileID) {
             manualRefreshAttempts[key] = nil
+        }
+    }
+
+    private func scheduleRefreshReconciliation(
+        key: RefreshKey,
+        overlayID: UUID
+    ) -> Task<Void, Never> {
+        cancelRefreshReconciliation(for: key)
+        let reconciliationID = UUID()
+        let task = Task { @MainActor [weak self] in
+            await Task.yield()
+            await self?.performScheduledRefreshReconciliation(
+                key: key,
+                overlayID: overlayID,
+                reconciliationID: reconciliationID
+            )
+        }
+        refreshReconciliationTasks[key] = RefreshReconciliationTask(
+            id: reconciliationID,
+            task: task
+        )
+        return task
+    }
+
+    private func cancelRefreshReconciliation(for key: RefreshKey) {
+        refreshReconciliationTasks.removeValue(forKey: key)?.task.cancel()
+    }
+
+    private func finishRefreshReconciliation(key: RefreshKey, id: UUID) {
+        guard refreshReconciliationTasks[key]?.id == id else { return }
+        refreshReconciliationTasks[key] = nil
+    }
+
+    fileprivate func performScheduledRefreshReconciliation(
+        key: RefreshKey,
+        overlayID: UUID,
+        reconciliationID: UUID
+    ) async {
+        while let reloadID, activeReloadIDs.contains(reloadID) {
+            await waitForReloadCompletion(reloadID)
+        }
+        guard !Task.isCancelled,
+              terminalRefreshOverlays[key]?.id == overlayID else {
+            finishRefreshReconciliation(key: key, id: reconciliationID)
+            return
+        }
+        _ = await reload()
+        finishRefreshReconciliation(key: key, id: reconciliationID)
+    }
+
+    private func waitForReloadCompletion(_ id: UUID) async {
+        guard activeReloadIDs.contains(id) else { return }
+        await withCheckedContinuation { continuation in
+            reloadCompletionWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    private func completeReload(_ id: UUID) {
+        activeReloadIDs.remove(id)
+        for waiter in reloadCompletionWaiters.removeValue(forKey: id) ?? [] {
+            waiter.resume()
         }
     }
 
@@ -710,7 +787,7 @@ final class AppModel {
     }
 }
 
-private extension AppModel {
+fileprivate extension AppModel {
     enum AlertKind {
         case playback
         case operation
@@ -721,7 +798,7 @@ private extension AppModel {
         let profile: SourceProfile
     }
 
-    struct RefreshKey: Hashable {
+    struct RefreshKey: Hashable, Sendable {
         let profileID: UUID
         let resource: RefreshResource
     }
@@ -729,14 +806,18 @@ private extension AppModel {
     struct ManualRefreshAttempt {
         let id: UUID
         let startedAt: Date
-        let baselineStatus: ResourceRefreshStatus?
     }
 
     struct TerminalRefreshOverlay {
         let id: UUID
         let startedAt: Date
-        let baselineStatus: ResourceRefreshStatus?
+        let expectedAttemptID: UUID?
         let outcome: RefreshOutcome
         let completedAt: Date
+    }
+
+    struct RefreshReconciliationTask {
+        let id: UUID
+        let task: Task<Void, Never>
     }
 }

@@ -411,19 +411,26 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     func commitPlaylistRefresh(
         profileID: UUID,
         channels: [Channel],
-        fetchedAt: Date
+        fetchedAt: Date,
+        attemptID: UUID?
     ) throws {
         guard !failedRefreshCommits.contains(.playlist) else {
             throw InjectedError.refreshCommit
         }
         try installPlaylist(profileID: profileID, channels: channels, fetchedAt: fetchedAt)
-        try recordSuccess(profileID: profileID, resource: .playlist, at: fetchedAt)
+        try recordSuccess(
+            profileID: profileID,
+            resource: .playlist,
+            at: fetchedAt,
+            attemptID: attemptID
+        )
     }
 
     func commitEPGRefresh(
         profileID: UUID,
         fileURL: URL,
-        fetchedAt: Date
+        fetchedAt: Date,
+        attemptID: UUID?
     ) throws -> XMLTVParseSummary {
         guard !failedRefreshCommits.contains(.epg) else {
             throw InjectedError.refreshCommit
@@ -433,22 +440,38 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             fileURL: fileURL,
             fetchedAt: fetchedAt
         )
-        try recordSuccess(profileID: profileID, resource: .epg, at: fetchedAt)
+        try recordSuccess(
+            profileID: profileID,
+            resource: .epg,
+            at: fetchedAt,
+            attemptID: attemptID
+        )
         return summary
     }
 
-    func recordAttempt(profileID: UUID, resource: RefreshResource, at: Date) throws {
+    func recordAttempt(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date,
+        attemptID: UUID?
+    ) throws {
         guard !failsRecordAttempt else { throw InjectedError.recordAttempt }
         let index = try profileIndex(profileID)
         updateStatus(index: index, resource: resource) { status in
             status.lastAttemptAt = at
             status.state = .refreshing
             status.errorSummary = nil
+            status.attemptID = attemptID
         }
         recordedEvents.append(.attempt(profileID, resource))
     }
 
-    func recordSuccess(profileID: UUID, resource: RefreshResource, at: Date) throws {
+    func recordSuccess(
+        profileID: UUID,
+        resource: RefreshResource,
+        at: Date,
+        attemptID: UUID?
+    ) throws {
         guard !failedRefreshCommits.contains(resource) else {
             throw InjectedError.refreshCommit
         }
@@ -457,6 +480,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             status.lastSuccessAt = at
             status.state = .succeeded
             status.errorSummary = nil
+            status.attemptID = attemptID
         }
         recordedEvents.append(.success(profileID, resource))
     }
@@ -465,7 +489,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         profileID: UUID,
         resource: RefreshResource,
         summary: String,
-        at: Date
+        at: Date,
+        attemptID: UUID?
     ) throws {
         guard !failsRecordFailure else { throw InjectedError.recordFailure }
         let index = try profileIndex(profileID)
@@ -473,6 +498,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         updateStatus(index: index, resource: resource) { status in
             status.state = .failed
             status.errorSummary = sanitized
+            status.attemptID = attemptID
         }
         recordedEvents.append(.failure(profileID, resource, sanitized))
     }

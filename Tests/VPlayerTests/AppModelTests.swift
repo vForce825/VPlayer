@@ -698,6 +698,122 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testBackToBackFaultedCoordinatorFlightsKeepTheSecondFailureOverlay() async {
+        let firstStartedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let secondStartedAt = firstStartedAt.addingTimeInterval(60)
+        let priorAt = firstStartedAt.addingTimeInterval(-600)
+        let clock = AppModelTestClock(firstStartedAt)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: firstStartedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: priorAt,
+            lastSuccessAt: priorAt,
+            state: .succeeded
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            failsRecordAttempt: true,
+            failsRecordFailure: true
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { clock.value }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            now: { clock.value }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        let firstFailure = model.profiles.first?.m3uStatus.errorSummary
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, firstStartedAt)
+        XCTAssertNotNil(firstFailure)
+
+        clock.value = secondStartedAt
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        let secondFailure = model.profiles.first?.m3uStatus.errorSummary
+        let laterReloadSucceeded = await model.reload()
+
+        XCTAssertTrue(laterReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, secondStartedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertNotNil(secondFailure)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, secondFailure)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, secondStartedAt)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus, profile.m3uStatus)
+    }
+
+    func testFaultedCoordinatorFlightKeepsOverlayWhenModelBaselineLagsRepositoryTerminal() async {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let priorAt = startedAt.addingTimeInterval(-600)
+        var modelBaseline = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: startedAt
+        )
+        modelBaseline.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: priorAt.addingTimeInterval(-60),
+            state: .failed,
+            errorSummary: "model baseline"
+        )
+        var repositoryTerminal = modelBaseline
+        repositoryTerminal.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: priorAt,
+            lastSuccessAt: priorAt,
+            state: .succeeded
+        )
+        let repository = RepositorySpy(
+            profiles: [modelBaseline],
+            failsRecordAttempt: true,
+            failsRecordFailure: true
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { startedAt }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            now: { startedAt }
+        )
+
+        await model.reload()
+        await repository.replaceProfiles([repositoryTerminal], activeProfileID: repositoryTerminal.id)
+        await model.refresh(profileID: modelBaseline.id, resource: .playlist)
+        let currentFailure = model.profiles.first?.m3uStatus.errorSummary
+        let laterReloadSucceeded = await model.reload()
+
+        XCTAssertTrue(laterReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertNotNil(currentFailure)
+        XCTAssertNotEqual(currentFailure, modelBaseline.m3uStatus.errorSummary)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, currentFailure)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus, repositoryTerminal.m3uStatus)
+    }
+
     func testSynthesizedFailureOverlaysSurviveOldTerminalRepositoryTruth() async {
         let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
         let priorAt = startedAt.addingTimeInterval(-600)
@@ -926,6 +1042,81 @@ final class AppModelTests: XCTestCase {
             XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary, scenario.name)
             XCTAssertEqual(model.activeProfile?.m3uStatus.state, .succeeded, scenario.name)
         }
+    }
+
+    func testJoinedOlderFlightFailureReplacesManualCancellationOverlay() async {
+        let flightStartedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let manualStartedAt = flightStartedAt.addingTimeInterval(60)
+        let clock = AppModelTestClock(flightStartedAt)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: flightStartedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: flightStartedAt.addingTimeInterval(-600),
+            state: .failed,
+            errorSummary: "prior terminal failure"
+        )
+        let repository = RepositorySpy(profiles: [profile])
+        let downloader = AppModelRefreshDownloader(
+            payload: Data("not an m3u".utf8),
+            gatesCompletion: true
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { clock.value }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            now: { clock.value }
+        )
+
+        await model.reload()
+        let originalWaiter = Task {
+            await coordinator.refresh(
+                profileID: profile.id,
+                resources: [.playlist],
+                trigger: .foreground
+            )
+        }
+        await downloader.waitUntilStarted()
+        clock.value = manualStartedAt
+        let manualWaiter = Task {
+            await model.refresh(profileID: profile.id, resource: .playlist)
+        }
+        await eventually {
+            model.profiles.first?.m3uStatus.lastAttemptAt == manualStartedAt
+                && model.profiles.first?.m3uStatus.state == .refreshing
+        }
+        for _ in 0..<10 { await Task.yield() }
+        manualWaiter.cancel()
+        await manualWaiter.value
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+
+        await downloader.releaseCompletion()
+        let originalOutcomes = await originalWaiter.value
+        let terminalMessage = originalOutcomes.first?.message
+        XCTAssertEqual(originalOutcomes.first?.succeeded, false)
+        XCTAssertNotNil(terminalMessage)
+        XCTAssertNotEqual(terminalMessage, "刷新已取消。")
+
+        let firstReloadSucceeded = await model.reload()
+        let secondReloadSucceeded = await model.reload()
+        XCTAssertTrue(firstReloadSucceeded)
+        XCTAssertTrue(secondReloadSucceeded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, flightStartedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, terminalMessage)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.errorSummary, terminalMessage)
     }
 
     func testManualRefreshTerminalOverlayKeepsOriginalCompletionTimeAcrossLaterReloads() async {
@@ -1269,6 +1460,90 @@ final class AppModelTests: XCTestCase {
         await eventually { model.profiles.first?.m3uStatus.state == .failed }
 
         XCTAssertNotNil(model.profiles.first?.m3uStatus.errorSummary)
+    }
+
+    func testCancelledManualRefreshAutomaticallyReconcilesTerminalNotificationStartedBeforeOverlay() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let scenarios: [(name: String, payload: Data?, error: URLError.Code?, state: RefreshState)] = [
+            (
+                "success",
+                Data("""
+                #EXTM3U
+                #EXTINF:-1,Refreshed
+                https://example.test/refreshed
+                """.utf8),
+                nil,
+                .succeeded
+            ),
+            ("failure", nil, .cannotConnectToHost, .failed),
+        ]
+
+        for scenario in scenarios {
+            let profile = makeProfile(
+                id: "00000000-0000-0000-0000-000000000001",
+                name: "Source",
+                now: now
+            )
+            let repository = RepositorySpy(profiles: [profile])
+            let changes = LibraryChangeSignal()
+            let persistedOutcomeGate = AppModelPersistedOutcomeGate()
+            let downloader = AppModelRefreshDownloader(
+                payload: scenario.payload,
+                error: scenario.error,
+                gatesCompletion: true
+            )
+            let coordinator = RefreshCoordinator(
+                repository: repository,
+                downloader: downloader,
+                now: { now },
+                onPersistedOutcome: { _, _ in
+                    await MainActor.run { changes.notify() }
+                    await persistedOutcomeGate.suspend()
+                }
+            )
+            let model = AppModel(
+                repository: repository,
+                refresh: { profileID, resources, trigger in
+                    await coordinator.refresh(
+                        profileID: profileID,
+                        resources: resources,
+                        trigger: trigger
+                    )
+                },
+                libraryChanges: changes,
+                now: { now }
+            )
+
+            await model.reload()
+            let manualRefresh = Task {
+                await model.refresh(profileID: profile.id, resource: .playlist)
+            }
+            await downloader.waitUntilStarted()
+            await repository.gateNextProfileRead()
+            await downloader.releaseCompletion()
+            await persistedOutcomeGate.waitUntilSuspended()
+            await repository.waitUntilProfileReadIsBlocked()
+            manualRefresh.cancel()
+            await manualRefresh.value
+            let persistedTerminal = await repository.snapshot().profiles.first?.m3uStatus
+            XCTAssertNotNil(model.profiles.first?.m3uStatus.attemptID, scenario.name)
+            XCTAssertEqual(
+                model.profiles.first?.m3uStatus.attemptID,
+                persistedTerminal?.attemptID,
+                scenario.name
+            )
+
+            await persistedOutcomeGate.release()
+            await repository.releaseProfileRead()
+            await eventually {
+                model.profiles.first?.m3uStatus.state == scenario.state
+                    && model.profiles.first?.m3uStatus.errorSummary != "刷新已取消。"
+            }
+            XCTAssertEqual(model.profiles.first?.m3uStatus.state, scenario.state, scenario.name)
+            XCTAssertEqual(model.activeProfile?.m3uStatus.state, scenario.state, scenario.name)
+            let snapshot = await repository.snapshot()
+            XCTAssertEqual(snapshot.profiles.first?.m3uStatus.state, scenario.state, scenario.name)
+        }
     }
 
     func testCancelledLifecycleReloadOccursOnlyAfterTerminalFailureIsPersisted() async throws {
@@ -1954,6 +2229,35 @@ private actor AppModelConcurrentRefreshGate {
         } else {
             pendingResults[key] = result
         }
+    }
+}
+
+private actor AppModelPersistedOutcomeGate {
+    private var isSuspended = false
+    private var suspensionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        isSuspended = true
+        for waiter in suspensionWaiters {
+            waiter.resume()
+        }
+        suspensionWaiters = []
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { continuation in
+            suspensionWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 

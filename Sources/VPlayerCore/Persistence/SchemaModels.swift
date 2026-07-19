@@ -29,10 +29,12 @@ import SwiftData
     var m3uLastSuccessAt: Date?
     var m3uStateRaw: String
     var m3uErrorSummary: String?
+    var m3uAttemptID: UUID?
     var epgLastAttemptAt: Date?
     var epgLastSuccessAt: Date?
     var epgStateRaw: String
     var epgErrorSummary: String?
+    var epgAttemptID: UUID?
     var createdAt: Date
     var updatedAt: Date
 
@@ -49,10 +51,12 @@ import SwiftData
         m3uLastSuccessAt: Date? = nil,
         m3uStateRaw: String = RefreshState.never.rawValue,
         m3uErrorSummary: String? = nil,
+        m3uAttemptID: UUID? = nil,
         epgLastAttemptAt: Date? = nil,
         epgLastSuccessAt: Date? = nil,
         epgStateRaw: String = RefreshState.never.rawValue,
         epgErrorSummary: String? = nil,
+        epgAttemptID: UUID? = nil,
         createdAt: Date,
         updatedAt: Date
     ) {
@@ -68,10 +72,12 @@ import SwiftData
         self.m3uLastSuccessAt = m3uLastSuccessAt
         self.m3uStateRaw = m3uStateRaw
         self.m3uErrorSummary = m3uErrorSummary
+        self.m3uAttemptID = m3uAttemptID
         self.epgLastAttemptAt = epgLastAttemptAt
         self.epgLastSuccessAt = epgLastSuccessAt
         self.epgStateRaw = epgStateRaw
         self.epgErrorSummary = epgErrorSummary
+        self.epgAttemptID = epgAttemptID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }

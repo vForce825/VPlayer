@@ -350,6 +350,7 @@ final class RefreshCoordinatorTests: XCTestCase {
         let cancelledOutcome = try XCTUnwrap(firstOutcomes?.first)
         XCTAssertFalse(cancelledOutcome.succeeded)
         XCTAssertEqual(cancelledOutcome.message, "刷新已取消。")
+        XCTAssertNotNil(cancelledOutcome.attemptID)
         let prematureSecondOutcomes = await secondCompletion.value
         let invocationCount = await downloader.invocationCount(for: .playlist)
         let cancellationCount = await downloader.cancellationCount(for: .playlist)
@@ -363,12 +364,14 @@ final class RefreshCoordinatorTests: XCTestCase {
         let successfulOutcome = try XCTUnwrap(secondOutcomes?.first)
         XCTAssertTrue(successfulOutcome.succeeded)
         XCTAssertNil(successfulOutcome.message)
+        XCTAssertEqual(successfulOutcome.attemptID, cancelledOutcome.attemptID)
         let snapshot = await repository.snapshot()
         XCTAssertEqual(snapshot.playlistInstallCount, 1)
         XCTAssertEqual(snapshot.events.filter { $0 == .attempt(profileID, .playlist) }.count, 1)
         XCTAssertEqual(snapshot.events.filter { $0 == .success(profileID, .playlist) }.count, 1)
         XCTAssertEqual(snapshot.events.compactMap(\.resource).filter { $0 == .playlist }.count, 3)
         XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .succeeded)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus.attemptID, successfulOutcome.attemptID)
         await assertTemporaryDownloadsWereDeleted(downloader)
         _ = await first.result
         _ = await second.result
@@ -496,6 +499,8 @@ final class RefreshCoordinatorTests: XCTestCase {
         let snapshot = await repository.snapshot()
         XCTAssertEqual(snapshot.profiles[0].epgStatus.state, .failed)
         XCTAssertEqual(snapshot.profiles[0].epgStatus.errorSummary, "刷新已取消。")
+        XCTAssertNotNil(outcome.attemptID)
+        XCTAssertEqual(snapshot.profiles[0].epgStatus.attemptID, outcome.attemptID)
     }
 
     func testPersistedOutcomeHookRunsAfterSuccessAndFailureReachTerminalStatus() async {

@@ -35,16 +35,19 @@ public struct ResourceRefreshStatus: Codable, Equatable, Sendable {
     public var lastSuccessAt: Date?
     public var state: RefreshState
     public var errorSummary: String?
+    public var attemptID: UUID?
 
     public init(
         lastAttemptAt: Date? = nil,
         lastSuccessAt: Date? = nil,
         state: RefreshState = .never,
-        errorSummary: String? = nil
+        errorSummary: String? = nil,
+        attemptID: UUID? = nil
     ) {
         self.lastAttemptAt = lastAttemptAt
         self.lastSuccessAt = lastSuccessAt
         self.state = state
         self.errorSummary = errorSummary
+        self.attemptID = attemptID
     }
 }

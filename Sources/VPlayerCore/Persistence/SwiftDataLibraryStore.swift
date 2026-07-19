@@ -236,20 +236,23 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             profileID: profileID,
             channels: channels,
             fetchedAt: fetchedAt,
-            recordsSuccess: false
+            recordsSuccess: false,
+            attemptID: nil
         )
     }
 
     public func commitPlaylistRefresh(
         profileID: UUID,
         channels: [Channel],
-        fetchedAt: Date
+        fetchedAt: Date,
+        attemptID: UUID?
     ) throws {
         try installPlaylistSnapshot(
             profileID: profileID,
             channels: channels,
             fetchedAt: fetchedAt,
-            recordsSuccess: true
+            recordsSuccess: true,
+            attemptID: attemptID
         )
     }
 
@@ -257,7 +260,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         profileID: UUID,
         channels: [Channel],
         fetchedAt: Date,
-        recordsSuccess: Bool
+        recordsSuccess: Bool,
+        attemptID: UUID?
     ) throws {
         try Task.checkCancellation()
         _ = try profileRecord(id: profileID)
@@ -310,7 +314,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 previousSnapshotID = profile.playlistSnapshotID
                 profile.playlistSnapshotID = snapshotID
                 if recordsSuccess {
-                    updateSuccessStatus(profile, resource: .playlist, at: fetchedAt)
+                    updateSuccessStatus(
+                        profile,
+                        resource: .playlist,
+                        at: fetchedAt,
+                        attemptID: attemptID
+                    )
                 }
             }
             oldSnapshotID = previousSnapshotID
@@ -334,20 +343,23 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             profileID: profileID,
             fileURL: fileURL,
             fetchedAt: fetchedAt,
-            recordsSuccess: false
+            recordsSuccess: false,
+            attemptID: nil
         )
     }
 
     public func commitEPGRefresh(
         profileID: UUID,
         fileURL: URL,
-        fetchedAt: Date
+        fetchedAt: Date,
+        attemptID: UUID?
     ) throws -> XMLTVParseSummary {
         try installEPGSnapshot(
             profileID: profileID,
             fileURL: fileURL,
             fetchedAt: fetchedAt,
-            recordsSuccess: true
+            recordsSuccess: true,
+            attemptID: attemptID
         )
     }
 
@@ -355,7 +367,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         profileID: UUID,
         fileURL: URL,
         fetchedAt: Date,
-        recordsSuccess: Bool
+        recordsSuccess: Bool,
+        attemptID: UUID?
     ) throws -> XMLTVParseSummary {
         try Task.checkCancellation()
         _ = try profileRecord(id: profileID)
@@ -398,7 +411,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 previousSnapshotID = profile.epgSnapshotID
                 profile.epgSnapshotID = snapshotID
                 if recordsSuccess {
-                    updateSuccessStatus(profile, resource: .epg, at: fetchedAt)
+                    updateSuccessStatus(
+                        profile,
+                        resource: .epg,
+                        at: fetchedAt,
+                        attemptID: attemptID
+                    )
                 }
             }
             oldSnapshotID = previousSnapshotID
@@ -417,7 +435,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     public func recordAttempt(
         profileID: UUID,
         resource: RefreshResource,
-        at: Date
+        at: Date,
+        attemptID: UUID?
     ) throws {
         try commit(.status) {
             let profile = try profileRecord(id: profileID)
@@ -426,10 +445,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 profile.m3uLastAttemptAt = at
                 profile.m3uStateRaw = RefreshState.refreshing.rawValue
                 profile.m3uErrorSummary = nil
+                profile.m3uAttemptID = attemptID
             case .epg:
                 profile.epgLastAttemptAt = at
                 profile.epgStateRaw = RefreshState.refreshing.rawValue
                 profile.epgErrorSummary = nil
+                profile.epgAttemptID = attemptID
             }
             profile.updatedAt = at
         }
@@ -438,11 +459,17 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     public func recordSuccess(
         profileID: UUID,
         resource: RefreshResource,
-        at: Date
+        at: Date,
+        attemptID: UUID?
     ) throws {
         try commit(.status) {
             let profile = try profileRecord(id: profileID)
-            updateSuccessStatus(profile, resource: resource, at: at)
+            updateSuccessStatus(
+                profile,
+                resource: resource,
+                at: at,
+                attemptID: attemptID
+            )
         }
     }
 
@@ -450,7 +477,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         profileID: UUID,
         resource: RefreshResource,
         summary: String,
-        at: Date
+        at: Date,
+        attemptID: UUID?
     ) throws {
         let truncatedSummary = String(summary.prefix(240))
         try commit(.status) {
@@ -459,9 +487,11 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             case .playlist:
                 profile.m3uStateRaw = RefreshState.failed.rawValue
                 profile.m3uErrorSummary = truncatedSummary
+                profile.m3uAttemptID = attemptID
             case .epg:
                 profile.epgStateRaw = RefreshState.failed.rawValue
                 profile.epgErrorSummary = truncatedSummary
+                profile.epgAttemptID = attemptID
             }
             profile.updatedAt = at
         }
@@ -537,17 +567,20 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     private func updateSuccessStatus(
         _ profile: SourceProfileRecord,
         resource: RefreshResource,
-        at: Date
+        at: Date,
+        attemptID: UUID?
     ) {
         switch resource {
         case .playlist:
             profile.m3uLastSuccessAt = at
             profile.m3uStateRaw = RefreshState.succeeded.rawValue
             profile.m3uErrorSummary = nil
+            profile.m3uAttemptID = attemptID
         case .epg:
             profile.epgLastSuccessAt = at
             profile.epgStateRaw = RefreshState.succeeded.rawValue
             profile.epgErrorSummary = nil
+            profile.epgAttemptID = attemptID
         }
         profile.updatedAt = at
     }
@@ -645,13 +678,15 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 lastAttemptAt: record.m3uLastAttemptAt,
                 lastSuccessAt: record.m3uLastSuccessAt,
                 state: m3uState,
-                errorSummary: record.m3uErrorSummary
+                errorSummary: record.m3uErrorSummary,
+                attemptID: record.m3uAttemptID
             ),
             epgStatus: ResourceRefreshStatus(
                 lastAttemptAt: record.epgLastAttemptAt,
                 lastSuccessAt: record.epgLastSuccessAt,
                 state: epgState,
-                errorSummary: record.epgErrorSummary
+                errorSummary: record.epgErrorSummary,
+                attemptID: record.epgAttemptID
             ),
             createdAt: record.createdAt,
             updatedAt: record.updatedAt
