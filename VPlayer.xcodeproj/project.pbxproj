@@ -8,10 +8,14 @@
 
 /* Begin PBXBuildFile section */
 		03C2431CE143F84391408374 /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; };
+		03DE307532976EEDAE5BE804 /* VPFFmpegInventory.c in Sources */ = {isa = PBXBuildFile; fileRef = F1DB262D8BFB783C33DB986C /* VPFFmpegInventory.c */; };
 		079771228F4B60F9A3DF01D8 /* RepositorySpy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64C377C392800022FACE5ABD /* RepositorySpy.swift */; };
+		0AED7EB317A1BB335E999F9F /* FFmpeg.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE9A0691FB5910ABD8C1717C /* FFmpeg.xcframework */; };
+		0D7077FE301D3660CC0CFFC6 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 66AD65AF4E3E185685F2B892 /* Metal.framework */; };
 		0F11E690D62302C3B5C72E86 /* RefreshSchedulePlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C69A53B57D2AE090EE69FF10 /* RefreshSchedulePlannerTests.swift */; };
 		1505DD0FB967752D2662C271 /* SourceProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C20F5E5ABD832EF5433B511 /* SourceProfile.swift */; };
 		16C47C091EC6C2F1E1CA6FE4 /* EPGModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E2D28FAA96259C6BA18B6D3 /* EPGModels.swift */; };
+		1BCD72FF7E064AFB4B4073C7 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AE2B9C7BBB3EF8539FCE28A9 /* CoreVideo.framework */; };
 		1C0E74475C42B940305CB753 /* EPGNameNormalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DB63A8123D009E49DFE7F62 /* EPGNameNormalizer.swift */; };
 		1F132F22A9DD9F45E47647D0 /* RefreshLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEBE3B30C45DB2BF522BC9D0 /* RefreshLifecycleTests.swift */; };
 		23210BD210A50F0CF2B42131 /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
@@ -19,8 +23,10 @@
 		2B1AA18D36EB95C46CE2D73C /* VPlayerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 639B3B5F5E1964B95399C8A4 /* VPlayerApp.swift */; };
 		2C63EB537A927F0D9EDD575A /* DomainTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C06659A8D23E58B934CA205 /* DomainTests.swift */; };
 		2E40E02301DFAA15A465F81C /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; };
+		3050A9650051F2F7FDC380B4 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D8E1C7B65261EC92D9D3B8F0 /* Security.framework */; };
 		3C7F560ED50B94359694163C /* VPlayerModelContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AA49D7990E924D5FD735C96 /* VPlayerModelContainer.swift */; };
 		3D7B6BC13CA73A25315AF674 /* XMLTVParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E14A9D1886717725B786B415 /* XMLTVParserTests.swift */; };
+		44E88AEB8689CAAD0C373CF3 /* FFmpegInventoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8069A1D126A708B0D8CF0B9 /* FFmpegInventoryTests.swift */; };
 		4778479CFB7605256F5FF863 /* AppDependencies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FE81A60ECC3F3F1EB27A4BA /* AppDependencies.swift */; };
 		4BE2000825436D6D3CA2B1EA /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9021619CDF96872E511E25E /* RootView.swift */; };
 		52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */; };
@@ -33,6 +39,7 @@
 		65B88FED397CA6E730F3E3D0 /* PlaybackContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 522B8D587AE1285AE62DAC45 /* PlaybackContracts.swift */; };
 		660D35085FB394D8A68203FC /* LibraryRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41903C4F3207EAF15E49C460 /* LibraryRepository.swift */; };
 		6AE290BF6F2EE394790910AF /* epg in Resources */ = {isa = PBXBuildFile; fileRef = 4E25D8207AC5FE42D7046523 /* epg */; };
+		6CE7818EEDAE98CF152A3FA8 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7447C78DF76543DB77656473 /* QuartzCore.framework */; };
 		70F366BE14A6E747945E194E /* Channel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E54A2D2F4C5510D3E98D86F /* Channel.swift */; };
 		7175563E28A200746A1CCB19 /* RefreshCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52AD46A713A5BB7C228BDDAC /* RefreshCoordinatorTests.swift */; };
 		775FE8867090EC0013A65B4A /* EPGMatcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3DC6FBBF870004CB37402A6 /* EPGMatcherTests.swift */; };
@@ -40,6 +47,7 @@
 		7C1000AB5ABBB846332FEF10 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D0DCDB6239235F5B85CC530 /* AppModelTests.swift */; };
 		7C690E439B501C8315CE11BD /* M3UParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A661E9919B5D9A88432C46D6 /* M3UParser.swift */; };
 		7EB4861905622CE49F87216F /* VPlayerCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		7F3420CC52E0E42A2ED30D92 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1E9F526E75D1691C1C4F2931 /* AVFoundation.framework */; };
 		7FA7AF493011792CC65E0B31 /* XMLTVTimeParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = E153CF816236DBE07FDC2A07 /* XMLTVTimeParser.swift */; };
 		80D40D0CACC559050F555C87 /* playlists in Resources */ = {isa = PBXBuildFile; fileRef = 78EFE7B618BDBB2FA8DF46CE /* playlists */; };
 		810B6A3316A6341043193CD1 /* ProjectConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */; };
@@ -49,6 +57,8 @@
 		891C5AAB506FE4CA07A334BA /* XMLTVParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = C99D8B80186539B2A8231C30 /* XMLTVParser.swift */; };
 		9025D4FC1DD44853D28BDC36 /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
 		9B9E9C3702781C3459233CBF /* SourceProfileEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9EC7EBA35F653A9B7D17F54 /* SourceProfileEditorView.swift */; };
+		9D84C80482A76916FA4B45FC /* FFmpegInventory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88D97544EFE35AFEB118C16F /* FFmpegInventory.swift */; };
+		9E1666F139596DD582D933A0 /* VideoToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84D67811AADAA8AC5192F218 /* VideoToolbox.framework */; };
 		A3098C1B5C42F7256681B090 /* ForegroundRefreshDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 831A88667C84AB1FB4B236ED /* ForegroundRefreshDriver.swift */; };
 		A5959C45A4EA00CE2CE5AE1E /* SourceProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D84D24FBFF0D2C7375C5DA0 /* SourceProfilesView.swift */; };
 		A79BA2EED45A2F4C09618A98 /* RefreshSchedulePlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F75BA0166609F1B99110EEE2 /* RefreshSchedulePlanner.swift */; };
@@ -56,18 +66,24 @@
 		AD16087EFB0A780317C69870 /* RemoteResourceDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 776A443BF009806F2461634E /* RemoteResourceDownloader.swift */; };
 		AE5F5F87B9AB412130D84582 /* StreamProtocolPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BD849891A41E876402BADA1 /* StreamProtocolPolicy.swift */; };
 		BD0915983FDEEEA04D4E067D /* RefreshCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E8424C82A7C430CDF059354 /* RefreshCoordinator.swift */; };
+		C3EEEE2FC8642259A578A436 /* VPlayerPlayback.h in Headers */ = {isa = PBXBuildFile; fileRef = 7A19FD5198D43E6FD15F4765 /* VPlayerPlayback.h */; settings = {ATTRIBUTES = (Public, ); }; };
 		C985594FCA4643772D7C81AC /* StubURLProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18AF1E7F70C884EFB8FD7910 /* StubURLProtocol.swift */; };
+		CEE3FC56301BDD747F327A36 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1DF63818CE82E7723BE40552 /* CoreMedia.framework */; };
 		CF8C42C2AD93FE06D5E4E8CB /* URLSessionBoundedDownloaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */; };
 		D268B0941547FB9C94B92413 /* LibraryChangeSignal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F11824742B40C13E58B8D0A /* LibraryChangeSignal.swift */; };
 		D339B98DF72A1A69C1B3FF81 /* PlaybackPlaceholderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E37B08B4CEA0606E850000 /* PlaybackPlaceholderView.swift */; };
 		D5BA6C5EBE7447F85C0B146D /* URLSessionBoundedDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 571D62BE7259ACB20E1FA4D0 /* URLSessionBoundedDownloader.swift */; };
 		D6FBABC968B226C01CC8D6F8 /* ChannelBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF2312CDCDAAF53C4BA80484 /* ChannelBrowserView.swift */; };
+		D8967F92CD95FA86971C01EF /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B9750ADE82FC75826AF5291F /* AudioToolbox.framework */; };
+		D9D5FF97AF28C1D191599C93 /* AVKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5498201DF1E4B105E63C7D22 /* AVKit.framework */; };
 		DA94714F6F72EEFE0CDAFF44 /* VPlayerPlayback.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		DB9ADDD074CAF0C77E89B276 /* PlaybackSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17FC24D02BC7CDA6FF415D93 /* PlaybackSettingsView.swift */; };
 		DFC4CAEA21A686600E575881 /* BackgroundRefreshRegistrar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E5EE57E19FE06FCEEE441B9 /* BackgroundRefreshRegistrar.swift */; };
+		E39BA3C9C9C938028709CB71 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C8C8CA1BD7FBE099A6FEEDE8 /* CoreFoundation.framework */; };
 		E5B997E005CE0E4A110A9A43 /* RedactedURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = E06EC3BAD31415A9EDE7701D /* RedactedURL.swift */; };
 		E601A3612F4CD4996F1B777B /* VPlayerCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 236D71D3D61B0D1A240B639D /* VPlayerCore.swift */; };
 		EC428FCDA3FDB59AF2C77783 /* RefreshTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8962CD0CAB958608B6C759D /* RefreshTypes.swift */; };
+		EEC3009CD506D94EE6348E58 /* VPFFmpegInventory.h in Headers */ = {isa = PBXBuildFile; fileRef = 9DD7C6783CC719FD2FFA2CDC /* VPFFmpegInventory.h */; settings = {ATTRIBUTES = (Public, ); }; };
 		F1605BF4CBDC7ECA1070A270 /* EPGPersistenceSink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63588834D9476CAF4EF3F770 /* EPGPersistenceSink.swift */; };
 		F16342F88880B29F1FA799B0 /* ChannelEPGMappingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A444ABEA3E13FA3A2BD4460 /* ChannelEPGMappingView.swift */; };
 		F23A8BBED3A47568702AC0F8 /* PlaylistTextDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3875C2090EE6FA7DA9F56E77 /* PlaylistTextDecoder.swift */; };
@@ -162,6 +178,8 @@
 		0C06659A8D23E58B934CA205 /* DomainTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainTests.swift; sourceTree = "<group>"; };
 		17FC24D02BC7CDA6FF415D93 /* PlaybackSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsView.swift; sourceTree = "<group>"; };
 		18AF1E7F70C884EFB8FD7910 /* StubURLProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StubURLProtocol.swift; sourceTree = "<group>"; };
+		1DF63818CE82E7723BE40552 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
+		1E9F526E75D1691C1C4F2931 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		2130C293D6ED355F03565731 /* ChannelRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelRow.swift; sourceTree = "<group>"; };
 		236D71D3D61B0D1A240B639D /* VPlayerCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerCore.swift; sourceTree = "<group>"; };
 		238998CD555F7F1A2BCCCEFC /* VPlayerTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -181,6 +199,7 @@
 		51A0549DC709E69E8CE7BC31 /* SwiftDataLibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftDataLibraryStore.swift; sourceTree = "<group>"; };
 		522B8D587AE1285AE62DAC45 /* PlaybackContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContracts.swift; sourceTree = "<group>"; };
 		52AD46A713A5BB7C228BDDAC /* RefreshCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshCoordinatorTests.swift; sourceTree = "<group>"; };
+		5498201DF1E4B105E63C7D22 /* AVKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVKit.framework; path = System/Library/Frameworks/AVKit.framework; sourceTree = SDKROOT; };
 		566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = VPlayerPlayback.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		571D62BE7259ACB20E1FA4D0 /* URLSessionBoundedDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URLSessionBoundedDownloader.swift; sourceTree = "<group>"; };
 		573347F33485184D47CD3408 /* VPlayerUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VPlayerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -189,31 +208,44 @@
 		63588834D9476CAF4EF3F770 /* EPGPersistenceSink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGPersistenceSink.swift; sourceTree = "<group>"; };
 		639B3B5F5E1964B95399C8A4 /* VPlayerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerApp.swift; sourceTree = "<group>"; };
 		64C377C392800022FACE5ABD /* RepositorySpy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RepositorySpy.swift; sourceTree = "<group>"; };
+		66AD65AF4E3E185685F2B892 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectConfigurationTests.swift; sourceTree = "<group>"; };
 		6D0DCDB6239235F5B85CC530 /* AppModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTests.swift; sourceTree = "<group>"; };
 		6DB63A8123D009E49DFE7F62 /* EPGNameNormalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGNameNormalizer.swift; sourceTree = "<group>"; };
+		7447C78DF76543DB77656473 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		776A443BF009806F2461634E /* RemoteResourceDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteResourceDownloader.swift; sourceTree = "<group>"; };
 		78EFE7B618BDBB2FA8DF46CE /* playlists */ = {isa = PBXFileReference; lastKnownFileType = folder; name = playlists; path = Tests/Fixtures/playlists; sourceTree = SOURCE_ROOT; };
+		7A19FD5198D43E6FD15F4765 /* VPlayerPlayback.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = VPlayerPlayback.h; sourceTree = "<group>"; };
 		831A88667C84AB1FB4B236ED /* ForegroundRefreshDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ForegroundRefreshDriver.swift; sourceTree = "<group>"; };
+		84D67811AADAA8AC5192F218 /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
+		88D97544EFE35AFEB118C16F /* FFmpegInventory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegInventory.swift; sourceTree = "<group>"; };
 		8F11824742B40C13E58B8D0A /* LibraryChangeSignal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryChangeSignal.swift; sourceTree = "<group>"; };
 		9A310932D1DA088CF7E99CCF /* VPlayerAppStartupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerAppStartupTests.swift; sourceTree = "<group>"; };
+		9DD7C6783CC719FD2FFA2CDC /* VPFFmpegInventory.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = VPFFmpegInventory.h; sourceTree = "<group>"; };
 		9E5EE57E19FE06FCEEE441B9 /* BackgroundRefreshRegistrar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundRefreshRegistrar.swift; sourceTree = "<group>"; };
 		A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URLSessionBoundedDownloaderTests.swift; sourceTree = "<group>"; };
 		A3DC6FBBF870004CB37402A6 /* EPGMatcherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGMatcherTests.swift; sourceTree = "<group>"; };
 		A661E9919B5D9A88432C46D6 /* M3UParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UParser.swift; sourceTree = "<group>"; };
+		AE2B9C7BBB3EF8539FCE28A9 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
+		B9750ADE82FC75826AF5291F /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
 		C69A53B57D2AE090EE69FF10 /* RefreshSchedulePlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshSchedulePlannerTests.swift; sourceTree = "<group>"; };
 		C7E37B08B4CEA0606E850000 /* PlaybackPlaceholderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPlaceholderView.swift; sourceTree = "<group>"; };
+		C8C8CA1BD7FBE099A6FEEDE8 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		C99D8B80186539B2A8231C30 /* XMLTVParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XMLTVParser.swift; sourceTree = "<group>"; };
 		CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsStoreTests.swift; sourceTree = "<group>"; };
 		CCD4A4570708418C5EB6D3E2 /* VPlayer.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = VPlayerCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		D8E1C7B65261EC92D9D3B8F0 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		DEBE3B30C45DB2BF522BC9D0 /* RefreshLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshLifecycleTests.swift; sourceTree = "<group>"; };
 		E06EC3BAD31415A9EDE7701D /* RedactedURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RedactedURL.swift; sourceTree = "<group>"; };
 		E14A9D1886717725B786B415 /* XMLTVParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XMLTVParserTests.swift; sourceTree = "<group>"; };
 		E153CF816236DBE07FDC2A07 /* XMLTVTimeParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XMLTVTimeParser.swift; sourceTree = "<group>"; };
+		E8069A1D126A708B0D8CF0B9 /* FFmpegInventoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegInventoryTests.swift; sourceTree = "<group>"; };
 		E8C84A23131BECD2EE7F1AB9 /* SchemaModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SchemaModels.swift; sourceTree = "<group>"; };
 		E9021619CDF96872E511E25E /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		EE9A0691FB5910ABD8C1717C /* FFmpeg.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = FFmpeg.xcframework; path = Vendor/FFmpeg/Artifacts/FFmpeg.xcframework; sourceTree = "<group>"; };
 		EF2312CDCDAAF53C4BA80484 /* ChannelBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelBrowserView.swift; sourceTree = "<group>"; };
+		F1DB262D8BFB783C33DB986C /* VPFFmpegInventory.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = VPFFmpegInventory.c; sourceTree = "<group>"; };
 		F75BA0166609F1B99110EEE2 /* RefreshSchedulePlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshSchedulePlanner.swift; sourceTree = "<group>"; };
 		F766ADE2FFF00B2A2273489F /* FixtureLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureLoader.swift; sourceTree = "<group>"; };
 		F83B421173E1978DA035BF40 /* VPlayerUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPlayerUITests.swift; sourceTree = "<group>"; };
@@ -245,6 +277,17 @@
 			buildActionMask = 2147483647;
 			files = (
 				9025D4FC1DD44853D28BDC36 /* VPlayerCore.framework in Frameworks */,
+				0AED7EB317A1BB335E999F9F /* FFmpeg.xcframework in Frameworks */,
+				3050A9650051F2F7FDC380B4 /* Security.framework in Frameworks */,
+				E39BA3C9C9C938028709CB71 /* CoreFoundation.framework in Frameworks */,
+				9E1666F139596DD582D933A0 /* VideoToolbox.framework in Frameworks */,
+				CEE3FC56301BDD747F327A36 /* CoreMedia.framework in Frameworks */,
+				1BCD72FF7E064AFB4B4073C7 /* CoreVideo.framework in Frameworks */,
+				D8967F92CD95FA86971C01EF /* AudioToolbox.framework in Frameworks */,
+				7F3420CC52E0E42A2ED30D92 /* AVFoundation.framework in Frameworks */,
+				D9D5FF97AF28C1D191599C93 /* AVKit.framework in Frameworks */,
+				0D7077FE301D3660CC0CFFC6 /* Metal.framework in Frameworks */,
+				6CE7818EEDAE98CF152A3FA8 /* QuartzCore.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -254,10 +297,39 @@
 		02B9CDAD969766E02128CF28 /* VPlayerPlayback */ = {
 			isa = PBXGroup;
 			children = (
+				0E54D809BFDCB06FA03E39FB /* FFmpeg */,
+				68FF9BF178093DA414BB24F5 /* include */,
+				88D97544EFE35AFEB118C16F /* FFmpegInventory.swift */,
 				522B8D587AE1285AE62DAC45 /* PlaybackContracts.swift */,
 				28CBFE07860F14CBAFCDC9C7 /* PlaybackSettingsStore.swift */,
 			);
 			path = VPlayerPlayback;
+			sourceTree = "<group>";
+		};
+		0E54D809BFDCB06FA03E39FB /* FFmpeg */ = {
+			isa = PBXGroup;
+			children = (
+				F1DB262D8BFB783C33DB986C /* VPFFmpegInventory.c */,
+			);
+			path = FFmpeg;
+			sourceTree = "<group>";
+		};
+		168258D687AF0C22FA61DEFD /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				B9750ADE82FC75826AF5291F /* AudioToolbox.framework */,
+				1E9F526E75D1691C1C4F2931 /* AVFoundation.framework */,
+				5498201DF1E4B105E63C7D22 /* AVKit.framework */,
+				C8C8CA1BD7FBE099A6FEEDE8 /* CoreFoundation.framework */,
+				1DF63818CE82E7723BE40552 /* CoreMedia.framework */,
+				AE2B9C7BBB3EF8539FCE28A9 /* CoreVideo.framework */,
+				EE9A0691FB5910ABD8C1717C /* FFmpeg.xcframework */,
+				66AD65AF4E3E185685F2B892 /* Metal.framework */,
+				7447C78DF76543DB77656473 /* QuartzCore.framework */,
+				D8E1C7B65261EC92D9D3B8F0 /* Security.framework */,
+				84D67811AADAA8AC5192F218 /* VideoToolbox.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		175C5ADE52E943E77E7D3BA3 /* Settings */ = {
@@ -319,6 +391,23 @@
 			path = Refresh;
 			sourceTree = "<group>";
 		};
+		683D8B48F6091BFDCFBA163B /* Playback */ = {
+			isa = PBXGroup;
+			children = (
+				E8069A1D126A708B0D8CF0B9 /* FFmpegInventoryTests.swift */,
+			);
+			path = Playback;
+			sourceTree = "<group>";
+		};
+		68FF9BF178093DA414BB24F5 /* include */ = {
+			isa = PBXGroup;
+			children = (
+				9DD7C6783CC719FD2FFA2CDC /* VPFFmpegInventory.h */,
+				7A19FD5198D43E6FD15F4765 /* VPlayerPlayback.h */,
+			);
+			path = include;
+			sourceTree = "<group>";
+		};
 		79BD6FC652CE1AC3047142C9 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -377,6 +466,7 @@
 		A9366909CA36CFE970C44C9A /* VPlayerTests */ = {
 			isa = PBXGroup;
 			children = (
+				683D8B48F6091BFDCFBA163B /* Playback */,
 				262815F870519A83B1F36F83 /* Support */,
 				6D0DCDB6239235F5B85CC530 /* AppModelTests.swift */,
 				0C06659A8D23E58B934CA205 /* DomainTests.swift */,
@@ -409,6 +499,7 @@
 			children = (
 				9B850AD0308F0AB480129CEA /* Sources */,
 				79BD6FC652CE1AC3047142C9 /* Tests */,
+				168258D687AF0C22FA61DEFD /* Frameworks */,
 				25DCE13494ACD7565D4EB356 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -473,6 +564,18 @@
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
+
+/* Begin PBXHeadersBuildPhase section */
+		B718C99183B8F4287214348B /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EEC3009CD506D94EE6348E58 /* VPFFmpegInventory.h in Headers */,
+				C3EEEE2FC8642259A578A436 /* VPlayerPlayback.h in Headers */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXHeadersBuildPhase section */
 
 /* Begin PBXNativeTarget section */
 		01923E138B558831CD3630E6 /* VPlayerTests */ = {
@@ -558,6 +661,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 95DD0DD38750FDFF575E64ED /* Build configuration list for PBXNativeTarget "VPlayerPlayback" */;
 			buildPhases = (
+				B718C99183B8F4287214348B /* Headers */,
 				F59A9C14120146B2422E1DE5 /* Sources */,
 				5FBB8E705AD500BAE9889E1F /* Frameworks */,
 			);
@@ -684,6 +788,7 @@
 				7C1000AB5ABBB846332FEF10 /* AppModelTests.swift in Sources */,
 				2C63EB537A927F0D9EDD575A /* DomainTests.swift in Sources */,
 				775FE8867090EC0013A65B4A /* EPGMatcherTests.swift in Sources */,
+				44E88AEB8689CAAD0C373CF3 /* FFmpegInventoryTests.swift in Sources */,
 				FD5802BCAA5B6626EBCD1529 /* FixtureLoader.swift in Sources */,
 				52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */,
 				86F079E90934D8EB19E328D4 /* PlaybackSettingsStoreTests.swift in Sources */,
@@ -712,8 +817,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9D84C80482A76916FA4B45FC /* FFmpegInventory.swift in Sources */,
 				65B88FED397CA6E730F3E3D0 /* PlaybackContracts.swift in Sources */,
 				290B8EF57BFE20A0C85264ED /* PlaybackSettingsStore.swift in Sources */,
+				03DE307532976EEDAE5BE804 /* VPFFmpegInventory.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -888,19 +995,27 @@
 		457F25EEB7FB5497D262A7BA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CLANG_C_LANGUAGE_STANDARD = c11;
 				CODE_SIGN_IDENTITY = "";
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Vendor/FFmpeg/Artifacts\"",
+				);
+				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback;
+				PUBLIC_HEADERS_FOLDER_PATH = "$(CONTENTS_FOLDER_PATH)/Headers";
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1068,19 +1183,27 @@
 		F6B563246CBF0CA90F06E704 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CLANG_C_LANGUAGE_STANDARD = c11;
 				CODE_SIGN_IDENTITY = "";
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Vendor/FFmpeg/Artifacts\"",
+				);
+				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback;
+				PUBLIC_HEADERS_FOLDER_PATH = "$(CONTENTS_FOLDER_PATH)/Headers";
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = 3;

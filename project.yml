@@ -30,13 +30,33 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: Sources/VPlayerPlayback
+        excludes:
+          - include
+      - path: Sources/VPlayerPlayback/include
+        headerVisibility: public
     dependencies:
       - target: VPlayerCore
+      - framework: Vendor/FFmpeg/Artifacts/FFmpeg.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVKit.framework
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback
-        DEFINES_MODULE: true
+        DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: true
+        CLANG_C_LANGUAGE_STANDARD: c11
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        PUBLIC_HEADERS_FOLDER_PATH: "$(CONTENTS_FOLDER_PATH)/Headers"
+        OTHER_LDFLAGS: "$(inherited) -lz"
   VPlayer:
     type: application
     platform: tvOS
