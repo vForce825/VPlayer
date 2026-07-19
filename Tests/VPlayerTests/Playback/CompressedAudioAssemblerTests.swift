@@ -292,6 +292,24 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         )
     }
 
+    func testMP2ParserExtradataIsForwardedWithoutBecomingMagicCookie() throws {
+        try assertNonAACParserExtradata(
+            codec: .mp2,
+            frameSamples: 1_152,
+            expectedFormatID: kAudioFormatMPEGLayer2,
+            expectedFramesPerPacket: 1_152
+        )
+    }
+
+    func testAC3ParserExtradataIsForwardedWithoutBecomingMagicCookie() throws {
+        try assertNonAACParserExtradata(
+            codec: .ac3,
+            frameSamples: 1_536,
+            expectedFormatID: kAudioFormatAC3,
+            expectedFramesPerPacket: 1_536
+        )
+    }
+
     func testMalformedADTSASCLayoutPTSAndFrameSamplesFailDeterministically() throws {
         var profileNotLC = makeADTSFrame(payload: Data([1]), hasCRC: false)
         profileNotLC[2] = (profileNotLC[2] & 0x3F) | 0x80
@@ -738,6 +756,64 @@ final class CompressedAudioAssemblerTests: XCTestCase {
                 frames: codec == .eac3 ? UInt32(count) : 0
             )
         }
+    }
+
+    private func assertNonAACParserExtradata(
+        codec: VPlayerPlayback.AudioCodec,
+        frameSamples: Int32,
+        expectedFormatID: AudioFormatID,
+        expectedFramesPerPacket: UInt32
+    ) throws {
+        let expectedExtradata = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        var sourceExtradata = expectedExtradata
+        let payload = Data([0xFF, 0xFD, 0xA5])
+        let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedAudioFrame(
+                bytes: payload,
+                frameSamples: frameSamples
+            ))
+        }
+        var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(
+            codec: codec,
+            extradata: sourceExtradata
+        )
+        let subject = try CompressedAudioAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 2) },
+            eventSink: { events.append($0) },
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+
+        XCTAssertEqual(factory.configurations.map(\.extradata), [expectedExtradata])
+        sourceExtradata.resetBytes(in: sourceExtradata.indices)
+        XCTAssertEqual(factory.configurations.map(\.extradata), [expectedExtradata])
+
+        try subject.push(AssemblerTestFixtures.audioPacket(data: Data([1]), codec: codec))
+
+        guard let firstEvent = events.first,
+              case let .format(format, eventCodec, fingerprint) = firstEvent else {
+            return XCTFail("format must be first")
+        }
+        XCTAssertEqual(eventCodec, codec)
+        XCTAssertEqual(
+            fingerprint,
+            try MediaFormatFingerprint(
+                trackSet: tracks,
+                videoParameterSets: [],
+                audioCookie: nil
+            )
+        )
+        try assertAudioFormat(
+            format,
+            formatID: expectedFormatID,
+            framesPerPacket: expectedFramesPerPacket,
+            cookie: nil
+        )
+        let sample = try XCTUnwrap(events.compactMap(\.sample).first)
+        XCTAssertTrue(CMSampleBufferDataIsReady(sample.sampleBuffer))
+        XCTAssertEqual(try copiedSampleData(sample.sampleBuffer), payload)
     }
 
     private func validParserConfiguration() -> VPFFParserConfigV1 {

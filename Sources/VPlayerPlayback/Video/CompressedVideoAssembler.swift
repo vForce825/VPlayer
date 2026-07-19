@@ -446,10 +446,20 @@ final class CompressedVideoAssembler {
     private func mergedParameterSets(_ incoming: [Data]) -> [Data] {
         guard !incoming.isEmpty else { return parameterSets }
         var groups = Dictionary(grouping: parameterSets) { parameterSetType($0) }
+            .mapValues(exactUniqueParameterSets)
         for (type, values) in Dictionary(grouping: incoming, by: { parameterSetType($0) }) {
-            groups[type] = values
+            groups[type] = exactUniqueParameterSets(values)
         }
         return parameterSetOrder().flatMap { groups[$0] ?? [] }
+    }
+
+    private func exactUniqueParameterSets(_ values: [Data]) -> [Data] {
+        var seen = Set<Data>()
+        var result: [Data] = []
+        for value in values where seen.insert(value).inserted {
+            result.append(value)
+        }
+        return result
     }
 
     private func hasRequiredParameterSets(_ values: [Data]) -> Bool {

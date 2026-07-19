@@ -121,7 +121,6 @@ final class CompressedAudioAssembler {
             }
             return
         }
-        guard descriptor.extradata.isEmpty else { throw validationError() }
         let built = try AudioFormatDescriptionBuilder.make(
             codec: descriptor.codec,
             sampleRate: descriptor.sampleRate,

@@ -171,6 +171,57 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         ])
     }
 
+    func testExactDuplicateParameterSetsDoNotReemitFormatOrAdvanceGeneration() throws {
+        let firstFrame = AssemblerTestFixtures.h264AccessUnit()
+        var duplicateFrame = AssemblerTestFixtures.annexBParameterSets([
+            AssemblerTestFixtures.h264SPS,
+            AssemblerTestFixtures.h264SPS,
+            AssemblerTestFixtures.h264PPS,
+        ])
+        duplicateFrame.append(contentsOf: [0, 0, 0, 1, 0x41, 0x9A, 0x22])
+        let frames = [firstFrame, duplicateFrame]
+        let factory = ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                bytes: frames[index],
+                pts: Int64(90_000 + index * 3_000),
+                dts: Int64(87_000 + index * 3_000),
+                keyFrame: index == 0
+            ))
+        }
+        var generation = MediaGeneration(rawValue: 0)
+        var timeline: [String] = []
+        var events: [VideoAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        let subject = try CompressedVideoAssembler(
+            trackSet: tracks,
+            generationProvider: {
+                timeline.append("generation-\(generation.rawValue)")
+                return generation
+            },
+            eventSink: { event in
+                events.append(event)
+                if case .format = event {
+                    generation = MediaGeneration(rawValue: generation.rawValue + 1)
+                    timeline.append("format-\(generation.rawValue)")
+                }
+            },
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+
+        try subject.push(AssemblerTestFixtures.videoPacket())
+        try subject.push(AssemblerTestFixtures.videoPacket())
+
+        XCTAssertEqual(events.compactMap(\.formatFingerprint).count, 1)
+        let accessUnits = events.compactMap(\.accessUnit)
+        XCTAssertEqual(accessUnits.map(\.generation), [
+            MediaGeneration(rawValue: 1),
+            MediaGeneration(rawValue: 1),
+        ])
+        XCTAssertTrue(accessUnits.allSatisfy { CMSampleBufferDataIsReady($0.sampleBuffer) })
+        XCTAssertEqual(timeline, ["format-1", "generation-1", "generation-1"])
+    }
+
     func testSharedAVFingerprintsRemainCompleteAfterVideoThenAudioReset() throws {
         try assertSharedAVFingerprintsRemainComplete(resetVideoFirst: true)
     }
