@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import VPlayerCore
 
 public enum PlaybackFoundation { public static let contractVersion = 1 }
 
@@ -19,6 +20,15 @@ public struct PlaybackRequest: Identifiable, Equatable, Sendable {
         self.channelID = channelID
         self.streamURL = streamURL
         self.title = title
+    }
+
+    public init(channel: Channel) {
+        self.init(
+            sourceProfileID: channel.sourceProfileID,
+            channelID: channel.id,
+            streamURL: channel.streamURL,
+            title: channel.displayName
+        )
     }
 }
 

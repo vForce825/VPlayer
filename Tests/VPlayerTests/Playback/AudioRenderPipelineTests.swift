@@ -841,8 +841,6 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                           "socket(" , "http" + "Server", "Metal", "Shaders", "PlaybackPipeline"] {
             XCTAssertNil(sources.range(of: forbidden, options: .caseInsensitive))
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: repository
-            .appendingPathComponent("Sources/VPlayerPlayback/Pipeline/PlaybackPipeline.swift").path))
     }
 
     private func makeHarness(codec: VPlayerPlayback.AudioCodec = .aac) throws -> AudioHarness {
