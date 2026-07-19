@@ -802,6 +802,132 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt)
     }
 
+    func testJoinedOlderFlightSuccessReplacesManualCancellationOverlay() async {
+        let flightStartedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let manualStartedAt = flightStartedAt.addingTimeInterval(60)
+        let priorAt = flightStartedAt.addingTimeInterval(-600)
+        let scenarios: [(name: String, loadModelAfterFlightStarts: Bool)] = [
+            ("refreshing baseline", true),
+            ("prior terminal baseline", false)
+        ]
+
+        for scenario in scenarios {
+            let clock = AppModelTestClock(flightStartedAt)
+            var profile = makeProfile(
+                id: "00000000-0000-0000-0000-000000000001",
+                name: "Source",
+                now: flightStartedAt
+            )
+            profile.m3uStatus = ResourceRefreshStatus(
+                lastAttemptAt: priorAt,
+                state: .failed,
+                errorSummary: "prior terminal failure"
+            )
+            let repository = RepositorySpy(profiles: [profile])
+            let downloader = AppModelRefreshDownloader(
+                payload: Data("""
+                #EXTM3U
+                #EXTINF:-1,Joined flight
+                https://example.test/joined
+                """.utf8),
+                gatesCompletion: true
+            )
+            let coordinator = RefreshCoordinator(
+                repository: repository,
+                downloader: downloader,
+                now: { clock.value }
+            )
+            let model = AppModel(
+                repository: repository,
+                refresh: { profileID, resources, trigger in
+                    await coordinator.refresh(
+                        profileID: profileID,
+                        resources: resources,
+                        trigger: trigger
+                    )
+                },
+                now: { clock.value }
+            )
+
+            if !scenario.loadModelAfterFlightStarts {
+                await model.reload()
+            }
+            let originalWaiter = Task {
+                await coordinator.refresh(
+                    profileID: profile.id,
+                    resources: [.playlist],
+                    trigger: .foreground
+                )
+            }
+            await downloader.waitUntilStarted()
+            let inFlightSnapshot = await repository.snapshot()
+            XCTAssertEqual(inFlightSnapshot.profiles.first?.m3uStatus.state, .refreshing, scenario.name)
+            XCTAssertEqual(
+                inFlightSnapshot.events.filter { $0 == .attempt(profile.id, .playlist) }.count,
+                1,
+                scenario.name
+            )
+
+            if scenario.loadModelAfterFlightStarts {
+                await model.reload()
+                XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing, scenario.name)
+                XCTAssertEqual(
+                    model.profiles.first?.m3uStatus.lastAttemptAt,
+                    flightStartedAt,
+                    scenario.name
+                )
+            } else {
+                XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed, scenario.name)
+            }
+
+            clock.value = manualStartedAt
+            let manualWaiter = Task {
+                await model.refresh(profileID: profile.id, resource: .playlist)
+            }
+            await eventually {
+                model.profiles.first?.m3uStatus.lastAttemptAt == manualStartedAt
+                    && model.profiles.first?.m3uStatus.state == .refreshing
+            }
+            for _ in 0..<10 { await Task.yield() }
+            manualWaiter.cancel()
+            await manualWaiter.value
+
+            XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, manualStartedAt, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。", scenario.name)
+
+            await downloader.releaseCompletion()
+            let originalOutcomes = await originalWaiter.value
+            XCTAssertEqual(originalOutcomes.first?.succeeded, true, scenario.name)
+            let successSnapshot = await repository.snapshot()
+            XCTAssertEqual(successSnapshot.profiles.first?.m3uStatus.state, .succeeded, scenario.name)
+            XCTAssertEqual(
+                successSnapshot.profiles.first?.m3uStatus.lastSuccessAt,
+                flightStartedAt,
+                scenario.name
+            )
+            XCTAssertEqual(
+                successSnapshot.events.filter { $0 == .attempt(profile.id, .playlist) }.count,
+                1,
+                scenario.name
+            )
+            XCTAssertEqual(
+                successSnapshot.events.filter { $0 == .success(profile.id, .playlist) }.count,
+                1,
+                scenario.name
+            )
+
+            let firstReloadSucceeded = await model.reload()
+            let secondReloadSucceeded = await model.reload()
+            XCTAssertTrue(firstReloadSucceeded, scenario.name)
+            XCTAssertTrue(secondReloadSucceeded, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded, scenario.name)
+            XCTAssertEqual(model.profiles.first?.m3uStatus.lastSuccessAt, flightStartedAt, scenario.name)
+            XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary, scenario.name)
+            XCTAssertEqual(model.activeProfile?.m3uStatus.state, .succeeded, scenario.name)
+        }
+    }
+
     func testManualRefreshTerminalOverlayKeepsOriginalCompletionTimeAcrossLaterReloads() async {
         let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
         let clock = AppModelTestClock(startedAt)
@@ -1835,20 +1961,24 @@ private actor AppModelRefreshDownloader: RemoteResourceDownloading {
     private let payload: Data?
     private let error: URLError.Code?
     private let gatesCancellation: Bool
+    private let gatesCompletion: Bool
     private var isStarted = false
     private var isCancellationBlocked = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var cancellationBlockedWaiters: [CheckedContinuation<Void, Never>] = []
     private var cancellationRelease: CheckedContinuation<Void, Never>?
+    private var completionRelease: CheckedContinuation<Void, Never>?
 
     init(
         payload: Data? = nil,
         error: URLError.Code? = nil,
-        gatesCancellation: Bool = false
+        gatesCancellation: Bool = false,
+        gatesCompletion: Bool = false
     ) {
         self.payload = payload
         self.error = error
         self.gatesCancellation = gatesCancellation
+        self.gatesCompletion = gatesCompletion
     }
 
     func download(_ request: RemoteResourceRequest) async throws -> DownloadedResource {
@@ -1857,6 +1987,12 @@ private actor AppModelRefreshDownloader: RemoteResourceDownloading {
             waiter.resume()
         }
         startWaiters = []
+
+        if gatesCompletion {
+            await withCheckedContinuation { continuation in
+                completionRelease = continuation
+            }
+        }
 
         if gatesCancellation {
             do {
@@ -1903,5 +2039,10 @@ private actor AppModelRefreshDownloader: RemoteResourceDownloading {
     func releaseCancellation() {
         cancellationRelease?.resume()
         cancellationRelease = nil
+    }
+
+    func releaseCompletion() {
+        completionRelease?.resume()
+        completionRelease = nil
     }
 }

@@ -297,7 +297,11 @@ final class AppModel {
 
     func refresh(profileID: UUID, resource: RefreshResource) async {
         let key = RefreshKey(profileID: profileID, resource: resource)
-        let attempt = ManualRefreshAttempt(id: UUID(), startedAt: now())
+        let attempt = ManualRefreshAttempt(
+            id: UUID(),
+            startedAt: now(),
+            baselineStatus: refreshStatus(profileID: profileID, resource: resource)
+        )
         manualRefreshAttempts[key] = attempt
         markRefreshing(
             profileID: profileID,
@@ -321,6 +325,7 @@ final class AppModel {
         terminalRefreshOverlays[key] = TerminalRefreshOverlay(
             id: UUID(),
             startedAt: attempt.startedAt,
+            baselineStatus: attempt.baselineStatus,
             outcome: outcome,
             completedAt: completedAt
         )
@@ -466,6 +471,17 @@ final class AppModel {
         }
     }
 
+    private func refreshStatus(
+        profileID: UUID,
+        resource: RefreshResource
+    ) -> ResourceRefreshStatus? {
+        guard let profile = profiles.first(where: { $0.id == profileID }) else { return nil }
+        return switch resource {
+        case .playlist: profile.m3uStatus
+        case .epg: profile.epgStatus
+        }
+    }
+
     private func presentOperationError(_ error: any Error) {
         switch error {
         case SourceProfileValidationError.emptyName:
@@ -608,7 +624,11 @@ final class AppModel {
             case .epg: profiles[index].epgStatus
             }
             if overlayIDsAtReloadStart[key] == overlay.id,
-               Self.isTerminalStatus(persistedStatus, freshSince: overlay.startedAt) {
+               Self.isTerminalStatus(
+                   persistedStatus,
+                   differentFrom: overlay.baselineStatus,
+                   orFreshSince: overlay.startedAt
+               ) {
                 terminalRefreshOverlays[key] = nil
                 continue
             }
@@ -633,9 +653,12 @@ final class AppModel {
 
     private static func isTerminalStatus(
         _ status: ResourceRefreshStatus,
-        freshSince startedAt: Date
+        differentFrom baselineStatus: ResourceRefreshStatus?,
+        orFreshSince startedAt: Date
     ) -> Bool {
-        switch status.state {
+        guard status.state == .succeeded || status.state == .failed else { return false }
+        if let baselineStatus, status != baselineStatus { return true }
+        return switch status.state {
         case .succeeded:
             status.lastSuccessAt.map { $0 >= startedAt } ?? false
         case .failed:
@@ -706,11 +729,13 @@ private extension AppModel {
     struct ManualRefreshAttempt {
         let id: UUID
         let startedAt: Date
+        let baselineStatus: ResourceRefreshStatus?
     }
 
     struct TerminalRefreshOverlay {
         let id: UUID
         let startedAt: Date
+        let baselineStatus: ResourceRefreshStatus?
         let outcome: RefreshOutcome
         let completedAt: Date
     }
