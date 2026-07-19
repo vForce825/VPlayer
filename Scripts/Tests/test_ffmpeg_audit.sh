@@ -28,4 +28,6 @@ jq '.libraries += ["avfilter"]' "$tmp/manifest.json" > "$tmp/extra-library.json"
 assert_rejected "$tmp/extra-library.json" "avfilter"
 
 "$root/Scripts/audit-ffmpeg.sh" --manifest-only "$tmp/manifest.json"
+"$root/Scripts/Tests/test_ffmpeg_artifact_audit.sh"
+"$root/Scripts/Tests/test_ffmpeg_promotion.sh"
 echo "FFmpeg audit tamper test OK"

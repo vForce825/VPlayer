@@ -12,8 +12,25 @@ Linkage: static, built by Scripts/build-ffmpeg.sh
 Local modifications: none; build configuration and component allowlists are
 recorded under Vendor/FFmpeg.
 
+The distributed FFmpeg archives include the pinned IJG-derived files
+libavcodec/jfdctfst.c, libavcodec/jfdctint_template.c, and
+libavcodec/jrevdct.c. For executable distributions, documentation must state:
+"this software is based in part on the work of the Independent JPEG Group".
+VPlayer made no additions, deletions, or changes to those three files in the
+pinned FFmpeg source. See Vendor/FFmpeg/UPSTREAM-LICENSE.md and the corresponding pinned
+source-file headers for the upstream licensing map and IJG license terms.
+
 Distributions must include FFmpeg's notices and corresponding source for the
 exact revision, plus relinkable VPlayer object material and instructions that
 allow recipients to replace the statically linked LGPL library with a
 modified compatible FFmpeg build. See Vendor/FFmpeg/LICENSE.md and
 Vendor/FFmpeg/README.md.
+
+Release and EULA terms must permit customers to modify the application for their own use
+and permit reverse engineering for debugging those modifications.
+Source, object material, and relinking instructions alone are not sufficient
+when distribution terms prohibit either activity. The VPlayer App Store
+exception does not alter FFmpeg's LGPL terms. Every App Store release must
+pass an App Store release/legal gate that checks the actual distribution
+terms and delivery mechanism against these obligations; this notice does not
+by itself guarantee App Store acceptance or legal compliance.

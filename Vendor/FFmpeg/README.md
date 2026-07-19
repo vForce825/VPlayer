@@ -12,12 +12,33 @@ Rebuild and audit it from the repository root:
 ./Scripts/audit-ffmpeg.sh Vendor/FFmpeg/Artifacts/FFmpeg.xcframework
 ```
 
+The behavioral audit tests require that real artifact and its bounded `Work`
+inputs already exist. Run them in this order; they fail with the actionable
+build command instead of skipping when those inputs are absent:
+
+```sh
+./Scripts/build-ffmpeg.sh
+bash Scripts/Tests/test_ffmpeg_lock.sh
+bash Scripts/Tests/test_ffmpeg_audit.sh
+```
+
 The build contains only `libavcodec`, `libavformat`, `libavutil`, and
 `libswresample`. It enables HTTP/HTTPS over Secure Transport, the exact
 protocol/parser/bitstream-filter/audio-decoder inventory in
 `component-manifest.json`, and the HLS-required AAC, AC-3, and E-AC-3 child
 demuxers. No FFmpeg video decoder, encoder, muxer, filter, device, GPL,
 nonfree, or version-3 component is enabled.
+
+The combined archives include FFmpeg's pinned IJG-derived files
+`libavcodec/jfdctfst.c`, `libavcodec/jfdctint_template.c`, and
+`libavcodec/jrevdct.c`. For executable distributions, the accompanying
+documentation must state:
+"this software is based in part on the work of the Independent JPEG Group".
+VPlayer made no additions, deletions, or changes to those three files in the
+pinned FFmpeg source. FFmpeg's upstream licensing map is preserved
+byte-for-byte at `Vendor/FFmpeg/UPSTREAM-LICENSE.md`; the
+three source-file headers in the corresponding source release contain the IJG
+license terms.
 
 FFmpeg 8.1.2 removed the old `--disable-postproc` configure option, so the
 pin uses `--disable-everything`, `--disable-avfilter`, and explicit library
@@ -47,3 +68,12 @@ replace the LGPL library with a modified compatible build. Preserve that
 material and clear relinking instructions for every release; the ignored
 `Work` and `Artifacts` directories are build outputs, not a release-compliance
 archive.
+
+Release and EULA terms must permit customers to modify the application for their own use
+and permit reverse engineering for debugging those modifications.
+Source, object material, and relinking instructions alone are not sufficient
+when distribution terms prohibit either activity. The VPlayer App Store
+exception does not alter FFmpeg's LGPL terms. Every App Store release must
+pass an App Store release/legal gate that checks the actual distribution
+terms and delivery mechanism against these obligations; this documentation
+does not by itself guarantee App Store acceptance or legal compliance.

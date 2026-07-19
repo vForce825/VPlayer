@@ -15,13 +15,48 @@ manifest="$root/Vendor/FFmpeg/component-manifest.json"
 work="$root/Vendor/FFmpeg/Work"
 source="$work/source"
 artifacts="$root/Vendor/FFmpeg/Artifacts"
-xcframework="$artifacts/FFmpeg.xcframework"
+candidate="$artifacts/.FFmpeg.candidate.xcframework"
 sdk_version_floor="18.0"
 
 fail() {
   echo "FFmpeg build failed: $*" >&2
   exit 1
 }
+
+clear_generated_directory() {
+  local directory="$1"
+  case "$directory" in
+    "$work"/build-device|"$work"/build-sim-arm64|"$work"/build-sim-x86_64|\
+    "$work"/install-device|"$work"/install-sim-arm64|"$work"/install-sim-x86_64|\
+    "$work"/install-simulator|"$artifacts") ;;
+    *) fail "refusing to clear unexpected path: $directory" ;;
+  esac
+  mkdir -p "$directory"
+  find "$directory" -mindepth 1 -type f -delete
+  find "$directory" -mindepth 1 -type l -delete
+  find "$directory" -mindepth 1 -depth -type d -empty -delete
+}
+
+cleanup_candidate() {
+  case "$candidate" in
+    "$root/Vendor/FFmpeg/Artifacts/.FFmpeg.candidate.xcframework") ;;
+    *) return 1 ;;
+  esac
+  if [[ -e "$candidate" || -L "$candidate" ]]; then
+    find "$candidate" -type f -delete
+    find "$candidate" -type l -delete
+    find "$candidate" -depth -type d -empty -delete
+  fi
+}
+
+trap cleanup_candidate EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Remove both any old final artifact and the fixed staging path before work
+# begins. Any later failure or signal leaves no candidate or stale final.
+clear_generated_directory "$artifacts"
 
 for tool in git jq make shasum; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
@@ -55,20 +90,7 @@ git -C "$source" checkout --detach "$commit"
 [[ "$(git -C "$source" rev-parse HEAD)" == "$commit" ]] || fail "source checkout differs from lock"
 [[ -z "$(git -C "$source" status --porcelain)" ]] || fail "source checkout contains local modifications"
 cmp -s "$source/COPYING.LGPLv2.1" "$root/Vendor/FFmpeg/LICENSE.md" || fail "LICENSE.md must be a byte-for-byte upstream copy"
-
-clear_generated_directory() {
-  local directory="$1"
-  case "$directory" in
-    "$work"/build-device|"$work"/build-sim-arm64|"$work"/build-sim-x86_64|\
-    "$work"/install-device|"$work"/install-sim-arm64|"$work"/install-sim-x86_64|\
-    "$work"/install-simulator|"$artifacts") ;;
-    *) fail "refusing to clear unexpected path: $directory" ;;
-  esac
-  mkdir -p "$directory"
-  find "$directory" -mindepth 1 -type f -delete
-  find "$directory" -mindepth 1 -type l -delete
-  find "$directory" -mindepth 1 -depth -type d -empty -delete
-}
+cmp -s "$source/LICENSE.md" "$root/Vendor/FFmpeg/UPSTREAM-LICENSE.md" || fail "UPSTREAM-LICENSE.md must be a byte-for-byte upstream copy"
 
 common_flags=()
 while IFS= read -r flag; do
@@ -145,10 +167,6 @@ build_slice() {
   popd >/dev/null
 }
 
-# Do not leave a previously audited XCFramework available while any new
-# architecture is being rebuilt. A failed build must leave no stale artifact.
-clear_generated_directory "$artifacts"
-mkdir -p "$artifacts"
 build_slice device appletvos arm64 "arm64-apple-tvos${sdk_version_floor}"
 build_slice sim-arm64 appletvsimulator arm64 "arm64-apple-tvos${sdk_version_floor}-simulator"
 build_slice sim-x86_64 appletvsimulator x86_64 "x86_64-apple-tvos${sdk_version_floor}-simulator"
@@ -168,5 +186,5 @@ diff -qr -x ffmpeg-build "$work/install-sim-arm64/include" "$work/install-sim-x8
 xcodebuild -create-xcframework \
   -library "$work/install-device/lib/libFFmpeg.a" -headers "$work/install-device/include" \
   -library "$sim/lib/libFFmpeg.a" -headers "$sim/include" \
-  -output "$xcframework"
-"$root/Scripts/audit-ffmpeg.sh" "$xcframework"
+  -output "$candidate"
+"$root/Scripts/promote-ffmpeg-artifact.sh"

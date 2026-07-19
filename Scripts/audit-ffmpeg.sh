@@ -51,6 +51,7 @@ audit_manifest "$manifest"
 [[ "$(git -C "$source" rev-parse HEAD)" == "$commit" ]] || fail "source checkout differs from lock"
 [[ "$(git -C "$source" rev-parse "refs/tags/$tag^{}")" == "$commit" ]] || fail "tag does not peel to locked commit"
 cmp -s "$source/COPYING.LGPLv2.1" "$vendor/LICENSE.md" || fail "LICENSE.md differs from upstream COPYING.LGPLv2.1"
+cmp -s "$source/LICENSE.md" "$vendor/UPSTREAM-LICENSE.md" || fail "UPSTREAM-LICENSE.md differs from upstream LICENSE.md"
 license_sha="$(shasum -a 256 "$vendor/LICENSE.md" | awk '{print $1}')"
 
 tmp="$(mktemp -d)"

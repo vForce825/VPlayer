@@ -7,11 +7,23 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 lock="$root/Vendor/FFmpeg/ffmpeg.lock.json"
 flags="$root/Vendor/FFmpeg/configure.flags"
+upstream_license="$root/Vendor/FFmpeg/UPSTREAM-LICENSE.md"
 
 test "$(jq -r .tag "$lock")" = "n8.1.2"
 test "$(jq -r .commit "$lock")" = "38b88335f99e76ed89ff3c93f877fdefce736c13"
 test "$(jq -r .sourceURL "$lock")" = "https://git.ffmpeg.org/ffmpeg.git"
 test "$(jq -r .licenseMode "$lock")" = "LGPL-2.1-or-later"
+test -f "$upstream_license"
+
+for documentation in "$root/THIRD_PARTY_NOTICES" "$root/Vendor/FFmpeg/README.md"; do
+  grep -F 'this software is based in part on the work of the Independent JPEG Group' "$documentation" >/dev/null
+  grep -F 'no additions, deletions, or changes' "$documentation" >/dev/null
+  grep -F 'Vendor/FFmpeg/UPSTREAM-LICENSE.md' "$documentation" >/dev/null
+  grep -F 'permit customers to modify the application for their own use' "$documentation" >/dev/null
+  grep -F 'permit reverse engineering for debugging those modifications' "$documentation" >/dev/null
+  grep -F 'Source, object material, and relinking instructions alone are not sufficient' "$documentation" >/dev/null
+  grep -F 'App Store release/legal gate' "$documentation" >/dev/null
+done
 
 diff -u - "$flags" <<'FLAGS'
 --disable-autodetect
