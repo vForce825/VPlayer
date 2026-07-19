@@ -484,7 +484,9 @@ final class FakeAudioFormatSupportChecker: AudioFormatSupportChecking, @unchecke
     private let lock = NSLock()
     var compressedSupported = true
     var pcmSupported = true
+    var requireRouteMatchingFormat = false
     private var checks: [(AudioRoute, AudioOutputCategory)] = []
+    private var formatIDs: [AudioFormatID] = []
 
     func supports(
         format: CMAudioFormatDescription,
@@ -495,6 +497,12 @@ final class FakeAudioFormatSupportChecker: AudioFormatSupportChecking, @unchecke
         lock.lock()
         defer { lock.unlock() }
         checks.append((route, output))
+        let formatID = CMFormatDescriptionGetMediaSubType(format)
+        formatIDs.append(formatID)
+        if requireRouteMatchingFormat {
+            let isPCM = formatID == kAudioFormatLinearPCM
+            guard isPCM == (route == .ffmpegPCM) else { return false }
+        }
         return route == .systemCompressed ? compressedSupported : pcmSupported
     }
 
@@ -502,5 +510,11 @@ final class FakeAudioFormatSupportChecker: AudioFormatSupportChecking, @unchecke
         lock.lock()
         defer { lock.unlock() }
         return checks
+    }
+
+    var formatIDSnapshot: [AudioFormatID] {
+        lock.lock()
+        defer { lock.unlock() }
+        return formatIDs
     }
 }

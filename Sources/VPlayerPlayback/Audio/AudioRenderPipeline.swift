@@ -30,6 +30,20 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         var output: AudioOutputCategory
     }
 
+    private enum RemovalContinuation: Sendable {
+        case configure
+        case fallback
+    }
+
+    private struct PendingRemoval: Sendable {
+        let rendererID: AudioRendererIdentity
+        let originEpoch: UInt64
+        let originGeneration: MediaGeneration
+        var targetEpoch: UInt64
+        var targetGeneration: MediaGeneration
+        var continuation: RemovalContinuation
+    }
+
     private let executor: PlaybackSerialExecutor
     private let synchronizer: any AudioRenderSynchronizing
     private let failureSink: @Sendable (PlaybackCoreError, MediaGeneration) -> Void
@@ -44,6 +58,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var epoch: UInt64 = 0
     private var generation = MediaGeneration(rawValue: 0)
     private var format: CMAudioFormatDescription?
+    private var pcmOutputFormat: CMAudioFormatDescription?
     private var codec: AudioCodec?
     private var renderer: (any AudioRenderer)?
     private var decoder: (any PCMAudioDecoding)?
@@ -59,6 +74,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var pendingReevaluation = false
     private var recoveryScheduled = false
     private var pendingRecovery: PendingRecovery?
+    private var pendingRemoval: PendingRemoval?
     private var currentOutput = AudioOutputCategory.other
 
     convenience init(
@@ -112,34 +128,25 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             throw PlaybackCoreError.audioRendererFailed(Self.isolationError)
         }
         let newEpoch = try takeEpoch()
-        teardownForReconfiguration()
+        prepareConfiguration(
+            format: format,
+            codec: codec,
+            generation: generation,
+            epoch: newEpoch
+        )
 
-        epoch = newEpoch
-        self.generation = generation
-        self.format = format
-        self.codec = codec
-        replay.removeAll(keepingCapacity: false)
-        pendingPCM.removeAll(keepingCapacity: false)
-        configured = true
-        stopped = false
-        fallbackUsed = false
-        replacing = false
-        terminal = false
-        needsAnchor = false
-        pendingReevaluation = false
-        recoveryScheduled = false
-        pendingRecovery = nil
-        currentOutput = .other
-        updateSnapshot(route: .systemCompressed, ready: false)
-
-        let candidate = try rendererFactory.makeRenderer(mediaKind: .compressed)
-        renderer = candidate
-        installCallbacks(on: candidate, epoch: newEpoch, generation: generation)
-        synchronizer.attach(candidate)
-        rendererAttached = true
-        startRequests(on: candidate, epoch: newEpoch, generation: generation)
-        startRouteMonitor(epoch: newEpoch, generation: generation)
-        updateReadiness()
+        if var pendingRemoval {
+            pendingRemoval.targetEpoch = newEpoch
+            pendingRemoval.targetGeneration = generation
+            pendingRemoval.continuation = .configure
+            self.pendingRemoval = pendingRemoval
+            return
+        }
+        if let renderer {
+            beginRemoval(of: renderer, continuation: .configure)
+            return
+        }
+        try activateCompressedRenderer()
     }
 
     func enqueue(_ sample: CompressedAudioSample) throws {
@@ -174,19 +181,35 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         guard let newEpoch = takeEpochWithoutThrow() else { return }
         epoch = newEpoch
         self.generation = generation
-        replacing = false
         terminal = false
         pendingReevaluation = false
         recoveryScheduled = false
         pendingRecovery = nil
         needsAnchor = false
         synchronizer.setRate(0, time: synchronizer.currentTime())
+        replay.removeAll(keepingCapacity: false)
+        pendingPCM.removeAll(keepingCapacity: false)
+        decoder?.flush()
+
+        if var pendingRemoval {
+            pendingRemoval.targetEpoch = newEpoch
+            pendingRemoval.targetGeneration = generation
+            self.pendingRemoval = pendingRemoval
+            replacing = true
+            switch pendingRemoval.continuation {
+            case .configure:
+                routeMonitor.stop()
+            case .fallback:
+                startRouteMonitor(epoch: newEpoch, generation: generation)
+            }
+            updateReadiness()
+            return
+        }
+
+        replacing = false
         renderer?.stopRequestingMediaData()
         renderer?.stopObserving()
         renderer?.flush()
-        decoder?.flush()
-        replay.removeAll(keepingCapacity: false)
-        pendingPCM.removeAll(keepingCapacity: false)
         if let renderer {
             installCallbacks(on: renderer, epoch: newEpoch, generation: generation)
             startRequests(on: renderer, epoch: newEpoch, generation: generation)
@@ -210,9 +233,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         recoveryScheduled = false
         pendingRecovery = nil
         routeMonitor.stop()
+        let removalWasPending = pendingRemoval != nil
+        pendingRemoval = nil
         let now = synchronizer.currentTime()
         synchronizer.setRate(0, time: now)
-        if let renderer {
+        if let renderer, !removalWasPending {
             renderer.stopRequestingMediaData()
             renderer.stopObserving()
             renderer.flush()
@@ -222,6 +247,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         rendererAttached = false
         decoder?.destroy()
         decoder = nil
+        pcmOutputFormat = nil
         replay.removeAll(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
         updateSnapshot(route: route, ready: false)
@@ -243,22 +269,46 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         return value
     }
 
-    private func teardownForReconfiguration() {
+    private func prepareConfiguration(
+        format: CMAudioFormatDescription,
+        codec: AudioCodec,
+        generation: MediaGeneration,
+        epoch: UInt64
+    ) {
         routeMonitor.stop()
         decoder?.destroy()
         decoder = nil
-        let now = synchronizer.currentTime()
-        if let renderer {
-            renderer.stopRequestingMediaData()
-            renderer.stopObserving()
-            renderer.flush()
-            synchronizer.remove(renderer, at: .invalid) { _ in }
-        }
-        self.renderer = nil
+        pcmOutputFormat = nil
+        self.epoch = epoch
+        self.generation = generation
+        self.format = format
+        self.codec = codec
+        replay.removeAll(keepingCapacity: false)
+        pendingPCM.removeAll(keepingCapacity: false)
+        configured = true
+        stopped = false
+        fallbackUsed = false
+        replacing = renderer != nil
+        terminal = false
+        needsAnchor = false
+        pendingReevaluation = false
+        recoveryScheduled = false
+        pendingRecovery = nil
+        currentOutput = .other
+        updateSnapshot(route: .systemCompressed, ready: false)
+    }
+
+    private func activateCompressedRenderer() throws {
+        let candidate = try rendererFactory.makeRenderer(mediaKind: .compressed)
+        renderer = candidate
         rendererAttached = false
-        if configured && !stopped {
-            synchronizer.setRate(0, time: now)
-        }
+        installCallbacks(on: candidate, epoch: epoch, generation: generation)
+        synchronizer.attach(candidate)
+        rendererAttached = true
+        replacing = false
+        startRequests(on: candidate, epoch: epoch, generation: generation)
+        startRouteMonitor(epoch: epoch, generation: generation)
+        updateReadiness()
     }
 
     private func installCallbacks(
@@ -436,9 +486,19 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             recover(at: recovery.time)
             return
         }
-        guard let format else { return }
+        let supportFormat: CMAudioFormatDescription?
+        switch route {
+        case .systemCompressed:
+            supportFormat = format
+        case .ffmpegPCM:
+            supportFormat = pcmOutputFormat
+        }
+        guard let supportFormat else {
+            recover(at: recovery.time)
+            return
+        }
         if !supportChecker.supports(
-            format: format,
+            format: supportFormat,
             route: route,
             output: recovery.output
         ) {
@@ -479,47 +539,81 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func beginFallback() {
         guard !fallbackUsed, !replacing, !terminal,
-              let renderer, let format, let codec else { return }
+              pendingRemoval == nil, let renderer,
+              format != nil, codec != nil else { return }
         fallbackUsed = true
+        beginRemoval(of: renderer, continuation: .fallback)
+    }
+
+    private func beginRemoval(
+        of renderer: any AudioRenderer,
+        continuation: RemovalContinuation
+    ) {
+        guard pendingRemoval == nil else { return }
         replacing = true
         updateSnapshot(route: route, ready: false)
-        let transactionEpoch = epoch
-        let transactionGeneration = generation
-        let rendererID = renderer.identity
-        let now = synchronizer.currentTime()
-        synchronizer.setRate(0, time: now)
+        synchronizer.setRate(0, time: synchronizer.currentTime())
         renderer.stopRequestingMediaData()
         renderer.stopObserving()
         renderer.flush()
+        let transition = PendingRemoval(
+            rendererID: renderer.identity,
+            originEpoch: epoch,
+            originGeneration: generation,
+            targetEpoch: epoch,
+            targetGeneration: generation,
+            continuation: continuation
+        )
+        pendingRemoval = transition
         synchronizer.remove(renderer, at: .invalid) { [weak self] didRemove in
             guard let self else { return }
             executor.submit { [weak self] in
-                self?.completeFallback(
+                self?.completeRemoval(
                     didRemove: didRemove,
-                    epoch: transactionEpoch,
-                    rendererID: rendererID,
-                    generation: transactionGeneration,
-                    format: format,
-                    codec: codec
+                    rendererID: transition.rendererID,
+                    originEpoch: transition.originEpoch,
+                    originGeneration: transition.originGeneration
                 )
             }
         }
     }
 
-    private func completeFallback(
+    private func completeRemoval(
         didRemove: Bool,
-        epoch: UInt64,
         rendererID: AudioRendererIdentity,
-        generation: MediaGeneration,
-        format: CMAudioFormatDescription,
-        codec: AudioCodec
+        originEpoch: UInt64,
+        originGeneration: MediaGeneration
     ) {
-        guard isCurrent(epoch: epoch, rendererID: rendererID, generation: generation),
-              replacing, !terminal else { return }
+        guard let transition = pendingRemoval,
+              transition.rendererID == rendererID,
+              transition.originEpoch == originEpoch,
+              transition.originGeneration == originGeneration,
+              transition.targetEpoch == epoch,
+              transition.targetGeneration == generation,
+              renderer?.identity == rendererID,
+              configured, !stopped, replacing, !terminal else { return }
+        pendingRemoval = nil
         guard didRemove else {
             emitTerminal(.audioRendererFailed(Self.removalFailedError))
             return
         }
+        renderer = nil
+        rendererAttached = false
+        switch transition.continuation {
+        case .configure:
+            do {
+                try activateCompressedRenderer()
+            } catch {
+                classifyAndEmitDecode(error)
+            }
+        case .fallback:
+            completeFallbackAfterRemoval()
+        }
+    }
+
+    private func completeFallbackAfterRemoval() {
+        guard configured, !stopped, replacing, !terminal,
+              let format, let codec else { return }
         do {
             let decoder = try decoderFactory.makeDecoder(codec: codec, format: format)
             let replacement = try rendererFactory.makeRenderer(mediaKind: .linearPCM)
@@ -574,6 +668,15 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 throw PlaybackCoreError.audioFallbackDecode(
                     FFmpegPCMAudioDecoder.tokenCapacityErrorCode
                 )
+            }
+            for output in outputs {
+                guard let outputFormat = CMSampleBufferGetFormatDescription(output),
+                      CMFormatDescriptionGetMediaSubType(outputFormat) == kAudioFormatLinearPCM else {
+                    throw PlaybackCoreError.audioFallbackDecode(
+                        FFmpegPCMAudioDecoder.invalidCallbackErrorCode
+                    )
+                }
+                pcmOutputFormat = outputFormat
             }
             pendingPCM.append(contentsOf: outputs)
             replay[index].decoded = true
