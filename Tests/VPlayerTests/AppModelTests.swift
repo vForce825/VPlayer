@@ -2315,6 +2315,147 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(snapshot.profileCreateCount, 2)
     }
 
+    func testActivationWriteFailureRestoresCompleteActiveBoundState() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second],
+            now: now
+        )
+
+        await fixture.repository.failNextActivation()
+        let activationSucceeded = await fixture.model.activate(profileID: second.id)
+
+        XCTAssertFalse(activationSucceeded)
+        assertCompleteActiveBoundState(fixture)
+        XCTAssertEqual(fixture.model.profiles, [fixture.activeProfile, second])
+        XCTAssertEqual(fixture.model.alertTitle, "操作失败")
+        XCTAssertNotNil(fixture.model.alertMessage)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
+        XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, second])
+        XCTAssertEqual(repositorySnapshot.channels[fixture.activeProfile.id], fixture.channels)
+        XCTAssertEqual(repositorySnapshot.epgChannels[fixture.activeProfile.id], fixture.epgChannels)
+        XCTAssertEqual(repositorySnapshot.programmes[fixture.activeProfile.id], fixture.programmes)
+        XCTAssertEqual(
+            repositorySnapshot.manualMappings[fixture.activeProfile.id],
+            [fixture.manualChannel.id: "manual"]
+        )
+    }
+
+    func testActiveDeletionWriteFailureRestoresCompleteActiveBoundStateAndProfiles() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second],
+            now: now
+        )
+
+        await fixture.repository.failNextDeletion()
+        let deletionSucceeded = await fixture.model.delete(profileID: fixture.activeProfile.id)
+
+        XCTAssertFalse(deletionSucceeded)
+        assertCompleteActiveBoundState(fixture)
+        XCTAssertEqual(fixture.model.profiles, [fixture.activeProfile, second])
+        XCTAssertEqual(fixture.model.alertTitle, "操作失败")
+        XCTAssertNotNil(fixture.model.alertMessage)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
+        XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, second])
+        XCTAssertEqual(repositorySnapshot.channels[fixture.activeProfile.id], fixture.channels)
+        XCTAssertEqual(repositorySnapshot.epgChannels[fixture.activeProfile.id], fixture.epgChannels)
+        XCTAssertEqual(repositorySnapshot.programmes[fixture.activeProfile.id], fixture.programmes)
+        XCTAssertEqual(
+            repositorySnapshot.manualMappings[fixture.activeProfile.id],
+            [fixture.manualChannel.id: "manual"]
+        )
+    }
+
+    func testStaleActivationWriteFailureCannotRestoreSnapshotOverNewerActivation() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let third = makeProfile(
+            id: "00000000-0000-0000-0000-000000000003",
+            name: "Third",
+            now: now
+        )
+        let thirdChannel = makeChannel(
+            profileID: third.id,
+            url: "https://example.test/third",
+            tvgID: nil,
+            order: 0
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second, third],
+            additionalChannels: [third.id: [thirdChannel]],
+            now: now
+        )
+
+        await fixture.repository.failNextActivation()
+        await fixture.repository.gateNextActivation()
+        let staleActivation = Task {
+            await fixture.model.activate(profileID: second.id)
+        }
+        await fixture.repository.waitUntilActivationIsBlocked()
+
+        let newerActivationSucceeded = await fixture.model.activate(profileID: third.id)
+        XCTAssertTrue(newerActivationSucceeded)
+        XCTAssertEqual(fixture.model.activeProfile, third)
+        XCTAssertEqual(fixture.model.channels, [thirdChannel])
+        XCTAssertFalse(fixture.model.isLoading)
+
+        await fixture.repository.releaseActivation()
+        let staleActivationSucceeded = await staleActivation.value
+
+        XCTAssertFalse(staleActivationSucceeded)
+        XCTAssertEqual(fixture.model.activeProfile, third)
+        XCTAssertEqual(fixture.model.channels, [thirdChannel])
+        XCTAssertTrue(fixture.model.epgChannels.isEmpty)
+        XCTAssertTrue(fixture.model.programmesByChannelID.isEmpty)
+        XCTAssertNil(fixture.model.matchedEPGChannelID(for: thirdChannel))
+        XCTAssertNil(fixture.model.manualEPGChannelID(for: thirdChannel))
+        XCTAssertNil(fixture.model.presentedPlaybackRequest)
+        XCTAssertFalse(fixture.model.isLoading)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, third.id)
+        XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, second, third])
+    }
+
+    func testInactiveDeletionWriteFailureDoesNotDisturbActiveBoundState() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let inactive = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Inactive",
+            now: now
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [inactive],
+            now: now
+        )
+
+        await fixture.repository.failNextDeletion()
+        let deletionSucceeded = await fixture.model.delete(profileID: inactive.id)
+
+        XCTAssertFalse(deletionSucceeded)
+        assertCompleteActiveBoundState(fixture)
+        XCTAssertEqual(fixture.model.profiles, [fixture.activeProfile, inactive])
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
+        XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, inactive])
+    }
+
     func testDeleteAndActivateClearUnsafeActiveStateWhenReloadFails() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
@@ -2480,6 +2621,153 @@ final class AppModelTests: XCTestCase {
             await Task.yield()
         }
         XCTFail("Condition did not become true", file: file, line: line)
+    }
+
+    private struct LoadedActiveBoundFixture {
+        let repository: RepositorySpy
+        let model: AppModel
+        let activeProfile: SourceProfile
+        let channels: [Channel]
+        let epgChannels: [EPGChannel]
+        let programmes: [Programme]
+        let programmesByChannelID: [String: [Programme]]
+        let automaticChannel: Channel
+        let manualChannel: Channel
+        let playbackRequest: PlaybackRequest
+    }
+
+    private func makeLoadedActiveBoundFixture(
+        additionalProfiles: [SourceProfile],
+        additionalChannels: [UUID: [Channel]] = [:],
+        now: Date
+    ) async throws -> LoadedActiveBoundFixture {
+        let active = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Active",
+            now: now
+        )
+        let automaticChannel = makeChannel(
+            profileID: active.id,
+            url: "https://example.test/automatic",
+            tvgID: "automatic",
+            order: 0
+        )
+        let manualChannel = makeChannel(
+            profileID: active.id,
+            url: "https://example.test/manual",
+            tvgID: "unmatched",
+            order: 1
+        )
+        let epgChannels = [
+            EPGChannel(id: "automatic", displayNames: ["Automatic"], iconURL: nil),
+            EPGChannel(id: "manual", displayNames: ["Manual"], iconURL: nil),
+        ]
+        let programmes = [
+            Programme(
+                id: "manual-current",
+                xmltvChannelID: "manual",
+                start: now.addingTimeInterval(-600),
+                stop: now.addingTimeInterval(600),
+                title: "Manual Current",
+                subtitle: nil,
+                summary: nil,
+                categories: []
+            ),
+            Programme(
+                id: "manual-next",
+                xmltvChannelID: "manual",
+                start: now.addingTimeInterval(600),
+                stop: now.addingTimeInterval(1_200),
+                title: "Manual Next",
+                subtitle: nil,
+                summary: nil,
+                categories: []
+            ),
+        ]
+        var channels = additionalChannels
+        channels[active.id] = [automaticChannel, manualChannel]
+        let repository = RepositorySpy(
+            profiles: [active] + additionalProfiles,
+            activeProfileID: active.id,
+            channels: channels,
+            epgChannels: [active.id: epgChannels],
+            programmes: [active.id: programmes],
+            manualMappings: [active.id: [manualChannel.id: "manual"]]
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            now: { now }
+        )
+
+        let loaded = await model.reload()
+        XCTAssertTrue(loaded)
+        let programmesByChannelID = [
+            automaticChannel.id: [],
+            manualChannel.id: programmes,
+        ]
+        XCTAssertEqual(model.programmesByChannelID, programmesByChannelID)
+        model.select(channel: manualChannel)
+        let playbackRequest = try XCTUnwrap(model.presentedPlaybackRequest)
+
+        return LoadedActiveBoundFixture(
+            repository: repository,
+            model: model,
+            activeProfile: active,
+            channels: [automaticChannel, manualChannel],
+            epgChannels: epgChannels,
+            programmes: programmes,
+            programmesByChannelID: programmesByChannelID,
+            automaticChannel: automaticChannel,
+            manualChannel: manualChannel,
+            playbackRequest: playbackRequest
+        )
+    }
+
+    private func assertCompleteActiveBoundState(
+        _ fixture: LoadedActiveBoundFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(fixture.model.activeProfile, fixture.activeProfile, file: file, line: line)
+        XCTAssertEqual(fixture.model.channels, fixture.channels, file: file, line: line)
+        XCTAssertEqual(fixture.model.epgChannels, fixture.epgChannels, file: file, line: line)
+        XCTAssertEqual(
+            fixture.model.programmesByChannelID,
+            fixture.programmesByChannelID,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            fixture.model.matchedEPGChannelID(for: fixture.automaticChannel),
+            "automatic",
+            file: file,
+            line: line
+        )
+        XCTAssertNil(
+            fixture.model.manualEPGChannelID(for: fixture.automaticChannel),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            fixture.model.matchedEPGChannelID(for: fixture.manualChannel),
+            "manual",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            fixture.model.manualEPGChannelID(for: fixture.manualChannel),
+            "manual",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest,
+            fixture.playbackRequest,
+            file: file,
+            line: line
+        )
+        XCTAssertFalse(fixture.model.isLoading, file: file, line: line)
     }
 
     private func makeProfile(id: String, name: String, now: Date) -> SourceProfile {

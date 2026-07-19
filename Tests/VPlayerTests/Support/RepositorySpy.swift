@@ -7,6 +7,8 @@ import Foundation
 
 actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     enum InjectedError: Error, Sendable {
+        case setActiveProfile
+        case deleteProfile
         case refreshCommit
         case recordAttempt
         case recordFailure
@@ -63,8 +65,10 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var blockedChannelReadContinuation: CheckedContinuation<Void, Never>?
     private var channelReadReleaseContinuation: CheckedContinuation<Void, Never>?
     private var shouldGateNextActivation = false
+    private var shouldFailNextActivation = false
     private var blockedActivationContinuation: CheckedContinuation<Void, Never>?
     private var activationReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var shouldFailNextDeletion = false
     private var shouldGateNextProfileRead = false
     private var blockedProfileReadContinuation: CheckedContinuation<Void, Never>?
     private var profileReadReleaseContinuation: CheckedContinuation<Void, Never>?
@@ -212,6 +216,14 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         shouldGateNextActivation = true
     }
 
+    func failNextActivation() {
+        shouldFailNextActivation = true
+    }
+
+    func failNextDeletion() {
+        shouldFailNextDeletion = true
+    }
+
     func waitUntilActivationIsBlocked() async {
         if activationReleaseContinuation != nil { return }
         guard shouldGateNextActivation else { return }
@@ -287,6 +299,10 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     }
 
     func deleteProfile(id: UUID) throws {
+        if shouldFailNextDeletion {
+            shouldFailNextDeletion = false
+            throw InjectedError.deleteProfile
+        }
         _ = try profileIndex(id)
         storedProfiles.removeAll { $0.id == id }
         storedChannels[id] = nil
@@ -300,6 +316,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
 
     func setActiveProfile(id: UUID) async throws {
         _ = try profileIndex(id)
+        let shouldFail = shouldFailNextActivation
+        shouldFailNextActivation = false
         if shouldGateNextActivation {
             shouldGateNextActivation = false
             blockedActivationContinuation?.resume()
@@ -307,6 +325,9 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             await withCheckedContinuation { continuation in
                 activationReleaseContinuation = continuation
             }
+        }
+        if shouldFail {
+            throw InjectedError.setActiveProfile
         }
         storedActiveProfileID = id
     }

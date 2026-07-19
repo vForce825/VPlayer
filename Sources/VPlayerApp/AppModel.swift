@@ -256,10 +256,7 @@ final class AppModel {
     @discardableResult
     func delete(profileID: UUID) async -> Bool {
         let deletedActiveProfile = activeProfile?.id == profileID
-        let previousActiveProfile = activeProfile
-        if deletedActiveProfile {
-            beginActiveTransition(to: nil)
-        }
+        let activeTransition = deletedActiveProfile ? beginActiveTransition(to: nil) : nil
         do {
             try await repository.deleteProfile(id: profileID)
             clearPendingCreation(profileID: profileID)
@@ -277,9 +274,8 @@ final class AppModel {
             }
             return true
         } catch {
-            if deletedActiveProfile {
-                activeProfile = previousActiveProfile
-                isLoading = false
+            if let activeTransition {
+                restoreActiveBoundState(ifOwnedBy: activeTransition)
             }
             presentOperationError(error)
             return false
@@ -288,8 +284,9 @@ final class AppModel {
 
     @discardableResult
     func activate(profileID: UUID) async -> Bool {
-        let previousActiveProfile = activeProfile
-        beginActiveTransition(to: profiles.first { $0.id == profileID })
+        let activeTransition = beginActiveTransition(
+            to: profiles.first { $0.id == profileID }
+        )
         do {
             try await repository.setActiveProfile(id: profileID)
             guard await reload() else {
@@ -300,8 +297,7 @@ final class AppModel {
             }
             return true
         } catch {
-            activeProfile = previousActiveProfile
-            isLoading = false
+            restoreActiveBoundState(ifOwnedBy: activeTransition)
             presentOperationError(error)
             return false
         }
@@ -510,11 +506,36 @@ final class AppModel {
         }
     }
 
-    private func beginActiveTransition(to profile: SourceProfile?) {
-        reloadID = UUID()
+    private func beginActiveTransition(to profile: SourceProfile?) -> ActiveTransition {
+        let transition = ActiveTransition(
+            id: UUID(),
+            previousState: ActiveBoundStateSnapshot(
+                activeProfile: activeProfile,
+                channels: channels,
+                epgChannels: epgChannels,
+                matchByChannelID: matchByChannelID,
+                manualMappingByChannelID: manualMappingByChannelID,
+                programmesByChannelID: programmesByChannelID,
+                presentedPlaybackRequest: presentedPlaybackRequest
+            )
+        )
+        reloadID = transition.id
         isLoading = true
         activeProfile = profile
         clearChannelState()
+        return transition
+    }
+
+    private func restoreActiveBoundState(ifOwnedBy transition: ActiveTransition) {
+        guard reloadID == transition.id else { return }
+        activeProfile = transition.previousState.activeProfile
+        channels = transition.previousState.channels
+        epgChannels = transition.previousState.epgChannels
+        matchByChannelID = transition.previousState.matchByChannelID
+        manualMappingByChannelID = transition.previousState.manualMappingByChannelID
+        programmesByChannelID = transition.previousState.programmesByChannelID
+        presentedPlaybackRequest = transition.previousState.presentedPlaybackRequest
+        isLoading = false
     }
 
     private func clearActiveBoundState() {
@@ -799,6 +820,21 @@ fileprivate extension AppModel {
     struct PendingCreation {
         let attemptID: UUID
         let profile: SourceProfile
+    }
+
+    struct ActiveTransition {
+        let id: UUID
+        let previousState: ActiveBoundStateSnapshot
+    }
+
+    struct ActiveBoundStateSnapshot {
+        let activeProfile: SourceProfile?
+        let channels: [Channel]
+        let epgChannels: [EPGChannel]
+        let matchByChannelID: [String: EPGMatchResult]
+        let manualMappingByChannelID: [String: String]
+        let programmesByChannelID: [String: [Programme]]
+        let presentedPlaybackRequest: PlaybackRequest?
     }
 
     struct RefreshKey: Hashable, Sendable {
