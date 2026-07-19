@@ -42,6 +42,7 @@ targets:
       - sdk: CoreFoundation.framework
       - sdk: VideoToolbox.framework
       - sdk: CoreMedia.framework
+      - sdk: CryptoKit.framework
       - sdk: CoreVideo.framework
       - sdk: AudioToolbox.framework
       - sdk: AVFoundation.framework
