@@ -2500,6 +2500,253 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, second, third])
     }
 
+    func testSupersededPostWriteActivationReloadDoesNotReplaceNewerRepositoryTruth() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let third = makeProfile(
+            id: "00000000-0000-0000-0000-000000000003",
+            name: "Third",
+            now: now
+        )
+        let thirdChannel = makeChannel(
+            profileID: third.id,
+            url: "https://example.test/third",
+            tvgID: nil,
+            order: 0
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second, third],
+            additionalChannels: [third.id: [thirdChannel]],
+            now: now
+        )
+
+        await fixture.repository.gateNextChannelRead()
+        let staleActivation = Task {
+            await fixture.model.activate(profileID: second.id)
+        }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+
+        await fixture.repository.replaceProfiles(
+            [fixture.activeProfile, second, third],
+            activeProfileID: third.id
+        )
+        let newerReloadApplied = await fixture.model.reload()
+        XCTAssertTrue(newerReloadApplied)
+        XCTAssertEqual(fixture.model.activeProfile, third)
+        XCTAssertEqual(fixture.model.channels, [thirdChannel])
+
+        await fixture.repository.releaseChannelRead()
+        let staleActivationSucceeded = await staleActivation.value
+
+        XCTAssertFalse(staleActivationSucceeded)
+        XCTAssertEqual(fixture.model.activeProfile, third)
+        XCTAssertEqual(fixture.model.channels, [thirdChannel])
+        XCTAssertFalse(fixture.model.isLoading)
+        XCTAssertNil(fixture.model.alertMessage)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, third.id)
+    }
+
+    func testSupersededPostWriteActiveDeletionReloadDoesNotClearNewerSelection() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let secondChannel = makeChannel(
+            profileID: second.id,
+            url: "https://example.test/second",
+            tvgID: nil,
+            order: 0
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second],
+            additionalChannels: [second.id: [secondChannel]],
+            now: now
+        )
+
+        await fixture.repository.gateNextChannelRead()
+        let staleDeletion = Task {
+            await fixture.model.delete(profileID: fixture.activeProfile.id)
+        }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+
+        let newerReloadApplied = await fixture.model.reload()
+        XCTAssertTrue(newerReloadApplied)
+        XCTAssertEqual(fixture.model.profiles, [second])
+        XCTAssertEqual(fixture.model.activeProfile, second)
+        XCTAssertEqual(fixture.model.channels, [secondChannel])
+
+        await fixture.repository.releaseChannelRead()
+        let staleDeletionSucceeded = await staleDeletion.value
+
+        XCTAssertFalse(staleDeletionSucceeded)
+        XCTAssertEqual(fixture.model.profiles, [second])
+        XCTAssertEqual(fixture.model.activeProfile, second)
+        XCTAssertEqual(fixture.model.channels, [secondChannel])
+        XCTAssertFalse(fixture.model.isLoading)
+        XCTAssertNil(fixture.model.alertMessage)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, second.id)
+    }
+
+    func testActivationWaitsForMaskedReloadBeforeCapturingFailureSnapshot() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second],
+            now: now
+        )
+        let (activationStarts, activationStartContinuation) = AsyncStream.makeStream(
+            of: Void.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        defer { activationStartContinuation.finish() }
+        var activationStartIterator = activationStarts.makeAsyncIterator()
+
+        await fixture.repository.gateNextChannelRead()
+        let reload = Task { await fixture.model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+        XCTAssertTrue(fixture.model.isLoading)
+        XCTAssertNil(fixture.model.activeProfile)
+        XCTAssertTrue(fixture.model.channels.isEmpty)
+
+        await fixture.repository.failNextActivation()
+        await fixture.repository.gateNextActivation()
+        let activation = Task {
+            activationStartContinuation.yield()
+            return await fixture.model.activate(profileID: second.id)
+        }
+        _ = await activationStartIterator.next()
+
+        await fixture.repository.releaseChannelRead()
+        let reloadApplied = await reload.value
+        XCTAssertTrue(reloadApplied)
+        await fixture.repository.waitUntilActivationIsBlocked()
+        let blockedSnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(
+            blockedSnapshot.operationEvents,
+            [.channelReadReleased, .activationStarted(second.id)]
+        )
+
+        await fixture.repository.releaseActivation()
+        let activationSucceeded = await activation.value
+
+        XCTAssertFalse(activationSucceeded)
+        assertCompleteActiveBoundState(fixture)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
+    }
+
+    func testReloadCarriesPlaybackOnlyWhenLoadedChannelIdentityAndURLStillMatch() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "First",
+            now: now
+        )
+        let foreign = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Foreign",
+            now: now
+        )
+        let channel = makeChannel(
+            profileID: first.id,
+            url: "https://example.test/original",
+            tvgID: nil,
+            order: 0
+        )
+        let changedStreamURL = try XCTUnwrap(URL(string: "https://example.test/changed"))
+        let repository = RepositorySpy(
+            profiles: [first, foreign],
+            activeProfileID: first.id,
+            channels: [first.id: [channel]]
+        )
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+        model.select(channel: channel)
+        await repository.replaceChannels(profileID: first.id, channels: [])
+        let staleChannelReloadApplied = await model.reload()
+        XCTAssertTrue(staleChannelReloadApplied)
+        XCTAssertNil(model.presentedPlaybackRequest)
+
+        await repository.replaceChannels(profileID: first.id, channels: [channel])
+        let restoredChannelReloadApplied = await model.reload()
+        XCTAssertTrue(restoredChannelReloadApplied)
+        model.presentedPlaybackRequest = PlaybackRequest(
+            sourceProfileID: foreign.id,
+            channelID: channel.id,
+            streamURL: channel.streamURL,
+            title: channel.displayName
+        )
+        let foreignRequestReloadApplied = await model.reload()
+        XCTAssertTrue(foreignRequestReloadApplied)
+        XCTAssertNil(model.presentedPlaybackRequest)
+
+        model.presentedPlaybackRequest = PlaybackRequest(
+            sourceProfileID: first.id,
+            channelID: channel.id,
+            streamURL: changedStreamURL,
+            title: channel.displayName
+        )
+        let changedURLReloadApplied = await model.reload()
+        XCTAssertTrue(changedURLReloadApplied)
+        XCTAssertNil(model.presentedPlaybackRequest)
+    }
+
+    func testNewerOverlappingActivationFailureRestoresInheritedStableSnapshot() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let third = makeProfile(
+            id: "00000000-0000-0000-0000-000000000003",
+            name: "Third",
+            now: now
+        )
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [second, third],
+            now: now
+        )
+
+        await fixture.repository.failNextActivation()
+        await fixture.repository.gateNextActivation()
+        let staleActivation = Task {
+            await fixture.model.activate(profileID: second.id)
+        }
+        await fixture.repository.waitUntilActivationIsBlocked()
+
+        await fixture.repository.failNextActivation()
+        let newerActivationSucceeded = await fixture.model.activate(profileID: third.id)
+
+        XCTAssertFalse(newerActivationSucceeded)
+        assertCompleteActiveBoundState(fixture)
+        XCTAssertNotNil(fixture.model.alertMessage)
+        fixture.model.dismissAlert()
+
+        await fixture.repository.releaseActivation()
+        let staleActivationSucceeded = await staleActivation.value
+
+        XCTAssertFalse(staleActivationSucceeded)
+        assertCompleteActiveBoundState(fixture)
+        XCTAssertNil(fixture.model.alertMessage)
+        let repositorySnapshot = await fixture.repository.snapshot()
+        XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
+    }
+
     func testInactiveDeletionWriteFailureDoesNotDisturbActiveBoundState() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let inactive = makeProfile(

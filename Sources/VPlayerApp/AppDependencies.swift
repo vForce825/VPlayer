@@ -346,6 +346,11 @@ private actor SeededLibrarySeeder {
         let now = Date()
 
         do {
+            guard let relayStreamURL = URL(
+                string: "https://relay.fixture.invalid/rtp/239.1.1.1:5000"
+            ), let multicastStreamURL = URL(string: "udp://239.1.1.1:5000") else {
+                return
+            }
             let profile = try await repository.createProfile(
                 SourceProfileInput(
                     name: "测试数据源",
@@ -362,7 +367,7 @@ private actor SeededLibrarySeeder {
                     Channel(
                         sourceProfileID: profile.id,
                         displayName: "测试频道",
-                        streamURL: URL(string: "https://relay.fixture.invalid/rtp/239.1.1.1:5000")!,
+                        streamURL: relayStreamURL,
                         tvgID: "fixture-channel",
                         tvgName: "测频道",
                         logoURL: nil,
@@ -373,7 +378,7 @@ private actor SeededLibrarySeeder {
                     Channel(
                         sourceProfileID: profile.id,
                         displayName: "组播频道",
-                        streamURL: URL(string: "udp://239.1.1.1:5000")!,
+                        streamURL: multicastStreamURL,
                         tvgID: nil,
                         tvgName: nil,
                         logoURL: nil,

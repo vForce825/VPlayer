@@ -42,6 +42,7 @@ final class AppModel {
     private var matchByChannelID: [String: EPGMatchResult] = [:]
     private var manualMappingByChannelID: [String: String] = [:]
     private var reloadID: UUID?
+    private var activeTransition: ActiveTransition?
     private var pendingCreation: PendingCreation?
     private var activeCreationAttemptIDs: Set<UUID> = []
     private var cancelledCreationAttemptIDs: Set<UUID> = []
@@ -93,10 +94,16 @@ final class AppModel {
 
     @discardableResult
     func reload() async -> Bool {
+        await reloadOutcome() == .applied
+    }
+
+    private func reloadOutcome() async -> ReloadOutcome {
         let currentReloadID = UUID()
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
         let terminalRefreshOverlayIDsAtStart = terminalRefreshOverlays.mapValues(\.id)
+        let presentedPlaybackRequestAtStart = presentedPlaybackRequest
+        activeTransition = nil
         reloadID = currentReloadID
         isLoading = true
         clearActiveBoundState()
@@ -117,6 +124,7 @@ final class AppModel {
                     matches: [:],
                     manualMappings: [:],
                     programmes: [:],
+                    presentedPlaybackRequestAtStart: presentedPlaybackRequestAtStart,
                     terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
                 )
             }
@@ -164,16 +172,18 @@ final class AppModel {
                 matches: matches,
                 manualMappings: manualMappings,
                 programmes: programmes,
+                presentedPlaybackRequestAtStart: presentedPlaybackRequestAtStart,
                 terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
             )
         } catch is CancellationError {
+            guard reloadID == currentReloadID else { return .superseded }
             finishLoading(reloadID: currentReloadID)
-            return false
+            return .failedWhileCurrent
         } catch {
-            guard reloadID == currentReloadID else { return false }
+            guard reloadID == currentReloadID else { return .superseded }
             presentOperationMessage("无法读取数据，请稍后重试。")
             finishLoading(reloadID: currentReloadID)
-            return false
+            return .failedWhileCurrent
         }
     }
 
@@ -268,27 +278,38 @@ final class AppModel {
 
     @discardableResult
     func delete(profileID: UUID) async -> Bool {
+        await waitForWinningReloadCompletion()
         let deletedActiveProfile = activeProfile?.id == profileID
         let activeTransition = deletedActiveProfile ? beginActiveTransition(to: nil) : nil
         do {
             try await repository.deleteProfile(id: profileID)
+            if let activeTransition,
+               !ownsActiveTransition(activeTransition) {
+                return false
+            }
             clearPendingCreation(profileID: profileID)
             profiles.removeAll { $0.id == profileID }
             if deletedActiveProfile {
                 clearActiveBoundState()
             }
-            guard await reload() else {
+            switch await reloadOutcome() {
+            case .applied:
+                return true
+            case .failedWhileCurrent:
                 profiles.removeAll { $0.id == profileID }
                 if deletedActiveProfile {
                     clearActiveBoundState()
                 }
                 presentOperationMessage("数据源已删除，但界面未能重新读取。请稍后重试。")
                 return false
+            case .superseded:
+                return false
             }
-            return true
         } catch {
             if let activeTransition {
-                restoreActiveBoundState(ifOwnedBy: activeTransition)
+                guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
+                    return false
+                }
             }
             presentOperationError(error)
             return false
@@ -297,20 +318,28 @@ final class AppModel {
 
     @discardableResult
     func activate(profileID: UUID) async -> Bool {
+        await waitForWinningReloadCompletion()
         let activeTransition = beginActiveTransition(
             to: profiles.first { $0.id == profileID }
         )
         do {
             try await repository.setActiveProfile(id: profileID)
-            guard await reload() else {
+            guard ownsActiveTransition(activeTransition) else { return false }
+            switch await reloadOutcome() {
+            case .applied:
+                return true
+            case .failedWhileCurrent:
                 activeProfile = profiles.first { $0.id == profileID }
                 clearChannelState()
                 presentOperationMessage("当前数据源已切换，但频道未能重新读取。请稍后重试。")
                 return false
+            case .superseded:
+                return false
             }
-            return true
         } catch {
-            restoreActiveBoundState(ifOwnedBy: activeTransition)
+            guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
+                return false
+            }
             presentOperationError(error)
             return false
         }
@@ -441,9 +470,10 @@ final class AppModel {
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
         programmes: [String: [Programme]],
+        presentedPlaybackRequestAtStart: PlaybackRequest?,
         terminalRefreshOverlayIDsAtStart: [RefreshKey: UUID]
-    ) -> Bool {
-        guard reloadID == currentReloadID else { return false }
+    ) -> ReloadOutcome {
+        guard reloadID == currentReloadID else { return .superseded }
         var profiles = profiles
         invalidateManualRefreshAttempts(missingFrom: profiles)
         reconcileActiveManualRefreshAttempts(in: &profiles)
@@ -463,12 +493,22 @@ final class AppModel {
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
+        if let presentedPlaybackRequestAtStart,
+           activeProfile?.id == presentedPlaybackRequestAtStart.sourceProfileID,
+           let loadedPlaybackChannel = channels.first(where: {
+               $0.id == presentedPlaybackRequestAtStart.channelID
+                   && $0.sourceProfileID == presentedPlaybackRequestAtStart.sourceProfileID
+           }),
+           loadedPlaybackChannel.streamURL == presentedPlaybackRequestAtStart.streamURL,
+           loadedPlaybackChannel.displayName == presentedPlaybackRequestAtStart.title {
+            presentedPlaybackRequest = presentedPlaybackRequestAtStart
+        }
         if let pendingCreation,
            !profiles.contains(where: { $0.id == pendingCreation.profile.id }) {
             self.pendingCreation = nil
         }
         finishLoading(reloadID: currentReloadID)
-        return true
+        return .applied
     }
 
     private func finishLoading(reloadID currentReloadID: UUID) {
@@ -520,18 +560,18 @@ final class AppModel {
     }
 
     private func beginActiveTransition(to profile: SourceProfile?) -> ActiveTransition {
+        let previousState: ActiveBoundStateSnapshot
+        if let activeTransition,
+           reloadID == activeTransition.id {
+            previousState = activeTransition.previousState
+        } else {
+            previousState = captureActiveBoundState()
+        }
         let transition = ActiveTransition(
             id: UUID(),
-            previousState: ActiveBoundStateSnapshot(
-                activeProfile: activeProfile,
-                channels: channels,
-                epgChannels: epgChannels,
-                matchByChannelID: matchByChannelID,
-                manualMappingByChannelID: manualMappingByChannelID,
-                programmesByChannelID: programmesByChannelID,
-                presentedPlaybackRequest: presentedPlaybackRequest
-            )
+            previousState: previousState
         )
+        activeTransition = transition
         reloadID = transition.id
         isLoading = true
         activeProfile = profile
@@ -539,8 +579,25 @@ final class AppModel {
         return transition
     }
 
-    private func restoreActiveBoundState(ifOwnedBy transition: ActiveTransition) {
-        guard reloadID == transition.id else { return }
+    private func captureActiveBoundState() -> ActiveBoundStateSnapshot {
+        ActiveBoundStateSnapshot(
+            activeProfile: activeProfile,
+            channels: channels,
+            epgChannels: epgChannels,
+            matchByChannelID: matchByChannelID,
+            manualMappingByChannelID: manualMappingByChannelID,
+            programmesByChannelID: programmesByChannelID,
+            presentedPlaybackRequest: presentedPlaybackRequest
+        )
+    }
+
+    private func ownsActiveTransition(_ transition: ActiveTransition) -> Bool {
+        reloadID == transition.id && activeTransition?.id == transition.id
+    }
+
+    @discardableResult
+    private func restoreActiveBoundState(ifOwnedBy transition: ActiveTransition) -> Bool {
+        guard ownsActiveTransition(transition) else { return false }
         activeProfile = transition.previousState.activeProfile
         channels = transition.previousState.channels
         epgChannels = transition.previousState.epgChannels
@@ -549,6 +606,8 @@ final class AppModel {
         programmesByChannelID = transition.previousState.programmesByChannelID
         presentedPlaybackRequest = transition.previousState.presentedPlaybackRequest
         isLoading = false
+        activeTransition = nil
+        return true
     }
 
     private func clearActiveBoundState() {
@@ -779,9 +838,7 @@ final class AppModel {
         overlayID: UUID,
         reconciliationID: UUID
     ) async {
-        while let reloadID, activeReloadIDs.contains(reloadID) {
-            await waitForReloadCompletion(reloadID)
-        }
+        await waitForWinningReloadCompletion()
         guard !Task.isCancelled,
               terminalRefreshOverlays[key]?.id == overlayID else {
             finishRefreshReconciliation(key: key, id: reconciliationID)
@@ -795,6 +852,12 @@ final class AppModel {
         guard activeReloadIDs.contains(id) else { return }
         await withCheckedContinuation { continuation in
             reloadCompletionWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    private func waitForWinningReloadCompletion() async {
+        while let reloadID, activeReloadIDs.contains(reloadID) {
+            await waitForReloadCompletion(reloadID)
         }
     }
 
@@ -838,6 +901,12 @@ fileprivate extension AppModel {
     struct ActiveTransition {
         let id: UUID
         let previousState: ActiveBoundStateSnapshot
+    }
+
+    enum ReloadOutcome {
+        case applied
+        case failedWhileCurrent
+        case superseded
     }
 
     struct ActiveBoundStateSnapshot {

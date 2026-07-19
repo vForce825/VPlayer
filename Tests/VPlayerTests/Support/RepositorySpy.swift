@@ -23,6 +23,11 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         case failure(UUID, RefreshResource, String)
     }
 
+    enum OperationEvent: Equatable, Sendable {
+        case channelReadReleased
+        case activationStarted(UUID)
+    }
+
     struct Snapshot: Sendable {
         struct ProgrammeRequest: Equatable, Sendable {
             let profileID: UUID
@@ -44,6 +49,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         let profileCreateCount: Int
         let profileUpdateCount: Int
         let profileReadPlaylistStates: [RefreshState]
+        let operationEvents: [OperationEvent]
     }
 
     private var storedProfiles: [SourceProfile]
@@ -60,6 +66,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var profileCreateCount = 0
     private var profileUpdateCount = 0
     private var profileReadPlaylistStates: [RefreshState] = []
+    private var operationEvents: [OperationEvent] = []
     private var failsReads = false
     private var shouldGateNextChannelRead = false
     private var blockedChannelReadContinuation: CheckedContinuation<Void, Never>?
@@ -119,7 +126,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             epgInstallCount: epgInstallCount,
             profileCreateCount: profileCreateCount,
             profileUpdateCount: profileUpdateCount,
-            profileReadPlaylistStates: profileReadPlaylistStates
+            profileReadPlaylistStates: profileReadPlaylistStates,
+            operationEvents: operationEvents
         )
     }
 
@@ -208,6 +216,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     }
 
     func releaseChannelRead() {
+        operationEvents.append(.channelReadReleased)
         channelReadReleaseContinuation?.resume()
         channelReadReleaseContinuation = nil
     }
@@ -316,6 +325,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
 
     func setActiveProfile(id: UUID) async throws {
         _ = try profileIndex(id)
+        operationEvents.append(.activationStarted(id))
         let shouldFail = shouldFailNextActivation
         shouldFailNextActivation = false
         if shouldGateNextActivation {
