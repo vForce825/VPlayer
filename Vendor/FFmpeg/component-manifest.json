@@ -1,0 +1,8 @@
+{
+  "libraries": ["avcodec", "avformat", "avutil", "swresample"],
+  "protocols": ["crypto", "data", "http", "https", "tcp", "tls"],
+  "demuxers": ["aac", "ac3", "eac3", "hls", "mov", "mpegts"],
+  "parsers": ["aac", "aac_latm", "ac3", "h264", "hevc", "mpegaudio"],
+  "bitstreamFilters": ["h264_mp4toannexb", "hevc_mp4toannexb"],
+  "decoders": ["aac", "ac3", "eac3", "mp2"]
+}

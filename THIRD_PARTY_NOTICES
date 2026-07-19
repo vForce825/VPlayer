@@ -1,9 +1,19 @@
 VPlayer Third-Party Notices
 
-Phase 1 distributes no third-party runtime source or binary component.
 XcodeGen and Mint are development-only tools and are not linked into or
 distributed inside the VPlayer application.
 
-Before adding FFmpeg or derived YADIF material, record the project URL,
-exact revision, license, local modifications, build configuration, and
-required relinking/source materials in this file.
+FFmpeg
+Project source: https://git.ffmpeg.org/ffmpeg.git
+Version: tag n8.1.2, commit 38b88335f99e76ed89ff3c93f877fdefce736c13
+License: GNU Lesser General Public License 2.1 or later
+Enabled libraries: libavcodec, libavformat, libavutil, libswresample
+Linkage: static, built by Scripts/build-ffmpeg.sh
+Local modifications: none; build configuration and component allowlists are
+recorded under Vendor/FFmpeg.
+
+Distributions must include FFmpeg's notices and corresponding source for the
+exact revision, plus relinkable VPlayer object material and instructions that
+allow recipients to replace the statically linked LGPL library with a
+modified compatible FFmpeg build. See Vendor/FFmpeg/LICENSE.md and
+Vendor/FFmpeg/README.md.
