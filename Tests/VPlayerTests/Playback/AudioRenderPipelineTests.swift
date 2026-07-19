@@ -212,6 +212,44 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.support.checkSnapshot.first?.1, .hdmi)
     }
 
+    func testScheduledRecoveryCoalescesBehindFallbackAndRechecksPCMExactlyOnce() throws {
+        for pcmSupported in [true, false] {
+            let harness = try makeHarness()
+            harness.support.requireRouteMatchingFormat = true
+            harness.support.compressedSupported = false
+            harness.support.pcmSupported = pcmSupported
+            let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
+
+            compressed.emit(.outputConfigurationChanged)
+            compressed.emit(.failed("force-fallback-before-scheduled-recovery"))
+            drain(harness.executor)
+
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            XCTAssertTrue(
+                harness.support.checkSnapshot.isEmpty,
+                "scheduled recovery must not classify the route while replacement is active"
+            )
+
+            harness.synchronizer.completeRemoval(didRemove: true)
+            drain(harness.executor)
+
+            XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+            XCTAssertEqual(harness.support.checkSnapshot.map(\.0), [.ffmpegPCM])
+            XCTAssertEqual(harness.support.formatIDSnapshot, [kAudioFormatLinearPCM])
+            if pcmSupported {
+                XCTAssertTrue(harness.failures.snapshot.isEmpty)
+                XCTAssertEqual(harness.decoderFactory.snapshot.first?.flushCountSnapshot, 1)
+            } else {
+                XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+                    .audioRendererFailed(AudioRenderPipeline.unsupportedPCMError),
+                ])
+            }
+        }
+    }
+
     func testPCMRouteReevaluationUsesDecodedFormatAndRecoversWithoutTerminalError() throws {
         let harness = try makeHarness()
         harness.support.requireRouteMatchingFormat = true
@@ -317,6 +355,75 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         ])
         XCTAssertEqual(harness.renderers.snapshot.count, 1)
         XCTAssertEqual(harness.synchronizer.attachedSnapshot, [first.identity])
+    }
+
+    func testStopRemovalStaysTrackedThroughConfigureAndFalseCompletionIsConsistent() throws {
+        do {
+            let harness = try makeHarness()
+            performWithoutThrow(on: harness.executor) {
+                harness.pipeline.stop()
+                harness.pipeline.stop()
+            }
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            harness.synchronizer.completeRemoval(didRemove: false)
+            harness.synchronizer.completeRemoval(didRemove: false)
+            drain(harness.executor)
+            XCTAssertTrue(harness.failures.snapshot.isEmpty, "stop-only removal failure is silent")
+            XCTAssertEqual(harness.renderers.snapshot.count, 1)
+            XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        }
+
+        do {
+            let harness = try makeHarness()
+            let first = try XCTUnwrap(harness.renderers.snapshot.first)
+            performWithoutThrow(on: harness.executor) { harness.pipeline.stop() }
+            try perform(on: harness.executor) {
+                try harness.pipeline.configure(
+                    format: try self.makeFormat(codec: .ac3),
+                    codec: .ac3,
+                    generation: MediaGeneration(rawValue: 2)
+                )
+            }
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            XCTAssertEqual(harness.renderers.snapshot.count, 1)
+
+            harness.synchronizer.completeRemoval(didRemove: true)
+            harness.synchronizer.completeRemoval(didRemove: true)
+            drain(harness.executor)
+
+            let successor = try XCTUnwrap(harness.renderers.snapshot.last)
+            XCTAssertEqual(harness.renderers.snapshot.count, 2)
+            XCTAssertEqual(harness.synchronizer.attachedSnapshot, [first.identity, successor.identity])
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        }
+
+        do {
+            let harness = try makeHarness()
+            let first = try XCTUnwrap(harness.renderers.snapshot.first)
+            performWithoutThrow(on: harness.executor) { harness.pipeline.stop() }
+            try perform(on: harness.executor) {
+                try harness.pipeline.configure(
+                    format: try self.makeFormat(codec: .mp2),
+                    codec: .mp2,
+                    generation: MediaGeneration(rawValue: 2)
+                )
+            }
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            XCTAssertEqual(harness.renderers.snapshot.count, 1)
+
+            harness.synchronizer.completeRemoval(didRemove: false)
+            harness.synchronizer.completeRemoval(didRemove: false)
+            drain(harness.executor)
+
+            XCTAssertEqual(harness.failures.snapshot, [
+                AudioFailureRecord(
+                    error: .audioRendererFailed(AudioRenderPipeline.removalFailedError),
+                    generation: MediaGeneration(rawValue: 2)
+                ),
+            ])
+            XCTAssertEqual(harness.renderers.snapshot.count, 1)
+            XCTAssertEqual(harness.synchronizer.attachedSnapshot, [first.identity])
+        }
     }
 
     func testFlushDuringFallbackRemovalNeverResurrectsFailedRendererAndCompletesPCM() throws {
@@ -571,6 +678,47 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         drain(harness.executor)
 
         XCTAssertEqual(harness.failures.snapshot.map(\.error), [.audioFallbackDecode(-32_109)])
+    }
+
+    func testPCMEnqueueDecodeFailureEmitsOnceWithoutThrowingOrRepeatingWork() throws {
+        let harness = try makeHarness()
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        compressed.emit(.failed("force-fallback"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        XCTAssertEqual(decoder.pushedIDSnapshot, [1])
+        performWithoutThrow(on: harness.executor) {
+            harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+        }
+        decoder.configurePushError(.audioFallbackDecode(-32_110))
+
+        XCTAssertNoThrow(try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                generation: MediaGeneration(rawValue: 2)
+            ))
+        })
+        XCTAssertNoThrow(try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 3,
+                generation: MediaGeneration(rawValue: 2)
+            ))
+        })
+
+        XCTAssertEqual(harness.failures.snapshot, [
+            AudioFailureRecord(
+                error: .audioFallbackDecode(-32_110),
+                generation: MediaGeneration(rawValue: 2)
+            ),
+        ])
+        XCTAssertEqual(decoder.pushedIDSnapshot, [1, 2])
     }
 
     func testPCMPendingCapacityDrainsThenContinuesDecodingWithoutAnotherReadyCallback() throws {

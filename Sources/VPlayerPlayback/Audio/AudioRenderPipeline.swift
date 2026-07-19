@@ -33,6 +33,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private enum RemovalContinuation: Sendable {
         case configure
         case fallback
+        case stop
     }
 
     private struct PendingRemoval: Sendable {
@@ -163,11 +164,15 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             throw PlaybackCoreError.audioRendererFailed(Self.replayCapacityError)
         }
         replay.append(ReplayEntry(sample: sample, sentCompressed: false, decoded: false))
-        if route == .systemCompressed {
-            try drainCompressed()
-        } else {
-            try decodeAvailable()
-            try drainPCM()
+        do {
+            if route == .systemCompressed {
+                try drainCompressed()
+            } else {
+                try decodeAvailable()
+                try drainPCM()
+            }
+        } catch {
+            classifyAndEmitDecode(error)
         }
         updateReadiness()
     }
@@ -197,7 +202,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             self.pendingRemoval = pendingRemoval
             replacing = true
             switch pendingRemoval.continuation {
-            case .configure:
+            case .configure, .stop:
                 routeMonitor.stop()
             case .fallback:
                 startRouteMonitor(epoch: newEpoch, generation: generation)
@@ -233,18 +238,19 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         recoveryScheduled = false
         pendingRecovery = nil
         routeMonitor.stop()
-        let removalWasPending = pendingRemoval != nil
-        pendingRemoval = nil
         let now = synchronizer.currentTime()
         synchronizer.setRate(0, time: now)
-        if let renderer, !removalWasPending {
-            renderer.stopRequestingMediaData()
-            renderer.stopObserving()
-            renderer.flush()
-            synchronizer.remove(renderer, at: .invalid) { _ in }
+        if var pendingRemoval {
+            pendingRemoval.targetEpoch = epoch
+            pendingRemoval.targetGeneration = generation
+            pendingRemoval.continuation = .stop
+            self.pendingRemoval = pendingRemoval
+            replacing = true
+        } else if let renderer {
+            beginRemoval(of: renderer, continuation: .stop)
+        } else {
+            replacing = false
         }
-        self.renderer = nil
-        rendererAttached = false
         decoder?.destroy()
         decoder = nil
         pcmOutputFormat = nil
@@ -482,6 +488,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         recoveryScheduled = false
         guard let recovery = pendingRecovery else { return }
         pendingRecovery = nil
+        guard !replacing, pendingRemoval == nil else {
+            pendingReevaluation = true
+            return
+        }
         if !recovery.requiresSupportCheck {
             recover(at: recovery.time)
             return
@@ -591,10 +601,21 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
               transition.targetEpoch == epoch,
               transition.targetGeneration == generation,
               renderer?.identity == rendererID,
-              configured, !stopped, replacing, !terminal else { return }
+              replacing, !terminal else { return }
+        switch transition.continuation {
+        case .configure, .fallback:
+            guard configured, !stopped else { return }
+        case .stop:
+            guard stopped, !configured else { return }
+        }
         pendingRemoval = nil
         guard didRemove else {
-            emitTerminal(.audioRendererFailed(Self.removalFailedError))
+            if transition.continuation == .stop {
+                replacing = false
+                updateReadiness()
+            } else {
+                emitTerminal(.audioRendererFailed(Self.removalFailedError))
+            }
             return
         }
         renderer = nil
@@ -608,6 +629,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             }
         case .fallback:
             completeFallbackAfterRemoval()
+        case .stop:
+            replacing = false
+            updateReadiness()
         }
     }
 

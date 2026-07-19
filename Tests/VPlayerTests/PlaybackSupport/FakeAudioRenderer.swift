@@ -252,6 +252,7 @@ final class FakePCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
 
     private let lock = NSLock()
     private let pushBody: PushBody
+    private var pushError: PlaybackCoreError?
     private var pushedIDs: [UInt64] = []
     private var flushCount = 0
     private var destroyCount = 0
@@ -261,8 +262,16 @@ final class FakePCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
     }
 
     func push(_ sample: CompressedAudioSample) throws -> [CMSampleBuffer] {
-        withLock { pushedIDs.append(sample.id) }
+        let error = withLock { () -> PlaybackCoreError? in
+            pushedIDs.append(sample.id)
+            return pushError
+        }
+        if let error { throw error }
         return try pushBody(sample)
+    }
+
+    func configurePushError(_ error: PlaybackCoreError?) {
+        withLock { pushError = error }
     }
 
     func flush() { withLock { flushCount += 1 } }
