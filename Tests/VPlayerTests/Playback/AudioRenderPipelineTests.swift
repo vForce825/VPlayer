@@ -842,8 +842,6 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             XCTAssertNil(sources.range(of: forbidden, options: .caseInsensitive))
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: repository
-            .appendingPathComponent("Sources/VPlayerPlayback/Sync/PlaybackClock.swift").path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: repository
             .appendingPathComponent("Sources/VPlayerPlayback/Pipeline/PlaybackPipeline.swift").path))
     }
 
