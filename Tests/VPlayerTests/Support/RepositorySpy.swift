@@ -75,8 +75,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var blockedMappingWriteContinuation: CheckedContinuation<Void, Never>?
     private var mappingWriteReleaseContinuation: CheckedContinuation<Void, Never>?
     private let failedRefreshCommits: Set<RefreshResource>
-    private let failsRecordAttempt: Bool
-    private let failsRecordFailure: Bool
+    private var failsRecordAttempt: Bool
+    private var failsRecordFailure: Bool
 
     init(
         profiles: [SourceProfile],
@@ -121,6 +121,14 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
 
     func setReadFailure(_ enabled: Bool) {
         failsReads = enabled
+    }
+
+    func setRefreshPersistenceFaults(
+        recordAttempt: Bool,
+        recordFailure: Bool
+    ) {
+        failsRecordAttempt = recordAttempt
+        failsRecordFailure = recordFailure
     }
 
     func replaceChannels(profileID: UUID, channels: [Channel]) {

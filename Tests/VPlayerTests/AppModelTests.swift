@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import Observation
 import XCTest
 @testable import VPlayer
 @testable import VPlayerCore
@@ -696,6 +697,467 @@ final class AppModelTests: XCTestCase {
             XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, currentFailure, scenario.name)
             XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, startedAt, scenario.name)
         }
+    }
+
+    func testNewerPlaylistLifecycleSuccessAutomaticallySupersedesFaultedManualOverlay() async throws {
+        let firstStartedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let secondStartedAt = firstStartedAt.addingTimeInterval(60)
+        let persistedAttemptID = UUID()
+        let clock = AppModelTestClock(firstStartedAt)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: firstStartedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: firstStartedAt,
+            state: .failed,
+            errorSummary: "persisted P",
+            attemptID: persistedAttemptID
+        )
+        let oldChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/old",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [oldChannel]],
+            failsRecordAttempt: true,
+            failsRecordFailure: true
+        )
+        let changes = LibraryChangeSignal()
+        let firstCoordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { clock.value }
+        )
+        let secondDownloader = AppModelRefreshDownloader(
+            payload: Data("""
+            #EXTM3U
+            #EXTINF:-1,New lifecycle
+            https://example.test/new-lifecycle
+            """.utf8),
+            gatesCompletion: true
+        )
+        let secondCoordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: secondDownloader,
+            now: { clock.value },
+            onPersistedOutcome: { _, _ in
+                await MainActor.run { changes.notify() }
+            }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await firstCoordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            libraryChanges: changes,
+            now: { clock.value }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        let firstAttemptID = try XCTUnwrap(model.profiles.first?.m3uStatus.attemptID)
+        let firstFailure = try XCTUnwrap(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertNotEqual(firstAttemptID, persistedAttemptID)
+        XCTAssertNotEqual(firstFailure, "persisted P")
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, firstStartedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+        var snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus, profile.m3uStatus)
+
+        let oldTruthReloaded = await model.reload()
+        XCTAssertTrue(oldTruthReloaded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, firstAttemptID)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, firstFailure)
+
+        await repository.setRefreshPersistenceFaults(
+            recordAttempt: false,
+            recordFailure: false
+        )
+        clock.value = secondStartedAt
+        let secondRefresh = Task {
+            await secondCoordinator.refresh(
+                profileID: profile.id,
+                resources: [.playlist],
+                trigger: .foreground
+            )
+        }
+        await secondDownloader.waitUntilStarted()
+        snapshot = await repository.snapshot()
+        let secondAttemptID = try XCTUnwrap(snapshot.profiles.first?.m3uStatus.attemptID)
+        XCTAssertNotEqual(secondAttemptID, firstAttemptID)
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus.lastAttemptAt, secondStartedAt)
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus.state, .refreshing)
+
+        await repository.gateNextProfileRead()
+        let automaticReload = expectation(description: "newer playlist truth is applied automatically")
+        withObservationTracking {
+            _ = model.profiles.first?.m3uStatus
+        } onChange: {
+            automaticReload.fulfill()
+        }
+        await secondDownloader.releaseCompletion()
+        let secondOutcomes = await secondRefresh.value
+        await repository.waitUntilProfileReadIsBlocked()
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, firstAttemptID)
+        await repository.releaseProfileRead()
+        await fulfillment(of: [automaticReload], timeout: 2)
+
+        XCTAssertEqual(secondOutcomes.first?.attemptID, secondAttemptID)
+        XCTAssertEqual(secondOutcomes.first?.succeeded, true)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, secondAttemptID)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, secondStartedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastSuccessAt, secondStartedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.m3uStatus, model.profiles.first?.m3uStatus)
+        XCTAssertEqual(
+            model.channels.map(\.streamURL),
+            [URL(string: "https://example.test/new-lifecycle")!]
+        )
+        snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus, model.profiles.first?.m3uStatus)
+        XCTAssertEqual(snapshot.playlistInstallCount, 1)
+        XCTAssertEqual(
+            snapshot.events.filter { $0 == .success(profile.id, .playlist) }.count,
+            1
+        )
+
+        let explicitReloaded = await model.reload()
+        XCTAssertTrue(explicitReloaded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, secondAttemptID)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(
+            model.channels.map(\.streamURL),
+            [URL(string: "https://example.test/new-lifecycle")!]
+        )
+    }
+
+    func testNewerEPGLifecycleFailureAutomaticallySupersedesOnlyMatchingOverlay() async throws {
+        let firstStartedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let secondStartedAt = firstStartedAt.addingTimeInterval(60)
+        let clock = AppModelTestClock(firstStartedAt)
+        var active = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Active",
+            now: firstStartedAt
+        )
+        var inactive = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Inactive",
+            now: firstStartedAt
+        )
+        active.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: firstStartedAt.addingTimeInterval(-300),
+            state: .failed,
+            errorSummary: "active old playlist",
+            attemptID: UUID()
+        )
+        active.epgStatus = ResourceRefreshStatus(
+            lastAttemptAt: firstStartedAt.addingTimeInterval(-300),
+            state: .failed,
+            errorSummary: "active old EPG",
+            attemptID: UUID()
+        )
+        inactive.epgStatus = ResourceRefreshStatus(
+            lastAttemptAt: firstStartedAt.addingTimeInterval(-300),
+            state: .failed,
+            errorSummary: "inactive old EPG",
+            attemptID: UUID()
+        )
+        let repository = RepositorySpy(
+            profiles: [active, inactive],
+            activeProfileID: active.id,
+            failsRecordAttempt: true,
+            failsRecordFailure: true
+        )
+        let changes = LibraryChangeSignal()
+        let firstCoordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { clock.value }
+        )
+        let secondDownloader = AppModelRefreshDownloader(
+            error: .cannotConnectToHost,
+            gatesCompletion: true
+        )
+        let secondCoordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: secondDownloader,
+            now: { clock.value },
+            onPersistedOutcome: { _, _ in
+                await MainActor.run { changes.notify() }
+            }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await firstCoordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            libraryChanges: changes,
+            now: { clock.value }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: active.id, resource: .epg)
+        await model.refresh(profileID: active.id, resource: .playlist)
+        await model.refresh(profileID: inactive.id, resource: .epg)
+        let activeEPGOverlay = try XCTUnwrap(
+            model.profiles.first { $0.id == active.id }?.epgStatus
+        )
+        let activePlaylistOverlay = try XCTUnwrap(
+            model.profiles.first { $0.id == active.id }?.m3uStatus
+        )
+        let inactiveEPGOverlay = try XCTUnwrap(
+            model.profiles.first { $0.id == inactive.id }?.epgStatus
+        )
+        XCTAssertEqual(activeEPGOverlay.lastAttemptAt, firstStartedAt)
+        XCTAssertEqual(activePlaylistOverlay.lastAttemptAt, firstStartedAt)
+        XCTAssertEqual(inactiveEPGOverlay.lastAttemptAt, firstStartedAt)
+        XCTAssertNotNil(activeEPGOverlay.attemptID)
+        XCTAssertNotNil(activePlaylistOverlay.attemptID)
+        XCTAssertNotNil(inactiveEPGOverlay.attemptID)
+
+        var snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.profiles.first { $0.id == active.id }?.epgStatus, active.epgStatus)
+        XCTAssertEqual(snapshot.profiles.first { $0.id == active.id }?.m3uStatus, active.m3uStatus)
+        XCTAssertEqual(snapshot.profiles.first { $0.id == inactive.id }?.epgStatus, inactive.epgStatus)
+
+        await repository.setRefreshPersistenceFaults(
+            recordAttempt: false,
+            recordFailure: false
+        )
+        clock.value = secondStartedAt
+        let secondRefresh = Task {
+            await secondCoordinator.refresh(
+                profileID: active.id,
+                resources: [.epg],
+                trigger: .background
+            )
+        }
+        await secondDownloader.waitUntilStarted()
+        snapshot = await repository.snapshot()
+        let secondAttemptID = try XCTUnwrap(
+            snapshot.profiles.first { $0.id == active.id }?.epgStatus.attemptID
+        )
+        XCTAssertNotEqual(secondAttemptID, activeEPGOverlay.attemptID)
+        XCTAssertEqual(
+            snapshot.profiles.first { $0.id == active.id }?.epgStatus.state,
+            .refreshing
+        )
+
+        await repository.gateNextProfileRead()
+        let automaticReload = expectation(description: "newer EPG truth is applied automatically")
+        withObservationTracking {
+            _ = model.profiles.first { $0.id == active.id }?.epgStatus
+        } onChange: {
+            automaticReload.fulfill()
+        }
+        await secondDownloader.releaseCompletion()
+        let secondOutcomes = await secondRefresh.value
+        await repository.waitUntilProfileReadIsBlocked()
+        XCTAssertEqual(
+            model.profiles.first { $0.id == active.id }?.epgStatus.attemptID,
+            activeEPGOverlay.attemptID
+        )
+        await repository.releaseProfileRead()
+        await fulfillment(of: [automaticReload], timeout: 2)
+
+        let terminalMessage = try XCTUnwrap(secondOutcomes.first?.message)
+        XCTAssertEqual(secondOutcomes.first?.attemptID, secondAttemptID)
+        XCTAssertEqual(secondOutcomes.first?.succeeded, false)
+        XCTAssertEqual(
+            model.profiles.first { $0.id == active.id }?.epgStatus.attemptID,
+            secondAttemptID
+        )
+        XCTAssertEqual(
+            model.profiles.first { $0.id == active.id }?.epgStatus.lastAttemptAt,
+            secondStartedAt
+        )
+        XCTAssertEqual(model.profiles.first { $0.id == active.id }?.epgStatus.state, .failed)
+        XCTAssertEqual(
+            model.profiles.first { $0.id == active.id }?.epgStatus.errorSummary,
+            terminalMessage
+        )
+        XCTAssertEqual(model.activeProfile?.epgStatus.attemptID, secondAttemptID)
+        XCTAssertEqual(
+            model.profiles.first { $0.id == active.id }?.m3uStatus,
+            activePlaylistOverlay
+        )
+        XCTAssertEqual(
+            model.profiles.first { $0.id == inactive.id }?.epgStatus,
+            inactiveEPGOverlay
+        )
+        snapshot = await repository.snapshot()
+        XCTAssertEqual(
+            snapshot.profiles.first { $0.id == active.id }?.epgStatus,
+            model.profiles.first { $0.id == active.id }?.epgStatus
+        )
+        XCTAssertEqual(snapshot.profiles.first { $0.id == active.id }?.m3uStatus, active.m3uStatus)
+        XCTAssertEqual(snapshot.profiles.first { $0.id == inactive.id }?.epgStatus, inactive.epgStatus)
+
+        let explicitReloaded = await model.reload()
+        XCTAssertTrue(explicitReloaded)
+        XCTAssertEqual(model.profiles.first { $0.id == active.id }?.epgStatus.attemptID, secondAttemptID)
+        XCTAssertEqual(
+            model.profiles.first { $0.id == active.id }?.m3uStatus,
+            activePlaylistOverlay
+        )
+        XCTAssertEqual(
+            model.profiles.first { $0.id == inactive.id }?.epgStatus,
+            inactiveEPGOverlay
+        )
+    }
+
+    func testReloadLetsNewerDifferentFlightRefreshingSupersedeTerminalOverlay() async throws {
+        let firstStartedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let secondStartedAt = firstStartedAt.addingTimeInterval(60)
+        let clock = AppModelTestClock(firstStartedAt)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: firstStartedAt
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: firstStartedAt.addingTimeInterval(-60),
+            state: .failed,
+            errorSummary: "old truth",
+            attemptID: UUID()
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            failsRecordAttempt: true,
+            failsRecordFailure: true
+        )
+        let firstCoordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { clock.value }
+        )
+        let secondDownloader = AppModelRefreshDownloader(
+            payload: Data("""
+            #EXTM3U
+            #EXTINF:-1,Second flight
+            https://example.test/second-flight
+            """.utf8),
+            gatesCompletion: true
+        )
+        let secondCoordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: secondDownloader,
+            now: { clock.value }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await firstCoordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            now: { clock.value }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        let firstAttemptID = try XCTUnwrap(model.profiles.first?.m3uStatus.attemptID)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed)
+
+        await repository.setRefreshPersistenceFaults(
+            recordAttempt: false,
+            recordFailure: false
+        )
+        clock.value = secondStartedAt
+        let secondRefresh = Task {
+            await secondCoordinator.refresh(
+                profileID: profile.id,
+                resources: [.playlist],
+                trigger: .foreground
+            )
+        }
+        await secondDownloader.waitUntilStarted()
+        let refreshingSnapshot = await repository.snapshot()
+        let secondAttemptID = try XCTUnwrap(refreshingSnapshot.profiles.first?.m3uStatus.attemptID)
+        XCTAssertNotEqual(secondAttemptID, firstAttemptID)
+        XCTAssertEqual(refreshingSnapshot.profiles.first?.m3uStatus.lastAttemptAt, secondStartedAt)
+        XCTAssertEqual(refreshingSnapshot.profiles.first?.m3uStatus.state, .refreshing)
+
+        let refreshingReloaded = await model.reload()
+
+        XCTAssertTrue(refreshingReloaded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, secondAttemptID)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, secondStartedAt)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertNil(model.profiles.first?.m3uStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.m3uStatus, model.profiles.first?.m3uStatus)
+
+        await secondDownloader.releaseCompletion()
+        let secondOutcomes = await secondRefresh.value
+        XCTAssertEqual(secondOutcomes.first?.attemptID, secondAttemptID)
+        XCTAssertEqual(secondOutcomes.first?.succeeded, true)
+        let terminalReloaded = await model.reload()
+        XCTAssertTrue(terminalReloaded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, secondAttemptID)
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+    }
+
+    func testReloadKeepsTerminalOverlayOverSameFlightRefreshingTruth() async throws {
+        let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: startedAt
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            failsRecordFailure: true
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
+            now: { startedAt }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            },
+            now: { startedAt }
+        )
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        let overlayStatus = try XCTUnwrap(model.profiles.first?.m3uStatus)
+        let snapshot = await repository.snapshot()
+        XCTAssertNotNil(overlayStatus.attemptID)
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus.attemptID, overlayStatus.attemptID)
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus.lastAttemptAt, startedAt)
+        XCTAssertEqual(snapshot.profiles.first?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(overlayStatus.state, .failed)
+        XCTAssertNotNil(overlayStatus.errorSummary)
+
+        let explicitReloaded = await model.reload()
+
+        XCTAssertTrue(explicitReloaded)
+        XCTAssertEqual(model.profiles.first?.m3uStatus, overlayStatus)
+        XCTAssertEqual(model.activeProfile?.m3uStatus, overlayStatus)
     }
 
     func testBackToBackFaultedCoordinatorFlightsKeepTheSecondFailureOverlay() async {

@@ -637,7 +637,7 @@ final class AppModel {
             case .epg: profiles[index].epgStatus
             }
             if overlayIDsAtReloadStart[key] == overlay.id,
-               Self.isTerminalStatus(
+               Self.persistedStatusSupersedesTerminalOverlay(
                    persistedStatus,
                    expectedAttemptID: overlay.expectedAttemptID,
                    orFreshSince: overlay.startedAt
@@ -664,15 +664,18 @@ final class AppModel {
         }
     }
 
-    private static func isTerminalStatus(
+    private static func persistedStatusSupersedesTerminalOverlay(
         _ status: ResourceRefreshStatus,
         expectedAttemptID: UUID?,
         orFreshSince startedAt: Date
     ) -> Bool {
-        guard status.state == .succeeded || status.state == .failed else { return false }
-        if let expectedAttemptID {
-            return status.attemptID == expectedAttemptID
+        if let persistedAttemptID = status.attemptID {
+            if let expectedAttemptID, persistedAttemptID == expectedAttemptID {
+                return status.state == .succeeded || status.state == .failed
+            }
+            return status.lastAttemptAt.map { $0 > startedAt } ?? false
         }
+        guard status.state == .succeeded || status.state == .failed else { return false }
         return switch status.state {
         case .succeeded:
             status.lastSuccessAt.map { $0 >= startedAt } ?? false
