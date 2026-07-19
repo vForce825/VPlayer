@@ -21,6 +21,19 @@ final class AppModel {
         let reloadApplied: Bool
     }
 
+    enum ActiveMutationLaneEvent: Equatable, Sendable {
+        enum Operation: Equatable, Sendable {
+            case activate(UUID)
+            case delete(UUID)
+        }
+
+        case acquired(Operation)
+        case queued(Operation)
+        case cancelled(Operation)
+        case released(Operation)
+        case reloadWaiting
+    }
+
     typealias LibraryChangeProcessed = @Sendable (ProcessedLibraryChange) -> Void
 
     var profiles: [SourceProfile] = []
@@ -52,6 +65,12 @@ final class AppModel {
     @ObservationIgnored private var reloadCompletionWaiters: [
         UUID: [CheckedContinuation<Void, Never>]
     ] = [:]
+    @ObservationIgnored private let mutationLaneEvent: (@MainActor @Sendable (
+        ActiveMutationLaneEvent
+    ) -> Void)?
+    @ObservationIgnored private var activeMutationLease: ActiveMutationLease?
+    @ObservationIgnored private var queuedActiveMutations: [ActiveMutationWaiter] = []
+    @ObservationIgnored private var mutationLaneIdleWaiters: [MutationLaneIdleWaiter] = []
     @ObservationIgnored private var refreshReconciliationTasks: [
         RefreshKey: RefreshReconciliationTask
     ] = [:]
@@ -63,10 +82,12 @@ final class AppModel {
         refresh: @escaping Refresh,
         libraryChanges: LibraryChangeSignal? = nil,
         libraryChangeProcessed: LibraryChangeProcessed? = nil,
+        mutationLaneEvent: (@MainActor @Sendable (ActiveMutationLaneEvent) -> Void)? = nil,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.repository = repository
         self.refreshResources = refresh
+        self.mutationLaneEvent = mutationLaneEvent
         self.now = now
         if let libraryChanges {
             let observedGeneration = libraryChanges.generation
@@ -94,7 +115,11 @@ final class AppModel {
 
     @discardableResult
     func reload() async -> Bool {
-        await reloadOutcome() == .applied
+        while true {
+            guard await waitForActiveMutationLaneIdle() else { return false }
+            guard activeMutationLease == nil, queuedActiveMutations.isEmpty else { continue }
+            return await reloadOutcome() == .applied
+        }
     }
 
     private func reloadOutcome() async -> ReloadOutcome {
@@ -106,7 +131,7 @@ final class AppModel {
         activeTransition = nil
         reloadID = currentReloadID
         isLoading = true
-        clearActiveBoundState()
+        clearActiveBoundState(preservingPlayback: true)
 
         do {
             let loadedProfiles = try await repository.profiles()
@@ -278,21 +303,28 @@ final class AppModel {
 
     @discardableResult
     func delete(profileID: UUID) async -> Bool {
+        guard let mutationLease = await acquireActiveMutationLease(
+            for: .delete(profileID)
+        ) else {
+            return false
+        }
+        defer { releaseActiveMutationLease(mutationLease) }
         await waitForWinningReloadCompletion()
+        guard !Task.isCancelled else {
+            mutationLaneEvent?(.cancelled(mutationLease.operation))
+            return false
+        }
+        clearOperationAlert()
         let deletedActiveProfile = activeProfile?.id == profileID
         let activeTransition = deletedActiveProfile ? beginActiveTransition(to: nil) : nil
         do {
             try await repository.deleteProfile(id: profileID)
-            if let activeTransition,
-               !ownsActiveTransition(activeTransition) {
-                return false
-            }
             clearPendingCreation(profileID: profileID)
             profiles.removeAll { $0.id == profileID }
             if deletedActiveProfile {
                 clearActiveBoundState()
             }
-            switch await reloadOutcome() {
+            switch await postWriteReloadOutcome() {
             case .applied:
                 return true
             case .failedWhileCurrent:
@@ -305,6 +337,13 @@ final class AppModel {
             case .superseded:
                 return false
             }
+        } catch is CancellationError {
+            if let activeTransition {
+                guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
+                    return false
+                }
+            }
+            return false
         } catch {
             if let activeTransition {
                 guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
@@ -318,14 +357,24 @@ final class AppModel {
 
     @discardableResult
     func activate(profileID: UUID) async -> Bool {
+        guard let mutationLease = await acquireActiveMutationLease(
+            for: .activate(profileID)
+        ) else {
+            return false
+        }
+        defer { releaseActiveMutationLease(mutationLease) }
         await waitForWinningReloadCompletion()
+        guard !Task.isCancelled else {
+            mutationLaneEvent?(.cancelled(mutationLease.operation))
+            return false
+        }
+        clearOperationAlert()
         let activeTransition = beginActiveTransition(
             to: profiles.first { $0.id == profileID }
         )
         do {
             try await repository.setActiveProfile(id: profileID)
-            guard ownsActiveTransition(activeTransition) else { return false }
-            switch await reloadOutcome() {
+            switch await postWriteReloadOutcome() {
             case .applied:
                 return true
             case .failedWhileCurrent:
@@ -336,6 +385,11 @@ final class AppModel {
             case .superseded:
                 return false
             }
+        } catch is CancellationError {
+            guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
+                return false
+            }
+            return false
         } catch {
             guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
                 return false
@@ -493,15 +547,18 @@ final class AppModel {
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
-        if let presentedPlaybackRequestAtStart,
-           activeProfile?.id == presentedPlaybackRequestAtStart.sourceProfileID,
-           let loadedPlaybackChannel = channels.first(where: {
-               $0.id == presentedPlaybackRequestAtStart.channelID
-                   && $0.sourceProfileID == presentedPlaybackRequestAtStart.sourceProfileID
-           }),
-           loadedPlaybackChannel.streamURL == presentedPlaybackRequestAtStart.streamURL,
-           loadedPlaybackChannel.displayName == presentedPlaybackRequestAtStart.title {
-            presentedPlaybackRequest = presentedPlaybackRequestAtStart
+        let loadedPlaybackStillMatches = presentedPlaybackRequestAtStart.map { request in
+            activeProfile?.id == request.sourceProfileID
+                && channels.contains(where: {
+                    $0.id == request.channelID
+                        && $0.sourceProfileID == request.sourceProfileID
+                        && $0.streamURL == request.streamURL
+                        && $0.displayName == request.title
+                })
+        } ?? false
+        if presentedPlaybackRequest == presentedPlaybackRequestAtStart,
+           !loadedPlaybackStillMatches {
+            presentedPlaybackRequest = nil
         }
         if let pendingCreation,
            !profiles.contains(where: { $0.id == pendingCreation.profile.id }) {
@@ -610,18 +667,20 @@ final class AppModel {
         return true
     }
 
-    private func clearActiveBoundState() {
+    private func clearActiveBoundState(preservingPlayback: Bool = false) {
         activeProfile = nil
-        clearChannelState()
+        clearChannelState(preservingPlayback: preservingPlayback)
     }
 
-    private func clearChannelState() {
+    private func clearChannelState(preservingPlayback: Bool = false) {
         channels = []
         epgChannels = []
         matchByChannelID = [:]
         manualMappingByChannelID = [:]
         programmesByChannelID = [:]
-        presentedPlaybackRequest = nil
+        if !preservingPlayback {
+            presentedPlaybackRequest = nil
+        }
     }
 
     private func reconcileCreatedProfile(_ profile: SourceProfile) {
@@ -848,6 +907,116 @@ final class AppModel {
         finishRefreshReconciliation(key: key, id: reconciliationID)
     }
 
+    private func acquireActiveMutationLease(
+        for operation: ActiveMutationLaneEvent.Operation
+    ) async -> ActiveMutationLease? {
+        let lease = ActiveMutationLease(id: UUID(), operation: operation)
+        let granted = await withTaskCancellationHandler(
+            operation: {
+                guard !Task.isCancelled else {
+                    mutationLaneEvent?(.cancelled(operation))
+                    return false
+                }
+                return await withCheckedContinuation { continuation in
+                    if activeMutationLease == nil {
+                        activeMutationLease = lease
+                        mutationLaneEvent?(.acquired(operation))
+                        continuation.resume(returning: true)
+                    } else {
+                        queuedActiveMutations.append(ActiveMutationWaiter(
+                            lease: lease,
+                            continuation: continuation
+                        ))
+                        mutationLaneEvent?(.queued(operation))
+                    }
+                }
+            },
+            onCancel: { [weak self] in
+                Task { @MainActor in
+                    self?.cancelQueuedActiveMutation(id: lease.id)
+                }
+            }
+        )
+        guard granted else { return nil }
+        guard !Task.isCancelled else {
+            mutationLaneEvent?(.cancelled(operation))
+            releaseActiveMutationLease(lease)
+            return nil
+        }
+        return lease
+    }
+
+    private func cancelQueuedActiveMutation(id: UUID) {
+        guard let index = queuedActiveMutations.firstIndex(where: { $0.lease.id == id }) else {
+            return
+        }
+        let waiter = queuedActiveMutations.remove(at: index)
+        mutationLaneEvent?(.cancelled(waiter.lease.operation))
+        waiter.continuation.resume(returning: false)
+    }
+
+    private func releaseActiveMutationLease(_ lease: ActiveMutationLease) {
+        guard activeMutationLease?.id == lease.id else { return }
+        mutationLaneEvent?(.released(lease.operation))
+        if queuedActiveMutations.isEmpty {
+            activeMutationLease = nil
+            let waiters = mutationLaneIdleWaiters
+            mutationLaneIdleWaiters = []
+            for waiter in waiters {
+                waiter.continuation.resume(returning: true)
+            }
+        } else {
+            let waiter = queuedActiveMutations.removeFirst()
+            activeMutationLease = waiter.lease
+            mutationLaneEvent?(.acquired(waiter.lease.operation))
+            waiter.continuation.resume(returning: true)
+        }
+    }
+
+    private func waitForActiveMutationLaneIdle() async -> Bool {
+        while activeMutationLease != nil || !queuedActiveMutations.isEmpty {
+            let waiterID = UUID()
+            let reachedIdle = await withTaskCancellationHandler(
+                operation: {
+                    guard !Task.isCancelled else { return false }
+                    return await withCheckedContinuation { continuation in
+                        guard activeMutationLease != nil || !queuedActiveMutations.isEmpty else {
+                            continuation.resume(returning: true)
+                            return
+                        }
+                        mutationLaneIdleWaiters.append(MutationLaneIdleWaiter(
+                            id: waiterID,
+                            continuation: continuation
+                        ))
+                        mutationLaneEvent?(.reloadWaiting)
+                    }
+                },
+                onCancel: { [weak self] in
+                    Task { @MainActor in
+                        self?.cancelMutationLaneIdleWaiter(id: waiterID)
+                    }
+                }
+            )
+            guard reachedIdle, !Task.isCancelled else { return false }
+        }
+        return !Task.isCancelled
+    }
+
+    private func cancelMutationLaneIdleWaiter(id: UUID) {
+        guard let index = mutationLaneIdleWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = mutationLaneIdleWaiters.remove(at: index)
+        waiter.continuation.resume(returning: false)
+    }
+
+    private func postWriteReloadOutcome() async -> ReloadOutcome {
+        let reconciliation = Task { @MainActor [self] in
+            await reloadOutcome()
+        }
+        return await reconciliation.value
+    }
+
     private func waitForReloadCompletion(_ id: UUID) async {
         guard activeReloadIDs.contains(id) else { return }
         await withCheckedContinuation { continuation in
@@ -871,6 +1040,11 @@ final class AppModel {
     private func presentOperationMessage(_ message: String) {
         alertKind = .operation
         alertMessage = message
+    }
+
+    private func clearOperationAlert() {
+        guard alertKind == .operation else { return }
+        alertMessage = nil
     }
 
     private func isCurrentMappingTarget(_ channel: Channel) -> Bool {
@@ -901,6 +1075,21 @@ fileprivate extension AppModel {
     struct ActiveTransition {
         let id: UUID
         let previousState: ActiveBoundStateSnapshot
+    }
+
+    struct ActiveMutationLease {
+        let id: UUID
+        let operation: ActiveMutationLaneEvent.Operation
+    }
+
+    struct ActiveMutationWaiter {
+        let lease: ActiveMutationLease
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    struct MutationLaneIdleWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
     }
 
     enum ReloadOutcome {

@@ -26,6 +26,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     enum OperationEvent: Equatable, Sendable {
         case channelReadReleased
         case activationStarted(UUID)
+        case deletionStarted(UUID)
     }
 
     struct Snapshot: Sendable {
@@ -76,6 +77,9 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var blockedActivationContinuation: CheckedContinuation<Void, Never>?
     private var activationReleaseContinuation: CheckedContinuation<Void, Never>?
     private var shouldFailNextDeletion = false
+    private var shouldGateNextDeletion = false
+    private var blockedDeletionContinuation: CheckedContinuation<Void, Never>?
+    private var deletionReleaseContinuation: CheckedContinuation<Void, Never>?
     private var shouldGateNextProfileRead = false
     private var blockedProfileReadContinuation: CheckedContinuation<Void, Never>?
     private var profileReadReleaseContinuation: CheckedContinuation<Void, Never>?
@@ -233,6 +237,23 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         shouldFailNextDeletion = true
     }
 
+    func gateNextDeletion() {
+        shouldGateNextDeletion = true
+    }
+
+    func waitUntilDeletionIsBlocked() async {
+        if deletionReleaseContinuation != nil { return }
+        guard shouldGateNextDeletion else { return }
+        await withCheckedContinuation { continuation in
+            blockedDeletionContinuation = continuation
+        }
+    }
+
+    func releaseDeletion() {
+        deletionReleaseContinuation?.resume()
+        deletionReleaseContinuation = nil
+    }
+
     func waitUntilActivationIsBlocked() async {
         if activationReleaseContinuation != nil { return }
         guard shouldGateNextActivation else { return }
@@ -307,7 +328,16 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         profileUpdateCount += 1
     }
 
-    func deleteProfile(id: UUID) throws {
+    func deleteProfile(id: UUID) async throws {
+        operationEvents.append(.deletionStarted(id))
+        if shouldGateNextDeletion {
+            shouldGateNextDeletion = false
+            blockedDeletionContinuation?.resume()
+            blockedDeletionContinuation = nil
+            await withCheckedContinuation { continuation in
+                deletionReleaseContinuation = continuation
+            }
+        }
         if shouldFailNextDeletion {
             shouldFailNextDeletion = false
             throw InjectedError.deleteProfile

@@ -2382,6 +2382,545 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(snapshot.profileCreateCount, 2)
     }
 
+    func testGenericReloadWaitsForGatedActivationReconciliation() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "First",
+            now: now
+        )
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let secondChannel = makeChannel(
+            profileID: second.id,
+            url: "https://example.test/second",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [first, second],
+            activeProfileID: first.id,
+            channels: [second.id: [secondChannel]]
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let activation = Task { await model.activate(profileID: second.id) }
+        let acquiredActivationEvent = await laneEventIterator.next()
+        XCTAssertEqual(
+            acquiredActivationEvent,
+            .acquired(.activate(second.id))
+        )
+        await repository.waitUntilActivationIsBlocked()
+
+        let reload = Task { await model.reload() }
+        let reloadWaitingEvent = await laneEventIterator.next()
+        XCTAssertEqual(reloadWaitingEvent, .reloadWaiting)
+
+        await repository.releaseActivation()
+        let activationSucceeded = await activation.value
+        let reloadApplied = await reload.value
+        XCTAssertTrue(activationSucceeded)
+        XCTAssertTrue(reloadApplied)
+
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.activeProfileID, second.id)
+        XCTAssertEqual(model.activeProfile, second)
+        XCTAssertEqual(model.channels, [secondChannel])
+    }
+
+    func testGenericReloadWaitsForGatedActiveDeletionReconciliation() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "First",
+            now: now
+        )
+        let second = makeProfile(
+            id: "00000000-0000-0000-0000-000000000002",
+            name: "Second",
+            now: now
+        )
+        let secondChannel = makeChannel(
+            profileID: second.id,
+            url: "https://example.test/second",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [first, second],
+            activeProfileID: first.id,
+            channels: [second.id: [secondChannel]]
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextDeletion()
+        let deletion = Task { await model.delete(profileID: first.id) }
+        let acquiredDeletionEvent = await laneEventIterator.next()
+        XCTAssertEqual(
+            acquiredDeletionEvent,
+            .acquired(.delete(first.id))
+        )
+        await repository.waitUntilDeletionIsBlocked()
+
+        let reload = Task { await model.reload() }
+        let reloadWaitingEvent = await laneEventIterator.next()
+        XCTAssertEqual(reloadWaitingEvent, .reloadWaiting)
+
+        await repository.releaseDeletion()
+        let deletionSucceeded = await deletion.value
+        let reloadApplied = await reload.value
+        XCTAssertTrue(deletionSucceeded)
+        XCTAssertTrue(reloadApplied)
+
+        let snapshot = await repository.snapshot()
+        XCTAssertFalse(snapshot.profiles.contains { $0.id == first.id })
+        XCTAssertEqual(snapshot.activeProfileID, second.id)
+        XCTAssertFalse(model.profiles.contains { $0.id == first.id })
+        XCTAssertEqual(model.activeProfile, second)
+        XCTAssertEqual(model.channels, [secondChannel])
+    }
+
+    func testSuccessfulActivationsPersistAndReconcileInInvocationOrder() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let third = makeProfile(id: "00000000-0000-0000-0000-000000000003", name: "Third", now: now)
+        let thirdChannel = makeChannel(
+            profileID: third.id,
+            url: "https://example.test/third",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [first, second, third],
+            activeProfileID: first.id,
+            channels: [third.id: [thirdChannel]]
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let firstActivation = Task { await model.activate(profileID: second.id) }
+        let acquiredFirstActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredFirstActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilActivationIsBlocked()
+
+        let secondActivation = Task { await model.activate(profileID: third.id) }
+        let queuedSecondActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedSecondActivation, .queued(.activate(third.id)))
+        await repository.releaseActivation()
+
+        let firstActivationSucceeded = await firstActivation.value
+        let secondActivationSucceeded = await secondActivation.value
+        XCTAssertTrue(firstActivationSucceeded)
+        XCTAssertTrue(secondActivationSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.operationEvents, [
+            .activationStarted(second.id),
+            .activationStarted(third.id),
+        ])
+        XCTAssertEqual(snapshot.activeProfileID, third.id)
+        XCTAssertEqual(model.activeProfile, third)
+        XCTAssertEqual(model.channels, [thirdChannel])
+    }
+
+    func testActivationThenDeletionPersistAndReconcileInInvocationOrder() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let repository = RepositorySpy(
+            profiles: [first, second],
+            activeProfileID: first.id
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let activation = Task { await model.activate(profileID: second.id) }
+        let acquiredActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilActivationIsBlocked()
+
+        let deletion = Task { await model.delete(profileID: second.id) }
+        let queuedDeletion = await laneEventIterator.next()
+        XCTAssertEqual(queuedDeletion, .queued(.delete(second.id)))
+        await repository.releaseActivation()
+
+        let activationSucceeded = await activation.value
+        let deletionSucceeded = await deletion.value
+        XCTAssertTrue(activationSucceeded)
+        XCTAssertTrue(deletionSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.operationEvents, [
+            .activationStarted(second.id),
+            .deletionStarted(second.id),
+        ])
+        XCTAssertFalse(snapshot.profiles.contains { $0.id == second.id })
+        XCTAssertEqual(snapshot.activeProfileID, first.id)
+        XCTAssertFalse(model.profiles.contains { $0.id == second.id })
+        XCTAssertEqual(model.activeProfile, first)
+    }
+
+    func testInactiveDeletionAlsoQueuesBehindActivation() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let inactive = makeProfile(id: "00000000-0000-0000-0000-000000000003", name: "Inactive", now: now)
+        let secondChannel = makeChannel(
+            profileID: second.id,
+            url: "https://example.test/second",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [first, second, inactive],
+            activeProfileID: first.id,
+            channels: [second.id: [secondChannel]]
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let activation = Task { await model.activate(profileID: second.id) }
+        let acquiredActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilActivationIsBlocked()
+
+        let deletion = Task { await model.delete(profileID: inactive.id) }
+        let queuedDeletion = await laneEventIterator.next()
+        XCTAssertEqual(queuedDeletion, .queued(.delete(inactive.id)))
+        await repository.releaseActivation()
+
+        let activationSucceeded = await activation.value
+        let deletionSucceeded = await deletion.value
+        XCTAssertTrue(activationSucceeded)
+        XCTAssertTrue(deletionSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.operationEvents, [
+            .activationStarted(second.id),
+            .deletionStarted(inactive.id),
+        ])
+        XCTAssertFalse(snapshot.profiles.contains { $0.id == inactive.id })
+        XCTAssertEqual(snapshot.activeProfileID, second.id)
+        XCTAssertEqual(model.activeProfile, second)
+        XCTAssertEqual(model.channels, [secondChannel])
+    }
+
+    func testCancellingQueuedActivationSkipsItsWriteAndGrantsFollowingMutation() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let third = makeProfile(id: "00000000-0000-0000-0000-000000000003", name: "Third", now: now)
+        let repository = RepositorySpy(
+            profiles: [first, second, third],
+            activeProfileID: first.id
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let firstActivation = Task { await model.activate(profileID: second.id) }
+        let acquiredFirstActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredFirstActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilActivationIsBlocked()
+
+        let cancelledActivation = Task { await model.activate(profileID: third.id) }
+        let queuedCancelledActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedCancelledActivation, .queued(.activate(third.id)))
+        let finalActivation = Task { await model.activate(profileID: first.id) }
+        let queuedFinalActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedFinalActivation, .queued(.activate(first.id)))
+
+        cancelledActivation.cancel()
+        let cancelledEvent = await laneEventIterator.next()
+        XCTAssertEqual(cancelledEvent, .cancelled(.activate(third.id)))
+        let cancelledActivationSucceeded = await cancelledActivation.value
+        XCTAssertFalse(cancelledActivationSucceeded)
+        await repository.releaseActivation()
+
+        let firstActivationSucceeded = await firstActivation.value
+        let finalActivationSucceeded = await finalActivation.value
+        XCTAssertTrue(firstActivationSucceeded)
+        XCTAssertTrue(finalActivationSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.operationEvents, [
+            .activationStarted(second.id),
+            .activationStarted(first.id),
+        ])
+        XCTAssertEqual(snapshot.activeProfileID, first.id)
+        XCTAssertEqual(model.activeProfile, first)
+    }
+
+    func testActivationCancelledBeforeEnqueueNeverWrites() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let repository = RepositorySpy(
+            profiles: [first, second],
+            activeProfileID: first.id
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        let activation = Task { await model.activate(profileID: second.id) }
+        activation.cancel()
+
+        let cancelledEvent = await laneEventIterator.next()
+        XCTAssertEqual(cancelledEvent, .cancelled(.activate(second.id)))
+        let activationSucceeded = await activation.value
+        XCTAssertFalse(activationSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertTrue(snapshot.operationEvents.isEmpty)
+        XCTAssertEqual(snapshot.activeProfileID, first.id)
+    }
+
+    func testActivationCancelledAsItIsGrantedSkipsWriteAndReleasesFollowingMutation() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let third = makeProfile(id: "00000000-0000-0000-0000-000000000003", name: "Third", now: now)
+        let repository = RepositorySpy(
+            profiles: [first, second, third],
+            activeProfileID: first.id
+        )
+        let grantCanceller = MutationGrantCanceller(
+            target: .activate(third.id)
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: {
+                laneEventContinuation.yield($0)
+                grantCanceller.observe($0)
+            },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let firstActivation = Task { await model.activate(profileID: second.id) }
+        let acquiredFirstActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredFirstActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilActivationIsBlocked()
+
+        let cancelledActivation = Task { await model.activate(profileID: third.id) }
+        grantCanceller.task = cancelledActivation
+        let queuedCancelledActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedCancelledActivation, .queued(.activate(third.id)))
+        let finalActivation = Task { await model.activate(profileID: first.id) }
+        let queuedFinalActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedFinalActivation, .queued(.activate(first.id)))
+
+        await repository.releaseActivation()
+        let firstActivationSucceeded = await firstActivation.value
+        let cancelledActivationSucceeded = await cancelledActivation.value
+        let finalActivationSucceeded = await finalActivation.value
+
+        XCTAssertTrue(firstActivationSucceeded)
+        XCTAssertFalse(cancelledActivationSucceeded)
+        XCTAssertTrue(finalActivationSucceeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.operationEvents, [
+            .activationStarted(second.id),
+            .activationStarted(first.id),
+        ])
+        XCTAssertEqual(snapshot.activeProfileID, first.id)
+        XCTAssertEqual(model.activeProfile, first)
+    }
+
+    func testCancelledReloadWaitingForMutationLeavesNoIdleWaiterLeak() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let repository = RepositorySpy(
+            profiles: [first, second],
+            activeProfileID: first.id
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextActivation()
+        let activation = Task { await model.activate(profileID: second.id) }
+        let acquiredActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilActivationIsBlocked()
+
+        let cancelledReload = Task { await model.reload() }
+        let reloadWaitingEvent = await laneEventIterator.next()
+        XCTAssertEqual(reloadWaitingEvent, .reloadWaiting)
+        cancelledReload.cancel()
+        let cancelledReloadApplied = await cancelledReload.value
+        XCTAssertFalse(cancelledReloadApplied)
+
+        await repository.releaseActivation()
+        let activationSucceeded = await activation.value
+        XCTAssertTrue(activationSucceeded)
+        let finalReloadApplied = await model.reload()
+        XCTAssertTrue(finalReloadApplied)
+        XCTAssertEqual(model.activeProfile, second)
+    }
+
+    func testCancellationAfterActivationWriteStillCompletesReconciliationBeforeRelease() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "First", now: now)
+        let second = makeProfile(id: "00000000-0000-0000-0000-000000000002", name: "Second", now: now)
+        let secondChannel = makeChannel(
+            profileID: second.id,
+            url: "https://example.test/second",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [first, second],
+            activeProfileID: first.id,
+            channels: [second.id: [secondChannel]]
+        )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextChannelRead()
+        let activation = Task { await model.activate(profileID: second.id) }
+        let acquiredActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredActivation, .acquired(.activate(second.id)))
+        await repository.waitUntilChannelReadIsBlocked()
+        activation.cancel()
+
+        let reload = Task { await model.reload() }
+        let reloadWaitingEvent = await laneEventIterator.next()
+        XCTAssertEqual(reloadWaitingEvent, .reloadWaiting)
+        await repository.releaseChannelRead()
+
+        let activationSucceeded = await activation.value
+        let reloadApplied = await reload.value
+        XCTAssertTrue(activationSucceeded)
+        XCTAssertTrue(reloadApplied)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.activeProfileID, second.id)
+        XCTAssertEqual(model.activeProfile, second)
+        XCTAssertEqual(model.channels, [secondChannel])
+    }
+
     func testActivationWriteFailureRestoresCompleteActiveBoundState() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let second = makeProfile(
@@ -2446,7 +2985,7 @@ final class AppModelTests: XCTestCase {
         )
     }
 
-    func testStaleActivationWriteFailureCannotRestoreSnapshotOverNewerActivation() async throws {
+    func testFailedActivationThenSuccessfulActivationUsesFIFOAndClearsOlderError() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let second = makeProfile(
             id: "00000000-0000-0000-0000-000000000002",
@@ -2464,29 +3003,40 @@ final class AppModelTests: XCTestCase {
             tvgID: nil,
             order: 0
         )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
         let fixture = try await makeLoadedActiveBoundFixture(
             additionalProfiles: [second, third],
             additionalChannels: [third.id: [thirdChannel]],
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
             now: now
         )
 
         await fixture.repository.failNextActivation()
         await fixture.repository.gateNextActivation()
-        let staleActivation = Task {
+        let firstActivation = Task {
             await fixture.model.activate(profileID: second.id)
         }
+        let acquiredFirstActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredFirstActivation, .acquired(.activate(second.id)))
         await fixture.repository.waitUntilActivationIsBlocked()
 
-        let newerActivationSucceeded = await fixture.model.activate(profileID: third.id)
-        XCTAssertTrue(newerActivationSucceeded)
-        XCTAssertEqual(fixture.model.activeProfile, third)
-        XCTAssertEqual(fixture.model.channels, [thirdChannel])
-        XCTAssertFalse(fixture.model.isLoading)
+        let secondActivation = Task {
+            await fixture.model.activate(profileID: third.id)
+        }
+        let queuedSecondActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedSecondActivation, .queued(.activate(third.id)))
 
         await fixture.repository.releaseActivation()
-        let staleActivationSucceeded = await staleActivation.value
+        let firstActivationSucceeded = await firstActivation.value
+        let secondActivationSucceeded = await secondActivation.value
 
-        XCTAssertFalse(staleActivationSucceeded)
+        XCTAssertFalse(firstActivationSucceeded)
+        XCTAssertTrue(secondActivationSucceeded)
         XCTAssertEqual(fixture.model.activeProfile, third)
         XCTAssertEqual(fixture.model.channels, [thirdChannel])
         XCTAssertTrue(fixture.model.epgChannels.isEmpty)
@@ -2495,12 +3045,13 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(fixture.model.manualEPGChannelID(for: thirdChannel))
         XCTAssertNil(fixture.model.presentedPlaybackRequest)
         XCTAssertFalse(fixture.model.isLoading)
+        XCTAssertNil(fixture.model.alertMessage)
         let repositorySnapshot = await fixture.repository.snapshot()
         XCTAssertEqual(repositorySnapshot.activeProfileID, third.id)
         XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, second, third])
     }
 
-    func testSupersededPostWriteActivationReloadDoesNotReplaceNewerRepositoryTruth() async throws {
+    func testGenericReloadWaitsForPostWriteActivationReloadBeforeApplyingNewerTruth() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let second = makeProfile(
             id: "00000000-0000-0000-0000-000000000002",
@@ -2518,31 +3069,41 @@ final class AppModelTests: XCTestCase {
             tvgID: nil,
             order: 0
         )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
         let fixture = try await makeLoadedActiveBoundFixture(
             additionalProfiles: [second, third],
             additionalChannels: [third.id: [thirdChannel]],
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
             now: now
         )
 
         await fixture.repository.gateNextChannelRead()
-        let staleActivation = Task {
+        let activation = Task {
             await fixture.model.activate(profileID: second.id)
         }
+        let acquiredActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredActivation, .acquired(.activate(second.id)))
         await fixture.repository.waitUntilChannelReadIsBlocked()
 
         await fixture.repository.replaceProfiles(
             [fixture.activeProfile, second, third],
             activeProfileID: third.id
         )
-        let newerReloadApplied = await fixture.model.reload()
-        XCTAssertTrue(newerReloadApplied)
-        XCTAssertEqual(fixture.model.activeProfile, third)
-        XCTAssertEqual(fixture.model.channels, [thirdChannel])
+        let reload = Task { await fixture.model.reload() }
+        let reloadWaitingEvent = await laneEventIterator.next()
+        XCTAssertEqual(reloadWaitingEvent, .reloadWaiting)
 
         await fixture.repository.releaseChannelRead()
-        let staleActivationSucceeded = await staleActivation.value
+        let activationSucceeded = await activation.value
+        let reloadApplied = await reload.value
 
-        XCTAssertFalse(staleActivationSucceeded)
+        XCTAssertTrue(activationSucceeded)
+        XCTAssertTrue(reloadApplied)
         XCTAssertEqual(fixture.model.activeProfile, third)
         XCTAssertEqual(fixture.model.channels, [thirdChannel])
         XCTAssertFalse(fixture.model.isLoading)
@@ -2551,7 +3112,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(repositorySnapshot.activeProfileID, third.id)
     }
 
-    func testSupersededPostWriteActiveDeletionReloadDoesNotClearNewerSelection() async throws {
+    func testGenericReloadWaitsForPostWriteDeletionReloadBeforeApplyingRepositoryTruth() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let second = makeProfile(
             id: "00000000-0000-0000-0000-000000000002",
@@ -2564,28 +3125,37 @@ final class AppModelTests: XCTestCase {
             tvgID: nil,
             order: 0
         )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
         let fixture = try await makeLoadedActiveBoundFixture(
             additionalProfiles: [second],
             additionalChannels: [second.id: [secondChannel]],
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
             now: now
         )
 
         await fixture.repository.gateNextChannelRead()
-        let staleDeletion = Task {
+        let deletion = Task {
             await fixture.model.delete(profileID: fixture.activeProfile.id)
         }
+        let acquiredDeletion = await laneEventIterator.next()
+        XCTAssertEqual(acquiredDeletion, .acquired(.delete(fixture.activeProfile.id)))
         await fixture.repository.waitUntilChannelReadIsBlocked()
 
-        let newerReloadApplied = await fixture.model.reload()
-        XCTAssertTrue(newerReloadApplied)
-        XCTAssertEqual(fixture.model.profiles, [second])
-        XCTAssertEqual(fixture.model.activeProfile, second)
-        XCTAssertEqual(fixture.model.channels, [secondChannel])
+        let reload = Task { await fixture.model.reload() }
+        let reloadWaitingEvent = await laneEventIterator.next()
+        XCTAssertEqual(reloadWaitingEvent, .reloadWaiting)
 
         await fixture.repository.releaseChannelRead()
-        let staleDeletionSucceeded = await staleDeletion.value
+        let deletionSucceeded = await deletion.value
+        let reloadApplied = await reload.value
 
-        XCTAssertFalse(staleDeletionSucceeded)
+        XCTAssertTrue(deletionSucceeded)
+        XCTAssertTrue(reloadApplied)
         XCTAssertEqual(fixture.model.profiles, [second])
         XCTAssertEqual(fixture.model.activeProfile, second)
         XCTAssertEqual(fixture.model.channels, [secondChannel])
@@ -2647,6 +3217,79 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
     }
 
+    func testOrdinaryReloadKeepsMatchingPlaybackPresentedWhileReadIsGated() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            now: now
+        )
+        let requestAtStart = try XCTUnwrap(fixture.model.presentedPlaybackRequest)
+
+        await fixture.repository.gateNextChannelRead()
+        let reload = Task { await fixture.model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+
+        XCTAssertEqual(fixture.model.presentedPlaybackRequest, requestAtStart)
+        XCTAssertEqual(fixture.model.presentedPlaybackRequest?.id, requestAtStart.id)
+
+        await fixture.repository.releaseChannelRead()
+        let reloadApplied = await reload.value
+        XCTAssertTrue(reloadApplied)
+        XCTAssertEqual(fixture.model.presentedPlaybackRequest, requestAtStart)
+        XCTAssertEqual(fixture.model.presentedPlaybackRequest?.id, requestAtStart.id)
+    }
+
+    func testOrdinaryReloadDoesNotRestorePlaybackDismissedWhileReadIsGated() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            now: now
+        )
+
+        await fixture.repository.gateNextChannelRead()
+        let reload = Task { await fixture.model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+        XCTAssertNotNil(fixture.model.presentedPlaybackRequest)
+
+        fixture.model.dismissPlayback()
+        await fixture.repository.releaseChannelRead()
+
+        let reloadApplied = await reload.value
+        XCTAssertTrue(reloadApplied)
+        XCTAssertNil(fixture.model.presentedPlaybackRequest)
+    }
+
+    func testOrdinaryReloadClearsPlaybackAfterGatedReadFindsChangedURL() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            now: now
+        )
+        let changedChannel = makeChannel(
+            profileID: fixture.activeProfile.id,
+            url: "https://example.test/changed",
+            tvgID: fixture.manualChannel.tvgID,
+            order: fixture.manualChannel.order
+        )
+        await fixture.repository.replaceChannels(
+            profileID: fixture.activeProfile.id,
+            channels: [fixture.automaticChannel, changedChannel]
+        )
+        await fixture.repository.gateNextChannelRead()
+
+        let reload = Task { await fixture.model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest,
+            fixture.playbackRequest
+        )
+
+        await fixture.repository.releaseChannelRead()
+        let reloadApplied = await reload.value
+        XCTAssertTrue(reloadApplied)
+        XCTAssertNil(fixture.model.presentedPlaybackRequest)
+    }
+
     func testReloadCarriesPlaybackOnlyWhenLoadedChannelIdentityAndURLStillMatch() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let first = makeProfile(
@@ -2705,7 +3348,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.presentedPlaybackRequest)
     }
 
-    func testNewerOverlappingActivationFailureRestoresInheritedStableSnapshot() async throws {
+    func testConsecutiveActivationFailuresUseFIFOAndPresentLatestError() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let second = makeProfile(
             id: "00000000-0000-0000-0000-000000000002",
@@ -2717,32 +3360,42 @@ final class AppModelTests: XCTestCase {
             name: "Third",
             now: now
         )
+        let (laneEvents, laneEventContinuation) = AsyncStream.makeStream(
+            of: AppModel.ActiveMutationLaneEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { laneEventContinuation.finish() }
+        var laneEventIterator = laneEvents.makeAsyncIterator()
         let fixture = try await makeLoadedActiveBoundFixture(
             additionalProfiles: [second, third],
+            mutationLaneEvent: { laneEventContinuation.yield($0) },
             now: now
         )
 
         await fixture.repository.failNextActivation()
         await fixture.repository.gateNextActivation()
-        let staleActivation = Task {
+        let firstActivation = Task {
             await fixture.model.activate(profileID: second.id)
         }
+        let acquiredFirstActivation = await laneEventIterator.next()
+        XCTAssertEqual(acquiredFirstActivation, .acquired(.activate(second.id)))
         await fixture.repository.waitUntilActivationIsBlocked()
 
         await fixture.repository.failNextActivation()
-        let newerActivationSucceeded = await fixture.model.activate(profileID: third.id)
-
-        XCTAssertFalse(newerActivationSucceeded)
-        assertCompleteActiveBoundState(fixture)
-        XCTAssertNotNil(fixture.model.alertMessage)
-        fixture.model.dismissAlert()
+        let secondActivation = Task {
+            await fixture.model.activate(profileID: third.id)
+        }
+        let queuedSecondActivation = await laneEventIterator.next()
+        XCTAssertEqual(queuedSecondActivation, .queued(.activate(third.id)))
 
         await fixture.repository.releaseActivation()
-        let staleActivationSucceeded = await staleActivation.value
+        let firstActivationSucceeded = await firstActivation.value
+        let secondActivationSucceeded = await secondActivation.value
 
-        XCTAssertFalse(staleActivationSucceeded)
+        XCTAssertFalse(firstActivationSucceeded)
+        XCTAssertFalse(secondActivationSucceeded)
         assertCompleteActiveBoundState(fixture)
-        XCTAssertNil(fixture.model.alertMessage)
+        XCTAssertNotNil(fixture.model.alertMessage)
         let repositorySnapshot = await fixture.repository.snapshot()
         XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
     }
@@ -2891,12 +3544,15 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
 
         await model.reload()
+        model.select(channel: firstChannel)
+        XCTAssertNotNil(model.presentedPlaybackRequest)
         await repository.gateNextActivation()
         let activation = Task { await model.activate(profileID: second.id) }
         await repository.waitUntilActivationIsBlocked()
 
         XCTAssertTrue(model.isLoading)
         XCTAssertTrue(model.channels.isEmpty)
+        XCTAssertNil(model.presentedPlaybackRequest)
         model.select(channel: firstChannel)
         XCTAssertNil(model.presentedPlaybackRequest)
         model.select(channel: secondChannel)
@@ -2953,6 +3609,7 @@ final class AppModelTests: XCTestCase {
     private func makeLoadedActiveBoundFixture(
         additionalProfiles: [SourceProfile],
         additionalChannels: [UUID: [Channel]] = [:],
+        mutationLaneEvent: (@MainActor @Sendable (AppModel.ActiveMutationLaneEvent) -> Void)? = nil,
         now: Date
     ) async throws -> LoadedActiveBoundFixture {
         let active = makeProfile(
@@ -3011,6 +3668,7 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(
             repository: repository,
             refresh: { _, _, _ in [] },
+            mutationLaneEvent: mutationLaneEvent,
             now: { now }
         )
 
@@ -3130,6 +3788,21 @@ private actor RefreshCallProbe {
 
     func record(profileID: UUID, resources: Set<RefreshResource>, trigger: RefreshTrigger) {
         calls.append(Call(profileID: profileID, resources: resources, trigger: trigger))
+    }
+}
+
+@MainActor
+private final class MutationGrantCanceller {
+    let target: AppModel.ActiveMutationLaneEvent.Operation
+    var task: Task<Bool, Never>?
+
+    init(target: AppModel.ActiveMutationLaneEvent.Operation) {
+        self.target = target
+    }
+
+    func observe(_ event: AppModel.ActiveMutationLaneEvent) {
+        guard event == .acquired(target) else { return }
+        task?.cancel()
     }
 }
 
