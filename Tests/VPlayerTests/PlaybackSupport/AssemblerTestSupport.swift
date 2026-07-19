@@ -88,6 +88,19 @@ final class ScriptedFFmpegParserHandle: FFmpegParserHandle {
 enum AssemblerTestFixtures {
     static let h264SPS = Data([0x67, 0x42, 0x00, 0x1F, 0x95, 0xA8, 0x14, 0x01, 0x6E, 0x40])
     static let h264PPS = Data([0x68, 0xCE, 0x06, 0xE2])
+    static let hevcVPS = Data([
+        0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60,
+        0x00, 0x00, 0x03, 0x00, 0xB0, 0x00, 0x00, 0x03,
+        0x00, 0x00, 0x03, 0x00, 0x5D, 0xAC, 0x59,
+    ])
+    static let hevcSPS = Data([
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x00, 0xB0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+        0x00, 0x5D, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16,
+        0x59, 0x59, 0xA4, 0x93, 0x2B, 0xC0, 0x5A, 0x80,
+        0x80, 0x80, 0xA0,
+    ])
+    static let hevcPPS = Data([0x44, 0x01, 0xC0, 0xF1, 0x83, 0x24])
 
     static func h264AccessUnit(
         sps: Data? = h264SPS,
@@ -108,10 +121,45 @@ enum AssemblerTestFixtures {
         return result
     }
 
+    static func h264ParserAccessUnit(
+        includeParameterSets: Bool,
+        nal: Data
+    ) -> Data {
+        var result = Data([0, 0, 0, 1, 0x09, 0xF0])
+        if includeParameterSets {
+            result.append(annexBParameterSets([h264SPS, h264PPS]))
+        }
+        result.append(contentsOf: [0, 0, 0, 1])
+        result.append(nal)
+        return result
+    }
+
+    static func annexBParameterSets(_ parameterSets: [Data]) -> Data {
+        var result = Data()
+        for parameterSet in parameterSets {
+            result.append(contentsOf: [0, 0, 0, 1])
+            result.append(parameterSet)
+        }
+        return result
+    }
+
+    static func hevcAccessUnit(
+        includeParameterSets: Bool = true,
+        nal: Data = Data([0x26, 0x01, 0x80])
+    ) -> Data {
+        var result = includeParameterSets
+            ? annexBParameterSets([hevcVPS, hevcSPS, hevcPPS])
+            : Data()
+        result.append(contentsOf: [0, 0, 0, 1])
+        result.append(nal)
+        return result
+    }
+
     static func videoTracks(
         codec: VideoCodec = .h264,
         streamIndex: Int32 = 0,
-        audio: AudioTrackDescriptor? = nil
+        audio: AudioTrackDescriptor? = nil,
+        extradata: Data = Data()
     ) throws -> DemuxTrackSet {
         let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
         return DemuxTrackSet(
@@ -123,7 +171,7 @@ enum AssemblerTestFixtures {
                 width: 1_920,
                 height: 1_080,
                 videoDelay: 1,
-                extradata: Data()
+                extradata: extradata
             ),
             audio: audio
         )

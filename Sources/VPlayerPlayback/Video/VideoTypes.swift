@@ -80,9 +80,13 @@ final class AssemblyFormatState {
         self.audioCookie = audioCookie
     }
 
-    func reset(for trackSet: DemuxTrackSet) {
+    func resetVideo(for trackSet: DemuxTrackSet) {
         self.trackSet = trackSet
         videoParameterSets = []
+    }
+
+    func resetAudio(for trackSet: DemuxTrackSet) {
+        self.trackSet = trackSet
         audioCookie = nil
     }
 

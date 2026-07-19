@@ -135,7 +135,11 @@ final class LiveFFmpegParserHandle: FFmpegParserHandle {
         dts: Int64?,
         duration: Int64?
     ) throws {
-        guard let native, !bytes.isEmpty else {
+        guard let native,
+              !bytes.isEmpty,
+              pts != Int64.min,
+              dts != Int64.min,
+              duration != Int64.min else {
             throw Self.error(for: codec, code: Self.malformedFrameErrorCode)
         }
         callbackFailure = nil
@@ -312,7 +316,7 @@ final class CompressedVideoAssembler {
         generationProvider: @escaping () -> MediaGeneration,
         eventSink: @escaping (VideoAssemblerEvent) -> Void,
         parserFactory: any FFmpegParserFactory = LiveFFmpegParserFactory(),
-        formatState: AssemblyFormatState? = nil,
+        formatState: AssemblyFormatState,
         startingID: UInt64 = 1
     ) throws {
         guard let descriptor = trackSet.video else {
@@ -323,7 +327,7 @@ final class CompressedVideoAssembler {
         self.generationProvider = generationProvider
         self.eventSink = eventSink
         self.parserFactory = parserFactory
-        self.formatState = formatState ?? AssemblyFormatState(trackSet: trackSet)
+        self.formatState = formatState
         nextID = startingID
         parser = try makeParser(for: descriptor)
         try prepareExtradata(descriptor.extradata)
@@ -357,7 +361,7 @@ final class CompressedVideoAssembler {
         parser = nil
         tracks = trackSet
         self.descriptor = descriptor
-        formatState.reset(for: trackSet)
+        formatState.resetVideo(for: trackSet)
         parser = try makeParser(for: descriptor)
         parameterSets = []
         formatDescription = nil
@@ -546,7 +550,7 @@ func exactTicks(_ time: CMTime, timeBase: MediaRational) throws -> Int64? {
     }
     if negative {
         if magnitude == UInt64(Int64.max) + 1 {
-            return Int64.min
+            throw PlaybackCoreError.videoDecode(CompressedVideoAssembler.invalidInputErrorCode)
         }
         return -Int64(magnitude)
     }

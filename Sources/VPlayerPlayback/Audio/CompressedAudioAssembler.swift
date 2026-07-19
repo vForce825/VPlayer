@@ -27,14 +27,14 @@ final class CompressedAudioAssembler {
     private var currentCookie: Data?
     private var emittedFingerprint: MediaFormatFingerprint?
     private var aacCarry = Data()
-    private var aacCarryPresentationTimeStamp: CMTime?
+    private var aacTimestampProvenance: [ADTSTimestampProvenance] = []
 
     init(
         trackSet: DemuxTrackSet,
         generationProvider: @escaping () -> MediaGeneration,
         eventSink: @escaping (AudioAssemblerEvent) -> Void,
         parserFactory: any FFmpegParserFactory = LiveFFmpegParserFactory(),
-        formatState: AssemblyFormatState? = nil,
+        formatState: AssemblyFormatState,
         startingID: UInt64 = 1
     ) throws {
         guard let descriptor = trackSet.audio else {
@@ -44,7 +44,7 @@ final class CompressedAudioAssembler {
         self.generationProvider = generationProvider
         self.eventSink = eventSink
         self.parserFactory = parserFactory
-        self.formatState = formatState ?? AssemblyFormatState(trackSet: trackSet)
+        self.formatState = formatState
         nextID = startingID
         try configure(for: descriptor)
     }
@@ -60,20 +60,25 @@ final class CompressedAudioAssembler {
               packet.presentationTimeStamp.isNumeric else {
             throw validationError()
         }
+        let pts = try audioExactTicks(
+            packet.presentationTimeStamp,
+            timeBase: descriptor.timeBase
+        )
+        let presentationTimeStamp = descriptor.timeBase.cmTime(forFFmpegValue: pts)
+        guard presentationTimeStamp.isNumeric else { throw validationError() }
         if descriptor.codec == .aac {
             if descriptor.extradata.isEmpty {
-                try consumeADTS(packet)
+                try consumeADTS(packet.data, presentationTimeStamp: presentationTimeStamp)
             } else {
                 guard !Self.hasADTSSync(packet.data) else { throw validationError() }
                 try emitSample(
                     data: packet.data,
-                    presentationTimeStamp: packet.presentationTimeStamp,
+                    presentationTimeStamp: presentationTimeStamp,
                     frameSamples: 1_024
                 )
             }
             return
         }
-        let pts = try audioExactTicks(packet.presentationTimeStamp, timeBase: descriptor.timeBase)
         let dts = try audioOptionalTicks(packet.decodeTimeStamp, timeBase: descriptor.timeBase)
         let duration = try audioOptionalDurationTicks(packet.duration, timeBase: descriptor.timeBase)
         try parser?.push(packet.data, pts: pts, dts: dts, duration: duration)
@@ -81,7 +86,9 @@ final class CompressedAudioAssembler {
 
     func drain() throws {
         if descriptor.codec == .aac {
-            guard aacCarry.isEmpty else { throw validationError() }
+            guard aacCarry.isEmpty, aacTimestampProvenance.isEmpty else {
+                throw validationError()
+            }
             return
         }
         try parser?.drain()
@@ -92,12 +99,12 @@ final class CompressedAudioAssembler {
         parser?.destroy()
         parser = nil
         self.descriptor = descriptor
-        formatState.reset(for: trackSet)
+        formatState.resetAudio(for: trackSet)
         formatDescription = nil
         currentCookie = nil
         emittedFingerprint = nil
         aacCarry.removeAll(keepingCapacity: false)
-        aacCarryPresentationTimeStamp = nil
+        aacTimestampProvenance.removeAll(keepingCapacity: false)
         try configure(for: descriptor)
     }
 
@@ -176,39 +183,46 @@ final class CompressedAudioAssembler {
         )
     }
 
-    private func consumeADTS(_ packet: DemuxPacket) throws {
-        guard packet.data.count <= Self.maximumPayloadBytes - aacCarry.count else {
+    private func consumeADTS(
+        _ data: Data,
+        presentationTimeStamp: CMTime
+    ) throws {
+        guard data.count <= Self.maximumPayloadBytes - aacCarry.count else {
             throw validationError()
         }
-        if aacCarry.isEmpty {
-            aacCarryPresentationTimeStamp = packet.presentationTimeStamp
-        }
-        aacCarry.append(packet.data)
+        aacTimestampProvenance.append(ADTSTimestampProvenance(
+            byteCount: data.count,
+            presentationTimeStamp: presentationTimeStamp,
+            startedFrameCount: 0
+        ))
+        aacCarry.append(data)
 
         while !aacCarry.isEmpty {
             guard Self.hasPossibleADTSSync(aacCarry) else { throw validationError() }
-            guard aacCarry.count >= 7 else { return }
+            guard aacCarry.count >= 7 else { break }
             let header = try parseADTSHeader(aacCarry)
-            guard aacCarry.count >= header.headerLength else { return }
-            guard aacCarry.count >= header.frameLength else { return }
-            let presentationTimeStamp = try unwrappedAACPresentationTimeStamp()
-            let payload = Data(aacCarry[header.headerLength..<header.frameLength])
+            guard aacCarry.count >= header.headerLength,
+                  aacCarry.count >= header.frameLength else { break }
+            let presentationTimeStamp = try takeAACPresentationTimeStamp()
+            let payloadStart = aacCarry.index(
+                aacCarry.startIndex,
+                offsetBy: header.headerLength
+            )
+            let payloadEnd = aacCarry.index(
+                aacCarry.startIndex,
+                offsetBy: header.frameLength
+            )
+            let payload = Data(aacCarry[payloadStart..<payloadEnd])
             try installFormat(cookie: header.cookie)
             try emitSample(
                 data: payload,
                 presentationTimeStamp: presentationTimeStamp,
                 frameSamples: 1_024
             )
-            aacCarry.removeFirst(header.frameLength)
-            if aacCarry.isEmpty {
-                aacCarryPresentationTimeStamp = nil
-            } else {
-                aacCarryPresentationTimeStamp = CMTimeAdd(
-                    presentationTimeStamp,
-                    CMTime(value: 1_024, timescale: descriptor.sampleRate)
-                )
-            }
+            aacCarry = Data(aacCarry.dropFirst(header.frameLength))
+            try consumeAACProvenanceBytes(header.frameLength)
         }
+        try collapseAACProvenanceForIncompleteFrame()
     }
 
     private func parseADTSHeader(_ data: Data) throws -> ADTSHeader {
@@ -324,11 +338,60 @@ final class CompressedAudioAssembler {
         )))
     }
 
-    private func unwrappedAACPresentationTimeStamp() throws -> CMTime {
-        guard let value = aacCarryPresentationTimeStamp, value.isNumeric else {
+    private func takeAACPresentationTimeStamp() throws -> CMTime {
+        guard !aacTimestampProvenance.isEmpty else {
             throw validationError()
         }
-        return value
+        let provenance = aacTimestampProvenance[0]
+        let (sampleOffset, multipliedOverflow) = provenance.startedFrameCount
+            .multipliedReportingOverflow(by: 1_024)
+        guard !multipliedOverflow else { throw validationError() }
+        let presentationTimeStamp = CMTimeAdd(
+            provenance.presentationTimeStamp,
+            CMTime(value: sampleOffset, timescale: descriptor.sampleRate)
+        )
+        guard presentationTimeStamp.isNumeric else { throw validationError() }
+        let (nextFrameCount, incrementOverflow) = provenance.startedFrameCount
+            .addingReportingOverflow(1)
+        guard !incrementOverflow else { throw validationError() }
+        aacTimestampProvenance[0].startedFrameCount = nextFrameCount
+        return presentationTimeStamp
+    }
+
+    private func consumeAACProvenanceBytes(_ byteCount: Int) throws {
+        var remaining = byteCount
+        while remaining > 0 {
+            guard !aacTimestampProvenance.isEmpty else { throw validationError() }
+            let available = aacTimestampProvenance[0].byteCount
+            guard available > 0 else { throw validationError() }
+            if remaining < available {
+                aacTimestampProvenance[0].byteCount = available - remaining
+                remaining = 0
+            } else {
+                remaining -= available
+                aacTimestampProvenance.removeFirst()
+            }
+        }
+    }
+
+    private func collapseAACProvenanceForIncompleteFrame() throws {
+        guard !aacCarry.isEmpty else {
+            guard aacTimestampProvenance.isEmpty else { throw validationError() }
+            return
+        }
+        guard let first = aacTimestampProvenance.first else { throw validationError() }
+        var totalBytes = 0
+        for provenance in aacTimestampProvenance {
+            let (sum, overflow) = totalBytes.addingReportingOverflow(provenance.byteCount)
+            guard !overflow else { throw validationError() }
+            totalBytes = sum
+        }
+        guard totalBytes == aacCarry.count else { throw validationError() }
+        aacTimestampProvenance = [ADTSTimestampProvenance(
+            byteCount: aacCarry.count,
+            presentationTimeStamp: first.presentationTimeStamp,
+            startedFrameCount: first.startedFrameCount
+        )]
     }
 
     private func takeNextID() throws -> UInt64 {
@@ -359,6 +422,12 @@ private struct ADTSHeader {
     let headerLength: Int
     let frameLength: Int
     let cookie: Data
+}
+
+private struct ADTSTimestampProvenance {
+    var byteCount: Int
+    let presentationTimeStamp: CMTime
+    var startedFrameCount: Int64
 }
 
 private func audioExactTicks(_ time: CMTime, timeBase: MediaRational) throws -> Int64 {

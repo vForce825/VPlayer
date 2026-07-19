@@ -37,7 +37,9 @@ enum AnnexBScanner {
                 throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
             }
             let nal = Data(bytes[start..<end])
-            guard let length = UInt32(exactly: nal.count),
+            let minimumHeaderLength = codec == .hevc ? 2 : 1
+            guard nal.count >= minimumHeaderLength,
+                  let length = UInt32(exactly: nal.count),
                   output.count <= maximumAccessUnitBytes - 4,
                   nal.count <= maximumAccessUnitBytes - output.count - 4 else {
                 throw PlaybackCoreError.videoDecode(invalidDataErrorCode)

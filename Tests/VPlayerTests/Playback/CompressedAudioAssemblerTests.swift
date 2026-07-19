@@ -10,10 +10,12 @@ import XCTest
 
 final class CompressedAudioAssemblerTests: XCTestCase {
     func testCanInitializeAndDrainWithoutFrames() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks()
         let subject = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 1) },
-            eventSink: { _ in }
+            eventSink: { _ in },
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         try subject.drain()
@@ -25,8 +27,9 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         var timeline: [String] = []
         var events: [AudioAssemblerEvent] = []
         var generation = MediaGeneration(rawValue: 10)
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
         let subject = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(extradata: Data()),
+            trackSet: tracks,
             generationProvider: {
                 timeline.append("generation-\(generation.rawValue)")
                 return generation
@@ -37,7 +40,8 @@ final class CompressedAudioAssemblerTests: XCTestCase {
                     generation = MediaGeneration(rawValue: generation.rawValue + 1)
                     timeline.append("format-\(generation.rawValue)")
                 }
-            }
+            },
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         try subject.push(AssemblerTestFixtures.audioPacket(
@@ -80,10 +84,12 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         let crcPayload = Data([0x44, 0x55, 0x66])
         let crcFrame = makeADTSFrame(payload: crcPayload, hasCRC: true)
         var adtsEvents: [AudioAssemblerEvent] = []
+        let adtsTracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
         let adts = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(extradata: Data()),
+            trackSet: adtsTracks,
             generationProvider: { MediaGeneration(rawValue: 1) },
-            eventSink: { adtsEvents.append($0) }
+            eventSink: { adtsEvents.append($0) },
+            formatState: AssemblyFormatState(trackSet: adtsTracks)
         )
         try adts.push(AssemblerTestFixtures.audioPacket(
             data: Data(crcFrame.prefix(8)),
@@ -101,10 +107,12 @@ final class CompressedAudioAssemblerTests: XCTestCase {
 
         let rawPayload = Data([0xDE, 0xAD, 0xBE, 0xEF])
         var rawEvents: [AudioAssemblerEvent] = []
+        let rawTracks = try AssemblerTestFixtures.audioTracks(extradata: Data([0x11, 0x90]))
         let raw = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(extradata: Data([0x11, 0x90])),
+            trackSet: rawTracks,
             generationProvider: { MediaGeneration(rawValue: 4) },
-            eventSink: { rawEvents.append($0) }
+            eventSink: { rawEvents.append($0) },
+            formatState: AssemblyFormatState(trackSet: rawTracks)
         )
         try raw.push(AssemblerTestFixtures.audioPacket(
             data: rawPayload,
@@ -120,6 +128,113 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         XCTAssertEqual(try copiedMagicCookie(rawFormat), Data([0x11, 0x90]))
     }
 
+    func testMultipleADTSFramesInOnePacketDeriveExactAACCadence() throws {
+        let firstPayload = Data([0x10, 0x11])
+        let secondPayload = Data([0x20, 0x21, 0x22])
+        let firstPTS = CMTime(value: 1, timescale: 1)
+        var packetData = makeADTSFrame(payload: firstPayload, hasCRC: false)
+        packetData.append(makeADTSFrame(payload: secondPayload, hasCRC: false))
+        var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let subject = try CompressedAudioAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { events.append($0) },
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+
+        try subject.push(AssemblerTestFixtures.audioPacket(
+            data: packetData,
+            codec: .aac,
+            pts: firstPTS
+        ))
+
+        let samples = events.compactMap(\.sample)
+        XCTAssertEqual(try samples.map { try copiedSampleData($0.sampleBuffer) }, [
+            firstPayload,
+            secondPayload,
+        ])
+        XCTAssertEqual(samples.map(\.presentationTimeStamp), [
+            firstPTS,
+            CMTimeAdd(firstPTS, CMTime(value: 1_024, timescale: 48_000)),
+        ])
+    }
+
+    func testSplitADTSFrameUsesDiscontinuousPTSForNextPacketFrameBoundary() throws {
+        let firstPayload = Data([0x30, 0x31, 0x32])
+        let secondPayload = Data([0x40, 0x41])
+        let firstFrame = makeADTSFrame(payload: firstPayload, hasCRC: false)
+        let secondFrame = makeADTSFrame(payload: secondPayload, hasCRC: false)
+        let firstPTS = CMTime(value: 1, timescale: 1)
+        let discontinuousPTS = CMTime(value: 10, timescale: 1)
+        var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let subject = try CompressedAudioAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { events.append($0) },
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+
+        try subject.push(AssemblerTestFixtures.audioPacket(
+            data: Data(firstFrame.prefix(5)),
+            codec: .aac,
+            pts: firstPTS
+        ))
+        var secondPacket = Data(firstFrame.dropFirst(5))
+        secondPacket.append(secondFrame)
+        try subject.push(AssemblerTestFixtures.audioPacket(
+            data: secondPacket,
+            codec: .aac,
+            pts: discontinuousPTS
+        ))
+
+        let samples = events.compactMap(\.sample)
+        XCTAssertEqual(try samples.map { try copiedSampleData($0.sampleBuffer) }, [
+            firstPayload,
+            secondPayload,
+        ])
+        XCTAssertEqual(samples.map(\.presentationTimeStamp), [firstPTS, discontinuousPTS])
+    }
+
+    func testResetClearsADTSTimestampProvenanceAndInvalidPTSIsRejected() throws {
+        let frame = makeADTSFrame(payload: Data([0x50, 0x51]), hasCRC: false)
+        var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let subject = try CompressedAudioAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { events.append($0) },
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+        try subject.push(AssemblerTestFixtures.audioPacket(
+            data: Data(frame.prefix(4)),
+            codec: .aac,
+            pts: CMTime(value: 2, timescale: 1)
+        ))
+
+        try subject.reset(for: AssemblerTestFixtures.audioTracks(
+            streamIndex: 2,
+            extradata: Data()
+        ))
+        let resetPTS = CMTime(value: 20, timescale: 1)
+        try subject.push(AssemblerTestFixtures.audioPacket(
+            data: frame,
+            streamIndex: 2,
+            codec: .aac,
+            pts: resetPTS
+        ))
+        XCTAssertEqual(events.compactMap(\.sample).map(\.presentationTimeStamp), [resetPTS])
+
+        XCTAssertThrowsError(try subject.push(AssemblerTestFixtures.audioPacket(
+            data: frame,
+            streamIndex: 2,
+            codec: .aac,
+            pts: .invalid
+        )))
+        XCTAssertEqual(events.compactMap(\.sample).count, 1)
+    }
+
     func testInjectedMP2ProducesTwoFramesFromOnePushWithExactASBDAndDurations() throws {
         let frames = [Data([0xFF, 0xFD, 1]), Data([0xFF, 0xFD, 2, 3])]
         let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
@@ -132,11 +247,13 @@ final class CompressedAudioAssemblerTests: XCTestCase {
             }
         }
         var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data())
         let subject = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data()),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 3) },
             eventSink: { events.append($0) },
-            parserFactory: factory
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         try subject.push(AssemblerTestFixtures.audioPacket(data: Data([1]), codec: .mp2))
@@ -185,20 +302,24 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         multipleRawBlocks[6] |= 1
         let malformedFrames = [profileNotLC, pce, multipleRawBlocks]
         for malformed in malformedFrames {
+            let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
             let subject = try CompressedAudioAssembler(
-                trackSet: AssemblerTestFixtures.audioTracks(extradata: Data()),
+                trackSet: tracks,
                 generationProvider: { MediaGeneration(rawValue: 0) },
-                eventSink: { _ in }
+                eventSink: { _ in },
+                formatState: AssemblyFormatState(trackSet: tracks)
             )
             XCTAssertThrowsError(try subject.push(
                 AssemblerTestFixtures.audioPacket(data: malformed, codec: .aac)
             ))
         }
 
+        let incompleteTracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
         let incomplete = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(extradata: Data()),
+            trackSet: incompleteTracks,
             generationProvider: { MediaGeneration(rawValue: 0) },
-            eventSink: { _ in }
+            eventSink: { _ in },
+            formatState: AssemblyFormatState(trackSet: incompleteTracks)
         )
         try incomplete.push(AssemblerTestFixtures.audioPacket(
             data: Data([0xFF, 0xF1, 0x4C]),
@@ -206,22 +327,47 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         ))
         XCTAssertThrowsError(try incomplete.drain())
 
+        let invalidASCTracks = try AssemblerTestFixtures.audioTracks(extradata: Data([0x2B, 0x92]))
         XCTAssertThrowsError(try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(extradata: Data([0x2B, 0x92])),
+            trackSet: invalidASCTracks,
             generationProvider: { MediaGeneration(rawValue: 0) },
-            eventSink: { _ in }
+            eventSink: { _ in },
+            formatState: AssemblyFormatState(trackSet: invalidASCTracks)
         ))
 
+        let invalidPTSTracks = try AssemblerTestFixtures.audioTracks()
         let invalidPTS = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(),
+            trackSet: invalidPTSTracks,
             generationProvider: { MediaGeneration(rawValue: 0) },
-            eventSink: { _ in }
+            eventSink: { _ in },
+            formatState: AssemblyFormatState(trackSet: invalidPTSTracks)
         )
         XCTAssertThrowsError(try invalidPTS.push(AssemblerTestFixtures.audioPacket(
             data: Data([1]),
             codec: .aac,
             pts: .invalid
         )))
+
+        let collisionFactory = ScriptedFFmpegParserFactory()
+        let collisionTracks = try AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data())
+        let timestampCollision = try CompressedAudioAssembler(
+            trackSet: collisionTracks,
+            generationProvider: { MediaGeneration(rawValue: 0) },
+            eventSink: { _ in },
+            parserFactory: collisionFactory,
+            formatState: AssemblyFormatState(trackSet: collisionTracks)
+        )
+        XCTAssertThrowsError(try timestampCollision.push(AssemblerTestFixtures.audioPacket(
+            data: Data([0xFF]),
+            codec: .mp2,
+            pts: CMTime(value: Int64.min, timescale: 90_000)
+        ))) { error in
+            XCTAssertEqual(
+                error as? PlaybackCoreError,
+                .audioFallbackDecode(CompressedAudioAssembler.invalidInputErrorCode)
+            )
+        }
+        XCTAssertEqual(collisionFactory.handles[0].pushCount, 0)
 
         let mismatchFactory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
             try handle.emit(AssemblerTestFixtures.parsedAudioFrame(
@@ -232,11 +378,13 @@ final class CompressedAudioAssemblerTests: XCTestCase {
                 nativeMask: 1
             ))
         }
+        let mismatchTracks = try AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data())
         let mismatch = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data()),
+            trackSet: mismatchTracks,
             generationProvider: { MediaGeneration(rawValue: 0) },
             eventSink: { _ in },
-            parserFactory: mismatchFactory
+            parserFactory: mismatchFactory,
+            formatState: AssemblyFormatState(trackSet: mismatchTracks)
         )
         XCTAssertThrowsError(try mismatch.push(
             AssemblerTestFixtures.audioPacket(data: Data([1]), codec: .mp2)
@@ -248,11 +396,13 @@ final class CompressedAudioAssemblerTests: XCTestCase {
                 frameSamples: 1_024
             ))
         }
+        let badCountTracks = try AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data())
         let badCount = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data()),
+            trackSet: badCountTracks,
             generationProvider: { MediaGeneration(rawValue: 0) },
             eventSink: { _ in },
-            parserFactory: badCountFactory
+            parserFactory: badCountFactory,
+            formatState: AssemblyFormatState(trackSet: badCountTracks)
         )
         XCTAssertThrowsError(try badCount.push(
             AssemblerTestFixtures.audioPacket(data: Data([1]), codec: .mp2)
@@ -273,8 +423,9 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         var timeline: [String] = []
         var generation = MediaGeneration(rawValue: 0)
         var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data())
         let subject = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(codec: .mp2, extradata: Data()),
+            trackSet: tracks,
             generationProvider: {
                 timeline.append("generation-\(generation.rawValue)")
                 return generation
@@ -287,6 +438,7 @@ final class CompressedAudioAssemblerTests: XCTestCase {
                 }
             },
             parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks),
             startingID: UInt64.max - 2
         )
 
@@ -329,10 +481,12 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         let payload = Data([0x10, 0x20])
         let frame = makeADTSFrame(payload: payload, hasCRC: false)
         var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
         let subject = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(extradata: Data()),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 0) },
-            eventSink: { events.append($0) }
+            eventSink: { events.append($0) },
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
         try subject.push(AssemblerTestFixtures.audioPacket(
             data: Data(frame.prefix(6)),
@@ -397,6 +551,123 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         vp_ffmpeg_parser_destroy(parser)
     }
 
+    func testVersionedCABIValidatesEveryConfigAndPointerBoundary() throws {
+        XCTAssertEqual(VPFF_PARSER_ABI_VERSION, 1)
+        XCTAssertEqual(
+            MemoryLayout<VPFFParserConfigV1>.stride,
+            Int(UInt32(MemoryLayout<VPFFParserConfigV1>.stride))
+        )
+        assertParserConfigRejected { $0.abi_version = 2 }
+        assertParserConfigRejected { $0.struct_size -= 1 }
+        assertParserConfigRejected { $0.codec = VPFFCodec(rawValue: 99) }
+        assertParserConfigRejected { $0.time_base_num = 0 }
+        assertParserConfigRejected { $0.time_base_den = -1 }
+        assertParserConfigRejected { $0.sample_rate = 0 }
+        assertParserConfigRejected { $0.channel_count = 0 }
+        assertParserConfigRejected { $0.channel_order = VPFFChannelOrder(rawValue: 99) }
+        assertParserConfigRejected { $0.has_channel_layout_mask = 2 }
+        assertParserConfigRejected { $0.channel_layout_mask = 0 }
+        assertParserConfigRejected { $0.channel_layout_mask = 1 }
+        assertParserConfigRejected {
+            $0.channel_order = VPFF_CHANNEL_ORDER_UNSPECIFIED
+            $0.has_channel_layout_mask = 0
+        }
+
+        var extradataByte: UInt8 = 0xAA
+        withUnsafePointer(to: &extradataByte) { pointer in
+            assertParserConfigRejected {
+                $0.extradata = pointer
+                $0.extradata_size = 0
+            }
+        }
+        assertParserConfigRejected { $0.extradata_size = 1 }
+
+        var valid = validParserConfiguration()
+        var native: OpaquePointer?
+        XCTAssertLessThan(vp_ffmpeg_parser_create_v1(
+            &valid,
+            nil,
+            nil,
+            &native
+        ), 0)
+        XCTAssertNil(native)
+        XCTAssertLessThan(vp_ffmpeg_parser_create_v1(
+            &valid,
+            { _, _ in },
+            nil,
+            nil
+        ), 0)
+        XCTAssertLessThan(vp_ffmpeg_parser_create(
+            VPFF_CODEC_MP2,
+            nil,
+            0,
+            { _, _ in },
+            nil,
+            &native
+        ), 0)
+        XCTAssertNil(native)
+
+        XCTAssertEqual(vp_ffmpeg_parser_create_v1(
+            &valid,
+            { _, _ in },
+            nil,
+            &native
+        ), 0)
+        let parser = try XCTUnwrap(native)
+        // Empty input cannot advance parser state and must fail without entering a spin.
+        XCTAssertLessThan(vp_ffmpeg_parser_push(
+            parser,
+            nil,
+            0,
+            Int64.min,
+            Int64.min,
+            Int64.min
+        ), 0)
+        var byte: UInt8 = 0
+        XCTAssertLessThan(vp_ffmpeg_parser_push(
+            parser,
+            &byte,
+            0,
+            Int64.min,
+            Int64.min,
+            Int64.min
+        ), 0)
+        XCTAssertLessThan(vp_ffmpeg_parser_push(
+            parser,
+            nil,
+            1,
+            Int64.min,
+            Int64.min,
+            Int64.min
+        ), 0)
+        XCTAssertEqual(vp_ffmpeg_parser_drain(parser), 0)
+        XCTAssertEqual(vp_ffmpeg_parser_drain(parser), 0)
+        XCTAssertLessThan(vp_ffmpeg_parser_push(
+            parser,
+            &byte,
+            1,
+            Int64.min,
+            Int64.min,
+            Int64.min
+        ), 0)
+        vp_ffmpeg_parser_destroy(parser)
+        XCTAssertLessThan(vp_ffmpeg_parser_drain(nil), 0)
+        vp_ffmpeg_parser_destroy(nil)
+
+        var unspecified = validParserConfiguration()
+        unspecified.channel_order = VPFF_CHANNEL_ORDER_UNSPECIFIED
+        unspecified.has_channel_layout_mask = 0
+        unspecified.channel_layout_mask = 0
+        native = nil
+        XCTAssertEqual(vp_ffmpeg_parser_create_v1(
+            &unspecified,
+            { _, _ in },
+            nil,
+            &native
+        ), 0)
+        vp_ffmpeg_parser_destroy(try XCTUnwrap(native))
+    }
+
     func testLiveAudioParserMapsPostDrainPushFailureToAudioError() throws {
         let descriptor = try XCTUnwrap(AssemblerTestFixtures.audioTracks(
             codec: .mp2,
@@ -438,11 +709,13 @@ final class CompressedAudioAssemblerTests: XCTestCase {
             }
         }
         var events: [AudioAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.audioTracks(codec: codec, extradata: Data())
         let subject = try CompressedAudioAssembler(
-            trackSet: AssemblerTestFixtures.audioTracks(codec: codec, extradata: Data()),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 1) },
             eventSink: { events.append($0) },
-            parserFactory: factory
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
         try subject.push(AssemblerTestFixtures.audioPacket(data: Data([1]), codec: codec))
 
@@ -465,6 +738,38 @@ final class CompressedAudioAssemblerTests: XCTestCase {
                 frames: codec == .eac3 ? UInt32(count) : 0
             )
         }
+    }
+
+    private func validParserConfiguration() -> VPFFParserConfigV1 {
+        var configuration = VPFFParserConfigV1()
+        configuration.abi_version = VPFF_PARSER_ABI_VERSION
+        configuration.struct_size = UInt32(MemoryLayout<VPFFParserConfigV1>.stride)
+        configuration.codec = VPFF_CODEC_MP2
+        configuration.time_base_num = 1
+        configuration.time_base_den = 90_000
+        configuration.sample_rate = 48_000
+        configuration.channel_count = 2
+        configuration.channel_order = VPFF_CHANNEL_ORDER_NATIVE
+        configuration.has_channel_layout_mask = 1
+        configuration.channel_layout_mask = 3
+        return configuration
+    }
+
+    private func assertParserConfigRejected(
+        _ mutate: (inout VPFFParserConfigV1) -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        var configuration = validParserConfiguration()
+        mutate(&configuration)
+        var native: OpaquePointer?
+        XCTAssertLessThan(vp_ffmpeg_parser_create_v1(
+            &configuration,
+            { _, _ in },
+            nil,
+            &native
+        ), 0, file: file, line: line)
+        XCTAssertNil(native, file: file, line: line)
     }
 
     private func assertAudioFormat(

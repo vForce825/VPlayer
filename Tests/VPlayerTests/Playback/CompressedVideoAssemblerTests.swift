@@ -26,7 +26,8 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         let subject = try CompressedVideoAssembler(
             trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 1) },
-            eventSink: { _ in }
+            eventSink: { _ in },
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         try subject.drain()
@@ -72,11 +73,13 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             }
         }
         var events: [VideoAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.videoTracks()
         let subject = try CompressedVideoAssembler(
-            trackSet: AssemblerTestFixtures.videoTracks(),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 4) },
             eventSink: { events.append($0) },
-            parserFactory: factory
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         try subject.push(AssemblerTestFixtures.videoPacket(data: Data([0, 0, 0, 1, 0x65])))
@@ -132,8 +135,9 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         var generation = MediaGeneration(rawValue: 0)
         var timeline: [String] = []
         var events: [VideoAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.videoTracks()
         let subject = try CompressedVideoAssembler(
-            trackSet: AssemblerTestFixtures.videoTracks(),
+            trackSet: tracks,
             generationProvider: {
                 timeline.append("generation-\(generation.rawValue)")
                 return generation
@@ -145,7 +149,8 @@ final class CompressedVideoAssemblerTests: XCTestCase {
                     timeline.append("format-\(generation.rawValue)")
                 }
             },
-            parserFactory: factory
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         for _ in frames {
@@ -164,6 +169,14 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         XCTAssertEqual(timeline, [
             "format-1", "generation-1", "generation-1", "format-2", "generation-2",
         ])
+    }
+
+    func testSharedAVFingerprintsRemainCompleteAfterVideoThenAudioReset() throws {
+        try assertSharedAVFingerprintsRemainComplete(resetVideoFirst: true)
+    }
+
+    func testSharedAVFingerprintsRemainCompleteAfterAudioThenVideoReset() throws {
+        try assertSharedAVFingerprintsRemainComplete(resetVideoFirst: false)
     }
 
     func testScannerHandlesH264HEVCZerosAndRejectsMalformedAndOversizedUnits() throws {
@@ -202,21 +215,68 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         )
     }
 
+    func testScannerRejectsOneByteHEVCNALHeader() throws {
+        XCTAssertThrowsError(
+            try AnnexBScanner.scan(Data([0, 0, 0, 1, 0x40]), codec: .hevc)
+        ) { error in
+            XCTAssertEqual(
+                error as? PlaybackCoreError,
+                .videoDecode(AnnexBScanner.invalidDataErrorCode)
+            )
+        }
+    }
+
+    func testHEVCBuilderCreatesRealFormatAndReadySample() throws {
+        let description = try VideoFormatDescriptionBuilder.make(
+            codec: .hevc,
+            parameterSets: [
+                AssemblerTestFixtures.hevcVPS,
+                AssemblerTestFixtures.hevcSPS,
+                AssemblerTestFixtures.hevcPPS,
+            ]
+        )
+        XCTAssertEqual(
+            CMFormatDescriptionGetMediaSubType(description),
+            kCMVideoCodecType_HEVC
+        )
+        let scan = try AnnexBScanner.scan(
+            AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false),
+            codec: .hevc
+        )
+        let sample = try SampleBufferBuilder.makeVideo(
+            data: scan.lengthPrefixedData,
+            formatDescription: description,
+            presentationTimeStamp: CMTime(value: 1, timescale: 1),
+            decodeTimeStamp: .invalid,
+            duration: .invalid,
+            isRandomAccess: true
+        )
+        XCTAssertTrue(CMSampleBufferDataIsReady(sample))
+        XCTAssertEqual(try copiedSampleData(sample), scan.lengthPrefixedData)
+        XCTAssertEqual(CMSampleBufferGetFormatDescription(sample), description)
+    }
+
     func testExactTimestampConversionPreservesNegativeAndAbsentAndRejectsNonIntegral() throws {
         let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
-        XCTAssertEqual(
+        XCTAssertThrowsError(
             try exactTicks(
                 CMTime(value: Int64.min, timescale: 90_000),
                 timeBase: timeBase
-            ),
-            Int64.min
-        )
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? PlaybackCoreError,
+                .videoDecode(CompressedVideoAssembler.invalidInputErrorCode)
+            )
+        }
         let factory = ScriptedFFmpegParserFactory()
+        let tracks = try AssemblerTestFixtures.videoTracks()
         let subject = try CompressedVideoAssembler(
-            trackSet: AssemblerTestFixtures.videoTracks(),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 1) },
             eventSink: { _ in },
-            parserFactory: factory
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
         )
 
         try subject.push(AssemblerTestFixtures.videoPacket(
@@ -231,6 +291,66 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             XCTAssertEqual(
                 error as? PlaybackCoreError,
                 .videoDecode(CompressedVideoAssembler.invalidInputErrorCode)
+            )
+        }
+        XCTAssertThrowsError(try subject.push(AssemblerTestFixtures.videoPacket(
+            pts: CMTime(value: Int64.min, timescale: 90_000),
+            dts: .invalid
+        ))) { error in
+            XCTAssertEqual(
+                error as? PlaybackCoreError,
+                .videoDecode(CompressedVideoAssembler.invalidInputErrorCode)
+            )
+        }
+        XCTAssertEqual(factory.handles[0].pushCount, 1)
+    }
+
+    func testLiveNativeParserCopiesSynchronousCallbacksAndRoundTripsTimestampPresence() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks().video)
+        var received: [FFmpegParsedFrame] = []
+        let handle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            receiver: { received.append($0) }
+        )
+        var firstInput = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true,
+            nal: Data([0x65, 0x88, 0x84])
+        )
+        var secondInput = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false,
+            nal: Data([0x41, 0x9A, 0x22])
+        )
+
+        try handle.push(firstInput, pts: -90_000, dts: nil, duration: nil)
+        firstInput.resetBytes(in: firstInput.indices)
+        try handle.push(secondInput, pts: nil, dts: nil, duration: nil)
+        XCTAssertEqual(received.count, 1, "the second push must synchronously emit the first AU")
+        let copiedBeforeNativeReuse = try XCTUnwrap(received.first?.bytes)
+        secondInput.resetBytes(in: secondInput.indices)
+        try handle.drain()
+
+        XCTAssertEqual(received.count, 2)
+        XCTAssertEqual(received.map(\.pts), [-90_000, nil])
+        XCTAssertEqual(received.map(\.dts), [nil, nil])
+        XCTAssertEqual(received[0].bytes, copiedBeforeNativeReuse)
+        XCTAssertFalse(received[0].bytes.allSatisfy { $0 == 0 })
+
+        let collisionHandle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            receiver: { _ in }
+        )
+        XCTAssertThrowsError(try collisionHandle.push(
+            AssemblerTestFixtures.h264ParserAccessUnit(
+                includeParameterSets: false,
+                nal: Data([0x41, 0x9B, 0x23])
+            ),
+            pts: Int64.min,
+            dts: nil,
+            duration: nil
+        )) { error in
+            XCTAssertEqual(
+                error as? PlaybackCoreError,
+                .videoDecode(LiveFFmpegParserHandle.malformedFrameErrorCode)
             )
         }
     }
@@ -252,11 +372,13 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             }
         )
         var events: [VideoAssemblerEvent] = []
+        let tracks = try AssemblerTestFixtures.videoTracks()
         let subject = try CompressedVideoAssembler(
-            trackSet: AssemblerTestFixtures.videoTracks(),
+            trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 8) },
             eventSink: { events.append($0) },
             parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks),
             startingID: UInt64.max - 1
         )
 
@@ -274,6 +396,98 @@ final class CompressedVideoAssemblerTests: XCTestCase {
                 .videoDecode(CompressedVideoAssembler.idExhaustedErrorCode)
             )
         }
+    }
+
+    private func assertSharedAVFingerprintsRemainComplete(resetVideoFirst: Bool) throws {
+        let initialCookie = Data([0x11, 0x90])
+        let initialAudio = try XCTUnwrap(AssemblerTestFixtures.audioTracks(
+            extradata: initialCookie
+        ).audio)
+        let initialParameterSets = [
+            AssemblerTestFixtures.h264SPS,
+            AssemblerTestFixtures.h264PPS,
+        ]
+        let initialTracks = try AssemblerTestFixtures.videoTracks(
+            audio: initialAudio,
+            extradata: AssemblerTestFixtures.annexBParameterSets(initialParameterSets)
+        )
+        let formatState = AssemblyFormatState(trackSet: initialTracks)
+        let videoFactory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                bytes: AssemblerTestFixtures.h264AccessUnit(sps: nil, pps: nil)
+            ))
+        }
+        var videoEvents: [VideoAssemblerEvent] = []
+        var audioEvents: [AudioAssemblerEvent] = []
+        let video = try CompressedVideoAssembler(
+            trackSet: initialTracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { videoEvents.append($0) },
+            parserFactory: videoFactory,
+            formatState: formatState
+        )
+        let audio = try CompressedAudioAssembler(
+            trackSet: initialTracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { audioEvents.append($0) },
+            formatState: formatState
+        )
+
+        try video.push(AssemblerTestFixtures.videoPacket())
+        try audio.push(AssemblerTestFixtures.audioPacket(
+            data: Data([0x21, 0x10]),
+            codec: .aac
+        ))
+
+        let initialExpected = try MediaFormatFingerprint(
+            trackSet: initialTracks,
+            videoParameterSets: initialParameterSets,
+            audioCookie: initialCookie
+        )
+        XCTAssertEqual(videoEvents.compactMap(\.formatFingerprint).last, initialExpected)
+        XCTAssertEqual(audioEvents.compactMap(\.formatFingerprint).last, initialExpected)
+
+        var changedSPS = AssemblerTestFixtures.h264SPS
+        changedSPS[3] = 0x20
+        let resetCookie = Data([0x12, 0x10])
+        let resetAudio = try XCTUnwrap(AssemblerTestFixtures.audioTracks(
+            streamIndex: 3,
+            sampleRate: 44_100,
+            extradata: resetCookie
+        ).audio)
+        let resetParameterSets = [changedSPS, AssemblerTestFixtures.h264PPS]
+        let resetTracks = try AssemblerTestFixtures.videoTracks(
+            streamIndex: 2,
+            audio: resetAudio,
+            extradata: AssemblerTestFixtures.annexBParameterSets(resetParameterSets)
+        )
+        if resetVideoFirst {
+            try video.reset(for: resetTracks)
+            try audio.reset(for: resetTracks)
+        } else {
+            try audio.reset(for: resetTracks)
+            try video.reset(for: resetTracks)
+        }
+
+        try video.push(AssemblerTestFixtures.videoPacket(streamIndex: 2))
+        try audio.push(AssemblerTestFixtures.audioPacket(
+            data: Data([0x22, 0x11]),
+            streamIndex: 3,
+            codec: .aac,
+            pts: CMTime(value: 180_000, timescale: 90_000)
+        ))
+
+        let resetExpected = try MediaFormatFingerprint(
+            trackSet: resetTracks,
+            videoParameterSets: resetParameterSets,
+            audioCookie: resetCookie
+        )
+        XCTAssertEqual(videoEvents.compactMap(\.formatFingerprint).last, resetExpected)
+        XCTAssertEqual(audioEvents.compactMap(\.formatFingerprint).last, resetExpected)
+        XCTAssertEqual(
+            videoEvents.compactMap(\.formatFingerprint).last,
+            audioEvents.compactMap(\.formatFingerprint).last
+        )
     }
 
     private func notSyncAttachment(_ sampleBuffer: CMSampleBuffer) throws -> Bool {
@@ -297,6 +511,13 @@ private extension VideoAssemblerEvent {
 
     var formatFingerprint: MediaFormatFingerprint? {
         guard case let .format(_, value) = self else { return nil }
+        return value
+    }
+}
+
+private extension AudioAssemblerEvent {
+    var formatFingerprint: MediaFormatFingerprint? {
+        guard case let .format(_, _, value) = self else { return nil }
         return value
     }
 }
