@@ -5,3 +5,4 @@
 #import <Foundation/Foundation.h>
 #import <VPlayerPlayback/VPFFmpegDemuxer.h>
 #import <VPlayerPlayback/VPFFmpegInventory.h>
+#import <VPlayerPlayback/VPFFmpegParser.h>
