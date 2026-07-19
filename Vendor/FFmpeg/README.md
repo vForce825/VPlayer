@@ -22,6 +22,13 @@ bash Scripts/Tests/test_ffmpeg_lock.sh
 bash Scripts/Tests/test_ffmpeg_audit.sh
 ```
 
+The build acquires the ignored, exclusive `Vendor/FFmpeg/Work/.build-lock`
+before cleaning, fetching, or building and holds it through audit and
+promotion. Each owner/token gets a unique private staging path ending in
+`.xcframework`. A concurrent or stale-looking lock fails closed with bounded
+manual cleanup instructions; it is never stolen automatically. Promotion
+requires the current build owner/token/candidate, an audit-before-and-after tree fingerprint and directory identity match, and a same-filesystem rename.
+
 The build contains only `libavcodec`, `libavformat`, `libavutil`, and
 `libswresample`. It enables HTTP/HTTPS over Secure Transport, the exact
 protocol/parser/bitstream-filter/audio-decoder inventory in
@@ -34,11 +41,12 @@ The combined archives include FFmpeg's pinned IJG-derived files
 `libavcodec/jrevdct.c`. For executable distributions, the accompanying
 documentation must state:
 "this software is based in part on the work of the Independent JPEG Group".
-VPlayer made no additions, deletions, or changes to those three files in the
-pinned FFmpeg source. FFmpeg's upstream licensing map is preserved
-byte-for-byte at `Vendor/FFmpeg/UPSTREAM-LICENSE.md`; the
-three source-file headers in the corresponding source release contain the IJG
-license terms.
+These are FFmpeg-adapted derivatives of IJG originals, not verbatim copies;
+their directly evidenced adaptations are recorded in
+`Vendor/FFmpeg/IJG-CHANGES.md`. No further additions, deletions, or changes are made by VPlayer relative to the pinned FFmpeg source. FFmpeg's upstream
+licensing map is preserved byte-for-byte at
+`Vendor/FFmpeg/UPSTREAM-LICENSE.md`; the three pinned source files and their
+headers are the complete authoritative code and license terms.
 
 FFmpeg 8.1.2 removed the old `--disable-postproc` configure option, so the
 pin uses `--disable-everything`, `--disable-avfilter`, and explicit library
@@ -57,6 +65,14 @@ architecture. The remaining exact symbols are recorded in
 interfaces, CoreFoundation and Security/Secure Transport interfaces, zlib,
 and compiler runtime interfaces. Consumers must link CoreFoundation,
 Security, and zlib (`-lz`). Wildcards are not accepted by the audit.
+
+For checkout-independent output, each Clang slice uses file, macro, and debug
+prefix maps. Immediately after configure and before make, the build
+deterministically normalizes FFMPEG_CONFIGURATION, FFMPEG_DATADIR, and AVCONV_DATADIR to stable virtual roots under `/VPlayer/FFmpeg`. The mapping and
+per-slice virtual install prefix are recorded in each `ffmpeg-build.json`.
+The audit rejects either the logical or physical checkout root in generated
+headers, build records, every installed archive, and every final thin archive;
+target triples and LGPL gates remain unchanged.
 
 ## Redistribution and relinking
 

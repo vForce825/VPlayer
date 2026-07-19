@@ -16,9 +16,12 @@ The distributed FFmpeg archives include the pinned IJG-derived files
 libavcodec/jfdctfst.c, libavcodec/jfdctint_template.c, and
 libavcodec/jrevdct.c. For executable distributions, documentation must state:
 "this software is based in part on the work of the Independent JPEG Group".
-VPlayer made no additions, deletions, or changes to those three files in the
-pinned FFmpeg source. See Vendor/FFmpeg/UPSTREAM-LICENSE.md and the corresponding pinned
-source-file headers for the upstream licensing map and IJG license terms.
+These files are FFmpeg-adapted derivatives of IJG originals, not verbatim
+copies; see Vendor/FFmpeg/IJG-CHANGES.md for the adaptations directly evidenced
+by the pinned source. No further additions, deletions, or changes are made by VPlayer relative to the pinned FFmpeg source. See
+Vendor/FFmpeg/UPSTREAM-LICENSE.md and the pinned source files and headers for
+the complete authoritative code, upstream licensing map, and IJG license
+terms.
 
 Distributions must include FFmpeg's notices and corresponding source for the
 exact revision, plus relinkable VPlayer object material and instructions that

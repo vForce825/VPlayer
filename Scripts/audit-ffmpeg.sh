@@ -5,11 +5,15 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+physical_root="$(cd -P "$(dirname "$0")/.." && pwd)"
 vendor="$root/Vendor/FFmpeg"
 lock="$vendor/ffmpeg.lock.json"
 manifest="$vendor/component-manifest.json"
 work="$vendor/Work"
 source="$work/source"
+virtual_checkout='/VPlayer/FFmpeg/Checkout'
+virtual_source='/VPlayer/FFmpeg/Source'
+virtual_install_base='/VPlayer/FFmpeg/Install'
 
 fail() {
   echo "FFmpeg audit failed: $*" >&2
@@ -86,6 +90,26 @@ require_define() {
   [[ "$actual" == "$expected" ]] || fail "$macro is ${actual:-missing}, expected $expected in $file"
 }
 
+assert_text_omits_checkout_roots() {
+  local file="$1" description="$2" checkout_root
+  for checkout_root in "$root" "$physical_root"; do
+    [[ -n "$checkout_root" ]] || continue
+    if grep -F "$checkout_root" "$file" >/dev/null; then
+      fail "checkout root leaked into $description"
+    fi
+  done
+}
+
+assert_archive_omits_checkout_roots() {
+  local archive="$1" description="$2" checkout_root
+  for checkout_root in "$root" "$physical_root"; do
+    [[ -n "$checkout_root" ]] || continue
+    if strings -a "$archive" | grep -F "$checkout_root" >/dev/null; then
+      fail "checkout root leaked into $description"
+    fi
+  done
+}
+
 audit_component_category() {
   local config="$1" suffix="$2" key="$3" actual expected
   actual="$(awk -v suffix="$suffix" '
@@ -123,16 +147,26 @@ audit_build_record() {
   config="$metadata_dir/config.h"
   components="$metadata_dir/config_components.h"
   [[ -f "$config" && -f "$components" ]] || fail "build configuration headers missing beside $record"
+  assert_text_omits_checkout_roots "$config" "$(basename "$(dirname "$record")") config.h"
+  assert_text_omits_checkout_roots "$components" "$(basename "$(dirname "$record")") config_components.h"
+  assert_text_omits_checkout_roots "$record" "$(basename "$(dirname "$record")") build record"
 
   jq -e --arg commit "$commit" --arg license "$license_mode" --arg sha "$license_sha" \
+    --arg checkout "$virtual_checkout" --arg source "$virtual_source" \
+    --arg installBase "$virtual_install_base" \
     --argjson flags "$flags_json" --slurpfile manifest "$manifest" '
-      .schemaVersion == 1 and
+      .schemaVersion == 2 and
       .commit == $commit and
       .license.mode == $license and
       .license.sha256 == $sha and
       .configureFlags == $flags and
       .components == $manifest[0] and
-      (keys | sort) == (["arch","archives","commit","components","configureFlags","extraConfigureFlags","license","schemaVersion","sdk","slice","target"] | sort) and
+      .pathNormalization == {
+        checkoutRoot:$checkout, sourceRoot:$source,
+        installPrefix:($installBase + "/" + .slice),
+        compilerPrefixMaps:["file","macro","debug"]
+      } and
+      (keys | sort) == (["arch","archives","commit","components","configureFlags","extraConfigureFlags","license","pathNormalization","schemaVersion","sdk","slice","target"] | sort) and
       (.license | keys | sort) == (["mode","sha256"] | sort) and
       (.archives | keys | sort) == (["libFFmpeg.a","libavcodec.a","libavformat.a","libavutil.a","libswresample.a"] | sort)
     ' "$record" >/dev/null || fail "invalid build record: $record"
@@ -199,7 +233,13 @@ audit_build_record() {
   require_define "$config" CONFIG_STATIC 1
   require_define "$config" CONFIG_SMALL 1
   grep -Fqx '#define FFMPEG_LICENSE "LGPL version 2.1 or later"' "$config" || fail "$slice reports a non-LGPL configure license"
-  grep -Fq -- "--extra-cflags='-target $target -fapplication-extension'" "$config" || fail "$slice config does not contain the audited target triple"
+  grep -Fq -- "--extra-cflags='-target $target -fapplication-extension" "$config" || fail "$slice config does not contain the audited target triple"
+  grep -Fq -- "-ffile-prefix-map=$virtual_checkout=$virtual_source" "$config" || fail "$slice config lacks stable file prefix mapping"
+  grep -Fq -- "-fmacro-prefix-map=$virtual_checkout=$virtual_source" "$config" || fail "$slice config lacks stable macro prefix mapping"
+  grep -Fq -- "-fdebug-prefix-map=$virtual_checkout=$virtual_source" "$config" || fail "$slice config lacks stable debug prefix mapping"
+  grep -Fq -- "--prefix=$virtual_install_base/$slice" "$config" || fail "$slice config lacks its stable virtual prefix"
+  grep -Fqx "#define FFMPEG_DATADIR \"$virtual_install_base/$slice/share/ffmpeg\"" "$config" || fail "$slice FFMPEG_DATADIR is not normalized"
+  grep -Fqx "#define AVCONV_DATADIR \"$virtual_install_base/$slice/share/ffmpeg\"" "$config" || fail "$slice AVCONV_DATADIR is not normalized"
   load_inventory="$(/usr/bin/otool -l "$prefix/lib/libFFmpeg.a" | awk '/^[[:space:]]*platform / || /^[[:space:]]*minos / {print $1, $2}' | LC_ALL=C sort -u)"
   expected_load_inventory="$(printf 'minos 18.0\nplatform %s' "$expected_platform_id")"
   [[ "$load_inventory" == "$expected_load_inventory" ]] || fail "$slice Mach-O platform or minimum OS differs from tvOS 18.0"
@@ -233,6 +273,7 @@ ARCHIVES
     expected_sha="$(jq -er --arg name "$archive_name" '.archives[$name]' "$record")"
     actual_sha="$(shasum -a 256 "$prefix/lib/$archive_name" | awk '{print $1}')"
     [[ "$actual_sha" == "$expected_sha" ]] || fail "$slice $archive_name differs from recorded build output"
+    assert_archive_omits_checkout_roots "$prefix/lib/$archive_name" "$slice installed $archive_name"
   done
   [[ "$(jq '.archives | length' "$record")" == "5" ]] || fail "$slice archive inventory contains extra entries"
 
@@ -247,6 +288,7 @@ ARCHIVES
   fi
   expected_sha="$(jq -er '.archives["libFFmpeg.a"]' "$record")"
   [[ "$actual_sha" == "$expected_sha" ]] || fail "$slice XCFramework archive differs from recorded thin archive"
+  assert_archive_omits_checkout_roots "${extracted:-$xc_archive}" "$slice final thin libFFmpeg.a"
 
   printf '%s\n' "$slice" >> "$tmp/seen-slices.txt"
 }

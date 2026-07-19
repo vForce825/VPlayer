@@ -126,8 +126,12 @@ case_root="$(new_case component-config)"
 printf '#define CONFIG_UDP_PROTOCOL 1\n' >> "$(device_components "$case_root")"
 assert_rejected "$case_root" "enabled protocols differ from component manifest" "an unexpected config_components protocol"
 
+case_root="$(new_case host-path-config)"
+replace_define "$(device_config "$case_root")" FFMPEG_DATADIR "\"$case_root/private-host-path\""
+assert_rejected "$case_root" "checkout root leaked into device config.h" "a reintroduced host checkout path"
+
 case_root="$(new_case record-schema)"
-replace_json "$(device_record "$case_root")" '.schemaVersion = 2'
+replace_json "$(device_record "$case_root")" '.schemaVersion = 3'
 assert_rejected "$case_root" "invalid build record" "a tampered record schema"
 
 case_root="$(new_case record-commit)"

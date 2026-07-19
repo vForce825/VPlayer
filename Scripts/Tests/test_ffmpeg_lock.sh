@@ -8,16 +8,44 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 lock="$root/Vendor/FFmpeg/ffmpeg.lock.json"
 flags="$root/Vendor/FFmpeg/configure.flags"
 upstream_license="$root/Vendor/FFmpeg/UPSTREAM-LICENSE.md"
+ijg_changes="$root/Vendor/FFmpeg/IJG-CHANGES.md"
 
 test "$(jq -r .tag "$lock")" = "n8.1.2"
 test "$(jq -r .commit "$lock")" = "38b88335f99e76ed89ff3c93f877fdefce736c13"
 test "$(jq -r .sourceURL "$lock")" = "https://git.ffmpeg.org/ffmpeg.git"
 test "$(jq -r .licenseMode "$lock")" = "LGPL-2.1-or-later"
 test -f "$upstream_license"
+test -f "$ijg_changes"
+
+grep -F 'FFmpeg-adapted derivatives of IJG originals, not verbatim copies' "$ijg_changes" >/dev/null
+for source_name in jfdctfst.c jfdctint_template.c jrevdct.c; do
+  grep -F "libavcodec/$source_name" "$ijg_changes" >/dev/null
+done
+grep -F 'ff_fdct_ifast' "$ijg_changes" >/dev/null
+grep -F 'FUNC(ff_jpeg_fdct_islow)' "$ijg_changes" >/dev/null
+grep -F 'ff_j_rev_dct4' "$ijg_changes" >/dev/null
+grep -F 'ff_jref_idct_put' "$ijg_changes" >/dev/null
+
+pinned_source="$root/Vendor/FFmpeg/Work/source/libavcodec"
+grep -F '#include "libavutil/attributes.h"' "$pinned_source/jfdctfst.c" >/dev/null
+grep -F 'ff_fdct_ifast (int16_t * data)' "$pinned_source/jfdctfst.c" >/dev/null
+grep -F '#include "bit_depth_template.c"' "$pinned_source/jfdctint_template.c" >/dev/null
+grep -F 'FUNC(ff_jpeg_fdct_islow)(int16_t *data)' "$pinned_source/jfdctint_template.c" >/dev/null
+grep -F '#include "libavutil/intreadwrite.h"' "$pinned_source/jrevdct.c" >/dev/null
+grep -F 'void ff_j_rev_dct4(DCTBLOCK data)' "$pinned_source/jrevdct.c" >/dev/null
+grep -F 'void ff_jref_idct_put' "$pinned_source/jrevdct.c" >/dev/null
+
+for slice in device sim-arm64 sim-x86_64; do
+  archive="$root/Vendor/FFmpeg/Work/install-$slice/lib/libFFmpeg.a"
+  for object_name in jfdctfst.o jfdctint.o jrevdct.o; do
+    /usr/bin/ar -t "$archive" | grep -Fqx "$object_name"
+  done
+done
 
 for documentation in "$root/THIRD_PARTY_NOTICES" "$root/Vendor/FFmpeg/README.md"; do
   grep -F 'this software is based in part on the work of the Independent JPEG Group' "$documentation" >/dev/null
-  grep -F 'no additions, deletions, or changes' "$documentation" >/dev/null
+  grep -F 'No further additions, deletions, or changes are made by VPlayer relative to the pinned FFmpeg source' "$documentation" >/dev/null
+  grep -F 'Vendor/FFmpeg/IJG-CHANGES.md' "$documentation" >/dev/null
   grep -F 'Vendor/FFmpeg/UPSTREAM-LICENSE.md' "$documentation" >/dev/null
   grep -F 'permit customers to modify the application for their own use' "$documentation" >/dev/null
   grep -F 'permit reverse engineering for debugging those modifications' "$documentation" >/dev/null
