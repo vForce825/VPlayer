@@ -1410,10 +1410,19 @@ final class AppModelTests: XCTestCase {
                 """.utf8),
                 gatesCompletion: true
             )
+            let (waiterRegistrations, waiterRegistrationContinuation) = AsyncStream.makeStream(
+                of: RefreshCoordinator.WaiterRegistration.self,
+                bufferingPolicy: .unbounded
+            )
+            defer { waiterRegistrationContinuation.finish() }
+            var waiterRegistrationIterator = waiterRegistrations.makeAsyncIterator()
             let coordinator = RefreshCoordinator(
                 repository: repository,
                 downloader: downloader,
-                now: { clock.value }
+                now: { clock.value },
+                waiterRegistrationObserver: { registration in
+                    waiterRegistrationContinuation.yield(registration)
+                }
             )
             let model = AppModel(
                 repository: repository,
@@ -1438,6 +1447,13 @@ final class AppModelTests: XCTestCase {
                 )
             }
             await downloader.waitUntilStarted()
+            guard let originalRegistration = await waiterRegistrationIterator.next() else {
+                XCTFail("Missing original waiter registration", file: #filePath, line: #line)
+                return
+            }
+            XCTAssertEqual(originalRegistration.profileID, profile.id, scenario.name)
+            XCTAssertEqual(originalRegistration.resource, .playlist, scenario.name)
+            XCTAssertEqual(originalRegistration.waiterCount, 1, scenario.name)
             let inFlightSnapshot = await repository.snapshot()
             XCTAssertEqual(inFlightSnapshot.profiles.first?.m3uStatus.state, .refreshing, scenario.name)
             XCTAssertEqual(
@@ -1466,17 +1482,30 @@ final class AppModelTests: XCTestCase {
                 model.profiles.first?.m3uStatus.lastAttemptAt == manualStartedAt
                     && model.profiles.first?.m3uStatus.state == .refreshing
             }
-            for _ in 0..<10 { await Task.yield() }
+            guard let joinedRegistration = await waiterRegistrationIterator.next() else {
+                XCTFail("Missing joined waiter registration", file: #filePath, line: #line)
+                return
+            }
+            XCTAssertEqual(joinedRegistration.profileID, profile.id, scenario.name)
+            XCTAssertEqual(joinedRegistration.resource, .playlist, scenario.name)
+            XCTAssertEqual(joinedRegistration.flightID, originalRegistration.flightID, scenario.name)
+            XCTAssertEqual(joinedRegistration.waiterCount, 2, scenario.name)
             manualWaiter.cancel()
             await manualWaiter.value
 
             XCTAssertEqual(model.profiles.first?.m3uStatus.lastAttemptAt, manualStartedAt, scenario.name)
             XCTAssertEqual(model.profiles.first?.m3uStatus.state, .failed, scenario.name)
             XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。", scenario.name)
+            XCTAssertEqual(
+                model.profiles.first?.m3uStatus.attemptID,
+                originalRegistration.flightID,
+                scenario.name
+            )
 
             await downloader.releaseCompletion()
             let originalOutcomes = await originalWaiter.value
             XCTAssertEqual(originalOutcomes.first?.succeeded, true, scenario.name)
+            XCTAssertEqual(originalOutcomes.first?.attemptID, originalRegistration.flightID, scenario.name)
             let successSnapshot = await repository.snapshot()
             XCTAssertEqual(successSnapshot.profiles.first?.m3uStatus.state, .succeeded, scenario.name)
             XCTAssertEqual(
@@ -1525,10 +1554,19 @@ final class AppModelTests: XCTestCase {
             payload: Data("not an m3u".utf8),
             gatesCompletion: true
         )
+        let (waiterRegistrations, waiterRegistrationContinuation) = AsyncStream.makeStream(
+            of: RefreshCoordinator.WaiterRegistration.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { waiterRegistrationContinuation.finish() }
+        var waiterRegistrationIterator = waiterRegistrations.makeAsyncIterator()
         let coordinator = RefreshCoordinator(
             repository: repository,
             downloader: downloader,
-            now: { clock.value }
+            now: { clock.value },
+            waiterRegistrationObserver: { registration in
+                waiterRegistrationContinuation.yield(registration)
+            }
         )
         let model = AppModel(
             repository: repository,
@@ -1551,6 +1589,13 @@ final class AppModelTests: XCTestCase {
             )
         }
         await downloader.waitUntilStarted()
+        guard let originalRegistration = await waiterRegistrationIterator.next() else {
+            XCTFail("Missing original waiter registration", file: #filePath, line: #line)
+            return
+        }
+        XCTAssertEqual(originalRegistration.profileID, profile.id)
+        XCTAssertEqual(originalRegistration.resource, .playlist)
+        XCTAssertEqual(originalRegistration.waiterCount, 1)
         clock.value = manualStartedAt
         let manualWaiter = Task {
             await model.refresh(profileID: profile.id, resource: .playlist)
@@ -1559,10 +1604,18 @@ final class AppModelTests: XCTestCase {
             model.profiles.first?.m3uStatus.lastAttemptAt == manualStartedAt
                 && model.profiles.first?.m3uStatus.state == .refreshing
         }
-        for _ in 0..<10 { await Task.yield() }
+        guard let joinedRegistration = await waiterRegistrationIterator.next() else {
+            XCTFail("Missing joined waiter registration", file: #filePath, line: #line)
+            return
+        }
+        XCTAssertEqual(joinedRegistration.profileID, profile.id)
+        XCTAssertEqual(joinedRegistration.resource, .playlist)
+        XCTAssertEqual(joinedRegistration.flightID, originalRegistration.flightID)
+        XCTAssertEqual(joinedRegistration.waiterCount, 2)
         manualWaiter.cancel()
         await manualWaiter.value
         XCTAssertEqual(model.profiles.first?.m3uStatus.errorSummary, "刷新已取消。")
+        XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, originalRegistration.flightID)
 
         await downloader.releaseCompletion()
         let originalOutcomes = await originalWaiter.value
@@ -1570,6 +1623,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(originalOutcomes.first?.succeeded, false)
         XCTAssertNotNil(terminalMessage)
         XCTAssertNotEqual(terminalMessage, "刷新已取消。")
+        XCTAssertEqual(originalOutcomes.first?.attemptID, originalRegistration.flightID)
 
         let firstReloadSucceeded = await model.reload()
         let secondReloadSucceeded = await model.reload()
@@ -2081,16 +2135,25 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(weakModel)
     }
 
-    func testLibraryChangeNotificationsDuringReloadCoalesceToOneLatestFollowUp() async throws {
+    func testLibraryChangeNotificationsDuringReloadCoalesceToOneLatestFollowUp() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
         let channel = makeChannel(profileID: profile.id, url: "https://example.test/live", tvgID: nil, order: 0)
         let repository = RepositorySpy(profiles: [profile], channels: [profile.id: [channel]])
         let changes = LibraryChangeSignal()
+        let (processedChanges, processedChangeContinuation) = AsyncStream.makeStream(
+            of: AppModel.ProcessedLibraryChange.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { processedChangeContinuation.finish() }
+        var processedChangeIterator = processedChanges.makeAsyncIterator()
         let model = AppModel(
             repository: repository,
             refresh: { _, _, _ in [] },
             libraryChanges: changes,
+            libraryChangeProcessed: { processing in
+                processedChangeContinuation.yield(processing)
+            },
             now: { now }
         )
 
@@ -2103,23 +2166,27 @@ final class AppModelTests: XCTestCase {
         for _ in 0..<1_000 {
             changes.notify()
         }
+        let newestGeneration = changes.generation
         await repository.releaseChannelRead()
         await repository.waitUntilChannelReadIsBlocked()
 
         var snapshot = await repository.snapshot()
         XCTAssertEqual(snapshot.profileLookupCount, 3)
 
-        await repository.gateNextChannelRead()
         await repository.releaseChannelRead()
-        try await Task.sleep(for: .milliseconds(100))
+        var newestProcessing: AppModel.ProcessedLibraryChange?
+        while let processing = await processedChangeIterator.next() {
+            if processing.generation == newestGeneration {
+                newestProcessing = processing
+                break
+            }
+        }
+        XCTAssertEqual(newestProcessing?.generation, newestGeneration)
+        XCTAssertEqual(newestProcessing?.reloadApplied, true)
         snapshot = await repository.snapshot()
         XCTAssertEqual(snapshot.profileLookupCount, 3)
         XCTAssertFalse(model.isLoading)
         XCTAssertEqual(model.channels, [channel])
-
-        if snapshot.profileLookupCount > 3 {
-            await repository.releaseChannelRead()
-        }
     }
 
     func testLibraryChangeStreamCatchesUpAndBuffersOnlyNewestGeneration() async {

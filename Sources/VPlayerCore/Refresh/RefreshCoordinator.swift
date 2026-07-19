@@ -32,6 +32,15 @@ public struct RefreshOutcome: Equatable, Sendable {
 public actor RefreshCoordinator {
     public typealias PersistedOutcomeHandler = @Sendable (UUID, RefreshOutcome) async -> Void
 
+    struct WaiterRegistration: Equatable, Sendable {
+        let profileID: UUID
+        let resource: RefreshResource
+        let flightID: UUID
+        let waiterCount: Int
+    }
+
+    typealias WaiterRegistrationObserver = @Sendable (WaiterRegistration) -> Void
+
     private struct RefreshKey: Hashable, Sendable {
         let profileID: UUID
         let resource: RefreshResource
@@ -58,6 +67,7 @@ public actor RefreshCoordinator {
     private let downloader: any RemoteResourceDownloading
     private let now: @Sendable () -> Date
     private let onPersistedOutcome: PersistedOutcomeHandler?
+    private let waiterRegistrationObserver: WaiterRegistrationObserver?
     private var inFlight: [RefreshKey: InFlight] = [:]
 
     public init(
@@ -70,6 +80,21 @@ public actor RefreshCoordinator {
         self.downloader = downloader
         self.now = now
         self.onPersistedOutcome = onPersistedOutcome
+        waiterRegistrationObserver = nil
+    }
+
+    init(
+        repository: any LibraryRepository & RefreshSnapshotCommitting,
+        downloader: any RemoteResourceDownloading,
+        now: @escaping @Sendable () -> Date = Date.init,
+        onPersistedOutcome: PersistedOutcomeHandler? = nil,
+        waiterRegistrationObserver: @escaping WaiterRegistrationObserver
+    ) {
+        self.repository = repository
+        self.downloader = downloader
+        self.now = now
+        self.onPersistedOutcome = onPersistedOutcome
+        self.waiterRegistrationObserver = waiterRegistrationObserver
     }
 
     public func refresh(
@@ -167,6 +192,12 @@ public actor RefreshCoordinator {
                 }
                 flight.waiters[waiterID] = continuation
                 inFlight[key] = flight
+                waiterRegistrationObserver?(WaiterRegistration(
+                    profileID: profileID,
+                    resource: resource,
+                    flightID: flightID,
+                    waiterCount: flight.waiters.count
+                ))
             }
         } onCancel: {
             Task {

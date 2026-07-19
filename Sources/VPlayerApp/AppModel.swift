@@ -16,6 +16,13 @@ final class AppModel {
         RefreshTrigger
     ) async -> [RefreshOutcome]
 
+    struct ProcessedLibraryChange: Equatable, Sendable {
+        let generation: Int
+        let reloadApplied: Bool
+    }
+
+    typealias LibraryChangeProcessed = @Sendable (ProcessedLibraryChange) -> Void
+
     var profiles: [SourceProfile] = []
     var activeProfile: SourceProfile?
     var channels: [Channel] = []
@@ -54,6 +61,7 @@ final class AppModel {
         repository: any LibraryRepository,
         refresh: @escaping Refresh,
         libraryChanges: LibraryChangeSignal? = nil,
+        libraryChangeProcessed: LibraryChangeProcessed? = nil,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.repository = repository
@@ -63,9 +71,14 @@ final class AppModel {
             let observedGeneration = libraryChanges.generation
             libraryChangeTask = Task { @MainActor [weak self, weak libraryChanges] in
                 guard let libraryChanges else { return }
-                for await _ in libraryChanges.changes(after: observedGeneration) {
+                for await generation in libraryChanges.changes(after: observedGeneration) {
                     guard !Task.isCancelled else { return }
-                    await self?.reload()
+                    guard let self else { return }
+                    let reloadApplied = await self.reload()
+                    libraryChangeProcessed?(ProcessedLibraryChange(
+                        generation: generation,
+                        reloadApplied: reloadApplied
+                    ))
                 }
             }
         }
