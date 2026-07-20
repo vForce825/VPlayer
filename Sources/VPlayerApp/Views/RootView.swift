@@ -67,6 +67,8 @@ struct RootView: View {
                 request: request,
                 engine: dependencies.playbackEngine,
                 presentationProvider: dependencies.playbackPresentationProvider,
+                metricsProvider: dependencies.playbackMetricsProvider,
+                acceptanceMetricsEnabled: dependencies.exposesAcceptanceMetrics,
                 settings: dependencies.playbackSettings
             ) {
                 model.dismissPlayback()

@@ -75,6 +75,7 @@
 		5066BD6D3AA4CAE5E56B9DA8 /* ScanTypeClassifierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F148C28BCD1B9AA7917E6B8 /* ScanTypeClassifierTests.swift */; };
 		50FF1E365B87A2BD253AF2F9 /* BoundedMediaQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92568840EBCE801B89236C72 /* BoundedMediaQueueTests.swift */; };
 		51DE1B0CD62B5693CF954F11 /* MediaGenerationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84F5424A7A62E03689F1A0AE /* MediaGenerationTests.swift */; };
+		52A3B2F6147F112EC1A4D951 /* PlaybackMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D84B6637D2D1BC5988140026 /* PlaybackMetricsTests.swift */; };
 		52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */; };
 		5324D682E94BD8CBD749AFE7 /* ChannelRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2130C293D6ED355F03565731 /* ChannelRow.swift */; };
 		550719CB422761BB77BB4867 /* VPlayerAppStartupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A310932D1DA088CF7E99CCF /* VPlayerAppStartupTests.swift */; };
@@ -187,6 +188,7 @@
 		DC105589DE1F39C1E0B37AC8 /* AudioRenderPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8576D8DDC02E6C1D6374132C /* AudioRenderPipeline.swift */; };
 		DD97F1D420CAAB101CDE4053 /* MediaTimestampTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 386002BD6CA2FC4B9189B858 /* MediaTimestampTests.swift */; };
 		DFC4CAEA21A686600E575881 /* BackgroundRefreshRegistrar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E5EE57E19FE06FCEEE441B9 /* BackgroundRefreshRegistrar.swift */; };
+		E2A85306B85D158E00C63B30 /* LongPlaybackAcceptanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C953CBB3F6CEDA55B0DE4DC /* LongPlaybackAcceptanceTests.swift */; };
 		E39BA3C9C9C938028709CB71 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C8C8CA1BD7FBE099A6FEEDE8 /* CoreFoundation.framework */; };
 		E54B6CA0A9B20ED306509A1C /* PlaybackFixtureIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27CCD92C354A59559E02E534 /* PlaybackFixtureIntegrationTests.swift */; };
 		E5B997E005CE0E4A110A9A43 /* RedactedURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = E06EC3BAD31415A9EDE7701D /* RedactedURL.swift */; };
@@ -197,6 +199,8 @@
 		EB4B1B6963487383BD9D3BA3 /* ProgressiveSurfacePool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 318666315A436EFEB9A374B9 /* ProgressiveSurfacePool.swift */; };
 		EC28750912618F80A870889C /* PlaybackClockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D375E53A4FFEF498BBC75FC /* PlaybackClockTests.swift */; };
 		EC428FCDA3FDB59AF2C77783 /* RefreshTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8962CD0CAB958608B6C759D /* RefreshTypes.swift */; };
+		EE4B001C22E1210BA051E36B /* PlaybackMetrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A52E5032DA9A0E428585979A /* PlaybackMetrics.swift */; };
+		EEB4EBD5D4D4E33638C9B081 /* PlaybackSignposts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80B4BA5D82A3CDBA418A7709 /* PlaybackSignposts.swift */; };
 		EEC3009CD506D94EE6348E58 /* VPFFmpegInventory.h in Headers */ = {isa = PBXBuildFile; fileRef = 9DD7C6783CC719FD2FFA2CDC /* VPFFmpegInventory.h */; settings = {ATTRIBUTES = (Public, ); }; };
 		F1605BF4CBDC7ECA1070A270 /* EPGPersistenceSink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63588834D9476CAF4EF3F770 /* EPGPersistenceSink.swift */; };
 		F16342F88880B29F1FA799B0 /* ChannelEPGMappingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A444ABEA3E13FA3A2BD4460 /* ChannelEPGMappingView.swift */; };
@@ -360,6 +364,7 @@
 		3BC07E59D5A77AEDA7743492 /* NetworkFailureMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkFailureMapper.swift; sourceTree = "<group>"; };
 		3BD849891A41E876402BADA1 /* StreamProtocolPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProtocolPolicy.swift; sourceTree = "<group>"; };
 		3C1ABD1121838FD686B24D7A /* VideoTestFactories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoTestFactories.swift; sourceTree = "<group>"; };
+		3C953CBB3F6CEDA55B0DE4DC /* LongPlaybackAcceptanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongPlaybackAcceptanceTests.swift; sourceTree = "<group>"; };
 		3E8424C82A7C430CDF059354 /* RefreshCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshCoordinator.swift; sourceTree = "<group>"; };
 		3FEAD5362C95E1C9A0089692 /* VideoPresentationQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPresentationQueue.swift; sourceTree = "<group>"; };
 		403AED4B11B4E79784EE8F88 /* CryptoKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CryptoKit.framework; path = System/Library/Frameworks/CryptoKit.framework; sourceTree = SDKROOT; };
@@ -414,6 +419,7 @@
 		7C223C8A6F940C833479BF7D /* MetalVideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalVideoView.swift; sourceTree = "<group>"; };
 		7D6AAD4FCE5CC250AEAF8DD4 /* MediaTimestamp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaTimestamp.swift; sourceTree = "<group>"; };
 		7F6EA8E449CEB8EFB532EB0E /* VPFFmpegParser.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = VPFFmpegParser.c; sourceTree = "<group>"; };
+		80B4BA5D82A3CDBA418A7709 /* PlaybackSignposts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSignposts.swift; sourceTree = "<group>"; };
 		831A88667C84AB1FB4B236ED /* ForegroundRefreshDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ForegroundRefreshDriver.swift; sourceTree = "<group>"; };
 		84D67811AADAA8AC5192F218 /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
 		84F5424A7A62E03689F1A0AE /* MediaGenerationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaGenerationTests.swift; sourceTree = "<group>"; };
@@ -441,6 +447,7 @@
 		A2D1071374DC489D6103DE84 /* MetalDisplayLinkDriverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDisplayLinkDriverTests.swift; sourceTree = "<group>"; };
 		A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URLSessionBoundedDownloaderTests.swift; sourceTree = "<group>"; };
 		A3DC6FBBF870004CB37402A6 /* EPGMatcherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGMatcherTests.swift; sourceTree = "<group>"; };
+		A52E5032DA9A0E428585979A /* PlaybackMetrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackMetrics.swift; sourceTree = "<group>"; };
 		A59532FEADDA1D86BE295EBC /* TemporalNoticeGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemporalNoticeGateTests.swift; sourceTree = "<group>"; };
 		A661E9919B5D9A88432C46D6 /* M3UParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UParser.swift; sourceTree = "<group>"; };
 		AC0E58729472755F6492C182 /* AppleTemporalConfigurator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleTemporalConfigurator.swift; sourceTree = "<group>"; };
@@ -464,6 +471,7 @@
 		D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = VPlayerCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		D5BF62AE53443B1D95C61E19 /* RenderSynchronizerClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderSynchronizerClock.swift; sourceTree = "<group>"; };
 		D76A0ADCC4357738AB36D065 /* SHA256SUMS */ = {isa = PBXFileReference; path = SHA256SUMS; sourceTree = "<group>"; };
+		D84B6637D2D1BC5988140026 /* PlaybackMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackMetricsTests.swift; sourceTree = "<group>"; };
 		D8E1C7B65261EC92D9D3B8F0 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		DB93919F5EFFA65A999C2216 /* PlaybackCoreError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackCoreError.swift; sourceTree = "<group>"; };
 		DD5D7004E99A55C744136EBC /* master.m3u8 */ = {isa = PBXFileReference; path = master.m3u8; sourceTree = "<group>"; };
@@ -544,6 +552,7 @@
 				EC1EAB12B5E9532565A98ACD /* Audio */,
 				61256C0E4D11FC98DCE1BBD5 /* Deinterlace */,
 				854DF8184C013424F8115C1D /* Demux */,
+				ED56EDBF6F40835D15699C5B /* Diagnostics */,
 				0E54D809BFDCB06FA03E39FB /* FFmpeg */,
 				68FF9BF178093DA414BB24F5 /* include */,
 				395AB9E2F7C6412541BB50BF /* Media */,
@@ -773,6 +782,7 @@
 				4D375E53A4FFEF498BBC75FC /* PlaybackClockTests.swift */,
 				F65415DE7536448E27200AAF /* PlaybackErrorMappingTests.swift */,
 				27CCD92C354A59559E02E534 /* PlaybackFixtureIntegrationTests.swift */,
+				D84B6637D2D1BC5988140026 /* PlaybackMetricsTests.swift */,
 				076C8411F54815FE5B2CA453 /* PlaybackPipelineTests.swift */,
 				734831C9A404E9E3C851BDD4 /* PlaybackPresentationContextTests.swift */,
 				16D419C6385433C4A3DC149C /* PlaybackSerialExecutorTests.swift */,
@@ -1025,6 +1035,7 @@
 			isa = PBXGroup;
 			children = (
 				ED0F39ED67B1A2AE262F47AD /* FullScreenPlayerUITests.swift */,
+				3C953CBB3F6CEDA55B0DE4DC /* LongPlaybackAcceptanceTests.swift */,
 				F83B421173E1978DA035BF40 /* VPlayerUITests.swift */,
 			);
 			path = VPlayerUITests;
@@ -1043,6 +1054,15 @@
 				E71FD24D9AECBC53F2FED26A /* SystemAudioRenderer.swift */,
 			);
 			path = Audio;
+			sourceTree = "<group>";
+		};
+		ED56EDBF6F40835D15699C5B /* Diagnostics */ = {
+			isa = PBXGroup;
+			children = (
+				A52E5032DA9A0E428585979A /* PlaybackMetrics.swift */,
+				80B4BA5D82A3CDBA418A7709 /* PlaybackSignposts.swift */,
+			);
+			path = Diagnostics;
 			sourceTree = "<group>";
 		};
 		F79D6F74C711B4F773BCF864 /* VPlayerApp */ = {
@@ -1368,6 +1388,7 @@
 				810FB6A4CDB7D75C40FDC581 /* PlaybackComponentFakes.swift in Sources */,
 				C837CF3C32970BC15ABC19E3 /* PlaybackErrorMappingTests.swift in Sources */,
 				E54B6CA0A9B20ED306509A1C /* PlaybackFixtureIntegrationTests.swift in Sources */,
+				52A3B2F6147F112EC1A4D951 /* PlaybackMetricsTests.swift in Sources */,
 				98DC7142278A6AF0C54DBD2B /* PlaybackPipelineTests.swift in Sources */,
 				102D66B91ED9F473DD5533D6 /* PlaybackPresentationContextTests.swift in Sources */,
 				5777308D17C83F752A76BAB4 /* PlaybackSerialExecutorTests.swift in Sources */,
@@ -1401,6 +1422,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				429B13395E9BE4781A531363 /* FullScreenPlayerUITests.swift in Sources */,
+				E2A85306B85D158E00C63B30 /* LongPlaybackAcceptanceTests.swift in Sources */,
 				849637FE454BDD01737C072F /* VPlayerUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1440,11 +1462,13 @@
 				65B88FED397CA6E730F3E3D0 /* PlaybackContracts.swift in Sources */,
 				A80DB8BF33009CC7993811BC /* PlaybackController.swift in Sources */,
 				E7AC553FC29627CC303F2EDA /* PlaybackCoreError.swift in Sources */,
+				EE4B001C22E1210BA051E36B /* PlaybackMetrics.swift in Sources */,
 				22D7FC33467D3F01406825B9 /* PlaybackPipeline.swift in Sources */,
 				13E6C46AA52A4FD2B0C43302 /* PlaybackPresentationContext.swift in Sources */,
 				AF8B3BCB2701E1123A7A08E7 /* PlaybackReadinessGate.swift in Sources */,
 				F6C7655F0A93CD26F8BB7115 /* PlaybackSerialExecutor.swift in Sources */,
 				290B8EF57BFE20A0C85264ED /* PlaybackSettingsStore.swift in Sources */,
+				EEB4EBD5D4D4E33638C9B081 /* PlaybackSignposts.swift in Sources */,
 				AD1EC292982AA0C8A8B52455 /* PresentationTimestampNormalizer.swift in Sources */,
 				EB4B1B6963487383BD9D3BA3 /* ProgressiveSurfacePool.swift in Sources */,
 				46A95371746F50F61231F9EA /* RenderSynchronizerClock.swift in Sources */,
@@ -1632,7 +1656,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Tests/VPlayerUITests/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1701,7 +1726,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Tests/VPlayerUITests/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

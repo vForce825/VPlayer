@@ -46,6 +46,30 @@ final class VPlayerAppStartupTests: XCTestCase {
         ]).playbackFixture)
     }
 
+    func testAcceptanceLaunchIsExactDebugOnlyAndNeverSelectsTheFixtureEngine() {
+        let acceptance = AppLaunchConfiguration(arguments: [
+            "VPlayer", "-acceptance-playback",
+        ])
+        #if DEBUG
+        XCTAssertNotEqual(acceptance.mode, .live)
+        #else
+        XCTAssertEqual(acceptance.mode, .live)
+        #endif
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: [
+                "VPlayer", "-acceptance-playback", "duplicate",
+                "-acceptance-playback",
+            ]).mode,
+            .live
+        )
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: [
+                "VPlayer", "-ui-fixture", "seeded", "-acceptance-playback",
+            ]).mode,
+            .live
+        )
+    }
+
     func testProductionAppStartupPurgesLibrarySnapshotsOnceAfterRepeatedStartRequests() async {
         let probe = StartupMaintenanceProbe()
         let dependencies = makeDependencies(maintenance: probe)

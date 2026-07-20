@@ -29,6 +29,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private let eventSink: @Sendable (VideoDecoderEvent) -> Void
     private let api: any VideoToolboxAPI
     private let compatibilityCheck: PixelBufferCompatibilityCheck
+    private let metrics: PlaybackMetrics?
+    private let signposts: PlaybackSignposts?
     private var active: ActiveSession?
 
     public convenience init(
@@ -39,7 +41,24 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             executor: executor,
             eventSink: eventSink,
             api: SystemVideoToolboxAPI(),
-            compatibilityCheck: VideoFormatMetadataReader.systemCompatibilityCheck
+            compatibilityCheck: VideoFormatMetadataReader.systemCompatibilityCheck,
+            metrics: nil,
+            signposts: nil
+        )
+    }
+
+    convenience init(
+        executor: PlaybackSerialExecutor,
+        diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
+        eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
+    ) {
+        self.init(
+            executor: executor,
+            eventSink: eventSink,
+            api: SystemVideoToolboxAPI(),
+            compatibilityCheck: VideoFormatMetadataReader.systemCompatibilityCheck,
+            metrics: diagnostics.metrics,
+            signposts: diagnostics.signposts
         )
     }
 
@@ -47,12 +66,16 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         executor: PlaybackSerialExecutor,
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void,
         api: any VideoToolboxAPI,
-        compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck
+        compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck,
+        metrics: PlaybackMetrics? = nil,
+        signposts: PlaybackSignposts? = nil
     ) {
         self.executor = executor
         self.eventSink = eventSink
         self.api = api
         self.compatibilityCheck = compatibilityCheck
+        self.metrics = metrics
+        self.signposts = signposts
     }
 
     public func configure(
@@ -100,7 +123,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             }
         case .appleTemporal:
             do {
-                try AppleTemporalConfigurator(api: api).configure(session: candidate)
+                try AppleTemporalConfigurator(
+                    api: api,
+                    propertyDidSet: { [metrics] in metrics?.recordTemporalPropertySet() }
+                ).configure(session: candidate)
             } catch let failure as AppleTemporalFailure {
                 api.invalidate(candidate)
                 throw VideoDecoderFailure.temporalUnavailable(failure)
@@ -155,17 +181,28 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         case .appleTemporal:
             decodeFlags.insert(._EnableTemporalProcessing)
         }
+        if decodeFlags.contains(._EnableTemporalProcessing) {
+            metrics?.recordTemporalDecodeFlag()
+        }
+        let signpostLifetime = PlaybackSignpostLifetime(
+            signposts: signposts,
+            token: signposts?.begin(.videoToolboxDecode, correlation: accessUnit.id)
+        )
+        let metrics = metrics
         let status = api.decode(
             active.session,
             sampleBuffer: accessUnit.sampleBuffer,
             flags: decodeFlags,
             frameOptions: nil
         ) { [weak self] output in
+            metrics?.recordDecoderCallback()
+            signpostLifetime.finish()
             executor.submit { [weak self] in
                 self?.handle(output: output, token: token, sessionID: sessionID)
             }
         }
         guard status == noErr else {
+            signpostLifetime.finish()
             throw Self.classify(status, configuration: active.configuration).failure
         }
     }
@@ -200,6 +237,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard let active,
               active.id == sessionID,
               active.generation == token.generation else {
+            metrics?.recordStaleGenerationDrop()
             return
         }
 
@@ -213,6 +251,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard let pixelBuffer = output.imageBuffer else {
             if output.infoFlags.contains(.frameDropped)
                 || output.infoFlags.contains(.frameInterrupted) {
+                metrics?.recordVideoDrop()
                 return
             }
             emit(

@@ -51,6 +51,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private let fieldReader = FieldMetadataReader()
     private let hooks: VideoPipelineCoordinatorHooks
     private let rawReadinessRequirementOverride: Int?
+    private let metrics: PlaybackMetrics?
+    private let signposts: PlaybackSignposts?
 
     private var generation: MediaGeneration
     private var selectedAlgorithm: DeinterlaceAlgorithm
@@ -86,6 +88,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         selectedAlgorithm: DeinterlaceAlgorithm,
         classifierConfiguration: ScanClassifierConfiguration = .init(),
         rawReadinessRequirementOverride: Int? = nil,
+        metrics: PlaybackMetrics? = nil,
+        signposts: PlaybackSignposts? = nil,
         hooks: VideoPipelineCoordinatorHooks
     ) {
         self.decoder = decoder
@@ -102,7 +106,11 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         self.rawReadinessRequirementOverride = rawReadinessRequirementOverride.map {
             max(1, $0)
         }
+        self.metrics = metrics
+        self.signposts = signposts
         self.hooks = hooks
+        metrics?.update(scanType: .unknown)
+        metrics?.update(activeRoute: .rawWhileClassifying)
     }
 
     func replaceFormat(_ format: CMVideoFormatDescription) {
@@ -137,6 +145,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         generation = hooks.advanceGeneration()
         routeEpoch &+= 1
         route = .rawWhileClassifying
+        metrics?.update(scanType: .unknown)
+        metrics?.update(activeRoute: .rawWhileClassifying)
         classifier.reset(generation: generation)
         normalizer.reset(generation: generation)
         passthrough.reset(to: generation)
@@ -156,7 +166,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
 
     func handle(accessUnit: CompressedVideoAccessUnit) {
         guard !stopped else { return }
-        guard accessUnit.generation == generation else { return }
+        guard accessUnit.generation == generation else {
+            metrics?.recordStaleGenerationDrop()
+            return
+        }
         if waitingForRandomAccess {
             guard accessUnit.isRandomAccess, let videoFormat else { return }
             let targetConfiguration = configuration(for: route)
@@ -203,7 +216,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         guard !stopped else { return }
         switch event {
         case let .frame(frame):
-            guard frame.generation == generation else { return }
+            guard frame.generation == generation else {
+                metrics?.recordStaleGenerationDrop()
+                return
+            }
             observe(frame, probe: nil)
             guard frame.generation == generation else { return }
             submitProbe(for: frame)
@@ -212,7 +228,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             }
         case let .recoverableFailure(failure, eventGeneration),
              let .fatalFailure(failure, eventGeneration):
-            guard eventGeneration == generation else { return }
+            guard eventGeneration == generation else {
+                metrics?.recordStaleGenerationDrop()
+                return
+            }
             if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
                 temporalRetrySuppressed = true
                 emitTemporalNoticeOnce()
@@ -230,6 +249,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         guard !stopped else { return }
         guard selectedAlgorithm != algorithm else { return }
         selectedAlgorithm = algorithm
+        metrics?.update(selectedAlgorithm: algorithm)
         if algorithm != .appleTemporal {
             temporalRetrySuppressed = false
         }
@@ -245,6 +265,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             generation = hooks.advanceGeneration()
             route = .rawWhileClassifying
             routeEpoch &+= 1
+            metrics?.update(scanType: .unknown)
+            metrics?.update(activeRoute: .rawWhileClassifying)
             classifier.reset(generation: generation)
             normalizer.reset(generation: generation)
             passthrough.reset(to: generation)
@@ -307,7 +329,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             probe: sample,
             presentationTimeStamp: frame.presentationTimeStamp
         )
-        guard classifier.observe(observation) != nil else { return }
+        guard let change = classifier.observe(observation) else { return }
+        metrics?.update(scanType: change.current)
         applyResolvedRoute()
     }
 
@@ -321,8 +344,13 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             switchDecoderConfiguration(to: next)
             return
         }
+        let token = signposts?.begin(.modeSwitch, correlation: routeEpoch &+ 1)
+        defer {
+            if let token { signposts?.end(token) }
+        }
         route = next
         routeEpoch &+= 1
+        metrics?.update(activeRoute: next)
         yadif.reset(to: generation)
         hooks.routeDidChange(requiredVideoFrameCount)
     }
@@ -342,9 +370,14 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private func configureRawTemporalFallback(
         format: CMVideoFormatDescription
     ) -> Bool {
+        let token = signposts?.begin(.modeSwitch, correlation: routeEpoch &+ 1)
+        defer {
+            if let token { signposts?.end(token) }
+        }
         temporalRetrySuppressed = true
         route = .rawTemporalFailure
         routeEpoch &+= 1
+        metrics?.update(activeRoute: .rawTemporalFailure)
         passthrough.reset(to: generation)
         yadif.reset(to: generation)
         hooks.routeDidChange(requiredVideoFrameCount)
@@ -369,6 +402,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
 
     private func emitTemporalNoticeOnce() {
         guard temporalNoticeGate.consume(sessionID: playbackSessionID) else { return }
+        metrics?.recordTemporalUnavailableNotice()
         hooks.notice(.appleTemporalUnavailable, generation)
     }
 
@@ -376,6 +410,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         to next: DeinterlaceRoute,
         toleratingTemporalDrainFailure: Bool = false
     ) {
+        let token = signposts?.begin(.modeSwitch, correlation: routeEpoch &+ 1)
+        defer {
+            if let token { signposts?.end(token) }
+        }
         hooks.closeAdmission()
         let toleratesOldAppleSessionFailure = toleratingTemporalDrainFailure
             || activeConfiguration == .appleTemporal
@@ -392,6 +430,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         generation = hooks.advanceGeneration()
         route = next
         routeEpoch &+= 1
+        metrics?.update(activeRoute: next)
         classifier.rebasePreservingClassification(generation: generation)
         normalizer.reset(generation: generation)
         passthrough.reset(to: generation)
@@ -436,18 +475,24 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
               let previousProbeBuffer else { return }
         let submittedGeneration = generation
         let submittedEpoch = routeEpoch
+        let token = signposts?.begin(.scanProbe, correlation: frame.accessUnitID)
+        let signposts = signposts
         probe.submit(
             current: frame.pixelBuffer,
             previous: previousProbeBuffer,
             generation: submittedGeneration
         ) { [weak self] result in
+            if let token { signposts?.end(token) }
             guard let self else { return }
             hooks.schedule { [weak self] in
                 guard let self,
                       !stopped,
                       generation == submittedGeneration,
-                      routeEpoch == submittedEpoch,
-                      case let .success(sample) = result else { return }
+                      routeEpoch == submittedEpoch else {
+                    self?.metrics?.recordStaleGenerationDrop()
+                    return
+                }
+                guard case let .success(sample) = result else { return }
                 observeSupplementalProbe(frame, sample: sample)
             }
         }
@@ -467,7 +512,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             probe: sample,
             presentationTimeStamp: frame.presentationTimeStamp
         )
-        guard classifier.observeSupplementalProbe(observation) != nil else { return }
+        guard let change = classifier.observeSupplementalProbe(observation) else { return }
+        metrics?.update(scanType: change.current)
         applyResolvedRoute()
     }
 
@@ -482,7 +528,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 guard let self,
                       !stopped,
                       generation == submittedGeneration,
-                      routeEpoch == submittedEpoch else { return }
+                      routeEpoch == submittedEpoch else {
+                    self?.metrics?.recordStaleGenerationDrop()
+                    return
+                }
                 switch result {
                 case let .success(frames):
                     hooks.deliver(frames, submittedGeneration)

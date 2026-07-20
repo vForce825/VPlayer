@@ -8,6 +8,7 @@ import VPlayerPlayback
 enum AppLaunchMode: Equatable {
     case live
     case seededFixture
+    case acceptance
 }
 
 struct AppLaunchConfiguration {
@@ -17,7 +18,18 @@ struct AppLaunchConfiguration {
 
     init(arguments: [String]) {
         let fixtureFlags = arguments.indices.filter { arguments[$0] == "-ui-fixture" }
-        if fixtureFlags.count == 1,
+        let acceptanceFlags = arguments.indices.filter {
+            arguments[$0] == "-acceptance-playback"
+        }
+        #if DEBUG
+        let selectsAcceptance = acceptanceFlags.count == 1 && fixtureFlags.isEmpty
+        #else
+        let selectsAcceptance = false
+        #endif
+        if selectsAcceptance {
+            mode = .acceptance
+        } else if acceptanceFlags.isEmpty,
+                  fixtureFlags.count == 1,
            let flagIndex = fixtureFlags.first,
            arguments.indices.contains(flagIndex + 1),
            arguments[flagIndex + 1] == "seeded" {
@@ -54,6 +66,12 @@ struct VPlayerApp: App {
             self.init(dependencies: .live())
         case .seededFixture:
             self.init(dependencies: .uiTesting(playbackFixture: configuration.playbackFixture))
+        case .acceptance:
+            #if DEBUG
+            self.init(dependencies: .acceptance())
+            #else
+            self.init(dependencies: .live())
+            #endif
         }
     }
 

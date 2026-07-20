@@ -133,6 +133,8 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private struct InFlightJob: @unchecked Sendable {
         let ready: ReadyJob
         let outputs: (first: CVPixelBuffer, second: CVPixelBuffer)
+        let gpuStartedAt: TimeInterval?
+        let signpostLifetime: PlaybackSignpostLifetime
     }
 
     private struct SubmissionAttempt: @unchecked Sendable {
@@ -174,6 +176,8 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private let maximumInFlight: Int
     private let maximumPendingFrames: Int
     private let dropSink: @Sendable (YADIFDropEvent) -> Void
+    private let metrics: PlaybackMetrics?
+    private let signposts: PlaybackSignposts?
 
     private var generation = MediaGeneration(rawValue: 0)
     private var segmentEpoch: UInt64 = 0
@@ -209,6 +213,35 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             clock: clock,
             maximumInFlight: maximumInFlight,
             maximumPendingFrames: maximumPendingFrames,
+            metrics: nil,
+            signposts: nil,
+            dropSink: dropSink
+        )
+    }
+
+    convenience init(
+        device: any MTLDevice,
+        commandQueue: any MTLCommandQueue,
+        textureCache: CVMetalTextureCache,
+        clock: any PlaybackClock,
+        diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
+        maximumInFlight: Int = 3,
+        maximumPendingFrames: Int = 4,
+        dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
+    ) throws {
+        let submitter = try YADIFSystemCommandSubmitter(
+            device: device,
+            commandQueue: commandQueue,
+            textureCache: textureCache
+        )
+        try self.init(
+            commandSubmitter: submitter,
+            surfacePool: ProgressiveSurfacePool(),
+            clock: clock,
+            maximumInFlight: maximumInFlight,
+            maximumPendingFrames: maximumPendingFrames,
+            metrics: diagnostics.metrics,
+            signposts: diagnostics.signposts,
             dropSink: dropSink
         )
     }
@@ -220,6 +253,8 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         clock: any PlaybackClock,
         maximumInFlight: Int = 3,
         maximumPendingFrames: Int = 4,
+        metrics: PlaybackMetrics? = nil,
+        signposts: PlaybackSignposts? = nil,
         dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
     ) throws {
         guard (1...3).contains(maximumInFlight) else {
@@ -241,6 +276,8 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         self.clock = clock
         self.maximumInFlight = maximumInFlight
         self.maximumPendingFrames = maximumPendingFrames
+        self.metrics = metrics
+        self.signposts = signposts
         self.dropSink = dropSink
     }
 
@@ -321,6 +358,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             actions.append(.complete(completion, .success([])))
         } else if frame.frame.generation < generation {
             counters.staleGenerationDrops &+= 1
+            metrics?.recordStaleGenerationDrop()
             actions.append(.complete(completion, .success([])))
         } else {
             if frame.frame.generation > generation {
@@ -336,6 +374,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             enforcePendingBoundLocked(actions: &actions)
             finishDrainIfPossibleLocked(actions: &actions)
         }
+        recordDepthsLocked()
         lock.unlock()
         perform(actions)
         driveScheduler()
@@ -353,6 +392,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         consumeLocked(window.drain(), actions: &actions)
         enforcePendingBoundLocked(actions: &actions)
         finishDrainIfPossibleLocked(actions: &actions)
+        recordDepthsLocked()
         lock.unlock()
         perform(actions)
         driveScheduler()
@@ -498,8 +538,24 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             perform(actions)
             return
         }
-        inFlightJobs[identifier] = InFlightJob(ready: attempt.ready, outputs: outputs)
+        let signpostLifetime = PlaybackSignpostLifetime(
+            signposts: signposts,
+            token: signposts?.begin(
+                .yadifCommandBuffer,
+                correlation: attempt.ready.job.current.frame.accessUnitID
+            )
+        )
+        inFlightJobs[identifier] = InFlightJob(
+            ready: attempt.ready,
+            outputs: outputs,
+            gpuStartedAt: metrics?.beginGPUOperation(),
+            signpostLifetime: signpostLifetime
+        )
         counters.submitted &+= 1
+        metrics?.recordYADIFKernelDispatch(
+            inFlightCount: activeInFlightCountLocked,
+            inputDepth: readyJobs.count + window.unemittedCount
+        )
         lock.unlock()
 
         do {
@@ -513,6 +569,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             var actions: [UserAction] = []
             lock.lock()
             if let rolledBack = inFlightJobs.removeValue(forKey: identifier) {
+                rolledBack.signpostLifetime.finish()
                 if isCurrentLocked(rolledBack.ready) {
                     counters.submitted -= 1
                     actions.append(.complete(
@@ -544,6 +601,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             } : nil
             let dropped = readyJobs.remove(at: lateIndex ?? readyJobs.startIndex)
             counters.gpuQueueFullDrops &+= 1
+            metrics?.recordVideoDrop(count: 2)
             actions.append(.complete(dropped.completion, .success([])))
             actions.append(.drop(dropSink, YADIFDropEvent(
                 reason: .gpuQueueFull,
@@ -564,8 +622,14 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             return
         }
         let isCurrent = isCurrentLocked(completed.ready)
+        completed.signpostLifetime.finish()
+        if let gpuStartedAt = completed.gpuStartedAt {
+            metrics?.recordGPUDuration(startedAt: gpuStartedAt)
+        }
         if isCurrent {
             counters.completed &+= 1
+        } else {
+            metrics?.recordStaleGenerationDrop()
         }
         if !isCurrent {
             actions.append(.complete(completed.ready.completion, .success([])))
@@ -584,6 +648,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             }
         }
         finishDrainIfPossibleLocked(actions: &actions)
+        recordDepthsLocked()
         lock.unlock()
         perform(actions)
         driveScheduler()
@@ -622,6 +687,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         nextSequenceNumber = 1
         counters = Counters()
         isDraining = false
+        recordDepthsLocked()
     }
 
     private func finishDrainIfPossibleLocked(actions: inout [UserAction]) {
@@ -644,6 +710,13 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
 
     private func perform(_ actions: [UserAction]) {
         for action in actions { action.perform() }
+    }
+
+    private func recordDepthsLocked() {
+        metrics?.recordYADIFDepths(
+            inFlightCount: activeInFlightCountLocked,
+            inputDepth: readyJobs.count + window.unemittedCount
+        )
     }
 
     private static func presentationFrames(

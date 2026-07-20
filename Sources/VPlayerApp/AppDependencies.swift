@@ -62,6 +62,7 @@ struct AppDependencies {
     typealias Refresh = AppModel.Refresh
     typealias Prepare = @Sendable () async -> Void
     typealias PlaybackPresentationProvider = @Sendable () async -> PlaybackPresentationContext?
+    typealias PlaybackMetricsProvider = @Sendable (Duration) async -> PlaybackMetricsSnapshot?
 
     let repository: any LibraryRepository
     let refresh: Refresh
@@ -69,6 +70,8 @@ struct AppDependencies {
     let playbackSettings: PlaybackSettingsStore
     let playbackEngine: any PlaybackEngine
     let playbackPresentationProvider: PlaybackPresentationProvider
+    let playbackMetricsProvider: PlaybackMetricsProvider
+    let exposesAcceptanceMetrics: Bool
     let libraryChanges: LibraryChangeSignal
     let libraryStartup: LibraryStartup
     let foregroundRefreshDriver: ForegroundRefreshDriver
@@ -86,6 +89,8 @@ struct AppDependencies {
         playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore(),
         playbackEngine: (any PlaybackEngine)? = nil,
         playbackPresentationProvider: PlaybackPresentationProvider? = nil,
+        playbackMetricsProvider: PlaybackMetricsProvider? = nil,
+        exposesAcceptanceMetrics: Bool = false,
         libraryChanges: LibraryChangeSignal = LibraryChangeSignal()
     ) {
         self.repository = repository
@@ -95,14 +100,19 @@ struct AppDependencies {
         if let playbackEngine {
             self.playbackEngine = playbackEngine
             self.playbackPresentationProvider = playbackPresentationProvider ?? { nil }
+            self.playbackMetricsProvider = playbackMetricsProvider ?? { _ in nil }
         } else {
             let controller = PlaybackController()
             self.playbackEngine = controller
             self.playbackPresentationProvider = {
                 await controller.presentationContext()
             }
+            self.playbackMetricsProvider = { window in
+                await controller.playbackMetricsSnapshot(window: window)
+            }
         }
         self.libraryChanges = libraryChanges
+        self.exposesAcceptanceMetrics = exposesAcceptanceMetrics
         self.libraryStartup = libraryStartup
         self.foregroundRefreshDriver = foregroundRefreshDriver
         self.backgroundRefreshRegistrar = backgroundRefreshRegistrar
@@ -167,6 +177,41 @@ struct AppDependencies {
     static func production() -> Self {
         live()
     }
+
+    #if DEBUG
+    static func acceptance() -> Self {
+        do {
+            let container = try VPlayerModelContainer.make(inMemory: true)
+            let repository = SwiftDataLibraryStore(modelContainer: container)
+            let libraryChanges = LibraryChangeSignal()
+            let coordinator = RefreshCoordinator(
+                repository: repository,
+                downloader: URLSessionBoundedDownloader(),
+                onPersistedOutcome: { [weak libraryChanges] _, _ in
+                    await MainActor.run { libraryChanges?.notify() }
+                }
+            )
+            let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in
+                await coordinator.refresh(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+            }
+            return make(
+                repository: repository,
+                refresh: refresh,
+                libraryChanges: libraryChanges,
+                libraryStartup: LibraryStartup {
+                    try await repository.purgeUnreferencedSnapshots()
+                },
+                exposesAcceptanceMetrics: true
+            )
+        } catch {
+            return live()
+        }
+    }
+    #endif
 
     static func uiTesting(playbackFixture: String? = nil) -> Self {
         do {
@@ -246,7 +291,8 @@ struct AppDependencies {
         repository: any LibraryRepository & RefreshSnapshotCommitting,
         refresh: @escaping Refresh,
         libraryChanges: LibraryChangeSignal,
-        libraryStartup: LibraryStartup
+        libraryStartup: LibraryStartup,
+        exposesAcceptanceMetrics: Bool = false
     ) -> Self {
         let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
             try await repository.profiles()
@@ -265,6 +311,7 @@ struct AppDependencies {
             ),
             repository: repository,
             refresh: refresh,
+            exposesAcceptanceMetrics: exposesAcceptanceMetrics,
             libraryChanges: libraryChanges
         )
     }

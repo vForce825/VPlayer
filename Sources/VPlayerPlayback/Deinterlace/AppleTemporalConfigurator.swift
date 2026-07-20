@@ -6,9 +6,14 @@ import VideoToolbox
 
 struct AppleTemporalConfigurator {
     private let api: any VTSessionPropertyAPI
+    private let propertyDidSet: @Sendable () -> Void
 
-    init(api: any VTSessionPropertyAPI) {
+    init(
+        api: any VTSessionPropertyAPI,
+        propertyDidSet: @escaping @Sendable () -> Void = {}
+    ) {
         self.api = api
+        self.propertyDidSet = propertyDidSet
     }
 
     func configure(session: any VideoToolboxSession) throws {
@@ -47,5 +52,6 @@ struct AppleTemporalConfigurator {
         guard status == noErr else {
             throw AppleTemporalFailure.propertySetFailed(key: key, status: status)
         }
+        propertyDidSet()
     }
 }

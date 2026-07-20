@@ -21,9 +21,14 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     var stopAutomaticallyCompletes = true
     private var stopContinuation: CheckedContinuation<Void, Never>?
     let presentationContext: PlaybackPresentationContext?
+    let metrics: PlaybackMetrics?
 
-    init(presentationContext: PlaybackPresentationContext? = nil) {
+    init(
+        presentationContext: PlaybackPresentationContext? = nil,
+        metrics: PlaybackMetrics? = nil
+    ) {
         self.presentationContext = presentationContext
+        self.metrics = metrics
     }
 
     func install(_ sink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) {
@@ -40,6 +45,11 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
 
     func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
         lock.withLock { algorithms.append(algorithm) }
+        metrics?.update(selectedAlgorithm: algorithm)
+    }
+
+    func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
+        metrics?.snapshot(window: window)
     }
 
     func stop() async {
@@ -101,6 +111,7 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
 
     func makePipeline(
         selectedAlgorithm: DeinterlaceAlgorithm,
+        channelID _: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
         try lock.withLock {

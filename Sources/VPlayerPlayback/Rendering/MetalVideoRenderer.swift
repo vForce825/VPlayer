@@ -319,6 +319,8 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     private let textureMapper: any VideoTextureMapping
     private let commandSubmitter: any MetalCommandSubmitting
     private let failureSink: @Sendable (PlaybackCoreError, MediaGeneration) -> Void
+    private let metrics: PlaybackMetrics?
+    private let signposts: PlaybackSignposts?
     private var activeGeneration: MediaGeneration
     private var inFlightCount = 0
     private var completedSinceCacheFlush = 0
@@ -327,6 +329,8 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     convenience init(
         device: any MTLDevice,
         generation: MediaGeneration,
+        metrics: PlaybackMetrics? = nil,
+        signposts: PlaybackSignposts? = nil,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     ) throws {
         try self.init(
@@ -334,6 +338,8 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             generation: generation,
             textureMapperFactory: { try CVMetalVideoTextureMapper(device: $0) },
             commandSubmitter: try SystemMetalCommandSubmitter(device: device),
+            metrics: metrics,
+            signposts: signposts,
             failureSink: failureSink
         )
     }
@@ -343,17 +349,25 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         generation: MediaGeneration,
         textureMapperFactory: (any MTLDevice) throws -> any VideoTextureMapping,
         commandSubmitter: any MetalCommandSubmitting,
+        metrics: PlaybackMetrics? = nil,
+        signposts: PlaybackSignposts? = nil,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     ) throws {
         activeGeneration = generation
         queue = VideoPresentationQueue(generation: generation)
         textureMapper = try textureMapperFactory(device)
         self.commandSubmitter = commandSubmitter
+        self.metrics = metrics
+        self.signposts = signposts
         self.failureSink = failureSink
     }
 
     public func enqueue(_ frame: VideoPresentationFrame) {
-        _ = queue.enqueue(frame)
+        if queue.enqueue(frame) {
+            metrics?.recordPresentationQueueDepth(queue.unpresentedCount)
+        } else {
+            metrics?.recordStaleGenerationDrop()
+        }
     }
 
     public func flush(to generation: MediaGeneration) {
@@ -391,6 +405,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             displayInterval: displayInterval
         )
         guard let frame = selection.frame else {
+            metrics?.recordVideoDrop(count: selection.droppedFrameCount)
             releaseInFlightSlot(flushCacheIfNeeded: false)
             return decision(
                 action: selection.action,
@@ -434,12 +449,21 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             frame: frame,
             retainedObjects: textures.retainedObjects
         )
+        let signpostLifetime = PlaybackSignpostLifetime(
+            signposts: signposts,
+            token: signposts?.begin(.renderDraw, correlation: frame.sourceAccessUnitID)
+        )
         do {
             try commandSubmitter.submitPresentingUntimed(job, drawable: drawable) { [weak self] result in
                 _ = lifetime
-                self?.complete(result, submittedGeneration: frame.generation)
+                self?.complete(
+                    result,
+                    submittedGeneration: frame.generation,
+                    signpostLifetime: signpostLifetime
+                )
             }
         } catch {
+            signpostLifetime.finish()
             releaseInFlightSlot(flushCacheIfNeeded: false)
             emit(.metalCommand(Self.sanitizedCommandMessage(String(describing: error))), generation: frame.generation)
             return decision(
@@ -448,6 +472,16 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
                 dropped: selection.droppedFrameCount
             )
         }
+
+        let currentGeneration = stateLock.withLock { activeGeneration }
+        metrics?.recordPresentation(
+            generation: frame.generation,
+            activeGeneration: currentGeneration,
+            presentationTimeStamp: frame.presentationTimeStamp,
+            targetMediaTime: targetMediaTime,
+            droppedFrames: selection.droppedFrameCount,
+            presentationQueueDepth: queue.unpresentedCount
+        )
 
         return decision(
             action: selection.action,
@@ -603,8 +637,10 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
 
     private func complete(
         _ result: MetalCommandCompletion,
-        submittedGeneration: MediaGeneration
+        submittedGeneration: MediaGeneration,
+        signpostLifetime: PlaybackSignpostLifetime
     ) {
+        signpostLifetime.finish()
         releaseInFlightSlot(flushCacheIfNeeded: true)
         guard case let .failed(message) = result else { return }
         let isCurrent = stateLock.withLock { activeGeneration == submittedGeneration }

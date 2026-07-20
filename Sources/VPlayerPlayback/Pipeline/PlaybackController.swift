@@ -4,7 +4,7 @@
 
 import Foundation
 
-public actor PlaybackController: PlaybackEngine {
+public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
     private let factory: any PlaybackPipelineFactory
     private var state = PlaybackState.idle
     private var pipeline: (any PlaybackPipelineProtocol)?
@@ -74,7 +74,10 @@ public actor PlaybackController: PlaybackEngine {
         pendingTeardown = nil
 
         do {
-            let next = try factory.makePipeline(selectedAlgorithm: selectedAlgorithm) { [weak self] event in
+            let next = try factory.makePipeline(
+                selectedAlgorithm: selectedAlgorithm,
+                channelID: request.channelID
+            ) { [weak self] event in
                 Task { await self?.receive(event, sessionID: id) }
             }
             pipeline = next
@@ -131,6 +134,10 @@ public actor PlaybackController: PlaybackEngine {
 
     public func presentationContext() -> PlaybackPresentationContext? {
         pipeline?.presentationContext
+    }
+
+    public func playbackMetricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
+        pipeline?.metricsSnapshot(window: window)
     }
 
     var currentStateForTesting: PlaybackState { state }

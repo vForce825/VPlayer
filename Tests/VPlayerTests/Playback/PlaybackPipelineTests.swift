@@ -35,6 +35,38 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertNil(failedContext)
     }
 
+    func testControllerMetricsProviderPublishesOnlyTheCurrentSessionCollector() async throws {
+        let firstMetrics = PlaybackMetrics(
+            selectedAlgorithm: .appleTemporal,
+            channelID: "first",
+            now: { 60 },
+            residentMemoryProvider: { 11 }
+        )
+        firstMetrics.recordDecoderCallback()
+        let secondMetrics = PlaybackMetrics(
+            selectedAlgorithm: .metalYADIF2x,
+            channelID: "second",
+            now: { 60 },
+            residentMemoryProvider: { 22 }
+        )
+        let first = FakeControllerPipeline(metrics: firstMetrics)
+        let second = FakeControllerPipeline(metrics: secondMetrics)
+        let controller = PlaybackController(factory: FakeControllerPipelineFactory([first, second]))
+
+        let idleSnapshot = await controller.playbackMetricsSnapshot(window: .seconds(60))
+        XCTAssertNil(idleSnapshot)
+        await controller.play(makeRequest(title: "first"))
+        let firstSnapshot = await controller.playbackMetricsSnapshot(window: .seconds(60))
+        XCTAssertEqual(firstSnapshot?.residentMemoryBytes, 11)
+        await controller.play(makeRequest(title: "second"))
+        let secondSnapshot = await controller.playbackMetricsSnapshot(window: .seconds(60))
+        XCTAssertEqual(secondSnapshot?.residentMemoryBytes, 22)
+        second.emit(.failed(.demuxRead(-1)))
+        try await Task.sleep(for: .milliseconds(20))
+        let failedSnapshot = await controller.playbackMetricsSnapshot(window: .seconds(60))
+        XCTAssertNil(failedSnapshot)
+    }
+
     func testControllerPublishesIdlePreparingPlayingPauseResumeAndStopped() async throws {
         let fake = FakeControllerPipeline()
         let controller = PlaybackController(factory: FakeControllerPipelineFactory([fake]))

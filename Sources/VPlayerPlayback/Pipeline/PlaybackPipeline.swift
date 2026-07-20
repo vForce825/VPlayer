@@ -18,6 +18,7 @@ enum PlaybackPipelineEvent: Sendable, Equatable {
 
 protocol PlaybackPipelineProtocol: AnyObject, Sendable {
     var presentationContext: PlaybackPresentationContext? { get }
+    func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot?
     func start(url: URL)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
     func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm)
@@ -27,6 +28,7 @@ protocol PlaybackPipelineProtocol: AnyObject, Sendable {
 protocol PlaybackPipelineFactory: Sendable {
     func makePipeline(
         selectedAlgorithm: DeinterlaceAlgorithm,
+        channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol
 }
@@ -149,6 +151,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private let clock: any PlaybackClock
     private let display: any PlaybackDisplayControlling
     private let eventSink: @Sendable (PlaybackPipelineEvent) -> Void
+    private let metrics: PlaybackMetrics?
+    private let signposts: PlaybackSignposts?
     private var videoCoordinator: VideoPipelineCoordinator!
 
     // Every property below is accessed exclusively from `executor`.
@@ -186,6 +190,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var anchorPreparationInProgress = false
     private var pendingDisplayTimingReset = false
     private var lastDisplayCriteriaKey: DisplayCriteriaKey?
+    private var modeSwitchSignpost: PlaybackSignpostToken?
 
     init(
         executor: PlaybackSerialExecutor,
@@ -202,7 +207,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         clock: any PlaybackClock,
         display: any PlaybackDisplayControlling,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void,
-        presentationContext: PlaybackPresentationContext? = nil
+        presentationContext: PlaybackPresentationContext? = nil,
+        metrics: PlaybackMetrics? = nil,
+        signposts: PlaybackSignposts? = nil
     ) {
         self.executor = executor
         self.demuxer = demuxer
@@ -213,6 +220,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         self.display = display
         self.eventSink = eventSink
         self.presentationContext = presentationContext
+        self.metrics = metrics
+        self.signposts = signposts
         videoCoordinator = VideoPipelineCoordinator(
             decoder: decoder,
             passthrough: processor,
@@ -221,6 +230,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             initialGeneration: generationController.current,
             selectedAlgorithm: selectedAlgorithm,
             rawReadinessRequirementOverride: rawReadinessRequirementOverride,
+            metrics: metrics,
+            signposts: signposts,
             hooks: VideoPipelineCoordinatorHooks(
                 closeAdmission: { [weak self] in self?.closeCoordinatorAdmissionIsolated() },
                 advanceGeneration: { [weak self] in
@@ -271,8 +282,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
         executor.submit { [weak self] in
             guard let self, !terminal else { return }
+            metrics?.update(selectedAlgorithm: algorithm)
             videoCoordinator.setAlgorithm(algorithm)
         }
+    }
+
+    func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
+        metrics?.snapshot(window: window)
     }
 
     func stop() async {
@@ -759,6 +775,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         renderer.flush(to: generation)
         audio.flush(to: generation)
         display.pauseSubmission()
+        metrics?.beginAVDriftGracePeriod(seconds: 5)
     }
 
     private func reopenCoordinatorAdmissionIsolated() {
@@ -776,6 +793,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         retainedVideo.removeAll(keepingCapacity: true)
         renderer.flush(to: generationController.current)
         display.pauseSubmission()
+        metrics?.beginAVDriftGracePeriod(seconds: 5)
     }
 
     private func setPausedIsolated(_ shouldPause: Bool, readinessCycle: UInt64) {
@@ -869,10 +887,18 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         clock.pause()
         readiness?.close(.displayModeSwitch)
         display.pauseSubmission()
+        if modeSwitchSignpost == nil {
+            modeSwitchSignpost = signposts?.begin(
+                .modeSwitch,
+                correlation: generationController.current.rawValue
+            )
+        }
+        metrics?.beginAVDriftGracePeriod(seconds: 5)
     }
 
     private func displayModeSwitchEndedIsolated() {
         assertIsolated()
+        finishModeSwitchSignpostIsolated()
         guard !terminal, !paused, let readiness else { return }
         _ = readiness.reopenAfterDisplayModeSwitch()
         if readiness.isOpen {
@@ -890,6 +916,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             display.resetPresentationTiming()
         }
         display.resumeSubmission()
+        metrics?.beginAVDriftGracePeriod(seconds: 5)
         if !readyPublished {
             readyPublished = true
             eventSink(.ready(readinessCycle: readinessCycle))
@@ -953,6 +980,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             $0.cycleID == expectedCycle && CMTimeCompare($0.commonPTS, commonPTS) == 0
         } ?? false
         if !alreadyPrepared {
+            let reanchorSignpost = signposts?.begin(
+                .reanchor,
+                correlation: generationController.current.rawValue
+            )
+            defer {
+                if let reanchorSignpost { signposts?.end(reanchorSignpost) }
+            }
             preparedAnchor = PreparedAnchor(cycleID: expectedCycle, commonPTS: commonPTS)
             anchorPreparationInProgress = true
             defer { anchorPreparationInProgress = false }
@@ -1025,6 +1059,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         normalStopInProgress = true
         normalStopPublishes = publish
         if let completion { stopCompletions.append(completion) }
+        finishModeSwitchSignpostIsolated()
         terminal = true
         demuxer.cancel()
         releasePendingAdmissionIsolated()
@@ -1077,6 +1112,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func failIsolated(_ error: PlaybackCoreError) {
         assertIsolated()
         guard !terminal else { return }
+        finishModeSwitchSignpostIsolated()
         terminal = true
         demuxer.cancel()
         releasePendingAdmissionIsolated()
@@ -1100,6 +1136,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         pendingPacketAdmission?.acknowledgement.signal()
         pendingPacketAdmission = nil
+    }
+
+    private func finishModeSwitchSignpostIsolated() {
+        assertIsolated()
+        guard let modeSwitchSignpost else { return }
+        signposts?.end(modeSwitchSignpost)
+        self.modeSwitchSignpost = nil
     }
 }
 
@@ -1138,15 +1181,24 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
 struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
     func makePipeline(
         selectedAlgorithm: DeinterlaceAlgorithm,
+        channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
+        let metrics = PlaybackMetrics(
+            selectedAlgorithm: selectedAlgorithm,
+            channelID: channelID
+        )
+        let signposts = PlaybackSignposts(channelIdentifier: metrics.channelIdentifier)
         let executor = PlaybackSerialExecutor()
         let demuxExecutor = PlaybackSerialExecutor(label: "org.vplayer.playback.demux.delivery")
         let synchronizer = AVSampleBufferRenderSynchronizer()
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
         let clock = RenderSynchronizerClock(synchronizer: synchronizer)
         let relay = PlaybackPipelineRelay()
-        let decoder = VideoToolboxDecoder(executor: executor) { relay.decoder($0) }
+        let decoder = VideoToolboxDecoder(
+            executor: executor,
+            diagnostics: (metrics: metrics, signposts: signposts)
+        ) { relay.decoder($0) }
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw PlaybackCoreError.metalCommand("device.unavailable")
         }
@@ -1170,7 +1222,8 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
                 device: device,
                 commandQueue: commandQueue,
                 textureCache: textureCache,
-                clock: clock
+                clock: clock,
+                diagnostics: (metrics: metrics, signposts: signposts)
             )
         } catch {
             throw PlaybackCoreError.metalCommand("yadif.setup")
@@ -1184,6 +1237,8 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let renderer = try MetalVideoRenderer(
             device: device,
             generation: MediaGeneration(rawValue: 0),
+            metrics: metrics,
+            signposts: signposts,
             failureSink: { relay.failure($0, generation: $1) }
         )
         let presentationContext = PlaybackPresentationContext(
@@ -1215,7 +1270,9 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             clock: clock,
             display: display,
             eventSink: eventSink,
-            presentationContext: presentationContext
+            presentationContext: presentationContext,
+            metrics: metrics,
+            signposts: signposts
         )
         relay.install(pipeline)
         return pipeline

@@ -15,14 +15,21 @@ struct FullScreenPlayerView: View {
     @State private var model: FullScreenPlayerViewModel
     @State private var showsSettings = false
     @State private var isClosing = false
+    #if DEBUG
+    @State private var acceptanceMetricsJSON = "{}"
+    #endif
     @FocusState private var failureFocus: FailureControl?
     private let settings: PlaybackSettingsStore
+    private let metricsProvider: AppDependencies.PlaybackMetricsProvider
+    private let acceptanceMetricsEnabled: Bool
     private let onDismiss: () -> Void
 
     init(
         request: PlaybackRequest,
         engine: any PlaybackEngine,
         presentationProvider: @escaping FullScreenPlayerViewModel.PresentationProvider,
+        metricsProvider: @escaping AppDependencies.PlaybackMetricsProvider,
+        acceptanceMetricsEnabled: Bool,
         settings: PlaybackSettingsStore,
         onDismiss: @escaping () -> Void
     ) {
@@ -33,6 +40,8 @@ struct FullScreenPlayerView: View {
             settings: settings
         ))
         self.settings = settings
+        self.metricsProvider = metricsProvider
+        self.acceptanceMetricsEnabled = acceptanceMetricsEnabled
         self.onDismiss = onDismiss
     }
 
@@ -50,6 +59,17 @@ struct FullScreenPlayerView: View {
                 .accessibilityIdentifier("player-full-screen")
                 .allowsHitTesting(false)
                 .focusable(false)
+
+            #if DEBUG
+            if acceptanceMetricsEnabled {
+                Color.clear
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityIdentifier("player-acceptance-metrics")
+                    .accessibilityValue(acceptanceMetricsJSON)
+                    .allowsHitTesting(false)
+                    .focusable(false)
+            }
+            #endif
 
             statusOverlay
 
@@ -69,6 +89,9 @@ struct FullScreenPlayerView: View {
             }
         }
         .task { model.start() }
+        #if DEBUG
+        .task { await publishAcceptanceMetrics() }
+        #endif
         .onDisappear { Task { await model.stop() } }
         .onPlayPauseCommand(perform: model.togglePause)
         .onExitCommand(perform: close)
@@ -122,4 +145,24 @@ struct FullScreenPlayerView: View {
             onDismiss()
         }
     }
+
+    #if DEBUG
+    private func publishAcceptanceMetrics() async {
+        guard acceptanceMetricsEnabled else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        while !Task.isCancelled {
+            if let snapshot = await metricsProvider(.seconds(60)),
+               let data = try? encoder.encode(snapshot),
+               let json = String(data: data, encoding: .utf8) {
+                acceptanceMetricsJSON = json
+            }
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+        }
+    }
+    #endif
 }

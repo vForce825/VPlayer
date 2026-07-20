@@ -104,12 +104,15 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: Tests/VPlayerUITests
+        excludes:
+          - Info.plist
     dependencies:
       - target: VPlayer
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.uitests
-        GENERATE_INFOPLIST_FILE: true
+        GENERATE_INFOPLIST_FILE: false
+        INFOPLIST_FILE: Tests/VPlayerUITests/Info.plist
         TEST_TARGET_NAME: VPlayer
 schemes:
   VPlayer:

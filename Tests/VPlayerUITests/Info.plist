@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SPDX-FileCopyrightText: 2026 VPlayer contributors
+SPDX-License-Identifier: GPL-3.0-only
+SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <key>VPLAYER_ACCEPTANCE_M3U_URL_B64</key>
+    <string>$(VPLAYER_ACCEPTANCE_M3U_URL_B64)</string>
+    <key>VPLAYER_ACCEPTANCE_CHANNEL_B64</key>
+    <string>$(VPLAYER_ACCEPTANCE_CHANNEL_B64)</string>
+    <key>VPLAYER_ACCEPTANCE_SECONDS_B64</key>
+    <string>$(VPLAYER_ACCEPTANCE_SECONDS_B64)</string>
+    <key>VPLAYER_ACCEPTANCE_ALGORITHM_B64</key>
+    <string>$(VPLAYER_ACCEPTANCE_ALGORITHM_B64)</string>
+</dict>
+</plist>
