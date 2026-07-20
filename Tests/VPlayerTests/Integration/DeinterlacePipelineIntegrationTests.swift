@@ -20,8 +20,11 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
 
             XCTAssertEqual(result.presentations.count, 150)
             XCTAssertEqual(result.metrics.yadifKernelDispatchCount, 0)
+            XCTAssertEqual(result.metrics.temporalConfigurationCount, 0)
             XCTAssertEqual(result.metrics.temporalPropertySetCount, 0)
             XCTAssertEqual(result.metrics.temporalDecodeFlagCount, 0)
+            XCTAssertEqual(result.metrics.bothFieldsConfigurationCount, 1)
+            XCTAssertGreaterThan(result.metrics.decodedAccessUnitCount, 150)
             XCTAssertEqual(result.allocatedDecodedSurfaceCount, 1)
             XCTAssertEqual(result.formatMetadata.dimensions.width, 3_840)
             XCTAssertEqual(result.formatMetadata.dimensions.height, 2_160)
@@ -32,6 +35,25 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
             XCTAssertEqual(result.pixelFormats, [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange])
             XCTAssertTrue(result.routes.contains(.rawWhileClassifying))
             XCTAssertTrue(result.routes.contains(.bypass))
+        }
+    }
+
+    func testPsFBypassesBothAlgorithmsThroughProductionCoordinator() async throws {
+        for algorithm in DeinterlaceAlgorithm.allCases {
+            let result = try await harness.play(
+                fixture: .h2641080PsF25,
+                algorithm: algorithm,
+                frames: 16
+            )
+
+            XCTAssertEqual(result.presentations.count, 16)
+            XCTAssertEqual(result.routes.last, .bypass)
+            XCTAssertEqual(result.metrics.yadifKernelDispatchCount, 0)
+            XCTAssertEqual(result.metrics.temporalConfigurationCount, 0)
+            XCTAssertEqual(result.metrics.temporalPropertySetCount, 0)
+            XCTAssertEqual(result.metrics.temporalDecodeFlagCount, 0)
+            XCTAssertEqual(result.metrics.bothFieldsConfigurationCount, 1)
+            XCTAssertGreaterThan(result.metrics.decodedAccessUnitCount, 16)
         }
     }
 
@@ -82,14 +104,13 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
 
         XCTAssertTrue(result.presentationPTS.isStrictlyIncreasingWithinEachGeneration)
         XCTAssertEqual(result.metrics.crossGenerationReferenceCount, 0)
-        XCTAssertEqual(
-            result.metrics.staleGenerationDropCount,
-            UInt64(result.injectedLateCallbackCount)
-        )
-        XCTAssertEqual(result.generationAdvanceReasons, [.sps, .pmt])
-        XCTAssertEqual(result.generationAdvanceDeltas, [1, 1])
-        XCTAssertEqual(result.generationAdvanceCount, 2)
+        XCTAssertEqual(result.generationAdvanceReasons, [.sps, .pmt, .discontinuity])
+        XCTAssertEqual(result.generationAdvanceDeltas, [1, 1, 1])
+        XCTAssertEqual(result.generationAdvanceCount, 3)
         XCTAssertEqual(result.unchangedPMTGenerationAdvanceCount, 0)
+        XCTAssertGreaterThanOrEqual(result.pipelineDemuxEventCount, 4)
+        XCTAssertEqual(result.discontinuityResetCount, 1)
+        XCTAssertEqual(result.lateDecoderCallbackDeliveryCount, 0)
         XCTAssertEqual(result.rawSourcePTS90k, [
             (1 << 33) - 7_200,
             (1 << 33) - 3_600,
@@ -98,18 +119,27 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
         ])
     }
 
-    func testClassifierAndTimingEdgeMatrixUsesProductionStateMachines() throws {
+    func testProductionCoordinatorReordersBFramePTSAndCarriesRepeatTiming() throws {
         let result = try harness.runClassifierAndTimingEdgeMatrix()
 
-        XCTAssertEqual(result.psfRoutes, [.bypass, .bypass])
         XCTAssertEqual(
             result.unknownRoutes,
             [.rawWhileClassifying, .rawWhileClassifying]
         )
-        XCTAssertEqual(result.repeatFieldObservationCount, 1)
         XCTAssertTrue(result.normalizedPTS.isStrictlyIncreasing)
-        XCTAssertGreaterThanOrEqual(result.synthesizedTimingCount, 3)
+        XCTAssertGreaterThanOrEqual(result.synthesizedTimingCount, 2)
         XCTAssertEqual(Set(result.normalizedDurations), [CMTime(value: 1, timescale: 25)])
+        XCTAssertEqual(
+            result.callbackSourcePTS90k,
+            [0, 7_200, 3_600, 10_800, 14_400, 14_400, nil]
+        )
+        XCTAssertEqual(result.deliveredSourceAccessUnitIDs.prefix(3), [1, 3, 2])
+        XCTAssertEqual(result.repeatFieldRoute, .metalYADIF2x)
+        XCTAssertTrue(result.repeatFieldMetadataReachedProcessor)
+        XCTAssertEqual(
+            result.repeatFieldNormalizedDurations,
+            [CMTime(value: 1, timescale: 25)]
+        )
     }
 
     func testTemporalInitializationAndRuntimeFailureRemainRawAndNoticeOnce() throws {
@@ -139,7 +169,12 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
 
         XCTAssertEqual(result.routes, [.appleTemporal, .metalYADIF2x, .appleTemporal])
         XCTAssertEqual(result.injectedLateCallbackCount, 1)
-        XCTAssertEqual(result.staleGenerationDropCount, 1)
+        XCTAssertEqual(result.lateYADIFCompletionCount, 1)
+        XCTAssertEqual(
+            result.productionSinkDeliveryCountAfterLateCompletion,
+            result.productionSinkDeliveryCountBeforeLateCompletion
+        )
+        XCTAssertEqual(result.generationAdvanceDuringFinalSwitch, 1)
         XCTAssertEqual(result.crossGenerationDeliveryCount, 0)
     }
 }

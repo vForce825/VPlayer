@@ -4,13 +4,16 @@
 
 import CoreMedia
 import CoreVideo
+import Dispatch
 import Foundation
 import Metal
+import QuartzCore
 import VideoToolbox
 @testable import VPlayerPlayback
 
 enum DeterministicPipelineFixture: Equatable, Sendable {
     case hevc2160p50Progressive
+    case h2641080PsF25
     case h2641080i25TFF
     case h2641080i30000Over1001BFF
     case wrapThenSPSAndPMTChange
@@ -19,10 +22,14 @@ enum DeterministicPipelineFixture: Equatable, Sendable {
 enum TraceGenerationAdvanceReason: Equatable, Sendable {
     case sps
     case pmt
+    case discontinuity
 }
 
 struct DeterministicPipelineMetrics: Equatable, Sendable {
     var yadifKernelDispatchCount: UInt64 = 0
+    var bothFieldsConfigurationCount: UInt64 = 0
+    var decodedAccessUnitCount: UInt64 = 0
+    var temporalConfigurationCount: UInt64 = 0
     var temporalPropertySetCount: UInt64 = 0
     var temporalDecodeFlagCount: UInt64 = 0
     var crossGenerationReferenceCount: UInt64 = 0
@@ -45,22 +52,27 @@ struct DeterministicPipelineResult: @unchecked Sendable {
     var resolvedFieldOrders: [FieldParity] = []
     var inputFrameDurations: Set<CMTime> = []
     var presentationPTS: [GenerationPresentationTime] = []
-    var injectedLateCallbackCount = 0
     var generationAdvanceReasons: [TraceGenerationAdvanceReason] = []
     var generationAdvanceDeltas: [UInt64] = []
     var unchangedPMTGenerationAdvanceCount = 0
     var rawSourcePTS90k: [UInt64] = []
+    var pipelineDemuxEventCount = 0
+    var discontinuityResetCount = 0
+    var lateDecoderCallbackDeliveryCount = 0
 
     var generationAdvanceCount: Int { generationAdvanceReasons.count }
 }
 
 struct ClassifierAndTimingEdgeResult: Sendable {
-    var psfRoutes: [DeinterlaceRoute] = []
     var unknownRoutes: [DeinterlaceRoute] = []
-    var repeatFieldObservationCount = 0
     var normalizedPTS: [CMTime] = []
     var normalizedDurations: [CMTime] = []
     var synthesizedTimingCount = 0
+    var callbackSourcePTS90k: [UInt64?] = []
+    var deliveredSourceAccessUnitIDs: [UInt64] = []
+    var repeatFieldNormalizedDurations: [CMTime] = []
+    var repeatFieldRoute = DeinterlaceRoute.rawWhileClassifying
+    var repeatFieldMetadataReachedProcessor = false
 }
 
 struct TemporalFailureRegressionResult: Sendable {
@@ -84,8 +96,11 @@ struct GPUCommandErrorRegressionResult: Sendable {
 struct RapidAlgorithmSwitchRegressionResult: Sendable {
     var routes: [DeinterlaceRoute] = []
     var injectedLateCallbackCount = 0
-    var staleGenerationDropCount = 0
     var crossGenerationDeliveryCount = 0
+    var lateYADIFCompletionCount = 0
+    var productionSinkDeliveryCountBeforeLateCompletion = 0
+    var productionSinkDeliveryCountAfterLateCompletion = 0
+    var generationAdvanceDuringFinalSwitch: UInt64 = 0
 }
 
 final class DeterministicPipelineHarness: @unchecked Sendable {
@@ -97,7 +112,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         fields: Int? = nil
     ) async throws -> DeterministicPipelineResult {
         if fixture == .wrapThenSPSAndPMTChange {
-            return try playWrapAndFormatChangeTrace()
+            return try await playWrapAndFormatChangeTrace()
         }
 
         let trace = try DeterministicPipelineTrace.make(
@@ -106,66 +121,75 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             seconds: seconds,
             fields: fields
         )
-        let generation = MediaGeneration(rawValue: 0)
-        var classifier = ScanTypeClassifier(generation: generation)
-        var normalizer = PresentationTimestampNormalizer(generation: generation)
-        normalizer.configureNominalFrameDuration(trace.nominalFrameDuration)
-        let passthrough = PassthroughVideoProcessor()
-        passthrough.reset(to: generation)
-        let collector = TracePresentationCollector()
-        let yadif = algorithm == .metalYADIF2x
-            ? try makeSystemYADIF(generation: generation) : nil
+        let gate = TraceSerialGate(label: "org.vplayer.tests.deinterlace.trace")
+        let host = TraceCoordinatorHost(gate: gate)
+        let decoder = TraceCoordinatorDecoder()
+        let systemYADIF = try makeSystemYADIF(generation: host.generation)
+        let yadif = ObservingTraceYADIF(processor: systemYADIF)
+        let coordinator = VideoPipelineCoordinator(
+            decoder: decoder,
+            passthrough: PassthroughVideoProcessor(),
+            yadif: yadif,
+            probe: fixture == .h2641080PsF25 ? ImmediatePsFTraceProbe() : nil,
+            initialGeneration: host.generation,
+            selectedAlgorithm: algorithm,
+            classifierConfiguration: ScanClassifierConfiguration(
+                progressiveConfirmationFrames: 1,
+                psfConfirmationFrames: 1,
+                exitInterlacedConfirmationFrames: 1
+            ),
+            hooks: host.hooks
+        )
         var routes: [DeinterlaceRoute] = []
-        var fieldOrders: [FieldParity] = []
-
-        func record(_ route: DeinterlaceRoute) {
-            if routes.last != route { routes.append(route) }
-        }
-        func process(_ normalized: NormalizedDecodedFrame) {
-            let route = DeinterlaceRoute.resolve(
-                scan: classifier.current,
-                selected: algorithm
-            )
-            record(route)
-            switch route {
-            case .metalYADIF2x:
-                guard let yadif, case let .interlaced(order) = classifier.current else {
-                    return
-                }
-                if !fieldOrders.contains(order.parity) { fieldOrders.append(order.parity) }
-                yadif.submit(
-                    normalized: normalized,
-                    order: order,
-                    discontinuity: false
-                ) { collector.consume($0) }
-            case .rawWhileClassifying, .rawTemporalFailure, .bypass, .appleTemporal:
-                passthrough.submit(normalized.decodedFrame) { collector.consume($0) }
+        func perform(_ operation: () -> Void) {
+            gate.perform {
+                operation()
+                if routes.last != coordinator.route { routes.append(coordinator.route) }
             }
         }
 
-        for frame in trace.frames {
-            let observation = ScanObservation(
+        perform { coordinator.replaceFormat(trace.formatDescription) }
+        let generation = host.snapshot().generation
+        let initialAccessUnit = try makeAccessUnit(
+            id: 0,
+            generation: generation,
+            format: trace.formatDescription,
+            duration: trace.nominalFrameDuration,
+            parser: trace.frames[0].parserMetadata
+        )
+        perform { coordinator.handle(accessUnit: initialAccessUnit) }
+
+        let flushFrames = makeFlushFrames(for: trace, generation: generation)
+        for source in trace.frames + flushFrames {
+            let frame = source.rebased(to: generation)
+            let accessUnit = try makeAccessUnit(
+                id: frame.accessUnitID,
                 generation: generation,
-                parser: frame.parserMetadata,
-                decodedFields: FieldMetadataReader().read(
-                    formatDescription: trace.formatDescription,
-                    pixelBuffer: frame.pixelBuffer
-                ),
-                probe: nil,
-                presentationTimeStamp: frame.presentationTimeStamp
+                format: trace.formatDescription,
+                duration: frame.duration,
+                parser: frame.parserMetadata
             )
-            _ = classifier.observe(observation)
-            record(DeinterlaceRoute.resolve(scan: classifier.current, selected: algorithm))
-            for normalized in normalizer.push(frame, discontinuity: false) {
-                process(normalized)
-            }
+            perform { coordinator.handle(accessUnit: accessUnit) }
+            perform { coordinator.handle(decoder: .frame(frame)) }
         }
-        for normalized in normalizer.drain() { process(normalized) }
-        if let yadif { try await drain(yadif, collector: collector) }
+        try await drain(yadif)
+        gate.barrier()
 
-        let presentations = try collector.snapshot().sorted(by: presentationPrecedes)
+        let targetIDs = Set(trace.frames.map(\.accessUnitID))
+        let hostSnapshot = host.snapshot()
+        let presentations = hostSnapshot.deliveredFrames
+            .filter { targetIDs.contains($0.sourceAccessUnitID) }
+            .sorted(by: presentationPrecedes)
+        let decoderSnapshot = decoder.snapshot()
         let metrics = DeterministicPipelineMetrics(
-            yadifKernelDispatchCount: yadif?.metricsSnapshot.completedJobCount ?? 0
+            yadifKernelDispatchCount: systemYADIF.metricsSnapshot.completedJobCount,
+            bothFieldsConfigurationCount: UInt64(decoderSnapshot.bothFieldsConfigurationCount),
+            decodedAccessUnitCount: UInt64(decoderSnapshot.decodedAccessUnitCount),
+            temporalConfigurationCount: UInt64(decoderSnapshot.temporalConfigurationCount),
+            temporalPropertySetCount: UInt64(decoderSnapshot.temporalPropertySetCount),
+            temporalDecodeFlagCount: UInt64(decoderSnapshot.temporalDecodeFlagCount),
+            crossGenerationReferenceCount: UInt64(hostSnapshot.crossGenerationDeliveryCount),
+            staleGenerationDropCount: systemYADIF.metricsSnapshot.staleGenerationDropCount
         )
         return DeterministicPipelineResult(
             presentations: presentations,
@@ -175,7 +199,9 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             formatCodecType: CMFormatDescriptionGetMediaSubType(trace.formatDescription),
             pixelFormats: Set(trace.frames.map { CVPixelBufferGetPixelFormatType($0.pixelBuffer) }),
             routes: routes,
-            resolvedFieldOrders: fieldOrders,
+            resolvedFieldOrders: yadif.snapshotOrders().map(\.parity).reduce(into: []) {
+                if !$0.contains($1) { $0.append($1) }
+            },
             inputFrameDurations: Set(trace.frames.map(\.duration)),
             presentationPTS: presentations.map {
                 GenerationPresentationTime(
@@ -187,96 +213,192 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
     }
 
     func runClassifierAndTimingEdgeMatrix() throws -> ClassifierAndTimingEdgeResult {
-        let generation = MediaGeneration(rawValue: 41)
         let token = try VideoTestFactories.nv12()
-        let psfParser = VideoParserMetadata(
-            fieldOrder: .tt,
+        let format = try VideoTestFactories.formatDescription()
+        let host = TraceCoordinatorHost()
+        let decoder = TraceCoordinatorDecoder()
+        let yadif = ImmediateRecordingTraceYADIF()
+        let coordinator = VideoPipelineCoordinator(
+            decoder: decoder,
+            passthrough: PassthroughVideoProcessor(),
+            yadif: yadif,
+            probe: nil,
+            initialGeneration: host.generation,
+            selectedAlgorithm: .metalYADIF2x,
+            classifierConfiguration: ScanClassifierConfiguration(
+                progressiveConfirmationFrames: 1,
+                psfConfirmationFrames: 1,
+                exitInterlacedConfirmationFrames: 1
+            ),
+            hooks: host.hooks
+        )
+        coordinator.replaceFormat(format)
+        let generation = host.generation
+        let progressiveParser = VideoParserMetadata(
+            fieldOrder: .progressive,
             pictureStructure: .frame,
-            isInterlaced: true,
+            isInterlaced: false,
             repeatFirstField: false,
-            topFieldFirst: true,
+            topFieldFirst: nil,
             sourcePTS90k: 0
         )
-        let psfObservation = ScanObservation(
+        coordinator.handle(accessUnit: try makeAccessUnit(
+            id: 0,
             generation: generation,
-            parser: psfParser,
-            decodedFields: FieldMetadataEvidence(
-                fieldCount: 2,
-                fieldOrder: ResolvedFieldOrder(
-                    parity: .top,
-                    confidence: .signaled,
-                    source: .formatDescription
-                ),
-                source: .formatDescription
-            ),
-            probe: ContentProbeSample(combRatio: 0.01, motionRatio: 0.02, sampleCount: 2_304),
-            presentationTimeStamp: .zero
-        )
-        var psfClassifier = ScanTypeClassifier(
-            generation: generation,
-            configuration: ScanClassifierConfiguration(psfConfirmationFrames: 1)
-        )
-        _ = psfClassifier.observe(psfObservation)
+            format: format,
+            duration: CMTime(value: 1, timescale: 25),
+            parser: progressiveParser
+        ))
 
-        let unknownObservation = ScanObservation(
-            generation: generation,
-            parser: VideoParserMetadata(
+        let callbackPTS: [UInt64?] = [0, 7_200, 3_600, 10_800, 14_400, 14_400, nil]
+        let flushPTS: [UInt64] = [18_000, 21_600]
+        for (index, rawPTS) in (callbackPTS + flushPTS.map(Optional.some)).enumerated() {
+            let parser = VideoParserMetadata(
+                fieldOrder: .progressive,
+                pictureStructure: .frame,
+                isInterlaced: false,
+                repeatFirstField: false,
+                topFieldFirst: nil,
+                sourcePTS90k: rawPTS
+            )
+            let frame = VideoTestFactories.decodedFrame(
+                id: UInt64(index + 1),
+                pixelBuffer: token,
+                presentationTimeStamp: rawPTS.map {
+                    CMTime(value: Int64($0), timescale: 90_000)
+                } ?? .invalid,
+                duration: index >= 4 ? .invalid : CMTime(value: 1, timescale: 25),
+                generation: generation,
+                parserMetadata: parser
+            )
+            coordinator.handle(accessUnit: try makeAccessUnit(
+                id: frame.accessUnitID,
+                generation: generation,
+                format: format,
+                duration: CMTime(value: 1, timescale: 25),
+                parser: parser
+            ))
+            coordinator.handle(decoder: .frame(frame))
+        }
+        let targetIDs = Set(UInt64(1)...UInt64(callbackPTS.count))
+        let delivered = host.deliveredFrames.filter {
+            targetIDs.contains($0.sourceAccessUnitID)
+        }
+        let synthesizedCount = delivered.filter { presentation in
+            guard let raw = callbackPTS[Int(presentation.sourceAccessUnitID - 1)] else {
+                return true
+            }
+            return CMTimeCompare(
+                presentation.presentationTimeStamp,
+                CMTime(value: Int64(raw), timescale: 90_000)
+            ) != 0
+        }.count
+
+        let unknownRoutes = try DeinterlaceAlgorithm.allCases.map { algorithm in
+            let unknownHost = TraceCoordinatorHost()
+            let unknownCoordinator = VideoPipelineCoordinator(
+                decoder: TraceCoordinatorDecoder(),
+                passthrough: PassthroughVideoProcessor(),
+                yadif: ImmediateRecordingTraceYADIF(),
+                probe: nil,
+                initialGeneration: unknownHost.generation,
+                selectedAlgorithm: algorithm,
+                classifierConfiguration: ScanClassifierConfiguration(
+                    progressiveConfirmationFrames: 1,
+                    psfConfirmationFrames: 1,
+                    exitInterlacedConfirmationFrames: 1
+                ),
+                hooks: unknownHost.hooks
+            )
+            unknownCoordinator.replaceFormat(format)
+            let unknownGeneration = unknownHost.generation
+            let parser = VideoParserMetadata(
                 fieldOrder: .unknown,
                 pictureStructure: .unknown,
                 isInterlaced: nil,
                 repeatFirstField: false,
                 topFieldFirst: nil,
                 sourcePTS90k: nil
-            ),
-            decodedFields: FieldMetadataEvidence(
-                fieldCount: nil,
-                fieldOrder: nil,
-                source: .none
-            ),
-            probe: nil,
-            presentationTimeStamp: .invalid
-        )
-        var unknownClassifier = ScanTypeClassifier(generation: generation)
-        _ = unknownClassifier.observe(unknownObservation)
+            )
+            unknownCoordinator.handle(accessUnit: try makeAccessUnit(
+                id: 100,
+                generation: unknownGeneration,
+                format: format,
+                duration: CMTime(value: 1, timescale: 25),
+                parser: parser
+            ))
+            unknownCoordinator.handle(decoder: .frame(VideoTestFactories.decodedFrame(
+                id: 100,
+                pixelBuffer: token,
+                presentationTimeStamp: .invalid,
+                duration: .invalid,
+                generation: unknownGeneration,
+                parserMetadata: parser
+            )))
+            return unknownCoordinator.route
+        }
 
-        var normalizer = PresentationTimestampNormalizer(generation: generation)
-        normalizer.configureNominalFrameDuration(CMTime(value: 1, timescale: 25))
-        let sourcePTS: [UInt64?] = [0, 0, nil, 3_600, nil]
-        var normalized: [NormalizedDecodedFrame] = []
-        for (index, pts) in sourcePTS.enumerated() {
+        let repeatHost = TraceCoordinatorHost()
+        let repeatYADIF = ImmediateRecordingTraceYADIF()
+        let repeatCoordinator = VideoPipelineCoordinator(
+            decoder: TraceCoordinatorDecoder(),
+            passthrough: PassthroughVideoProcessor(),
+            yadif: repeatYADIF,
+            probe: nil,
+            initialGeneration: repeatHost.generation,
+            selectedAlgorithm: .metalYADIF2x,
+            classifierConfiguration: ScanClassifierConfiguration(
+                progressiveConfirmationFrames: 1,
+                psfConfirmationFrames: 1,
+                exitInterlacedConfirmationFrames: 1
+            ),
+            hooks: repeatHost.hooks
+        )
+        let repeatFormat = try VideoTestFactories.formatDescription(
+            fieldCount: NSNumber(value: 2),
+            detail: kCVImageBufferFieldDetailTemporalTopFirst
+        )
+        repeatCoordinator.replaceFormat(repeatFormat)
+        let repeatGeneration = repeatHost.generation
+        for index in 0..<3 {
             let parser = VideoParserMetadata(
                 fieldOrder: .tt,
-                pictureStructure: .frame,
+                pictureStructure: .topField,
                 isInterlaced: true,
-                repeatFirstField: index == 2,
+                repeatFirstField: index == 0,
                 topFieldFirst: true,
-                sourcePTS90k: pts
+                sourcePTS90k: UInt64(index * 3_600)
             )
-            let frame = VideoTestFactories.decodedFrame(
-                id: UInt64(index + 1),
+            if index == 0 {
+                repeatCoordinator.handle(accessUnit: try makeAccessUnit(
+                    id: 200,
+                    generation: repeatGeneration,
+                    format: repeatFormat,
+                    duration: CMTime(value: 1, timescale: 25),
+                    parser: parser
+                ))
+            }
+            repeatCoordinator.handle(decoder: .frame(VideoTestFactories.decodedFrame(
+                id: UInt64(200 + index),
                 pixelBuffer: token,
-                presentationTimeStamp: pts.map {
-                    CMTime(value: Int64($0), timescale: 90_000)
-                } ?? .invalid,
-                duration: .invalid,
-                generation: generation,
+                presentationTimeStamp: CMTime(value: Int64(index), timescale: 25),
+                duration: index == 0 ? .invalid : CMTime(value: 1, timescale: 25),
+                generation: repeatGeneration,
                 parserMetadata: parser
-            )
-            normalized.append(contentsOf: normalizer.push(frame, discontinuity: false))
+            )))
         }
-        normalized.append(contentsOf: normalizer.drain())
 
         return ClassifierAndTimingEdgeResult(
-            psfRoutes: DeinterlaceAlgorithm.allCases.map {
-                DeinterlaceRoute.resolve(scan: psfClassifier.current, selected: $0)
-            },
-            unknownRoutes: DeinterlaceAlgorithm.allCases.map {
-                DeinterlaceRoute.resolve(scan: unknownClassifier.current, selected: $0)
-            },
-            repeatFieldObservationCount: sourcePTS.indices.filter { $0 == 2 }.count,
-            normalizedPTS: normalized.map(\.presentationTimeStamp),
-            normalizedDurations: normalized.map(\.frameDuration),
-            synthesizedTimingCount: normalized.filter(\.timingWasSynthesized).count
+            unknownRoutes: unknownRoutes,
+            normalizedPTS: delivered.map(\.presentationTimeStamp),
+            normalizedDurations: delivered.map(\.duration),
+            synthesizedTimingCount: synthesizedCount,
+            callbackSourcePTS90k: callbackPTS,
+            deliveredSourceAccessUnitIDs: delivered.map(\.sourceAccessUnitID),
+            repeatFieldNormalizedDurations: repeatYADIF.snapshot().map(\.frameDuration),
+            repeatFieldRoute: repeatCoordinator.route,
+            repeatFieldMetadataReachedProcessor: repeatYADIF.snapshot().first?
+                .frame.parserMetadata.repeatFirstField == true
         )
     }
 
@@ -415,107 +537,308 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             )))
         }
         let lateCount = harness.yadif.pendingCompletionCount
+        let generationBeforeFinalSwitch = harness.host.generation
+        let deliveriesBeforeLateCompletion = harness.host.deliveredFrames.count
         harness.coordinator.setAlgorithm(.appleTemporal)
         routes.append(harness.coordinator.route)
         harness.yadif.completeAll()
+        let deliveriesAfterLateCompletion = harness.host.deliveredFrames.count
 
         return RapidAlgorithmSwitchRegressionResult(
             routes: routes,
             injectedLateCallbackCount: lateCount,
-            staleGenerationDropCount: lateCount,
-            crossGenerationDeliveryCount: harness.host.crossGenerationDeliveryCount
+            crossGenerationDeliveryCount: harness.host.crossGenerationDeliveryCount,
+            lateYADIFCompletionCount: harness.yadif.completedCallbackCount,
+            productionSinkDeliveryCountBeforeLateCompletion: deliveriesBeforeLateCompletion,
+            productionSinkDeliveryCountAfterLateCompletion: deliveriesAfterLateCompletion,
+            generationAdvanceDuringFinalSwitch: harness.host.generation.rawValue
+                - generationBeforeFinalSwitch.rawValue
         )
     }
 
-    private func playWrapAndFormatChangeTrace() throws -> DeterministicPipelineResult {
+    private func playWrapAndFormatChangeTrace() async throws -> DeterministicPipelineResult {
         let trace = try DeterministicPipelineTrace.make(
             fixture: .wrapThenSPSAndPMTChange,
             frames: nil,
             seconds: nil,
             fields: nil
         )
-        var controller = GenerationController()
-        let initialFingerprint = MediaFormatFingerprint(bytes: Data([0x11]))
-        var generation = controller.observe(initialFingerprint)
-        var normalizer = PresentationTimestampNormalizer(generation: generation)
-        var window = YADIFReferenceWindow(generation: generation)
-        var result = DeterministicPipelineResult(
+        let demuxer = CountingTraceDemuxer()
+        let decoder = TraceCoordinatorDecoder()
+        let systemYADIF = try makeSystemYADIF(generation: MediaGeneration(rawValue: 0))
+        let yadif = ObservingTraceYADIF(processor: systemYADIF)
+        let renderer = AuditTraceRenderer()
+        let events = TracePipelineEvents()
+        let pipeline = PlaybackPipeline(
+            executor: PlaybackSerialExecutor(label: "org.vplayer.tests.wrap.pipeline"),
+            demuxer: demuxer,
+            assemblerBuilder: FakePlaybackAssemblerBuilder(),
+            decoder: decoder,
+            processor: PassthroughVideoProcessor(),
+            yadifProcessor: yadif,
+            selectedAlgorithm: .metalYADIF2x,
+            renderer: renderer,
+            audio: FakePipelineAudio(),
+            clock: FakePipelineClock(),
+            display: FakePlaybackDisplay(),
+            eventSink: { events.append($0) }
+        )
+        pipeline.start(url: URL(string: "https://example.test/wrap.ts")!)
+        try await waitUntil { demuxer.hasStarted }
+
+        let initialSPS = Data([0x67, 0x64, 0x00, 0x1F])
+        let pps = Data([0x68, 0xEE, 0x3C, 0x80])
+        let initialCookie = Data([0x12, 0x10])
+        let initialTracks = PlaybackFakeMedia.tracks(
+            videoExtradata: initialSPS,
+            audioExtradata: initialCookie
+        )
+        let initialFingerprint = try MediaFormatFingerprint(
+            trackSet: initialTracks,
+            videoParameterSets: [initialSPS, pps],
+            audioCookie: initialCookie
+        )
+        demuxer.emit(.tracks(initialTracks))
+        pipeline.receive(audio: .format(
+            try PlaybackFakeMedia.audioFormat(),
+            .aac,
+            initialFingerprint
+        ))
+        pipeline.receive(video: .format(trace.formatDescription, initialFingerprint))
+        try await waitUntil {
+            await pipeline.debugSnapshot().generation == MediaGeneration(rawValue: 1)
+        }
+        let initialGeneration = await pipeline.debugSnapshot().generation
+
+        let initialAccessUnit = try makeAccessUnit(
+            id: 0,
+            generation: initialGeneration,
+            format: trace.formatDescription,
+            duration: trace.nominalFrameDuration,
+            parser: trace.frames[0].parserMetadata
+        )
+        pipeline.receive(video: .accessUnit(initialAccessUnit))
+        let wrapFlushFrames = makeFlushFrames(for: trace, generation: initialGeneration)
+        for source in trace.frames + wrapFlushFrames {
+            let frame = source.rebased(to: initialGeneration)
+            pipeline.receive(video: .accessUnit(try makeAccessUnit(
+                id: frame.accessUnitID,
+                generation: initialGeneration,
+                format: trace.formatDescription,
+                duration: frame.duration,
+                parser: frame.parserMetadata
+            )))
+            pipeline.receive(decoder: .frame(frame))
+        }
+        _ = await pipeline.debugSnapshot()
+        try await drain(yadif)
+        let wrapIDs = Set(trace.frames.map(\.accessUnitID))
+        try await waitUntil {
+            renderer.snapshot().allFrames.filter {
+                wrapIDs.contains($0.sourceAccessUnitID)
+            }.count == trace.frames.count * 2
+        }
+        let wrapPresentations = renderer.snapshot().allFrames
+            .filter { wrapIDs.contains($0.sourceAccessUnitID) }
+            .sorted(by: presentationPrecedes)
+
+        let beforeSamePMT = await pipeline.debugSnapshot().generation
+        demuxer.emit(.tracks(initialTracks))
+        let afterSamePMT = await pipeline.debugSnapshot().generation
+        let unchangedPMTAdvanceCount = beforeSamePMT == afterSamePMT ? 0 : 1
+
+        var changedSPS = initialSPS
+        changedSPS[3] = 0x20
+        let changedSPSFingerprint = try MediaFormatFingerprint(
+            trackSet: initialTracks,
+            videoParameterSets: [changedSPS, pps],
+            audioCookie: initialCookie
+        )
+        pipeline.receive(video: .format(trace.formatDescription, changedSPSFingerprint))
+        try await waitUntil {
+            await pipeline.debugSnapshot().generation.rawValue
+                == afterSamePMT.rawValue + 1
+        }
+        let spsGeneration = await pipeline.debugSnapshot().generation
+
+        let changedCookie = Data([0x13, 0x10])
+        let changedTracks = PlaybackFakeMedia.tracks(
+            videoExtradata: Data([0x00, 0x00, 0x01, 0x67]),
+            audioExtradata: changedCookie
+        )
+        let changedPMTFingerprint = try MediaFormatFingerprint(
+            trackSet: changedTracks,
+            videoParameterSets: [changedSPS, pps],
+            audioCookie: changedCookie
+        )
+        demuxer.emit(.tracks(changedTracks))
+        pipeline.receive(audio: .format(
+            try PlaybackFakeMedia.audioFormat(),
+            .aac,
+            changedPMTFingerprint
+        ))
+        pipeline.receive(video: .format(trace.formatDescription, changedPMTFingerprint))
+        try await waitUntil {
+            await pipeline.debugSnapshot().generation.rawValue
+                == spsGeneration.rawValue + 1
+        }
+        let pmtGeneration = await pipeline.debugSnapshot().generation
+
+        demuxer.emit(.discontinuity(changedTracks))
+        try await waitUntil {
+            await pipeline.debugSnapshot().generation.rawValue
+                == pmtGeneration.rawValue + 1
+        }
+        let discontinuityGeneration = await pipeline.debugSnapshot().generation
+        pipeline.receive(audio: .format(
+            try PlaybackFakeMedia.audioFormat(),
+            .aac,
+            changedPMTFingerprint
+        ))
+        pipeline.receive(video: .format(trace.formatDescription, changedPMTFingerprint))
+        _ = await pipeline.debugSnapshot()
+
+        let staleFrame = VideoTestFactories.decodedFrame(
+            id: 999,
+            pixelBuffer: trace.frames[0].pixelBuffer,
+            presentationTimeStamp: CMTime(value: 7_200, timescale: 90_000),
+            duration: trace.nominalFrameDuration,
+            generation: pmtGeneration,
+            parserMetadata: traceInterlacedParser(parity: .top, sourcePTS90k: 7_200),
+            formatMetadata: trace.formatMetadata
+        )
+        pipeline.receive(decoder: .frame(staleFrame))
+        _ = await pipeline.debugSnapshot()
+        let rendererSnapshot = renderer.snapshot()
+        let lateDeliveryCount = rendererSnapshot.allFrames.filter {
+            $0.sourceAccessUnitID == 999
+        }.count
+        let generationAudit = yadif.generationAudit()
+        let resetSet = Set(generationAudit.resets)
+        let resetMismatchCount = generationAudit.submissions.filter {
+            !resetSet.contains($0)
+        }.count
+        let failureEvents = events.snapshot().filter {
+            if case .failed = $0 { return true }
+            return false
+        }
+        if !failureEvents.isEmpty { throw DeterministicTraceError.pipelineFailure }
+
+        return DeterministicPipelineResult(
+            presentations: wrapPresentations,
+            metrics: DeterministicPipelineMetrics(
+                yadifKernelDispatchCount: systemYADIF.metricsSnapshot.completedJobCount,
+                bothFieldsConfigurationCount: UInt64(
+                    decoder.snapshot().bothFieldsConfigurationCount
+                ),
+                decodedAccessUnitCount: UInt64(decoder.snapshot().decodedAccessUnitCount),
+                temporalConfigurationCount: UInt64(
+                    decoder.snapshot().temporalConfigurationCount
+                ),
+                temporalPropertySetCount: UInt64(decoder.snapshot().temporalPropertySetCount),
+                temporalDecodeFlagCount: UInt64(decoder.snapshot().temporalDecodeFlagCount),
+                crossGenerationReferenceCount: UInt64(
+                    rendererSnapshot.crossGenerationDeliveryCount + resetMismatchCount
+                ),
+                staleGenerationDropCount: systemYADIF.metricsSnapshot.staleGenerationDropCount
+            ),
             allocatedDecodedSurfaceCount: trace.allocatedDecodedSurfaceCount,
             formatMetadata: trace.formatMetadata,
             formatCodecType: CMFormatDescriptionGetMediaSubType(trace.formatDescription),
-            pixelFormats: Set(trace.frames.map { CVPixelBufferGetPixelFormatType($0.pixelBuffer) })
+            pixelFormats: Set(trace.frames.map { CVPixelBufferGetPixelFormatType($0.pixelBuffer) }),
+            presentationPTS: wrapPresentations.map {
+                GenerationPresentationTime(
+                    generation: $0.generation,
+                    presentationTimeStamp: $0.presentationTimeStamp
+                )
+            },
+            generationAdvanceReasons: [.sps, .pmt, .discontinuity],
+            generationAdvanceDeltas: [
+                spsGeneration.rawValue - afterSamePMT.rawValue,
+                pmtGeneration.rawValue - spsGeneration.rawValue,
+                discontinuityGeneration.rawValue - pmtGeneration.rawValue,
+            ],
+            unchangedPMTGenerationAdvanceCount: unchangedPMTAdvanceCount,
+            rawSourcePTS90k: trace.frames.compactMap(\.parserMetadata.sourcePTS90k),
+            pipelineDemuxEventCount: demuxer.emissionCount,
+            discontinuityResetCount: rendererSnapshot.flushes.filter {
+                $0 == discontinuityGeneration
+            }.count,
+            lateDecoderCallbackDeliveryCount: lateDeliveryCount
         )
-        result.rawSourcePTS90k = trace.frames.compactMap(\.parserMetadata.sourcePTS90k)
+    }
 
-        func consume(_ normalizedFrames: [NormalizedDecodedFrame]) {
-            for normalized in normalizedFrames {
-                result.presentationPTS.append(GenerationPresentationTime(
-                    generation: normalized.frame.generation,
-                    presentationTimeStamp: normalized.presentationTimeStamp
-                ))
-                let transition = window.push(normalized, order: topOrder)
-                if let job = transition.job {
-                    let generations = [
-                        job.previous.frame.generation,
-                        job.current.frame.generation,
-                        job.next.frame.generation,
-                    ]
-                    if generations.contains(where: { $0 != job.current.frame.generation }) {
-                        result.metrics.crossGenerationReferenceCount &+= 1
-                    }
-                }
-            }
-        }
-
-        for frame in trace.frames {
-            let rebased = frame.rebased(to: generation)
-            consume(normalizer.push(rebased, discontinuity: false))
-        }
-        consume(normalizer.drain())
-
-        let samePMTGeneration = controller.observe(initialFingerprint)
-        if samePMTGeneration != generation {
-            result.unchangedPMTGenerationAdvanceCount += 1
-            generation = samePMTGeneration
-            normalizer.reset(generation: generation)
-        }
-        let changedSPS = controller.observe(MediaFormatFingerprint(bytes: Data([0x12])))
-        if changedSPS != generation {
-            result.generationAdvanceReasons.append(.sps)
-            result.generationAdvanceDeltas.append(changedSPS.rawValue - generation.rawValue)
-            generation = changedSPS
-            normalizer.reset(generation: generation)
-        }
-        consume(try generationSeedFrames(generation: generation, startingID: 100).flatMap {
-            normalizer.push($0, discontinuity: false)
-        })
-        consume(normalizer.drain())
-
-        let changedPMT = controller.observe(MediaFormatFingerprint(bytes: Data([0x13])))
-        if changedPMT != generation {
-            result.generationAdvanceReasons.append(.pmt)
-            result.generationAdvanceDeltas.append(changedPMT.rawValue - generation.rawValue)
-            generation = changedPMT
-            normalizer.reset(generation: generation)
-        }
-        consume(try generationSeedFrames(generation: generation, startingID: 200).flatMap {
-            normalizer.push($0, discontinuity: false)
-        })
-        consume(normalizer.drain())
-
-        let staleGeneration = MediaGeneration(rawValue: generation.rawValue - 1)
-        let stale = normalizedFrame(
-            id: 999,
-            pixelBuffer: try VideoTestFactories.nv12(),
-            generation: staleGeneration,
-            pts: CMTime(value: 1, timescale: 25),
-            duration: CMTime(value: 1, timescale: 25),
-            parity: .top
+    private func makeAccessUnit(
+        id: UInt64,
+        generation: MediaGeneration,
+        format: CMVideoFormatDescription,
+        duration: CMTime,
+        parser: VideoParserMetadata
+    ) throws -> CompressedVideoAccessUnit {
+        let pts = parser.sourcePTS90k.map {
+            CMTime(value: Int64($0), timescale: 90_000)
+        } ?? CMTime(value: Int64(id), timescale: 25)
+        let sampleBuffer = try SampleBufferBuilder.makeVideo(
+            data: Data([0, 0, 0, 1]),
+            formatDescription: format,
+            presentationTimeStamp: pts,
+            decodeTimeStamp: .invalid,
+            duration: duration,
+            isRandomAccess: true
         )
-        let staleTransition = window.push(stale, order: topOrder)
-        result.injectedLateCallbackCount = 1
-        result.metrics.staleGenerationDropCount = UInt64(staleTransition.discarded.count)
-        return result
+        return CompressedVideoAccessUnit(
+            id: id,
+            sampleBuffer: sampleBuffer,
+            generation: generation,
+            isRandomAccess: true,
+            parserMetadata: parser
+        )
+    }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        _ condition: @escaping () async -> Bool
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw DeterministicTraceError.timeout
+    }
+
+    private func makeFlushFrames(
+        for trace: DeterministicPipelineTrace,
+        generation: MediaGeneration
+    ) -> [DecodedVideoFrame] {
+        guard let last = trace.frames.last else { return [] }
+        let convertedDuration = CMTimeConvertScale(
+            trace.nominalFrameDuration,
+            timescale: 90_000,
+            method: .default
+        )
+        let lastRawPTS = last.parserMetadata.sourcePTS90k ?? 0
+        return (1...2).map { offset in
+            let rawPTS = lastRawPTS &+ UInt64(convertedDuration.value * Int64(offset))
+            let parser = VideoParserMetadata(
+                fieldOrder: last.parserMetadata.fieldOrder,
+                pictureStructure: last.parserMetadata.pictureStructure,
+                isInterlaced: last.parserMetadata.isInterlaced,
+                repeatFirstField: false,
+                topFieldFirst: last.parserMetadata.topFieldFirst,
+                sourcePTS90k: rawPTS
+            )
+            return VideoTestFactories.decodedFrame(
+                id: UInt64(trace.frames.count + offset),
+                pixelBuffer: trace.frames[(offset - 1) % trace.frames.count].pixelBuffer,
+                presentationTimeStamp: CMTime(value: Int64(rawPTS), timescale: 90_000),
+                duration: trace.nominalFrameDuration,
+                generation: generation,
+                parserMetadata: parser,
+                formatMetadata: trace.formatMetadata
+            )
+        }
     }
 
     private func makeSystemYADIF(generation: MediaGeneration) throws -> YADIFProcessor {
@@ -546,17 +869,14 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         return processor
     }
 
-    private func drain(
-        _ processor: YADIFProcessor,
-        collector: TracePresentationCollector
-    ) async throws {
+    private func drain(_ processor: ObservingTraceYADIF) async throws {
         await withCheckedContinuation { continuation in
             processor.drain { result in
-                collector.consume(result)
+                processor.consumeDrainResult(result)
                 continuation.resume()
             }
         }
-        if let failure = collector.failure { throw failure }
+        if let failure = processor.drainFailure { throw failure }
     }
 
     private func presentationPrecedes(
@@ -565,30 +885,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
     ) -> Bool {
         let comparison = CMTimeCompare(lhs.presentationTimeStamp, rhs.presentationTimeStamp)
         return comparison == 0 ? lhs.sequenceNumber < rhs.sequenceNumber : comparison < 0
-    }
-
-    private func generationSeedFrames(
-        generation: MediaGeneration,
-        startingID: UInt64
-    ) throws -> [DecodedVideoFrame] {
-        let buffers = try VideoTestFactories.movingFieldBuffers(
-            pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            parity: .top,
-            count: 3
-        )
-        return buffers.enumerated().map { index, buffer in
-            VideoTestFactories.decodedFrame(
-                id: startingID + UInt64(index),
-                pixelBuffer: buffer,
-                presentationTimeStamp: CMTime(value: Int64(index * 3_600), timescale: 90_000),
-                duration: CMTime(value: 3_600, timescale: 90_000),
-                generation: generation,
-                parserMetadata: traceInterlacedParser(
-                    parity: .top,
-                    sourcePTS90k: UInt64(index * 3_600)
-                )
-            )
-        }
     }
 
     private func makeCoordinatorHarness(
@@ -696,6 +992,46 @@ struct DeterministicPipelineTrace: @unchecked Sendable {
                     width: 3_840,
                     height: 2_160
                 ),
+                formatMetadata: metadata,
+                nominalFrameDuration: duration,
+                allocatedDecodedSurfaceCount: 1
+            )
+
+        case .h2641080PsF25:
+            let count = requestedFrames ?? 16
+            let token = try VideoTestFactories.pixelBuffer(
+                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            )
+            let metadata = VideoTestFactories.metadata(width: 1_920, height: 1_080)
+            let duration = CMTime(value: 3_600, timescale: 90_000)
+            var generated: [DecodedVideoFrame] = []
+            generated.reserveCapacity(count)
+            for index in 0..<count {
+                let parser = VideoParserMetadata(
+                    fieldOrder: .tt,
+                    pictureStructure: .frame,
+                    isInterlaced: true,
+                    repeatFirstField: false,
+                    topFieldFirst: true,
+                    sourcePTS90k: UInt64(index * 3_600)
+                )
+                let frame = VideoTestFactories.decodedFrame(
+                    id: UInt64(index + 1),
+                    pixelBuffer: token,
+                    presentationTimeStamp: CMTime(
+                        value: Int64(index * 3_600),
+                        timescale: 90_000
+                    ),
+                    duration: duration,
+                    generation: MediaGeneration(rawValue: 0),
+                    parserMetadata: parser,
+                    formatMetadata: metadata
+                )
+                generated.append(frame)
+            }
+            return DeterministicPipelineTrace(
+                frames: generated,
+                formatDescription: try interlacedFormat(parity: .top),
                 formatMetadata: metadata,
                 nominalFrameDuration: duration,
                 allocatedDecodedSurfaceCount: 1
@@ -825,20 +1161,6 @@ struct DeterministicPipelineTrace: @unchecked Sendable {
     }
 }
 
-private extension NormalizedDecodedFrame {
-    var decodedFrame: DecodedVideoFrame {
-        DecodedVideoFrame(
-            accessUnitID: frame.accessUnitID,
-            pixelBuffer: frame.pixelBuffer,
-            presentationTimeStamp: presentationTimeStamp,
-            duration: frameDuration,
-            generation: frame.generation,
-            parserMetadata: frame.parserMetadata,
-            formatMetadata: frame.formatMetadata
-        )
-    }
-}
-
 private extension DecodedVideoFrame {
     func rebased(to generation: MediaGeneration) -> DecodedVideoFrame {
         DecodedVideoFrame(
@@ -899,30 +1221,226 @@ private func normalizedFrame(
     )
 }
 
-private final class TracePresentationCollector: @unchecked Sendable {
+private final class CountingTraceDemuxer: MediaDemuxing, @unchecked Sendable {
     private let lock = NSLock()
-    private var presentations: [VideoPresentationFrame] = []
-    private var storedFailure: PlaybackFailure?
+    private var sink: (@Sendable (DemuxEvent) -> Void)?
+    private var started = false
+    private var emissions = 0
 
-    var failure: PlaybackFailure? { lock.withLock { storedFailure } }
+    var hasStarted: Bool { lock.withLock { started } }
+    var emissionCount: Int { lock.withLock { emissions } }
 
-    func consume(_ result: Result<[VideoPresentationFrame], PlaybackFailure>) {
+    func start(
+        url _: URL,
+        sink: @escaping @Sendable (DemuxEvent) -> Void
+    ) throws {
         lock.withLock {
-            switch result {
-            case let .success(frames):
-                presentations.append(contentsOf: frames)
-            case let .failure(failure):
-                storedFailure = storedFailure ?? failure
-            }
+            self.sink = sink
+            started = true
         }
     }
 
-    func snapshot() throws -> [VideoPresentationFrame] {
-        try lock.withLock {
-            if let storedFailure { throw storedFailure }
-            return presentations
+    func cancel() {}
+
+    func emit(_ event: DemuxEvent) {
+        let current = lock.withLock { () -> (@Sendable (DemuxEvent) -> Void)? in
+            emissions += 1
+            return sink
+        }
+        current?(event)
+    }
+}
+
+private final class TracePipelineEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [PlaybackPipelineEvent] = []
+    func append(_ event: PlaybackPipelineEvent) { lock.withLock { events.append(event) } }
+    func snapshot() -> [PlaybackPipelineEvent] { lock.withLock { events } }
+}
+
+private struct AuditTraceRendererSnapshot: Sendable {
+    let allFrames: [VideoPresentationFrame]
+    let flushes: [MediaGeneration]
+    let crossGenerationDeliveryCount: Int
+}
+
+private final class AuditTraceRenderer: PlaybackVideoRendering, @unchecked Sendable {
+    private let lock = NSLock()
+    private var allFrames: [VideoPresentationFrame] = []
+    private var flushes: [MediaGeneration] = []
+    private var currentGeneration = MediaGeneration(rawValue: 0)
+    private var crossGenerationDeliveryCount = 0
+
+    func enqueue(_ frame: VideoPresentationFrame) {
+        lock.withLock {
+            if frame.generation != currentGeneration {
+                crossGenerationDeliveryCount += 1
+            }
+            allFrames.append(frame)
         }
     }
+
+    func flush(to generation: MediaGeneration) {
+        lock.withLock {
+            currentGeneration = generation
+            flushes.append(generation)
+        }
+    }
+
+    func draw(
+        targetMediaTime _: CMTime,
+        drawable _: any CAMetalDrawable
+    ) -> VideoRenderDecision {
+        VideoRenderDecision(
+            action: .waiting,
+            sourceAccessUnitID: nil,
+            sequenceNumber: nil,
+            droppedFrameCount: 0
+        )
+    }
+
+    func resetPresentationTiming() {}
+
+    func snapshot() -> AuditTraceRendererSnapshot {
+        lock.withLock {
+            AuditTraceRendererSnapshot(
+                allFrames: allFrames,
+                flushes: flushes,
+                crossGenerationDeliveryCount: crossGenerationDeliveryCount
+            )
+        }
+    }
+}
+
+private final class TraceSerialGate: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let key = DispatchSpecificKey<UInt8>()
+
+    init(label: String) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+        queue.setSpecific(key: key, value: 1)
+    }
+
+    func perform<Value>(_ operation: () -> Value) -> Value {
+        if DispatchQueue.getSpecific(key: key) == 1 { return operation() }
+        return queue.sync(execute: operation)
+    }
+
+    func submit(_ operation: @escaping @Sendable () -> Void) {
+        queue.async(execute: operation)
+    }
+
+    func barrier() { perform {} }
+}
+
+private final class ObservingTraceYADIF: YADIFFrameProcessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let processor: YADIFProcessor
+    private var orders: [ResolvedFieldOrder] = []
+    private var resetGenerations: [MediaGeneration] = []
+    private var submissionGenerations: [MediaGeneration] = []
+    private var storedDrainFailure: PlaybackFailure?
+
+    init(processor: YADIFProcessor) {
+        self.processor = processor
+    }
+
+    var drainFailure: PlaybackFailure? { lock.withLock { storedDrainFailure } }
+
+    func reset(to generation: MediaGeneration) {
+        lock.withLock { resetGenerations.append(generation) }
+        processor.reset(to: generation)
+    }
+
+    func submit(
+        normalized frame: NormalizedDecodedFrame,
+        order: ResolvedFieldOrder,
+        discontinuity: Bool,
+        completion: @escaping @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    ) {
+        lock.withLock {
+            orders.append(order)
+            submissionGenerations.append(frame.frame.generation)
+        }
+        processor.submit(
+            normalized: frame,
+            order: order,
+            discontinuity: discontinuity,
+            completion: completion
+        )
+    }
+
+    func drain(
+        completion: @escaping @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    ) {
+        processor.drain(completion: completion)
+    }
+
+    func consumeDrainResult(
+        _ result: Result<[VideoPresentationFrame], PlaybackFailure>
+    ) {
+        if case let .failure(failure) = result {
+            lock.withLock { storedDrainFailure = failure }
+        }
+    }
+
+    func snapshotOrders() -> [ResolvedFieldOrder] { lock.withLock { orders } }
+
+    func generationAudit() -> (resets: [MediaGeneration], submissions: [MediaGeneration]) {
+        lock.withLock { (resetGenerations, submissionGenerations) }
+    }
+}
+
+private final class ImmediateRecordingTraceYADIF: YADIFFrameProcessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var submissions: [NormalizedDecodedFrame] = []
+
+    func reset(to _: MediaGeneration) {}
+
+    func submit(
+        normalized frame: NormalizedDecodedFrame,
+        order _: ResolvedFieldOrder,
+        discontinuity _: Bool,
+        completion: @escaping @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    ) {
+        lock.withLock { submissions.append(frame) }
+        completion(.success([]))
+    }
+
+    func drain(
+        completion: @escaping @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    ) {
+        completion(.success([]))
+    }
+
+    func snapshot() -> [NormalizedDecodedFrame] { lock.withLock { submissions } }
+}
+
+private final class ImmediatePsFTraceProbe: LumaScanProbing, @unchecked Sendable {
+    func submit(
+        current _: CVPixelBuffer,
+        previous _: CVPixelBuffer,
+        generation _: MediaGeneration,
+        completion: @escaping @Sendable (
+            Result<ContentProbeSample, LumaScanProbeFailure>
+        ) -> Void
+    ) {
+        completion(.success(ContentProbeSample(
+            combRatio: 0.01,
+            motionRatio: 0.02,
+            sampleCount: VideoTestFactories.width * VideoTestFactories.height
+        )))
+    }
+
+    func stop(generation _: MediaGeneration) {}
 }
 
 private final class TracePlaybackClock: PlaybackClock, @unchecked Sendable {
@@ -973,11 +1491,34 @@ private struct TraceCoordinatorHarness {
     let host: TraceCoordinatorHost
 }
 
+private struct TraceCoordinatorHostSnapshot: Sendable {
+    let generation: MediaGeneration
+    let deliveredFrames: [VideoPresentationFrame]
+    let crossGenerationDeliveryCount: Int
+}
+
 private final class TraceCoordinatorHost: @unchecked Sendable {
+    private let gate: TraceSerialGate?
     private(set) var generation = MediaGeneration(rawValue: 0)
+    private(set) var deliveredFrames: [VideoPresentationFrame] = []
     private(set) var notices: [PlaybackNotice] = []
     private(set) var failures: [PlaybackCoreError] = []
     private(set) var crossGenerationDeliveryCount = 0
+
+    init(gate: TraceSerialGate? = nil) {
+        self.gate = gate
+    }
+
+    func snapshot() -> TraceCoordinatorHostSnapshot {
+        let capture = {
+            TraceCoordinatorHostSnapshot(
+                generation: self.generation,
+                deliveredFrames: self.deliveredFrames,
+                crossGenerationDeliveryCount: self.crossGenerationDeliveryCount
+            )
+        }
+        return gate?.perform(capture) ?? capture()
+    }
 
     var hooks: VideoPipelineCoordinatorHooks {
         VideoPipelineCoordinatorHooks(
@@ -992,21 +1533,40 @@ private final class TraceCoordinatorHost: @unchecked Sendable {
             routeDidChange: { _ in },
             deliver: { [weak self] frames, generation in
                 guard let self else { return }
+                deliveredFrames.append(contentsOf: frames)
                 crossGenerationDeliveryCount += frames.filter {
                     $0.generation != generation || generation != self.generation
                 }.count
             },
             notice: { [weak self] notice, _ in self?.notices.append(notice) },
             fail: { [weak self] failure, _ in self?.failures.append(failure) },
-            schedule: { operation in operation() }
+            schedule: { [weak self] operation in
+                if let gate = self?.gate {
+                    gate.submit(operation)
+                } else {
+                    operation()
+                }
+            }
         )
     }
 }
 
+private struct TraceCoordinatorDecoderSnapshot: Sendable {
+    let bothFieldsConfigurationCount: Int
+    let decodedAccessUnitCount: Int
+    let temporalConfigurationCount: Int
+    let temporalPropertySetCount: Int
+    let temporalDecodeFlagCount: Int
+}
+
 private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable {
+    private let lock = NSLock()
     var failNextTemporalConfiguration = false
     private(set) var temporalPropertySetCount = 0
+    private(set) var temporalConfigurationCount = 0
     private(set) var temporalDecodeFlagCount = 0
+    private(set) var bothFieldsConfigurationCount = 0
+    private(set) var decodedAccessUnitCount = 0
     private var activeConfiguration: VideoDecodeConfiguration?
 
     func configure(
@@ -1014,32 +1574,52 @@ private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable 
         generation _: MediaGeneration,
         configuration: VideoDecodeConfiguration
     ) throws {
-        if configuration == .appleTemporal {
-            temporalPropertySetCount += 2
-            if failNextTemporalConfiguration {
-                failNextTemporalConfiguration = false
-                throw VideoDecoderFailure.temporalUnavailable(
-                    .initializationFailed(status: -77_710)
-                )
+        try lock.withLock {
+            if configuration == .appleTemporal {
+                temporalConfigurationCount += 1
+                temporalPropertySetCount += 2
+                if failNextTemporalConfiguration {
+                    failNextTemporalConfiguration = false
+                    throw VideoDecoderFailure.temporalUnavailable(
+                        .initializationFailed(status: -77_710)
+                    )
+                }
+            } else {
+                bothFieldsConfigurationCount += 1
             }
+            activeConfiguration = configuration
         }
-        activeConfiguration = configuration
     }
 
     func decode(
         _ accessUnit: CompressedVideoAccessUnit,
         flags: VTDecodeFrameFlags
     ) throws {
-        if activeConfiguration == .appleTemporal,
-           flags.contains(._EnableAsynchronousDecompression) {
-            temporalDecodeFlagCount += 1
+        lock.withLock {
+            decodedAccessUnitCount += 1
+            if activeConfiguration == .appleTemporal,
+               flags.contains(._EnableAsynchronousDecompression) {
+                temporalDecodeFlagCount += 1
+            }
         }
         _ = accessUnit
     }
 
     func finishDelayedFrames() throws {}
     func waitForAsynchronousFrames() throws {}
-    func invalidate() { activeConfiguration = nil }
+    func invalidate() { lock.withLock { activeConfiguration = nil } }
+
+    func snapshot() -> TraceCoordinatorDecoderSnapshot {
+        lock.withLock {
+            TraceCoordinatorDecoderSnapshot(
+                bothFieldsConfigurationCount: bothFieldsConfigurationCount,
+                decodedAccessUnitCount: decodedAccessUnitCount,
+                temporalConfigurationCount: temporalConfigurationCount,
+                temporalPropertySetCount: temporalPropertySetCount,
+                temporalDecodeFlagCount: temporalDecodeFlagCount
+            )
+        }
+    }
 }
 
 private final class DelayedTraceYADIF: YADIFFrameProcessing, @unchecked Sendable {
@@ -1050,6 +1630,7 @@ private final class DelayedTraceYADIF: YADIFFrameProcessing, @unchecked Sendable
 
     private var pending: [Pending] = []
     private var sequence: UInt64 = 0
+    private(set) var completedCallbackCount = 0
     var pendingCompletionCount: Int { pending.count }
 
     func reset(to _: MediaGeneration) {}
@@ -1090,7 +1671,10 @@ private final class DelayedTraceYADIF: YADIFFrameProcessing, @unchecked Sendable
     func completeAll() {
         let completions = pending
         pending.removeAll()
-        for item in completions { item.completion(.success(item.frames)) }
+        for item in completions {
+            completedCallbackCount += 1
+            item.completion(.success(item.frames))
+        }
     }
 }
 
@@ -1138,4 +1722,6 @@ enum DeterministicTraceError: Error {
     case metalUnavailable
     case textureCache(CVReturn)
     case oddFieldCount(Int)
+    case pipelineFailure
+    case timeout
 }
