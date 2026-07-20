@@ -16,18 +16,58 @@
     "yadif-nv12-tff.bin": {
       "byteCount": 20736,
       "sha256": "f3f595225d18b6d7e700481798a8c8e84f093f7728831fe7fd18e0d8277785c1"
+    },
+    "yadif-p010-bff-input.bin": {
+      "byteCount": 34560,
+      "sha256": "6b910d9d07bfabf1ce40197061470550053fa20b001e7537787155735ea07c22"
+    },
+    "yadif-p010-bff.bin": {
+      "byteCount": 41472,
+      "sha256": "747553acf57254ccc2105c93256c537bbaea856029212fd9a34eeda8d79077ed"
+    },
+    "yadif-p010-tff-input.bin": {
+      "byteCount": 34560,
+      "sha256": "fe65681ff173cddc8c6b740eb61f8b848cf49a7dacb88b374bab4582afdad438"
+    },
+    "yadif-p010-tff.bin": {
+      "byteCount": 41472,
+      "sha256": "f2a840cf22087e2655c1d762384bd2f7beb1522a7e2df51b1f0bad948412cd5f"
+    }
+  },
+  "formats": {
+    "nv12": {
+      "bytesPerFrame": 3456,
+      "graphs": {
+        "bffInput": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,format=nv12",
+        "bffOutput": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
+        "tffInput": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,format=nv12",
+        "tffOutput": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=nv12"
+      },
+      "inputFrameCount": 5,
+      "layout": "bi-planar-420-8-bit",
+      "outputFrameCount": 6,
+      "pixelFormat": "nv12",
+      "source": "testsrc2=size=128x72:rate=50:duration=0.20,scale=64:36:flags=bilinear"
+    },
+    "p010le": {
+      "bytesPerFrame": 6912,
+      "graphs": {
+        "bffInput": "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,format=p010le",
+        "bffOutput": "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=p010le",
+        "tffInput": "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,format=p010le",
+        "tffOutput": "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=p010le"
+      },
+      "inputFrameCount": 5,
+      "layout": "bi-planar-420-10-bit-msb16",
+      "outputFrameCount": 6,
+      "pixelFormat": "p010le",
+      "source": "testsrc2=size=128x72:rate=50:duration=0.20,format=yuv420p10le,scale=64:36:flags=bilinear"
     }
   },
   "generatorArguments": {
-    "bff": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
-    "source": "testsrc2=size=128x72:rate=50:duration=0.20,scale=64:36:flags=bilinear",
-    "tff": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
     "trim": "trim=start_frame=2:end_frame=8"
   },
   "height": 36,
-  "inputFrameCount": 5,
-  "outputFrameCount": 6,
-  "pixelFormat": "nv12",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "width": 64
 }

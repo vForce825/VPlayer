@@ -6,6 +6,19 @@ import CoreVideo
 import Foundation
 import Metal
 
+protocol YADIFCommandSubmitting: AnyObject, Sendable {
+    func submit(
+        job: YADIFJob,
+        outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
+        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+    ) throws(YADIFFailure)
+}
+
+enum YADIFCommandResult: Sendable, Equatable {
+    case completed
+    case failed
+}
+
 public struct YADIFJob: @unchecked Sendable {
     public let previous: NormalizedDecodedFrame
     public let current: NormalizedDecodedFrame
@@ -40,7 +53,9 @@ public enum YADIFFailure: Error, Equatable, Sendable {
     case shaderLibraryUnavailable
     case shaderFunctionUnavailable(String)
     case pipelineCreationFailed
+    case commandBufferAllocationFailed
     case commandEncoderAllocationFailed
+    case commandFailed
 }
 
 struct YADIFSurfaceDescription: Equatable, Sendable {
@@ -144,9 +159,15 @@ final class YADIFTextureMapper: @unchecked Sendable {
 
     init(
         device: any MTLDevice,
+        textureCache: CVMetalTextureCache? = nil,
         cacheFactory: YADIFTextureCacheFactory? = nil,
         textureFactory: YADIFTextureFactory? = nil
     ) throws(YADIFFailure) {
+        if let textureCache {
+            cache = textureCache
+            self.textureFactory = textureFactory ?? Self.makeTexture
+            return
+        }
         let cacheResult: (status: CVReturn, cache: CVMetalTextureCache?)
         if let cacheFactory {
             cacheResult = cacheFactory(device)
@@ -167,22 +188,29 @@ final class YADIFTextureMapper: @unchecked Sendable {
     func map(_ pixelBuffer: CVPixelBuffer) throws(YADIFFailure) -> YADIFMappedTextures {
         let description = YADIFSurfaceDescription(pixelBuffer: pixelBuffer)
         try YADIFSurfaceValidator.validate(description)
-        guard description.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-                || description.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
+        let planeFormats: (luma: MTLPixelFormat, chroma: MTLPixelFormat)
+        switch description.pixelFormat {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            planeFormats = (.r8Unorm, .rg8Unorm)
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            planeFormats = (.r16Unorm, .rg16Unorm)
+        default:
             throw .unsupportedPixelFormat(description.pixelFormat)
         }
 
         let luma = try mapPlane(
             pixelBuffer,
             plane: 0,
-            format: .r8Unorm,
+            format: planeFormats.luma,
             width: description.lumaWidth,
             height: description.lumaHeight
         )
         let chroma = try mapPlane(
             pixelBuffer,
             plane: 1,
-            format: .rg8Unorm,
+            format: planeFormats.chroma,
             width: description.chromaWidth,
             height: description.chromaHeight
         )
@@ -273,13 +301,15 @@ final class YADIFNV12Kernel: @unchecked Sendable {
     private static let shaderBundle = Bundle(for: ShaderBundleToken.self)
 
     private let mapper: YADIFTextureMapper
-    private let pipeline: any MTLComputePipelineState
+    private let pipeline8: any MTLComputePipelineState
+    private let pipeline16: any MTLComputePipelineState
     private let encoderFactory: YADIFEncoderFactory
 
     init(
         device: any MTLDevice,
         textureMapper: YADIFTextureMapper? = nil,
         functionName: String = "yadifPlane8",
+        p010FunctionName: String = "yadifPlane16",
         libraryFactory: YADIFLibraryFactory? = nil,
         pipelineFactory: YADIFPipelineFactory? = nil,
         encoderFactory: YADIFEncoderFactory? = nil
@@ -301,18 +331,23 @@ final class YADIFNV12Kernel: @unchecked Sendable {
             throw .shaderLibraryUnavailable
         }
         guard let library else { throw .shaderLibraryUnavailable }
-        guard let function = library.makeFunction(name: functionName) else {
-            throw .shaderFunctionUnavailable(functionName)
-        }
-        do {
-            if let pipelineFactory {
-                pipeline = try pipelineFactory(device, function)
-            } else {
-                pipeline = try device.makeComputePipelineState(function: function)
+        func makePipeline(
+            named name: String
+        ) throws(YADIFFailure) -> any MTLComputePipelineState {
+            guard let function = library.makeFunction(name: name) else {
+                throw .shaderFunctionUnavailable(name)
             }
-        } catch {
-            throw .pipelineCreationFailed
+            do {
+                if let pipelineFactory {
+                    return try pipelineFactory(device, function)
+                }
+                return try device.makeComputePipelineState(function: function)
+            } catch {
+                throw .pipelineCreationFailed
+            }
         }
+        pipeline8 = try makePipeline(named: functionName)
+        pipeline16 = try makePipeline(named: p010FunctionName)
         self.encoderFactory = encoderFactory ?? { $0.makeComputeCommandEncoder() }
     }
 
@@ -332,6 +367,17 @@ final class YADIFNV12Kernel: @unchecked Sendable {
         for description in descriptions { try YADIFSurfaceValidator.validate(description) }
         guard descriptions.dropFirst().allSatisfy({ $0 == descriptions[0] }) else {
             throw .invalidDimensions
+        }
+        let pipeline: any MTLComputePipelineState
+        switch descriptions[0].pixelFormat {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            pipeline = pipeline8
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            pipeline = pipeline16
+        default:
+            throw .unsupportedPixelFormat(descriptions[0].pixelFormat)
         }
         var mappings: [YADIFMappedTextures] = []
         mappings.reserveCapacity(buffers.count)

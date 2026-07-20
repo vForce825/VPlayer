@@ -14,10 +14,25 @@ import XCTest
 final class YADIFGoldenPixelTests: XCTestCase {
     private static let width = 64
     private static let height = 36
-    private static let bytesPerFrame = width * height * 3 / 2
+    private static let nv12BytesPerFrame = width * height * 3 / 2
+    private static let p010BytesPerFrame = width * height * 3
     private static let lockedCommit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
-    private static let sourceRecipe =
+    private static let nv12SourceRecipe =
         "testsrc2=size=128x72:rate=50:duration=0.20,scale=64:36:flags=bilinear"
+    private static let p010SourceRecipe =
+        "testsrc2=size=128x72:rate=50:duration=0.20,format=yuv420p10le,scale=64:36:flags=bilinear"
+    private static let nv12Graphs = GoldenManifest.FormatEntry.Graphs(
+        tffInput: "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,format=nv12",
+        bffInput: "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,format=nv12",
+        tffOutput: "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
+        bffOutput: "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=nv12"
+    )
+    private static let p010Graphs = GoldenManifest.FormatEntry.Graphs(
+        tffInput: "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,format=p010le",
+        bffInput: "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,format=p010le",
+        tffOutput: "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=p010le",
+        bffOutput: "setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=p010le"
+    )
 
     func testPublicContractsAreSendableAndFailureValuesAreExact() throws {
         assertSendable(YADIFJob.self)
@@ -36,7 +51,9 @@ final class YADIFGoldenPixelTests: XCTestCase {
             .shaderLibraryUnavailable,
             .shaderFunctionUnavailable("missing"),
             .pipelineCreationFailed,
+            .commandBufferAllocationFailed,
             .commandEncoderAllocationFailed,
+            .commandFailed,
         ]
         XCTAssertEqual(failures, failures)
     }
@@ -55,25 +72,46 @@ final class YADIFGoldenPixelTests: XCTestCase {
             from: Data(contentsOf: root.appendingPathComponent("Vendor/FFmpeg/ffmpeg.lock.json"))
         )
 
-        XCTAssertEqual(manifest.schemaVersion, 1)
+        XCTAssertEqual(manifest.schemaVersion, 2)
         XCTAssertEqual(manifest.ffmpegCommit, Self.lockedCommit)
         XCTAssertEqual(manifest.ffmpegCommit, lock.commit)
         XCTAssertEqual(manifest.width, Self.width)
         XCTAssertEqual(manifest.height, Self.height)
-        XCTAssertEqual(manifest.pixelFormat, "nv12")
-        XCTAssertEqual(manifest.inputFrameCount, 5)
-        XCTAssertEqual(manifest.outputFrameCount, 6)
-        XCTAssertEqual(manifest.generatorArguments.source, Self.sourceRecipe)
         XCTAssertEqual(manifest.generatorArguments.trim, "trim=start_frame=2:end_frame=8")
+        XCTAssertEqual(Set(manifest.formats.keys), Set(["nv12", "p010le"]))
+        XCTAssertEqual(manifest.formats["nv12"], .init(
+            source: Self.nv12SourceRecipe,
+            pixelFormat: "nv12",
+            layout: "bi-planar-420-8-bit",
+            inputFrameCount: 5,
+            outputFrameCount: 6,
+            bytesPerFrame: Self.nv12BytesPerFrame,
+            graphs: Self.nv12Graphs
+        ))
+        XCTAssertEqual(manifest.formats["p010le"], .init(
+            source: Self.p010SourceRecipe,
+            pixelFormat: "p010le",
+            layout: "bi-planar-420-10-bit-msb16",
+            inputFrameCount: 5,
+            outputFrameCount: 6,
+            bytesPerFrame: Self.p010BytesPerFrame,
+            graphs: Self.p010Graphs
+        ))
         XCTAssertEqual(Set(manifest.files.keys), Set([
             "yadif-nv12-tff-input.bin",
             "yadif-nv12-bff-input.bin",
             "yadif-nv12-tff.bin",
             "yadif-nv12-bff.bin",
+            "yadif-p010-tff-input.bin",
+            "yadif-p010-bff-input.bin",
+            "yadif-p010-tff.bin",
+            "yadif-p010-bff.bin",
         ]))
 
         for (name, entry) in manifest.files {
-            let expectedSize = name.contains("-input") ? 17_280 : 20_736
+            let bytesPerFrame = name.contains("p010")
+                ? Self.p010BytesPerFrame : Self.nv12BytesPerFrame
+            let expectedSize = bytesPerFrame * (name.contains("-input") ? 5 : 6)
             XCTAssertEqual(entry.byteCount, expectedSize, name)
             let bytes = try Data(contentsOf: root.appendingPathComponent("Tests/Fixtures/Video/\(name)"))
             XCTAssertEqual(bytes.count, expectedSize, name)
@@ -87,7 +125,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
         }
         for (index, input) in interlacedInputs.enumerated() {
             let lumaHashes = (0..<5).map { frameIndex in
-                let frameStart = frameIndex * Self.bytesPerFrame
+                let frameStart = frameIndex * Self.nv12BytesPerFrame
                 return SHA256.hash(data: input.subdata(
                     in: frameStart..<(frameStart + Self.width * Self.height)
                 )).hex
@@ -102,6 +140,34 @@ final class YADIFGoldenPixelTests: XCTestCase {
             interlacedInputs[0],
             interlacedInputs[1],
             "TFF and BFF inputs must exercise different woven pictures"
+        )
+
+        let p010Inputs = try ["tff", "bff"].map { stem in
+            try Data(contentsOf: root.appendingPathComponent(
+                "Tests/Fixtures/Video/yadif-p010-\(stem)-input.bin"
+            ))
+        }
+        for (index, input) in p010Inputs.enumerated() {
+            assertP010LowBitsAreZero(
+                input,
+                label: "\(index == 0 ? "tff" : "bff") P010 input"
+            )
+            let lumaHashes = (0..<5).map { frameIndex in
+                let frameStart = frameIndex * Self.p010BytesPerFrame
+                return SHA256.hash(data: input.subdata(
+                    in: frameStart..<(frameStart + Self.width * Self.height * 2)
+                )).hex
+            }
+            XCTAssertEqual(
+                Set(lumaHashes).count,
+                5,
+                "\(index == 0 ? "tff" : "bff") P010 must contain five unique luma frames"
+            )
+        }
+        XCTAssertNotEqual(
+            p010Inputs[0],
+            p010Inputs[1],
+            "P010 TFF and BFF inputs must exercise different woven pictures"
         )
     }
 
@@ -131,7 +197,8 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertTrue(build.contains("status --porcelain"))
         XCTAssertTrue(build.contains("CONFIG_GPL 0"))
         XCTAssertTrue(generate.contains("mktemp -d"))
-        XCTAssertTrue(generate.contains(Self.sourceRecipe))
+        XCTAssertTrue(generate.contains(Self.nv12SourceRecipe))
+        XCTAssertTrue(generate.contains(Self.p010SourceRecipe))
         XCTAssertFalse(generate.contains("testsrc2=size=64x36"))
         XCTAssertTrue(generate.contains("trim=start_frame=2:end_frame=8"))
         XCTAssertTrue(generate.contains("setfield=tff,separatefields"))
@@ -141,11 +208,17 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertTrue(generate.contains("weave=first_field=bottom"))
         XCTAssertTrue(generate.contains("progressive.bin"))
         XCTAssertTrue(generate.contains("cmp -s - <("))
-        XCTAssertTrue(generate.contains("verify_unique_luma_frames tff"))
-        XCTAssertTrue(generate.contains("verify_unique_luma_frames bff"))
+        XCTAssertTrue(generate.contains("verify_unique_luma_frames nv12 tff 3456 2304"))
+        XCTAssertTrue(generate.contains("verify_unique_luma_frames nv12 bff 3456 2304"))
+        XCTAssertTrue(generate.contains("verify_unique_luma_frames p010 tff 6912 4608"))
+        XCTAssertTrue(generate.contains("verify_unique_luma_frames p010 bff 6912 4608"))
         XCTAssertTrue(generate.contains("TFF and BFF inputs are unexpectedly identical"))
         XCTAssertTrue(generate.contains("17280"))
         XCTAssertTrue(generate.contains("20736"))
+        XCTAssertTrue(generate.contains("34560"))
+        XCTAssertTrue(generate.contains("41472"))
+        XCTAssertTrue(generate.contains("verify_p010_low_bits"))
+        XCTAssertTrue(generate.contains("format=p010le"))
         XCTAssertTrue(generate.contains("jq -n -S"))
         XCTAssertFalse(generate.contains("command -v ffmpeg"))
         XCTAssertFalse(build.contains("tinterlace"))
@@ -277,6 +350,48 @@ final class YADIFGoldenPixelTests: XCTestCase {
         try await verifyGolden(order: .bottom, stem: "bff")
     }
 
+    func testP010TFFMatchesPinnedOracleAndExactStorageRules() async throws {
+        try await verifyP010Golden(order: .top, stem: "tff")
+    }
+
+    func testP010BFFMatchesPinnedOracleAndExactStorageRules() async throws {
+        try await verifyP010Golden(order: .bottom, stem: "bff")
+    }
+
+    func testMapperSelectsExactNV12AndP010PlaneFormatsForVideoAndFullRange() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal device unavailable")
+        }
+        for (pixelFormat, expectedLuma, expectedChroma) in [
+            (
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                MTLPixelFormat.r8Unorm,
+                MTLPixelFormat.rg8Unorm
+            ),
+            (
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                MTLPixelFormat.r8Unorm,
+                MTLPixelFormat.rg8Unorm
+            ),
+            (
+                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                MTLPixelFormat.r16Unorm,
+                MTLPixelFormat.rg16Unorm
+            ),
+            (
+                kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+                MTLPixelFormat.r16Unorm,
+                MTLPixelFormat.rg16Unorm
+            ),
+        ] {
+            let mapped = try YADIFTextureMapper(device: device).map(
+                try makePixelBuffer(pixelFormat: pixelFormat)
+            )
+            XCTAssertEqual(mapped.luma.pixelFormat, expectedLuma)
+            XCTAssertEqual(mapped.chroma.pixelFormat, expectedChroma)
+        }
+    }
+
     func testEncodedResourceTokenRetainsTextureCacheOwnerUntilTokenRelease() async throws {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
@@ -333,19 +448,26 @@ final class YADIFGoldenPixelTests: XCTestCase {
         let directory = repositoryRoot.appendingPathComponent(
             "Sources/VPlayerPlayback/Deinterlace/YADIF"
         )
-        let swift = try ["YADIFTypes.swift", "ProgressiveSurfacePool.swift"].map {
+        let lowLevelSwift = try ["YADIFTypes.swift", "ProgressiveSurfacePool.swift"].map {
             try String(contentsOf: directory.appendingPathComponent($0), encoding: .utf8)
         }.joined(separator: "\n")
+        let processor = try String(
+            contentsOf: directory.appendingPathComponent("YADIFProcessor.swift"),
+            encoding: .utf8
+        )
+        let swift = lowLevelSwift + "\n" + processor
         let metal = try String(
             contentsOf: directory.appendingPathComponent("YADIF.metal"),
             encoding: .utf8
         )
         for forbidden in [
             "CVPixelBufferLockBaseAddress", "CVPixelBufferGetBaseAddress", ".getBytes(",
-            "waitUntilCompleted", ".commit()",
+            "waitUntilCompleted",
         ] {
             XCTAssertFalse(swift.contains(forbidden), forbidden)
         }
+        XCTAssertFalse(lowLevelSwift.contains(".commit()"), "kernel encoder must not commit")
+        XCTAssertEqual(processor.components(separatedBy: ".commit()").count - 1, 1)
         XCTAssertTrue(metal.contains("kernel void yadifPlane8"))
         XCTAssertTrue(metal.contains("kernel void yadifPlane16"))
         XCTAssertFalse(metal.lowercased().contains("placeholder"))
@@ -361,7 +483,9 @@ final class YADIFGoldenPixelTests: XCTestCase {
         let inputs = try (0..<5).map { index in
             try makePixelBuffer(
                 pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                bytes: inputBytes.subdata(in: index * Self.bytesPerFrame..<(index + 1) * Self.bytesPerFrame)
+                bytes: inputBytes.subdata(
+                    in: index * Self.nv12BytesPerFrame..<(index + 1) * Self.nv12BytesPerFrame
+                )
             )
         }
         let pool = ProgressiveSurfacePool()
@@ -399,7 +523,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertEqual(rendered.count, 6)
         for index in rendered.indices {
             let expected = golden.subdata(
-                in: index * Self.bytesPerFrame..<(index + 1) * Self.bytesPerFrame
+                in: index * Self.nv12BytesPerFrame..<(index + 1) * Self.nv12BytesPerFrame
             )
             assertPlane(
                 rendered[index].prefix(Self.width * Self.height),
@@ -418,7 +542,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
             assertCopiedRows(
                 output: rendered[index],
                 current: inputBytes.subdata(
-                    in: (index / 2 + 1) * Self.bytesPerFrame..<(index / 2 + 2) * Self.bytesPerFrame
+                    in: ((index / 2 + 1) * Self.nv12BytesPerFrame)..<((index / 2 + 2) * Self.nv12BytesPerFrame)
                 ),
                 copiedParity: copiedParity(order: order, outputIndex: index % 2),
                 label: "\(stem) frame \(index)"
@@ -434,6 +558,139 @@ final class YADIFGoldenPixelTests: XCTestCase {
                 SHA256.hash(data: rendered[pair * 2 + 1].prefix(Self.width * Self.height)).hex,
                 "field pair \(pair) must contain two different pictures"
             )
+        }
+    }
+
+    private func verifyP010Golden(order: FieldParity, stem: String) async throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else {
+            throw XCTSkip("Metal device unavailable")
+        }
+        let inputBytes = try fixture("yadif-p010-\(stem)-input.bin")
+        let golden = try fixture("yadif-p010-\(stem).bin")
+        XCTAssertEqual(inputBytes.count, 5 * Self.p010BytesPerFrame)
+        XCTAssertEqual(golden.count, 6 * Self.p010BytesPerFrame)
+        assertP010LowBitsAreZero(inputBytes, label: "\(stem) input")
+        assertP010LowBitsAreZero(golden, label: "\(stem) oracle")
+        let inputs = try (0..<5).map { index in
+            try makePixelBuffer(
+                pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                bytes: inputBytes.subdata(
+                    in: index * Self.p010BytesPerFrame..<(index + 1) * Self.p010BytesPerFrame
+                )
+            )
+        }
+        let pool = ProgressiveSurfacePool()
+        let kernel = try YADIFNV12Kernel(device: device)
+        var rendered: [Data] = []
+
+        for center in 1...3 {
+            let outputs = try pool.allocatePair(matching: inputs[center])
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let token = try kernel.encode(
+                YADIFJob(
+                    previous: normalized(inputs[center - 1], id: UInt64(center)),
+                    current: normalized(inputs[center], id: UInt64(center + 1)),
+                    next: normalized(inputs[center + 1], id: UInt64(center + 2)),
+                    order: resolved(order),
+                    spatialOnly: false
+                ),
+                outputs: outputs,
+                into: commandBuffer
+            )
+            XCTAssertEqual(commandBuffer.status, .notEnqueued, "encoding must not commit")
+            let completed = expectation(description: "P010 YADIF GPU completion \(center)")
+            commandBuffer.addCompletedHandler { buffer in
+                withExtendedLifetime(token) {
+                    XCTAssertEqual(buffer.status, .completed)
+                    completed.fulfill()
+                }
+            }
+            commandBuffer.commit()
+            await fulfillment(of: [completed], timeout: 5)
+            rendered.append(try packedBytes(outputs.first))
+            rendered.append(try packedBytes(outputs.second))
+        }
+
+        XCTAssertEqual(rendered.count, 6)
+        let lumaSampleCount = Self.width * Self.height
+        for index in rendered.indices {
+            let expected = golden.subdata(
+                in: index * Self.p010BytesPerFrame..<(index + 1) * Self.p010BytesPerFrame
+            )
+            assertP010LowBitsAreZero(rendered[index], label: "\(stem) frame \(index)")
+            let actualCodes = p010CodeUnits(rendered[index])
+            let expectedCodes = p010CodeUnits(expected)
+            assertCodePlane(
+                actualCodes.prefix(lumaSampleCount),
+                expectedCodes.prefix(lumaSampleCount),
+                tolerance: 12,
+                maximumOutlierFraction: 0.005,
+                label: "\(stem) P010 frame \(index) luma"
+            )
+            assertCodePlane(
+                actualCodes.suffix(Self.width * Self.height / 2),
+                expectedCodes.suffix(Self.width * Self.height / 2),
+                tolerance: 16,
+                maximumOutlierFraction: 0.005,
+                label: "\(stem) P010 frame \(index) chroma"
+            )
+            assertCopiedRows(
+                output: rendered[index],
+                current: inputBytes.subdata(
+                    in: ((index / 2 + 1) * Self.p010BytesPerFrame)..<((index / 2 + 2) * Self.p010BytesPerFrame)
+                ),
+                copiedParity: copiedParity(order: order, outputIndex: index % 2),
+                bytesPerStoredComponent: 2,
+                label: "\(stem) P010 frame \(index)"
+            )
+            let chroma = Array(actualCodes.suffix(Self.width * Self.height / 2))
+            let cb = stride(from: 0, to: chroma.count, by: 2).map { chroma[$0] }
+            let cr = stride(from: 1, to: chroma.count, by: 2).map { chroma[$0] }
+            XCTAssertNotEqual(cb, cr, "P010 Cb and Cr must be predicted independently")
+        }
+        for pair in 0..<3 {
+            let firstLuma = rendered[pair * 2].prefix(Self.width * Self.height * 2)
+            let secondLuma = rendered[pair * 2 + 1].prefix(Self.width * Self.height * 2)
+            XCTAssertNotEqual(
+                SHA256.hash(data: firstLuma).hex,
+                SHA256.hash(data: secondLuma).hex,
+                "P010 field pair \(pair) must contain two different pictures"
+            )
+        }
+    }
+
+    private func assertCodePlane(
+        _ actual: ArraySlice<UInt16>,
+        _ expected: ArraySlice<UInt16>,
+        tolerance: Int,
+        maximumOutlierFraction: Double,
+        label: String
+    ) {
+        XCTAssertEqual(actual.count, expected.count, label)
+        let outliers = zip(actual, expected).reduce(into: 0) { count, pair in
+            if abs(Int(pair.0) - Int(pair.1)) > tolerance { count += 1 }
+        }
+        XCTAssertLessThanOrEqual(
+            Double(outliers) / Double(max(1, actual.count)),
+            maximumOutlierFraction,
+            "\(label): \(outliers) outliers"
+        )
+    }
+
+    private func assertP010LowBitsAreZero(_ data: Data, label: String) {
+        let nonzero = p010StoredUnits(data).filter { $0 & 0x003f != 0 }
+        XCTAssertTrue(nonzero.isEmpty, "\(label): \(nonzero.count) low-six-bit violations")
+    }
+
+    private func p010CodeUnits(_ data: Data) -> [UInt16] {
+        p010StoredUnits(data).map { $0 >> 6 }
+    }
+
+    private func p010StoredUnits(_ data: Data) -> [UInt16] {
+        XCTAssertTrue(data.count.isMultiple(of: 2))
+        return stride(from: 0, to: data.count, by: 2).map { index in
+            UInt16(data[index]) | UInt16(data[index + 1]) << 8
         }
     }
 
@@ -459,12 +716,14 @@ final class YADIFGoldenPixelTests: XCTestCase {
         output: Data,
         current: Data,
         copiedParity: Int,
+        bytesPerStoredComponent: Int = 1,
         label: String
     ) {
         for plane in 0..<2 {
-            let width = plane == 0 ? Self.width : Self.width
+            let width = Self.width * bytesPerStoredComponent
             let height = plane == 0 ? Self.height : Self.height / 2
-            let offset = plane == 0 ? 0 : Self.width * Self.height
+            let offset = plane == 0
+                ? 0 : Self.width * Self.height * bytesPerStoredComponent
             for y in stride(from: copiedParity, to: height, by: 2) {
                 let range = offset + y * width..<offset + (y + 1) * width
                 XCTAssertEqual(output.subdata(in: range), current.subdata(in: range), "\(label) plane \(plane) row \(y)")
@@ -480,6 +739,10 @@ final class YADIFGoldenPixelTests: XCTestCase {
     private func normalized(_ pixelBuffer: CVPixelBuffer, id: UInt64) -> NormalizedDecodedFrame {
         let generation = MediaGeneration(rawValue: 1)
         let duration = CMTime(value: 1, timescale: 25)
+        let tenBit = [
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+        ].contains(CVPixelBufferGetPixelFormatType(pixelBuffer))
         return NormalizedDecodedFrame(
             frame: DecodedVideoFrame(
                 accessUnitID: id,
@@ -497,7 +760,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
                 ),
                 formatMetadata: VideoFormatMetadata(
                     dimensions: .init(width: 64, height: 36),
-                    bitDepth: 8,
+                    bitDepth: tenBit ? 10 : 8,
                     range: .video,
                     matrix: .bt709,
                     transfer: .bt709,
@@ -542,14 +805,18 @@ final class YADIFGoldenPixelTests: XCTestCase {
     }
 
     private func writePacked(_ data: Data, to pixelBuffer: CVPixelBuffer) throws {
-        XCTAssertEqual(data.count, Self.bytesPerFrame)
+        let bytesPerComponent = bytesPerStoredComponent(in: pixelBuffer)
+        let expectedByteCount = Self.nv12BytesPerFrame * bytesPerComponent
+        XCTAssertEqual(data.count, expectedByteCount)
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
         try data.withUnsafeBytes { raw in
             guard let source = raw.baseAddress else { throw SyntheticFailure() }
             var offset = 0
             for plane in 0..<2 {
-                let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane) * (plane == 0 ? 1 : 2)
+                let componentCount = plane == 0 ? 1 : 2
+                let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane)
+                    * componentCount * bytesPerComponent
                 let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
                 let stride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
                 let destination = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane))
@@ -564,10 +831,13 @@ final class YADIFGoldenPixelTests: XCTestCase {
     private func packedBytes(_ pixelBuffer: CVPixelBuffer) throws -> Data {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let bytesPerComponent = bytesPerStoredComponent(in: pixelBuffer)
         var result = Data()
-        result.reserveCapacity(Self.bytesPerFrame)
+        result.reserveCapacity(Self.nv12BytesPerFrame * bytesPerComponent)
         for plane in 0..<2 {
-            let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane) * (plane == 0 ? 1 : 2)
+            let componentCount = plane == 0 ? 1 : 2
+            let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane)
+                * componentCount * bytesPerComponent
             let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
             let stride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
             let source = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane))
@@ -576,6 +846,16 @@ final class YADIFGoldenPixelTests: XCTestCase {
             }
         }
         return result
+    }
+
+    private func bytesPerStoredComponent(in pixelBuffer: CVPixelBuffer) -> Int {
+        switch CVPixelBufferGetPixelFormatType(pixelBuffer) {
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            return 2
+        default:
+            return 1
+        }
     }
 
     private func setRepresentativeAttachments(on pixelBuffer: CVPixelBuffer) {
@@ -627,8 +907,23 @@ final class YADIFGoldenPixelTests: XCTestCase {
 
 private struct GoldenManifest: Decodable {
     struct Arguments: Decodable {
-        let source: String
         let trim: String
+    }
+    struct FormatEntry: Decodable, Equatable {
+        struct Graphs: Decodable, Equatable {
+            let tffInput: String
+            let bffInput: String
+            let tffOutput: String
+            let bffOutput: String
+        }
+
+        let source: String
+        let pixelFormat: String
+        let layout: String
+        let inputFrameCount: Int
+        let outputFrameCount: Int
+        let bytesPerFrame: Int
+        let graphs: Graphs
     }
     struct FileEntry: Decodable {
         let byteCount: Int
@@ -638,9 +933,7 @@ private struct GoldenManifest: Decodable {
     let ffmpegCommit: String
     let width: Int
     let height: Int
-    let pixelFormat: String
-    let inputFrameCount: Int
-    let outputFrameCount: Int
+    let formats: [String: FormatEntry]
     let generatorArguments: Arguments
     let files: [String: FileEntry]
 }
