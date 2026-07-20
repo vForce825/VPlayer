@@ -47,7 +47,7 @@ final class PlaybackClockTests: XCTestCase {
 
     func testReadinessBoundaryIsClosedAt249Point999MillisecondsAndOpensAt250Milliseconds() {
         let harness = makeGate(requiredVideoCount: 1)
-        harness.gate.updateVideo(firstPTS: time(4), readyFrameCount: 1)
+        harness.gate.updateVideo(firstPTS: time(3), readyFrameCount: 1)
         harness.gate.updateAudio(
             firstPTS: time(3),
             contiguousDuration: CMTime(value: 249_999, timescale: 1_000_000),
@@ -139,12 +139,13 @@ final class PlaybackClockTests: XCTestCase {
             prepareAnchor: {
                 order.append("prepare")
                 XCTAssertEqual($0, CMTime(value: 10_001, timescale: 1_000))
+                return true
             }
         )
         gate.configure(requiredVideoFrameCount: 1)
         gate.updateAudio(
             firstPTS: CMTime(value: 10_000, timescale: 1_000),
-            contiguousDuration: CMTime(value: 250, timescale: 1_000),
+            contiguousDuration: CMTime(value: 251, timescale: 1_000),
             isContiguous: true
         )
         gate.updateVideo(firstPTS: CMTime(value: 10_001, timescale: 1_000), readyFrameCount: 1)
@@ -153,6 +154,86 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(clock.anchors.first?.mediaTime, CMTime(value: 10_001, timescale: 1_000))
         XCTAssertEqual(clock.anchors.first?.hostTime, CMTime(value: 100_100, timescale: 1_000))
         XCTAssertEqual(clock.anchors.first?.rate, 1)
+    }
+
+    func testGateRequiresACommonIntervalWithFullPostIntersectionReadiness() {
+        let nonOverlapping = makeGate(requiredVideoCount: 1)
+        nonOverlapping.gate.updateAudio(
+            firstPTS: time(10),
+            contiguousDuration: CMTime(value: 1, timescale: 2),
+            isContiguous: true
+        )
+        nonOverlapping.gate.updateVideo(frames: [
+            PlaybackReadinessVideoFrame(
+                presentationTimeStamp: .zero,
+                duration: CMTime(value: 1, timescale: 25)
+            ),
+        ])
+        XCTAssertFalse(nonOverlapping.gate.isOpen)
+        XCTAssertTrue(nonOverlapping.clock.anchors.isEmpty)
+
+        let clippedAudio = makeGate(requiredVideoCount: 1)
+        clippedAudio.gate.updateAudio(
+            firstPTS: time(1),
+            contiguousDuration: CMTime(value: 1, timescale: 4),
+            isContiguous: true
+        )
+        clippedAudio.gate.updateVideo(frames: [
+            PlaybackReadinessVideoFrame(
+                presentationTimeStamp: CMTime(value: 6, timescale: 5),
+                duration: CMTime(value: 1, timescale: 25)
+            ),
+        ])
+        XCTAssertFalse(clippedAudio.gate.isOpen)
+        XCTAssertTrue(clippedAudio.clock.anchors.isEmpty)
+
+        let overlapping = makeGate(requiredVideoCount: 2)
+        overlapping.gate.updateAudio(
+            firstPTS: .zero,
+            contiguousDuration: CMTime(value: 1, timescale: 2),
+            isContiguous: true
+        )
+        overlapping.gate.updateVideo(frames: [
+            PlaybackReadinessVideoFrame(
+                presentationTimeStamp: CMTime(value: 1, timescale: 5),
+                duration: CMTime(value: 1, timescale: 25)
+            ),
+            PlaybackReadinessVideoFrame(
+                presentationTimeStamp: CMTime(value: 6, timescale: 25),
+                duration: CMTime(value: 1, timescale: 25)
+            ),
+        ])
+        XCTAssertTrue(overlapping.gate.isOpen)
+        XCTAssertEqual(overlapping.clock.anchors.map(\.mediaTime), [CMTime(value: 1, timescale: 5)])
+    }
+
+    func testPrepareAnchorCanVetoOpeningWithoutRateOrOpenState() {
+        let clock = FakePlaybackClock()
+        var prepared: [CMTime] = []
+        let gate = PlaybackReadinessGate(
+            clock: clock,
+            hostTime: { .zero },
+            prepareAnchor: {
+                prepared.append($0)
+                return false
+            }
+        )
+        gate.configure(requiredVideoFrameCount: 1)
+        gate.updateAudio(
+            firstPTS: .zero,
+            contiguousDuration: CMTime(value: 1, timescale: 4),
+            isContiguous: true
+        )
+        gate.updateVideo(frames: [
+            PlaybackReadinessVideoFrame(
+                presentationTimeStamp: .zero,
+                duration: CMTime(value: 1, timescale: 25)
+            ),
+        ])
+
+        XCTAssertEqual(prepared, [.zero])
+        XCTAssertFalse(gate.isOpen)
+        XCTAssertTrue(clock.anchors.isEmpty)
     }
 
     func testGateAnchorsOncePerCycleAndEveryCloseReasonPausesThenAllowsFreshCycle() {
@@ -235,7 +316,7 @@ final class PlaybackClockTests: XCTestCase {
     ) {
         gate.updateAudio(
             firstPTS: audioPTS,
-            contiguousDuration: CMTime(value: 250, timescale: 1_000),
+            contiguousDuration: CMTime(value: 10, timescale: 1),
             isContiguous: true
         )
         gate.updateVideo(firstPTS: videoPTS, readyFrameCount: videoCount)

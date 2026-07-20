@@ -14,8 +14,11 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     private let lock = NSLock()
     private var sink: (@Sendable (PlaybackPipelineEvent) -> Void)?
     private(set) var starts: [URL] = []
-    private(set) var pauses: [Bool] = []
+    private(set) var pauses: [(Bool, UInt64)] = []
     private(set) var stopCount = 0
+    private(set) var completedStopCount = 0
+    var stopAutomaticallyCompletes = true
+    private var stopContinuation: CheckedContinuation<Void, Never>?
 
     func install(_ sink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) {
         lock.withLock { self.sink = sink }
@@ -25,12 +28,29 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
         lock.withLock { starts.append(url) }
     }
 
-    func setPaused(_ paused: Bool) {
-        lock.withLock { pauses.append(paused) }
+    func setPaused(_ paused: Bool, readinessCycle: UInt64) {
+        lock.withLock { pauses.append((paused, readinessCycle)) }
     }
 
-    func stop() {
-        lock.withLock { stopCount += 1 }
+    func stop() async {
+        let shouldWait = lock.withLock { () -> Bool in
+            stopCount += 1
+            return !stopAutomaticallyCompletes
+        }
+        if shouldWait {
+            await withCheckedContinuation { continuation in
+                lock.withLock { stopContinuation = continuation }
+            }
+        }
+        lock.withLock { completedStopCount += 1 }
+    }
+
+    func completeStop() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            defer { stopContinuation = nil }
+            return stopContinuation
+        }
+        continuation?.resume()
     }
 
     func emit(_ event: PlaybackPipelineEvent) {
@@ -38,14 +58,23 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
         current?(event)
     }
 
-    func snapshot() -> (starts: [URL], pauses: [Bool], stopCount: Int) {
-        lock.withLock { (starts, pauses, stopCount) }
+    func snapshot() -> (
+        starts: [URL],
+        pauses: [(Bool, UInt64)],
+        stopCount: Int,
+        completedStopCount: Int,
+        isStopWaiting: Bool
+    ) {
+        lock.withLock {
+            (starts, pauses, stopCount, completedStopCount, stopContinuation != nil)
+        }
     }
 }
 
 final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked Sendable {
     private let lock = NSLock()
     private var queued: [FakeControllerPipeline]
+    private var makeCount = 0
 
     init(_ pipelines: [FakeControllerPipeline]) {
         queued = pipelines
@@ -56,11 +85,14 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     ) throws -> any PlaybackPipelineProtocol {
         try lock.withLock {
             guard !queued.isEmpty else { throw PlaybackCoreError.demuxOpen(-99) }
+            makeCount += 1
             let pipeline = queued.removeFirst()
             pipeline.install(eventSink)
             return pipeline
         }
     }
+
+    var makeCountSnapshot: Int { lock.withLock { makeCount } }
 }
 
 final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
@@ -95,7 +127,7 @@ final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
 final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
     enum Operation: Equatable {
         case configure(MediaGeneration, VideoDecodeConfiguration)
-        case decode(UInt64, MediaGeneration)
+        case decode(UInt64, MediaGeneration, VTDecodeFrameFlags)
         case finish
         case wait
         case invalidate
@@ -117,19 +149,19 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
         lock.withLock { operations.append(.configure(generation, configuration)) }
     }
 
-    func decode(_ accessUnit: CompressedVideoAccessUnit, flags _: VTDecodeFrameFlags) throws {
+    func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws {
         if let decodeError { throw decodeError }
-        lock.withLock { operations.append(.decode(accessUnit.id, accessUnit.generation)) }
+        lock.withLock { operations.append(.decode(accessUnit.id, accessUnit.generation, flags)) }
     }
 
     func finishDelayedFrames() throws {
-        if let finishError { throw finishError }
         lock.withLock { operations.append(.finish) }
+        if let finishError { throw finishError }
     }
 
     func waitForAsynchronousFrames() throws {
-        if let waitError { throw waitError }
         lock.withLock { operations.append(.wait) }
+        if let waitError { throw waitError }
     }
 
     func invalidate() {
@@ -213,6 +245,7 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private(set) var flushes: [MediaGeneration] = []
     private(set) var stopCount = 0
     var enqueueError: PlaybackCoreError?
+    private var flushHandler: (@Sendable (MediaGeneration) -> Void)?
 
     var isReadyForPlayback: Bool { lock.withLock { ready } }
     var route: VPlayerPlayback.AudioRoute { lock.withLock { selectedRoute } }
@@ -231,10 +264,12 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     }
 
     func flush(to generation: MediaGeneration) {
-        lock.withLock {
+        let handler = lock.withLock { () -> (@Sendable (MediaGeneration) -> Void)? in
             flushes.append(generation)
             samples.removeAll(keepingCapacity: true)
+            return flushHandler
         }
+        handler?(generation)
     }
 
     func stop() {
@@ -242,6 +277,10 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     }
 
     func setReady(_ value: Bool) { lock.withLock { ready = value } }
+
+    func setFlushHandler(_ handler: (@Sendable (MediaGeneration) -> Void)?) {
+        lock.withLock { flushHandler = handler }
+    }
 
     func snapshot() -> (configured: [(VPlayerPlayback.AudioCodec, MediaGeneration)], samples: [CompressedAudioSample], flushes: [MediaGeneration], stops: Int) {
         lock.withLock { (configured, samples, flushes, stopCount) }
@@ -283,11 +322,16 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
         private(set) var packets: [DemuxPacket] = []
         private(set) var resetTracks: [DemuxTrackSet] = []
         var pushError: PlaybackCoreError?
+        var drainError: PlaybackCoreError?
+        private(set) var drainCount = 0
         func push(_ packet: DemuxPacket) throws {
             if let pushError { throw pushError }
             packets.append(packet)
         }
-        func drain() throws {}
+        func drain() throws {
+            drainCount += 1
+            if let drainError { throw drainError }
+        }
         func reset(for trackSet: DemuxTrackSet) throws { resetTracks.append(trackSet) }
     }
 
@@ -295,11 +339,16 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
         private(set) var packets: [DemuxPacket] = []
         private(set) var resetTracks: [DemuxTrackSet] = []
         var pushError: PlaybackCoreError?
+        var drainError: PlaybackCoreError?
+        private(set) var drainCount = 0
         func push(_ packet: DemuxPacket) throws {
             if let pushError { throw pushError }
             packets.append(packet)
         }
-        func drain() throws {}
+        func drain() throws {
+            drainCount += 1
+            if let drainError { throw drainError }
+        }
         func reset(for trackSet: DemuxTrackSet) throws { resetTracks.append(trackSet) }
     }
 

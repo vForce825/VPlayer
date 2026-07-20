@@ -4,6 +4,16 @@
 
 import CoreMedia
 
+public struct PlaybackReadinessVideoFrame: Sendable, Equatable {
+    public let presentationTimeStamp: CMTime
+    public let duration: CMTime
+
+    public init(presentationTimeStamp: CMTime, duration: CMTime) {
+        self.presentationTimeStamp = presentationTimeStamp
+        self.duration = duration
+    }
+}
+
 public enum PlaybackReadinessCloseReason: UInt8, Sendable, Equatable {
     case flush
     case buffering
@@ -22,11 +32,12 @@ public final class PlaybackReadinessGate {
     private struct VideoSnapshot {
         let firstPTS: CMTime
         let readyFrameCount: Int
+        let frames: [PlaybackReadinessVideoFrame]?
     }
 
     private let clock: PlaybackClock
     private let hostTimeProvider: () -> CMTime
-    private let prepareAnchor: ((CMTime) -> Void)?
+    private let prepareAnchor: ((CMTime) -> Bool)?
     private var requiredVideoFrameCount = 1
     private var audio: AudioSnapshot?
     private var video: VideoSnapshot?
@@ -38,7 +49,7 @@ public final class PlaybackReadinessGate {
     public convenience init(
         clock: PlaybackClock,
         hostClock: CMClock = CMClockGetHostTimeClock(),
-        prepareAnchor: ((CMTime) -> Void)? = nil
+        prepareAnchor: ((CMTime) -> Bool)? = nil
     ) {
         self.init(
             clock: clock,
@@ -50,7 +61,7 @@ public final class PlaybackReadinessGate {
     init(
         clock: PlaybackClock,
         hostTime: @escaping () -> CMTime,
-        prepareAnchor: ((CMTime) -> Void)?,
+        prepareAnchor: ((CMTime) -> Bool)?,
         initialCycleID: UInt64 = 0
     ) {
         self.clock = clock
@@ -82,7 +93,7 @@ public final class PlaybackReadinessGate {
             return
         }
         audio = AudioSnapshot(firstPTS: firstPTS, contiguousDuration: contiguousDuration)
-        _ = attemptOpen()
+        reevaluate()
     }
 
     public func updateVideo(firstPTS: CMTime, readyFrameCount: Int) {
@@ -94,8 +105,33 @@ public final class PlaybackReadinessGate {
             }
             return
         }
-        video = VideoSnapshot(firstPTS: firstPTS, readyFrameCount: readyFrameCount)
-        _ = attemptOpen()
+        video = VideoSnapshot(firstPTS: firstPTS, readyFrameCount: readyFrameCount, frames: nil)
+        reevaluate()
+    }
+
+    public func updateVideo(frames: [PlaybackReadinessVideoFrame]) {
+        let valid = frames.filter { frame in
+            guard frame.presentationTimeStamp.isNumeric,
+                  frame.duration.isNumeric,
+                  CMTimeCompare(frame.duration, .zero) > 0 else { return false }
+            return CMTimeAdd(frame.presentationTimeStamp, frame.duration).isNumeric
+        }.sorted {
+            CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp) < 0
+        }
+        guard valid.count == frames.count, let first = valid.first else {
+            if isOpen {
+                close(.buffering)
+            } else {
+                video = nil
+            }
+            return
+        }
+        video = VideoSnapshot(
+            firstPTS: first.presentationTimeStamp,
+            readyFrameCount: valid.count,
+            frames: valid
+        )
+        reevaluate()
     }
 
     public func close(_ reason: PlaybackReadinessCloseReason) {
@@ -124,17 +160,15 @@ public final class PlaybackReadinessGate {
     private func attemptOpen() -> Bool {
         guard !isOpen,
               !waitingForDisplayModeEnd,
-              let audio,
-              let video,
-              video.readyFrameCount >= requiredVideoFrameCount,
-              CMTimeCompare(audio.contiguousDuration, CMTime(value: 1, timescale: 4)) >= 0 else {
+              let commonPTS = commonReadyPTS() else {
             return false
         }
-        let commonPTS = CMTimeCompare(audio.firstPTS, video.firstPTS) >= 0
-            ? audio.firstPTS
-            : video.firstPTS
-        guard commonPTS.isNumeric else { return false }
-        prepareAnchor?(commonPTS)
+        let openingCycle = cycleID
+        guard prepareAnchor?(commonPTS) != false,
+              cycleID == openingCycle,
+              !isOpen,
+              !waitingForDisplayModeEnd,
+              commonReadyPTS() == commonPTS else { return false }
         let anchorHostTime = CMTimeAdd(
             hostTimeProvider(),
             CMTime(value: 100, timescale: 1_000)
@@ -143,5 +177,40 @@ public final class PlaybackReadinessGate {
         clock.anchor(mediaTime: commonPTS, atHostTime: anchorHostTime, rate: 1)
         isOpen = true
         return true
+    }
+
+    private func reevaluate() {
+        if isOpen, commonReadyPTS() == nil {
+            close(.buffering)
+            return
+        }
+        _ = attemptOpen()
+    }
+
+    private func commonReadyPTS() -> CMTime? {
+        guard let audio, let video,
+              video.readyFrameCount >= requiredVideoFrameCount else { return nil }
+        let audioEnd = CMTimeAdd(audio.firstPTS, audio.contiguousDuration)
+        guard audioEnd.isNumeric else { return nil }
+        let commonPTS = CMTimeCompare(audio.firstPTS, video.firstPTS) >= 0
+            ? audio.firstPTS
+            : video.firstPTS
+        guard commonPTS.isNumeric,
+              CMTimeCompare(commonPTS, audioEnd) < 0,
+              CMTimeCompare(
+                  CMTimeSubtract(audioEnd, commonPTS),
+                  CMTime(value: 1, timescale: 4)
+              ) >= 0 else { return nil }
+        if let frames = video.frames {
+            let overlappingCount = frames.filter { frame in
+                let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+                return CMTimeCompare(end, commonPTS) > 0
+                    && CMTimeCompare(frame.presentationTimeStamp, audioEnd) < 0
+            }.count
+            guard overlappingCount >= requiredVideoFrameCount else { return nil }
+        } else {
+            guard CMTimeCompare(video.firstPTS, audioEnd) < 0 else { return nil }
+        }
+        return commonPTS
     }
 }

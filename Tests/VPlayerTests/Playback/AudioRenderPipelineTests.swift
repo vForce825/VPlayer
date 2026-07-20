@@ -199,6 +199,60 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.support.checkSnapshot.suffix(2).map(\.1), [.other, .hdmi])
     }
 
+    func testExternallyClockedFallbackAndRecoveryReportReadinessWithoutChangingRateOrAnchor() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-clock")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let decoderFactory = FakePCMAudioDecoderFactory { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+        }
+        let routeMonitor = FakeAudioRouteMonitor()
+        let support = FakeAudioFormatSupportChecker()
+        let failures = LockedAudioFailures(executor: executor)
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { error, generation in failures.append(error, generation: generation) },
+            rendererFactory: renderers,
+            decoderFactory: decoderFactory,
+            routeMonitor: routeMonitor,
+            supportChecker: support,
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in readiness.append(change, generation: generation) }
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1)
+            )
+            try pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let compressed = try XCTUnwrap(renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: true)
+        compressed.fireReady()
+        drain(executor)
+
+        compressed.emit(.automaticFlush(CMTime(value: 1, timescale: 10)))
+        drain(executor)
+        compressed.fireReady()
+        drain(executor)
+        compressed.emit(.failed("force-fallback"))
+        drain(executor)
+        synchronizer.completeRemoval(didRemove: true)
+        drain(executor)
+        let pcm = try XCTUnwrap(renderers.snapshot.last)
+        pcm.configureReadiness(ready: true, sufficient: true)
+        pcm.fireReady()
+        drain(executor)
+
+        XCTAssertTrue(synchronizer.rateSnapshot.isEmpty)
+        XCTAssertTrue(readiness.snapshot.map(\.change).contains(.invalidated))
+        XCTAssertTrue(readiness.snapshot.map(\.change).contains(.available))
+        XCTAssertTrue(failures.snapshot.isEmpty)
+    }
+
     func testOverlappingRecoveryEventsMergeIntoOneFlushAndReevaluation() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
@@ -1007,6 +1061,23 @@ private final class LockedAudioFailures: @unchecked Sendable {
         lock.lock(); records.append(.init(error: error, generation: generation)); lock.unlock()
     }
     var snapshot: [AudioFailureRecord] { lock.lock(); defer { lock.unlock() }; return records }
+}
+
+private struct AudioReadinessRecord: Sendable, Equatable {
+    let change: AudioRenderReadinessChange
+    let generation: MediaGeneration
+}
+
+private final class LockedAudioReadinessChanges: @unchecked Sendable {
+    private let lock = NSLock()
+    private let executor: PlaybackSerialExecutor
+    private var records: [AudioReadinessRecord] = []
+    init(executor: PlaybackSerialExecutor) { self.executor = executor }
+    func append(_ change: AudioRenderReadinessChange, generation: MediaGeneration) {
+        XCTAssertTrue(executor.isIsolated)
+        lock.withLock { records.append(.init(change: change, generation: generation)) }
+    }
+    var snapshot: [AudioReadinessRecord] { lock.withLock { records } }
 }
 
 private final class LockedCategories: @unchecked Sendable {

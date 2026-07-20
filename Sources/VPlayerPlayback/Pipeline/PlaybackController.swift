@@ -11,6 +11,8 @@ public actor PlaybackController: PlaybackEngine {
     private var request: PlaybackRequest?
     private var userPaused = false
     private var sessionID: UInt64 = 0
+    private var readinessCycle: UInt64 = 0
+    private var pendingTeardown: Task<Void, Never>?
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
     private var selectedAlgorithm = DeinterlaceAlgorithm.appleTemporal
@@ -52,13 +54,25 @@ public actor PlaybackController: PlaybackEngine {
 
     public func play(_ request: PlaybackRequest) async {
         invalidateSession()
-        pipeline?.stop()
+        let id = sessionID
+        let previous = pipeline
         pipeline = nil
         self.request = request
         userPaused = false
+        readinessCycle = 0
         publish(.preparing(request))
+        let teardown: Task<Void, Never>?
+        if let previous {
+            let task = Task { await previous.stop() }
+            pendingTeardown = task
+            teardown = task
+        } else {
+            teardown = pendingTeardown
+        }
+        if let teardown { await teardown.value }
+        guard sessionID == id else { return }
+        pendingTeardown = nil
 
-        let id = sessionID
         do {
             let next = try factory.makePipeline { [weak self] event in
                 Task { await self?.receive(event, sessionID: id) }
@@ -80,18 +94,33 @@ public actor PlaybackController: PlaybackEngine {
         case .preparing, .playing, .paused:
             break
         }
+        guard userPaused != paused else { return }
         userPaused = paused
-        pipeline?.setPaused(paused)
+        advanceReadinessCycle()
+        pipeline?.setPaused(paused, readinessCycle: readinessCycle)
         publish(paused ? .paused(request) : .preparing(request))
     }
 
     public func stop() async {
+        guard pipeline != nil || request != nil || pendingTeardown != nil else { return }
         invalidateSession()
+        let id = sessionID
         let current = pipeline
         pipeline = nil
         request = nil
         userPaused = false
-        current?.stop()
+        readinessCycle = 0
+        let teardown: Task<Void, Never>?
+        if let current {
+            let task = Task { await current.stop() }
+            pendingTeardown = task
+            teardown = task
+        } else {
+            teardown = pendingTeardown
+        }
+        if let teardown { await teardown.value }
+        guard sessionID == id else { return }
+        pendingTeardown = nil
         publish(.stopped)
     }
 
@@ -140,8 +169,10 @@ public actor PlaybackController: PlaybackEngine {
     private func receive(_ event: PlaybackPipelineEvent, sessionID: UInt64) {
         guard sessionID == self.sessionID, pipeline != nil else { return }
         switch event {
-        case .ready:
-            guard let request, !userPaused else { return }
+        case let .ready(eventCycle):
+            guard let request,
+                  !userPaused,
+                  eventCycle == readinessCycle else { return }
             publish(.playing(request))
         case .stopped:
             pipeline = nil
@@ -160,7 +191,12 @@ public actor PlaybackController: PlaybackEngine {
         sessionID &+= 1
     }
 
+    private func advanceReadinessCycle() {
+        if readinessCycle < UInt64.max { readinessCycle += 1 }
+    }
+
     private func publish(_ newState: PlaybackState) {
+        guard state != newState else { return }
         state = newState
         for continuation in eventContinuations.values {
             _ = continuation.yield(newState)

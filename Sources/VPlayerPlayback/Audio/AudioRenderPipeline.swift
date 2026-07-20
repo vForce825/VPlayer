@@ -52,6 +52,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private let decoderFactory: any PCMAudioDecoderFactory
     private let routeMonitor: any AudioRouteMonitoring
     private let supportChecker: any AudioFormatSupportChecking
+    private let clockMode: AudioClockMode
+    private let readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)?
     private let snapshotLock = NSLock()
     private var publicSnapshot = PublicSnapshot()
 
@@ -81,7 +83,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     convenience init(
         synchronizer: AVSampleBufferRenderSynchronizer,
         executor: PlaybackSerialExecutor,
-        failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
+        failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void,
+        clockMode: AudioClockMode = .standalone,
+        readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)? = nil
     ) {
         self.init(
             synchronizer: SystemAudioSynchronizer(synchronizer),
@@ -90,7 +94,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             rendererFactory: SystemAudioRendererFactory(),
             decoderFactory: LivePCMAudioDecoderFactory(),
             routeMonitor: AudioOutputRouteMonitor(executor: executor),
-            supportChecker: SystemAudioFormatSupportChecker()
+            supportChecker: SystemAudioFormatSupportChecker(),
+            clockMode: clockMode,
+            readinessSink: readinessSink
         )
     }
 
@@ -101,7 +107,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         rendererFactory: any AudioRendererFactory,
         decoderFactory: any PCMAudioDecoderFactory,
         routeMonitor: any AudioRouteMonitoring,
-        supportChecker: any AudioFormatSupportChecking
+        supportChecker: any AudioFormatSupportChecking,
+        clockMode: AudioClockMode = .standalone,
+        readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)? = nil
     ) {
         self.synchronizer = synchronizer
         self.executor = executor
@@ -110,6 +118,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         self.decoderFactory = decoderFactory
         self.routeMonitor = routeMonitor
         self.supportChecker = supportChecker
+        self.clockMode = clockMode
+        self.readinessSink = readinessSink
     }
 
     var isReadyForPlayback: Bool {
@@ -191,7 +201,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         recoveryScheduled = false
         pendingRecovery = nil
         needsAnchor = false
-        synchronizer.setRate(0, time: synchronizer.currentTime())
+        updateSnapshot(route: route, ready: false)
+        setSynchronizerRate(0, time: synchronizer.currentTime())
         replay.removeAll(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
         decoder?.flush()
@@ -239,7 +250,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         pendingRecovery = nil
         routeMonitor.stop()
         let now = synchronizer.currentTime()
-        synchronizer.setRate(0, time: now)
+        setSynchronizerRate(0, time: now)
         if var pendingRemoval {
             pendingRemoval.targetEpoch = epoch
             pendingRemoval.targetGeneration = generation
@@ -524,7 +535,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func recover(at time: CMTime) {
         guard !terminal, !replacing, let renderer else { return }
-        synchronizer.setRate(0, time: time)
+        updateSnapshot(route: route, ready: false)
+        setSynchronizerRate(0, time: time)
         renderer.flush()
         do {
             try pruneExpired(at: time)
@@ -562,7 +574,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         guard pendingRemoval == nil else { return }
         replacing = true
         updateSnapshot(route: route, ready: false)
-        synchronizer.setRate(0, time: synchronizer.currentTime())
+        setSynchronizerRate(0, time: synchronizer.currentTime())
         renderer.stopRequestingMediaData()
         renderer.stopObserving()
         renderer.flush()
@@ -728,7 +740,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func anchorIfNeeded(at time: CMTime) {
         guard needsAnchor else { return }
         needsAnchor = false
-        synchronizer.setRate(1, time: time)
+        setSynchronizerRate(1, time: time)
     }
 
     private func pruneExpired(at time: CMTime) throws {
@@ -788,9 +800,18 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func updateSnapshot(route: AudioRoute, ready: Bool) {
         snapshotLock.lock()
+        let readinessChanged = publicSnapshot.isReadyForPlayback != ready
         publicSnapshot.route = route
         publicSnapshot.isReadyForPlayback = ready
         snapshotLock.unlock()
+        if clockMode == .externallyManaged, readinessChanged {
+            readinessSink?(ready ? .available : .invalidated, generation)
+        }
+    }
+
+    private func setSynchronizerRate(_ rate: Float, time: CMTime) {
+        guard clockMode == .standalone else { return }
+        synchronizer.setRate(rate, time: time)
     }
 
     private func withSnapshot<Result>(_ body: (PublicSnapshot) -> Result) -> Result {

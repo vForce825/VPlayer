@@ -11,6 +11,16 @@ public enum AudioRoute: Sendable, Equatable {
     case ffmpegPCM
 }
 
+enum AudioClockMode: Sendable, Equatable {
+    case standalone
+    case externallyManaged
+}
+
+enum AudioRenderReadinessChange: Sendable, Equatable {
+    case invalidated
+    case available
+}
+
 public protocol AudioRenderPipelineProtocol: AnyObject {
     var isReadyForPlayback: Bool { get }
     var route: AudioRoute { get }
