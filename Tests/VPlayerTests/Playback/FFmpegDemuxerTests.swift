@@ -129,6 +129,24 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertEqual(second.audio?.channelLayout.nativeMask, 3)
     }
 
+    func testCopiesEveryNonnegativeVideoDelayExactly() throws {
+        for expected in [Int32(0), 1, 3] {
+            let bridge = FakeFFmpegDemuxBridge { handle in
+                handle.emitTracks(video: .h264(videoDelay: expected))
+                handle.emitTerminal(VPFF_EVENT_END)
+                return 0
+            }
+
+            let events = try run(bridge: bridge)
+
+            guard case let .tracks(tracks) = events.first else {
+                return XCTFail("missing tracks for video delay \(expected)")
+            }
+            XCTAssertEqual(tracks.video?.videoDelay, expected)
+            XCTAssertEqual(events.last, .endOfStream)
+        }
+    }
+
     func testMapsEverySupportedCodecAndPreservesNegativeAndInvalidTimes() throws {
         let specs: [(VPFFCodec, MediaCodec)] = [
             (VPFF_CODEC_H264, .video(.h264)),
@@ -926,6 +944,7 @@ private func cDemuxSmokeCallback(
 private extension RawTrackSpec {
     static func h264(
         width: Int32 = 1_920,
+        videoDelay: Int32 = 1,
         extradata: Data = Data([1, 2, 3])
     ) -> Self {
         .init(
@@ -933,7 +952,7 @@ private extension RawTrackSpec {
             codec: VPFF_CODEC_H264,
             width: width,
             height: 1_080,
-            videoDelay: 1,
+            videoDelay: videoDelay,
             extradata: extradata
         )
     }
