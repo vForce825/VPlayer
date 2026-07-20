@@ -9,6 +9,75 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class FFmpegDemuxerTests: XCTestCase {
+#if DEBUG
+    func testBootstrapPacketLimitAccepts64AndRejects65WithoutLeaking() {
+        let accepted = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_EXACT)
+        XCTAssertEqual(accepted.status, 0)
+        XCTAssertEqual(accepted.details.peak_packet_count, 64)
+        XCTAssertEqual(accepted.details.live_resource_count, 0)
+
+        let rejected = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_OVERFLOW)
+        XCTAssertLessThan(rejected.status, 0)
+        XCTAssertEqual(rejected.details.peak_packet_count, 64)
+        XCTAssertEqual(rejected.details.live_resource_count, 0)
+    }
+
+    func testBootstrapByteLimitAcceptsExactBoundAndRejectsOneByteOverWithoutLeaking() {
+        let accepted = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_EXACT)
+        XCTAssertEqual(accepted.status, 0)
+        XCTAssertEqual(accepted.details.peak_accounted_bytes, 16 * 1_024 * 1_024)
+        XCTAssertEqual(accepted.details.live_resource_count, 0)
+
+        let rejected = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_OVERFLOW)
+        XCTAssertLessThan(rejected.status, 0)
+        XCTAssertLessThan(rejected.details.peak_accounted_bytes, 16 * 1_024 * 1_024)
+        XCTAssertEqual(rejected.details.live_resource_count, 0)
+    }
+
+    func testBootstrapRejectsEOFAndBothParserZeroProgressFormsWithoutLeaking() {
+        let eof = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_EOF_BEFORE_DIMENSIONS)
+        XCTAssertLessThan(eof.status, 0)
+        XCTAssertEqual(eof.details.live_resource_count, 0)
+
+        let noOutput = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_NO_OUTPUT)
+        XCTAssertLessThan(noOutput.status, 0)
+        XCTAssertEqual(noOutput.details.parser_call_count, 1)
+        XCTAssertEqual(noOutput.details.live_resource_count, 0)
+
+        let retry = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_WITH_OUTPUT)
+        XCTAssertEqual(retry.status, 0)
+        XCTAssertEqual(retry.details.parser_call_count, 2)
+        XCTAssertEqual(retry.details.retried_same_input, 1)
+        XCTAssertEqual(retry.details.live_resource_count, 0)
+
+        let repeated = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_REPEATED_ZERO_CONSUMED)
+        XCTAssertLessThan(repeated.status, 0)
+        XCTAssertEqual(repeated.details.parser_call_count, 2)
+        XCTAssertEqual(repeated.details.retried_same_input, 1)
+        XCTAssertEqual(repeated.details.live_resource_count, 0)
+    }
+
+    func testBootstrapRestoresInitialAndPacketLocalStreamStateInReplayOrder() {
+        let result = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_SNAPSHOT_REPLAY)
+
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.details.initial_width, 1_280)
+        XCTAssertEqual(result.details.initial_height, 720)
+        XCTAssertEqual(result.details.replayed_packet_count, 3)
+        XCTAssertEqual(result.details.first_replay_width, 1_280)
+        XCTAssertEqual(result.details.first_replay_time_base_num, 1)
+        XCTAssertEqual(result.details.first_replay_time_base_den, 90_000)
+        XCTAssertEqual(result.details.second_replay_sample_rate, 48_000)
+        XCTAssertEqual(result.details.second_replay_time_base_num, 1)
+        XCTAssertEqual(result.details.second_replay_time_base_den, 48_000)
+        XCTAssertEqual(result.details.third_replay_width, 1_920)
+        XCTAssertEqual(result.details.third_replay_height, 1_080)
+        XCTAssertEqual(result.details.third_replay_time_base_num, 1)
+        XCTAssertEqual(result.details.third_replay_time_base_den, 45_000)
+        XCTAssertEqual(result.details.live_resource_count, 0)
+    }
+#endif
+
     func testAcceptsHTTPAndHTTPSAndPreservesExactUTF8BytesAndLength() throws {
         for rawURL in ["http://example.invalid/live.ts", "https://example.invalid/频道.m3u8"] {
             let bridge = FakeFFmpegDemuxBridge()
@@ -890,6 +959,16 @@ final class FFmpegDemuxerTests: XCTestCase {
         return handle?.destroyCount ?? 0
     }
 }
+
+#if DEBUG
+private func runBootstrapDebugScenario(
+    _ scenario: VPFFBootstrapDebugScenario
+) -> (status: Int32, details: VPFFBootstrapDebugResult) {
+    var details = VPFFBootstrapDebugResult()
+    let status = vp_ffmpeg_demuxer_debug_run_bootstrap(scenario, &details)
+    return (status, details)
+}
+#endif
 
 private final class WeakDemuxerBox: @unchecked Sendable {
     weak var value: FFmpegDemuxer?

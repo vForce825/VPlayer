@@ -100,9 +100,43 @@ typedef struct {
 } VPFFFailure;
 
 typedef struct {
-    AVPacket *packets[VPFF_BOOTSTRAP_MAX_PACKETS];
+    AVPacket *packet;
+    AVCodecParameters *parameters;
+    AVRational time_base;
+    size_t accounted_bytes;
+} VPFFRetainedPacket;
+
+typedef struct {
+    int consumed;
+    uint8_t *output;
+    int output_size;
+    int width;
+    int height;
+    int coded_width;
+    int coded_height;
+} VPFFBootstrapParserStep;
+
+typedef int (*VPFFBootstrapReadFunction)(void *context, AVPacket *packet);
+typedef int (*VPFFBootstrapParseFunction)(
+    void *context,
+    const uint8_t *data,
+    int size,
+    int64_t pts,
+    int64_t dts,
+    int64_t position,
+    VPFFBootstrapParserStep *step
+);
+
+typedef struct {
+    VPFFRetainedPacket packets[VPFF_BOOTSTRAP_MAX_PACKETS];
     size_t packet_count;
     size_t total_bytes;
+    AVCodecParameters *initial_video_parameters;
+    AVRational initial_video_time_base;
+    AVCodecParameters *initial_audio_parameters;
+    AVRational initial_audio_time_base;
+    int parsed_width;
+    int parsed_height;
     AVCodecParserContext *parser;
     AVCodecContext *codec_context;
 } VPFFVideoBootstrap;
@@ -912,33 +946,154 @@ static int vpff_packet_footprint(const AVPacket *packet, size_t *footprint) {
     return 0;
 }
 
-static void vpff_video_bootstrap_clear(VPFFVideoBootstrap *bootstrap) {
+static int vpff_size_add(size_t *total, size_t value) {
+    if (total == NULL || value > SIZE_MAX - *total) {
+        return AVERROR_INVALIDDATA;
+    }
+    *total += value;
+    return 0;
+}
+
+static int vpff_parameter_footprint(
+    const AVCodecParameters *parameters,
+    size_t *footprint
+) {
+    if (!vpff_parameters_are_bounded(parameters) || footprint == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    size_t total = sizeof(*parameters);
+    if (parameters->extradata_size > 0 &&
+        vpff_size_add(
+            &total,
+            (size_t)parameters->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE
+        ) < 0) {
+        return AVERROR_INVALIDDATA;
+    }
+    if (parameters->nb_coded_side_data > 0) {
+        size_t entry_count = (size_t)parameters->nb_coded_side_data;
+        if (entry_count > SIZE_MAX / sizeof(*parameters->coded_side_data) ||
+            vpff_size_add(
+                &total,
+                entry_count * sizeof(*parameters->coded_side_data)
+            ) < 0) {
+            return AVERROR_INVALIDDATA;
+        }
+        for (int index = 0; index < parameters->nb_coded_side_data; index += 1) {
+            size_t size = parameters->coded_side_data[index].size;
+            if (size > SIZE_MAX - AV_INPUT_BUFFER_PADDING_SIZE ||
+                vpff_size_add(&total, size + AV_INPUT_BUFFER_PADDING_SIZE) < 0) {
+                return AVERROR_INVALIDDATA;
+            }
+        }
+    }
+    if (parameters->ch_layout.order == AV_CHANNEL_ORDER_CUSTOM &&
+        parameters->ch_layout.nb_channels > 0) {
+        size_t channel_count = (size_t)parameters->ch_layout.nb_channels;
+        if (channel_count > SIZE_MAX / sizeof(*parameters->ch_layout.u.map) ||
+            vpff_size_add(
+                &total,
+                channel_count * sizeof(*parameters->ch_layout.u.map)
+            ) < 0) {
+            return AVERROR_INVALIDDATA;
+        }
+    }
+    *footprint = total;
+    return 0;
+}
+
+static size_t vpff_video_bootstrap_live_resource_count(
+    const VPFFVideoBootstrap *bootstrap
+) {
     if (bootstrap == NULL) {
+        return 0;
+    }
+    size_t count = bootstrap->parser != NULL ? 1 : 0;
+    count += bootstrap->codec_context != NULL ? 1 : 0;
+    count += bootstrap->initial_video_parameters != NULL ? 1 : 0;
+    count += bootstrap->initial_audio_parameters != NULL ? 1 : 0;
+    for (size_t index = 0; index < bootstrap->packet_count; index += 1) {
+        count += bootstrap->packets[index].packet != NULL ? 1 : 0;
+        count += bootstrap->packets[index].parameters != NULL ? 1 : 0;
+    }
+    return count;
+}
+
+static void vpff_retained_packet_clear(VPFFRetainedPacket *retained) {
+    if (retained == NULL) {
         return;
     }
-    for (size_t index = 0; index < bootstrap->packet_count; index += 1) {
-        av_packet_free(&bootstrap->packets[index]);
+    av_packet_free(&retained->packet);
+    avcodec_parameters_free(&retained->parameters);
+    memset(retained, 0, sizeof(*retained));
+}
+
+static size_t vpff_video_bootstrap_clear(VPFFVideoBootstrap *bootstrap) {
+    if (bootstrap == NULL) {
+        return 0;
     }
+    for (size_t index = 0; index < bootstrap->packet_count; index += 1) {
+        vpff_retained_packet_clear(&bootstrap->packets[index]);
+    }
+    avcodec_parameters_free(&bootstrap->initial_video_parameters);
+    avcodec_parameters_free(&bootstrap->initial_audio_parameters);
     av_parser_close(bootstrap->parser);
+    bootstrap->parser = NULL;
     avcodec_free_context(&bootstrap->codec_context);
+    size_t residual = vpff_video_bootstrap_live_resource_count(bootstrap);
     memset(bootstrap, 0, sizeof(*bootstrap));
+    return residual;
+}
+
+static int vpff_video_bootstrap_copy_initial(
+    VPFFVideoBootstrap *bootstrap,
+    const AVCodecParameters *source,
+    AVCodecParameters **destination
+) {
+    size_t footprint = 0;
+    int result = vpff_parameter_footprint(source, &footprint);
+    if (result < 0 || bootstrap->total_bytes > VPFF_BOOTSTRAP_MAX_BYTES ||
+        footprint > VPFF_BOOTSTRAP_MAX_BYTES - bootstrap->total_bytes) {
+        return AVERROR_INVALIDDATA;
+    }
+    AVCodecParameters *copy = avcodec_parameters_alloc();
+    if (copy == NULL) {
+        return AVERROR(ENOMEM);
+    }
+    result = avcodec_parameters_copy(copy, source);
+    if (result < 0) {
+        avcodec_parameters_free(&copy);
+        return result;
+    }
+    *destination = copy;
+    bootstrap->total_bytes += footprint;
+    return 0;
 }
 
 static int vpff_video_bootstrap_initialize(
     VPFFVideoBootstrap *bootstrap,
-    const AVCodecParameters *parameters
+    AVFormatContext *format,
+    const VPFFSelection *selection
 ) {
-    if (bootstrap == NULL || !vpff_is_supported_video(parameters) ||
-        !vpff_parameters_are_bounded(parameters)) {
+    if (bootstrap == NULL || format == NULL || selection == NULL ||
+        selection->video_stream_index < 0 ||
+        (unsigned int)selection->video_stream_index >= format->nb_streams) {
         return AVERROR_INVALIDDATA;
     }
+    AVStream *video_stream = format->streams[selection->video_stream_index];
+    if (video_stream == NULL || !vpff_is_supported_video(video_stream->codecpar) ||
+        !vpff_parameters_are_bounded(video_stream->codecpar) ||
+        !vpff_time_base_is_valid(video_stream->time_base)) {
+        return AVERROR_INVALIDDATA;
+    }
+    const AVCodecParameters *parameters = video_stream->codecpar;
     bootstrap->parser = av_parser_init(parameters->codec_id);
     if (bootstrap->parser == NULL) {
         return AVERROR(ENOSYS);
     }
     bootstrap->codec_context = avcodec_alloc_context3(NULL);
     if (bootstrap->codec_context == NULL) {
-        vpff_video_bootstrap_clear(bootstrap);
+        (void)vpff_video_bootstrap_clear(bootstrap);
         return AVERROR(ENOMEM);
     }
     int result = avcodec_parameters_to_context(
@@ -946,90 +1101,410 @@ static int vpff_video_bootstrap_initialize(
         parameters
     );
     if (result < 0) {
-        vpff_video_bootstrap_clear(bootstrap);
+        (void)vpff_video_bootstrap_clear(bootstrap);
+        return result;
+    }
+    result = vpff_video_bootstrap_copy_initial(
+        bootstrap,
+        video_stream->codecpar,
+        &bootstrap->initial_video_parameters
+    );
+    if (result >= 0) {
+        bootstrap->initial_video_time_base = video_stream->time_base;
+    }
+    if (result >= 0 && selection->audio_stream_index >= 0) {
+        if ((unsigned int)selection->audio_stream_index >= format->nb_streams) {
+            result = AVERROR_INVALIDDATA;
+        } else {
+            AVStream *audio_stream = format->streams[selection->audio_stream_index];
+            if (audio_stream == NULL || audio_stream->codecpar == NULL ||
+                !vpff_time_base_is_valid(audio_stream->time_base)) {
+                result = AVERROR_INVALIDDATA;
+            } else {
+                result = vpff_video_bootstrap_copy_initial(
+                    bootstrap,
+                    audio_stream->codecpar,
+                    &bootstrap->initial_audio_parameters
+                );
+                if (result >= 0) {
+                    bootstrap->initial_audio_time_base = audio_stream->time_base;
+                }
+            }
+        }
+    }
+    if (result < 0) {
+        (void)vpff_video_bootstrap_clear(bootstrap);
     }
     return result;
 }
 
-static int vpff_video_bootstrap_retain(
+static int vpff_video_bootstrap_retain_with_footprint(
     VPFFVideoBootstrap *bootstrap,
-    const AVPacket *packet
+    const AVPacket *packet,
+    const AVStream *stream,
+    size_t packet_footprint
 ) {
-    if (bootstrap == NULL || bootstrap->packet_count >= VPFF_BOOTSTRAP_MAX_PACKETS) {
+    if (bootstrap == NULL || stream == NULL || stream->codecpar == NULL ||
+        !vpff_time_base_is_valid(stream->time_base) ||
+        bootstrap->packet_count >= VPFF_BOOTSTRAP_MAX_PACKETS) {
         return AVERROR_INVALIDDATA;
     }
-    size_t footprint = 0;
-    int result = vpff_packet_footprint(packet, &footprint);
-    if (result < 0 || bootstrap->total_bytes > VPFF_BOOTSTRAP_MAX_BYTES ||
-        footprint > VPFF_BOOTSTRAP_MAX_BYTES - bootstrap->total_bytes) {
+    size_t parameter_footprint = 0;
+    int result = vpff_parameter_footprint(stream->codecpar, &parameter_footprint);
+    size_t retained_footprint = packet_footprint;
+    if (result < 0 || vpff_size_add(&retained_footprint, parameter_footprint) < 0 ||
+        bootstrap->total_bytes > VPFF_BOOTSTRAP_MAX_BYTES ||
+        retained_footprint > VPFF_BOOTSTRAP_MAX_BYTES - bootstrap->total_bytes) {
         return AVERROR_INVALIDDATA;
     }
-    AVPacket *retained = av_packet_clone(packet);
-    if (retained == NULL) {
+
+    VPFFRetainedPacket retained = {0};
+    retained.packet = av_packet_clone(packet);
+    retained.parameters = avcodec_parameters_alloc();
+    if (retained.packet == NULL || retained.parameters == NULL) {
+        vpff_retained_packet_clear(&retained);
         return AVERROR(ENOMEM);
     }
+    result = avcodec_parameters_copy(retained.parameters, stream->codecpar);
+    if (result < 0) {
+        vpff_retained_packet_clear(&retained);
+        return result;
+    }
+    retained.time_base = stream->time_base;
+    retained.accounted_bytes = retained_footprint;
     bootstrap->packets[bootstrap->packet_count] = retained;
     bootstrap->packet_count += 1;
-    bootstrap->total_bytes += footprint;
+    bootstrap->total_bytes += retained_footprint;
     return 0;
+}
+
+static int vpff_video_bootstrap_retain(
+    VPFFVideoBootstrap *bootstrap,
+    const AVPacket *packet,
+    const AVStream *stream
+) {
+    size_t footprint = 0;
+    int result = vpff_packet_footprint(packet, &footprint);
+    return result < 0
+        ? result
+        : vpff_video_bootstrap_retain_with_footprint(
+            bootstrap,
+            packet,
+            stream,
+            footprint
+        );
+}
+
+static int vpff_video_bootstrap_parse_ffmpeg(
+    void *context,
+    const uint8_t *data,
+    int size,
+    int64_t pts,
+    int64_t dts,
+    int64_t position,
+    VPFFBootstrapParserStep *step
+) {
+    VPFFVideoBootstrap *bootstrap = context;
+    if (bootstrap == NULL || bootstrap->parser == NULL ||
+        bootstrap->codec_context == NULL || step == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    step->consumed = av_parser_parse2(
+        bootstrap->parser,
+        bootstrap->codec_context,
+        &step->output,
+        &step->output_size,
+        data,
+        size,
+        pts,
+        dts,
+        position
+    );
+    step->width = bootstrap->parser->width;
+    step->height = bootstrap->parser->height;
+    step->coded_width = bootstrap->parser->coded_width;
+    step->coded_height = bootstrap->parser->coded_height;
+    return step->consumed < 0 ? step->consumed : 0;
 }
 
 static int vpff_video_bootstrap_parse(
     VPFFVideoBootstrap *bootstrap,
-    AVCodecParameters *parameters,
     const AVPacket *packet,
+    VPFFBootstrapParseFunction parse,
+    void *parse_context,
     bool *complete
 ) {
     if (bootstrap == NULL || bootstrap->parser == NULL ||
-        bootstrap->codec_context == NULL || parameters == NULL || packet == NULL ||
-        complete == NULL || packet->size < 0 ||
+        bootstrap->codec_context == NULL || packet == NULL || parse == NULL ||
+        complete == NULL || packet->size <= 0 ||
         (packet->size > 0 && packet->data == NULL)) {
         return AVERROR_INVALIDDATA;
     }
 
     const uint8_t *data = packet->data;
     int remaining = packet->size;
+    bool zero_consumed_output = false;
     while (remaining > 0) {
-        uint8_t *parsed_data = NULL;
-        int parsed_size = 0;
-        int consumed = av_parser_parse2(
-            bootstrap->parser,
-            bootstrap->codec_context,
-            &parsed_data,
-            &parsed_size,
+        VPFFBootstrapParserStep step = {0};
+        int consumed_offset = packet->size - remaining;
+        if (packet->pos > INT64_MAX - (int64_t)consumed_offset) {
+            return AVERROR_INVALIDDATA;
+        }
+        int result = parse(
+            parse_context,
             data,
             remaining,
             packet->pts,
             packet->dts,
-            packet->pos
+            packet->pos + consumed_offset,
+            &step
         );
-        if (consumed < 0 || consumed > remaining || parsed_size < 0 ||
-            (parsed_size > 0 && parsed_data == NULL)) {
-            return consumed < 0 ? consumed : AVERROR_INVALIDDATA;
+        if (result < 0 || step.consumed < 0 || step.consumed > remaining ||
+            step.output_size < 0 ||
+            (size_t)step.output_size > VPFF_MAX_PACKET_BYTES ||
+            (step.output_size > 0 && step.output == NULL)) {
+            return result < 0 ? result : AVERROR_INVALIDDATA;
         }
-
-        int width = bootstrap->parser->width;
-        int height = bootstrap->parser->height;
-        int coded_width = bootstrap->parser->coded_width;
-        int coded_height = bootstrap->parser->coded_height;
-        if (width > 0 && height > 0) {
-            if (coded_width <= 0 || coded_height <= 0 ||
-                width > coded_width || height > coded_height) {
+        if (step.consumed == 0 && step.output_size == 0) {
+            return AVERROR_INVALIDDATA;
+        }
+        if (step.consumed == 0) {
+            if (zero_consumed_output) {
                 return AVERROR_INVALIDDATA;
             }
-            parameters->width = width;
-            parameters->height = height;
+            zero_consumed_output = true;
+            continue;
+        }
+        zero_consumed_output = false;
+        data += step.consumed;
+        remaining -= step.consumed;
+
+        if (step.width > 0 && step.height > 0) {
+            if (step.coded_width <= 0 || step.coded_height <= 0 ||
+                step.width > step.coded_width || step.height > step.coded_height) {
+                return AVERROR_INVALIDDATA;
+            }
+            bootstrap->parsed_width = step.width;
+            bootstrap->parsed_height = step.height;
             *complete = true;
             return 0;
         }
-        if (consumed == 0) {
-            break;
-        }
-        data += consumed;
-        remaining -= consumed;
     }
     *complete = false;
     return 0;
+}
+
+typedef struct {
+    AVFormatContext *format;
+    VPDemuxer *demuxer;
+} VPFFBootstrapLiveReader;
+
+static int vpff_video_bootstrap_read_live(void *context, AVPacket *packet) {
+    VPFFBootstrapLiveReader *reader = context;
+    if (reader == NULL || reader->format == NULL || reader->demuxer == NULL ||
+        packet == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    vpff_refresh_deadline(reader->demuxer);
+    int result;
+    do {
+        result = av_read_frame(reader->format, packet);
+        if (result == AVERROR(EAGAIN) && !vpff_interrupt(reader->demuxer)) {
+            av_usleep(1000);
+        }
+    } while (result == AVERROR(EAGAIN) && !vpff_interrupt(reader->demuxer));
+    vpff_clear_deadline(reader->demuxer);
+    return vpff_is_cancelled(reader->demuxer) ? AVERROR_EXIT : result;
+}
+
+static int vpff_video_bootstrap_collect(
+    VPFFVideoBootstrap *bootstrap,
+    AVFormatContext *format,
+    const VPFFSelection *selection,
+    AVPacket *input,
+    VPFFBootstrapReadFunction read,
+    void *read_context,
+    VPFFBootstrapParseFunction parse,
+    void *parse_context
+) {
+    if (bootstrap == NULL || format == NULL || selection == NULL || input == NULL ||
+        read == NULL || parse == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    bool dimensions_complete = false;
+    while (!dimensions_complete) {
+        int result = read(read_context, input);
+        if (result == AVERROR_EOF) {
+            return AVERROR_INVALIDDATA;
+        }
+        if (result < 0) {
+            return result;
+        }
+        if (input->stream_index < 0 ||
+            (unsigned int)input->stream_index >= format->nb_streams) {
+            return AVERROR_INVALIDDATA;
+        }
+        AVStream *packet_stream = format->streams[input->stream_index];
+        if (packet_stream == NULL || packet_stream->codecpar == NULL ||
+            packet_stream->index != input->stream_index) {
+            return AVERROR_INVALIDDATA;
+        }
+        if (input->stream_index != selection->video_stream_index &&
+            input->stream_index != selection->audio_stream_index) {
+            packet_stream->discard = AVDISCARD_ALL;
+            av_packet_unref(input);
+            continue;
+        }
+        if (!vpff_packet_is_bounded(input)) {
+            return AVERROR_INVALIDDATA;
+        }
+        result = vpff_video_bootstrap_retain(bootstrap, input, packet_stream);
+        if (result < 0) {
+            return result;
+        }
+        if (input->stream_index == selection->video_stream_index) {
+            result = vpff_video_bootstrap_parse(
+                bootstrap,
+                input,
+                parse,
+                parse_context,
+                &dimensions_complete
+            );
+            if (result < 0) {
+                return result;
+            }
+        }
+        av_packet_unref(input);
+    }
+    return 0;
+}
+
+static int vpff_video_bootstrap_fill_missing_dimensions(
+    const VPFFVideoBootstrap *bootstrap,
+    AVCodecParameters *parameters
+) {
+    if (bootstrap == NULL || !vpff_is_supported_video(parameters) ||
+        bootstrap->parsed_width <= 0 || bootstrap->parsed_height <= 0) {
+        return AVERROR_INVALIDDATA;
+    }
+    if (parameters->width <= 0) {
+        parameters->width = bootstrap->parsed_width;
+    }
+    if (parameters->height <= 0) {
+        parameters->height = bootstrap->parsed_height;
+    }
+    return parameters->width > 0 && parameters->height > 0
+        ? 0
+        : AVERROR_INVALIDDATA;
+}
+
+static int vpff_video_bootstrap_restore_stream(
+    const VPFFVideoBootstrap *bootstrap,
+    AVStream *stream,
+    AVCodecParameters *parameters,
+    AVRational time_base,
+    bool is_video
+) {
+    if (bootstrap == NULL || stream == NULL || stream->codecpar == NULL ||
+        parameters == NULL || !vpff_time_base_is_valid(time_base)) {
+        return AVERROR_INVALIDDATA;
+    }
+    int result = 0;
+    if (is_video) {
+        result = vpff_video_bootstrap_fill_missing_dimensions(bootstrap, parameters);
+    }
+    if (result >= 0) {
+        result = avcodec_parameters_copy(stream->codecpar, parameters);
+    }
+    if (result >= 0) {
+        stream->time_base = time_base;
+    }
+    return result;
+}
+
+static int vpff_video_bootstrap_restore_initial(
+    VPFFVideoBootstrap *bootstrap,
+    AVFormatContext *format,
+    const VPFFSelection *selection
+) {
+    if (bootstrap == NULL || format == NULL || selection == NULL ||
+        selection->video_stream_index < 0 ||
+        (unsigned int)selection->video_stream_index >= format->nb_streams) {
+        return AVERROR_INVALIDDATA;
+    }
+    int result = vpff_video_bootstrap_restore_stream(
+        bootstrap,
+        format->streams[selection->video_stream_index],
+        bootstrap->initial_video_parameters,
+        bootstrap->initial_video_time_base,
+        true
+    );
+    if (result >= 0 && selection->audio_stream_index >= 0) {
+        if ((unsigned int)selection->audio_stream_index >= format->nb_streams) {
+            return AVERROR_INVALIDDATA;
+        }
+        result = vpff_video_bootstrap_restore_stream(
+            bootstrap,
+            format->streams[selection->audio_stream_index],
+            bootstrap->initial_audio_parameters,
+            bootstrap->initial_audio_time_base,
+            false
+        );
+    }
+    return result;
+}
+
+typedef int (*VPFFBootstrapReplayFunction)(
+    void *context,
+    AVFormatContext *format,
+    const VPFFSelection *selection,
+    AVPacket *packet
+);
+
+static int vpff_video_bootstrap_replay(
+    VPFFVideoBootstrap *bootstrap,
+    AVFormatContext *format,
+    const VPFFSelection *selection,
+    VPFFBootstrapReplayFunction replay,
+    void *replay_context
+) {
+    if (bootstrap == NULL || format == NULL || selection == NULL || replay == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    int result = 0;
+    for (size_t index = 0; index < bootstrap->packet_count; index += 1) {
+        VPFFRetainedPacket *retained = &bootstrap->packets[index];
+        if (retained->packet == NULL || retained->parameters == NULL ||
+            retained->packet->stream_index < 0 ||
+            (unsigned int)retained->packet->stream_index >= format->nb_streams) {
+            result = AVERROR_INVALIDDATA;
+        } else {
+            bool is_video = retained->packet->stream_index ==
+                selection->video_stream_index;
+            result = vpff_video_bootstrap_restore_stream(
+                bootstrap,
+                format->streams[retained->packet->stream_index],
+                retained->parameters,
+                retained->time_base,
+                is_video
+            );
+        }
+        if (result >= 0) {
+            result = replay(
+                replay_context,
+                format,
+                selection,
+                retained->packet
+            );
+        }
+        vpff_retained_packet_clear(retained);
+        if (result < 0) {
+            size_t residual = vpff_video_bootstrap_clear(bootstrap);
+            return residual == 0 ? result : AVERROR_BUG;
+        }
+    }
+    return vpff_video_bootstrap_clear(bootstrap) == 0 ? 0 : AVERROR_BUG;
 }
 
 static bool vpff_bytes_equal(
@@ -2015,6 +2490,42 @@ static int vpff_process_selected_packet(
     return result;
 }
 
+typedef struct {
+    AVPacket *output;
+    VPFFVideoFilter *video_filter;
+    AVCodecParameters **audio_key;
+    AVCodecParameters **audio_source_key;
+    AVRational *audio_time_base;
+    VPFFOwnedTrackSet *current_tracks;
+    VPDemuxer *demuxer;
+    VPFFFailure *failure;
+} VPFFBootstrapLiveReplay;
+
+static int vpff_video_bootstrap_replay_live(
+    void *context,
+    AVFormatContext *format,
+    const VPFFSelection *selection,
+    AVPacket *packet
+) {
+    VPFFBootstrapLiveReplay *replay = context;
+    if (replay == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    return vpff_process_selected_packet(
+        format,
+        selection,
+        packet,
+        replay->output,
+        replay->video_filter,
+        replay->audio_key,
+        replay->audio_source_key,
+        replay->audio_time_base,
+        replay->current_tracks,
+        replay->demuxer,
+        replay->failure
+    );
+}
+
 static int vpff_set_open_options(AVDictionary **options, int64_t timeout_us) {
     int result = av_dict_set_int(options, "rw_timeout", timeout_us, 0);
     if (result >= 0) {
@@ -2234,78 +2745,40 @@ int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer) {
             failure.stage = VPFF_DEMUX_STAGE_SELECTION;
             result = vpff_video_bootstrap_initialize(
                 &video_bootstrap,
-                video_stream->codecpar
+                format,
+                &selection
             );
             if (result < 0) {
                 failure.code = result;
                 goto finish_failure;
             }
-
-            bool dimensions_complete = false;
-            while (!dimensions_complete) {
-                vpff_refresh_deadline(demuxer);
-                do {
-                    result = av_read_frame(format, input);
-                    if (result == AVERROR(EAGAIN) && !vpff_interrupt(demuxer)) {
-                        av_usleep(1000);
-                    }
-                } while (result == AVERROR(EAGAIN) && !vpff_interrupt(demuxer));
-
-                if (result == AVERROR_EOF) {
-                    vpff_clear_deadline(demuxer);
-                    failure.code = AVERROR_INVALIDDATA;
-                    goto finish_failure;
-                }
-                if (result < 0) {
-                    failure.stage = VPFF_DEMUX_STAGE_READ;
-                    failure.code = result;
-                    goto finish_failure;
-                }
-                vpff_clear_deadline(demuxer);
-                if (vpff_is_cancelled(demuxer)) {
-                    failure.stage = VPFF_DEMUX_STAGE_READ;
-                    failure.code = AVERROR_EXIT;
-                    goto finish_failure;
-                }
-                if (input->stream_index < 0 ||
-                    (unsigned int)input->stream_index >= format->nb_streams) {
-                    failure.code = AVERROR_INVALIDDATA;
-                    goto finish_failure;
-                }
-                AVStream *packet_stream = format->streams[input->stream_index];
-                if (packet_stream == NULL || packet_stream->codecpar == NULL ||
-                    packet_stream->index != input->stream_index) {
-                    failure.code = AVERROR_INVALIDDATA;
-                    goto finish_failure;
-                }
-                if (input->stream_index != selection.video_stream_index &&
-                    input->stream_index != selection.audio_stream_index) {
-                    packet_stream->discard = AVDISCARD_ALL;
-                    av_packet_unref(input);
-                    continue;
-                }
-                if (!vpff_packet_is_bounded(input)) {
-                    failure.code = AVERROR_INVALIDDATA;
-                    goto finish_failure;
-                }
-                result = vpff_video_bootstrap_retain(&video_bootstrap, input);
-                if (result < 0) {
-                    failure.code = result;
-                    goto finish_failure;
-                }
-                if (input->stream_index == selection.video_stream_index) {
-                    result = vpff_video_bootstrap_parse(
-                        &video_bootstrap,
-                        video_stream->codecpar,
-                        input,
-                        &dimensions_complete
-                    );
-                    if (result < 0) {
-                        failure.code = result;
-                        goto finish_failure;
-                    }
-                }
-                av_packet_unref(input);
+            VPFFBootstrapLiveReader reader = {
+                .format = format,
+                .demuxer = demuxer,
+            };
+            result = vpff_video_bootstrap_collect(
+                &video_bootstrap,
+                format,
+                &selection,
+                input,
+                vpff_video_bootstrap_read_live,
+                &reader,
+                vpff_video_bootstrap_parse_ffmpeg,
+                &video_bootstrap
+            );
+            if (result < 0) {
+                failure.stage = VPFF_DEMUX_STAGE_READ;
+                failure.code = result;
+                goto finish_failure;
+            }
+            result = vpff_video_bootstrap_restore_initial(
+                &video_bootstrap,
+                format,
+                &selection
+            );
+            if (result < 0) {
+                failure.code = result;
+                goto finish_failure;
             }
         }
     }
@@ -2375,22 +2848,24 @@ int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer) {
         goto finish_failure;
     }
 
-    for (size_t index = 0; index < video_bootstrap.packet_count; index += 1) {
-        AVPacket *retained = video_bootstrap.packets[index];
-        result = vpff_process_selected_packet(
+    if (video_bootstrap.packet_count > 0) {
+        VPFFBootstrapLiveReplay replay = {
+            .output = output,
+            .video_filter = &video_filter,
+            .audio_key = &audio_key,
+            .audio_source_key = &audio_source_key,
+            .audio_time_base = &audio_time_base,
+            .current_tracks = &current_tracks,
+            .demuxer = demuxer,
+            .failure = &failure,
+        };
+        result = vpff_video_bootstrap_replay(
+            &video_bootstrap,
             format,
             &selection,
-            retained,
-            output,
-            &video_filter,
-            &audio_key,
-            &audio_source_key,
-            &audio_time_base,
-            &current_tracks,
-            demuxer,
-            &failure
+            vpff_video_bootstrap_replay_live,
+            &replay
         );
-        av_packet_free(&video_bootstrap.packets[index]);
         if (result < 0) {
             goto finish_failure;
         }
@@ -2496,7 +2971,7 @@ finish:
     av_dict_free(&options);
     av_packet_free(&input);
     av_packet_free(&output);
-    vpff_video_bootstrap_clear(&video_bootstrap);
+    (void)vpff_video_bootstrap_clear(&video_bootstrap);
     vpff_video_filter_free(&video_filter);
     avcodec_parameters_free(&audio_key);
     avcodec_parameters_free(&audio_source_key);
@@ -2533,3 +3008,305 @@ void vp_ffmpeg_demuxer_destroy(VPDemuxer *demuxer) {
     free(demuxer->url);
     free(demuxer);
 }
+
+#if DEBUG
+typedef struct {
+    VPFFBootstrapDebugScenario scenario;
+    VPFFBootstrapDebugResult *result;
+    const uint8_t *first_input;
+    int64_t first_position;
+    uint8_t output;
+} VPFFBootstrapDebugParser;
+
+typedef struct {
+    VPFFBootstrapDebugResult *result;
+} VPFFBootstrapDebugReplay;
+
+static AVFormatContext *vpff_bootstrap_debug_format(void) {
+    AVFormatContext *format = avformat_alloc_context();
+    if (format == NULL) {
+        return NULL;
+    }
+    AVStream *video = avformat_new_stream(format, NULL);
+    AVStream *audio = avformat_new_stream(format, NULL);
+    if (video == NULL || audio == NULL) {
+        avformat_free_context(format);
+        return NULL;
+    }
+    video->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    video->codecpar->codec_id = AV_CODEC_ID_H264;
+    video->codecpar->video_delay = 0;
+    video->time_base = (AVRational){1, 90000};
+
+    audio->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    audio->codecpar->codec_id = AV_CODEC_ID_AAC;
+    audio->codecpar->sample_rate = 48000;
+    audio->time_base = (AVRational){1, 48000};
+    if (av_channel_layout_from_mask(
+            &audio->codecpar->ch_layout,
+            AV_CH_LAYOUT_STEREO
+        ) < 0) {
+        avformat_free_context(format);
+        return NULL;
+    }
+    return format;
+}
+
+static AVPacket *vpff_bootstrap_debug_packet(int stream_index) {
+    AVPacket *packet = av_packet_alloc();
+    if (packet == NULL || av_new_packet(packet, 1) < 0) {
+        av_packet_free(&packet);
+        return NULL;
+    }
+    packet->data[0] = 0;
+    packet->stream_index = stream_index;
+    packet->pts = 0;
+    packet->dts = 0;
+    packet->pos = 0;
+    return packet;
+}
+
+static int vpff_bootstrap_debug_eof_read(void *context, AVPacket *packet) {
+    (void)context;
+    (void)packet;
+    return AVERROR_EOF;
+}
+
+static int vpff_bootstrap_debug_parse(
+    void *context,
+    const uint8_t *data,
+    int size,
+    int64_t pts,
+    int64_t dts,
+    int64_t position,
+    VPFFBootstrapParserStep *step
+) {
+    (void)pts;
+    (void)dts;
+    VPFFBootstrapDebugParser *parser = context;
+    if (parser == NULL || parser->result == NULL || data == NULL ||
+        size <= 0 || step == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    if (parser->result->parser_call_count == 0) {
+        parser->first_input = data;
+        parser->first_position = position;
+    } else if (parser->first_input == data && parser->first_position == position) {
+        parser->result->retried_same_input = 1;
+    }
+    parser->result->parser_call_count += 1;
+
+    switch (parser->scenario) {
+    case VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_NO_OUTPUT:
+        return 0;
+    case VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_WITH_OUTPUT:
+        if (parser->result->parser_call_count == 1) {
+            step->output = &parser->output;
+            step->output_size = 1;
+            return 0;
+        }
+        step->consumed = size;
+        step->width = 1280;
+        step->height = 720;
+        step->coded_width = 1280;
+        step->coded_height = 720;
+        return 0;
+    case VPFF_BOOTSTRAP_DEBUG_REPEATED_ZERO_CONSUMED:
+        step->output = &parser->output;
+        step->output_size = 1;
+        return 0;
+    default:
+        return AVERROR(EINVAL);
+    }
+}
+
+static int vpff_bootstrap_debug_replay(
+    void *context,
+    AVFormatContext *format,
+    const VPFFSelection *selection,
+    AVPacket *packet
+) {
+    VPFFBootstrapDebugReplay *replay = context;
+    if (replay == NULL || replay->result == NULL || format == NULL ||
+        selection == NULL || packet == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    VPFFBootstrapDebugResult *result = replay->result;
+    size_t replay_index = result->replayed_packet_count;
+    AVStream *stream = format->streams[packet->stream_index];
+    if (replay_index == 0 && packet->stream_index == selection->video_stream_index) {
+        result->first_replay_width = stream->codecpar->width;
+        result->first_replay_time_base_num = stream->time_base.num;
+        result->first_replay_time_base_den = stream->time_base.den;
+    } else if (replay_index == 1 &&
+               packet->stream_index == selection->audio_stream_index) {
+        result->second_replay_sample_rate = stream->codecpar->sample_rate;
+        result->second_replay_time_base_num = stream->time_base.num;
+        result->second_replay_time_base_den = stream->time_base.den;
+    } else if (replay_index == 2 &&
+               packet->stream_index == selection->video_stream_index) {
+        result->third_replay_width = stream->codecpar->width;
+        result->third_replay_height = stream->codecpar->height;
+        result->third_replay_time_base_num = stream->time_base.num;
+        result->third_replay_time_base_den = stream->time_base.den;
+    } else {
+        return AVERROR_INVALIDDATA;
+    }
+    result->replayed_packet_count += 1;
+    return 0;
+}
+
+int32_t vp_ffmpeg_demuxer_debug_run_bootstrap(
+    VPFFBootstrapDebugScenario scenario,
+    VPFFBootstrapDebugResult *out_result
+) {
+    if (out_result == NULL) {
+        return AVERROR(EINVAL);
+    }
+    memset(out_result, 0, sizeof(*out_result));
+
+    AVFormatContext *format = vpff_bootstrap_debug_format();
+    AVPacket *packet = vpff_bootstrap_debug_packet(0);
+    AVPacket *input = av_packet_alloc();
+    VPFFVideoBootstrap bootstrap = {0};
+    VPFFSelection selection = {
+        .video_stream_index = 0,
+        .audio_stream_index = 1,
+    };
+    int result = format == NULL || packet == NULL || input == NULL
+        ? AVERROR(ENOMEM)
+        : vpff_video_bootstrap_initialize(&bootstrap, format, &selection);
+    if (result < 0) {
+        goto finish;
+    }
+
+    if (scenario == VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_EXACT ||
+        scenario == VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_OVERFLOW) {
+        size_t requested = scenario == VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_EXACT
+            ? VPFF_BOOTSTRAP_MAX_PACKETS
+            : VPFF_BOOTSTRAP_MAX_PACKETS + 1;
+        for (size_t index = 0; index < requested; index += 1) {
+            result = vpff_video_bootstrap_retain_with_footprint(
+                &bootstrap,
+                packet,
+                format->streams[0],
+                0
+            );
+            if (result < 0) {
+                break;
+            }
+            out_result->peak_packet_count = bootstrap.packet_count;
+            out_result->peak_accounted_bytes = bootstrap.total_bytes;
+        }
+    } else if (scenario == VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_EXACT ||
+               scenario == VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_OVERFLOW) {
+        size_t parameter_bytes = 0;
+        result = vpff_parameter_footprint(
+            format->streams[0]->codecpar,
+            &parameter_bytes
+        );
+        if (result >= 0 &&
+            bootstrap.total_bytes + parameter_bytes <= VPFF_BOOTSTRAP_MAX_BYTES) {
+            size_t packet_bytes = VPFF_BOOTSTRAP_MAX_BYTES -
+                bootstrap.total_bytes - parameter_bytes;
+            if (scenario == VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_OVERFLOW) {
+                packet_bytes += 1;
+            }
+            result = vpff_video_bootstrap_retain_with_footprint(
+                &bootstrap,
+                packet,
+                format->streams[0],
+                packet_bytes
+            );
+            out_result->peak_packet_count = bootstrap.packet_count;
+            out_result->peak_accounted_bytes = bootstrap.total_bytes;
+        }
+    } else if (scenario == VPFF_BOOTSTRAP_DEBUG_EOF_BEFORE_DIMENSIONS) {
+        result = vpff_video_bootstrap_collect(
+            &bootstrap,
+            format,
+            &selection,
+            input,
+            vpff_bootstrap_debug_eof_read,
+            NULL,
+            vpff_video_bootstrap_parse_ffmpeg,
+            &bootstrap
+        );
+    } else if (scenario == VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_NO_OUTPUT ||
+               scenario == VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_WITH_OUTPUT ||
+               scenario == VPFF_BOOTSTRAP_DEBUG_REPEATED_ZERO_CONSUMED) {
+        VPFFBootstrapDebugParser parser = {
+            .scenario = scenario,
+            .result = out_result,
+        };
+        bool complete = false;
+        result = vpff_video_bootstrap_parse(
+            &bootstrap,
+            packet,
+            vpff_bootstrap_debug_parse,
+            &parser,
+            &complete
+        );
+        if (result >= 0 && !complete) {
+            result = AVERROR_INVALIDDATA;
+        }
+    } else if (scenario == VPFF_BOOTSTRAP_DEBUG_SNAPSHOT_REPLAY) {
+        bootstrap.parsed_width = 1280;
+        bootstrap.parsed_height = 720;
+        result = vpff_video_bootstrap_retain(
+            &bootstrap,
+            packet,
+            format->streams[0]
+        );
+        if (result >= 0) {
+            packet->stream_index = 1;
+            result = vpff_video_bootstrap_retain(
+                &bootstrap,
+                packet,
+                format->streams[1]
+            );
+        }
+        if (result >= 0) {
+            format->streams[0]->codecpar->width = 1920;
+            format->streams[0]->codecpar->height = 1080;
+            format->streams[0]->time_base = (AVRational){1, 45000};
+            packet->stream_index = 0;
+            result = vpff_video_bootstrap_retain(
+                &bootstrap,
+                packet,
+                format->streams[0]
+            );
+        }
+        out_result->peak_packet_count = bootstrap.packet_count;
+        out_result->peak_accounted_bytes = bootstrap.total_bytes;
+        if (result >= 0) {
+            result = vpff_video_bootstrap_restore_initial(
+                &bootstrap,
+                format,
+                &selection
+            );
+        }
+        if (result >= 0) {
+            out_result->initial_width = format->streams[0]->codecpar->width;
+            out_result->initial_height = format->streams[0]->codecpar->height;
+            VPFFBootstrapDebugReplay replay = {.result = out_result};
+            result = vpff_video_bootstrap_replay(
+                &bootstrap,
+                format,
+                &selection,
+                vpff_bootstrap_debug_replay,
+                &replay
+            );
+        }
+    } else {
+        result = AVERROR(EINVAL);
+    }
+
+finish:
+    out_result->live_resource_count = vpff_video_bootstrap_clear(&bootstrap);
+    av_packet_free(&packet);
+    av_packet_free(&input);
+    avformat_free_context(format);
+    return (int32_t)result;
+}
+#endif

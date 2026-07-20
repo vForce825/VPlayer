@@ -122,6 +122,46 @@ int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer);
 void vp_ffmpeg_demuxer_cancel(VPDemuxer *demuxer);
 void vp_ffmpeg_demuxer_destroy(VPDemuxer *demuxer);
 
+#if DEBUG
+typedef enum {
+    VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_EXACT = 1,
+    VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_OVERFLOW = 2,
+    VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_EXACT = 3,
+    VPFF_BOOTSTRAP_DEBUG_BYTE_LIMIT_OVERFLOW = 4,
+    VPFF_BOOTSTRAP_DEBUG_EOF_BEFORE_DIMENSIONS = 5,
+    VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_NO_OUTPUT = 6,
+    VPFF_BOOTSTRAP_DEBUG_ZERO_CONSUMED_WITH_OUTPUT = 7,
+    VPFF_BOOTSTRAP_DEBUG_REPEATED_ZERO_CONSUMED = 8,
+    VPFF_BOOTSTRAP_DEBUG_SNAPSHOT_REPLAY = 9
+} VPFFBootstrapDebugScenario;
+
+typedef struct {
+    size_t peak_packet_count;
+    size_t peak_accounted_bytes;
+    size_t replayed_packet_count;
+    size_t parser_call_count;
+    size_t live_resource_count;
+    uint8_t retried_same_input;
+    int32_t initial_width;
+    int32_t initial_height;
+    int32_t first_replay_width;
+    int32_t first_replay_time_base_num;
+    int32_t first_replay_time_base_den;
+    int32_t second_replay_sample_rate;
+    int32_t second_replay_time_base_num;
+    int32_t second_replay_time_base_den;
+    int32_t third_replay_width;
+    int32_t third_replay_height;
+    int32_t third_replay_time_base_num;
+    int32_t third_replay_time_base_den;
+} VPFFBootstrapDebugResult;
+
+int32_t vp_ffmpeg_demuxer_debug_run_bootstrap(
+    VPFFBootstrapDebugScenario scenario,
+    VPFFBootstrapDebugResult *out_result
+);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

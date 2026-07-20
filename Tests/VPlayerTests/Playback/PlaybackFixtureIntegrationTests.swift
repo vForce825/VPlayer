@@ -302,8 +302,32 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         let videoPTS = result.videoAccessUnits.map {
             CMSampleBufferGetPresentationTimeStamp($0.sampleBuffer)
         }
-        try assertStrictlyMonotonic(videoPTS.sorted(by: { CMTimeCompare($0, $1) < 0 }))
+        try assertBFramePresentationTimeline(videoPTS)
         try assertStrictlyMonotonic(result.audioSamples.map(\.presentationTimeStamp))
+    }
+
+    private func assertBFramePresentationTimeline(_ decodeOrder: [CMTime]) throws {
+        XCTAssertFalse(decodeOrder.isEmpty)
+        XCTAssertTrue(decodeOrder.allSatisfy(\.isNumeric))
+        XCTAssertTrue(
+            zip(decodeOrder, decodeOrder.dropFirst()).contains { earlier, later in
+                CMTimeCompare(earlier, later) > 0
+            },
+            "the two-B-frame fixture must expose presentation timestamps out of decode order"
+        )
+
+        let presentationOrder = decodeOrder.sorted {
+            CMTimeCompare($0, $1) < 0
+        }
+        try assertStrictlyMonotonic(presentationOrder)
+        let expectedCadence = CMTime(value: 1, timescale: 25)
+        for (earlier, later) in zip(presentationOrder, presentationOrder.dropFirst()) {
+            XCTAssertEqual(
+                CMTimeCompare(CMTimeSubtract(later, earlier), expectedCadence),
+                0,
+                "presentation cadence must be exactly 1/25 second"
+            )
+        }
     }
 
     private func assertStrictlyMonotonic(_ times: [CMTime]) throws {
