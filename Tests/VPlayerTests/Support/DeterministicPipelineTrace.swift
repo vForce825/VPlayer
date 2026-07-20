@@ -25,6 +25,17 @@ enum TraceGenerationAdvanceReason: Equatable, Sendable {
     case discontinuity
 }
 
+enum TraceProcessorEvent: Equatable, Sendable {
+    case reset(MediaGeneration)
+    case submit(MediaGeneration)
+}
+
+struct TraceGenerationBoundaryAudit: Equatable, Sendable {
+    let reason: TraceGenerationAdvanceReason
+    let generation: MediaGeneration
+    let processorEventOffset: Int
+}
+
 struct DeterministicPipelineMetrics: Equatable, Sendable {
     var yadifKernelDispatchCount: UInt64 = 0
     var bothFieldsConfigurationCount: UInt64 = 0
@@ -32,7 +43,7 @@ struct DeterministicPipelineMetrics: Equatable, Sendable {
     var temporalConfigurationCount: UInt64 = 0
     var temporalPropertySetCount: UInt64 = 0
     var temporalDecodeFlagCount: UInt64 = 0
-    var crossGenerationReferenceCount: UInt64 = 0
+    var crossGenerationRendererDeliveryCount: UInt64 = 0
     var staleGenerationDropCount: UInt64 = 0
 }
 
@@ -57,8 +68,10 @@ struct DeterministicPipelineResult: @unchecked Sendable {
     var unchangedPMTGenerationAdvanceCount = 0
     var rawSourcePTS90k: [UInt64] = []
     var pipelineDemuxEventCount = 0
-    var discontinuityResetCount = 0
+    var discontinuityRendererFlushCount = 0
     var lateDecoderCallbackDeliveryCount = 0
+    var processorEvents: [TraceProcessorEvent] = []
+    var generationBoundaryAudits: [TraceGenerationBoundaryAudit] = []
 
     var generationAdvanceCount: Int { generationAdvanceReasons.count }
 }
@@ -188,7 +201,9 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             temporalConfigurationCount: UInt64(decoderSnapshot.temporalConfigurationCount),
             temporalPropertySetCount: UInt64(decoderSnapshot.temporalPropertySetCount),
             temporalDecodeFlagCount: UInt64(decoderSnapshot.temporalDecodeFlagCount),
-            crossGenerationReferenceCount: UInt64(hostSnapshot.crossGenerationDeliveryCount),
+            crossGenerationRendererDeliveryCount: UInt64(
+                hostSnapshot.crossGenerationDeliveryCount
+            ),
             staleGenerationDropCount: systemYADIF.metricsSnapshot.staleGenerationDropCount
         )
         return DeterministicPipelineResult(
@@ -609,38 +624,15 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             await pipeline.debugSnapshot().generation == MediaGeneration(rawValue: 1)
         }
         let initialGeneration = await pipeline.debugSnapshot().generation
-
-        let initialAccessUnit = try makeAccessUnit(
-            id: 0,
+        var activityIDsByGeneration: [MediaGeneration: Set<UInt64>] = [:]
+        activityIDsByGeneration[initialGeneration] = try await feedWrapGeneration(
+            pipeline: pipeline,
+            trace: trace,
             generation: initialGeneration,
-            format: trace.formatDescription,
-            duration: trace.nominalFrameDuration,
-            parser: trace.frames[0].parserMetadata
+            accessUnitIDOffset: 0,
+            renderer: renderer,
+            yadif: yadif
         )
-        pipeline.receive(video: .accessUnit(initialAccessUnit))
-        let wrapFlushFrames = makeFlushFrames(for: trace, generation: initialGeneration)
-        for source in trace.frames + wrapFlushFrames {
-            let frame = source.rebased(to: initialGeneration)
-            pipeline.receive(video: .accessUnit(try makeAccessUnit(
-                id: frame.accessUnitID,
-                generation: initialGeneration,
-                format: trace.formatDescription,
-                duration: frame.duration,
-                parser: frame.parserMetadata
-            )))
-            pipeline.receive(decoder: .frame(frame))
-        }
-        _ = await pipeline.debugSnapshot()
-        try await drain(yadif)
-        let wrapIDs = Set(trace.frames.map(\.accessUnitID))
-        try await waitUntil {
-            renderer.snapshot().allFrames.filter {
-                wrapIDs.contains($0.sourceAccessUnitID)
-            }.count == trace.frames.count * 2
-        }
-        let wrapPresentations = renderer.snapshot().allFrames
-            .filter { wrapIDs.contains($0.sourceAccessUnitID) }
-            .sorted(by: presentationPrecedes)
 
         let beforeSamePMT = await pipeline.debugSnapshot().generation
         demuxer.emit(.tracks(initialTracks))
@@ -654,12 +646,21 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             videoParameterSets: [changedSPS, pps],
             audioCookie: initialCookie
         )
+        let spsBoundaryEventOffset = yadif.eventCount
         pipeline.receive(video: .format(trace.formatDescription, changedSPSFingerprint))
         try await waitUntil {
             await pipeline.debugSnapshot().generation.rawValue
                 == afterSamePMT.rawValue + 1
         }
         let spsGeneration = await pipeline.debugSnapshot().generation
+        activityIDsByGeneration[spsGeneration] = try await feedWrapGeneration(
+            pipeline: pipeline,
+            trace: trace,
+            generation: spsGeneration,
+            accessUnitIDOffset: 100,
+            renderer: renderer,
+            yadif: yadif
+        )
 
         let changedCookie = Data([0x13, 0x10])
         let changedTracks = PlaybackFakeMedia.tracks(
@@ -671,6 +672,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             videoParameterSets: [changedSPS, pps],
             audioCookie: changedCookie
         )
+        let pmtBoundaryEventOffset = yadif.eventCount
         demuxer.emit(.tracks(changedTracks))
         pipeline.receive(audio: .format(
             try PlaybackFakeMedia.audioFormat(),
@@ -683,7 +685,16 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
                 == spsGeneration.rawValue + 1
         }
         let pmtGeneration = await pipeline.debugSnapshot().generation
+        activityIDsByGeneration[pmtGeneration] = try await feedWrapGeneration(
+            pipeline: pipeline,
+            trace: trace,
+            generation: pmtGeneration,
+            accessUnitIDOffset: 200,
+            renderer: renderer,
+            yadif: yadif
+        )
 
+        let discontinuityBoundaryEventOffset = yadif.eventCount
         demuxer.emit(.discontinuity(changedTracks))
         try await waitUntil {
             await pipeline.debugSnapshot().generation.rawValue
@@ -697,6 +708,14 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         ))
         pipeline.receive(video: .format(trace.formatDescription, changedPMTFingerprint))
         _ = await pipeline.debugSnapshot()
+        activityIDsByGeneration[discontinuityGeneration] = try await feedWrapGeneration(
+            pipeline: pipeline,
+            trace: trace,
+            generation: discontinuityGeneration,
+            accessUnitIDOffset: 300,
+            renderer: renderer,
+            yadif: yadif
+        )
 
         let staleFrame = VideoTestFactories.decodedFrame(
             id: 999,
@@ -710,14 +729,13 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         pipeline.receive(decoder: .frame(staleFrame))
         _ = await pipeline.debugSnapshot()
         let rendererSnapshot = renderer.snapshot()
+        let generationPresentations = rendererSnapshot.allFrames.filter { frame in
+            activityIDsByGeneration[frame.generation]?.contains(frame.sourceAccessUnitID) == true
+        }.sorted(by: presentationPrecedes)
         let lateDeliveryCount = rendererSnapshot.allFrames.filter {
             $0.sourceAccessUnitID == 999
         }.count
-        let generationAudit = yadif.generationAudit()
-        let resetSet = Set(generationAudit.resets)
-        let resetMismatchCount = generationAudit.submissions.filter {
-            !resetSet.contains($0)
-        }.count
+        let processorEvents = yadif.eventSnapshot()
         let failureEvents = events.snapshot().filter {
             if case .failed = $0 { return true }
             return false
@@ -725,7 +743,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         if !failureEvents.isEmpty { throw DeterministicTraceError.pipelineFailure }
 
         return DeterministicPipelineResult(
-            presentations: wrapPresentations,
+            presentations: generationPresentations,
             metrics: DeterministicPipelineMetrics(
                 yadifKernelDispatchCount: systemYADIF.metricsSnapshot.completedJobCount,
                 bothFieldsConfigurationCount: UInt64(
@@ -737,8 +755,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
                 ),
                 temporalPropertySetCount: UInt64(decoder.snapshot().temporalPropertySetCount),
                 temporalDecodeFlagCount: UInt64(decoder.snapshot().temporalDecodeFlagCount),
-                crossGenerationReferenceCount: UInt64(
-                    rendererSnapshot.crossGenerationDeliveryCount + resetMismatchCount
+                crossGenerationRendererDeliveryCount: UInt64(
+                    rendererSnapshot.crossGenerationDeliveryCount
                 ),
                 staleGenerationDropCount: systemYADIF.metricsSnapshot.staleGenerationDropCount
             ),
@@ -746,7 +764,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             formatMetadata: trace.formatMetadata,
             formatCodecType: CMFormatDescriptionGetMediaSubType(trace.formatDescription),
             pixelFormats: Set(trace.frames.map { CVPixelBufferGetPixelFormatType($0.pixelBuffer) }),
-            presentationPTS: wrapPresentations.map {
+            presentationPTS: generationPresentations.map {
                 GenerationPresentationTime(
                     generation: $0.generation,
                     presentationTimeStamp: $0.presentationTimeStamp
@@ -761,11 +779,64 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             unchangedPMTGenerationAdvanceCount: unchangedPMTAdvanceCount,
             rawSourcePTS90k: trace.frames.compactMap(\.parserMetadata.sourcePTS90k),
             pipelineDemuxEventCount: demuxer.emissionCount,
-            discontinuityResetCount: rendererSnapshot.flushes.filter {
+            discontinuityRendererFlushCount: rendererSnapshot.flushes.filter {
                 $0 == discontinuityGeneration
             }.count,
-            lateDecoderCallbackDeliveryCount: lateDeliveryCount
+            lateDecoderCallbackDeliveryCount: lateDeliveryCount,
+            processorEvents: processorEvents,
+            generationBoundaryAudits: [
+                TraceGenerationBoundaryAudit(
+                    reason: .sps,
+                    generation: spsGeneration,
+                    processorEventOffset: spsBoundaryEventOffset
+                ),
+                TraceGenerationBoundaryAudit(
+                    reason: .pmt,
+                    generation: pmtGeneration,
+                    processorEventOffset: pmtBoundaryEventOffset
+                ),
+                TraceGenerationBoundaryAudit(
+                    reason: .discontinuity,
+                    generation: discontinuityGeneration,
+                    processorEventOffset: discontinuityBoundaryEventOffset
+                ),
+            ]
         )
+    }
+
+    private func feedWrapGeneration(
+        pipeline: PlaybackPipeline,
+        trace: DeterministicPipelineTrace,
+        generation: MediaGeneration,
+        accessUnitIDOffset: UInt64,
+        renderer: AuditTraceRenderer,
+        yadif: ObservingTraceYADIF
+    ) async throws -> Set<UInt64> {
+        let sources = trace.frames + makeFlushFrames(for: trace, generation: generation)
+        for source in sources {
+            let frame = source.rebased(
+                to: generation,
+                accessUnitID: source.accessUnitID + accessUnitIDOffset
+            )
+            pipeline.receive(video: .accessUnit(try makeAccessUnit(
+                id: frame.accessUnitID,
+                generation: generation,
+                format: trace.formatDescription,
+                duration: frame.duration,
+                parser: frame.parserMetadata
+            )))
+            pipeline.receive(decoder: .frame(frame))
+        }
+        _ = await pipeline.debugSnapshot()
+        try await drain(yadif)
+
+        let targetIDs = Set(trace.frames.map { $0.accessUnitID + accessUnitIDOffset })
+        try await waitUntil {
+            renderer.snapshot().allFrames.filter {
+                $0.generation == generation && targetIDs.contains($0.sourceAccessUnitID)
+            }.count == trace.frames.count * 2
+        }
+        return targetIDs
     }
 
     private func makeAccessUnit(
@@ -1162,9 +1233,12 @@ struct DeterministicPipelineTrace: @unchecked Sendable {
 }
 
 private extension DecodedVideoFrame {
-    func rebased(to generation: MediaGeneration) -> DecodedVideoFrame {
+    func rebased(
+        to generation: MediaGeneration,
+        accessUnitID: UInt64? = nil
+    ) -> DecodedVideoFrame {
         DecodedVideoFrame(
-            accessUnitID: accessUnitID,
+            accessUnitID: accessUnitID ?? self.accessUnitID,
             pixelBuffer: pixelBuffer,
             presentationTimeStamp: presentationTimeStamp,
             duration: duration,
@@ -1337,8 +1411,7 @@ private final class ObservingTraceYADIF: YADIFFrameProcessing, @unchecked Sendab
     private let lock = NSLock()
     private let processor: YADIFProcessor
     private var orders: [ResolvedFieldOrder] = []
-    private var resetGenerations: [MediaGeneration] = []
-    private var submissionGenerations: [MediaGeneration] = []
+    private var events: [TraceProcessorEvent] = []
     private var storedDrainFailure: PlaybackFailure?
 
     init(processor: YADIFProcessor) {
@@ -1346,9 +1419,10 @@ private final class ObservingTraceYADIF: YADIFFrameProcessing, @unchecked Sendab
     }
 
     var drainFailure: PlaybackFailure? { lock.withLock { storedDrainFailure } }
+    var eventCount: Int { lock.withLock { events.count } }
 
     func reset(to generation: MediaGeneration) {
-        lock.withLock { resetGenerations.append(generation) }
+        lock.withLock { events.append(.reset(generation)) }
         processor.reset(to: generation)
     }
 
@@ -1362,7 +1436,7 @@ private final class ObservingTraceYADIF: YADIFFrameProcessing, @unchecked Sendab
     ) {
         lock.withLock {
             orders.append(order)
-            submissionGenerations.append(frame.frame.generation)
+            events.append(.submit(frame.frame.generation))
         }
         processor.submit(
             normalized: frame,
@@ -1390,9 +1464,7 @@ private final class ObservingTraceYADIF: YADIFFrameProcessing, @unchecked Sendab
 
     func snapshotOrders() -> [ResolvedFieldOrder] { lock.withLock { orders } }
 
-    func generationAudit() -> (resets: [MediaGeneration], submissions: [MediaGeneration]) {
-        lock.withLock { (resetGenerations, submissionGenerations) }
-    }
+    func eventSnapshot() -> [TraceProcessorEvent] { lock.withLock { events } }
 }
 
 private final class ImmediateRecordingTraceYADIF: YADIFFrameProcessing, @unchecked Sendable {

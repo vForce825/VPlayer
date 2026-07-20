@@ -103,14 +103,50 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
         )
 
         XCTAssertTrue(result.presentationPTS.isStrictlyIncreasingWithinEachGeneration)
-        XCTAssertEqual(result.metrics.crossGenerationReferenceCount, 0)
+        XCTAssertEqual(result.metrics.crossGenerationRendererDeliveryCount, 0)
         XCTAssertEqual(result.generationAdvanceReasons, [.sps, .pmt, .discontinuity])
         XCTAssertEqual(result.generationAdvanceDeltas, [1, 1, 1])
         XCTAssertEqual(result.generationAdvanceCount, 3)
         XCTAssertEqual(result.unchangedPMTGenerationAdvanceCount, 0)
         XCTAssertGreaterThanOrEqual(result.pipelineDemuxEventCount, 4)
-        XCTAssertEqual(result.discontinuityResetCount, 1)
+        XCTAssertGreaterThanOrEqual(result.discontinuityRendererFlushCount, 1)
         XCTAssertEqual(result.lateDecoderCallbackDeliveryCount, 0)
+        var activeProcessorGeneration: MediaGeneration?
+        for event in result.processorEvents {
+            switch event {
+            case let .reset(generation):
+                activeProcessorGeneration = generation
+            case let .submit(generation):
+                XCTAssertEqual(generation, activeProcessorGeneration)
+            }
+        }
+        XCTAssertEqual(
+            result.generationBoundaryAudits.map(\.reason),
+            [.sps, .pmt, .discontinuity]
+        )
+        for boundary in result.generationBoundaryAudits {
+            let resetIndex = try XCTUnwrap(
+                result.processorEvents.indices.dropFirst(boundary.processorEventOffset).first {
+                    result.processorEvents[$0] == .reset(boundary.generation)
+                }
+            )
+            let beforeReset = result.processorEvents[
+                boundary.processorEventOffset..<resetIndex
+            ]
+            XCTAssertFalse(beforeReset.contains { event in
+                if case .submit = event { return true }
+                return false
+            })
+            let postBoundarySubmitCount = result.processorEvents.indices.filter { index in
+                index > resetIndex
+                    && result.processorEvents[index] == .submit(boundary.generation)
+            }.count
+            XCTAssertGreaterThanOrEqual(postBoundarySubmitCount, 3)
+            let generationPresentationCount = result.presentationPTS.filter {
+                $0.generation == boundary.generation
+            }.count
+            XCTAssertEqual(generationPresentationCount, 8)
+        }
         XCTAssertEqual(result.rawSourcePTS90k, [
             (1 << 33) - 7_200,
             (1 << 33) - 3_600,
