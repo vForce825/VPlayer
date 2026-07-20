@@ -81,7 +81,7 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) is unavailable")
+        return nil
     }
 
     public func startDisplayLink(runLoop: RunLoop = .main) {
