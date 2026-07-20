@@ -3,7 +3,6 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import CoreGraphics
-import CoreMedia
 import Foundation
 import Metal
 import QuartzCore
@@ -11,73 +10,36 @@ import UIKit
 
 @MainActor
 public final class MetalVideoView: UIView, DisplayLinkControlling {
-    struct Lifecycle {
-        let add: (CAMetalDisplayLink, RunLoop.Mode) -> Void
-        let remove: (CAMetalDisplayLink, RunLoop.Mode) -> Void
-        let invalidate: (CAMetalDisplayLink) -> Void
-
-        init(
-            add: @escaping (CAMetalDisplayLink, RunLoop.Mode) -> Void = {
-                $0.add(to: .main, forMode: $1)
-            },
-            remove: @escaping (CAMetalDisplayLink, RunLoop.Mode) -> Void = {
-                $0.remove(from: .main, forMode: $1)
-            },
-            invalidate: @escaping (CAMetalDisplayLink) -> Void = { $0.invalidate() }
-        ) {
-            self.add = add
-            self.remove = remove
-            self.invalidate = invalidate
-        }
-    }
-
-    private final class DisplayLinkTeardown: @unchecked Sendable {
-        private let lock = NSLock()
-        private let link: CAMetalDisplayLink
-        private let lifecycle: Lifecycle
-        private var isComplete = false
-
-        init(link: CAMetalDisplayLink, lifecycle: Lifecycle) {
-            self.link = link
-            self.lifecycle = lifecycle
-        }
-
-        @MainActor
-        func perform() {
-            let shouldPerform = lock.withLock {
-                guard !isComplete else { return false }
-                isComplete = true
-                return true
-            }
-            guard shouldPerform else { return }
-            lifecycle.remove(link, .common)
-            link.delegate = nil
-            lifecycle.invalidate(link)
-        }
-
-        nonisolated func schedule() {
-            Task { @MainActor [self] in
-                perform()
-            }
-        }
-    }
+    typealias Lifecycle = MetalDisplayLinkDriver.Lifecycle
 
     public override class var layerClass: AnyClass { CAMetalLayer.self }
 
-    public private(set) var displayLink: CAMetalDisplayLink!
-    private let clock: PlaybackClock
-    private let renderer: VideoRendering
-    private var teardownState: DisplayLinkTeardown!
-    private var isTornDown = false
+    private var driver: MetalDisplayLinkDriver!
+
+    public var displayLink: CAMetalDisplayLink { driver.displayLink }
+
+    public convenience init(
+        frame: CGRect,
+        clock: PlaybackClock,
+        renderer: VideoRendering,
+        device: any MTLDevice
+    ) {
+        self.init(
+            frame: frame,
+            clock: clock,
+            renderer: renderer,
+            device: device,
+            displayLinkFactory: { CAMetalDisplayLink(metalLayer: $0) },
+            lifecycle: Lifecycle()
+        )
+    }
 
     convenience init(
         frame: CGRect,
         clock: PlaybackClock,
         renderer: VideoRendering,
         device: any MTLDevice,
-        displayLinkFactory: (CAMetalLayer) -> CAMetalDisplayLink = {
-            CAMetalDisplayLink(metalLayer: $0)
-        }
+        displayLinkFactory: (CAMetalLayer) -> CAMetalDisplayLink
     ) {
         self.init(
             frame: frame,
@@ -99,23 +61,21 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
         },
         lifecycle: Lifecycle
     ) {
-        self.clock = clock
-        self.renderer = renderer
         super.init(frame: frame)
 
         guard let metalLayer = layer as? CAMetalLayer else {
             preconditionFailure("MetalVideoView requires CAMetalLayer")
         }
         metalLayer.device = device
-        metalLayer.pixelFormat = .rgba16Float
-        metalLayer.framebufferOnly = true
-        metalLayer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
-        metalLayer.toneMapMode = .automatic
-
-        displayLink = displayLinkFactory(metalLayer)
-        displayLink.delegate = self
-        lifecycle.add(displayLink, .common)
-        teardownState = DisplayLinkTeardown(link: displayLink, lifecycle: lifecycle)
+        HDRPresentationPolicy.systemManaged.configure(layer: metalLayer)
+        driver = MetalDisplayLinkDriver(
+            layer: metalLayer,
+            renderer: renderer,
+            clock: clock,
+            displayLinkFactory: displayLinkFactory,
+            lifecycle: lifecycle
+        )
+        driver.start()
     }
 
     @available(*, unavailable)
@@ -123,65 +83,45 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
         fatalError("init(coder:) is unavailable")
     }
 
-    deinit {
-        teardownState.schedule()
+    public func startDisplayLink(runLoop: RunLoop = .main) {
+        driver.start(runLoop: runLoop)
+    }
+
+    public func stopDisplayLink() {
+        driver.stop()
     }
 
     public func teardown() {
-        guard !isTornDown else { return }
-        isTornDown = true
-        displayLink.isPaused = true
-        teardownState.perform()
+        stopDisplayLink()
     }
 
     public func pauseDisplayLink() {
-        guard !isTornDown, !displayLink.isPaused else { return }
-        displayLink.isPaused = true
+        driver.pause()
     }
 
     public func resumeDisplayLink() {
-        guard !isTornDown, displayLink.isPaused else { return }
-        displayLink.isPaused = false
+        driver.resume()
     }
 
     public func pause() {
-        pauseDisplayLink()
+        driver.pause()
     }
 
     public func resume() {
-        resumeDisplayLink()
+        driver.resume()
     }
 
     public func resetPresentationTiming() {
-        guard !isTornDown else { return }
-        (renderer as? VideoPresentationTimingResetting)?.resetPresentationTiming()
+        driver.resetPresentationTiming()
     }
 
     func render(
         targetPresentationTimestamp: CFTimeInterval,
         drawable: any CAMetalDrawable
     ) {
-        guard !isTornDown, targetPresentationTimestamp.isFinite else { return }
-        let hostTime = CMTime(
-            seconds: targetPresentationTimestamp,
-            preferredTimescale: 1_000_000_000
-        )
-        guard hostTime.isNumeric else { return }
-        let mediaTime = clock.mediaTime(forHostTime: hostTime)
-        guard mediaTime.isNumeric else { return }
-        _ = renderer.draw(targetMediaTime: mediaTime, drawable: drawable)
-    }
-}
-
-extension MetalVideoView: @MainActor CAMetalDisplayLinkDelegate {
-    public func metalDisplayLink(
-        _ link: CAMetalDisplayLink,
-        needsUpdate update: CAMetalDisplayLink.Update
-    ) {
-        guard link === displayLink, !isTornDown else { return }
-        render(
-            targetPresentationTimestamp: update.targetPresentationTimestamp,
-            drawable: update.drawable
+        driver.render(
+            targetPresentationTimestamp: targetPresentationTimestamp,
+            drawable: drawable
         )
     }
 }

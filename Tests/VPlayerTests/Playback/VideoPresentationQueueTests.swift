@@ -140,6 +140,25 @@ final class VideoPresentationQueueTests: XCTestCase {
         XCTAssertEqual(second.frame?.sourceAccessUnitID, 1)
     }
 
+    func testNinetyKilohertzTarget3500Selects3600AndDropsTwoSupersededFrames() throws {
+        let queue = VideoPresentationQueue(generation: generation)
+        for pts: Int64 in [0, 1_800, 3_600] {
+            XCTAssertTrue(queue.enqueue(try frame(
+                id: UInt64(pts),
+                pts: CMTime(value: pts, timescale: 90_000),
+                duration: CMTime(value: 1_800, timescale: 90_000)
+            )))
+        }
+
+        let selection = queue.select(
+            targetMediaTime: CMTime(value: 3_500, timescale: 90_000),
+            displayInterval: CMTime(value: 1_800, timescale: 90_000)
+        )
+
+        XCTAssertEqual(selection.frame?.presentationTimeStamp.value, 3_600)
+        XCTAssertEqual(selection.droppedFrameCount, 2)
+    }
+
     func testGenerationFlushClearsQueueCurrentOverflowIntervalAndMetricsEpoch() throws {
         let queue = VideoPresentationQueue(generation: generation)
         for pts in 1...13 {

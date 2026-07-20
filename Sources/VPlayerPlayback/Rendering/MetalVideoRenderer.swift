@@ -413,8 +413,11 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             )
         }
 
+        let presentationConfiguration = HDRPresentationPolicy.systemManaged.configuration(
+            for: frame.formatMetadata
+        )
         let shaderState = Self.makeShaderState(
-            metadata: frame.formatMetadata,
+            configuration: presentationConfiguration,
             pixelFormatIsTenBit: isTenBit
         )
         let job = MetalRenderJob(
@@ -422,7 +425,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             chroma: textures.chroma,
             uniforms: Self.makeGPUUniforms(
                 shaderState: shaderState,
-                metadata: frame.formatMetadata
+                configuration: presentationConfiguration
             ),
             outputConfiguration: shaderState.outputConfiguration,
             displayInterval: displayInterval
@@ -457,8 +460,18 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         metadata: VideoFormatMetadata,
         pixelFormatIsTenBit: Bool
     ) -> MetalShaderState {
-        let isIdentity = metadata.matrix == .identity
-        let fullRange = metadata.range == .full
+        makeShaderState(
+            configuration: HDRPresentationPolicy.systemManaged.configuration(for: metadata),
+            pixelFormatIsTenBit: pixelFormatIsTenBit
+        )
+    }
+
+    private static func makeShaderState(
+        configuration: HDRPresentationConfiguration,
+        pixelFormatIsTenBit: Bool
+    ) -> MetalShaderState {
+        let isIdentity = configuration.matrix == .identity
+        let fullRange = configuration.range == .full
         let maximumCode: Float = pixelFormatIsTenBit ? 1_023 : 255
         let yOffsetCode: Float = fullRange ? 0 : (pixelFormatIsTenBit ? 64 : 16)
         let yRangeCode: Float = fullRange ? maximumCode : (pixelFormatIsTenBit ? 876 : 219)
@@ -470,7 +483,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             : (fullRange ? maximumCode : (pixelFormatIsTenBit ? 896 : 224))
         let normalization: Float = pixelFormatIsTenBit ? 65_535 / 65_472 : 1
 
-        let matrix = yuvMatrix(for: metadata.matrix)
+        let matrix = yuvMatrix(for: configuration.matrix)
         let gamut = simd_float3x3(columns: (
             SIMD3<Float>(0.627404, 0.069097, 0.016392),
             SIMD3<Float>(0.329283, 0.919540, 0.088013),
@@ -485,15 +498,11 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
                 sampleNormalization: normalization,
                 yuvToRGB: matrix,
                 gamut709To2020: gamut,
-                transfer: metadata.transfer,
-                matrixKind: metadata.matrix,
-                primaries: metadata.primaries
+                transfer: configuration.transfer,
+                matrixKind: configuration.matrix,
+                primaries: configuration.primaries
             ),
-            outputConfiguration: MetalOutputConfiguration(
-                cleanAperture: metadata.cleanAperture,
-                chromaLocation: metadata.chromaLocation,
-                hdrStaticMetadata: metadata.hdrStaticMetadata
-            )
+            outputConfiguration: configuration.outputConfiguration
         )
     }
 
@@ -666,10 +675,20 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         shaderState: MetalShaderState,
         metadata: VideoFormatMetadata
     ) -> MetalGPUUniforms {
+        makeGPUUniforms(
+            shaderState: shaderState,
+            configuration: HDRPresentationPolicy.systemManaged.configuration(for: metadata)
+        )
+    }
+
+    private static func makeGPUUniforms(
+        shaderState: MetalShaderState,
+        configuration: HDRPresentationConfiguration
+    ) -> MetalGPUUniforms {
         let uniforms = shaderState.uniforms
-        let aperture = metadata.cleanAperture
-        let width = max(Float(metadata.dimensions.width), 1)
-        let height = max(Float(metadata.dimensions.height), 1)
+        let aperture = configuration.cleanAperture
+        let width = max(Float(configuration.dimensions.width), 1)
+        let height = max(Float(configuration.dimensions.height), 1)
         let transform: SIMD4<Float>
         if let aperture {
             transform = SIMD4<Float>(
@@ -706,7 +725,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             ),
             textureTransform: transform,
             transferKind: transferKind,
-            applyGamutTransform: metadata.primaries == .bt709 ? 1 : 0
+            applyGamutTransform: configuration.primaries == .bt709 ? 1 : 0
         )
     }
 }

@@ -428,6 +428,11 @@ final class MetalVideoRendererTests: XCTestCase {
 
     func testRenderJobCarriesColorAndHDRConfigurationToSubmission() throws {
         let metadata = makeMetadata(
+            bitDepth: 10,
+            range: .unknown,
+            matrix: .unknown,
+            transfer: .hlg,
+            primaries: .unknown,
             cleanAperture: CGRect(x: 2, y: 1, width: 1_916, height: 1_078),
             chromaLocation: .init(topField: "left", bottomField: "center"),
             hdrStaticMetadata: .init(
@@ -456,6 +461,8 @@ final class MetalVideoRendererTests: XCTestCase {
             chromaLocation: metadata.chromaLocation,
             hdrStaticMetadata: metadata.hdrStaticMetadata
         ))
+        XCTAssertEqual(harness.submitter.jobs.first?.uniforms.transferKind, 3)
+        XCTAssertEqual(harness.submitter.jobs.first?.uniforms.applyGamutTransform, 0)
     }
 
     func testProductionShaderBundleIsPlaybackFrameworkInsteadOfHostApplication() {
@@ -601,8 +608,8 @@ final class MetalVideoRendererTests: XCTestCase {
             renderer: renderer,
             device: device,
             lifecycle: .init(
-                add: { recorder.operations.append("add:\($1.rawValue)") },
-                remove: { recorder.operations.append("remove:\($1.rawValue)") },
+                add: { recorder.operations.append("add:\($2.rawValue)") },
+                remove: { recorder.operations.append("remove:\($2.rawValue)") },
                 invalidate: { _ in recorder.operations.append("invalidate") }
             )
         )
