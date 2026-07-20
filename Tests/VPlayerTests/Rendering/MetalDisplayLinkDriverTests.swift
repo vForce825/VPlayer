@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import CoreMedia
+import Foundation
 import Metal
 import QuartzCore
 import XCTest
@@ -41,6 +42,38 @@ final class MetalDisplayLinkDriverTests: XCTestCase {
         XCTAssertTrue(harness.lifecycle.addedRunLoop === harness.lifecycle.removedRunLoop)
         XCTAssertTrue(harness.lifecycle.removeObservedPaused)
         XCTAssertTrue(harness.lifecycle.invalidateObservedDelegateNil)
+    }
+
+    func testNonMainRunLoopIsRejectedWithoutConsumingLaterMainStart() throws {
+        let backgroundRunLoop = try makeBackgroundRunLoop()
+        let harness = try makeHarness()
+        let drawable = try DriverDrawable(device: harness.device)
+        harness.driver.displayLink.isPaused = true
+        XCTAssertTrue(backgroundRunLoop !== RunLoop.main)
+
+        harness.driver.start(runLoop: backgroundRunLoop)
+
+        XCTAssertTrue(harness.driver.displayLink.isPaused)
+        XCTAssertTrue(harness.lifecycle.operations.isEmpty)
+        XCTAssertNil(harness.lifecycle.addedRunLoop)
+        harness.driver.render(targetPresentationTimestamp: 1, drawable: drawable)
+        XCTAssertTrue(harness.order.values.isEmpty)
+
+        harness.driver.start(runLoop: .main)
+        XCTAssertFalse(harness.driver.displayLink.isPaused)
+        XCTAssertEqual(harness.lifecycle.operations, ["add:kCFRunLoopCommonModes"])
+        XCTAssertTrue(harness.lifecycle.addedRunLoop === RunLoop.main)
+
+        harness.driver.render(targetPresentationTimestamp: 2, drawable: drawable)
+        XCTAssertEqual(harness.order.values, ["clock", "draw"])
+
+        harness.driver.stop()
+        XCTAssertEqual(harness.lifecycle.operations, [
+            "add:kCFRunLoopCommonModes",
+            "remove:kCFRunLoopCommonModes",
+            "invalidate",
+        ])
+        XCTAssertTrue(harness.lifecycle.removedRunLoop === RunLoop.main)
     }
 
     func testStopBeforeStartIsTerminalWithoutRemovingAnUnscheduledLink() throws {
@@ -216,6 +249,19 @@ final class MetalDisplayLinkDriverTests: XCTestCase {
             factoryCount: { factoryCount }
         )
     }
+
+    private func makeBackgroundRunLoop() throws -> RunLoop {
+        let box = DriverRunLoopBox()
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            box.store(RunLoop.current)
+            ready.signal()
+        }
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        XCTAssertEqual(ready.wait(timeout: .now() + 2), .success)
+        return try XCTUnwrap(box.value)
+    }
 }
 
 @MainActor
@@ -267,6 +313,17 @@ private final class DriverOrderRecorder: @unchecked Sendable {
     private var stored: [String] = []
     var values: [String] { lock.withLock { stored } }
     func append(_ value: String) { lock.withLock { stored.append(value) } }
+}
+
+private final class DriverRunLoopBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: RunLoop?
+
+    var value: RunLoop? { lock.withLock { stored } }
+
+    func store(_ runLoop: RunLoop) {
+        lock.withLock { stored = runLoop }
+    }
 }
 
 private final class DriverClock: PlaybackClock {

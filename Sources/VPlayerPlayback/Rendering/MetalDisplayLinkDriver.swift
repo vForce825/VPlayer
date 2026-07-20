@@ -118,7 +118,7 @@ public final class MetalDisplayLinkDriver: NSObject {
     }
 
     public func start(runLoop: RunLoop = .main) {
-        guard !isStopped, !isStarted else { return }
+        guard runLoop === RunLoop.main, !isStopped, !isStarted else { return }
         isStarted = true
         teardownState.recordScheduledRunLoop(runLoop)
         displayLink.isPaused = false
