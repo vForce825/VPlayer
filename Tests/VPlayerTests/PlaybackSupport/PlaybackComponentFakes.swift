@@ -17,6 +17,7 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     private(set) var pauses: [(Bool, UInt64)] = []
     private(set) var stopCount = 0
     private(set) var completedStopCount = 0
+    private(set) var algorithms: [DeinterlaceAlgorithm] = []
     var stopAutomaticallyCompletes = true
     private var stopContinuation: CheckedContinuation<Void, Never>?
 
@@ -30,6 +31,10 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
 
     func setPaused(_ paused: Bool, readinessCycle: UInt64) {
         lock.withLock { pauses.append((paused, readinessCycle)) }
+    }
+
+    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
+        lock.withLock { algorithms.append(algorithm) }
     }
 
     func stop() async {
@@ -61,12 +66,20 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     func snapshot() -> (
         starts: [URL],
         pauses: [(Bool, UInt64)],
+        algorithms: [DeinterlaceAlgorithm],
         stopCount: Int,
         completedStopCount: Int,
         isStopWaiting: Bool
     ) {
         lock.withLock {
-            (starts, pauses, stopCount, completedStopCount, stopContinuation != nil)
+            (
+                starts,
+                pauses,
+                algorithms,
+                stopCount,
+                completedStopCount,
+                stopContinuation != nil
+            )
         }
     }
 }
@@ -75,17 +88,20 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     private let lock = NSLock()
     private var queued: [FakeControllerPipeline]
     private var makeCount = 0
+    private var selectedAlgorithms: [DeinterlaceAlgorithm] = []
 
     init(_ pipelines: [FakeControllerPipeline]) {
         queued = pipelines
     }
 
     func makePipeline(
+        selectedAlgorithm: DeinterlaceAlgorithm,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
         try lock.withLock {
             guard !queued.isEmpty else { throw PlaybackCoreError.demuxOpen(-99) }
             makeCount += 1
+            selectedAlgorithms.append(selectedAlgorithm)
             let pipeline = queued.removeFirst()
             pipeline.install(eventSink)
             return pipeline
@@ -93,6 +109,9 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     }
 
     var makeCountSnapshot: Int { lock.withLock { makeCount } }
+    var selectedAlgorithmsSnapshot: [DeinterlaceAlgorithm] {
+        lock.withLock { selectedAlgorithms }
+    }
 }
 
 final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
@@ -181,6 +200,46 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
 
     func snapshot() -> (resets: [MediaGeneration], metadata: [VideoParserMetadata]) {
         lock.withLock { (resetGenerations, submittedMetadata) }
+    }
+}
+
+final class FakePipelineYADIFProcessor: YADIFFrameProcessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var resetGenerations: [MediaGeneration] = []
+    private(set) var submittedOrders: [ResolvedFieldOrder] = []
+
+    func reset(to generation: MediaGeneration) {
+        lock.withLock { resetGenerations.append(generation) }
+    }
+
+    func submit(
+        normalized frame: NormalizedDecodedFrame,
+        order: ResolvedFieldOrder,
+        discontinuity _: Bool,
+        completion: @escaping @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    ) {
+        lock.withLock { submittedOrders.append(order) }
+        completion(.success([
+            VideoPresentationFrame(
+                storage: .pixelBuffer(frame.frame.pixelBuffer),
+                presentationTimeStamp: frame.presentationTimeStamp,
+                duration: frame.fieldDuration,
+                generation: frame.frame.generation,
+                sequenceNumber: frame.frame.accessUnitID,
+                sourceAccessUnitID: frame.frame.accessUnitID,
+                formatMetadata: frame.frame.formatMetadata
+            ),
+        ]))
+    }
+
+    func drain(
+        completion: @escaping @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    ) {
+        completion(.success([]))
     }
 }
 
@@ -598,13 +657,26 @@ enum PlaybackFakeMedia {
         guard status == kCVReturnSuccess, let pixelBuffer else {
             throw PlaybackCoreError.videoDecode(status)
         }
+        let sourcePTS90k = pts.isNumeric
+            ? UInt64(max(
+                0,
+                CMTimeConvertScale(pts, timescale: 90_000, method: .default).value
+            ))
+            : nil
         return DecodedVideoFrame(
             accessUnitID: id,
             pixelBuffer: pixelBuffer,
             presentationTimeStamp: pts,
             duration: CMTime(value: 1, timescale: 25),
             generation: generation,
-            parserMetadata: parserMetadata(interlaced: interlaced),
+            parserMetadata: VideoParserMetadata(
+                fieldOrder: interlaced ? .tb : .progressive,
+                pictureStructure: .frame,
+                isInterlaced: interlaced,
+                repeatFirstField: false,
+                topFieldFirst: interlaced,
+                sourcePTS90k: sourcePTS90k
+            ),
             formatMetadata: VideoFormatMetadata(
                 dimensions: CMVideoDimensions(width: 16, height: 16),
                 bitDepth: 8,

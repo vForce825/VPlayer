@@ -141,11 +141,72 @@ final class ScanTypeClassifierTests: XCTestCase {
         )
 
         for _ in 0..<11 { XCTAssertNil(sut.observe(sample)) }
-        XCTAssertNil(sut.observe(observation(fieldCount: 2)))
+        XCTAssertNil(sut.observe(observation(
+            fieldCount: 2,
+            probe: probe(comb: 0.04, motion: 0.08)
+        )))
         for _ in 0..<11 { XCTAssertNil(sut.observe(sample)) }
         XCTAssertEqual(
             sut.observe(sample)?.current,
             .progressiveSegmentedFrame(order(.bottom, confidence: .signaled, source: .pixelBuffer))
+        )
+    }
+
+    func testAsyncPsFStreakSurvivesBaseObservationsAndExplicitMissResetsIt() {
+        let configuration = ScanClassifierConfiguration(
+            progressiveConfirmationFrames: 8,
+            psfConfirmationFrames: 3,
+            exitInterlacedConfirmationFrames: 12
+        )
+        let base = observation(fieldOrder: .tt, isInterlaced: true)
+        let lowComb = observation(
+            fieldOrder: .tt,
+            isInterlaced: true,
+            probe: probe(comb: 0.01, motion: 0.08)
+        )
+        let nonqualifying = observation(
+            fieldOrder: .tt,
+            isInterlaced: true,
+            probe: probe(comb: 0.04, motion: 0.08)
+        )
+
+        var uninterrupted = ScanTypeClassifier(
+            generation: generation,
+            configuration: configuration
+        )
+        for _ in 0..<2 {
+            XCTAssertNil(uninterrupted.observe(base))
+            XCTAssertNil(uninterrupted.observeSupplementalProbe(lowComb))
+        }
+        XCTAssertNil(uninterrupted.observe(base))
+        XCTAssertEqual(
+            uninterrupted.observeSupplementalProbe(lowComb)?.current,
+            .progressiveSegmentedFrame(
+                order(.top, confidence: .signaled, source: .parser)
+            )
+        )
+
+        var interrupted = ScanTypeClassifier(
+            generation: generation,
+            configuration: configuration
+        )
+        for _ in 0..<2 {
+            XCTAssertNil(interrupted.observe(base))
+            XCTAssertNil(interrupted.observeSupplementalProbe(lowComb))
+        }
+        XCTAssertNil(interrupted.observe(base))
+        XCTAssertNil(interrupted.observeSupplementalProbe(nonqualifying))
+        for _ in 0..<2 {
+            XCTAssertNil(interrupted.observe(base))
+            XCTAssertNil(interrupted.observeSupplementalProbe(lowComb))
+        }
+        XCTAssertEqual(interrupted.current, .unknown)
+        XCTAssertNil(interrupted.observe(base))
+        XCTAssertEqual(
+            interrupted.observeSupplementalProbe(lowComb)?.current,
+            .progressiveSegmentedFrame(
+                order(.top, confidence: .signaled, source: .parser)
+            )
         )
     }
 

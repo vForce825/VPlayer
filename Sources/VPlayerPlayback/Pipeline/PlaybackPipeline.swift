@@ -4,12 +4,14 @@
 
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import Foundation
 import Metal
 import VideoToolbox
 
 enum PlaybackPipelineEvent: Sendable, Equatable {
     case ready(readinessCycle: UInt64)
+    case notice(PlaybackNotice)
     case stopped
     case failed(PlaybackCoreError)
 }
@@ -17,11 +19,13 @@ enum PlaybackPipelineEvent: Sendable, Equatable {
 protocol PlaybackPipelineProtocol: AnyObject, Sendable {
     func start(url: URL)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
+    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm)
     func stop() async
 }
 
 protocol PlaybackPipelineFactory: Sendable {
     func makePipeline(
+        selectedAlgorithm: DeinterlaceAlgorithm,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol
 }
@@ -108,6 +112,9 @@ struct PlaybackPipelineSnapshot: Sendable {
     let isPaused: Bool
     let deferredPacketCount: Int
     let isTerminal: Bool
+    let requiredVideoFrameCount: Int
+    let mediaAdmissionOpen: Bool
+    let videoAdmissionOpen: Bool
 }
 
 final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
@@ -130,13 +137,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private let executor: PlaybackSerialExecutor
     private let demuxer: any MediaDemuxing
     private let assemblerBuilder: any PlaybackAssemblerBuilding
-    private let decoder: any VideoDecoding
-    private let processor: any VideoFrameProcessing
     private let renderer: any PlaybackVideoRendering
     private let audio: any AudioRenderPipelineProtocol
     private let clock: any PlaybackClock
     private let display: any PlaybackDisplayControlling
     private let eventSink: @Sendable (PlaybackPipelineEvent) -> Void
+    private var videoCoordinator: VideoPipelineCoordinator!
 
     // Every property below is accessed exclusively from `executor`.
     private var generationController = GenerationController()
@@ -154,8 +160,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var videoFormat: CMVideoFormatDescription?
     private var audioFormat: CMAudioFormatDescription?
     private var audioCodec: AudioCodec?
-    private var decoderConfigured = false
-    private var waitingForRandomAccess = true
+    private var videoAdmissionOpen = false
     private var paused = false
     private var started = false
     private var terminal = false
@@ -178,6 +183,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assemblerBuilder: any PlaybackAssemblerBuilding,
         decoder: any VideoDecoding,
         processor: any VideoFrameProcessing,
+        yadifProcessor: any YADIFFrameProcessing,
+        scanProbe: (any LumaScanProbing)? = nil,
+        selectedAlgorithm: DeinterlaceAlgorithm = .appleTemporal,
+        rawReadinessRequirementOverride: Int? = nil,
         renderer: any PlaybackVideoRendering,
         audio: any AudioRenderPipelineProtocol,
         clock: any PlaybackClock,
@@ -187,13 +196,54 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         self.executor = executor
         self.demuxer = demuxer
         self.assemblerBuilder = assemblerBuilder
-        self.decoder = decoder
-        self.processor = processor
         self.renderer = renderer
         self.audio = audio
         self.clock = clock
         self.display = display
         self.eventSink = eventSink
+        videoCoordinator = VideoPipelineCoordinator(
+            decoder: decoder,
+            passthrough: processor,
+            yadif: yadifProcessor,
+            probe: scanProbe,
+            initialGeneration: generationController.current,
+            selectedAlgorithm: selectedAlgorithm,
+            rawReadinessRequirementOverride: rawReadinessRequirementOverride,
+            hooks: VideoPipelineCoordinatorHooks(
+                closeAdmission: { [weak self] in self?.closeCoordinatorAdmissionIsolated() },
+                advanceGeneration: { [weak self] in
+                    self?.advanceCoordinatorGenerationIsolated()
+                        ?? MediaGeneration(rawValue: 0)
+                },
+                resetPlayback: { [weak self] generation, requiredCount in
+                    self?.resetCoordinatorPlaybackIsolated(
+                        to: generation,
+                        requiredVideoFrameCount: requiredCount
+                    )
+                },
+                reopenAdmission: { [weak self] in self?.reopenCoordinatorAdmissionIsolated() },
+                routeDidChange: { [weak self] requiredCount in
+                    self?.coordinatorRouteDidChangeIsolated(
+                        requiredVideoFrameCount: requiredCount
+                    )
+                },
+                deliver: { [weak self] frames, generation in
+                    self?.handleProcessedFrames(.success(frames), generation: generation)
+                },
+                notice: { [weak self] notice, generation in
+                    guard let self,
+                          generationController.accepts(generation),
+                          !terminal else { return }
+                    eventSink(.notice(notice))
+                },
+                fail: { [weak self] failure, generation in
+                    guard let self,
+                          generationController.accepts(generation) else { return }
+                    failIsolated(failure)
+                },
+                schedule: { [weak self] operation in self?.executor.submit(operation) }
+            )
+        )
     }
 
     func start(url: URL) {
@@ -203,6 +253,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     func setPaused(_ paused: Bool, readinessCycle: UInt64) {
         executor.submit { [weak self] in
             self?.setPausedIsolated(paused, readinessCycle: readinessCycle)
+        }
+    }
+
+    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
+        executor.submit { [weak self] in
+            guard let self, !terminal else { return }
+            videoCoordinator.setAlgorithm(algorithm)
         }
     }
 
@@ -270,7 +327,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                         hasTracks: false,
                         isPaused: false,
                         deferredPacketCount: 0,
-                        isTerminal: true
+                        isTerminal: true,
+                        requiredVideoFrameCount: 1,
+                        mediaAdmissionOpen: false,
+                        videoAdmissionOpen: false
                     ))
                     return
                 }
@@ -280,7 +340,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                     hasTracks: tracks != nil,
                     isPaused: paused,
                     deferredPacketCount: deferredPackets.count,
-                    isTerminal: terminal
+                    isTerminal: terminal,
+                    requiredVideoFrameCount: videoCoordinator.requiredVideoFrameCount,
+                    mediaAdmissionOpen: mediaAdmissionOpen,
+                    videoAdmissionOpen: videoAdmissionOpen
                 ))
             }
         }
@@ -327,7 +390,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         readiness = PlaybackReadinessGate(clock: clock, prepareAnchorVeto: { [weak self] commonPTS in
             self?.prepareAnchorIsolated(commonPTS: commonPTS) == true
         })
-        readiness?.configure(requiredVideoFrameCount: processor.requiredInputFrameCount)
+        readiness?.configure(requiredVideoFrameCount: videoCoordinator.requiredVideoFrameCount)
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
             failIsolated(.unsupportedProtocol(scheme))
@@ -450,6 +513,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         beginTrackEpochIsolated()
         if discontinuity {
             try forceAdvanceGenerationIsolated()
+            guard !terminal else { return }
             trackEpochAlreadyAdvanced = true
         }
         try videoAssembler?.reset(for: newTracks)
@@ -478,13 +542,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 freshVideoFormatArrived = true
                 try consumeCanonicalFingerprintIsolated(latestEventFingerprint: fingerprint)
             case let .accessUnit(accessUnit):
-                guard mediaAdmissionOpen else { return }
+                guard mediaAdmissionOpen, videoAdmissionOpen else { return }
                 guard generationController.accepts(accessUnit.generation) else { return }
-                if waitingForRandomAccess {
-                    guard accessUnit.isRandomAccess else { return }
-                    waitingForRandomAccess = false
-                }
-                try decoder.decode(accessUnit, flags: ._EnableAsynchronousDecompression)
+                videoCoordinator.handle(accessUnit: accessUnit)
             }
         } catch let error as VideoDecoderFailure {
             failIsolated(Self.coreError(for: error))
@@ -526,20 +586,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func handle(decoder event: VideoDecoderEvent) {
         assertIsolated()
         guard !terminal else { return }
-        switch event {
-        case let .frame(frame):
-            guard mediaAdmissionOpen else { return }
-            guard generationController.accepts(frame.generation) else { return }
-            processor.submit(frame) { [weak self] result in
-                self?.submitOrRun { [weak self] in
-                    self?.handleProcessedFrames(result, generation: frame.generation)
-                }
-            }
-        case let .recoverableFailure(failure, generation),
-             let .fatalFailure(failure, generation):
-            guard generationController.accepts(generation) else { return }
-            failIsolated(Self.coreError(for: failure))
-        }
+        videoCoordinator.handle(decoder: event)
     }
 
     private func handleProcessedFrames(
@@ -583,18 +630,19 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             if trackEpochAlreadyAdvanced {
                 try configureCurrentGenerationIsolated()
             } else {
-                let next = generationController.forceAdvance()
-                try rebuildForGenerationIsolated(next)
+                try rebuildForCurrentFormatsIsolated()
             }
+            guard !terminal else { return }
             awaitingFreshTrackEpoch = false
             trackEpochAlreadyAdvanced = false
             mediaAdmissionOpen = true
+            videoAdmissionOpen = true
             return
         }
         guard consumedFingerprint != fingerprint else { return }
         consumedFingerprint = fingerprint
-        let next = generationController.forceAdvance()
-        try rebuildForGenerationIsolated(next)
+        try rebuildForCurrentFormatsIsolated()
+        guard !terminal else { return }
     }
 
     private func beginTrackEpochIsolated() {
@@ -603,11 +651,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         freshVideoFormatArrived = false
         freshAudioFormatArrived = false
         mediaAdmissionOpen = false
+        videoAdmissionOpen = false
         videoFormat = nil
         audioFormat = nil
         audioCodec = nil
         trackEpochAlreadyAdvanced = false
-        waitingForRandomAccess = true
         readyPublished = false
         readiness?.close(.discontinuity)
         display.pauseSubmission()
@@ -617,45 +665,78 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         guard let videoFormat, let audioFormat, let audioCodec else { return }
         let generation = generationController.current
-        try decoder.configure(
-            format: videoFormat,
-            generation: generation,
-            configuration: .bothFields
-        )
-        decoderConfigured = true
+        videoCoordinator.installFormatForCurrentGeneration(videoFormat)
         try audio.configure(format: audioFormat, codec: audioCodec, generation: generation)
         mediaAdmissionOpen = true
+        videoAdmissionOpen = true
     }
 
     private func forceAdvanceGenerationIsolated() throws {
         assertIsolated()
-        let next = generationController.forceAdvance()
-        try rebuildForGenerationIsolated(next)
+        videoCoordinator.beginDiscontinuity()
+        guard !terminal else { return }
+        mediaAdmissionOpen = false
+        videoAdmissionOpen = false
     }
 
-    private func rebuildForGenerationIsolated(_ generation: MediaGeneration) throws {
+    private func rebuildForCurrentFormatsIsolated() throws {
+        assertIsolated()
+        guard let videoFormat, let audioFormat, let audioCodec else { return }
+        videoCoordinator.replaceFormat(videoFormat)
+        guard !terminal else { return }
+        let generation = generationController.current
+        try audio.configure(format: audioFormat, codec: audioCodec, generation: generation)
+        guard !terminal else { return }
+        mediaAdmissionOpen = true
+        videoAdmissionOpen = true
+    }
+
+    private func closeCoordinatorAdmissionIsolated() {
+        assertIsolated()
+        mediaAdmissionOpen = false
+        videoAdmissionOpen = false
+    }
+
+    private func advanceCoordinatorGenerationIsolated() -> MediaGeneration {
+        assertIsolated()
+        return generationController.forceAdvance()
+    }
+
+    private func resetCoordinatorPlaybackIsolated(
+        to generation: MediaGeneration,
+        requiredVideoFrameCount: Int
+    ) {
         assertIsolated()
         clock.pause()
         readiness?.close(.discontinuity)
+        readiness?.configure(requiredVideoFrameCount: requiredVideoFrameCount)
         readyPublished = false
-        mediaAdmissionOpen = false
-        waitingForRandomAccess = true
-
-        if decoderConfigured {
-            try decoder.finishDelayedFrames()
-            try decoder.waitForAsynchronousFrames()
-        }
-
+        releasePendingAdmissionIsolated()
+        preparedAnchor = nil
+        anchorPreparationInProgress = false
         retainedAudio.removeAll(keepingCapacity: true)
         retainedVideo.removeAll(keepingCapacity: true)
         deferredPackets.removeAll(keepingCapacity: true)
-        processor.reset(to: generation)
         renderer.flush(to: generation)
         audio.flush(to: generation)
-        decoder.invalidate()
-        decoderConfigured = false
+        display.pauseSubmission()
+    }
 
-        try configureCurrentGenerationIsolated()
+    private func reopenCoordinatorAdmissionIsolated() {
+        assertIsolated()
+        mediaAdmissionOpen = true
+        videoAdmissionOpen = true
+    }
+
+    private func coordinatorRouteDidChangeIsolated(requiredVideoFrameCount: Int) {
+        assertIsolated()
+        readiness?.close(.buffering)
+        readiness?.configure(requiredVideoFrameCount: requiredVideoFrameCount)
+        readyPublished = false
+        preparedAnchor = nil
+        retainedVideo.removeAll(keepingCapacity: true)
+        renderer.flush(to: generationController.current)
+        display.pauseSubmission()
     }
 
     private func setPausedIsolated(_ shouldPause: Bool, readinessCycle: UInt64) {
@@ -830,7 +911,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 && CMTimeCompare(end, commonPTS) > 0
                 && CMTimeCompare(frame.presentationTimeStamp, audioEnd) < 0
         }.count
-        return overlappingVideoCount >= processor.requiredInputFrameCount
+        return overlappingVideoCount >= videoCoordinator.requiredVideoFrameCount
     }
 
     private func stopIsolated(
@@ -862,11 +943,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         // tail in one component must not skip later waits or invalidation.
         do { try videoAssembler?.drain() } catch {}
         do { try audioAssembler?.drain() } catch {}
-        do { try decoder.finishDelayedFrames() } catch {}
-        do { try decoder.waitForAsynchronousFrames() } catch {}
-        decoder.invalidate()
+        videoCoordinator.stop(emergency: false)
         let generation = generationController.current
-        processor.reset(to: generation)
         renderer.flush(to: generation)
         audio.flush(to: generation)
         readiness?.close(.flush)
@@ -896,19 +974,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         guard !terminal else { return }
         terminal = true
-        let generation = generationController.forceAdvance()
         demuxer.cancel()
         releasePendingAdmissionIsolated()
-        deferredPackets.removeAll(keepingCapacity: false)
-        retainedAudio.removeAll(keepingCapacity: false)
-        retainedVideo.removeAll(keepingCapacity: false)
-        clock.pause()
-        readiness?.close(.flush)
-        processor.reset(to: generation)
-        renderer.flush(to: generation)
-        audio.flush(to: generation)
+        videoCoordinator.stop(emergency: true)
         audio.stop()
-        decoder.invalidate()
         display.pauseSubmission()
         display.clearDisplayCriteria()
         eventSink(.failed(error))
@@ -947,6 +1016,7 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
 
 struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
     func makePipeline(
+        selectedAlgorithm: DeinterlaceAlgorithm,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
         let executor = PlaybackSerialExecutor()
@@ -958,6 +1028,37 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let decoder = VideoToolboxDecoder(executor: executor) { relay.decoder($0) }
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw PlaybackCoreError.metalCommand("device.unavailable")
+        }
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw PlaybackCoreError.metalCommand("command-queue.unavailable")
+        }
+        var textureCache: CVMetalTextureCache?
+        let cacheStatus = CVMetalTextureCacheCreate(
+            nil,
+            nil,
+            device,
+            nil,
+            &textureCache
+        )
+        guard cacheStatus == kCVReturnSuccess, let textureCache else {
+            throw PlaybackCoreError.metalCommand("texture-cache.\(cacheStatus)")
+        }
+        let yadif: YADIFProcessor
+        do {
+            yadif = try YADIFProcessor(
+                device: device,
+                commandQueue: commandQueue,
+                textureCache: textureCache,
+                clock: clock
+            )
+        } catch {
+            throw PlaybackCoreError.metalCommand("yadif.setup")
+        }
+        let probe: LumaScanProbe
+        do {
+            probe = try LumaScanProbe(commandQueue: commandQueue, maximumFrames: 12)
+        } catch {
+            throw PlaybackCoreError.metalCommand("scan-probe.setup")
         }
         let renderer = try MetalVideoRenderer(
             device: device,
@@ -977,6 +1078,9 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             assemblerBuilder: SystemPlaybackAssemblerBuilder(),
             decoder: decoder,
             processor: PassthroughVideoProcessor(),
+            yadifProcessor: yadif,
+            scanProbe: probe,
+            selectedAlgorithm: selectedAlgorithm,
             renderer: renderer,
             audio: audio,
             clock: clock,

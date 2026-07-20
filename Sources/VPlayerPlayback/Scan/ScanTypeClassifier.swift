@@ -110,6 +110,13 @@ public struct ScanTypeClassifier: Sendable {
             return applyRefinement(refinementOrder)
         }
 
+        // A probe for this field-signalled frame may arrive asynchronously. Keep the
+        // prior PsF streak intact until that supplemental evidence is observed.
+        if fieldSignalled, probe == nil {
+            progressiveStreak = 0
+            return applyRefinement(refinementOrder)
+        }
+
         psfStreak = 0
 
         if isTrustedParserProgressive(observation) {
@@ -128,9 +135,65 @@ public struct ScanTypeClassifier: Sendable {
         return applyRefinement(refinementOrder)
     }
 
+    /// Applies asynchronous luma evidence for a frame whose parser/field evidence was
+    /// already observed. This intentionally does not advance progressive streaks twice.
+    public mutating func observeSupplementalProbe(
+        _ observation: ScanObservation
+    ) -> ScanClassificationChange? {
+        guard observation.generation == generation,
+              let probe = validProbe(observation.probe) else { return nil }
+
+        let orderEvidence = explicitOrder(in: observation)
+        if probe.combRatio >= configuration.combThreshold,
+           probe.motionRatio >= configuration.motionThreshold {
+            clearStreaks()
+            return transition(to: .interlaced(interlaceOrder(from: orderEvidence)))
+        }
+
+        let refinementOrder: ResolvedFieldOrder?
+        if case let .interlaced(existingOrder) = current,
+           existingOrder.confidence == .assumed,
+           case let .agree(explicitOrder) = orderEvidence,
+           explicitOrder.confidence != .assumed {
+            refinementOrder = explicitOrder
+        } else {
+            refinementOrder = nil
+        }
+
+        if hasFieldSignalling(observation),
+           probe.motionRatio >= configuration.motionThreshold,
+           probe.combRatio <= configuration.psfMaximumCombRatio {
+            progressiveStreak = 0
+            psfStreak = increment(psfStreak, toward: psfThreshold)
+            if psfStreak == psfThreshold,
+               !isConfirmedInterlaced,
+               !isConfirmedPsF {
+                let order: ResolvedFieldOrder?
+                if case let .agree(explicitOrder) = orderEvidence {
+                    order = explicitOrder
+                } else {
+                    order = nil
+                }
+                return transition(to: .progressiveSegmentedFrame(order))
+            }
+            return applyRefinement(refinementOrder)
+        }
+        psfStreak = 0
+        return applyRefinement(refinementOrder)
+    }
+
     public mutating func reset(generation: MediaGeneration) {
         self.generation = generation
         current = .unknown
+        clearStreaks()
+    }
+
+    /// Moves confirmed scan evidence to a format-preserving playback generation.
+    /// Decoder-mode changes do not invalidate the coded stream's scan classification.
+    public mutating func rebasePreservingClassification(
+        generation: MediaGeneration
+    ) {
+        self.generation = generation
         clearStreaks()
     }
 

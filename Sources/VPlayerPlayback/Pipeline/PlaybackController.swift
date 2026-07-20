@@ -74,7 +74,7 @@ public actor PlaybackController: PlaybackEngine {
         pendingTeardown = nil
 
         do {
-            let next = try factory.makePipeline { [weak self] event in
+            let next = try factory.makePipeline(selectedAlgorithm: selectedAlgorithm) { [weak self] event in
                 Task { await self?.receive(event, sessionID: id) }
             }
             pipeline = next
@@ -126,6 +126,7 @@ public actor PlaybackController: PlaybackEngine {
 
     public func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async {
         selectedAlgorithm = algorithm
+        pipeline?.setDeinterlaceAlgorithm(algorithm)
     }
 
     var currentStateForTesting: PlaybackState { state }
@@ -174,6 +175,10 @@ public actor PlaybackController: PlaybackEngine {
                   !userPaused,
                   eventCycle == readinessCycle else { return }
             publish(.playing(request))
+        case let .notice(notice):
+            for continuation in noticeContinuations.values {
+                _ = continuation.yield(notice)
+            }
         case .stopped:
             pipeline = nil
             request = nil

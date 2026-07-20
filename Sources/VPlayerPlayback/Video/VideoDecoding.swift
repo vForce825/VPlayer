@@ -127,6 +127,11 @@ public enum VideoDecoderFailure: Error, Sendable, Equatable {
     case badData(OSStatus)
     case malfunction(OSStatus)
     case temporalUnavailable(AppleTemporalFailure)
+
+    public var isTemporalUnavailable: Bool {
+        if case .temporalUnavailable = self { return true }
+        return false
+    }
 }
 
 public enum VideoDecoderEvent: @unchecked Sendable {
