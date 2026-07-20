@@ -43,6 +43,7 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
         let operations: [String]
         let creates: [CreateRecord]
         let sets: [PropertyRecord]
+        let supportedPropertyQueries: [VTSessionID]
         let copies: [CopyRecord]
         let decodes: [DecodeRecord]
         let finishedSessionIDs: [VTSessionID]
@@ -70,6 +71,7 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
     private var nextSessionRawValue: UInt64 = 1
     private var createScripts: [CreateScript] = []
     private var setStatuses: [OSStatus] = []
+    private var supportedPropertySnapshots: [VTSupportedPropertySnapshot] = []
     private var copyResults: [VTPropertyCopyResult] = []
     private var decodeStatuses: [OSStatus] = []
     private var finishStatuses: [OSStatus] = []
@@ -77,6 +79,7 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
     private var operations: [String] = []
     private var creates: [CreateRecord] = []
     private var sets: [PropertyRecord] = []
+    private var supportedPropertyQueries: [VTSessionID] = []
     private var copies: [CopyRecord] = []
     private var decodes: [DecodeRecord] = []
     private var finishedSessionIDs: [VTSessionID] = []
@@ -90,6 +93,10 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
 
     func enqueueSetStatus(_ status: OSStatus) {
         withLock { setStatuses.append(status) }
+    }
+
+    func enqueueSupportedPropertySnapshot(_ snapshot: VTSupportedPropertySnapshot) {
+        withLock { supportedPropertySnapshots.append(snapshot) }
     }
 
     func enqueueCopyResult(_ result: VTPropertyCopyResult) {
@@ -114,6 +121,7 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
                 operations: operations,
                 creates: creates,
                 sets: sets,
+                supportedPropertyQueries: supportedPropertyQueries,
                 copies: copies,
                 decodes: decodes,
                 finishedSessionIDs: finishedSessionIDs,
@@ -174,6 +182,24 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
             operations.append("set")
             sets.append(PropertyRecord(sessionID: session.id, key: key, value: value))
             return setStatuses.isEmpty ? noErr : setStatuses.removeFirst()
+        }
+    }
+
+    func copySupportedPropertySnapshot(
+        _ session: any VideoToolboxSession
+    ) -> VTSupportedPropertySnapshot {
+        withLock {
+            operations.append("supported")
+            supportedPropertyQueries.append(session.id)
+            return supportedPropertySnapshots.isEmpty
+                ? VTSupportedPropertySnapshot(
+                    status: noErr,
+                    supportedPropertyKeys: [
+                        kVTDecompressionPropertyKey_FieldMode as String,
+                        kVTDecompressionPropertyKey_DeinterlaceMode as String,
+                    ]
+                )
+                : supportedPropertySnapshots.removeFirst()
         }
     }
 

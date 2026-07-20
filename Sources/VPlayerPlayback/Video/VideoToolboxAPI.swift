@@ -73,6 +73,11 @@ struct VTPropertyCopyResult: Sendable, Equatable {
     let value: VTPropertyValue?
 }
 
+struct VTSupportedPropertySnapshot: Sendable, Equatable {
+    let status: OSStatus
+    let supportedPropertyKeys: Set<String>?
+}
+
 struct VTDecodeOutput: @unchecked Sendable {
     let status: OSStatus
     let infoFlags: VTDecodeInfoFlags
@@ -81,17 +86,23 @@ struct VTDecodeOutput: @unchecked Sendable {
     let duration: CMTime
 }
 
-protocol VideoToolboxAPI: AnyObject {
-    func createSession(
-        format: CMVideoFormatDescription,
-        decoderSpecification: [String: VTPropertyValue],
-        imageBufferAttributes: [String: VTPropertyValue]
-    ) -> (status: OSStatus, session: (any VideoToolboxSession)?)
+protocol VTSessionPropertyAPI: AnyObject {
+    func copySupportedPropertySnapshot(
+        _ session: any VideoToolboxSession
+    ) -> VTSupportedPropertySnapshot
     func setProperty(
         _ session: any VideoToolboxSession,
         key: String,
         value: VTPropertyValue
     ) -> OSStatus
+}
+
+protocol VideoToolboxAPI: AnyObject, VTSessionPropertyAPI {
+    func createSession(
+        format: CMVideoFormatDescription,
+        decoderSpecification: [String: VTPropertyValue],
+        imageBufferAttributes: [String: VTPropertyValue]
+    ) -> (status: OSStatus, session: (any VideoToolboxSession)?)
     func copyProperty(
         _ session: any VideoToolboxSession,
         key: String
@@ -174,6 +185,32 @@ final class SystemVideoToolboxAPI: VideoToolboxAPI {
             session.rawSession,
             key: key as CFString,
             value: object as CFTypeRef
+        )
+    }
+
+    func copySupportedPropertySnapshot(
+        _ session: any VideoToolboxSession
+    ) -> VTSupportedPropertySnapshot {
+        guard let session = session as? SystemVideoToolboxSession else {
+            return VTSupportedPropertySnapshot(
+                status: kVTInvalidSessionErr,
+                supportedPropertyKeys: nil
+            )
+        }
+        var copiedDictionary: CFDictionary?
+        let status = VTSessionCopySupportedPropertyDictionary(
+            session.rawSession,
+            supportedPropertyDictionaryOut: &copiedDictionary
+        )
+        let copiedKeys: Set<String>? = copiedDictionary.map { dictionary in
+            Set<String>((dictionary as NSDictionary).allKeys.compactMap { rawKey in
+                guard let key = rawKey as? String else { return nil }
+                return String(key)
+            })
+        }
+        return VTSupportedPropertySnapshot(
+            status: status,
+            supportedPropertyKeys: copiedKeys
         )
     }
 

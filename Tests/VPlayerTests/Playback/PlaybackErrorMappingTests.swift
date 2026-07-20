@@ -37,5 +37,23 @@ final class PlaybackErrorMappingTests: XCTestCase {
         XCTAssertEqual(PlaybackPipeline.coreError(for: .softwareDecoder), .hardwareDecoderUnavailable)
         XCTAssertEqual(PlaybackPipeline.coreError(for: .badData(-8)), .videoDecode(-8))
         XCTAssertEqual(PlaybackPipeline.coreError(for: .malfunction(-9)), .videoDecode(-9))
+        XCTAssertEqual(
+            PlaybackPipeline.coreError(for: .temporalUnavailable(.unsupportedProperty("field"))),
+            .videoDecode(kVTPropertyNotSupportedErr)
+        )
+        XCTAssertEqual(
+            PlaybackPipeline.coreError(for: .temporalUnavailable(
+                .propertySetFailed(key: "field", status: -10)
+            )),
+            .videoDecode(-10)
+        )
+        XCTAssertEqual(
+            PlaybackPipeline.coreError(for: .temporalUnavailable(.initializationFailed(status: -11))),
+            .videoDecode(-11)
+        )
+        XCTAssertEqual(
+            PlaybackPipeline.coreError(for: .temporalUnavailable(.processingFailed(status: -12))),
+            .videoDecode(-12)
+        )
     }
 }

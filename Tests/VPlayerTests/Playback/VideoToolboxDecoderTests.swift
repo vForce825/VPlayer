@@ -41,6 +41,44 @@ final class VideoToolboxDecoderTests: XCTestCase {
         )])
     }
 
+    func testAppleTemporalConfigurationUsesExactCandidateOperationOrderAndProperties() throws {
+        let harness = makeHarness()
+
+        try configure(harness, generation: 3, configuration: .appleTemporal)
+
+        let snapshot = harness.api.snapshot
+        XCTAssertEqual(snapshot.operations, ["create", "supported", "set", "set", "copy"])
+        XCTAssertEqual(snapshot.creates.first?.decoderSpecification, [
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: .boolean(true),
+        ])
+        XCTAssertEqual(snapshot.creates.first?.imageBufferAttributes, [
+            kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
+            kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
+            kCVPixelBufferPixelFormatTypeKey as String: .array([
+                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+            ]),
+        ])
+        XCTAssertEqual(snapshot.supportedPropertyQueries, [VTSessionID(rawValue: 1)])
+        XCTAssertEqual(snapshot.sets, [
+            .init(
+                sessionID: VTSessionID(rawValue: 1),
+                key: kVTDecompressionPropertyKey_FieldMode as String,
+                value: .string(kVTDecompressionProperty_FieldMode_DeinterlaceFields as String)
+            ),
+            .init(
+                sessionID: VTSessionID(rawValue: 1),
+                key: kVTDecompressionPropertyKey_DeinterlaceMode as String,
+                value: .string(kVTDecompressionProperty_DeinterlaceMode_Temporal as String)
+            ),
+        ])
+        XCTAssertEqual(snapshot.copies, [.init(
+            sessionID: VTSessionID(rawValue: 1),
+            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder as String
+        )])
+    }
+
     func testUnsupportedCodecFailsBeforeAPIAndPreservesActiveSession() throws {
         let harness = makeHarness()
         try configure(harness, generation: 1)
@@ -132,13 +170,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 2))
     }
 
-    func testAppleTemporalHasZeroAPISideEffectsAndPreservesOldSession() throws {
+    func testUnsupportedAppleCodecFailsBeforeAPISideEffectsAndPreservesOldSession() throws {
         let harness = makeHarness()
         try configure(harness, generation: 4)
         let before = harness.api.snapshot
-        let replacementFormat = try makeFormat(codec: kCMVideoCodecType_HEVC)
+        let replacementFormat = try makeFormat(codec: kCMVideoCodecType_JPEG)
 
-        assertFailure(.unsupportedConfiguration(.appleTemporal)) {
+        assertFailure(.sessionCreate(kVTVideoDecoderUnsupportedDataFormatErr)) {
             try perform(on: harness.executor) {
                 try harness.decoder.configure(
                     format: replacementFormat,
@@ -155,17 +193,213 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
     }
 
-    func testDecodeDropsStaleInputAndUsesExactAsyncFlagAndNilOptions() throws {
+    func testEveryTemporalInitializationFailureInvalidatesOnlyCandidateAndPreservesOldSession() throws {
+        typealias Scenario = (
+            expected: AppleTemporalFailure,
+            arrange: (FakeVideoToolboxAPI) -> Void
+        )
+        let fieldModeKey = kVTDecompressionPropertyKey_FieldMode as String
+        let deinterlaceModeKey = kVTDecompressionPropertyKey_DeinterlaceMode as String
+        let queryStatus: OSStatus = -21_001
+        let firstSetStatus: OSStatus = -21_002
+        let secondSetStatus: OSStatus = -21_003
+        let scenarios: [Scenario] = [
+            (
+                .initializationFailed(status: queryStatus),
+                { $0.enqueueSupportedPropertySnapshot(.init(
+                    status: queryStatus,
+                    supportedPropertyKeys: [fieldModeKey, deinterlaceModeKey]
+                )) }
+            ),
+            (
+                .initializationFailed(status: kVTParameterErr),
+                { $0.enqueueSupportedPropertySnapshot(.init(
+                    status: noErr,
+                    supportedPropertyKeys: nil
+                )) }
+            ),
+            (
+                .unsupportedProperty(fieldModeKey),
+                { $0.enqueueSupportedPropertySnapshot(.init(
+                    status: noErr,
+                    supportedPropertyKeys: [deinterlaceModeKey]
+                )) }
+            ),
+            (
+                .unsupportedProperty(deinterlaceModeKey),
+                { $0.enqueueSupportedPropertySnapshot(.init(
+                    status: noErr,
+                    supportedPropertyKeys: [fieldModeKey]
+                )) }
+            ),
+            (
+                .propertySetFailed(key: fieldModeKey, status: firstSetStatus),
+                { $0.enqueueSetStatus(firstSetStatus) }
+            ),
+            (
+                .propertySetFailed(key: deinterlaceModeKey, status: secondSetStatus),
+                {
+                    $0.enqueueSetStatus(noErr)
+                    $0.enqueueSetStatus(secondSetStatus)
+                }
+            ),
+        ]
+
+        for scenario in scenarios {
+            let harness = makeHarness()
+            try configure(harness, generation: 7)
+            scenario.arrange(harness.api)
+
+            assertFailure(.temporalUnavailable(scenario.expected)) {
+                try configure(harness, generation: 8, configuration: .appleTemporal)
+            }
+
+            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 2)])
+            try decode(harness, id: 99, generation: 7)
+            XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
+        }
+    }
+
+    func testAppleBaseCreateAndHardwareFailuresRemainBaseFailuresAndPreserveOldSession() throws {
+        typealias Scenario = (
+            expected: VideoDecoderFailure,
+            arrange: (FakeVideoToolboxAPI) -> Void
+        )
+        let createStatus: OSStatus = -22_001
+        let copyStatus: OSStatus = -22_002
+        let scenarios: [Scenario] = [
+            (
+                .sessionCreate(createStatus),
+                { $0.enqueueCreate(.init(status: createStatus, returnsSession: true)) }
+            ),
+            (
+                .sessionCreate(copyStatus),
+                { $0.enqueueCopyResult(.init(status: copyStatus, value: nil)) }
+            ),
+            (
+                .softwareDecoder,
+                { $0.enqueueCopyResult(.init(status: noErr, value: .boolean(false))) }
+            ),
+        ]
+
+        for scenario in scenarios {
+            let harness = makeHarness()
+            try configure(harness, generation: 7)
+            scenario.arrange(harness.api)
+
+            assertFailure(scenario.expected) {
+                try configure(harness, generation: 8, configuration: .appleTemporal)
+            }
+
+            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 2)])
+            try decode(harness, id: 100, generation: 7)
+            XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
+        }
+    }
+
+    func testSuccessfulAppleCandidateSwapsThenInvalidatesOldSession() throws {
+        let harness = makeHarness()
+        try configure(harness, generation: 2)
+
+        try configure(harness, generation: 3, configuration: .appleTemporal)
+
+        XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
+        try decode(harness, id: 4, generation: 3)
+        XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 2))
+    }
+
+    func testBothFieldsDecodeDropsStaleInputAndPreservesCallerFlagsWithoutTemporalFlag() throws {
         let harness = makeHarness()
         try configure(harness, generation: 9)
+        let callerFlags = VTDecodeFrameFlags(
+            rawValue: 0x4000 | VTDecodeFrameFlags._EnableTemporalProcessing.rawValue
+        )
 
-        try decode(harness, id: 1, generation: 8)
+        try decode(harness, id: 1, generation: 8, flags: callerFlags)
         XCTAssertTrue(harness.api.snapshot.decodes.isEmpty)
 
-        try decode(harness, id: 2, generation: 9)
+        try decode(harness, id: 2, generation: 9, flags: callerFlags)
         XCTAssertEqual(harness.api.snapshot.decodes.count, 1)
-        XCTAssertEqual(harness.api.snapshot.decodes.first?.flagsRawValue, 1)
+        XCTAssertEqual(
+            harness.api.snapshot.decodes.first?.flagsRawValue,
+            0x4000 | VTDecodeFrameFlags._EnableAsynchronousDecompression.rawValue
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(harness.api.snapshot.decodes.first?.flagsRawValue)
+                & VTDecodeFrameFlags._EnableTemporalProcessing.rawValue,
+            0
+        )
         XCTAssertNil(harness.api.snapshot.decodes.first?.frameOptions)
+    }
+
+    func testAppleTemporalDecodePreservesCallerFlagsAndAddsAsyncAndTemporalFlags() throws {
+        let harness = makeHarness()
+        try configure(harness, generation: 9, configuration: .appleTemporal)
+        let callerFlags = VTDecodeFrameFlags(rawValue: 0x4000)
+
+        try decode(harness, id: 2, generation: 9, flags: callerFlags)
+
+        XCTAssertEqual(
+            harness.api.snapshot.decodes.first?.flagsRawValue,
+            callerFlags.rawValue
+                | VTDecodeFrameFlags._EnableAsynchronousDecompression.rawValue
+                | VTDecodeFrameFlags._EnableTemporalProcessing.rawValue
+        )
+        XCTAssertNil(harness.api.snapshot.decodes.first?.frameOptions)
+    }
+
+    func testAppleTemporalEmitsEveryOneTwoOrThreeCallbacksWithSourceIdentityAndOwnTiming() throws {
+        for callbackCount in 1 ... 3 {
+            let harness = makeHarness()
+            try configure(harness, generation: 5, configuration: .appleTemporal)
+            let metadata = parserMetadata(fieldOrder: .bb, sourcePTS90k: 450_000)
+            try decode(harness, id: 77, generation: 5, parserMetadata: metadata)
+            let pixelBuffer = try makePixelBuffer()
+
+            for callbackIndex in 0 ..< callbackCount {
+                harness.api.deliver(index: 0, output: output(
+                    imageBuffer: pixelBuffer,
+                    pts: CMTime(value: Int64(100 + callbackIndex), timescale: 60),
+                    duration: CMTime(value: Int64(callbackIndex + 1), timescale: 120)
+                ))
+            }
+            drain(harness.executor)
+
+            let frames = harness.events.frames
+            XCTAssertEqual(frames.count, callbackCount)
+            XCTAssertEqual(frames.map(\.accessUnitID), Array(repeating: 77, count: callbackCount))
+            XCTAssertEqual(
+                frames.map(\.generation),
+                Array(repeating: MediaGeneration(rawValue: 5), count: callbackCount)
+            )
+            XCTAssertEqual(frames.map(\.parserMetadata), Array(repeating: metadata, count: callbackCount))
+            XCTAssertEqual(
+                frames.map(\.presentationTimeStamp),
+                (0 ..< callbackCount).map {
+                    CMTime(value: Int64(100 + $0), timescale: 60)
+                }
+            )
+            XCTAssertEqual(
+                frames.map(\.duration),
+                (0 ..< callbackCount).map {
+                    CMTime(value: Int64($0 + 1), timescale: 120)
+                }
+            )
+        }
+    }
+
+    func testAppleTemporalStaleGenerationAndSessionCallbacksRemainSuppressed() throws {
+        let harness = makeHarness()
+        try configure(harness, generation: 3, configuration: .appleTemporal)
+        try decode(harness, id: 1, generation: 3)
+
+        try configure(harness, generation: 4, configuration: .appleTemporal)
+        harness.api.deliver(index: 0, output: output(
+            imageBuffer: try makePixelBuffer()
+        ))
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.events.events.isEmpty)
     }
 
     func testReverseCallbackDeliveryPreservesCompleteImmutableTokensAndCallbackTiming() throws {
@@ -294,6 +528,69 @@ final class VideoToolboxDecoderTests: XCTestCase {
             XCTAssertEqual(harness.events.failures.first?.failure, expectedFailure)
             XCTAssertEqual(harness.events.failures.first?.disposition, disposition)
             XCTAssertEqual(harness.events.failures.first?.generation, MediaGeneration(rawValue: 6))
+        }
+    }
+
+    func testAppleTemporalImmediateProcessingFailuresAreTemporalButDataFailuresStayBadData() throws {
+        let cases: [(OSStatus, VideoDecoderFailure)] = [
+            (kVTVideoDecoderBadDataErr, .badData(kVTVideoDecoderBadDataErr)),
+            (kVTVideoDecoderReferenceMissingErr, .badData(kVTVideoDecoderReferenceMissingErr)),
+            (
+                kVTVideoDecoderMalfunctionErr,
+                .temporalUnavailable(.processingFailed(status: kVTVideoDecoderMalfunctionErr))
+            ),
+            (-77_701, .temporalUnavailable(.processingFailed(status: -77_701))),
+        ]
+
+        for (status, expected) in cases {
+            let harness = makeHarness()
+            try configure(harness, generation: 1, configuration: .appleTemporal)
+            harness.api.enqueueDecodeStatus(status)
+
+            assertFailure(expected) { try decode(harness, id: 1, generation: 1) }
+
+            XCTAssertTrue(harness.events.events.isEmpty)
+        }
+    }
+
+    func testAppleTemporalCallbackProcessingFailuresAreRecoverableButDataFailuresStayBadData() throws {
+        let cases: [(OSStatus, VideoDecoderFailure)] = [
+            (kVTVideoDecoderBadDataErr, .badData(kVTVideoDecoderBadDataErr)),
+            (kVTVideoDecoderReferenceMissingErr, .badData(kVTVideoDecoderReferenceMissingErr)),
+            (
+                kVTVideoDecoderMalfunctionErr,
+                .temporalUnavailable(.processingFailed(status: kVTVideoDecoderMalfunctionErr))
+            ),
+            (-77_702, .temporalUnavailable(.processingFailed(status: -77_702))),
+        ]
+
+        for (status, expected) in cases {
+            let harness = makeHarness()
+            try configure(harness, generation: 6, configuration: .appleTemporal)
+            try decode(harness, id: 1, generation: 6)
+
+            harness.api.deliver(index: 0, output: output(status: status))
+            drain(harness.executor)
+
+            XCTAssertEqual(harness.events.failures, [FailureRecord(
+                failure: expected,
+                generation: MediaGeneration(rawValue: 6),
+                disposition: .recoverable
+            )])
+        }
+    }
+
+    func testAppleTemporalFinishAndWaitProcessingFailuresAreTemporalUnavailable() throws {
+        let harness = makeHarness()
+        try configure(harness, generation: 5, configuration: .appleTemporal)
+        harness.api.enqueueFinishStatus(-77_703)
+        harness.api.enqueueWaitStatus(-77_704)
+
+        assertFailure(.temporalUnavailable(.processingFailed(status: -77_703))) {
+            try perform(on: harness.executor) { try harness.decoder.finishDelayedFrames() }
+        }
+        assertFailure(.temporalUnavailable(.processingFailed(status: -77_704))) {
+            try perform(on: harness.executor) { try harness.decoder.waitForAsynchronousFrames() }
         }
     }
 
@@ -528,7 +825,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertNil(metadata.hdrStaticMetadata.contentLightLevelInfo)
     }
 
-    func testSourceGateScansOnlyExistingTask6ProductionFiles() throws {
+    func testSourceGateHasNoYADIFImplementation() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -548,8 +845,6 @@ final class VideoToolboxDecoderTests: XCTestCase {
         }
         let combined = existingSources.joined(separator: "\n")
 
-        XCTAssertFalse(combined.contains("Enable" + "TemporalProcessing"))
-        XCTAssertFalse(combined.contains("Deinterlace" + "Mode"))
         XCTAssertNil(combined.range(of: "ya" + "dif", options: .caseInsensitive))
     }
 
@@ -571,14 +866,15 @@ final class VideoToolboxDecoderTests: XCTestCase {
     private func configure(
         _ harness: DecoderHarness,
         generation: UInt64,
-        codec: CMVideoCodecType = kCMVideoCodecType_H264
+        codec: CMVideoCodecType = kCMVideoCodecType_H264,
+        configuration: VideoDecodeConfiguration = .bothFields
     ) throws {
         let format = try makeFormat(codec: codec)
         try perform(on: harness.executor) {
             try harness.decoder.configure(
                 format: format,
                 generation: MediaGeneration(rawValue: generation),
-                configuration: .bothFields
+                configuration: configuration
             )
         }
     }
@@ -594,7 +890,8 @@ final class VideoToolboxDecoderTests: XCTestCase {
             repeatFirstField: false,
             topFieldFirst: nil,
             sourcePTS90k: nil
-        )
+        ),
+        flags: VTDecodeFrameFlags = ._EnableAsynchronousDecompression
     ) throws {
         let format = try makeFormat(codec: kCMVideoCodecType_H264)
         let sampleBuffer = try SampleBufferBuilder.makeVideo(
@@ -613,7 +910,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
             parserMetadata: parserMetadata
         )
         try perform(on: harness.executor) {
-            try harness.decoder.decode(accessUnit, flags: ._EnableAsynchronousDecompression)
+            try harness.decoder.decode(accessUnit, flags: flags)
         }
     }
 

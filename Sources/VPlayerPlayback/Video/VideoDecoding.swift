@@ -113,12 +113,20 @@ public enum VideoDecodeConfiguration: Sendable, Equatable {
     case appleTemporal
 }
 
+public enum AppleTemporalFailure: Error, Equatable, Sendable {
+    case unsupportedProperty(String)
+    case propertySetFailed(key: String, status: OSStatus)
+    case initializationFailed(status: OSStatus)
+    case processingFailed(status: OSStatus)
+}
+
 public enum VideoDecoderFailure: Error, Sendable, Equatable {
     case unsupportedConfiguration(VideoDecodeConfiguration)
     case sessionCreate(OSStatus)
     case softwareDecoder
     case badData(OSStatus)
     case malfunction(OSStatus)
+    case temporalUnavailable(AppleTemporalFailure)
 }
 
 public enum VideoDecoderEvent: @unchecked Sendable {

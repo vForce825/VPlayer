@@ -296,6 +296,15 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             .hardwareDecoderUnavailable
         case let .badData(status), let .malfunction(status):
             .videoDecode(status)
+        case let .temporalUnavailable(failure):
+            switch failure {
+            case .unsupportedProperty:
+                .videoDecode(kVTPropertyNotSupportedErr)
+            case let .propertySetFailed(_, status),
+                 let .initializationFailed(status),
+                 let .processingFailed(status):
+                .videoDecode(status)
+            }
         }
     }
 
