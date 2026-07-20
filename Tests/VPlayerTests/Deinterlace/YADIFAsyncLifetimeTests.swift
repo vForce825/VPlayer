@@ -239,6 +239,124 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertEqual(harness.processor.metricsSnapshot.pendingFrameCount, 3)
     }
 
+    func testPendingBoundIsImmediateWhileCommandSubmissionIsBlockedOutsideLock() throws {
+        let submitter = BlockingYADIFCommandSubmitter()
+        let results = YADIFProcessorResultRecorder()
+        let drops = YADIFDropRecorder()
+        let processor = try YADIFProcessor(
+            commandSubmitter: submitter,
+            surfacePool: ProgressiveSurfacePool(),
+            clock: TestYADIFClock(),
+            maximumInFlight: 1,
+            maximumPendingFrames: 1,
+            dropSink: { drops.record($0) }
+        )
+        processor.reset(to: generation)
+        let frames = try (1...9).map { try normalized(id: UInt64($0)) }
+        processor.submit(normalized: frames[0], order: top) {
+            results.record(id: 1, result: $0)
+        }
+
+        let blockedSubmitReturned = expectation(description: "blocked command submit returned")
+        let order = top
+        DispatchQueue.global().async {
+            processor.submit(normalized: frames[1], order: order) {
+                results.record(id: 2, result: $0)
+            }
+            blockedSubmitReturned.fulfill()
+        }
+        XCTAssertTrue(submitter.waitUntilBlocked())
+
+        for (index, frame) in frames[2...].enumerated() {
+            processor.submit(normalized: frame, order: top) {
+                results.record(id: UInt64(index + 3), result: $0)
+            }
+        }
+
+        let pendingFrameCountWhileBlocked = processor.metricsSnapshot.pendingFrameCount
+        let dropIDsWhileBlocked = drops.snapshot.map(\.sourceAccessUnitID)
+        let resultCountsWhileBlocked = (UInt64(2)...8).map {
+            results.results(for: $0).count
+        }
+
+        submitter.unblock()
+        wait(for: [blockedSubmitReturned], timeout: 5)
+        processor.reset(to: generation)
+        submitter.completeNext(.completed)
+
+        XCTAssertEqual(pendingFrameCountWhileBlocked, 1)
+        XCTAssertEqual(dropIDsWhileBlocked, Array(UInt64(2)...8))
+        XCTAssertEqual(resultCountsWhileBlocked, Array(repeating: 1, count: 7))
+        for id in UInt64(2)...8 {
+            XCTAssertEqual(try? success(results.singleResult(for: id)).count, 0)
+        }
+        XCTAssertEqual(results.results(for: 1).count, 1)
+        XCTAssertEqual(results.results(for: 9).count, 1)
+    }
+
+    func testPendingBoundCountsReservedAttemptBeforeAndAfterResetWhileAllocationIsBlocked() throws {
+        let queue = FakeMetalCommandQueue()
+        let allocator = BlockingYADIFOutputAllocator()
+        let results = YADIFProcessorResultRecorder()
+        let drops = YADIFDropRecorder()
+        let outputAllocator: YADIFOutputAllocator = { source in
+            try allocator.allocate(matching: source)
+        }
+        let processor = try YADIFProcessor(
+            commandSubmitter: queue,
+            surfacePool: ProgressiveSurfacePool(),
+            outputAllocator: outputAllocator,
+            clock: TestYADIFClock(),
+            maximumInFlight: 1,
+            maximumPendingFrames: 1,
+            dropSink: { drops.record($0) }
+        )
+        processor.reset(to: generation)
+        let frames = try (1...9).map { try normalized(id: UInt64($0)) }
+        processor.submit(normalized: frames[0], order: top) {
+            results.record(id: 1, result: $0)
+        }
+
+        let blockedSubmitReturned = expectation(description: "blocked allocation submit returned")
+        let order = top
+        DispatchQueue.global().async {
+            processor.submit(normalized: frames[1], order: order) {
+                results.record(id: 2, result: $0)
+            }
+            blockedSubmitReturned.fulfill()
+        }
+        XCTAssertTrue(allocator.waitUntilBlocked())
+
+        for (index, frame) in frames[2...4].enumerated() {
+            processor.submit(normalized: frame, order: top) {
+                results.record(id: UInt64(index + 3), result: $0)
+            }
+        }
+
+        XCTAssertEqual(processor.metricsSnapshot.pendingFrameCount, 1)
+        XCTAssertEqual(drops.snapshot.map(\.sourceAccessUnitID), [2, 3, 4])
+        processor.reset(to: generation)
+        XCTAssertEqual(results.results(for: 1).count, 1)
+        XCTAssertEqual(results.results(for: 5).count, 1)
+
+        for (index, frame) in frames[5...8].enumerated() {
+            processor.submit(normalized: frame, order: top) {
+                results.record(id: UInt64(index + 6), result: $0)
+            }
+        }
+        XCTAssertEqual(processor.metricsSnapshot.pendingFrameCount, 1)
+        XCTAssertEqual(drops.snapshot.map(\.sourceAccessUnitID), [2, 3, 4, 6, 7, 8])
+        processor.reset(to: generation)
+        XCTAssertEqual(results.results(for: 9).count, 1)
+
+        allocator.unblock()
+        wait(for: [blockedSubmitReturned], timeout: 5)
+        XCTAssertEqual(queue.committedCount, 0)
+        for id in UInt64(1)...9 {
+            XCTAssertEqual(results.results(for: id).count, 1)
+        }
+    }
+
     func testResetClosesQueuedTailImmediatelyAndInflightCompletionOnlyAfterResourceRelease() throws {
         let harness = try makeHarness(maximumInFlight: 1)
         submit(try normalized(id: 1), to: harness)
@@ -446,6 +564,118 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         harness.processor.reset(to: nextGeneration)
         submit(try normalized(id: 3, generation: nextGeneration), to: harness)
         XCTAssertTrue(harness.results.results(for: 3).isEmpty)
+    }
+
+    func testDuplicateNormalizedInstanceOwnsBothCompletionsExactlyOnceThroughDrain() throws {
+        let harness = try makeHarness(maximumInFlight: 1)
+        let frame = try normalized(id: 1)
+        harness.processor.submit(normalized: frame, order: top) {
+            harness.results.record(id: 101, result: $0)
+        }
+        harness.processor.submit(normalized: frame, order: top) {
+            harness.results.record(id: 102, result: $0)
+        }
+
+        let firstResultBeforeDrain = harness.results.results(for: 101).first
+        let secondResultCountBeforeDrain = harness.results.results(for: 102).count
+        harness.processor.drain { harness.results.record(id: 103, result: $0) }
+        harness.queue.completeNext(.completed)
+
+        XCTAssertEqual(try? firstResultBeforeDrain?.get().count, 0)
+        XCTAssertEqual(secondResultCountBeforeDrain, 0)
+        XCTAssertEqual(harness.queue.submittedSourceAccessUnitIDs, [1])
+        XCTAssertEqual(try? success(harness.results.singleResult(for: 102)).count, 2)
+        XCTAssertEqual(try? success(harness.results.singleResult(for: 103)).count, 0)
+        for id in UInt64(101)...103 {
+            XCTAssertEqual(harness.results.results(for: id).count, 1)
+        }
+    }
+
+    func testDuplicateNormalizedInstanceOwnsBothCompletionsExactlyOnceThroughReset() throws {
+        let harness = try makeHarness(maximumInFlight: 1)
+        let frame = try normalized(id: 1)
+        harness.processor.submit(normalized: frame, order: top) {
+            harness.results.record(id: 101, result: $0)
+        }
+        harness.processor.submit(normalized: frame, order: top) {
+            harness.results.record(id: 102, result: $0)
+        }
+
+        harness.processor.reset(to: generation)
+
+        XCTAssertEqual(try? success(harness.results.singleResult(for: 101)).count, 0)
+        XCTAssertEqual(try? success(harness.results.singleResult(for: 102)).count, 0)
+        XCTAssertEqual(harness.results.results(for: 101).count, 1)
+        XCTAssertEqual(harness.results.results(for: 102).count, 1)
+        XCTAssertEqual(harness.queue.committedCount, 0)
+    }
+
+    func testSameInputKeyIncreasingTimestampsPopCompletionsInSubmissionOrder() throws {
+        let submitter = ImmediateYADIFCommandSubmitter()
+        let results = YADIFProcessorResultRecorder()
+        let processor = try YADIFProcessor(
+            commandSubmitter: submitter,
+            surfacePool: ProgressiveSurfacePool(),
+            clock: TestYADIFClock(),
+            maximumInFlight: 1,
+            maximumPendingFrames: 2
+        )
+        processor.reset(to: generation)
+        let first = try normalized(id: 1, pts: .zero)
+        let laterTimestamp = CMTime(value: 1, timescale: 25)
+        let later = NormalizedDecodedFrame(
+            frame: first.frame,
+            presentationTimeStamp: laterTimestamp,
+            frameDuration: first.frameDuration,
+            fieldDuration: first.fieldDuration,
+            timingWasSynthesized: first.timingWasSynthesized,
+            provenance: first.provenance
+        )
+        processor.submit(normalized: first, order: top) {
+            results.record(id: 101, result: $0)
+        }
+        processor.submit(normalized: later, order: top) {
+            results.record(id: 102, result: $0)
+        }
+        processor.drain { results.record(id: 103, result: $0) }
+
+        XCTAssertEqual(
+            try? success(results.singleResult(for: 101)).first?.presentationTimeStamp,
+            first.presentationTimeStamp
+        )
+        XCTAssertEqual(
+            try? success(results.singleResult(for: 102)).first?.presentationTimeStamp,
+            laterTimestamp
+        )
+        XCTAssertEqual(try? success(results.singleResult(for: 103)).count, 0)
+        for id in UInt64(101)...103 {
+            XCTAssertEqual(results.results(for: id).count, 1)
+        }
+    }
+
+    func testSameInputKeyInvalidTimestampDiscardsBothCompletionsInSubmissionOrder() throws {
+        let harness = try makeHarness(maximumInFlight: 1)
+        let valid = try normalized(id: 1)
+        let invalid = NormalizedDecodedFrame(
+            frame: valid.frame,
+            presentationTimeStamp: .invalid,
+            frameDuration: valid.frameDuration,
+            fieldDuration: valid.fieldDuration,
+            timingWasSynthesized: valid.timingWasSynthesized,
+            provenance: valid.provenance
+        )
+        harness.processor.submit(normalized: valid, order: top) {
+            harness.results.record(id: 101, result: $0)
+        }
+        harness.processor.submit(normalized: invalid, order: top) {
+            harness.results.record(id: 102, result: $0)
+        }
+
+        XCTAssertEqual(try? success(harness.results.singleResult(for: 101)).count, 0)
+        XCTAssertEqual(try? success(harness.results.singleResult(for: 102)).count, 0)
+        XCTAssertEqual(harness.results.results(for: 101).count, 1)
+        XCTAssertEqual(harness.results.results(for: 102).count, 1)
+        XCTAssertEqual(harness.queue.committedCount, 0)
     }
 
     func testResetClosesReservedAttemptWhileAllocationIsBlockedAndFinalizeDoesNotResubmit() throws {
@@ -831,6 +1061,40 @@ private final class ImmediateYADIFCommandSubmitter: YADIFCommandSubmitting, @unc
     ) throws(YADIFFailure) {
         lock.withLock { storedSubmitCount += 1 }
         completion(.completed)
+    }
+}
+
+private final class BlockingYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Sendable {
+    private struct Pending: @unchecked Sendable {
+        let completion: @Sendable (YADIFCommandResult) -> Void
+    }
+
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private var pending: [Pending] = []
+
+    func submit(
+        job: YADIFJob,
+        outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
+        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+    ) throws(YADIFFailure) {
+        lock.withLock { pending.append(Pending(completion: completion)) }
+        entered.signal()
+        release.wait()
+    }
+
+    func waitUntilBlocked() -> Bool {
+        entered.wait(timeout: .now() + 5) == .success
+    }
+
+    func unblock() { release.signal() }
+
+    func completeNext(_ result: YADIFCommandResult) {
+        let completion = lock.withLock {
+            pending.isEmpty ? nil : pending.removeFirst().completion
+        }
+        completion?(result)
     }
 }
 

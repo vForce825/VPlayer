@@ -178,7 +178,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private var generation = MediaGeneration(rawValue: 0)
     private var segmentEpoch: UInt64 = 0
     private var window = YADIFReferenceWindow(generation: MediaGeneration(rawValue: 0))
-    private var pendingCompletions: [InputKey: Completion] = [:]
+    private var pendingCompletions: [InputKey: [Completion]] = [:]
     private var readyJobs: [ReadyJob] = []
     private var submissionAttempts: [UInt64: SubmissionAttempt] = [:]
     private var inFlightJobs: [UInt64: InFlightJob] = [:]
@@ -326,13 +326,14 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             if frame.frame.generation > generation {
                 resetLocked(to: frame.frame.generation, actions: &actions)
             }
-            pendingCompletions[InputKey(frame)] = completion
+            pendingCompletions[InputKey(frame), default: []].append(completion)
             let transition = window.push(
                 frame,
                 order: order,
                 discontinuity: discontinuity
             )
             consumeLocked(transition, actions: &actions)
+            enforcePendingBoundLocked(actions: &actions)
             finishDrainIfPossibleLocked(actions: &actions)
         }
         lock.unlock()
@@ -350,6 +351,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         isDraining = true
         drainBarriers.append(completion)
         consumeLocked(window.drain(), actions: &actions)
+        enforcePendingBoundLocked(actions: &actions)
         finishDrainIfPossibleLocked(actions: &actions)
         lock.unlock()
         perform(actions)
@@ -375,6 +377,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         }
     }
 
+    private var occupiedSubmissionSlotCountLocked: Int {
+        inFlightJobs.count + submissionAttempts.count
+    }
+
     private func isCurrentLocked(_ ready: ReadyJob) -> Bool {
         ready.epoch == segmentEpoch
             && ready.job.current.frame.generation == generation
@@ -385,12 +391,12 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         actions: inout [UserAction]
     ) {
         for discarded in transition.discarded {
-            if let completion = pendingCompletions.removeValue(forKey: InputKey(discarded)) {
+            if let completion = popPendingCompletionLocked(for: discarded) {
                 actions.append(.complete(completion, .success([])))
             }
         }
         guard let job = transition.job,
-              let completion = pendingCompletions.removeValue(forKey: InputKey(job.current)) else {
+              let completion = popPendingCompletionLocked(for: job.current) else {
             return
         }
         let firstSequence = nextSequenceNumber
@@ -401,6 +407,22 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             firstSequenceNumber: firstSequence,
             epoch: segmentEpoch
         ))
+    }
+
+    private func popPendingCompletionLocked(
+        for frame: NormalizedDecodedFrame
+    ) -> Completion? {
+        let key = InputKey(frame)
+        guard var completions = pendingCompletions[key], !completions.isEmpty else {
+            return nil
+        }
+        let completion = completions.removeFirst()
+        if completions.isEmpty {
+            pendingCompletions.removeValue(forKey: key)
+        } else {
+            pendingCompletions[key] = completions
+        }
+        return completion
     }
 
     private func driveScheduler() {
@@ -415,7 +437,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         while true {
             var actions: [UserAction] = []
             lock.lock()
-            if inFlightJobs.count < maximumInFlight, !readyJobs.isEmpty {
+            if occupiedSubmissionSlotCountLocked < maximumInFlight, !readyJobs.isEmpty {
                 let identifier = nextInFlightIdentifier
                 nextInFlightIdentifier &+= 1
                 submissionAttempts[identifier] = SubmissionAttempt(
@@ -508,7 +530,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     }
 
     private func enforcePendingBoundLocked(actions: inout [UserAction]) {
-        while inFlightJobs.count >= maximumInFlight,
+        while occupiedSubmissionSlotCountLocked >= maximumInFlight,
               readyJobs.count + window.unemittedCount > maximumPendingFrames,
               !readyJobs.isEmpty {
             let now = clock.currentTime
@@ -573,8 +595,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     ) {
         segmentEpoch &+= 1
         _ = window.reset(generation: generation)
-        for completion in pendingCompletions.values {
-            actions.append(.complete(completion, .success([])))
+        for completions in pendingCompletions.values {
+            for completion in completions {
+                actions.append(.complete(completion, .success([])))
+            }
         }
         pendingCompletions.removeAll(keepingCapacity: true)
         for ready in readyJobs {
