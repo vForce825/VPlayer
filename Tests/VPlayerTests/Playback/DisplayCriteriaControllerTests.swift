@@ -39,8 +39,9 @@ final class DisplayCriteriaControllerTests: XCTestCase {
     func testObserversAreInstalledBeforeCriteriaMutation() throws {
         let center = NotificationCenter()
         let manager = FakeDisplayCriteriaManager()
-        let link = FakeDisplayLinkControl()
-        let readiness = FakeDisplayReadinessControl()
+        var sharedOrder: [String] = []
+        let link = FakeDisplayLinkControl(order: { sharedOrder.append($0) })
+        let readiness = FakeDisplayReadinessControl(order: { sharedOrder.append($0) })
         manager.beforeMutation = {
             center.post(name: .AVDisplayManagerModeSwitchStart, object: nil)
         }
@@ -58,6 +59,7 @@ final class DisplayCriteriaControllerTests: XCTestCase {
 
         XCTAssertEqual(link.operations, ["pause"])
         XCTAssertEqual(readiness.operations, ["close"])
+        XCTAssertEqual(sharedOrder, ["pause", "close"])
     }
 
     func testModeSwitchStartIsIdempotentAndEndAnchorsBeforeResume() throws {
@@ -82,7 +84,54 @@ final class DisplayCriteriaControllerTests: XCTestCase {
         XCTAssertEqual(readiness.operations.filter { $0 == "anchor" }.count, 1)
         XCTAssertEqual(link.operations.filter { $0 == "resume" }.count, 1)
         XCTAssertEqual(link.operations.filter { $0 == "reset" }.count, 1)
+        XCTAssertEqual(sharedOrder.prefix(2), ["pause", "close"])
         XCTAssertEqual(sharedOrder.suffix(3), ["anchor", "reset", "resume"])
+    }
+
+    func testModeSwitchEndDoesNotResetOrResumeWhenPipelineReadinessIsStillClosed() throws {
+        let center = NotificationCenter()
+        let manager = FakeDisplayCriteriaManager()
+        let link = FakeDisplayLinkControl()
+        let readiness = FakeDisplayReadinessControl()
+        readiness.allowsReanchor = false
+        let subject = makeSubject(manager: manager, center: center, link: link, readiness: readiness)
+        subject.enterFullScreen(
+            formatDescription: try makeFormatDescription(),
+            outputFrameRate: 50
+        )
+
+        center.post(name: .AVDisplayManagerModeSwitchStart, object: nil)
+        center.post(name: .AVDisplayManagerModeSwitchEnd, object: nil)
+
+        XCTAssertEqual(readiness.operations, ["close", "anchor"])
+        XCTAssertEqual(link.operations, ["pause"])
+    }
+
+    func testLeaveDuringModeSwitchCancelsReadinessWithoutResetOrResume() throws {
+        let center = NotificationCenter()
+        let manager = FakeDisplayCriteriaManager()
+        var sharedOrder: [String] = []
+        let link = FakeDisplayLinkControl(order: { sharedOrder.append($0) })
+        let readiness = FakeDisplayReadinessControl(order: { sharedOrder.append($0) })
+        let subject = makeSubject(
+            manager: manager,
+            center: center,
+            link: link,
+            readiness: readiness
+        )
+        subject.enterFullScreen(
+            formatDescription: try makeFormatDescription(),
+            outputFrameRate: 50
+        )
+        center.post(name: .AVDisplayManagerModeSwitchStart, object: nil)
+
+        subject.leaveFullScreen()
+        center.post(name: .AVDisplayManagerModeSwitchEnd, object: nil)
+
+        XCTAssertEqual(readiness.operations, ["close", "anchor"])
+        XCTAssertEqual(link.operations, ["pause", "pause"])
+        XCTAssertEqual(sharedOrder, ["pause", "close", "pause", "anchor"])
+        XCTAssertNil(manager.preferredDisplayCriteria)
     }
 
     func testLeaveRemovesObserversPausesAndUnconditionallyClearsCriteria() throws {
@@ -203,6 +252,7 @@ private final class FakeDisplayLinkControl: DisplayLinkControlling {
 private final class FakeDisplayReadinessControl: DisplayReadinessControlling {
     let order: ((String) -> Void)?
     var operations: [String] = []
+    var allowsReanchor = true
 
     init(order: ((String) -> Void)? = nil) {
         self.order = order
@@ -213,8 +263,9 @@ private final class FakeDisplayReadinessControl: DisplayReadinessControlling {
         order?("close")
     }
 
-    func reanchorAfterDisplayModeSwitch() {
+    func reanchorAfterDisplayModeSwitch() -> Bool {
         operations.append("anchor")
         order?("anchor")
+        return allowsReanchor
     }
 }

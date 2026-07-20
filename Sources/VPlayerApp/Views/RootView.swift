@@ -6,10 +6,14 @@ import SwiftUI
 
 struct RootView: View {
     private let dependencies: AppDependencies
+    private let algorithmSelection: PlaybackAlgorithmSelectionController
     @State private var model: AppModel
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
+        algorithmSelection = PlaybackAlgorithmSelectionController(
+            engine: dependencies.playbackEngine
+        )
         _model = State(initialValue: AppModel(
             repository: dependencies.repository,
             refresh: dependencies.refresh,
@@ -31,7 +35,10 @@ struct RootView: View {
                     Label("数据源", systemImage: "externaldrive.connected.to.line.below")
                 }
 
-            PlaybackSettingsView(settings: dependencies.playbackSettings)
+            PlaybackSettingsView(
+                settings: dependencies.playbackSettings,
+                onAlgorithmChange: algorithmSelection.select
+            )
                 .tabItem {
                     Label("设置", systemImage: "gearshape")
                 }
@@ -56,7 +63,12 @@ struct RootView: View {
             Text(model.alertMessage ?? "")
         }
         .fullScreenCover(item: $model.presentedPlaybackRequest) { request in
-            PlaybackPlaceholderView(request: request) {
+            FullScreenPlayerView(
+                request: request,
+                engine: dependencies.playbackEngine,
+                presentationProvider: dependencies.playbackPresentationProvider,
+                settings: dependencies.playbackSettings
+            ) {
                 model.dismissPlayback()
             }
         }

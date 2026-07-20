@@ -15,6 +15,7 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
     public override class var layerClass: AnyClass { CAMetalLayer.self }
 
     private var driver: MetalDisplayLinkDriver!
+    var windowDidChange: ((UIWindow?) -> Void)?
 
     public var displayLink: CAMetalDisplayLink { driver.displayLink }
 
@@ -85,6 +86,11 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
 
     public func startDisplayLink(runLoop: RunLoop = .main) {
         driver.start(runLoop: runLoop)
+    }
+
+    public override func didMoveToWindow() {
+        super.didMoveToWindow()
+        windowDidChange?(window)
     }
 
     public func stopDisplayLink() {

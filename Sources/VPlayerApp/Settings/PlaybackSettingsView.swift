@@ -5,8 +5,37 @@
 import SwiftUI
 import VPlayerPlayback
 
+@MainActor
+final class PlaybackAlgorithmSelectionController {
+    private let engine: any PlaybackEngine
+    private var task: Task<Void, Never>?
+
+    init(engine: any PlaybackEngine) {
+        self.engine = engine
+    }
+
+    func select(_ algorithm: DeinterlaceAlgorithm) {
+        let predecessor = task
+        let engine = engine
+        task = Task {
+            await predecessor?.value
+            guard !Task.isCancelled else { return }
+            await engine.setDeinterlaceAlgorithm(algorithm)
+        }
+    }
+}
+
 struct PlaybackSettingsView: View {
     @Bindable var settings: PlaybackSettingsStore
+    let onAlgorithmChange: @MainActor (DeinterlaceAlgorithm) -> Void
+
+    init(
+        settings: PlaybackSettingsStore,
+        onAlgorithmChange: @escaping @MainActor (DeinterlaceAlgorithm) -> Void = { _ in }
+    ) {
+        self.settings = settings
+        self.onAlgorithmChange = onAlgorithmChange
+    }
 
     var body: some View {
         NavigationStack {
@@ -36,6 +65,7 @@ struct PlaybackSettingsView: View {
             Spacer()
             Button {
                 settings.deinterlaceAlgorithm = algorithm
+                onAlgorithmChange(algorithm)
             } label: {
                 Image(systemName: settings.deinterlaceAlgorithm == algorithm ? "checkmark.circle.fill" : "circle")
             }

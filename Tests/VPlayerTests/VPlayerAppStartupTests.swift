@@ -34,6 +34,16 @@ final class VPlayerAppStartupTests: XCTestCase {
             AppLaunchConfiguration(arguments: ["VPlayer", "-uiTestResetPlaybackSettings"])
                 .resetsPlaybackSettings
         )
+        XCTAssertEqual(
+            AppLaunchConfiguration(arguments: [
+                "VPlayer", "-ui-fixture", "seeded",
+                "-ui-playback-fixture", "interlaced-temporal-unsupported",
+            ]).playbackFixture,
+            "interlaced-temporal-unsupported"
+        )
+        XCTAssertNil(AppLaunchConfiguration(arguments: [
+            "VPlayer", "-ui-playback-fixture",
+        ]).playbackFixture)
     }
 
     func testProductionAppStartupPurgesLibrarySnapshotsOnceAfterRepeatedStartRequests() async {

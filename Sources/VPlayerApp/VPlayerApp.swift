@@ -13,6 +13,7 @@ enum AppLaunchMode: Equatable {
 struct AppLaunchConfiguration {
     let mode: AppLaunchMode
     let resetsPlaybackSettings: Bool
+    let playbackFixture: String?
 
     init(arguments: [String]) {
         let fixtureFlags = arguments.indices.filter { arguments[$0] == "-ui-fixture" }
@@ -25,6 +26,16 @@ struct AppLaunchConfiguration {
             mode = .live
         }
         resetsPlaybackSettings = arguments.contains("-uiTestResetPlaybackSettings")
+        let playbackFixtureFlags = arguments.indices.filter {
+            arguments[$0] == "-ui-playback-fixture"
+        }
+        if playbackFixtureFlags.count == 1,
+           let flagIndex = playbackFixtureFlags.first,
+           arguments.indices.contains(flagIndex + 1) {
+            playbackFixture = arguments[flagIndex + 1]
+        } else {
+            playbackFixture = nil
+        }
     }
 }
 
@@ -42,7 +53,7 @@ struct VPlayerApp: App {
         case .live:
             self.init(dependencies: .live())
         case .seededFixture:
-            self.init(dependencies: .uiTesting())
+            self.init(dependencies: .uiTesting(playbackFixture: configuration.playbackFixture))
         }
     }
 

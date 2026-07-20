@@ -22,7 +22,7 @@ public protocol DisplayLinkControlling: AnyObject {
 @MainActor
 public protocol DisplayReadinessControlling: AnyObject {
     func closeForDisplayModeSwitch()
-    func reanchorAfterDisplayModeSwitch()
+    func reanchorAfterDisplayModeSwitch() -> Bool
 }
 
 @MainActor
@@ -91,6 +91,7 @@ public final class DisplayCriteriaController: NSObject {
     }
 
     public func leaveFullScreen() {
+        let wasSwitchingMode = isSwitchingMode
         if isFullScreen {
             notificationCenter.removeObserver(
                 self,
@@ -106,6 +107,9 @@ public final class DisplayCriteriaController: NSObject {
         isFullScreen = false
         isSwitchingMode = false
         displayLink.pause()
+        if wasSwitchingMode {
+            _ = readiness.reanchorAfterDisplayModeSwitch()
+        }
         manager.preferredDisplayCriteria = nil
     }
 
@@ -119,8 +123,9 @@ public final class DisplayCriteriaController: NSObject {
     @objc private func modeSwitchEnded() {
         guard isFullScreen, isSwitchingMode else { return }
         isSwitchingMode = false
-        readiness.reanchorAfterDisplayModeSwitch()
-        displayLink.resetPresentationTiming()
-        displayLink.resume()
+        if readiness.reanchorAfterDisplayModeSwitch() {
+            displayLink.resetPresentationTiming()
+            displayLink.resume()
+        }
     }
 }

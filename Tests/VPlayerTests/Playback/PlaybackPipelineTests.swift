@@ -4,11 +4,37 @@
 
 import CoreMedia
 import Foundation
+import Metal
 import VideoToolbox
 import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackPipelineTests: XCTestCase {
+    func testControllerPublishesOnlyCurrentSessionPresentationContextAndClearsItOnFailure() async throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let context = PlaybackPresentationContext(
+            renderer: FakePipelineVideoRenderer(),
+            clock: FakePipelineClock(),
+            device: device
+        )
+        let first = FakeControllerPipeline(presentationContext: context)
+        let second = FakeControllerPipeline()
+        let controller = PlaybackController(factory: FakeControllerPipelineFactory([first, second]))
+
+        let contextBeforePlay = await controller.presentationContext()
+        XCTAssertNil(contextBeforePlay)
+        await controller.play(makeRequest(title: "first"))
+        let firstContext = await controller.presentationContext()
+        XCTAssertTrue(firstContext === context)
+        await controller.play(makeRequest(title: "second"))
+        let secondContext = await controller.presentationContext()
+        XCTAssertNil(secondContext)
+        second.emit(.failed(.demuxRead(-1)))
+        try await Task.sleep(for: .milliseconds(20))
+        let failedContext = await controller.presentationContext()
+        XCTAssertNil(failedContext)
+    }
+
     func testControllerPublishesIdlePreparingPlayingPauseResumeAndStopped() async throws {
         let fake = FakeControllerPipeline()
         let controller = PlaybackController(factory: FakeControllerPipelineFactory([fake]))
@@ -1046,6 +1072,75 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(harness.renderer.snapshot().resets, 3)
     }
 
+    func testDisplayModeSwitchWaitsForLaterReadinessThenResetsBeforeTheOnlyResume() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1, generation: generation, pts: .zero, interlaced: false
+            ),
+        ], in: harness)
+        try await eventually { harness.display.snapshot().last == "resume" }
+
+        harness.pipeline.displayModeSwitchStarted()
+        harness.audio.setReady(false)
+        harness.pipeline.displayModeSwitchEnded()
+        try await eventually { harness.display.snapshot().last == "pause" }
+        let operationsWhileClosed = harness.display.snapshot()
+        XCTAssertFalse(operationsWhileClosed.suffix(2).contains("reset"))
+
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audioReadiness: .available, generation: generation)
+        try await eventually { harness.display.snapshot().suffix(2) == ["reset", "resume"] }
+        XCTAssertEqual(
+            harness.display.snapshot().dropFirst(operationsWhileClosed.count).filter {
+                $0 == "resume"
+            }.count,
+            1
+        )
+    }
+
+    func testRepeatedFramesWithSameFormatRouteAndCadenceRequestCriteriaOnlyOnce() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+            PlaybackFakeMedia.decodedFrame(
+                id: 2,
+                generation: generation,
+                pts: CMTime(value: 1, timescale: 25),
+                interlaced: false
+            ),
+            PlaybackFakeMedia.decodedFrame(
+                id: 3,
+                generation: generation,
+                pts: CMTime(value: 2, timescale: 25),
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually {
+            harness.renderer.snapshot().frames.count >= 3
+        }
+
+        XCTAssertEqual(
+            harness.display.snapshot().filter { $0.hasPrefix("criteria:") }.count,
+            1
+        )
+    }
+
     func testPauseKeepsBoundedPacketsAndBackpressuresUntilResume() async throws {
         let harness = makeHarness()
         _ = try await configure(harness)
@@ -1136,6 +1231,51 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
         XCTAssertEqual(harness.display.snapshot().filter { $0 == "clear" }.count, 1)
         XCTAssertEqual(harness.audio.snapshot().stops, 1)
+    }
+
+    func testNormalStopDoesNotReturnOrPublishUntilDisplayClearCompletes() async throws {
+        let harness = makeHarness()
+        _ = try await configure(harness)
+        harness.display.clearAutomaticallyCompletes = false
+        let stopFinished = LockedFlag()
+
+        let stop = Task {
+            await harness.pipeline.stop()
+            stopFinished.set()
+        }
+        try await eventually { harness.display.isClearWaiting }
+
+        XCTAssertFalse(stopFinished.value)
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        harness.display.completeClear()
+        await stop.value
+
+        XCTAssertTrue(stopFinished.value)
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+    }
+
+    func testFailureIsNotPublishedUntilDisplayClearCompletes() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.display.clearAutomaticallyCompletes = false
+
+        harness.pipeline.receive(failure: .renderTextureMapping, generation: generation)
+        try await eventually { harness.display.isClearWaiting }
+        let stopFinished = LockedFlag()
+        let stop = Task {
+            await harness.pipeline.stop()
+            stopFinished.set()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertFalse(harness.events.snapshot().contains(.failed(.renderTextureMapping)))
+        XCTAssertFalse(stopFinished.value)
+        harness.display.completeClear()
+        await stop.value
+        try await eventually {
+            harness.events.snapshot().contains(.failed(.renderTextureMapping))
+        }
+        XCTAssertTrue(stopFinished.value)
     }
 
     func testNormalStopIsolatesEveryDrainAndDecoderStageFailure() async throws {

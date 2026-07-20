@@ -129,6 +129,10 @@ public actor PlaybackController: PlaybackEngine {
         pipeline?.setDeinterlaceAlgorithm(algorithm)
     }
 
+    public func presentationContext() -> PlaybackPresentationContext? {
+        pipeline?.presentationContext
+    }
+
     var currentStateForTesting: PlaybackState { state }
     var selectedDeinterlaceAlgorithmForTesting: DeinterlaceAlgorithm { selectedAlgorithm }
 

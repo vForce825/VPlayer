@@ -17,6 +17,7 @@ enum PlaybackPipelineEvent: Sendable, Equatable {
 }
 
 protocol PlaybackPipelineProtocol: AnyObject, Sendable {
+    var presentationContext: PlaybackPresentationContext? { get }
     func start(url: URL)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
     func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm)
@@ -97,13 +98,12 @@ extension MetalVideoRenderer: PlaybackVideoRendering {}
 protocol PlaybackDisplayControlling: Sendable {
     func pauseSubmission()
     func resumeSubmission()
-    func clearDisplayCriteria()
-}
-
-private struct PhaseTwoPlaybackDisplay: PlaybackDisplayControlling {
-    func pauseSubmission() {}
-    func resumeSubmission() {}
-    func clearDisplayCriteria() {}
+    func resetPresentationTiming()
+    func updateDisplayCriteria(
+        formatDescription: CMFormatDescription,
+        outputFrameRate: Float
+    )
+    func clearDisplayCriteria() async
 }
 
 struct PlaybackPipelineSnapshot: Sendable {
@@ -118,7 +118,14 @@ struct PlaybackPipelineSnapshot: Sendable {
 }
 
 final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
+    let presentationContext: PlaybackPresentationContext?
     private typealias StopCompletion = @Sendable () -> Void
+
+    private struct DisplayCriteriaKey: Equatable {
+        let formatIdentity: ObjectIdentifier
+        let route: DeinterlaceRoute
+        let outputFrameRate: Float
+    }
 
     private struct PreparedAnchor {
         let cycleID: UInt64
@@ -166,6 +173,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var terminal = false
     private var normalStopInProgress = false
     private var normalStopCompleted = false
+    private var displayClearInProgress = false
     private var normalStopPublishes = false
     private var stopCompletions: [StopCompletion] = []
     private var readyPublished = false
@@ -176,6 +184,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var retainedVideo: [VideoPresentationFrame] = []
     private var preparedAnchor: PreparedAnchor?
     private var anchorPreparationInProgress = false
+    private var pendingDisplayTimingReset = false
+    private var lastDisplayCriteriaKey: DisplayCriteriaKey?
 
     init(
         executor: PlaybackSerialExecutor,
@@ -191,7 +201,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         audio: any AudioRenderPipelineProtocol,
         clock: any PlaybackClock,
         display: any PlaybackDisplayControlling,
-        eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
+        eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void,
+        presentationContext: PlaybackPresentationContext? = nil
     ) {
         self.executor = executor
         self.demuxer = demuxer
@@ -201,6 +212,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         self.clock = clock
         self.display = display
         self.eventSink = eventSink
+        self.presentationContext = presentationContext
         videoCoordinator = VideoPipelineCoordinator(
             decoder: decoder,
             passthrough: processor,
@@ -316,6 +328,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     func refreshReadiness() {
         executor.submit { [weak self] in self?.updateReadinessIsolated() }
+    }
+
+    func displayModeSwitchStarted() {
+        executor.submit { [weak self] in self?.displayModeSwitchStartedIsolated() }
+    }
+
+    func displayModeSwitchEnded() {
+        executor.submit { [weak self] in self?.displayModeSwitchEndedIsolated() }
     }
 
     func debugSnapshot() async -> PlaybackPipelineSnapshot {
@@ -602,6 +622,25 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             for frame in frames where generationController.accepts(frame.generation) {
                 renderer.enqueue(frame)
                 retainedVideo.append(frame)
+                let route = videoCoordinator.route
+                if let videoFormat,
+                   let rate = PlaybackPresentationCadencePolicy.outputFrameRate(
+                    for: frame,
+                    route: presentationRoute(for: route)
+                   ) {
+                    let criteriaKey = DisplayCriteriaKey(
+                        formatIdentity: ObjectIdentifier(videoFormat as AnyObject),
+                        route: route,
+                        outputFrameRate: rate
+                    )
+                    if criteriaKey != lastDisplayCriteriaKey {
+                        lastDisplayCriteriaKey = criteriaKey
+                        display.updateDisplayCriteria(
+                            formatDescription: videoFormat,
+                            outputFrameRate: rate
+                        )
+                    }
+                }
             }
             retainedVideo.sort {
                 let comparison = CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp)
@@ -817,9 +856,56 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
            !terminal,
            !paused,
            !readyPublished {
+            resumeDisplayForOpenReadinessGateIsolated()
+        }
+    }
+
+    private func displayModeSwitchStartedIsolated() {
+        assertIsolated()
+        guard !terminal, !paused else { return }
+        preparedAnchor = nil
+        readyPublished = false
+        pendingDisplayTimingReset = true
+        clock.pause()
+        readiness?.close(.displayModeSwitch)
+        display.pauseSubmission()
+    }
+
+    private func displayModeSwitchEndedIsolated() {
+        assertIsolated()
+        guard !terminal, !paused, let readiness else { return }
+        _ = readiness.reopenAfterDisplayModeSwitch()
+        if readiness.isOpen {
+            resumeDisplayForOpenReadinessGateIsolated()
+        } else {
+            updateReadinessIsolated()
+        }
+    }
+
+    private func resumeDisplayForOpenReadinessGateIsolated() {
+        assertIsolated()
+        if pendingDisplayTimingReset {
+            pendingDisplayTimingReset = false
+            renderer.resetPresentationTiming()
+            display.resetPresentationTiming()
+        }
+        display.resumeSubmission()
+        if !readyPublished {
             readyPublished = true
-            display.resumeSubmission()
             eventSink(.ready(readinessCycle: readinessCycle))
+        }
+    }
+
+    private func presentationRoute(for route: DeinterlaceRoute) -> PlaybackPresentationRoute {
+        switch route {
+        case .bypass, .rawWhileClassifying:
+            .progressive
+        case .appleTemporal:
+            .appleTemporal
+        case .metalYADIF2x:
+            .metalYADIF2x
+        case .rawTemporalFailure:
+            .rawInterlacedAfterTemporalFailure
         }
     }
 
@@ -929,7 +1015,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             return
         }
         guard !terminal else {
-            completion?()
+            if displayClearInProgress, let completion {
+                stopCompletions.append(completion)
+            } else {
+                completion?()
+            }
             return
         }
         normalStopInProgress = true
@@ -960,10 +1050,24 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func completeNormalStopIsolated() {
         assertIsolated()
+        guard normalStopInProgress,
+              !normalStopCompleted,
+              !displayClearInProgress else { return }
+        displayClearInProgress = true
+        Task { [self] in
+            await display.clearDisplayCriteria()
+            executor.submit { [self] in
+                finishNormalStopAfterDisplayClearIsolated()
+            }
+        }
+    }
+
+    private func finishNormalStopAfterDisplayClearIsolated() {
+        assertIsolated()
         guard normalStopInProgress, !normalStopCompleted else { return }
+        displayClearInProgress = false
         normalStopInProgress = false
         normalStopCompleted = true
-        display.clearDisplayCriteria()
         if normalStopPublishes { eventSink(.stopped) }
         let completions = stopCompletions
         stopCompletions.removeAll(keepingCapacity: false)
@@ -979,8 +1083,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         videoCoordinator.stop(emergency: true)
         audio.stop()
         display.pauseSubmission()
-        display.clearDisplayCriteria()
-        eventSink(.failed(error))
+        displayClearInProgress = true
+        Task { [self] in
+            await display.clearDisplayCriteria()
+            executor.submit { [self] in
+                displayClearInProgress = false
+                eventSink(.failed(error))
+                let completions = stopCompletions
+                stopCompletions.removeAll(keepingCapacity: false)
+                for completion in completions { completion() }
+            }
+        }
     }
 
     private func releasePendingAdmissionIsolated() {
@@ -1011,6 +1124,14 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
         generation: MediaGeneration
     ) {
         lock.withLock { target }?.receive(audioReadiness: change, generation: generation)
+    }
+
+    func displayModeSwitchStarted() {
+        lock.withLock { target }?.displayModeSwitchStarted()
+    }
+
+    func displayModeSwitchEnded() {
+        lock.withLock { target }?.displayModeSwitchEnded()
     }
 }
 
@@ -1065,6 +1186,14 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             generation: MediaGeneration(rawValue: 0),
             failureSink: { relay.failure($0, generation: $1) }
         )
+        let presentationContext = PlaybackPresentationContext(
+            renderer: renderer,
+            clock: clock,
+            device: device,
+            switchStarted: { relay.displayModeSwitchStarted() },
+            switchEnded: { relay.displayModeSwitchEnded() }
+        )
+        let display = PlaybackPresentationDisplayBridge(context: presentationContext)
         let audio = AudioRenderPipeline(
             synchronizer: synchronizer,
             executor: executor,
@@ -1084,8 +1213,9 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             renderer: renderer,
             audio: audio,
             clock: clock,
-            display: PhaseTwoPlaybackDisplay(),
-            eventSink: eventSink
+            display: display,
+            eventSink: eventSink,
+            presentationContext: presentationContext
         )
         relay.install(pipeline)
         return pipeline

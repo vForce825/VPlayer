@@ -61,11 +61,14 @@ actor LibraryStartup {
 struct AppDependencies {
     typealias Refresh = AppModel.Refresh
     typealias Prepare = @Sendable () async -> Void
+    typealias PlaybackPresentationProvider = @Sendable () async -> PlaybackPresentationContext?
 
     let repository: any LibraryRepository
     let refresh: Refresh
     let prepare: Prepare
     let playbackSettings: PlaybackSettingsStore
+    let playbackEngine: any PlaybackEngine
+    let playbackPresentationProvider: PlaybackPresentationProvider
     let libraryChanges: LibraryChangeSignal
     let libraryStartup: LibraryStartup
     let foregroundRefreshDriver: ForegroundRefreshDriver
@@ -81,12 +84,24 @@ struct AppDependencies {
         },
         prepare: @escaping Prepare = {},
         playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore(),
+        playbackEngine: (any PlaybackEngine)? = nil,
+        playbackPresentationProvider: PlaybackPresentationProvider? = nil,
         libraryChanges: LibraryChangeSignal = LibraryChangeSignal()
     ) {
         self.repository = repository
         self.refresh = refresh
         self.prepare = prepare
         self.playbackSettings = playbackSettings
+        if let playbackEngine {
+            self.playbackEngine = playbackEngine
+            self.playbackPresentationProvider = playbackPresentationProvider ?? { nil }
+        } else {
+            let controller = PlaybackController()
+            self.playbackEngine = controller
+            self.playbackPresentationProvider = {
+                await controller.presentationContext()
+            }
+        }
         self.libraryChanges = libraryChanges
         self.libraryStartup = libraryStartup
         self.foregroundRefreshDriver = foregroundRefreshDriver
@@ -153,7 +168,7 @@ struct AppDependencies {
         live()
     }
 
-    static func uiTesting() -> Self {
+    static func uiTesting(playbackFixture: String? = nil) -> Self {
         do {
             let container = try VPlayerModelContainer.make(inMemory: true)
             let repository = SwiftDataLibraryStore(modelContainer: container)
@@ -186,6 +201,8 @@ struct AppDependencies {
                 prepare: {
                     await seeder.seed()
                 },
+                playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
+                playbackPresentationProvider: { nil },
                 libraryChanges: libraryChanges
             )
         } catch {
@@ -207,7 +224,9 @@ struct AppDependencies {
                     reportStatus: { _ in }
                 ),
                 repository: repository,
-                refresh: refresh
+                refresh: refresh,
+                playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
+                playbackPresentationProvider: { nil }
             )
         }
     }

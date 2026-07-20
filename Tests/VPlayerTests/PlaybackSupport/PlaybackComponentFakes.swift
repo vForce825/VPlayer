@@ -20,6 +20,11 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     private(set) var algorithms: [DeinterlaceAlgorithm] = []
     var stopAutomaticallyCompletes = true
     private var stopContinuation: CheckedContinuation<Void, Never>?
+    let presentationContext: PlaybackPresentationContext?
+
+    init(presentationContext: PlaybackPresentationContext? = nil) {
+        self.presentationContext = presentationContext
+    }
 
     func install(_ sink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) {
         lock.withLock { self.sink = sink }
@@ -378,9 +383,44 @@ final class FakePipelineClock: PlaybackClock, @unchecked Sendable {
 final class FakePlaybackDisplay: PlaybackDisplayControlling, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var operations: [String] = []
+    private var clearAutoCompletes = true
+    private var clearContinuations: [CheckedContinuation<Void, Never>] = []
+    var clearAutomaticallyCompletes: Bool {
+        get { lock.withLock { clearAutoCompletes } }
+        set { lock.withLock { clearAutoCompletes = newValue } }
+    }
+    var isClearWaiting: Bool { lock.withLock { !clearContinuations.isEmpty } }
     func pauseSubmission() { lock.withLock { operations.append("pause") } }
     func resumeSubmission() { lock.withLock { operations.append("resume") } }
-    func clearDisplayCriteria() { lock.withLock { operations.append("clear") } }
+    func resetPresentationTiming() { lock.withLock { operations.append("reset") } }
+    func updateDisplayCriteria(
+        formatDescription _: CMFormatDescription,
+        outputFrameRate: Float
+    ) { lock.withLock { operations.append("criteria:\(outputFrameRate)") } }
+    func clearDisplayCriteria() async {
+        let shouldWait = lock.withLock {
+            operations.append("clear")
+            return !clearAutoCompletes
+        }
+        guard shouldWait else { return }
+        await withCheckedContinuation { continuation in
+            let shouldResume = lock.withLock {
+                guard !clearAutoCompletes else { return true }
+                clearContinuations.append(continuation)
+                return false
+            }
+            if shouldResume { continuation.resume() }
+        }
+    }
+    func completeClear() {
+        let continuations = lock.withLock {
+            clearAutoCompletes = true
+            let pending = clearContinuations
+            clearContinuations.removeAll()
+            return pending
+        }
+        for continuation in continuations { continuation.resume() }
+    }
     func snapshot() -> [String] { lock.withLock { operations } }
 }
 
