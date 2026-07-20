@@ -12,6 +12,13 @@ Linkage: static, built by Scripts/build-ffmpeg.sh
 Local modifications: none; build configuration and component allowlists are
 recorded under Vendor/FFmpeg.
 
+A separate pinned host FFmpeg executable may be built locally as a
+development/test-only YADIF oracle for deterministic pixel fixtures. It is
+created only under ignored build output, is not tracked or distributed, and
+is not linked into the VPlayer application. VPlayer's Metal YADIF shader is an
+independent implementation derived from documented pixel behavior.
+It does not copy FFmpeg source text, comments, naming, or control flow.
+
 The distributed FFmpeg archives include the pinned IJG-derived files
 libavcodec/jfdctfst.c, libavcodec/jfdctint_template.c, and
 libavcodec/jrevdct.c. For executable distributions, documentation must state:

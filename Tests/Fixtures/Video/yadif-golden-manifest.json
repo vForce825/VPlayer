@@ -1,0 +1,33 @@
+{
+  "ffmpegCommit": "38b88335f99e76ed89ff3c93f877fdefce736c13",
+  "files": {
+    "yadif-nv12-bff-input.bin": {
+      "byteCount": 17280,
+      "sha256": "905ac6a4fb566856e6816e89727c2e00cd606b28eb7b2276e85820142e37e41a"
+    },
+    "yadif-nv12-bff.bin": {
+      "byteCount": 20736,
+      "sha256": "9f35c65f93b68250186c1773bbe85b619b665e1506ce71a02bad260bd439ebc0"
+    },
+    "yadif-nv12-tff-input.bin": {
+      "byteCount": 17280,
+      "sha256": "905ac6a4fb566856e6816e89727c2e00cd606b28eb7b2276e85820142e37e41a"
+    },
+    "yadif-nv12-tff.bin": {
+      "byteCount": 20736,
+      "sha256": "21f98c4368190f8c677326009cfc592c4dee15983acdcfbe68c787a735311c8d"
+    }
+  },
+  "generatorArguments": {
+    "bff": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
+    "source": "testsrc2=size=64x36:rate=50:duration=0.20",
+    "tff": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
+    "trim": "trim=start_frame=2:end_frame=8"
+  },
+  "height": 36,
+  "inputFrameCount": 5,
+  "outputFrameCount": 6,
+  "pixelFormat": "nv12",
+  "schemaVersion": 1,
+  "width": 64
+}
