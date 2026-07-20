@@ -30,6 +30,28 @@ final class PresentationTimestampNormalizerTests: XCTestCase {
         )
     }
 
+    func testReordersBFramesAcrossEstablishedThirtyThreeBitWrapEpoch() throws {
+        let modulus: UInt64 = 1 << 33
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        sut.configureMaximumReorderDepth(8)
+        let frames = try [
+            decodedFrame(id: 0, rawPTS90k: modulus - 10_800),
+            decodedFrame(id: 1, rawPTS90k: modulus - 3_600),
+            decodedFrame(id: 2, rawPTS90k: modulus - 7_200),
+            decodedFrame(id: 3, rawPTS90k: 0),
+        ]
+
+        let output = frames.flatMap { sut.push($0, discontinuity: false) } + sut.drain()
+
+        XCTAssertEqual(output.map { $0.frame.accessUnitID }, [0, 2, 1, 3])
+        XCTAssertEqual(output.map(ptsValue), [
+            Int64(modulus - 10_800),
+            Int64(modulus - 7_200),
+            Int64(modulus - 3_600),
+            Int64(modulus),
+        ])
+    }
+
     func testEqualTransportPTSUsesAccessUnitIDAsDeterministicTieBreak() throws {
         var sut = PresentationTimestampNormalizer(generation: generation(1))
         sut.configureMaximumReorderDepth(4)
@@ -116,6 +138,9 @@ final class PresentationTimestampNormalizerTests: XCTestCase {
 
     func testRepairsMissingAndDuplicatePTSWithMedianCadence() throws {
         var sut = PresentationTimestampNormalizer(generation: generation(2))
+        // Keep the nil PTS below its latency bound here so this matrix isolates
+        // deterministic PTS repair; the continuous-live test covers expiration.
+        sut.configureMaximumReorderDepth(3)
         let values: [Int64?] = [0, 3_600, 7_200, nil, 7_200, 14_400]
         let frames = try values.enumerated().map { index, value in
             try decodedFrame(id: UInt64(index), pts90k: value, generation: 2)
@@ -124,7 +149,37 @@ final class PresentationTimestampNormalizerTests: XCTestCase {
         let output = frames.flatMap { sut.push($0, discontinuity: false) } + sut.drain()
 
         XCTAssertEqual(output.map(ptsValue), [0, 3_600, 7_200, 10_800, 14_400, 18_000])
+        XCTAssertEqual(output.map { $0.frame.accessUnitID }, [0, 1, 2, 4, 5, 3])
         XCTAssertEqual(output.filter(\.timingWasSynthesized).count, 2)
+    }
+
+    func testMissingPTSExpiresAfterConfiguredDepthOfContinuousTrustedPushes() throws {
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        sut.configureMaximumReorderDepth(2)
+        var output: [NormalizedDecodedFrame] = []
+        for index in 0..<3 {
+            output += sut.push(
+                try decodedFrame(id: UInt64(index), pts90k: Int64(index * 3_600)),
+                discontinuity: false
+            )
+        }
+        output += sut.push(try decodedFrame(id: 99, pts90k: nil), discontinuity: false)
+
+        let firstSubsequent = sut.push(
+            try decodedFrame(id: 3, pts90k: 10_800),
+            discontinuity: false
+        )
+        let secondSubsequent = sut.push(
+            try decodedFrame(id: 4, pts90k: 14_400),
+            discontinuity: false
+        )
+        output += firstSubsequent + secondSubsequent
+
+        XCTAssertEqual(firstSubsequent.map { $0.frame.accessUnitID }, [2])
+        XCTAssertEqual(secondSubsequent.map { $0.frame.accessUnitID }, [99])
+        XCTAssertEqual(secondSubsequent.map(ptsValue), [10_800])
+        XCTAssertEqual(secondSubsequent.map(\.timingWasSynthesized), [true])
+        XCTAssertEqual(output.map { $0.frame.accessUnitID }, [0, 1, 2, 99])
     }
 
     func testDiscontinuityDropsBufferedFramesAndPreservesNewAbsolutePTS() throws {
@@ -378,6 +433,20 @@ private extension PresentationTimestampNormalizerTests {
                     contentLightLevelInfo: nil
                 )
             )
+        )
+    }
+
+    func decodedFrame(
+        id: UInt64,
+        rawPTS90k: UInt64,
+        duration: CMTime = .invalid,
+        generation rawGeneration: UInt64 = 1
+    ) throws -> DecodedVideoFrame {
+        try decodedFrame(
+            id: id,
+            pts90k: Int64(rawPTS90k),
+            duration: duration,
+            generation: rawGeneration
         )
     }
 

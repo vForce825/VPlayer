@@ -40,11 +40,14 @@ public struct PresentationTimestampNormalizer: Sendable {
     private struct PendingFrame: Sendable {
         let frame: DecodedVideoFrame
         let trustedPTS90k: Int64?
-        let insertionOrder: UInt64
+        var stableOrder: Int
+        var missingPushAge: Int
     }
 
     private static let fallback25iDuration = CMTime(value: 1, timescale: 25)
     private static let transportTimescale: CMTimeScale = 90_000
+    private static let minimumReorderDepth = 2
+    private static let maximumReorderDepth = 8
 
     private var generation: MediaGeneration
     private var unwrapper = Timestamp33Unwrapper()
@@ -55,7 +58,6 @@ public struct PresentationTimestampNormalizer: Sendable {
     private var lastExactOutputPTS: CMTime?
     private var nominalFrameDuration: CMTime?
     private var maximumReorderDepth = 2
-    private var nextInsertionOrder: UInt64 = 0
 
     public init(generation: MediaGeneration) {
         self.generation = generation
@@ -71,6 +73,7 @@ public struct PresentationTimestampNormalizer: Sendable {
             resetTimingHistory(generation: frame.generation)
         }
 
+        agePendingMissingFramesForNewPush()
         let trustedPTS90k = frame.parserMetadata.sourcePTS90k.map { rawPTS in
             unwrapper.unwrap(raw: rawPTS)
         }
@@ -78,15 +81,16 @@ public struct PresentationTimestampNormalizer: Sendable {
             PendingFrame(
                 frame: frame,
                 trustedPTS90k: trustedPTS90k,
-                insertionOrder: nextInsertionOrder
+                stableOrder: pending.count,
+                missingPushAge: 0
             )
         )
-        nextInsertionOrder &+= 1
         pending.sort(by: pendingFramePrecedes)
 
         var output: [NormalizedDecodedFrame] = []
         while pending.count > maximumReorderDepth {
-            let first = pending.removeFirst()
+            let removalIndex = expiredMissingFrameIndex() ?? pending.startIndex
+            let first = pending.remove(at: removalIndex)
             output.append(normalize(first, next: pending.first))
         }
         return output
@@ -102,7 +106,10 @@ public struct PresentationTimestampNormalizer: Sendable {
 
     /// Reorder-depth configuration survives timing resets and is clamped to 2...8.
     public mutating func configureMaximumReorderDepth(_ depth: Int) {
-        maximumReorderDepth = min(max(depth, 2), 8)
+        maximumReorderDepth = min(
+            max(depth, Self.minimumReorderDepth),
+            Self.maximumReorderDepth
+        )
     }
 
     public mutating func drain() -> [NormalizedDecodedFrame] {
@@ -128,7 +135,6 @@ public struct PresentationTimestampNormalizer: Sendable {
         lastTrustedPresentationPTS = nil
         lastOutputPTS = nil
         lastExactOutputPTS = nil
-        nextInsertionOrder = 0
     }
 
     private func pendingFramePrecedes(_ lhs: PendingFrame, _ rhs: PendingFrame) -> Bool {
@@ -145,7 +151,38 @@ public struct PresentationTimestampNormalizer: Sendable {
         if lhs.frame.accessUnitID != rhs.frame.accessUnitID {
             return lhs.frame.accessUnitID < rhs.frame.accessUnitID
         }
-        return lhs.insertionOrder < rhs.insertionOrder
+        return lhs.stableOrder < rhs.stableOrder
+    }
+
+    private mutating func agePendingMissingFramesForNewPush() {
+        for index in pending.indices {
+            pending[index].stableOrder = index
+            if pending[index].trustedPTS90k == nil {
+                pending[index].missingPushAge = min(
+                    pending[index].missingPushAge + 1,
+                    Self.maximumReorderDepth
+                )
+            }
+        }
+    }
+
+    private func expiredMissingFrameIndex() -> Int? {
+        pending.indices
+            .filter {
+                pending[$0].trustedPTS90k == nil
+                    && pending[$0].missingPushAge >= maximumReorderDepth
+            }
+            .min { lhs, rhs in
+                let left = pending[lhs]
+                let right = pending[rhs]
+                if left.missingPushAge != right.missingPushAge {
+                    return left.missingPushAge > right.missingPushAge
+                }
+                if left.frame.accessUnitID != right.frame.accessUnitID {
+                    return left.frame.accessUnitID < right.frame.accessUnitID
+                }
+                return left.stableOrder < right.stableOrder
+            }
     }
 
     private mutating func normalize(
