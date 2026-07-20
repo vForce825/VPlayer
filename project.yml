@@ -87,6 +87,9 @@ targets:
       - path: Tests/Fixtures/epg
         type: folder
         buildPhase: resources
+      - path: Tests/Fixtures/Video
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: VPlayerCore
       - target: VPlayerPlayback
