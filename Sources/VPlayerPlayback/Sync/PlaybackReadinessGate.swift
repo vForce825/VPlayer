@@ -37,7 +37,7 @@ public final class PlaybackReadinessGate {
 
     private let clock: PlaybackClock
     private let hostTimeProvider: () -> CMTime
-    private let prepareAnchor: ((CMTime) -> Bool)?
+    private let prepareAnchorVeto: ((CMTime) -> Bool)?
     private var requiredVideoFrameCount = 1
     private var audio: AudioSnapshot?
     private var video: VideoSnapshot?
@@ -49,24 +49,41 @@ public final class PlaybackReadinessGate {
     public convenience init(
         clock: PlaybackClock,
         hostClock: CMClock = CMClockGetHostTimeClock(),
-        prepareAnchor: ((CMTime) -> Bool)? = nil
+        prepareAnchor: ((CMTime) -> Void)? = nil
     ) {
         self.init(
             clock: clock,
             hostTime: { CMClockGetTime(hostClock) },
-            prepareAnchor: prepareAnchor
+            prepareAnchorVeto: prepareAnchor.map { prepare in
+                { time in
+                    prepare(time)
+                    return true
+                }
+            }
+        )
+    }
+
+    convenience init(
+        clock: PlaybackClock,
+        hostClock: CMClock = CMClockGetHostTimeClock(),
+        prepareAnchorVeto: @escaping (CMTime) -> Bool
+    ) {
+        self.init(
+            clock: clock,
+            hostTime: { CMClockGetTime(hostClock) },
+            prepareAnchorVeto: prepareAnchorVeto
         )
     }
 
     init(
         clock: PlaybackClock,
         hostTime: @escaping () -> CMTime,
-        prepareAnchor: ((CMTime) -> Bool)?,
+        prepareAnchorVeto: ((CMTime) -> Bool)?,
         initialCycleID: UInt64 = 0
     ) {
         self.clock = clock
         hostTimeProvider = hostTime
-        self.prepareAnchor = prepareAnchor
+        self.prepareAnchorVeto = prepareAnchorVeto
         cycleID = initialCycleID
         clock.pause()
     }
@@ -164,7 +181,7 @@ public final class PlaybackReadinessGate {
             return false
         }
         let openingCycle = cycleID
-        guard prepareAnchor?(commonPTS) != false,
+        guard prepareAnchorVeto?(commonPTS) != false,
               cycleID == openingCycle,
               !isOpen,
               !waitingForDisplayModeEnd,

@@ -32,6 +32,13 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
     func enqueue(_ sample: CompressedAudioSample) throws
     func flush(to generation: MediaGeneration)
     func stop()
+    func stopAwaitingRendererRemoval() async
+}
+
+public extension AudioRenderPipelineProtocol {
+    func stopAwaitingRendererRemoval() async {
+        stop()
+    }
 }
 
 struct AudioRendererIdentity: RawRepresentable, Hashable, Sendable {

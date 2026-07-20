@@ -111,6 +111,8 @@ struct PlaybackPipelineSnapshot: Sendable {
 }
 
 final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
+    private typealias StopCompletion = @Sendable () -> Void
+
     private struct PreparedAnchor {
         let cycleID: UInt64
         let commonPTS: CMTime
@@ -139,8 +141,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     // Every property below is accessed exclusively from `executor`.
     private var generationController = GenerationController()
     private var consumedFingerprint: MediaFormatFingerprint?
-    private var videoFingerprint: MediaFormatFingerprint?
-    private var audioFingerprint: MediaFormatFingerprint?
+    private var awaitingFreshTrackEpoch = false
+    private var freshVideoFormatArrived = false
+    private var freshAudioFormatArrived = false
+    private var mediaAdmissionOpen = false
     private var trackEpochAlreadyAdvanced = false
     private var readiness: PlaybackReadinessGate?
     private var tracks: DemuxTrackSet?
@@ -155,6 +159,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var paused = false
     private var started = false
     private var terminal = false
+    private var normalStopInProgress = false
+    private var normalStopCompleted = false
+    private var normalStopPublishes = false
+    private var stopCompletions: [StopCompletion] = []
     private var readyPublished = false
     private var readinessCycle: UInt64 = 0
     private var deferredPackets: [DemuxPacket] = []
@@ -201,8 +209,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     func stop() async {
         await withCheckedContinuation { continuation in
             executor.submit { [self] in
-                stopIsolated(publish: true)
-                continuation.resume()
+                stopIsolated(publish: true) {
+                    continuation.resume()
+                }
             }
         }
     }
@@ -306,9 +315,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         guard !started, !terminal else { return }
         started = true
-        readiness = PlaybackReadinessGate(clock: clock) { [weak self] commonPTS in
+        readiness = PlaybackReadinessGate(clock: clock, prepareAnchorVeto: { [weak self] commonPTS in
             self?.prepareAnchorIsolated(commonPTS: commonPTS) == true
-        }
+        })
         readiness?.configure(requiredVideoFrameCount: processor.requiredInputFrameCount)
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
@@ -376,7 +385,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             case let .discontinuity(newTracks):
                 try installTracksIsolated(newTracks, discontinuity: true)
             case .endOfStream:
-                stopIsolated(publish: true)
+                stopIsolated(publish: true, completion: nil)
             case .cancelled:
                 failIsolated(.cancelled)
             case let .failure(error):
@@ -401,7 +410,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         if let tracks, tracks == newTracks, !discontinuity { return }
 
         if tracks == nil {
-            clearTrackEpochFormatsIsolated()
+            beginTrackEpochIsolated()
             let sharedState = AssemblyFormatState(trackSet: newTracks)
             formatState = sharedState
             videoAssembler = try assemblerBuilder.makeVideo(
@@ -429,7 +438,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
 
         tracks = newTracks
-        clearTrackEpochFormatsIsolated()
+        beginTrackEpochIsolated()
         if discontinuity {
             try forceAdvanceGenerationIsolated()
             trackEpochAlreadyAdvanced = true
@@ -457,9 +466,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             switch event {
             case let .format(format, fingerprint):
                 videoFormat = format
-                videoFingerprint = fingerprint
-                try consumeCanonicalFingerprintIsolated()
+                freshVideoFormatArrived = true
+                try consumeCanonicalFingerprintIsolated(latestEventFingerprint: fingerprint)
             case let .accessUnit(accessUnit):
+                guard mediaAdmissionOpen else { return }
                 guard generationController.accepts(accessUnit.generation) else { return }
                 if waitingForRandomAccess {
                     guard accessUnit.isRandomAccess else { return }
@@ -484,9 +494,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             case let .format(format, codec, fingerprint):
                 audioFormat = format
                 audioCodec = codec
-                audioFingerprint = fingerprint
-                try consumeCanonicalFingerprintIsolated()
+                freshAudioFormatArrived = true
+                try consumeCanonicalFingerprintIsolated(latestEventFingerprint: fingerprint)
             case let .sample(sample):
+                guard mediaAdmissionOpen else { return }
                 guard generationController.accepts(sample.generation) else { return }
                 try audio.enqueue(sample)
                 retainedAudio.append(sample)
@@ -508,6 +519,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         guard !terminal else { return }
         switch event {
         case let .frame(frame):
+            guard mediaAdmissionOpen else { return }
             guard generationController.accepts(frame.generation) else { return }
             processor.submit(frame) { [weak self] result in
                 self?.submitOrRun { [weak self] in
@@ -526,7 +538,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         generation: MediaGeneration
     ) {
         assertIsolated()
-        guard !terminal, generationController.accepts(generation) else { return }
+        guard !terminal,
+              mediaAdmissionOpen,
+              generationController.accepts(generation) else { return }
         switch result {
         case let .success(frames):
             for frame in frames where generationController.accepts(frame.generation) {
@@ -546,16 +560,26 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
     }
 
-    private func consumeCanonicalFingerprintIsolated() throws {
+    private func consumeCanonicalFingerprintIsolated(
+        latestEventFingerprint fingerprint: MediaFormatFingerprint
+    ) throws {
         assertIsolated()
-        guard let videoFingerprint,
-              let audioFingerprint,
-              videoFingerprint == audioFingerprint else { return }
-        let fingerprint = videoFingerprint
-        if trackEpochAlreadyAdvanced {
-            trackEpochAlreadyAdvanced = false
+        if awaitingFreshTrackEpoch {
+            guard freshVideoFormatArrived,
+                  freshAudioFormatArrived,
+                  videoFormat != nil,
+                  audioFormat != nil,
+                  audioCodec != nil else { return }
             consumedFingerprint = fingerprint
-            try configureCurrentGenerationIsolated()
+            if trackEpochAlreadyAdvanced {
+                try configureCurrentGenerationIsolated()
+            } else {
+                let next = generationController.forceAdvance()
+                try rebuildForGenerationIsolated(next)
+            }
+            awaitingFreshTrackEpoch = false
+            trackEpochAlreadyAdvanced = false
+            mediaAdmissionOpen = true
             return
         }
         guard consumedFingerprint != fingerprint else { return }
@@ -564,30 +588,34 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         try rebuildForGenerationIsolated(next)
     }
 
-    private func clearTrackEpochFormatsIsolated() {
+    private func beginTrackEpochIsolated() {
         assertIsolated()
+        awaitingFreshTrackEpoch = true
+        freshVideoFormatArrived = false
+        freshAudioFormatArrived = false
+        mediaAdmissionOpen = false
         videoFormat = nil
         audioFormat = nil
         audioCodec = nil
-        videoFingerprint = nil
-        audioFingerprint = nil
         trackEpochAlreadyAdvanced = false
+        waitingForRandomAccess = true
+        readyPublished = false
+        readiness?.close(.discontinuity)
+        display.pauseSubmission()
     }
 
     private func configureCurrentGenerationIsolated() throws {
         assertIsolated()
+        guard let videoFormat, let audioFormat, let audioCodec else { return }
         let generation = generationController.current
-        if let videoFormat {
-            try decoder.configure(
-                format: videoFormat,
-                generation: generation,
-                configuration: .bothFields
-            )
-            decoderConfigured = true
-        }
-        if let audioFormat, let audioCodec {
-            try audio.configure(format: audioFormat, codec: audioCodec, generation: generation)
-        }
+        try decoder.configure(
+            format: videoFormat,
+            generation: generation,
+            configuration: .bothFields
+        )
+        decoderConfigured = true
+        try audio.configure(format: audioFormat, codec: audioCodec, generation: generation)
+        mediaAdmissionOpen = true
     }
 
     private func forceAdvanceGenerationIsolated() throws {
@@ -601,6 +629,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         clock.pause()
         readiness?.close(.discontinuity)
         readyPublished = false
+        mediaAdmissionOpen = false
         waitingForRandomAccess = true
 
         if decoderConfigured {
@@ -671,7 +700,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func updateReadinessIsolated() {
         assertIsolated()
-        guard !terminal, !paused, let readiness else { return }
+        guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         let expectedGeneration = generationController.current
         let expectedCycle = readiness.cycleID
         let wasOpen = readiness.isOpen
@@ -795,9 +824,27 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         return overlappingVideoCount >= processor.requiredInputFrameCount
     }
 
-    private func stopIsolated(publish: Bool) {
+    private func stopIsolated(
+        publish: Bool,
+        completion: StopCompletion?
+    ) {
         assertIsolated()
-        guard !terminal else { return }
+        if normalStopCompleted {
+            completion?()
+            return
+        }
+        if normalStopInProgress {
+            normalStopPublishes = normalStopPublishes || publish
+            if let completion { stopCompletions.append(completion) }
+            return
+        }
+        guard !terminal else {
+            completion?()
+            return
+        }
+        normalStopInProgress = true
+        normalStopPublishes = publish
+        if let completion { stopCompletions.append(completion) }
         terminal = true
         demuxer.cancel()
         releasePendingAdmissionIsolated()
@@ -813,14 +860,27 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         processor.reset(to: generation)
         renderer.flush(to: generation)
         audio.flush(to: generation)
-        audio.stop()
         readiness?.close(.flush)
         retainedAudio.removeAll(keepingCapacity: false)
         retainedVideo.removeAll(keepingCapacity: false)
         deferredPackets.removeAll(keepingCapacity: false)
         display.pauseSubmission()
+        Task { [self] in
+            await audio.stopAwaitingRendererRemoval()
+            executor.submit { [self] in completeNormalStopIsolated() }
+        }
+    }
+
+    private func completeNormalStopIsolated() {
+        assertIsolated()
+        guard normalStopInProgress, !normalStopCompleted else { return }
+        normalStopInProgress = false
+        normalStopCompleted = true
         display.clearDisplayCriteria()
-        if publish { eventSink(.stopped) }
+        if normalStopPublishes { eventSink(.stopped) }
+        let completions = stopCompletions
+        stopCompletions.removeAll(keepingCapacity: false)
+        for completion in completions { completion() }
     }
 
     private func failIsolated(_ error: PlaybackCoreError) {

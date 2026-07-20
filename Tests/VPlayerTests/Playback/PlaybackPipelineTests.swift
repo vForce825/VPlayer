@@ -321,19 +321,24 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(postDiscontinuityFormat.generation, MediaGeneration(rawValue: generation.rawValue + 2))
     }
 
-    func testCanonicalFingerprintWaitsForBothFreshFormatsInEitherOrder() async throws {
+    func testCanonicalFingerprintUsesLatestCompleteEventAfterDistinctPartialInEitherOrder() async throws {
         for videoFirst in [true, false] {
             let harness = makeHarness()
             harness.pipeline.start(url: makeRequest().streamURL)
             try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
             harness.demux.emit(.tracks(PlaybackFakeMedia.tracks()))
             try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
-            let fingerprint = MediaFormatFingerprint(bytes: Data([0x0A]))
+            let partialFingerprint = MediaFormatFingerprint(bytes: Data([0x0A]))
+            let completeFingerprint = MediaFormatFingerprint(bytes: Data([0x0B]))
 
             if videoFirst {
-                harness.pipeline.receive(video: .format(try PlaybackFakeMedia.videoFormat(), fingerprint))
+                harness.pipeline.receive(video: .format(
+                    try PlaybackFakeMedia.videoFormat(), partialFingerprint
+                ))
             } else {
-                harness.pipeline.receive(audio: .format(try PlaybackFakeMedia.audioFormat(), .aac, fingerprint))
+                harness.pipeline.receive(audio: .format(
+                    try PlaybackFakeMedia.audioFormat(), .aac, partialFingerprint
+                ))
             }
             try await Task.sleep(for: .milliseconds(20))
             let oneSidedGeneration = await harness.pipeline.debugSnapshot().generation
@@ -342,9 +347,13 @@ final class PlaybackPipelineTests: XCTestCase {
             XCTAssertTrue(harness.audio.snapshot().configured.isEmpty)
 
             if videoFirst {
-                harness.pipeline.receive(audio: .format(try PlaybackFakeMedia.audioFormat(), .aac, fingerprint))
+                harness.pipeline.receive(audio: .format(
+                    try PlaybackFakeMedia.audioFormat(), .aac, completeFingerprint
+                ))
             } else {
-                harness.pipeline.receive(video: .format(try PlaybackFakeMedia.videoFormat(), fingerprint))
+                harness.pipeline.receive(video: .format(
+                    try PlaybackFakeMedia.videoFormat(), completeFingerprint
+                ))
             }
             try await eventually { (await harness.pipeline.debugSnapshot()).generation == MediaGeneration(rawValue: 1) }
             XCTAssertEqual(harness.decoder.snapshot().filter {
@@ -353,6 +362,210 @@ final class PlaybackPipelineTests: XCTestCase {
             }, [.configure(MediaGeneration(rawValue: 1), .bothFields)])
             XCTAssertEqual(harness.audio.snapshot().configured.map(\.1), [MediaGeneration(rawValue: 1)])
         }
+    }
+
+    func testRealSharedStateAssemblersDeliverPartialThenCompleteAndDropFirstSideMedia() async throws {
+        for videoFirst in [true, false] {
+            let builder = AssemblerBackedPlaybackBuilder()
+            let harness = makeHarness(playbackAssemblerBuilder: builder)
+            harness.pipeline.start(url: makeRequest().streamURL)
+            try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
+            harness.demux.emit(.tracks(PlaybackFakeMedia.tracks(audioExtradata: Data())))
+            try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
+
+            harness.demux.emit(.packet(
+                videoFirst
+                    ? PlaybackFakeMedia.videoPacket(marker: 1)
+                    : PlaybackFakeMedia.audioPacket(id: 1)
+            ))
+            try await eventually { builder.formatFingerprintsSnapshot.count == 1 }
+            let firstSideSnapshot = await harness.pipeline.debugSnapshot()
+            XCTAssertEqual(firstSideSnapshot.generation.rawValue, 0)
+            XCTAssertFalse(harness.decoder.snapshot().contains {
+                if case .decode = $0 { return true }
+                return false
+            })
+            XCTAssertTrue(harness.audio.snapshot().samples.isEmpty)
+
+            harness.demux.emit(.packet(
+                videoFirst
+                    ? PlaybackFakeMedia.audioPacket(id: 2)
+                    : PlaybackFakeMedia.videoPacket(marker: 1)
+            ))
+            try await eventually { (await harness.pipeline.debugSnapshot()).generation.rawValue == 1 }
+            let fingerprints = builder.formatFingerprintsSnapshot
+            XCTAssertEqual(fingerprints.count, 2)
+            XCTAssertNotEqual(fingerprints[0], fingerprints[1])
+
+            let generation = (await harness.pipeline.debugSnapshot()).generation
+            if videoFirst {
+                XCTAssertEqual(harness.audio.snapshot().samples.map(\.generation), [generation])
+                XCTAssertFalse(harness.decoder.snapshot().contains {
+                    if case .decode = $0 { return true }
+                    return false
+                })
+                harness.demux.emit(.packet(PlaybackFakeMedia.videoPacket(marker: 1, pts: 93_000)))
+            } else {
+                XCTAssertTrue(harness.audio.snapshot().samples.isEmpty)
+                harness.demux.emit(.packet(PlaybackFakeMedia.audioPacket(id: 2)))
+            }
+            try await eventually {
+                harness.decoder.snapshot().contains {
+                    if case let .decode(_, decodedGeneration, _) = $0 {
+                        return decodedGeneration == generation
+                    }
+                    return false
+                } && harness.audio.snapshot().samples.contains { $0.generation == generation }
+            }
+        }
+    }
+
+    func testInEpochSingleSideFormatChangesImmediatelyRebuildWithCurrentOppositeDescription() async throws {
+        let harness = makeHarness()
+        let initial = try await configure(harness)
+
+        harness.pipeline.receive(video: .format(
+            try PlaybackFakeMedia.videoFormat(),
+            MediaFormatFingerprint(bytes: Data([0x21]))
+        ))
+        try await eventually {
+            (await harness.pipeline.debugSnapshot()).generation.rawValue == initial.rawValue + 1
+        }
+        let afterVideo = (await harness.pipeline.debugSnapshot()).generation
+        XCTAssertEqual(harness.audio.snapshot().configured.map(\.1), [initial, afterVideo])
+
+        harness.pipeline.receive(audio: .format(
+            try PlaybackFakeMedia.audioFormat(),
+            .aac,
+            MediaFormatFingerprint(bytes: Data([0x22]))
+        ))
+        try await eventually {
+            (await harness.pipeline.debugSnapshot()).generation.rawValue == afterVideo.rawValue + 1
+        }
+        let afterAudio = (await harness.pipeline.debugSnapshot()).generation
+        XCTAssertEqual(harness.audio.snapshot().configured.map(\.1), [initial, afterVideo, afterAudio])
+        XCTAssertEqual(harness.decoder.snapshot().filter {
+            if case .configure = $0 { return true }
+            return false
+        }, [
+            .configure(initial, .bothFields),
+            .configure(afterVideo, .bothFields),
+            .configure(afterAudio, .bothFields),
+        ])
+    }
+
+    func testChangedTrackAndDiscontinuityEpochsDropMediaUntilBothFreshFormatsThenGateVideoOnRandomAccess() async throws {
+        for discontinuity in [false, true] {
+            let harness = makeHarness()
+            let initial = try await configure(harness)
+            let updatedTracks = PlaybackFakeMedia.tracks(videoExtradata: Data([0x01]))
+            harness.demux.emit(discontinuity ? .discontinuity(updatedTracks) : .tracks(updatedTracks))
+            if discontinuity {
+                try await eventually {
+                    (await harness.pipeline.debugSnapshot()).generation.rawValue == initial.rawValue + 1
+                }
+            }
+            let awaitingGeneration = (await harness.pipeline.debugSnapshot()).generation
+            let operationsBeforeFirstFormatMedia = harness.decoder.snapshot()
+            let audioSamplesBeforeFirstFormatMedia = harness.audio.snapshot().samples
+
+            harness.pipeline.receive(video: .format(
+                try PlaybackFakeMedia.videoFormat(),
+                MediaFormatFingerprint(bytes: Data([0x31]))
+            ))
+            harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+                id: 31,
+                generation: awaitingGeneration,
+                randomAccess: true
+            )))
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: 31,
+                generation: awaitingGeneration,
+                pts: .zero,
+                duration: CMTime(value: 1, timescale: 4)
+            )))
+            try await Task.sleep(for: .milliseconds(20))
+            XCTAssertEqual(harness.decoder.snapshot(), operationsBeforeFirstFormatMedia)
+            XCTAssertEqual(
+                harness.audio.snapshot().samples.map(\.id),
+                audioSamplesBeforeFirstFormatMedia.map(\.id)
+            )
+
+            harness.pipeline.receive(audio: .format(
+                try PlaybackFakeMedia.audioFormat(),
+                .aac,
+                MediaFormatFingerprint(bytes: Data([0x32]))
+            ))
+            let expectedGeneration = MediaGeneration(rawValue: initial.rawValue + 1)
+            try await eventually {
+                (await harness.pipeline.debugSnapshot()).generation == expectedGeneration
+                    && harness.audio.snapshot().configured.last?.1 == expectedGeneration
+            }
+
+            harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+                id: 32,
+                generation: expectedGeneration,
+                randomAccess: false
+            )))
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: 32,
+                generation: expectedGeneration,
+                pts: CMTime(value: 1, timescale: 4),
+                duration: CMTime(value: 1, timescale: 4)
+            )))
+            harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+                id: 33,
+                generation: expectedGeneration,
+                randomAccess: true
+            )))
+            try await eventually {
+                harness.audio.snapshot().samples.contains { $0.id == 32 }
+                    && harness.decoder.snapshot().contains(.decode(
+                        33,
+                        expectedGeneration,
+                        ._EnableAsynchronousDecompression
+                    ))
+            }
+            XCTAssertFalse(harness.decoder.snapshot().contains {
+                if case let .decode(id, _, _) = $0 { return id == 32 }
+                return false
+            })
+        }
+    }
+
+    func testAwaitingFreshTrackEpochRejectsPriorProcessorCompletionAndReadinessRefresh() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+        harness.pipeline.receive(decoder: .frame(try PlaybackFakeMedia.decodedFrame(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            interlaced: false
+        )))
+        try await eventually { harness.clock.snapshot().anchors.count == 1 }
+
+        harness.processor.setAutomaticallyCompletes(false)
+        harness.pipeline.receive(decoder: .frame(try PlaybackFakeMedia.decodedFrame(
+            id: 99,
+            generation: generation,
+            pts: CMTime(value: 1, timescale: 25),
+            interlaced: false
+        )))
+        try await eventually { harness.processor.snapshot().metadata.count == 2 }
+        harness.demux.emit(.tracks(PlaybackFakeMedia.tracks(videoExtradata: Data([0x44]))))
+        harness.processor.completePending()
+        harness.pipeline.refreshReadiness()
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertFalse(harness.renderer.snapshot().frames.contains { $0.sourceAccessUnitID == 99 })
+        XCTAssertEqual(harness.clock.snapshot().anchors.count, 1)
     }
 
     func testChangedTracksNeverMixStaleOppositeFormatAndConsumeCanonicalFingerprintOnce() async throws {
@@ -642,6 +855,33 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertFalse(failed.decoder.snapshot().contains(.wait))
     }
 
+    func testEOSAndConcurrentExplicitStopAwaitAudioRemovalBeforeOneTerminalCompletion() async throws {
+        let harness = makeHarness()
+        _ = try await configure(harness)
+        harness.audio.stopAutomaticallyCompletes = false
+
+        harness.demux.emit(.endOfStream)
+        try await eventually { harness.audio.snapshot().isStopWaiting }
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        XCTAssertFalse(harness.display.snapshot().contains("clear"))
+
+        let stopFinished = LockedFlag()
+        let explicitStop = Task {
+            await harness.pipeline.stop()
+            stopFinished.set()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertFalse(stopFinished.value)
+        XCTAssertEqual(harness.audio.snapshot().stops, 1)
+
+        harness.audio.completeStop()
+        await explicitStop.value
+        XCTAssertTrue(stopFinished.value)
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+        XCTAssertEqual(harness.display.snapshot().filter { $0 == "clear" }.count, 1)
+        XCTAssertEqual(harness.audio.snapshot().stops, 1)
+    }
+
     func testNormalStopIsolatesEveryDrainAndDecoderStageFailure() async throws {
         enum Stage { case videoDrain, audioDrain, finish, wait }
         for stage in [Stage.videoDrain, .audioDrain, .finish, .wait] {
@@ -713,7 +953,10 @@ final class PlaybackPipelineTests: XCTestCase {
         return (await harness.pipeline.debugSnapshot()).generation
     }
 
-    private func makeHarness(requiredVideoFrames: Int = 1) -> Harness {
+    private func makeHarness(
+        requiredVideoFrames: Int = 1,
+        playbackAssemblerBuilder: (any PlaybackAssemblerBuilding)? = nil
+    ) -> Harness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.pipeline")
         let demux = FakePipelineDemuxer()
         let assemblers = FakePlaybackAssemblerBuilder()
@@ -727,7 +970,7 @@ final class PlaybackPipelineTests: XCTestCase {
         let pipeline = PlaybackPipeline(
             executor: executor,
             demuxer: demux,
-            assemblerBuilder: assemblers,
+            assemblerBuilder: playbackAssemblerBuilder ?? assemblers,
             decoder: decoder,
             processor: processor,
             renderer: renderer,

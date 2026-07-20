@@ -10,6 +10,109 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
+    func testAwaitedStopCompletesExactlyOnceAfterRemovalSuccessFailureAndRepeatedCalls() async throws {
+        for didRemove in [true, false] {
+            let harness = try makeHarness()
+            let completions = LockedAudioCompletionCount()
+            let first = Task {
+                await harness.pipeline.stopAwaitingRendererRemoval()
+                completions.increment()
+            }
+            let second = Task {
+                await harness.pipeline.stopAwaitingRendererRemoval()
+                completions.increment()
+            }
+
+            try await eventually { harness.synchronizer.removalCount == 1 }
+            XCTAssertEqual(completions.value, 0)
+            harness.synchronizer.completeRemoval(didRemove: didRemove)
+            await first.value
+            await second.value
+            XCTAssertEqual(completions.value, 2)
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+
+            harness.synchronizer.completeRemoval(didRemove: didRemove)
+            drain(harness.executor)
+            XCTAssertEqual(completions.value, 2)
+            await harness.pipeline.stopAwaitingRendererRemoval()
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        }
+    }
+
+    func testAwaitedStopHandlesNoRendererAndPendingConfigureRemovalWithoutCreatingReplacement() async throws {
+        let unconfigured = try makeHarness(configure: false)
+        await unconfigured.pipeline.stopAwaitingRendererRemoval()
+        XCTAssertEqual(unconfigured.synchronizer.removalCount, 0)
+
+        let pending = try makeHarness()
+        try perform(on: pending.executor) {
+            try pending.pipeline.configure(
+                format: try self.makeFormat(codec: .ac3),
+                codec: .ac3,
+                generation: MediaGeneration(rawValue: 2)
+            )
+        }
+        XCTAssertEqual(pending.synchronizer.removalCount, 1)
+        let completion = LockedAudioCompletionCount()
+        let stop = Task {
+            await pending.pipeline.stopAwaitingRendererRemoval()
+            completion.increment()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        drain(pending.executor)
+        XCTAssertEqual(completion.value, 0)
+
+        pending.synchronizer.completeRemoval(didRemove: true)
+        await stop.value
+        XCTAssertEqual(completion.value, 1)
+        XCTAssertEqual(pending.renderers.snapshot.count, 1)
+    }
+
+    func testSynchronousStopStronglyRetainsCleanupUntilAsynchronousRemovalCallback() async throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.stop-retention")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let decoderFactory = FakePCMAudioDecoderFactory { _ in [] }
+        let routeMonitor = FakeAudioRouteMonitor()
+        let support = FakeAudioFormatSupportChecker()
+        let failures = LockedAudioFailures(executor: executor)
+        weak var weakPipeline: AudioRenderPipeline?
+
+        do {
+            let pipeline = AudioRenderPipeline(
+                synchronizer: synchronizer,
+                executor: executor,
+                failureSink: { error, generation in failures.append(error, generation: generation) },
+                rendererFactory: renderers,
+                decoderFactory: decoderFactory,
+                routeMonitor: routeMonitor,
+                supportChecker: support
+            )
+            weakPipeline = pipeline
+            try perform(on: executor) {
+                try pipeline.configure(
+                    format: try self.makeFormat(codec: .aac),
+                    codec: .aac,
+                    generation: MediaGeneration(rawValue: 1)
+                )
+                pipeline.stop()
+            }
+        }
+
+        XCTAssertNotNil(weakPipeline)
+        XCTAssertEqual(synchronizer.removalCount, 1)
+        synchronizer.completeRemoval(didRemove: true)
+        drain(executor)
+        synchronizer.releaseRemoval()
+        try await eventually { weakPipeline == nil }
+    }
+
+    func testCompletionAwareProtocolRequirementDefaultsToLegacySynchronousStop() async {
+        let legacy: any AudioRenderPipelineProtocol = LegacySynchronousAudioPipeline()
+        await legacy.stopAwaitingRendererRemoval()
+        XCTAssertEqual((legacy as? LegacySynchronousAudioPipeline)?.stopCount, 1)
+    }
+
     func testAllSupportedCodecsStartCompressedAttachBeforeFirstEnqueue() throws {
         for codec in [VPlayerPlayback.AudioCodec.aac, .ac3, .eac3, .mp2] {
             let harness = try makeHarness(codec: codec)
@@ -897,7 +1000,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func makeHarness(codec: VPlayerPlayback.AudioCodec = .aac) throws -> AudioHarness {
+    private func makeHarness(
+        codec: VPlayerPlayback.AudioCodec = .aac,
+        configure: Bool = true
+    ) throws -> AudioHarness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -916,12 +1022,14 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             routeMonitor: routeMonitor,
             supportChecker: support
         )
-        try perform(on: executor) {
-            try pipeline.configure(
-                format: try self.makeFormat(codec: codec),
-                codec: codec,
-                generation: MediaGeneration(rawValue: 1)
-            )
+        if configure {
+            try perform(on: executor) {
+                try pipeline.configure(
+                    format: try self.makeFormat(codec: codec),
+                    codec: codec,
+                    generation: MediaGeneration(rawValue: 1)
+                )
+            }
         }
         return AudioHarness(
             executor: executor, synchronizer: synchronizer, renderers: renderers,
@@ -1023,6 +1131,19 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         wait(for: [completed], timeout: 5)
     }
 
+    private func eventually(
+        timeout: Duration = .seconds(2),
+        _ condition: @escaping () -> Bool
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("condition was not satisfied before timeout")
+    }
+
     private func assertCoreError(
         _ expected: PlaybackCoreError,
         file: StaticString = #filePath,
@@ -1098,6 +1219,29 @@ private final class LockedAudioCallResult: @unchecked Sendable {
     private var stored: Error?
     func store(_ error: Error?) { lock.lock(); stored = error; lock.unlock() }
     var error: Error? { lock.lock(); defer { lock.unlock() }; return stored }
+}
+
+private final class LockedAudioCompletionCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = 0
+    var value: Int { lock.withLock { stored } }
+    func increment() { lock.withLock { stored += 1 } }
+}
+
+private final class LegacySynchronousAudioPipeline: AudioRenderPipelineProtocol {
+    var isReadyForPlayback = false
+    var route = AudioRoute.systemCompressed
+    private(set) var stopCount = 0
+
+    func configure(
+        format _: CMAudioFormatDescription,
+        codec _: VPlayerPlayback.AudioCodec,
+        generation _: MediaGeneration
+    ) throws {}
+
+    func enqueue(_: CompressedAudioSample) throws {}
+    func flush(to _: MediaGeneration) {}
+    func stop() { stopCount += 1 }
 }
 
 private func formatID(for codec: VPlayerPlayback.AudioCodec) -> AudioFormatID {

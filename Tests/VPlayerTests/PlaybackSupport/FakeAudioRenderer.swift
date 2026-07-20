@@ -234,6 +234,10 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
         completion(didRemove)
     }
 
+    func releaseRemoval(index: Int = 0) {
+        withLock { removals.remove(at: index) }
+    }
+
     var operationSnapshot: [String] { withLock { operations } }
     var attachedSnapshot: [AudioRendererIdentity] { withLock { attached } }
     var rateSnapshot: [(Float, CMTime)] { withLock { rateChanges } }

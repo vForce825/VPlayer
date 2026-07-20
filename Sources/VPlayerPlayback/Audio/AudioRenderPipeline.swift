@@ -7,6 +7,8 @@ import CoreMedia
 import Foundation
 
 final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendable {
+    private typealias StopCompletion = @Sendable () -> Void
+
     static let replayCapacityError = "audio.replay.capacity"
     static let removalFailedError = "audio.renderer.remove"
     static let unsupportedPCMError = "audio.pcm.unsupported"
@@ -78,6 +80,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var recoveryScheduled = false
     private var pendingRecovery: PendingRecovery?
     private var pendingRemoval: PendingRemoval?
+    private var stopCompletions: [StopCompletion] = []
     private var currentOutput = AudioOutputCategory.other
 
     convenience init(
@@ -235,9 +238,32 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     func stop() {
+        requestStop(completion: nil)
+    }
+
+    func stopAwaitingRendererRemoval() async {
+        await withCheckedContinuation { continuation in
+            requestStop {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func requestStop(completion: StopCompletion?) {
         guard executor.isIsolated else {
-            executor.submit { [weak self] in self?.stop() }
+            executor.submit { [self] in stopIsolated(completion: completion) }
             return
+        }
+        stopIsolated(completion: completion)
+    }
+
+    private func stopIsolated(completion: StopCompletion?) {
+        if let completion {
+            if stopped, pendingRemoval == nil {
+                completion()
+                return
+            }
+            stopCompletions.append(completion)
         }
         guard !stopped else { return }
         if let newEpoch = takeEpochWithoutThrow() { epoch = newEpoch }
@@ -261,6 +287,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             beginRemoval(of: renderer, continuation: .stop)
         } else {
             replacing = false
+            completeStopCompletions()
         }
         decoder?.destroy()
         decoder = nil
@@ -268,6 +295,12 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         replay.removeAll(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
         updateSnapshot(route: route, ready: false)
+    }
+
+    private func completeStopCompletions() {
+        let completions = stopCompletions
+        stopCompletions.removeAll(keepingCapacity: false)
+        for completion in completions { completion() }
     }
 
     private func takeEpoch() throws -> UInt64 {
@@ -587,10 +620,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             continuation: continuation
         )
         pendingRemoval = transition
-        synchronizer.remove(renderer, at: .invalid) { [weak self] didRemove in
-            guard let self else { return }
-            executor.submit { [weak self] in
-                self?.completeRemoval(
+        synchronizer.remove(renderer, at: .invalid) { [self] didRemove in
+            executor.submit { [self] in
+                completeRemoval(
                     didRemove: didRemove,
                     rendererID: transition.rendererID,
                     originEpoch: transition.originEpoch,
@@ -621,6 +653,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             guard stopped, !configured else { return }
         }
         pendingRemoval = nil
+        completeStopCompletions()
         guard didRemove else {
             if transition.continuation == .stop {
                 replacing = false

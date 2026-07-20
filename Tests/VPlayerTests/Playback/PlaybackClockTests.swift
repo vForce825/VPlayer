@@ -8,6 +8,27 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackClockTests: XCTestCase {
+    func testPublicReadinessInitializerAcceptsOriginalVoidPrepareAnchorClosure() {
+        let clock = FakePlaybackClock()
+        var prepared: [CMTime] = []
+        let prepareAnchor: (CMTime) -> Void = { prepared.append($0) }
+        let gate = PlaybackReadinessGate(
+            clock: clock,
+            hostClock: CMClockGetHostTimeClock(),
+            prepareAnchor: prepareAnchor
+        )
+        gate.configure(requiredVideoFrameCount: 1)
+        gate.updateAudio(
+            firstPTS: .zero,
+            contiguousDuration: CMTime(value: 1, timescale: 4),
+            isContiguous: true
+        )
+        gate.updateVideo(firstPTS: .zero, readyFrameCount: 1)
+
+        XCTAssertEqual(prepared, [.zero])
+        XCTAssertTrue(gate.isOpen)
+    }
+
     func testRenderSynchronizerClockOwnsCallerSynchronizerAndUsesInjectedExactTimeConversion() {
         let synchronizer = AVSampleBufferRenderSynchronizer()
         var convertedHostTimes: [CMTime] = []
@@ -136,7 +157,7 @@ final class PlaybackClockTests: XCTestCase {
         let gate = PlaybackReadinessGate(
             clock: clock,
             hostTime: { CMTime(value: 100, timescale: 1) },
-            prepareAnchor: {
+            prepareAnchorVeto: {
                 order.append("prepare")
                 XCTAssertEqual($0, CMTime(value: 10_001, timescale: 1_000))
                 return true
@@ -213,7 +234,7 @@ final class PlaybackClockTests: XCTestCase {
         let gate = PlaybackReadinessGate(
             clock: clock,
             hostTime: { .zero },
-            prepareAnchor: {
+            prepareAnchorVeto: {
                 prepared.append($0)
                 return false
             }
@@ -288,7 +309,7 @@ final class PlaybackClockTests: XCTestCase {
         let gate = PlaybackReadinessGate(
             clock: clock,
             hostTime: { .zero },
-            prepareAnchor: nil,
+            prepareAnchorVeto: nil,
             initialCycleID: UInt64.max - 1
         )
         gate.close(.flush)
@@ -302,7 +323,7 @@ final class PlaybackClockTests: XCTestCase {
         let gate = PlaybackReadinessGate(
             clock: clock,
             hostTime: { CMTime(value: 100, timescale: 1) },
-            prepareAnchor: nil
+            prepareAnchorVeto: nil
         )
         gate.configure(requiredVideoFrameCount: requiredVideoCount)
         return GateHarness(gate: gate, clock: clock)

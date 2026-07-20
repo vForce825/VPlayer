@@ -172,10 +172,14 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
 }
 
 final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendable {
+    private typealias PendingCompletion = @Sendable () -> Void
+
     private let lock = NSLock()
     let requiredInputFrameCount: Int
     private(set) var resetGenerations: [MediaGeneration] = []
     private(set) var submittedMetadata: [VideoParserMetadata] = []
+    private var automaticallyCompletes = true
+    private var pendingCompletions: [PendingCompletion] = []
 
     init(requiredInputFrameCount: Int = 1) {
         self.requiredInputFrameCount = requiredInputFrameCount
@@ -189,16 +193,37 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
         _ frame: DecodedVideoFrame,
         completion: @escaping @Sendable (Result<[VideoPresentationFrame], PlaybackFailure>) -> Void
     ) {
-        lock.withLock { submittedMetadata.append(frame.parserMetadata) }
-        completion(.success([VideoPresentationFrame(
-            storage: .pixelBuffer(frame.pixelBuffer),
-            presentationTimeStamp: frame.presentationTimeStamp,
-            duration: frame.duration,
-            generation: frame.generation,
-            sequenceNumber: frame.accessUnitID,
-            sourceAccessUnitID: frame.accessUnitID,
-            formatMetadata: frame.formatMetadata
-        )]))
+        let result = Result<[VideoPresentationFrame], PlaybackFailure>.success([
+            VideoPresentationFrame(
+                storage: .pixelBuffer(frame.pixelBuffer),
+                presentationTimeStamp: frame.presentationTimeStamp,
+                duration: frame.duration,
+                generation: frame.generation,
+                sequenceNumber: frame.accessUnitID,
+                sourceAccessUnitID: frame.accessUnitID,
+                formatMetadata: frame.formatMetadata
+            ),
+        ])
+        let shouldComplete = lock.withLock { () -> Bool in
+            submittedMetadata.append(frame.parserMetadata)
+            if !automaticallyCompletes {
+                pendingCompletions.append { completion(result) }
+            }
+            return automaticallyCompletes
+        }
+        if shouldComplete { completion(result) }
+    }
+
+    func setAutomaticallyCompletes(_ value: Bool) {
+        lock.withLock { automaticallyCompletes = value }
+    }
+
+    func completePending() {
+        let completions = lock.withLock { () -> [PendingCompletion] in
+            defer { pendingCompletions.removeAll(keepingCapacity: false) }
+            return pendingCompletions
+        }
+        for completion in completions { completion() }
     }
 
     func snapshot() -> (resets: [MediaGeneration], metadata: [VideoParserMetadata]) {
@@ -244,8 +269,10 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private(set) var samples: [CompressedAudioSample] = []
     private(set) var flushes: [MediaGeneration] = []
     private(set) var stopCount = 0
+    var stopAutomaticallyCompletes = true
     var enqueueError: PlaybackCoreError?
     private var flushHandler: (@Sendable (MediaGeneration) -> Void)?
+    private var stopContinuations: [CheckedContinuation<Void, Never>] = []
 
     var isReadyForPlayback: Bool { lock.withLock { ready } }
     var route: VPlayerPlayback.AudioRoute { lock.withLock { selectedRoute } }
@@ -276,14 +303,42 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
         lock.withLock { stopCount += 1 }
     }
 
+    func stopAwaitingRendererRemoval() async {
+        let shouldWait = lock.withLock { () -> Bool in
+            stopCount += 1
+            return !stopAutomaticallyCompletes
+        }
+        if shouldWait {
+            await withCheckedContinuation { continuation in
+                lock.withLock { stopContinuations.append(continuation) }
+            }
+        }
+    }
+
+    func completeStop() {
+        let continuations = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            defer { stopContinuations.removeAll(keepingCapacity: false) }
+            return stopContinuations
+        }
+        for continuation in continuations { continuation.resume() }
+    }
+
     func setReady(_ value: Bool) { lock.withLock { ready = value } }
 
     func setFlushHandler(_ handler: (@Sendable (MediaGeneration) -> Void)?) {
         lock.withLock { flushHandler = handler }
     }
 
-    func snapshot() -> (configured: [(VPlayerPlayback.AudioCodec, MediaGeneration)], samples: [CompressedAudioSample], flushes: [MediaGeneration], stops: Int) {
-        lock.withLock { (configured, samples, flushes, stopCount) }
+    func snapshot() -> (
+        configured: [(VPlayerPlayback.AudioCodec, MediaGeneration)],
+        samples: [CompressedAudioSample],
+        flushes: [MediaGeneration],
+        stops: Int,
+        isStopWaiting: Bool
+    ) {
+        lock.withLock {
+            (configured, samples, flushes, stopCount, !stopContinuations.isEmpty)
+        }
     }
 }
 
@@ -368,6 +423,65 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
         eventSink _: @escaping @Sendable (AudioAssemblerEvent) -> Void,
         formatState _: AssemblyFormatState
     ) throws -> any AudioSampleAssembling { audio }
+}
+
+final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var formatFingerprints: [MediaFormatFingerprint] = []
+
+    func makeVideo(
+        trackSet: DemuxTrackSet,
+        generationProvider: @escaping @Sendable () -> MediaGeneration,
+        eventSink: @escaping @Sendable (VideoAssemblerEvent) -> Void,
+        formatState: AssemblyFormatState
+    ) throws -> any VideoAccessUnitAssembling {
+        let parserFactory = ScriptedFFmpegParserFactory { handle, _, bytes, pts, dts, _ in
+            var sps = AssemblerTestFixtures.h264SPS
+            if bytes.first == 2 { sps[3] = 0x20 }
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                bytes: AssemblerTestFixtures.h264AccessUnit(sps: sps),
+                pts: pts,
+                dts: dts,
+                duration: CMTime(value: 3_000, timescale: 90_000),
+                keyFrame: true
+            ))
+        }
+        return try CompressedVideoAssembler(
+            trackSet: trackSet,
+            generationProvider: generationProvider,
+            eventSink: { [weak self] event in
+                if case let .format(_, fingerprint) = event {
+                    self?.lock.withLock { self?.formatFingerprints.append(fingerprint) }
+                }
+                eventSink(event)
+            },
+            parserFactory: parserFactory,
+            formatState: formatState
+        )
+    }
+
+    func makeAudio(
+        trackSet: DemuxTrackSet,
+        generationProvider: @escaping @Sendable () -> MediaGeneration,
+        eventSink: @escaping @Sendable (AudioAssemblerEvent) -> Void,
+        formatState: AssemblyFormatState
+    ) throws -> any AudioSampleAssembling {
+        try CompressedAudioAssembler(
+            trackSet: trackSet,
+            generationProvider: generationProvider,
+            eventSink: { [weak self] event in
+                if case let .format(_, _, fingerprint) = event {
+                    self?.lock.withLock { self?.formatFingerprints.append(fingerprint) }
+                }
+                eventSink(event)
+            },
+            formatState: formatState
+        )
+    }
+
+    var formatFingerprintsSnapshot: [MediaFormatFingerprint] {
+        lock.withLock { formatFingerprints }
+    }
 }
 
 enum PlaybackFakeMedia {
@@ -455,6 +569,42 @@ enum PlaybackFakeMedia {
             generation: generation,
             presentationTimeStamp: pts,
             duration: duration
+        )
+    }
+
+    static func videoPacket(marker: UInt8, pts: Int64 = 90_000) -> DemuxPacket {
+        DemuxPacket(
+            streamIndex: 100,
+            codec: .video(.h264),
+            data: Data([marker]),
+            presentationTimeStamp: CMTime(value: pts, timescale: 90_000),
+            decodeTimeStamp: CMTime(value: pts - 3_000, timescale: 90_000),
+            duration: CMTime(value: 3_000, timescale: 90_000),
+            isKey: true,
+            isCorrupt: false
+        )
+    }
+
+    static func audioPacket(id: UInt8) -> DemuxPacket {
+        let payload = Data([id, 0xAA])
+        let frameLength = 7 + payload.count
+        var data = Data([
+            0xFF, 0xF1, 0x4C,
+            UInt8(0x80 | ((frameLength >> 11) & 0x03)),
+            UInt8((frameLength >> 3) & 0xFF),
+            UInt8(((frameLength & 0x07) << 5) | 0x1F),
+            0xFC,
+        ])
+        data.append(payload)
+        return DemuxPacket(
+            streamIndex: 101,
+            codec: .audio(.aac),
+            data: data,
+            presentationTimeStamp: CMTime(value: Int64(id) * 1_920, timescale: 90_000),
+            decodeTimeStamp: .invalid,
+            duration: .invalid,
+            isKey: false,
+            isCorrupt: false
         )
     }
 
