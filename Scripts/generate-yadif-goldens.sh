@@ -7,7 +7,7 @@ reference="$root/Vendor/FFmpeg/Work/yadif-reference/ffmpeg"
 fixtures="$root/Tests/Fixtures/Video"
 lock="$root/Vendor/FFmpeg/ffmpeg.lock.json"
 commit="$(jq -er '.commit' "$lock")"
-source_filter='testsrc2=size=64x36:rate=50:duration=0.20'
+source_filter='testsrc2=size=128x72:rate=50:duration=0.20,scale=64:36:flags=bilinear'
 trim_filter='trim=start_frame=2:end_frame=8'
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/vplayer-yadif.XXXXXX")"
 trap 'rm -rf "$temporary"' EXIT
@@ -48,6 +48,31 @@ tff_graph="format=yuv420p,setfield=tff,separatefields,select='eq(mod(n\,4)\,0)+e
 bff_graph="format=yuv420p,setfield=tff,separatefields,select='eq(mod(n\,4)\,1)+eq(mod(n\,4)\,2)',weave=first_field=bottom"
 generate_order tff "$tff_graph" tff
 generate_order bff "$bff_graph" bff
+
+verify_unique_luma_frames() {
+  local stem="$1"
+  local input="$temporary/yadif-nv12-${stem}-input.bin"
+  local unique_count
+  unique_count="$({
+    for frame in 0 1 2 3 4; do
+      dd if="$input" bs=1 skip="$((frame * 3456))" count=2304 2>/dev/null \
+        | shasum -a 256 | awk '{print $1}'
+    done
+  } | sort -u | wc -l | tr -d ' ')"
+  [[ "$unique_count" == "5" ]] || {
+    echo "${stem} input does not contain five unique luma frames" >&2
+    exit 2
+  }
+}
+
+verify_unique_luma_frames tff
+verify_unique_luma_frames bff
+if cmp -s \
+  "$temporary/yadif-nv12-tff-input.bin" \
+  "$temporary/yadif-nv12-bff-input.bin"; then
+  echo "TFF and BFF inputs are unexpectedly identical" >&2
+  exit 2
+fi
 
 progressive="$temporary/progressive.bin"
 "$reference" -hide_banner -loglevel error -y \

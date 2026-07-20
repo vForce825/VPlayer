@@ -28,6 +28,79 @@ inline int sampleCode(
     return int(round(value * 255.0f));
 }
 
+struct SpatialSearchState {
+    int score;
+    int prediction;
+};
+
+inline int directionalScore(
+    texture2d<float, access::read> current,
+    int x,
+    int aboveY,
+    int belowY,
+    int direction,
+    uint component,
+    bool tenBit
+) {
+    int score = 0;
+    for (int offset = -1; offset <= 1; ++offset) {
+        score += abs(
+            sampleCode(
+                current,
+                x + offset + direction,
+                aboveY,
+                component,
+                tenBit
+            )
+            - sampleCode(
+                current,
+                x + offset - direction,
+                belowY,
+                component,
+                tenBit
+            )
+        );
+    }
+    return score;
+}
+
+inline SpatialSearchState refineDirectionPair(
+    texture2d<float, access::read> current,
+    int x,
+    int aboveY,
+    int belowY,
+    int sign,
+    uint component,
+    bool tenBit,
+    SpatialSearchState state
+) {
+    int nearDirection = sign;
+    int nearScore = directionalScore(
+        current, x, aboveY, belowY, nearDirection, component, tenBit
+    );
+    if (nearScore >= state.score) {
+        return state;
+    }
+    state.score = nearScore;
+    state.prediction = (
+        sampleCode(current, x + nearDirection, aboveY, component, tenBit)
+        + sampleCode(current, x - nearDirection, belowY, component, tenBit)
+    ) >> 1;
+
+    int farDirection = sign * 2;
+    int farScore = directionalScore(
+        current, x, aboveY, belowY, farDirection, component, tenBit
+    );
+    if (farScore < state.score) {
+        state.score = farScore;
+        state.prediction = (
+            sampleCode(current, x + farDirection, aboveY, component, tenBit)
+            + sampleCode(current, x - farDirection, belowY, component, tenBit)
+        ) >> 1;
+    }
+    return state;
+}
+
 inline int spatialPrediction(
     texture2d<float, access::read> current,
     int x,
@@ -45,44 +118,21 @@ inline int spatialPrediction(
         return prediction;
     }
 
-    int bestScore = -1;
+    int defaultScore = -1;
     for (int offset = -1; offset <= 1; ++offset) {
-        bestScore += abs(
+        defaultScore += abs(
             sampleCode(current, x + offset, aboveY, component, tenBit)
             - sampleCode(current, x + offset, belowY, component, tenBit)
         );
     }
-    constexpr int directions[4] = {-2, -1, 1, 2};
-    for (uint index = 0; index < 4; ++index) {
-        int direction = directions[index];
-        int score = 0;
-        for (int offset = -1; offset <= 1; ++offset) {
-            score += abs(
-                sampleCode(
-                    current,
-                    x + offset + direction,
-                    aboveY,
-                    component,
-                    tenBit
-                )
-                - sampleCode(
-                    current,
-                    x + offset - direction,
-                    belowY,
-                    component,
-                    tenBit
-                )
-            );
-        }
-        if (score < bestScore) {
-            bestScore = score;
-            prediction = (
-                sampleCode(current, x + direction, aboveY, component, tenBit)
-                + sampleCode(current, x - direction, belowY, component, tenBit)
-            ) >> 1;
-        }
-    }
-    return prediction;
+    SpatialSearchState state = {defaultScore, prediction};
+    state = refineDirectionPair(
+        current, x, aboveY, belowY, -1, component, tenBit, state
+    );
+    state = refineDirectionPair(
+        current, x, aboveY, belowY, 1, component, tenBit, state
+    );
+    return state.prediction;
 }
 
 inline int synthesize(

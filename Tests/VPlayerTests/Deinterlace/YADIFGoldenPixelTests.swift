@@ -16,6 +16,8 @@ final class YADIFGoldenPixelTests: XCTestCase {
     private static let height = 36
     private static let bytesPerFrame = width * height * 3 / 2
     private static let lockedCommit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
+    private static let sourceRecipe =
+        "testsrc2=size=128x72:rate=50:duration=0.20,scale=64:36:flags=bilinear"
 
     func testPublicContractsAreSendableAndFailureValuesAreExact() throws {
         assertSendable(YADIFJob.self)
@@ -61,7 +63,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertEqual(manifest.pixelFormat, "nv12")
         XCTAssertEqual(manifest.inputFrameCount, 5)
         XCTAssertEqual(manifest.outputFrameCount, 6)
-        XCTAssertEqual(manifest.generatorArguments.source, "testsrc2=size=64x36:rate=50:duration=0.20")
+        XCTAssertEqual(manifest.generatorArguments.source, Self.sourceRecipe)
         XCTAssertEqual(manifest.generatorArguments.trim, "trim=start_frame=2:end_frame=8")
         XCTAssertEqual(Set(manifest.files.keys), Set([
             "yadif-nv12-tff-input.bin",
@@ -77,6 +79,30 @@ final class YADIFGoldenPixelTests: XCTestCase {
             XCTAssertEqual(bytes.count, expectedSize, name)
             XCTAssertEqual(SHA256.hash(data: bytes).hex, entry.sha256, name)
         }
+
+        let interlacedInputs = try ["tff", "bff"].map { stem in
+            try Data(contentsOf: root.appendingPathComponent(
+                "Tests/Fixtures/Video/yadif-nv12-\(stem)-input.bin"
+            ))
+        }
+        for (index, input) in interlacedInputs.enumerated() {
+            let lumaHashes = (0..<5).map { frameIndex in
+                let frameStart = frameIndex * Self.bytesPerFrame
+                return SHA256.hash(data: input.subdata(
+                    in: frameStart..<(frameStart + Self.width * Self.height)
+                )).hex
+            }
+            XCTAssertEqual(
+                Set(lumaHashes).count,
+                5,
+                "\(index == 0 ? "tff" : "bff") must contain five unique luma frames"
+            )
+        }
+        XCTAssertNotEqual(
+            interlacedInputs[0],
+            interlacedInputs[1],
+            "TFF and BFF inputs must exercise different woven pictures"
+        )
     }
 
     func testScriptsPinNonGPLIgnoredHostOracleAndUseAtomicValidatedOutputs() throws {
@@ -105,6 +131,8 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertTrue(build.contains("status --porcelain"))
         XCTAssertTrue(build.contains("CONFIG_GPL 0"))
         XCTAssertTrue(generate.contains("mktemp -d"))
+        XCTAssertTrue(generate.contains(Self.sourceRecipe))
+        XCTAssertFalse(generate.contains("testsrc2=size=64x36"))
         XCTAssertTrue(generate.contains("trim=start_frame=2:end_frame=8"))
         XCTAssertTrue(generate.contains("setfield=tff,separatefields"))
         XCTAssertTrue(generate.contains("eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3)"))
@@ -113,6 +141,9 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertTrue(generate.contains("weave=first_field=bottom"))
         XCTAssertTrue(generate.contains("progressive.bin"))
         XCTAssertTrue(generate.contains("cmp -s - <("))
+        XCTAssertTrue(generate.contains("verify_unique_luma_frames tff"))
+        XCTAssertTrue(generate.contains("verify_unique_luma_frames bff"))
+        XCTAssertTrue(generate.contains("TFF and BFF inputs are unexpectedly identical"))
         XCTAssertTrue(generate.contains("17280"))
         XCTAssertTrue(generate.contains("20736"))
         XCTAssertTrue(generate.contains("jq -n -S"))

@@ -3,24 +3,24 @@
   "files": {
     "yadif-nv12-bff-input.bin": {
       "byteCount": 17280,
-      "sha256": "905ac6a4fb566856e6816e89727c2e00cd606b28eb7b2276e85820142e37e41a"
+      "sha256": "0b01f41b52401b0005e632b1ffdcbe543e31964443d440dc6a3d1c9938251366"
     },
     "yadif-nv12-bff.bin": {
       "byteCount": 20736,
-      "sha256": "9f35c65f93b68250186c1773bbe85b619b665e1506ce71a02bad260bd439ebc0"
+      "sha256": "41184a5a66f6e9d17b7013a60e4246d3f20601a62bc100cf4bc3df80f23c3f69"
     },
     "yadif-nv12-tff-input.bin": {
       "byteCount": 17280,
-      "sha256": "905ac6a4fb566856e6816e89727c2e00cd606b28eb7b2276e85820142e37e41a"
+      "sha256": "e0ed1e6ba6c43867c1b12d5a5c870c76afdbdae4ca65867d878c07711edef325"
     },
     "yadif-nv12-tff.bin": {
       "byteCount": 20736,
-      "sha256": "21f98c4368190f8c677326009cfc592c4dee15983acdcfbe68c787a735311c8d"
+      "sha256": "f3f595225d18b6d7e700481798a8c8e84f093f7728831fe7fd18e0d8277785c1"
     }
   },
   "generatorArguments": {
     "bff": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,1)+eq(mod(n\\,4)\\,2),weave=first_field=bottom,yadif=mode=send_field:parity=bff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
-    "source": "testsrc2=size=64x36:rate=50:duration=0.20",
+    "source": "testsrc2=size=128x72:rate=50:duration=0.20,scale=64:36:flags=bilinear",
     "tff": "format=yuv420p,setfield=tff,separatefields,select=eq(mod(n\\,4)\\,0)+eq(mod(n\\,4)\\,3),weave=first_field=top,yadif=mode=send_field:parity=tff:deint=all,trim=start_frame=2:end_frame=8,format=nv12",
     "trim": "trim=start_frame=2:end_frame=8"
   },
