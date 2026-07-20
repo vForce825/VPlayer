@@ -18,13 +18,27 @@ struct SourceProfileEditorView: View {
     @State private var validationMessage: String?
     @State private var isSaving = false
     @State private var createAttemptID: UUID
+    private let protectsAcceptanceSourceValue: Bool
 
     init(model: AppModel, profile: SourceProfile?) {
         self.model = model
         self.profile = profile
-        _name = State(initialValue: profile?.name ?? "")
-        _m3uURLString = State(initialValue: profile?.m3uURL.absoluteString ?? "")
-        _epgURLString = State(initialValue: profile?.epgURL.absoluteString ?? "")
+        #if DEBUG
+        let acceptancePrefill = profile == nil ? AcceptanceSourcePrefill.current() : nil
+        let initialName = profile?.name ?? acceptancePrefill?.name ?? ""
+        let initialM3U = profile?.m3uURL.absoluteString ?? acceptancePrefill?.m3uURLString ?? ""
+        let initialEPG = profile?.epgURL.absoluteString ?? acceptancePrefill?.epgURLString ?? ""
+        let protectsAcceptanceSourceValue = acceptancePrefill != nil
+        #else
+        let initialName = profile?.name ?? ""
+        let initialM3U = profile?.m3uURL.absoluteString ?? ""
+        let initialEPG = profile?.epgURL.absoluteString ?? ""
+        let protectsAcceptanceSourceValue = false
+        #endif
+        self.protectsAcceptanceSourceValue = protectsAcceptanceSourceValue
+        _name = State(initialValue: initialName)
+        _m3uURLString = State(initialValue: initialM3U)
+        _epgURLString = State(initialValue: initialEPG)
         _m3uRefreshInterval = State(initialValue: profile?.m3uRefreshInterval ?? .sixHours)
         _epgRefreshInterval = State(initialValue: profile?.epgRefreshInterval ?? .daily)
         _createAttemptID = State(initialValue: UUID())
@@ -37,6 +51,11 @@ struct SourceProfileEditorView: View {
                     .accessibilityIdentifier("source.editor.name")
                 TextField("M3U 地址", text: $m3uURLString)
                     .accessibilityIdentifier("source.editor.m3u")
+                    .accessibilityValue(
+                        protectsAcceptanceSourceValue
+                            ? "Protected URL configured"
+                            : m3uURLString
+                    )
                 TextField("EPG 地址", text: $epgURLString)
                     .accessibilityIdentifier("source.editor.epg")
 

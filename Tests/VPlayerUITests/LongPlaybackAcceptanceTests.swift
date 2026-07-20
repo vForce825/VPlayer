@@ -6,7 +6,7 @@ import Foundation
 import XCTest
 
 final class LongPlaybackAcceptanceTests: XCTestCase {
-    private static let requiredEnvironmentKeys = [
+    private static let requiredConfigurationKeys = [
         "VPLAYER_ACCEPTANCE_M3U_URL",
         "VPLAYER_ACCEPTANCE_CHANNEL",
         "VPLAYER_ACCEPTANCE_SECONDS",
@@ -14,14 +14,14 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     ]
 
     @MainActor
-    func testLongRunningRealDevicePlayback() throws {
+    func testLongRunningRealDevicePlayback() async throws {
         let configuration = try acceptanceConfiguration()
         let app = XCUIApplication()
         app.launchArguments = ["-acceptance-playback", "-uiTestResetPlaybackSettings"]
-        app.launchEnvironment = configuration.environment
+        app.launchEnvironment = configuration.encodedEnvironment
         app.launch()
 
-        try importProfile(m3uURL: configuration.m3uURL, in: app)
+        try importPrefilledProfile(in: app)
         selectAlgorithm(configuration.algorithm, in: app)
         selectTab(named: "频道", in: app)
 
@@ -30,93 +30,129 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             channelText.waitForExistence(timeout: 90),
             "The refreshed live playlist did not expose the requested channel"
         )
-        let channelButton = app.buttons.containing(.staticText, identifier: configuration.channel).element
+        let channelButton = app.buttons.containing(
+            .staticText,
+            identifier: configuration.channel
+        ).element
         focusAndSelect(channelButton)
         XCTAssertTrue(app.otherElements["player-full-screen"].waitForExistence(timeout: 30))
-        XCTAssertTrue(app.buttons["player-play-pause"].waitForExistence(timeout: 10))
-
-        performTwentyManualAlgorithmSwitches(
-            finalAlgorithm: configuration.algorithm,
-            in: app
-        )
 
         let metricsElement = app.otherElements["player-acceptance-metrics"]
         XCTAssertTrue(metricsElement.waitForExistence(timeout: 30))
-        var snapshots: [AcceptanceMetricsSnapshot] = []
-        let startedAt = Date()
-        var nextAttachmentAt: TimeInterval = 60
-        while Date().timeIntervalSince(startedAt) < configuration.duration {
-            let elapsed = Date().timeIntervalSince(startedAt)
-            if elapsed >= nextAttachmentAt {
-                snapshots.append(try attachSnapshot(from: metricsElement, elapsed: elapsed))
-                nextAttachmentAt += 60
-            }
-            XCTAssertTrue(app.otherElements["player-full-screen"].exists)
-            _ = XCTWaiter.wait(for: [expectation(description: "acceptance heartbeat")], timeout: 1)
-        }
-        snapshots.append(try attachSnapshot(
+        let bannerTracker = CapabilityBannerTracker(app: app)
+        _ = try await awaitStableRoute(
+            algorithm: configuration.algorithm,
             from: metricsElement,
-            elapsed: Date().timeIntervalSince(startedAt)
-        ))
-        let final = try XCTUnwrap(snapshots.last)
-        assertThresholds(
+            tracker: bannerTracker,
+            timeout: .seconds(90)
+        )
+        try await performTwentyManualAlgorithmSwitches(
+            initialAlgorithm: configuration.algorithm,
+            metricsElement: metricsElement,
+            tracker: bannerTracker,
+            in: app
+        )
+
+        let runBaseline = try await activeHeartbeat(
+            after: -Double.infinity,
+            metricsElement: metricsElement,
+            tracker: bannerTracker,
+            in: app
+        )
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let requestedDuration = Duration.milliseconds(Int64(configuration.duration * 1_000))
+        let end = startedAt.advanced(by: requestedDuration)
+        var nextMinute = startedAt.advanced(by: .seconds(60))
+        var lastObservedElapsed = runBaseline.elapsedSeconds
+        var snapshots: [AcceptanceMetricsSnapshot] = []
+
+        while clock.now < end {
+            let heartbeat = try await activeHeartbeat(
+                after: lastObservedElapsed,
+                metricsElement: metricsElement,
+                tracker: bannerTracker,
+                in: app
+            )
+            lastObservedElapsed = heartbeat.elapsedSeconds
+            if clock.now >= nextMinute {
+                if let prior = snapshots.last {
+                    XCTAssertGreaterThan(heartbeat.elapsedSeconds, prior.elapsedSeconds)
+                }
+                try attach(heartbeat, elapsed: elapsedSeconds(from: startedAt, clock: clock))
+                assertSteadyStateThresholds(heartbeat, configuration: configuration)
+                snapshots.append(heartbeat)
+                repeat {
+                    nextMinute = nextMinute.advanced(by: .seconds(60))
+                } while nextMinute <= clock.now
+            }
+            try await clock.sleep(for: .seconds(1))
+        }
+
+        let final = try await activeHeartbeat(
+            after: lastObservedElapsed,
+            metricsElement: metricsElement,
+            tracker: bannerTracker,
+            in: app
+        )
+        if let prior = snapshots.last {
+            XCTAssertGreaterThan(final.elapsedSeconds, prior.elapsedSeconds)
+        }
+        try attach(final, elapsed: elapsedSeconds(from: startedAt, clock: clock))
+        assertSteadyStateThresholds(final, configuration: configuration)
+        snapshots.append(final)
+
+        XCTAssertGreaterThanOrEqual(final.elapsedSeconds, configuration.duration)
+        XCTAssertGreaterThanOrEqual(
+            final.elapsedSeconds - runBaseline.elapsedSeconds,
+            configuration.duration
+        )
+        try assertLongRunMemoryEvidence(snapshots, configuration: configuration)
+        assertTemporalCapabilityOutcome(
             final,
-            snapshots: snapshots,
-            configuration: configuration
+            configuration: configuration,
+            tracker: bannerTracker
         )
     }
 
     private func acceptanceConfiguration() throws -> AcceptanceConfiguration {
-        let processEnvironment = ProcessInfo.processInfo.environment
-        var environment: [String: String] = [:]
-        for key in Self.requiredEnvironmentKeys {
-            if let value = acceptanceValue(for: key, processEnvironment: processEnvironment) {
-                environment[key] = value
+        var decoded: [String: String] = [:]
+        var encodedEnvironment: [String: String] = [:]
+        for key in Self.requiredConfigurationKeys {
+            let encodedKey = "\(key)_B64"
+            guard let encoded = Bundle(for: Self.self).object(
+                forInfoDictionaryKey: encodedKey
+            ) as? String,
+                !encoded.isEmpty,
+                let data = Data(base64Encoded: encoded),
+                let value = String(data: data, encoding: .utf8),
+                !value.isEmpty else {
+                throw XCTSkip("Long device acceptance requires protected bundle configuration")
             }
+            decoded[key] = value
+            encodedEnvironment[encodedKey] = encoded
         }
-        guard environment.count == Self.requiredEnvironmentKeys.count else {
-            throw XCTSkip("Long device acceptance requires all four VPLAYER_ACCEPTANCE_* variables")
-        }
-        let urlText = try XCTUnwrap(environment["VPLAYER_ACCEPTANCE_M3U_URL"])
-        let channel = try XCTUnwrap(environment["VPLAYER_ACCEPTANCE_CHANNEL"])
-        let secondsText = try XCTUnwrap(environment["VPLAYER_ACCEPTANCE_SECONDS"])
-        let algorithmText = try XCTUnwrap(environment["VPLAYER_ACCEPTANCE_ALGORITHM"])
-        let url = try XCTUnwrap(URL(string: urlText))
-        XCTAssertTrue(["http", "https"].contains(url.scheme?.lowercased() ?? ""))
-        let duration = try XCTUnwrap(TimeInterval(secondsText))
+
+        let sourceText = try XCTUnwrap(decoded["VPLAYER_ACCEPTANCE_M3U_URL"])
+        let sourceURL = try XCTUnwrap(URL(string: sourceText))
+        XCTAssertTrue(["http", "https"].contains(sourceURL.scheme?.lowercased() ?? ""))
+        let channel = try XCTUnwrap(decoded["VPLAYER_ACCEPTANCE_CHANNEL"])
+        let duration = try XCTUnwrap(TimeInterval(decoded["VPLAYER_ACCEPTANCE_SECONDS"] ?? ""))
         XCTAssertGreaterThan(duration, 0)
-        let algorithm = try XCTUnwrap(AcceptanceAlgorithm(rawValue: algorithmText))
+        let algorithm = try XCTUnwrap(AcceptanceAlgorithm(
+            rawValue: decoded["VPLAYER_ACCEPTANCE_ALGORITHM"] ?? ""
+        ))
         return AcceptanceConfiguration(
-            environment: environment,
-            m3uURL: urlText,
+            encodedEnvironment: encodedEnvironment,
             channel: channel,
             duration: duration,
             algorithm: algorithm
         )
     }
 
-    private func acceptanceValue(
-        for key: String,
-        processEnvironment: [String: String]
-    ) -> String? {
-        if let value = processEnvironment[key], !value.isEmpty {
-            return value
-        }
-        let encodedKey = "\(key)_B64"
-        guard let encoded = Bundle(for: Self.self).object(
-            forInfoDictionaryKey: encodedKey
-        ) as? String,
-            !encoded.isEmpty,
-            let data = Data(base64Encoded: encoded),
-            let value = String(data: data, encoding: .utf8),
-            !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-
     @MainActor
-    private func importProfile(m3uURL: String, in app: XCUIApplication) throws {
+    private func importPrefilledProfile(in app: XCUIApplication) throws {
         selectTab(named: "数据源", in: app)
         let add = app.buttons["source.add"]
         XCTAssertTrue(add.waitForExistence(timeout: 10))
@@ -126,18 +162,11 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let m3u = app.textFields["source.editor.m3u"]
         let epg = app.textFields["source.editor.epg"]
         XCTAssertTrue(name.waitForExistence(timeout: 5))
-        focus(name)
-        XCUIRemote.shared.press(.select)
-        name.typeText("Device Acceptance")
-        XCUIRemote.shared.press(.menu)
-        focus(m3u)
-        XCUIRemote.shared.press(.select)
-        m3u.typeText(m3uURL)
-        XCUIRemote.shared.press(.menu)
-        focus(epg)
-        XCUIRemote.shared.press(.select)
-        epg.typeText("https://example.invalid/acceptance.xml")
-        XCUIRemote.shared.press(.menu)
+        XCTAssertTrue(m3u.exists)
+        XCTAssertTrue(epg.exists)
+        XCTAssertFalse((name.value as? String)?.isEmpty ?? true)
+        XCTAssertEqual(m3u.value as? String, "Protected URL configured")
+        XCTAssertFalse((epg.value as? String)?.isEmpty ?? true)
         focusAndSelect(app.buttons["source.editor.save"])
 
         let refresh = app.buttons["source.refresh.playlist"]
@@ -157,22 +186,101 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
 
     @MainActor
     private func performTwentyManualAlgorithmSwitches(
-        finalAlgorithm: AcceptanceAlgorithm,
+        initialAlgorithm: AcceptanceAlgorithm,
+        metricsElement: XCUIElement,
+        tracker: CapabilityBannerTracker,
         in app: XCUIApplication
-    ) {
+    ) async throws {
         focusAndSelect(app.buttons["player-settings"])
         let apple = app.buttons[AcceptanceAlgorithm.appleTemporal.accessibilityIdentifier]
         let yadif = app.buttons[AcceptanceAlgorithm.metalYADIF2x.accessibilityIdentifier]
         XCTAssertTrue(apple.waitForExistence(timeout: 10))
         XCTAssertTrue(yadif.waitForExistence(timeout: 10))
-        for iteration in 0..<20 {
-            focusAndSelect(iteration.isMultiple(of: 2) ? yadif : apple)
+        XCTAssertTrue(apple.hasFocus || yadif.hasFocus, "Settings must establish focus")
+
+        var selected = initialAlgorithm
+        for _ in 0..<20 {
+            let target = selected.opposite
+            let targetButton = app.buttons[target.accessibilityIdentifier]
+            let otherButton = app.buttons[selected.accessibilityIdentifier]
+            if !targetButton.hasFocus {
+                XCTAssertTrue(otherButton.hasFocus, "Focus was lost between algorithm switches")
+                XCUIRemote.shared.press(target == .appleTemporal ? .up : .down)
+            }
+            XCTAssertTrue(targetButton.hasFocus, "A single deterministic move must reach the target")
+            XCUIRemote.shared.press(.select)
+            XCTAssertTrue(targetButton.hasFocus, "Selecting an algorithm must preserve settings focus")
+            _ = try await awaitStableRoute(
+                algorithm: target,
+                from: metricsElement,
+                tracker: tracker,
+                timeout: .seconds(20)
+            )
+            selected = target
         }
-        focusAndSelect(app.buttons[finalAlgorithm.accessibilityIdentifier])
-        XCTAssertTrue(app.buttons[finalAlgorithm.accessibilityIdentifier].isSelected)
+
+        XCTAssertEqual(selected, initialAlgorithm)
+        XCTAssertTrue(app.buttons[initialAlgorithm.accessibilityIdentifier].isSelected)
         XCUIRemote.shared.press(.menu)
-        XCTAssertTrue(app.buttons["player-play-pause"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.buttons["player-play-pause"].hasFocus)
+        assertActiveControls(in: app)
+    }
+
+    @MainActor
+    private func awaitStableRoute(
+        algorithm: AcceptanceAlgorithm,
+        from element: XCUIElement,
+        tracker: CapabilityBannerTracker,
+        timeout: Duration
+    ) async throws -> AcceptanceMetricsSnapshot {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            tracker.observe()
+            if let snapshot = try? snapshot(from: element),
+               snapshot.selectedAlgorithm == algorithm.rawValue,
+               snapshot.scanType != "unknown",
+               snapshot.activeRoute != "rawWhileClassifying",
+               routeMatches(snapshot, algorithm: algorithm) {
+                if snapshot.temporalUnavailableNoticeCount == 1 {
+                    tracker.observeExpectedNotice()
+                }
+                return snapshot
+            }
+            try await clock.sleep(for: .milliseconds(250))
+        }
+        throw AcceptanceFailure.stableRouteTimedOut
+    }
+
+    @MainActor
+    private func activeHeartbeat(
+        after previousElapsed: Double,
+        metricsElement: XCUIElement,
+        tracker: CapabilityBannerTracker,
+        in app: XCUIApplication
+    ) async throws -> AcceptanceMetricsSnapshot {
+        assertActiveControls(in: app)
+        tracker.observe()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(4))
+        while clock.now < deadline {
+            if let candidate = try? snapshot(from: metricsElement),
+               candidate.elapsedSeconds > previousElapsed {
+                XCTAssertGreaterThan(candidate.decoderCallbacksPerSecond, 0)
+                XCTAssertGreaterThan(candidate.presentationsPerSecond, 0)
+                XCTAssertGreaterThan(candidate.residentMemoryBytes, 0)
+                return candidate
+            }
+            try await clock.sleep(for: .milliseconds(250))
+        }
+        throw AcceptanceFailure.metricsDidNotAdvance
+    }
+
+    @MainActor
+    private func assertActiveControls(in app: XCUIApplication) {
+        XCTAssertTrue(app.otherElements["player-full-screen"].exists)
+        XCTAssertTrue(app.buttons["player-play-pause"].exists)
+        XCTAssertTrue(app.buttons["player-settings"].exists)
+        XCTAssertEqual(app.buttons.matching(identifier: "player-retry").count, 0)
     }
 
     @MainActor
@@ -189,19 +297,22 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     }
 
     @MainActor
-    private func attachSnapshot(
-        from element: XCUIElement,
-        elapsed: TimeInterval
-    ) throws -> AcceptanceMetricsSnapshot {
-        let elementValue = element.value
-        let json = try XCTUnwrap(elementValue as? String)
-        let data = try XCTUnwrap(json.data(using: .utf8))
-        let snapshot = try JSONDecoder().decode(AcceptanceMetricsSnapshot.self, from: data)
+    private func snapshot(from element: XCUIElement) throws -> AcceptanceMetricsSnapshot {
+        guard let json = element.value as? String,
+              !json.isEmpty,
+              json != "unavailable",
+              let data = json.data(using: .utf8) else {
+            throw AcceptanceFailure.metricsUnavailable
+        }
+        return try JSONDecoder().decode(AcceptanceMetricsSnapshot.self, from: data)
+    }
+
+    private func attach(_ snapshot: AcceptanceMetricsSnapshot, elapsed: Double) throws {
+        let data = try JSONEncoder().encode(snapshot)
         let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
         attachment.name = String(format: "playback-metrics-%06.0f-seconds.json", elapsed)
         attachment.lifetime = .keepAlways
         add(attachment)
-        return snapshot
     }
 
     @MainActor
@@ -224,18 +335,41 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         }
     }
 
-    private func assertThresholds(
+    private func routeMatches(
         _ snapshot: AcceptanceMetricsSnapshot,
-        snapshots: [AcceptanceMetricsSnapshot],
+        algorithm: AcceptanceAlgorithm
+    ) -> Bool {
+        if ["progressive", "progressiveSegmentedFrame"].contains(snapshot.scanType) {
+            return snapshot.activeRoute == "bypass"
+        }
+        guard snapshot.scanType == "interlaced" else { return false }
+        switch algorithm {
+        case .appleTemporal:
+            return snapshot.activeRoute == "appleTemporal"
+                || snapshot.activeRoute == "rawTemporalFailure"
+        case .metalYADIF2x:
+            return snapshot.activeRoute == "metalYADIF2x"
+        }
+    }
+
+    private func assertSteadyStateThresholds(
+        _ snapshot: AcceptanceMetricsSnapshot,
         configuration: AcceptanceConfiguration
     ) {
         XCTAssertEqual(snapshot.selectedAlgorithm, configuration.algorithm.rawValue)
+        XCTAssertGreaterThan(snapshot.decoderCallbacksPerSecond, 0)
+        XCTAssertGreaterThan(snapshot.presentationsPerSecond, 0)
+        XCTAssertGreaterThan(snapshot.residentMemoryBytes, 0)
         XCTAssertLessThanOrEqual(snapshot.maximumPresentationQueueDepth, 12)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
         XCTAssertEqual(snapshot.automaticAlgorithmSwitchCount, 0)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
         XCTAssertGreaterThan(snapshot.presentedVideoFrames, 0)
+        if snapshot.elapsedSeconds >= 60 {
+            XCTAssertGreaterThanOrEqual(snapshot.windowDurationSeconds, 55)
+            XCTAssertLessThanOrEqual(snapshot.windowDurationSeconds, 60.5)
+        }
 
         let denominator = snapshot.presentedVideoFrames + snapshot.droppedVideoFrames
         XCTAssertGreaterThan(denominator, 0)
@@ -248,46 +382,121 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
 
         if configuration.channel == "东方卫视 4K" {
             XCTAssertEqual(snapshot.scanType, "progressive")
+            XCTAssertEqual(snapshot.activeRoute, "bypass")
             XCTAssertEqual(snapshot.yadifKernelDispatchCount, 0)
             XCTAssertEqual(snapshot.temporalDecodeFlagCount, 0)
-        } else if ["东方卫视 HD", "五星体育 HD"].contains(configuration.channel) {
+            return
+        }
+        if ["东方卫视 HD", "五星体育 HD"].contains(configuration.channel) {
             XCTAssertEqual(snapshot.scanType, "interlaced")
         }
+        guard snapshot.scanType == "interlaced" else { return }
 
-        if configuration.algorithm == .metalYADIF2x, snapshot.scanType == "interlaced" {
+        switch configuration.algorithm {
+        case .metalYADIF2x:
+            XCTAssertEqual(snapshot.activeRoute, "metalYADIF2x")
+            XCTAssertTrue((22...28).contains(snapshot.decoderCallbacksPerSecond))
+            XCTAssertTrue((45...55).contains(snapshot.presentationsPerSecond))
+            XCTAssertGreaterThan(snapshot.yadifKernelDispatchCount, 0)
+            XCTAssertGreaterThan(snapshot.gpuDurationP95Milliseconds, 0)
             XCTAssertLessThanOrEqual(snapshot.gpuDurationP95Milliseconds, 16)
+        case .appleTemporal where snapshot.temporalUnavailableNoticeCount == 0:
+            XCTAssertEqual(snapshot.activeRoute, "appleTemporal")
+            XCTAssertGreaterThan(snapshot.temporalPropertySetCount, 0)
+            XCTAssertGreaterThan(snapshot.temporalDecodeFlagCount, 0)
+            XCTAssertTrue(isBroadcastCadence(snapshot.decoderCallbacksPerSecond))
+            XCTAssertTrue(isBroadcastCadence(snapshot.presentationsPerSecond))
+        case .appleTemporal:
+            XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 1)
+            XCTAssertEqual(snapshot.activeRoute, "rawTemporalFailure")
         }
-        if configuration.algorithm == .appleTemporal, snapshot.scanType == "interlaced" {
-            XCTAssertLessThanOrEqual(snapshot.temporalUnavailableNoticeCount, 1)
-            if snapshot.temporalUnavailableNoticeCount == 0 {
-                XCTAssertGreaterThan(snapshot.decoderCallbacksPerSecond, 0)
-                XCTAssertGreaterThan(snapshot.presentationsPerSecond, 0)
-                XCTAssertLessThanOrEqual(
-                    snapshot.presentationsPerSecond,
-                    snapshot.decoderCallbacksPerSecond * 1.1 + 1
-                )
-            } else {
-                XCTAssertEqual(snapshot.activeRoute, "rawTemporalFailure")
-            }
-        }
+    }
 
-        if configuration.duration >= 7_200,
-           let baseline = snapshots.first(where: { $0.elapsedSeconds >= 900 }) {
-            let secondHourMaximum = snapshots
-                .filter { $0.elapsedSeconds >= 3_600 }
-                .map(\.residentMemoryBytes)
-                .max() ?? baseline.residentMemoryBytes
-            let growth = secondHourMaximum > baseline.residentMemoryBytes
-                ? secondHourMaximum - baseline.residentMemoryBytes
-                : 0
-            XCTAssertLessThanOrEqual(growth, 32 * 1_024 * 1_024)
+    private func assertLongRunMemoryEvidence(
+        _ snapshots: [AcceptanceMetricsSnapshot],
+        configuration: AcceptanceConfiguration
+    ) throws {
+        guard configuration.duration >= 7_200 else { return }
+        let baseline = try XCTUnwrap(snapshots.first { $0.elapsedSeconds >= 900 })
+        XCTAssertGreaterThan(baseline.residentMemoryBytes, 0)
+        let secondHour = snapshots.filter { $0.elapsedSeconds >= 3_600 }
+        XCTAssertFalse(secondHour.isEmpty)
+        XCTAssertTrue(secondHour.allSatisfy { $0.residentMemoryBytes > 0 })
+        let secondHourMaximum = try XCTUnwrap(secondHour.map(\.residentMemoryBytes).max())
+        let growth = secondHourMaximum > baseline.residentMemoryBytes
+            ? secondHourMaximum - baseline.residentMemoryBytes
+            : 0
+        XCTAssertLessThanOrEqual(growth, 32 * 1_024 * 1_024)
+    }
+
+    @MainActor
+    private func assertTemporalCapabilityOutcome(
+        _ snapshot: AcceptanceMetricsSnapshot,
+        configuration: AcceptanceConfiguration,
+        tracker: CapabilityBannerTracker
+    ) {
+        guard configuration.algorithm == .appleTemporal,
+              snapshot.scanType == "interlaced" else { return }
+        if snapshot.temporalUnavailableNoticeCount == 1 {
+            XCTAssertEqual(snapshot.activeRoute, "rawTemporalFailure")
+            XCTAssertEqual(tracker.appearanceCount, 1)
+        } else {
+            XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 0)
+            XCTAssertEqual(snapshot.activeRoute, "appleTemporal")
+            XCTAssertEqual(tracker.appearanceCount, 0)
         }
+    }
+
+    private func isBroadcastCadence(_ rate: Double) -> Bool {
+        (22...28).contains(rate) || (45...55).contains(rate)
+    }
+
+    private func elapsedSeconds(
+        from start: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) -> Double {
+        let components = start.duration(to: clock.now).components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }
 
+@MainActor
+private final class CapabilityBannerTracker {
+    private let banners: XCUIElementQuery
+    private let banner: XCUIElement
+    private var wasVisible = false
+    private(set) var appearanceCount = 0
+
+    init(app: XCUIApplication) {
+        banners = app.staticTexts.matching(identifier: "player-capability-notice")
+        banner = banners.element
+    }
+
+    func observe() {
+        let isVisible = banner.exists
+        XCTAssertLessThanOrEqual(banners.count, 1)
+        if isVisible, !wasVisible {
+            appearanceCount += 1
+        }
+        wasVisible = isVisible
+    }
+
+    func observeExpectedNotice() {
+        if appearanceCount == 0 {
+            XCTAssertTrue(banner.waitForExistence(timeout: 3))
+        }
+        observe()
+    }
+}
+
+private enum AcceptanceFailure: Error {
+    case metricsUnavailable
+    case metricsDidNotAdvance
+    case stableRouteTimedOut
+}
+
 private struct AcceptanceConfiguration {
-    let environment: [String: String]
-    let m3uURL: String
+    let encodedEnvironment: [String: String]
     let channel: String
     let duration: TimeInterval
     let algorithm: AcceptanceAlgorithm
@@ -303,9 +512,16 @@ private enum AcceptanceAlgorithm: String {
         case .metalYADIF2x: "settings.deinterlace.yadif"
         }
     }
+
+    var opposite: Self {
+        switch self {
+        case .appleTemporal: .metalYADIF2x
+        case .metalYADIF2x: .appleTemporal
+        }
+    }
 }
 
-private struct AcceptanceMetricsSnapshot: Decodable {
+private struct AcceptanceMetricsSnapshot: Codable {
     let scanType: String
     let selectedAlgorithm: String
     let activeRoute: String

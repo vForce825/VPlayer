@@ -48,6 +48,29 @@ struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
     }
 }
 
+struct PlaybackDiagnosticsCorrelationID: Sendable, Equatable {
+    let value: String
+
+    init(channelIdentifier: PlaybackDiagnosticsChannelID, rawValue: UInt64) {
+        let input = "\(channelIdentifier.value):\(rawValue)"
+        let digest = SHA256.hash(data: Data(input.utf8))
+        value = digest.prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+struct MetalGPUInterval: Sendable, Equatable {
+    let gpuStartTime: TimeInterval
+    let gpuEndTime: TimeInterval
+
+    var durationMilliseconds: Double? {
+        guard gpuStartTime.isFinite,
+              gpuEndTime.isFinite,
+              gpuStartTime >= 0,
+              gpuEndTime >= gpuStartTime else { return nil }
+        return (gpuEndTime - gpuStartTime) * 1_000
+    }
+}
+
 final class PlaybackMetrics: @unchecked Sendable {
     typealias Now = @Sendable () -> TimeInterval
     typealias ResidentMemoryProvider = @Sendable () -> UInt64
@@ -128,27 +151,23 @@ final class PlaybackMetrics: @unchecked Sendable {
         }
     }
 
-    func recordPresentation(
+    func recordPresentationCompletion(
         generation: MediaGeneration,
         activeGeneration: MediaGeneration,
+        isUniquePresentation: Bool,
         presentationTimeStamp: CMTime,
-        targetMediaTime: CMTime,
-        droppedFrames: Int,
-        presentationQueueDepth: Int
+        targetMediaTime: CMTime
     ) {
         let timestamp = now()
         lock.withLock {
             pruneIfNeeded(at: timestamp)
+            guard generation == activeGeneration else {
+                state.crossGenerationPresentationCount &+= 1
+                return
+            }
+            guard isUniquePresentation else { return }
             state.presentationTimes.append(timestamp)
             state.presentedVideoFrames &+= 1
-            state.droppedVideoFrames &+= UInt64(max(0, droppedFrames))
-            state.maximumPresentationQueueDepth = max(
-                state.maximumPresentationQueueDepth,
-                max(0, presentationQueueDepth)
-            )
-            if generation != activeGeneration {
-                state.crossGenerationPresentationCount &+= 1
-            }
             guard timestamp >= state.avDriftGraceUntil,
                   presentationTimeStamp.isNumeric,
                   targetMediaTime.isNumeric else { return }
@@ -207,14 +226,6 @@ final class PlaybackMetrics: @unchecked Sendable {
     func beginAVDriftGracePeriod(seconds: TimeInterval) {
         let graceUntil = now() + max(0, seconds)
         lock.withLock { state.avDriftGraceUntil = max(state.avDriftGraceUntil, graceUntil) }
-    }
-
-    func beginGPUOperation() -> TimeInterval {
-        now()
-    }
-
-    func recordGPUDuration(startedAt: TimeInterval) {
-        recordGPUDuration(milliseconds: max(0, now() - startedAt) * 1_000)
     }
 
     func recordGPUDuration(milliseconds: Double) {

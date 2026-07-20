@@ -404,8 +404,9 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             targetMediaTime: targetMediaTime,
             displayInterval: displayInterval
         )
+        metrics?.recordVideoDrop(count: selection.droppedFrameCount)
+        metrics?.recordPresentationQueueDepth(queue.unpresentedCount)
         guard let frame = selection.frame else {
-            metrics?.recordVideoDrop(count: selection.droppedFrameCount)
             releaseInFlightSlot(flushCacheIfNeeded: false)
             return decision(
                 action: selection.action,
@@ -456,10 +457,13 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         do {
             try commandSubmitter.submitPresentingUntimed(job, drawable: drawable) { [weak self] result in
                 _ = lifetime
+                signpostLifetime.finish()
                 self?.complete(
                     result,
                     submittedGeneration: frame.generation,
-                    signpostLifetime: signpostLifetime
+                    action: selection.action,
+                    presentationTimeStamp: frame.presentationTimeStamp,
+                    targetMediaTime: targetMediaTime
                 )
             }
         } catch {
@@ -472,16 +476,6 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
                 dropped: selection.droppedFrameCount
             )
         }
-
-        let currentGeneration = stateLock.withLock { activeGeneration }
-        metrics?.recordPresentation(
-            generation: frame.generation,
-            activeGeneration: currentGeneration,
-            presentationTimeStamp: frame.presentationTimeStamp,
-            targetMediaTime: targetMediaTime,
-            droppedFrames: selection.droppedFrameCount,
-            presentationQueueDepth: queue.unpresentedCount
-        )
 
         return decision(
             action: selection.action,
@@ -638,17 +632,28 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     private func complete(
         _ result: MetalCommandCompletion,
         submittedGeneration: MediaGeneration,
-        signpostLifetime: PlaybackSignpostLifetime
+        action: VideoRenderDecision.Action,
+        presentationTimeStamp: CMTime,
+        targetMediaTime: CMTime
     ) {
-        signpostLifetime.finish()
+        let currentGeneration = stateLock.withLock { activeGeneration }
         releaseInFlightSlot(flushCacheIfNeeded: true)
-        guard case let .failed(message) = result else { return }
-        let isCurrent = stateLock.withLock { activeGeneration == submittedGeneration }
-        guard isCurrent else { return }
-        emit(
-            .metalCommand(Self.sanitizedCommandMessage(message)),
-            generation: submittedGeneration
-        )
+        switch result {
+        case .succeeded:
+            metrics?.recordPresentationCompletion(
+                generation: submittedGeneration,
+                activeGeneration: currentGeneration,
+                isUniquePresentation: action == .presented,
+                presentationTimeStamp: presentationTimeStamp,
+                targetMediaTime: targetMediaTime
+            )
+        case let .failed(message):
+            guard currentGeneration == submittedGeneration else { return }
+            emit(
+                .metalCommand(Self.sanitizedCommandMessage(message)),
+                generation: submittedGeneration
+            )
+        }
     }
 
     private func emit(_ error: PlaybackCoreError, generation: MediaGeneration) {

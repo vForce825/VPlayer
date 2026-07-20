@@ -16,7 +16,7 @@ struct FullScreenPlayerView: View {
     @State private var showsSettings = false
     @State private var isClosing = false
     #if DEBUG
-    @State private var acceptanceMetricsJSON = "{}"
+    @State private var acceptanceMetricsJSON = "unavailable"
     #endif
     @FocusState private var failureFocus: FailureControl?
     private let settings: PlaybackSettingsStore
@@ -156,6 +156,8 @@ struct FullScreenPlayerView: View {
                let data = try? encoder.encode(snapshot),
                let json = String(data: data, encoding: .utf8) {
                 acceptanceMetricsJSON = json
+            } else {
+                acceptanceMetricsJSON = "unavailable"
             }
             do {
                 try await Task.sleep(for: .seconds(1))

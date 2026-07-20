@@ -79,12 +79,19 @@ final class ProjectConfigurationTests: XCTestCase {
             ),
             encoding: .utf8
         )
+        let signalTest = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Scripts/test-device-acceptance-signal.sh"
+            ),
+            encoding: .utf8
+        )
 
         for forbidden in ["absoluteString", "streamURL", "query", "channelName", "rawChannel"] {
             XCTAssertFalse(signposts.contains(forbidden), "signposts reference sensitive field: \(forbidden)")
         }
         XCTAssertTrue(acceptanceView.contains("player-acceptance-metrics"))
         XCTAssertTrue(acceptanceView.contains("JSONEncoder"))
+        XCTAssertTrue(acceptanceView.contains("acceptanceMetricsJSON = \"unavailable\""))
         XCTAssertFalse(acceptanceView.contains("streamURL.absoluteString"))
         XCTAssertTrue(runner.contains("VPLAYER_ACCEPTANCE_M3U_URL"))
         XCTAssertFalse(runner.contains("set -x"))
@@ -97,10 +104,27 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertFalse(runner.contains("-destination \"platform=tvOS,id=$device_udid\""))
         XCTAssertTrue(runner.contains("acceptance.xcconfig"))
         XCTAssertTrue(runner.contains("-xcconfig \"$acceptance_xcconfig\""))
+        XCTAssertTrue(runner.contains("security find-certificate"))
+        XCTAssertTrue(runner.contains("openssl x509"))
+        XCTAssertTrue(runner.contains("OU="))
+        XCTAssertFalse(runner.contains("Apple Development:.*\\(([A-Z0-9]{10})\\)"))
+        XCTAssertFalse(runner.contains("VPLAYER_ACCEPTANCE_M3U_URL=\"$m3u_url\""))
+        XCTAssertFalse(runner.contains("VPLAYER_ACCEPTANCE_CHANNEL=\"$channel\""))
+        XCTAssertTrue(runner.contains("child_pid=$!"))
+        XCTAssertTrue(runner.contains("wait \"$child_pid\""))
+        XCTAssertTrue(runner.contains("kill -\"$signal\" -- \"-$child_pid\""))
+        XCTAssertTrue(runner.contains("rg -a -F -q -- \"$m3u_url\""))
+        XCTAssertTrue(signalTest.contains("VPLAYER_ACCEPTANCE_SIGNAL_TEST_MODE=1"))
+        XCTAssertTrue(signalTest.contains("[[ \"$status\" == \"130\" ]]"))
         XCTAssertTrue(project.contains("INFOPLIST_FILE: Tests/VPlayerUITests/Info.plist"))
         XCTAssertTrue(uiTestInfoPlist.contains("$(VPLAYER_ACCEPTANCE_M3U_URL_B64)"))
         XCTAssertTrue(acceptanceTest.contains("Data(base64Encoded:"))
         XCTAssertTrue(acceptanceTest.contains("Bundle(for: Self.self)"))
+        XCTAssertTrue(acceptanceTest.contains("ContinuousClock()"))
+        XCTAssertTrue(acceptanceTest.contains("json != \"unavailable\""))
+        XCTAssertTrue(acceptanceTest.contains("app.launchEnvironment = configuration.encodedEnvironment"))
+        XCTAssertFalse(acceptanceTest.contains("ProcessInfo.processInfo.environment"))
+        XCTAssertFalse(acceptanceTest.contains("typeText(m3u"))
     }
 
     func testProductionSourcesKeepTask12ForbiddenControlsAndCopiesAbsent() throws {

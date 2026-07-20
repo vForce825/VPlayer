@@ -30,17 +30,18 @@ final class PlaybackMetricsTests: XCTestCase {
             metrics.recordDecoderCallback()
             if second.isMultiple(of: 2) {
                 let presentationTime = CMTime(seconds: TimeInterval(second), preferredTimescale: 1_000)
-                metrics.recordPresentation(
+                metrics.recordPresentationCompletion(
                     generation: generation,
                     activeGeneration: generation,
+                    isUniquePresentation: true,
                     presentationTimeStamp: presentationTime,
                     targetMediaTime: CMTimeAdd(
                         presentationTime,
                         CMTime(value: Int64(second % 20 + 1), timescale: 1_000)
-                    ),
-                    droppedFrames: second == 60 ? 2 : 0,
-                    presentationQueueDepth: min(12, second)
+                    )
                 )
+                metrics.recordVideoDrop(count: second == 60 ? 2 : 0)
+                metrics.recordPresentationQueueDepth(min(12, second))
             }
         }
         for duration in 1...20 {
@@ -95,22 +96,21 @@ final class PlaybackMetricsTests: XCTestCase {
         clock.value = 120
         metrics.recordDecoderCallback()
         metrics.recordGPUDuration(milliseconds: 4)
-        metrics.recordPresentation(
+        metrics.recordPresentationCompletion(
             generation: generation,
             activeGeneration: MediaGeneration(rawValue: 2),
+            isUniquePresentation: true,
             presentationTimeStamp: .zero,
-            targetMediaTime: CMTime(value: 9, timescale: 1_000),
-            droppedFrames: 0,
-            presentationQueueDepth: 1
+            targetMediaTime: CMTime(value: 9, timescale: 1_000)
         )
 
         let snapshot = metrics.snapshot(window: .seconds(60))
 
         XCTAssertEqual(snapshot.windowDurationSeconds, 60, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.decoderCallbacksPerSecond, 1.0 / 60.0, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentationsPerSecond, 1.0 / 60.0, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.presentationsPerSecond, 0, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.gpuDurationP95Milliseconds, 4, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentedVideoFrames, 1)
+        XCTAssertEqual(snapshot.presentedVideoFrames, 0)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
     }
 
@@ -125,22 +125,20 @@ final class PlaybackMetricsTests: XCTestCase {
         let generation = MediaGeneration(rawValue: 1)
         clock.value = 10
         metrics.beginAVDriftGracePeriod(seconds: 5)
-        metrics.recordPresentation(
+        metrics.recordPresentationCompletion(
             generation: generation,
             activeGeneration: generation,
+            isUniquePresentation: true,
             presentationTimeStamp: .zero,
-            targetMediaTime: CMTime(value: 900, timescale: 1_000),
-            droppedFrames: 0,
-            presentationQueueDepth: 1
+            targetMediaTime: CMTime(value: 900, timescale: 1_000)
         )
         clock.value = 15
-        metrics.recordPresentation(
+        metrics.recordPresentationCompletion(
             generation: generation,
             activeGeneration: generation,
+            isUniquePresentation: true,
             presentationTimeStamp: CMTime(value: 15_000, timescale: 1_000),
-            targetMediaTime: CMTime(value: 15_025, timescale: 1_000),
-            droppedFrames: 0,
-            presentationQueueDepth: 1
+            targetMediaTime: CMTime(value: 15_025, timescale: 1_000)
         )
 
         let snapshot = metrics.snapshot(window: .seconds(60))
@@ -180,14 +178,14 @@ final class PlaybackMetricsTests: XCTestCase {
                 inFlightCount: index % 4,
                 inputDepth: index % 5
             )
-            metrics.recordPresentation(
+            metrics.recordPresentationCompletion(
                 generation: generation,
                 activeGeneration: generation,
+                isUniquePresentation: true,
                 presentationTimeStamp: CMTime(value: Int64(index), timescale: 1_000),
-                targetMediaTime: CMTime(value: Int64(index + 1), timescale: 1_000),
-                droppedFrames: 0,
-                presentationQueueDepth: index % 13
+                targetMediaTime: CMTime(value: Int64(index + 1), timescale: 1_000)
             )
+            metrics.recordPresentationQueueDepth(index % 13)
         }
 
         let snapshot = metrics.snapshot(window: .seconds(60))
@@ -218,6 +216,36 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(identifier.value.count, 12)
         XCTAssertTrue(identifier.value.allSatisfy { $0.isHexDigit && !$0.isUppercase })
     }
+
+    func testSignpostLifetimeFinishesExactlyOnceIncludingDeinitFallback() {
+        let recorder = SignpostFinishRecorder()
+        var lifetime: PlaybackSignpostLifetime? = PlaybackSignpostLifetime {
+            recorder.record()
+        }
+        lifetime?.finish()
+        lifetime?.finish()
+        lifetime = nil
+        XCTAssertEqual(recorder.count, 1)
+
+        var fallback: PlaybackSignpostLifetime? = PlaybackSignpostLifetime {
+            recorder.record()
+        }
+        XCTAssertNotNil(fallback)
+        fallback = nil
+        XCTAssertEqual(recorder.count, 2)
+    }
+
+    func testSignpostCorrelationIsHashedAndBounded() {
+        let identifier = PlaybackDiagnosticsChannelID(rawValue: "channel")
+        let correlation = PlaybackDiagnosticsCorrelationID(
+            channelIdentifier: identifier,
+            rawValue: 12_345_678_901_234_567_890
+        )
+
+        XCTAssertEqual(correlation.value.count, 12)
+        XCTAssertFalse(correlation.value.contains("12345678901234567890"))
+        XCTAssertTrue(correlation.value.allSatisfy { $0.isHexDigit && !$0.isUppercase })
+    }
 }
 
 private final class MetricsTestClock: @unchecked Sendable {
@@ -228,4 +256,11 @@ private final class MetricsTestClock: @unchecked Sendable {
         get { lock.withLock { storage } }
         set { lock.withLock { storage = newValue } }
     }
+}
+
+private final class SignpostFinishRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+    var count: Int { lock.withLock { storage } }
+    func record() { lock.withLock { storage += 1 } }
 }

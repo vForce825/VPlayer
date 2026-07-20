@@ -842,7 +842,49 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         }
 
         wait(for: [completed], timeout: 5)
-        XCTAssertEqual(result.snapshot, [.completed])
+        guard case let .completedWithGPUInterval(interval) = try XCTUnwrap(result.snapshot.first) else {
+            return XCTFail("expected completed Metal GPU interval")
+        }
+        XCTAssertGreaterThanOrEqual(interval.gpuStartTime, 0)
+        XCTAssertGreaterThanOrEqual(interval.gpuEndTime, interval.gpuStartTime)
+    }
+
+    func testMetricsUseCompletedCommandBufferGPUIntervalInsteadOfWallClock() throws {
+        let queue = FakeMetalCommandQueue()
+        let metrics = PlaybackMetrics(
+            selectedAlgorithm: .metalYADIF2x,
+            channelID: "channel",
+            now: { 120 },
+            residentMemoryProvider: { 1 }
+        )
+        let processor = try YADIFProcessor(
+            commandSubmitter: queue,
+            surfacePool: ProgressiveSurfacePool(),
+            clock: TestYADIFClock(),
+            metrics: metrics
+        )
+        processor.reset(to: generation)
+        let harness = YADIFProcessorHarness(
+            processor: processor,
+            queue: queue,
+            clock: TestYADIFClock(),
+            results: YADIFProcessorResultRecorder(),
+            drops: YADIFDropRecorder()
+        )
+        for id in 1...3 {
+            submit(try normalized(id: UInt64(id)), to: harness)
+        }
+
+        queue.completeNext(.completedWithGPUInterval(.init(
+            gpuStartTime: 40,
+            gpuEndTime: 40.004
+        )))
+
+        XCTAssertEqual(
+            metrics.snapshot(window: .seconds(60)).gpuDurationP95Milliseconds,
+            4,
+            accuracy: 0.000_001
+        )
     }
 
     private func makeHarness(

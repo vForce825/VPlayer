@@ -98,7 +98,14 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
         )
         commandBuffer.addCompletedHandler { buffer in
             resources.releaseBeforeUserCompletion()
-            completion(buffer.status == .completed ? .completed : .failed)
+            if buffer.status == .completed {
+                completion(.completedWithGPUInterval(.init(
+                    gpuStartTime: buffer.gpuStartTime,
+                    gpuEndTime: buffer.gpuEndTime
+                )))
+            } else {
+                completion(.failed)
+            }
         }
         commandBuffer.commit()
     }
@@ -133,7 +140,6 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private struct InFlightJob: @unchecked Sendable {
         let ready: ReadyJob
         let outputs: (first: CVPixelBuffer, second: CVPixelBuffer)
-        let gpuStartedAt: TimeInterval?
         let signpostLifetime: PlaybackSignpostLifetime
     }
 
@@ -548,7 +554,6 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         inFlightJobs[identifier] = InFlightJob(
             ready: attempt.ready,
             outputs: outputs,
-            gpuStartedAt: metrics?.beginGPUOperation(),
             signpostLifetime: signpostLifetime
         )
         counters.submitted &+= 1
@@ -623,19 +628,18 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         }
         let isCurrent = isCurrentLocked(completed.ready)
         completed.signpostLifetime.finish()
-        if let gpuStartedAt = completed.gpuStartedAt {
-            metrics?.recordGPUDuration(startedAt: gpuStartedAt)
+        if case let .completedWithGPUInterval(interval) = result,
+           let duration = interval.durationMilliseconds {
+            metrics?.recordGPUDuration(milliseconds: duration)
         }
         if isCurrent {
             counters.completed &+= 1
-        } else {
-            metrics?.recordStaleGenerationDrop()
         }
         if !isCurrent {
             actions.append(.complete(completed.ready.completion, .success([])))
         } else {
             switch result {
-            case .completed:
+            case .completed, .completedWithGPUInterval:
                 actions.append(.complete(
                     completed.ready.completion,
                     .success(Self.presentationFrames(for: completed))

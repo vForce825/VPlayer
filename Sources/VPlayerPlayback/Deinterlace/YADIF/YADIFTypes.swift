@@ -16,6 +16,7 @@ protocol YADIFCommandSubmitting: AnyObject, Sendable {
 
 enum YADIFCommandResult: Sendable, Equatable {
     case completed
+    case completedWithGPUInterval(MetalGPUInterval)
     case failed
 }
 

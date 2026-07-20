@@ -21,20 +21,28 @@ struct PlaybackSignpostToken: @unchecked Sendable {
 
 final class PlaybackSignpostLifetime: @unchecked Sendable {
     private let lock = NSLock()
-    private let signposts: PlaybackSignposts?
-    private var token: PlaybackSignpostToken?
+    private var finishOperation: (@Sendable () -> Void)?
 
     init(signposts: PlaybackSignposts?, token: PlaybackSignpostToken?) {
-        self.signposts = signposts
-        self.token = token
+        if let signposts, let token {
+            finishOperation = { signposts.end(token) }
+        }
+    }
+
+    init(_ finishOperation: @escaping @Sendable () -> Void) {
+        self.finishOperation = finishOperation
     }
 
     func finish() {
-        let token = lock.withLock { () -> PlaybackSignpostToken? in
-            defer { self.token = nil }
-            return self.token
+        let operation = lock.withLock { () -> (@Sendable () -> Void)? in
+            defer { finishOperation = nil }
+            return finishOperation
         }
-        if let token { signposts?.end(token) }
+        operation?()
+    }
+
+    deinit {
+        finish()
     }
 }
 
@@ -52,43 +60,47 @@ final class PlaybackSignposts: @unchecked Sendable {
     func begin(_ span: PlaybackSignpostSpan, correlation: UInt64) -> PlaybackSignpostToken {
         let identifier = signposter.makeSignpostID()
         let channel = channelIdentifier.value
+        let boundedCorrelation = PlaybackDiagnosticsCorrelationID(
+            channelIdentifier: channelIdentifier,
+            rawValue: correlation
+        ).value
         let state: OSSignpostIntervalState
         switch span {
         case .videoToolboxDecode:
             state = signposter.beginInterval(
                 "VT decode",
                 id: identifier,
-                "channel=\(channel, privacy: .public) correlation=\(correlation)"
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
         case .scanProbe:
             state = signposter.beginInterval(
                 "Scan probe",
                 id: identifier,
-                "channel=\(channel, privacy: .public) correlation=\(correlation)"
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
         case .yadifCommandBuffer:
             state = signposter.beginInterval(
                 "YADIF command buffer",
                 id: identifier,
-                "channel=\(channel, privacy: .public) correlation=\(correlation)"
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
         case .renderDraw:
             state = signposter.beginInterval(
                 "Render draw",
                 id: identifier,
-                "channel=\(channel, privacy: .public) correlation=\(correlation)"
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
         case .modeSwitch:
             state = signposter.beginInterval(
                 "Mode switch",
                 id: identifier,
-                "channel=\(channel, privacy: .public) correlation=\(correlation)"
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
         case .reanchor:
             state = signposter.beginInterval(
                 "Reanchor",
                 id: identifier,
-                "channel=\(channel, privacy: .public) correlation=\(correlation)"
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
         }
         return PlaybackSignpostToken(span: span, state: state)

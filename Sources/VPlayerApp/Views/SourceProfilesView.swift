@@ -121,7 +121,7 @@ struct SourceProfilesView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(profile.name)
                     .font(.headline)
-                Text(profile.m3uURL.absoluteString)
+                Text(displayedM3UURL(for: profile))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -141,6 +141,15 @@ struct SourceProfilesView: View {
                 .accessibilityIdentifier("source.activate.\(profile.id.uuidString)")
             }
         }
+    }
+
+    private func displayedM3UURL(for profile: SourceProfile) -> String {
+        #if DEBUG
+        if AcceptanceSourcePrefill.isActive() {
+            return "Protected URL configured"
+        }
+        #endif
+        return profile.m3uURL.absoluteString
     }
 
     private func resourceStatus(

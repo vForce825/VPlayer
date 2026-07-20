@@ -248,6 +248,119 @@ final class MetalVideoRendererTests: XCTestCase {
         XCTAssertEqual(harness.failures.snapshot.count, 1)
     }
 
+    func testAcceptanceMetricsCountOnlySuccessfulNewFrameCompletions() throws {
+        let metrics = PlaybackMetrics(
+            selectedAlgorithm: .appleTemporal,
+            channelID: "channel",
+            now: { 60 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = try makeHarness(metrics: metrics)
+        harness.renderer.enqueue(frame(
+            id: 1,
+            pts: .zero,
+            storage: .metalPlanes(.init(
+                luma: harness.mapper.texture,
+                chroma: harness.mapper.texture,
+                retainedObjects: []
+            ))
+        ))
+
+        XCTAssertEqual(
+            harness.renderer.draw(targetMediaTime: .zero, drawable: harness.drawable).action,
+            .presented
+        )
+        XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 0)
+        harness.submitter.completeFirst(.succeeded)
+        XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 1)
+
+        XCTAssertEqual(
+            harness.renderer.draw(
+                targetMediaTime: CMTime(value: 1, timescale: 60),
+                drawable: harness.drawable
+            ).action,
+            .repeated
+        )
+        harness.submitter.completeFirst(.succeeded)
+        XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 1)
+
+        harness.renderer.enqueue(frame(
+            id: 2,
+            pts: CMTime(value: 2, timescale: 60),
+            storage: .metalPlanes(.init(
+                luma: harness.mapper.texture,
+                chroma: harness.mapper.texture,
+                retainedObjects: []
+            ))
+        ))
+        XCTAssertEqual(
+            harness.renderer.draw(
+                targetMediaTime: CMTime(value: 2, timescale: 60),
+                drawable: harness.drawable
+            ).action,
+            .presented
+        )
+        harness.submitter.completeFirst(.failed("asynchronous failure"))
+        XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 1)
+    }
+
+    func testFlushBeforeSuccessfulCompletionCountsCrossGenerationWithoutPresentation() throws {
+        let metrics = PlaybackMetrics(
+            selectedAlgorithm: .appleTemporal,
+            channelID: "channel",
+            now: { 60 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = try makeHarness(metrics: metrics)
+        harness.renderer.enqueue(frame(
+            id: 1,
+            pts: .zero,
+            storage: .metalPlanes(.init(
+                luma: harness.mapper.texture,
+                chroma: harness.mapper.texture,
+                retainedObjects: []
+            ))
+        ))
+        _ = harness.renderer.draw(targetMediaTime: .zero, drawable: harness.drawable)
+
+        harness.renderer.flush(to: MediaGeneration(rawValue: 5))
+        harness.submitter.completeFirst(.succeeded)
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.presentedVideoFrames, 0)
+        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
+    }
+
+    func testSelectionDropsAreCountedExactlyOnceEvenWhenSubmissionFails() throws {
+        let metrics = PlaybackMetrics(
+            selectedAlgorithm: .appleTemporal,
+            channelID: "channel",
+            now: { 60 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = try makeHarness(metrics: metrics)
+        for id in 1...3 {
+            harness.renderer.enqueue(frame(
+                id: UInt64(id),
+                pts: CMTime(value: Int64(id), timescale: 100),
+                storage: .metalPlanes(.init(
+                    luma: harness.mapper.texture,
+                    chroma: harness.mapper.texture,
+                    retainedObjects: []
+                ))
+            ))
+        }
+
+        let decision = harness.renderer.draw(
+            targetMediaTime: CMTime(value: 3, timescale: 100),
+            drawable: harness.drawable
+        )
+        XCTAssertEqual(decision.droppedFrameCount, 2)
+        XCTAssertEqual(metrics.snapshot(window: .seconds(60)).droppedVideoFrames, 2)
+        harness.submitter.completeFirst(.failed("asynchronous failure"))
+        XCTAssertEqual(metrics.snapshot(window: .seconds(60)).droppedVideoFrames, 2)
+    }
+
     func testFlushLinearizesSelectionMappingAndSubmissionAcrossGenerations() throws {
         let harness = try makeHarness()
         let mappingStarted = DispatchSemaphore(value: 0)
@@ -633,7 +746,7 @@ final class MetalVideoRendererTests: XCTestCase {
         ])
     }
 
-    private func makeHarness() throws -> RendererHarness {
+    private func makeHarness(metrics: PlaybackMetrics? = nil) throws -> RendererHarness {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let mapper = try FakeTextureMapper(device: device)
         let submitter = FakeCommandSubmitter()
@@ -643,6 +756,7 @@ final class MetalVideoRendererTests: XCTestCase {
             generation: generation,
             textureMapperFactory: { _ in mapper },
             commandSubmitter: submitter,
+            metrics: metrics,
             failureSink: { failures.append(error: $0, generation: $1) }
         )
         return RendererHarness(

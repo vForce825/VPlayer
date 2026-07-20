@@ -767,6 +767,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             )))
         }
         XCTAssertGreaterThan(harness.yadif.pendingCompletionCount, 0)
+        let staleCompletionCount = harness.yadif.pendingCompletionCount
 
         harness.coordinator.setAlgorithm(.appleTemporal)
         XCTAssertGreaterThan(harness.host.generation, oldGeneration)
@@ -774,6 +775,10 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
         XCTAssertTrue(harness.host.failures.isEmpty)
+        XCTAssertEqual(
+            harness.metrics.snapshot(window: .seconds(60)).staleGenerationDropCount,
+            UInt64(staleCompletionCount)
+        )
     }
 
     private func makeHarness(
@@ -790,6 +795,12 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         let yadif = FakeCoordinatorYADIFProcessor()
         let probe = FakeCoordinatorProbe()
         let host = CoordinatorHost(trace: trace)
+        let metrics = PlaybackMetrics(
+            selectedAlgorithm: algorithm,
+            channelID: "channel",
+            now: { 60 },
+            residentMemoryProvider: { 1 }
+        )
         let coordinator = VideoPipelineCoordinator(
             decoder: decoder,
             passthrough: passthrough,
@@ -798,6 +809,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             initialGeneration: host.generation,
             selectedAlgorithm: algorithm,
             classifierConfiguration: classifierConfiguration,
+            metrics: metrics,
             hooks: host.hooks
         )
         return CoordinatorHarness(
@@ -807,6 +819,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             yadif: yadif,
             probe: probe,
             host: host,
+            metrics: metrics,
             trace: trace
         )
     }
@@ -893,6 +906,7 @@ private struct CoordinatorHarness {
     let yadif: FakeCoordinatorYADIFProcessor
     let probe: FakeCoordinatorProbe
     let host: CoordinatorHost
+    let metrics: PlaybackMetrics
     let trace: CoordinatorTrace
 }
 

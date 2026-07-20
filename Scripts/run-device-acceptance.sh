@@ -5,6 +5,54 @@
 
 set -euo pipefail
 
+child_pid=""
+received_signal=""
+
+forward_signal() {
+    local signal="$1"
+    received_signal="$signal"
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+        kill -"$signal" -- "-$child_pid" 2>/dev/null \
+            || kill -"$signal" "$child_pid" 2>/dev/null \
+            || true
+    fi
+}
+
+wait_for_child() {
+    local status=0
+    set +e
+    while true; do
+        wait "$child_pid"
+        status=$?
+        if [[ -n "$received_signal" ]] && kill -0 "$child_pid" 2>/dev/null; then
+            continue
+        fi
+        break
+    done
+    set -e
+    if [[ -n "$received_signal" ]]; then
+        return 130
+    fi
+    return "$status"
+}
+
+trap 'forward_signal INT' INT
+trap 'forward_signal TERM' TERM
+trap 'forward_signal HUP' HUP
+
+if [[ "${VPLAYER_ACCEPTANCE_SIGNAL_TEST_MODE:-0}" == "1" ]]; then
+    signal_pid_file="${VPLAYER_ACCEPTANCE_SIGNAL_TEST_PID_FILE:?signal-test PID file required}"
+    set -m
+    bash -c 'trap "exit 0" INT TERM HUP; while true; do sleep 1; done' &
+    child_pid=$!
+    printf '%s\n' "$child_pid" >"$signal_pid_file"
+    set +e
+    wait_for_child
+    test_status=$?
+    set -e
+    exit "$test_status"
+fi
+
 usage() {
     echo "usage: $0 DEVICE_UDID {appleTemporal|metalYADIF2x} CHANNEL POSITIVE_SECONDS [M3U_URL]" >&2
 }
@@ -58,10 +106,21 @@ fi
 development_team="${VPLAYER_DEVELOPMENT_TEAM:-}"
 if [[ -z "$development_team" ]]; then
     signing_identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
-    development_team="$(
-        sed -nE 's/.*"Apple Development:.*\(([A-Z0-9]{10})\)".*/\1/p' \
+    signing_identity="$(
+        sed -nE 's/^[[:space:]]*[0-9]+\) [A-Fa-f0-9]+ "([^"]+)".*/\1/p' \
             <<<"$signing_identities" | sed -n '1p'
     )"
+    if [[ -n "$signing_identity" ]]; then
+        certificate_subject="$(
+            security find-certificate -a -p -c "$signing_identity" 2>/dev/null \
+                | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null \
+                || true
+        )"
+        development_team="$(
+            sed -nE 's/.*OU=([A-Z0-9]{10})(,|$).*/\1/p' \
+                <<<"$certificate_subject" | sed -n '1p'
+        )"
+    fi
 fi
 if [[ ! "$development_team" =~ ^[A-Z0-9]{10}$ ]]; then
     echo "a valid Apple Development team is required for device signing" >&2
@@ -75,6 +134,7 @@ run_id="$(date -u '+%Y%m%dT%H%M%SZ')-${algorithm}-$$"
 run_directory="$artifact_root/$run_id"
 derived_data="$run_directory/DerivedData"
 result_bundle="$run_directory/acceptance.xcresult"
+console_log="$run_directory/xcodebuild.log"
 acceptance_xcconfig="$run_directory/acceptance.xcconfig"
 umask 077
 mkdir -p "$run_directory"
@@ -89,19 +149,8 @@ encode_build_setting() {
     printf 'VPLAYER_ACCEPTANCE_ALGORITHM_B64 = %s\n' "$(encode_build_setting "$algorithm")"
 } >"$acceptance_xcconfig"
 
-interrupted=0
-handle_interrupt() {
-    interrupted=1
-    echo "acceptance interrupted; partial artifacts remain at: $run_directory" >&2
-}
-trap handle_interrupt INT TERM HUP
-
 echo "running device acceptance on verified AppleTV14,1; artifacts: $run_directory"
-set +e
-VPLAYER_ACCEPTANCE_M3U_URL="$m3u_url" \
-VPLAYER_ACCEPTANCE_CHANNEL="$channel" \
-VPLAYER_ACCEPTANCE_SECONDS="$duration" \
-VPLAYER_ACCEPTANCE_ALGORITHM="$algorithm" \
+set -m
 xcodebuild test \
     -project "$repository_root/VPlayer.xcodeproj" \
     -scheme VPlayer \
@@ -113,11 +162,27 @@ xcodebuild test \
     -parallel-testing-enabled NO \
     -allowProvisioningUpdates \
     -only-testing:VPlayerUITests/LongPlaybackAcceptanceTests/testLongRunningRealDevicePlayback \
-    DEVELOPMENT_TEAM="$development_team"
+    DEVELOPMENT_TEAM="$development_team" >"$console_log" 2>&1 &
+child_pid=$!
+set +e
+wait_for_child
 status=$?
 set -e
 
-if (( interrupted != 0 )); then
+privacy_violation=0
+if rg -a -F -q -- "$m3u_url" "$console_log"; then
+    privacy_violation=1
+elif [[ -e "$result_bundle" ]] && rg -a -F -q -- "$m3u_url" "$result_bundle"; then
+    privacy_violation=1
+fi
+if (( privacy_violation != 0 )); then
+    echo "acceptance privacy scan failed; protected artifacts retained without console replay" >&2
+    exit 78
+fi
+
+sed -n '1,$p' "$console_log"
+if [[ -n "$received_signal" ]]; then
+    echo "acceptance interrupted; partial artifacts remain at: $run_directory" >&2
     exit 130
 fi
 if (( status != 0 )); then

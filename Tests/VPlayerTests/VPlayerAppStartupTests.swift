@@ -70,6 +70,28 @@ final class VPlayerAppStartupTests: XCTestCase {
         )
     }
 
+    #if DEBUG
+    func testAcceptanceSourcePrefillAcceptsOnlyBase64LaunchTransport() throws {
+        let source = "https://example.test/list.m3u"
+        let encoded = Data(source.utf8).base64EncodedString()
+
+        let prefill = try XCTUnwrap(AcceptanceSourcePrefill.current(
+            arguments: ["VPlayer", "-acceptance-playback"],
+            environment: [AcceptanceSourcePrefill.encodedM3UKey: encoded]
+        ))
+
+        XCTAssertEqual(prefill.m3uURLString, source)
+        XCTAssertNil(AcceptanceSourcePrefill.current(
+            arguments: ["VPlayer"],
+            environment: [AcceptanceSourcePrefill.encodedM3UKey: encoded]
+        ))
+        XCTAssertNil(AcceptanceSourcePrefill.current(
+            arguments: ["VPlayer", "-acceptance-playback"],
+            environment: ["VPLAYER_ACCEPTANCE_M3U_URL": source]
+        ))
+    }
+    #endif
+
     func testProductionAppStartupPurgesLibrarySnapshotsOnceAfterRepeatedStartRequests() async {
         let probe = StartupMaintenanceProbe()
         let dependencies = makeDependencies(maintenance: probe)

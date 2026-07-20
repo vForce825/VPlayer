@@ -22,11 +22,7 @@ struct AppLaunchConfiguration {
             arguments[$0] == "-acceptance-playback"
         }
         #if DEBUG
-        let selectsAcceptance = acceptanceFlags.count == 1 && fixtureFlags.isEmpty
-        #else
-        let selectsAcceptance = false
-        #endif
-        if selectsAcceptance {
+        if acceptanceFlags.count == 1 && fixtureFlags.isEmpty {
             mode = .acceptance
         } else if acceptanceFlags.isEmpty,
                   fixtureFlags.count == 1,
@@ -37,6 +33,17 @@ struct AppLaunchConfiguration {
         } else {
             mode = .live
         }
+        #else
+        if acceptanceFlags.isEmpty,
+           fixtureFlags.count == 1,
+           let flagIndex = fixtureFlags.first,
+           arguments.indices.contains(flagIndex + 1),
+           arguments[flagIndex + 1] == "seeded" {
+            mode = .seededFixture
+        } else {
+            mode = .live
+        }
+        #endif
         resetsPlaybackSettings = arguments.contains("-uiTestResetPlaybackSettings")
         let playbackFixtureFlags = arguments.indices.filter {
             arguments[$0] == "-ui-playback-fixture"
@@ -50,6 +57,39 @@ struct AppLaunchConfiguration {
         }
     }
 }
+
+#if DEBUG
+struct AcceptanceSourcePrefill: Equatable {
+    static let encodedM3UKey = "VPLAYER_ACCEPTANCE_M3U_URL_B64"
+
+    let name: String
+    let m3uURLString: String
+    let epgURLString: String
+
+    static func isActive(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
+        arguments.filter { $0 == "-acceptance-playback" }.count == 1
+    }
+
+    static func current(
+        arguments: [String] = ProcessInfo.processInfo.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Self? {
+        guard isActive(arguments: arguments),
+              let encoded = environment[encodedM3UKey],
+              let data = Data(base64Encoded: encoded),
+              let value = String(data: data, encoding: .utf8),
+              let url = URL(string: value),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            return nil
+        }
+        return Self(
+            name: "Device Acceptance",
+            m3uURLString: value,
+            epgURLString: "https://example.invalid/acceptance.xml"
+        )
+    }
+}
+#endif
 
 @main
 struct VPlayerApp: App {
