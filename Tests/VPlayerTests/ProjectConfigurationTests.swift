@@ -85,6 +85,24 @@ final class ProjectConfigurationTests: XCTestCase {
             ),
             encoding: .utf8
         )
+        let signingResolver = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Scripts/resolve-acceptance-development-team.sh"
+            ),
+            encoding: .utf8
+        )
+        let signingTest = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Scripts/test-device-acceptance-signing.sh"
+            ),
+            encoding: .utf8
+        )
+        let sourceEditor = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Views/SourceProfileEditorView.swift"
+            ),
+            encoding: .utf8
+        )
 
         for forbidden in ["absoluteString", "streamURL", "query", "channelName", "rawChannel"] {
             XCTAssertFalse(signposts.contains(forbidden), "signposts reference sensitive field: \(forbidden)")
@@ -105,8 +123,15 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(runner.contains("acceptance.xcconfig"))
         XCTAssertTrue(runner.contains("-xcconfig \"$acceptance_xcconfig\""))
         XCTAssertTrue(runner.contains("security find-certificate"))
-        XCTAssertTrue(runner.contains("openssl x509"))
-        XCTAssertTrue(runner.contains("OU="))
+        XCTAssertTrue(runner.contains("resolve_acceptance_development_team"))
+        XCTAssertTrue(runner.contains("-a -Z -p -c \"Apple Development:\""))
+        XCTAssertTrue(signingResolver.contains("signing_fingerprint"))
+        XCTAssertTrue(signingResolver.contains("openssl x509"))
+        XCTAssertTrue(signingResolver.contains("OU=([A-Z0-9]{10})"))
+        XCTAssertFalse(signingResolver.contains("printf '%s\\n' \"$selected_certificate\""))
+        XCTAssertTrue(signingTest.contains("TEAMWRONG1"))
+        XCTAssertTrue(signingTest.contains("TEAMRIGHT1"))
+        XCTAssertTrue(signingTest.contains("Apple Development: Duplicate Name"))
         XCTAssertFalse(runner.contains("Apple Development:.*\\(([A-Z0-9]{10})\\)"))
         XCTAssertFalse(runner.contains("VPLAYER_ACCEPTANCE_M3U_URL=\"$m3u_url\""))
         XCTAssertFalse(runner.contains("VPLAYER_ACCEPTANCE_CHANNEL=\"$channel\""))
@@ -115,7 +140,10 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(runner.contains("kill -\"$signal\" -- \"-$child_pid\""))
         XCTAssertTrue(runner.contains("rg -a -F -q -- \"$m3u_url\""))
         XCTAssertTrue(signalTest.contains("VPLAYER_ACCEPTANCE_SIGNAL_TEST_MODE=1"))
+        XCTAssertTrue(signalTest.contains("VPLAYER_ACCEPTANCE_PREFLIGHT_SIGNAL_TEST_MODE=1"))
+        XCTAssertTrue(signalTest.contains("run_prechild_signal_test HUP"))
         XCTAssertTrue(signalTest.contains("[[ \"$status\" == \"130\" ]]"))
+        XCTAssertTrue(runner.contains("abort_if_signaled"))
         XCTAssertTrue(project.contains("INFOPLIST_FILE: Tests/VPlayerUITests/Info.plist"))
         XCTAssertTrue(uiTestInfoPlist.contains("$(VPLAYER_ACCEPTANCE_M3U_URL_B64)"))
         XCTAssertTrue(acceptanceTest.contains("Data(base64Encoded:"))
@@ -125,6 +153,9 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(acceptanceTest.contains("app.launchEnvironment = configuration.encodedEnvironment"))
         XCTAssertFalse(acceptanceTest.contains("ProcessInfo.processInfo.environment"))
         XCTAssertFalse(acceptanceTest.contains("typeText(m3u"))
+        XCTAssertTrue(sourceEditor.contains("text: .constant(m3uFieldPresentation.displayedValue)"))
+        XCTAssertTrue(sourceEditor.contains("text: $m3uURLString"))
+        XCTAssertFalse(sourceEditor.contains(".accessibilityValue("))
     }
 
     func testProductionSourcesKeepTask12ForbiddenControlsAndCopiesAbsent() throws {

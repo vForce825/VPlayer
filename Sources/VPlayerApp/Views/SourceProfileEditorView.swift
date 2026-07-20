@@ -5,6 +5,18 @@
 import SwiftUI
 import VPlayerCore
 
+struct SourceProfileEditorM3UFieldPresentation: Equatable {
+    static let protectedValue = "Protected URL configured"
+
+    let displayedValue: String
+    let isProtected: Bool
+
+    init(rawValue: String, protectsValue: Bool) {
+        isProtected = protectsValue
+        displayedValue = protectsValue ? Self.protectedValue : rawValue
+    }
+}
+
 struct SourceProfileEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var model: AppModel
@@ -49,13 +61,7 @@ struct SourceProfileEditorView: View {
             Form {
                 TextField("数据源名称", text: $name)
                     .accessibilityIdentifier("source.editor.name")
-                TextField("M3U 地址", text: $m3uURLString)
-                    .accessibilityIdentifier("source.editor.m3u")
-                    .accessibilityValue(
-                        protectsAcceptanceSourceValue
-                            ? "Protected URL configured"
-                            : m3uURLString
-                    )
+                m3uURLField
                 TextField("EPG 地址", text: $epgURLString)
                     .accessibilityIdentifier("source.editor.epg")
 
@@ -87,6 +93,22 @@ struct SourceProfileEditorView: View {
         .onDisappear {
             guard profile == nil else { return }
             model.cancelCreateAttempt(createAttemptID)
+        }
+    }
+
+    @ViewBuilder
+    private var m3uURLField: some View {
+        let m3uFieldPresentation = SourceProfileEditorM3UFieldPresentation(
+            rawValue: m3uURLString,
+            protectsValue: protectsAcceptanceSourceValue
+        )
+        if m3uFieldPresentation.isProtected {
+            TextField("M3U 地址", text: .constant(m3uFieldPresentation.displayedValue))
+                .disabled(true)
+                .accessibilityIdentifier("source.editor.m3u")
+        } else {
+            TextField("M3U 地址", text: $m3uURLString)
+                .accessibilityIdentifier("source.editor.m3u")
         }
     }
 

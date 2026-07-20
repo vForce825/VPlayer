@@ -89,6 +89,34 @@ final class VPlayerAppStartupTests: XCTestCase {
             arguments: ["VPlayer", "-acceptance-playback"],
             environment: ["VPLAYER_ACCEPTANCE_M3U_URL": source]
         ))
+        XCTAssertNil(AcceptanceSourcePrefill.current(
+            arguments: [
+                "VPlayer", "-ui-fixture", "seeded", "-acceptance-playback",
+            ],
+            environment: [AcceptanceSourcePrefill.encodedM3UKey: encoded]
+        ))
+        XCTAssertFalse(AcceptanceSourcePrefill.isActive(arguments: [
+            "VPlayer", "-ui-fixture", "seeded", "-acceptance-playback",
+        ]))
+    }
+
+    func testAcceptanceM3UFieldPresentationNeverDisplaysRawURL() {
+        let source = "https://user:secret@example.test/list.m3u?token=private"
+
+        let protected = SourceProfileEditorM3UFieldPresentation(
+            rawValue: source,
+            protectsValue: true
+        )
+        let normal = SourceProfileEditorM3UFieldPresentation(
+            rawValue: source,
+            protectsValue: false
+        )
+
+        XCTAssertTrue(protected.isProtected)
+        XCTAssertEqual(protected.displayedValue, "Protected URL configured")
+        XCTAssertFalse(protected.displayedValue.contains(source))
+        XCTAssertFalse(normal.isProtected)
+        XCTAssertEqual(normal.displayedValue, source)
     }
     #endif
 

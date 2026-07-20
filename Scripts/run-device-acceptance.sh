@@ -5,8 +5,22 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=resolve-acceptance-development-team.sh
+source "$script_dir/resolve-acceptance-development-team.sh"
+
 child_pid=""
 received_signal=""
+
+abort_if_signaled() {
+    [[ -z "$received_signal" ]] && return
+    if [[ -n "${run_directory:-}" ]]; then
+        echo "acceptance interrupted; partial artifacts remain at: $run_directory" >&2
+    else
+        echo "acceptance interrupted before launch" >&2
+    fi
+    exit 130
+}
 
 forward_signal() {
     local signal="$1"
@@ -15,6 +29,8 @@ forward_signal() {
         kill -"$signal" -- "-$child_pid" 2>/dev/null \
             || kill -"$signal" "$child_pid" 2>/dev/null \
             || true
+    elif [[ -z "$child_pid" ]]; then
+        abort_if_signaled
     fi
 }
 
@@ -39,6 +55,18 @@ wait_for_child() {
 trap 'forward_signal INT' INT
 trap 'forward_signal TERM' TERM
 trap 'forward_signal HUP' HUP
+
+if [[ "${VPLAYER_ACCEPTANCE_PREFLIGHT_SIGNAL_TEST_MODE:-0}" == "1" ]]; then
+    preflight_ready_file="${VPLAYER_ACCEPTANCE_PREFLIGHT_SIGNAL_TEST_READY_FILE:?preflight ready file required}"
+    preflight_launch_file="${VPLAYER_ACCEPTANCE_PREFLIGHT_SIGNAL_TEST_LAUNCH_FILE:?preflight launch file required}"
+    printf 'ready\n' >"$preflight_ready_file"
+    while [[ -z "$received_signal" ]]; do
+        sleep 0.05 || true
+    done
+    abort_if_signaled
+    printf 'launched\n' >"$preflight_launch_file"
+    exit 1
+fi
 
 if [[ "${VPLAYER_ACCEPTANCE_SIGNAL_TEST_MODE:-0}" == "1" ]]; then
     signal_pid_file="${VPLAYER_ACCEPTANCE_SIGNAL_TEST_PID_FILE:?signal-test PID file required}"
@@ -106,28 +134,22 @@ fi
 development_team="${VPLAYER_DEVELOPMENT_TEAM:-}"
 if [[ -z "$development_team" ]]; then
     signing_identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
-    signing_identity="$(
-        sed -nE 's/^[[:space:]]*[0-9]+\) [A-Fa-f0-9]+ "([^"]+)".*/\1/p' \
-            <<<"$signing_identities" | sed -n '1p'
+    signing_certificates="$(
+        security find-certificate -a -Z -p -c "Apple Development:" 2>/dev/null \
+            || true
     )"
-    if [[ -n "$signing_identity" ]]; then
-        certificate_subject="$(
-            security find-certificate -a -p -c "$signing_identity" 2>/dev/null \
-                | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null \
-                || true
-        )"
-        development_team="$(
-            sed -nE 's/.*OU=([A-Z0-9]{10})(,|$).*/\1/p' \
-                <<<"$certificate_subject" | sed -n '1p'
-        )"
-    fi
+    development_team="$(
+        resolve_acceptance_development_team \
+            "$signing_identities" \
+            "$signing_certificates" \
+            || true
+    )"
 fi
 if [[ ! "$development_team" =~ ^[A-Z0-9]{10}$ ]]; then
     echo "a valid Apple Development team is required for device signing" >&2
     exit 69
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd "$script_dir/.." && pwd)"
 artifact_root="${VPLAYER_ACCEPTANCE_ARTIFACT_ROOT:-$repository_root/.superpowers/acceptance}"
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')-${algorithm}-$$"
@@ -150,6 +172,7 @@ encode_build_setting() {
 } >"$acceptance_xcconfig"
 
 echo "running device acceptance on verified AppleTV14,1; artifacts: $run_directory"
+abort_if_signaled
 set -m
 xcodebuild test \
     -project "$repository_root/VPlayer.xcodeproj" \

@@ -11,6 +11,15 @@ enum AppLaunchMode: Equatable {
     case acceptance
 }
 
+#if DEBUG
+enum AcceptanceLaunchSelection {
+    static func isSelected(arguments: [String]) -> Bool {
+        arguments.filter { $0 == "-acceptance-playback" }.count == 1
+            && !arguments.contains("-ui-fixture")
+    }
+}
+#endif
+
 struct AppLaunchConfiguration {
     let mode: AppLaunchMode
     let resetsPlaybackSettings: Bool
@@ -22,7 +31,7 @@ struct AppLaunchConfiguration {
             arguments[$0] == "-acceptance-playback"
         }
         #if DEBUG
-        if acceptanceFlags.count == 1 && fixtureFlags.isEmpty {
+        if AcceptanceLaunchSelection.isSelected(arguments: arguments) {
             mode = .acceptance
         } else if acceptanceFlags.isEmpty,
                   fixtureFlags.count == 1,
@@ -67,7 +76,7 @@ struct AcceptanceSourcePrefill: Equatable {
     let epgURLString: String
 
     static func isActive(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
-        arguments.filter { $0 == "-acceptance-playback" }.count == 1
+        AcceptanceLaunchSelection.isSelected(arguments: arguments)
     }
 
     static func current(

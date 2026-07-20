@@ -13,6 +13,36 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         "VPLAYER_ACCEPTANCE_ALGORITHM",
     ]
 
+    func testSnapshotDeltaRejectsBadCurrentMinuteAfterGoodLongPrefix() {
+        let previousPresented: UInt64 = 150_000
+        let previousDropped: UInt64 = 100
+        let currentPresented: UInt64 = 150_049
+        let currentDropped: UInt64 = 102
+
+        XCTAssertLessThan(
+            Double(currentDropped) / Double(currentPresented + currentDropped),
+            0.01,
+            "The cumulative session ratio intentionally remains good"
+        )
+        XCTAssertThrowsError(try AcceptanceSnapshotValidator.validateCounterDelta(
+            previousPresented: previousPresented,
+            previousDropped: previousDropped,
+            currentPresented: currentPresented,
+            currentDropped: currentDropped
+        )) { error in
+            XCTAssertEqual(error as? AcceptanceValidationError, .dropRatioExceeded)
+        }
+    }
+
+    func testAppleCadenceRejectsMismatchedTwentyFiveAndFiftyBands() {
+        XCTAssertThrowsError(try AcceptanceSnapshotValidator.validateMatchingAppleCadence(
+            decoderCallbacksPerSecond: 25,
+            presentationsPerSecond: 50
+        )) { error in
+            XCTAssertEqual(error as? AcceptanceValidationError, .cadenceBandMismatch)
+        }
+    }
+
     @MainActor
     func testLongRunningRealDevicePlayback() async throws {
         let configuration = try acceptanceConfiguration()
@@ -66,6 +96,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let end = startedAt.advanced(by: requestedDuration)
         var nextMinute = startedAt.advanced(by: .seconds(60))
         var lastObservedElapsed = runBaseline.elapsedSeconds
+        var previousSteadySnapshot = runBaseline
         var snapshots: [AcceptanceMetricsSnapshot] = []
 
         while clock.now < end {
@@ -80,9 +111,14 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 if let prior = snapshots.last {
                     XCTAssertGreaterThan(heartbeat.elapsedSeconds, prior.elapsedSeconds)
                 }
+                assertSteadyStateCounterDelta(
+                    from: previousSteadySnapshot,
+                    to: heartbeat
+                )
                 try attach(heartbeat, elapsed: elapsedSeconds(from: startedAt, clock: clock))
                 assertSteadyStateThresholds(heartbeat, configuration: configuration)
                 snapshots.append(heartbeat)
+                previousSteadySnapshot = heartbeat
                 repeat {
                     nextMinute = nextMinute.advanced(by: .seconds(60))
                 } while nextMinute <= clock.now
@@ -99,6 +135,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         if let prior = snapshots.last {
             XCTAssertGreaterThan(final.elapsedSeconds, prior.elapsedSeconds)
         }
+        assertSteadyStateCounterDelta(from: previousSteadySnapshot, to: final)
         try attach(final, elapsed: elapsedSeconds(from: startedAt, clock: clock))
         assertSteadyStateThresholds(final, configuration: configuration)
         snapshots.append(final)
@@ -404,12 +441,26 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertEqual(snapshot.activeRoute, "appleTemporal")
             XCTAssertGreaterThan(snapshot.temporalPropertySetCount, 0)
             XCTAssertGreaterThan(snapshot.temporalDecodeFlagCount, 0)
-            XCTAssertTrue(isBroadcastCadence(snapshot.decoderCallbacksPerSecond))
-            XCTAssertTrue(isBroadcastCadence(snapshot.presentationsPerSecond))
+            XCTAssertNoThrow(try AcceptanceSnapshotValidator.validateMatchingAppleCadence(
+                decoderCallbacksPerSecond: snapshot.decoderCallbacksPerSecond,
+                presentationsPerSecond: snapshot.presentationsPerSecond
+            ))
         case .appleTemporal:
             XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 1)
             XCTAssertEqual(snapshot.activeRoute, "rawTemporalFailure")
         }
+    }
+
+    private func assertSteadyStateCounterDelta(
+        from previous: AcceptanceMetricsSnapshot,
+        to current: AcceptanceMetricsSnapshot
+    ) {
+        XCTAssertNoThrow(try AcceptanceSnapshotValidator.validateCounterDelta(
+            previousPresented: previous.presentedVideoFrames,
+            previousDropped: previous.droppedVideoFrames,
+            currentPresented: current.presentedVideoFrames,
+            currentDropped: current.droppedVideoFrames
+        ))
     }
 
     private func assertLongRunMemoryEvidence(
@@ -447,16 +498,65 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         }
     }
 
-    private func isBroadcastCadence(_ rate: Double) -> Bool {
-        (22...28).contains(rate) || (45...55).contains(rate)
-    }
-
     private func elapsedSeconds(
         from start: ContinuousClock.Instant,
         clock: ContinuousClock
     ) -> Double {
         let components = start.duration(to: clock.now).components
         return Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+}
+
+private enum AcceptanceValidationError: Error, Equatable {
+    case counterRegressed
+    case emptyCounterDelta
+    case dropRatioExceeded
+    case cadenceOutsideBroadcastBands
+    case cadenceBandMismatch
+}
+
+private enum AcceptanceSnapshotValidator {
+    private enum CadenceBand: Equatable {
+        case broadcast25
+        case broadcast50
+    }
+
+    static func validateCounterDelta(
+        previousPresented: UInt64,
+        previousDropped: UInt64,
+        currentPresented: UInt64,
+        currentDropped: UInt64
+    ) throws {
+        guard currentPresented >= previousPresented,
+              currentDropped >= previousDropped else {
+            throw AcceptanceValidationError.counterRegressed
+        }
+        let presentedDelta = currentPresented - previousPresented
+        let droppedDelta = currentDropped - previousDropped
+        let denominator = Double(presentedDelta) + Double(droppedDelta)
+        guard denominator > 0 else {
+            throw AcceptanceValidationError.emptyCounterDelta
+        }
+        guard Double(droppedDelta) / denominator <= 0.01 else {
+            throw AcceptanceValidationError.dropRatioExceeded
+        }
+    }
+
+    static func validateMatchingAppleCadence(
+        decoderCallbacksPerSecond: Double,
+        presentationsPerSecond: Double
+    ) throws {
+        let decoderBand = try cadenceBand(for: decoderCallbacksPerSecond)
+        let presentationBand = try cadenceBand(for: presentationsPerSecond)
+        guard decoderBand == presentationBand else {
+            throw AcceptanceValidationError.cadenceBandMismatch
+        }
+    }
+
+    private static func cadenceBand(for rate: Double) throws -> CadenceBand {
+        if (22...28).contains(rate) { return .broadcast25 }
+        if (45...55).contains(rate) { return .broadcast50 }
+        throw AcceptanceValidationError.cadenceOutsideBroadcastBands
     }
 }
 
