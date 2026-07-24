@@ -1075,7 +1075,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
 
         guard retainedVideo.count > Self.retainedVideoCapacity else { return }
-        retainedVideo.removeFirst(retainedVideo.count - Self.retainedVideoCapacity)
+        retainedVideo.removeLast(retainedVideo.count - Self.retainedVideoCapacity)
     }
 
     private func prepareAnchorIsolated(commonPTS: CMTime) -> Bool {

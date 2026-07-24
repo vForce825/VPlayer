@@ -192,15 +192,20 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 decoderConfigured = true
                 activeConfiguration = targetConfiguration
                 waitingForRandomAccess = false
-            } catch let failure as VideoDecoderFailure
-                where targetConfiguration == .appleTemporal && failure.isTemporalUnavailable {
-                guard configureRawTemporalFallback(format: videoFormat) else { return }
             } catch let failure as VideoDecoderFailure {
-                hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
-                return
+                if targetConfiguration == .appleTemporal {
+                    guard configureRawTemporalFallback(format: videoFormat) else { return }
+                } else {
+                    hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
+                    return
+                }
             } catch {
-                hooks.fail(.videoDecode(-1), generation)
-                return
+                if targetConfiguration == .appleTemporal {
+                    guard configureRawTemporalFallback(format: videoFormat) else { return }
+                } else {
+                    hooks.fail(.videoDecode(-1), generation)
+                    return
+                }
             }
         }
 
@@ -264,7 +269,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 metrics?.recordStaleGenerationDrop()
                 return
             }
-            if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
+            if activeConfiguration == .appleTemporal {
                 temporalRetrySuppressed = true
                 emitTemporalNoticeOnce()
                 switchDecoderConfiguration(
@@ -677,8 +682,9 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 switch result {
                 case let .success(frames):
                     hooks.deliver(frames, submittedGeneration)
-                case let .failure(failure):
-                    hooks.fail(.metalCommand(failure.code), submittedGeneration)
+                case .failure:
+                    metrics?.recordVideoDrop()
+                    hooks.deliver([], submittedGeneration)
                 }
             }
         }

@@ -166,7 +166,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         configuration: VideoDecodeConfiguration
     ) throws {
         let subtype = CMFormatDescriptionGetMediaSubType(format)
-        guard subtype == kCMVideoCodecType_H264 || subtype == kCMVideoCodecType_HEVC else {
+        guard subtype == kCMVideoCodecType_H264 ||
+              subtype == kCMVideoCodecType_HEVC ||
+              subtype == kCMVideoCodecType_MPEG2Video ||
+              subtype == kCMVideoCodecType_MPEG4Video else {
             throw VideoDecoderFailure.sessionCreate(kVTVideoDecoderUnsupportedDataFormatErr)
         }
 
@@ -176,8 +179,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let imageBufferAttributes: [String: VTPropertyValue] = [
             kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
             kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String:
+            kCVPixelBufferPixelFormatTypeKey as String: .array([
                 .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange),
+            ]),
         ]
         let creation = api.createSession(
             format: format,
@@ -430,8 +437,6 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                  transientNoFrameStatus,
                  kVTVideoDecoderReferenceMissingErr:
                 return ClassifiedFailure(failure: .badData(status), isRecoverable: true)
-            case kVTVideoDecoderUnsupportedDataFormatErr:
-                return ClassifiedFailure(failure: .badData(status), isRecoverable: false)
             default:
                 return ClassifiedFailure(
                     failure: .temporalUnavailable(.processingFailed(status: status)),
