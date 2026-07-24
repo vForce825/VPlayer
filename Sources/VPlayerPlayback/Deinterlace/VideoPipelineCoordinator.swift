@@ -559,7 +559,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
 
     private func submitProbe(for frame: DecodedVideoFrame) {
         defer { previousProbeBuffer = frame.pixelBuffer }
-        guard route != .appleTemporal,
+        guard route == .rawWhileClassifying,
               let probe,
               let previousProbeBuffer else { return }
         let submittedGeneration = generation

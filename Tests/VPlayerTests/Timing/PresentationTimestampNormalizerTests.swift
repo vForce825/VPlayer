@@ -398,6 +398,26 @@ private extension PresentationTimestampNormalizerTests {
         MediaGeneration(rawValue: rawValue)
     }
 
+    func testAppleTemporalMultiFieldFramesUseFieldDurationAndSingleFieldStepPTS() throws {
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        sut.configureMaximumReorderDepth(4)
+        let frames = try [
+            decodedFrame(id: 1, pts90k: 0),
+            decodedFrame(id: 1, pts90k: 0),
+            decodedFrame(id: 2, pts90k: 3_600),
+            decodedFrame(id: 2, pts90k: 3_600),
+        ]
+
+        let output = frames.flatMap { sut.push($0, discontinuity: false) } + sut.drain()
+
+        XCTAssertEqual(output.count, 4)
+        XCTAssertEqual(output.map(ptsValue), [0, 1_800, 3_600, 5_400])
+        XCTAssertEqual(
+            output.map(\.frameDuration),
+            Array(repeating: CMTime(value: 1, timescale: 50), count: 4)
+        )
+    }
+
     func decodedFrame(
         id: UInt64,
         pts90k: Int64?,

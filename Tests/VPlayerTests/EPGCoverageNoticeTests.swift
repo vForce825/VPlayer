@@ -72,12 +72,15 @@ import UIKit
 final class ZZFontProbeTests: XCTestCase {
     @MainActor
     func testPrintPreferredFontSizes() {
-        let styles: [(String, UIFont.TextStyle)] = [
-            ("largeTitle", .largeTitle), ("title1", .title1), ("title2", .title2),
+        var styles: [(String, UIFont.TextStyle)] = [
+            ("title1", .title1), ("title2", .title2),
             ("title3", .title3), ("headline", .headline), ("subheadline", .subheadline),
             ("body", .body), ("callout", .callout), ("footnote", .footnote),
             ("caption1", .caption1), ("caption2", .caption2)
         ]
+        #if !os(tvOS)
+        styles.insert(("largeTitle", .largeTitle), at: 0)
+        #endif
         for (name, style) in styles {
             let font = UIFont.preferredFont(forTextStyle: style)
             print("FONTPROBE \(name) size=\(font.pointSize) name=\(font.fontName)")

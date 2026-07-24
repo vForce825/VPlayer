@@ -74,6 +74,8 @@ public final class URLSessionBoundedDownloader: NSObject,
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 180
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
         self.configuration = configuration
         fileManager = .default
         downloadsDirectory = FileManager.default.temporaryDirectory
@@ -91,6 +93,8 @@ public final class URLSessionBoundedDownloader: NSObject,
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 180
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
         self.configuration = configuration
         self.fileManager = fileManager
         self.downloadsDirectory = downloadsDirectory
@@ -283,7 +287,9 @@ public final class URLSessionBoundedDownloader: NSObject,
                 session = created
                 activeSession = created
             }
-            let task = activeSession.dataTask(with: URLRequest(url: request.url))
+            var urlRequest = URLRequest(url: request.url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+            urlRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            let task = activeSession.dataTask(with: urlRequest)
             transfer.task = task
             transfers[task.taskIdentifier] = transfer
             return task

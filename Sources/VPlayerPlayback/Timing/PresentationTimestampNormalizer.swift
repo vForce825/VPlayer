@@ -56,6 +56,7 @@ public struct PresentationTimestampNormalizer: Sendable {
     private var lastTrustedPresentationPTS: CMTime?
     private var lastOutputPTS: CMTime?
     private var lastExactOutputPTS: CMTime?
+    private var lastAccessUnitID: UInt64?
     private var nominalFrameDuration: CMTime?
     private var maximumReorderDepth = 2
 
@@ -135,6 +136,7 @@ public struct PresentationTimestampNormalizer: Sendable {
         lastTrustedPresentationPTS = nil
         lastOutputPTS = nil
         lastExactOutputPTS = nil
+        lastAccessUnitID = nil
     }
 
     private func pendingFramePrecedes(_ lhs: PendingFrame, _ rhs: PendingFrame) -> Bool {
@@ -189,6 +191,10 @@ public struct PresentationTimestampNormalizer: Sendable {
         _ pendingFrame: PendingFrame,
         next: PendingFrame?
     ) -> NormalizedDecodedFrame {
+        let isSameAccessUnitAsPrevious = lastAccessUnitID != nil && lastAccessUnitID == pendingFrame.frame.accessUnitID
+        let isSameAccessUnitAsNext = next?.frame.accessUnitID == pendingFrame.frame.accessUnitID
+        lastAccessUnitID = pendingFrame.frame.accessUnitID
+
         let trustedPTS = pendingFrame.trustedPTS90k.map {
             CMTime(value: $0, timescale: Self.transportTimescale)
         }
@@ -213,20 +219,37 @@ public struct PresentationTimestampNormalizer: Sendable {
             for: pendingFrame.frame,
             adjacentTrustedDelta: adjacentTrustedDelta
         )
+
+        let fieldStepDuration = CMTimeMultiplyByRatio(
+            durationSelection.duration,
+            multiplier: 1,
+            divisor: 2
+        )
+        let isMultiFieldFrame = isSameAccessUnitAsPrevious || isSameAccessUnitAsNext
+        let effectiveDuration = isMultiFieldFrame ? fieldStepDuration : durationSelection.duration
+
         let outputPTS: CMTime
         let timingWasSynthesized: Bool
-        if let trustedPTS,
+        if isSameAccessUnitAsPrevious, let lastOutputPTS {
+            let exactOutputPTS = CMTimeAdd(
+                lastExactOutputPTS ?? lastOutputPTS,
+                fieldStepDuration
+            )
+            outputPTS = strictlyIncreasingTransportPTS(
+                from: exactOutputPTS,
+                after: lastOutputPTS
+            )
+            lastExactOutputPTS = exactOutputPTS
+            timingWasSynthesized = true
+        } else if let trustedPTS,
            lastOutputPTS.map({ CMTimeCompare(trustedPTS, $0) > 0 }) ?? true {
             outputPTS = trustedPTS
             lastExactOutputPTS = trustedPTS
             timingWasSynthesized = false
         } else if let lastOutputPTS {
-            // Accumulate the exact rational timestamp first, then round the
-            // absolute value once for the 90 kHz public transport timeline.
-            // This avoids the drift caused by rounding every duration step.
             let exactOutputPTS = CMTimeAdd(
                 lastExactOutputPTS ?? lastOutputPTS,
-                durationSelection.duration,
+                effectiveDuration
             )
             outputPTS = strictlyIncreasingTransportPTS(
                 from: exactOutputPTS,
@@ -244,12 +267,8 @@ public struct PresentationTimestampNormalizer: Sendable {
         return NormalizedDecodedFrame(
             frame: pendingFrame.frame,
             presentationTimeStamp: outputPTS,
-            frameDuration: durationSelection.duration,
-            fieldDuration: CMTimeMultiplyByRatio(
-                durationSelection.duration,
-                multiplier: 1,
-                divisor: 2
-            ),
+            frameDuration: effectiveDuration,
+            fieldDuration: fieldStepDuration,
             timingWasSynthesized: timingWasSynthesized,
             provenance: durationSelection.provenance
         )
