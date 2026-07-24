@@ -136,7 +136,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     static let deferredPacketCapacity = 32
     static let pendingTrackMediaCapacity = 96
-    static let startupRetainedVideoCapacity = 4
+    static let startupRetainedVideoCapacity = 12
     private static let retainedAudioCapacity = 96
     private static let retainedVideoCapacity = VideoPresentationQueue.capacity
 
@@ -1017,6 +1017,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             renderer.resetPresentationTiming()
             display.resetPresentationTiming()
         }
+        renderer.flush(to: generationController.current)
+        for frame in retainedVideo { renderer.enqueue(frame) }
         display.resumeSubmission()
         metrics?.beginAVDriftGracePeriod(seconds: 5)
         if !readyPublished {
@@ -1075,7 +1077,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 }
             }
             if retainedVideo.count > Self.startupRetainedVideoCapacity {
-                retainedVideo.removeLast(
+                retainedVideo.removeFirst(
                     retainedVideo.count - Self.startupRetainedVideoCapacity
                 )
             }

@@ -120,6 +120,10 @@ public struct ScanTypeClassifier: Sendable {
         psfStreak = 0
 
         if isTrustedParserProgressive(observation) {
+            if isConfirmedInterlaced, probe == nil, observation.parser.isInterlaced != false {
+                progressiveStreak = 0
+                return applyRefinement(refinementOrder)
+            }
             let threshold = usesExitHysteresis
                 ? exitInterlacedThreshold
                 : progressiveThreshold
