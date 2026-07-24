@@ -546,8 +546,11 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 phase: .acquireFocus
             )
         }
+        // The browser lays a group's channels out left-to-right in a grid, so
+        // the acceptance channels (all in the playlist's first group and within
+        // one grid row) are reached with horizontal presses from the first one.
         for _ in 0..<channelOffset {
-            XCUIRemote.shared.press(.down)
+            XCUIRemote.shared.press(.right)
         }
         let fullScreenPlayer = app.otherElements["player-full-screen"]
         try activateContent(channelButton, target: .requestedChannel) {
@@ -741,7 +744,9 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let editor = app.textFields["source.editor.name"]
         try AcceptanceRefreshOutcomeGuard.activate(
             exists: refresh.exists,
-            selection: { XCUIRemote.shared.press(.select) },
+            selection: {
+                selectIdleRefresh(refresh, status: refreshStatus, editor: editor)
+            },
             outcome: {
                 waitForRefreshOutcome(
                     status: refreshStatus,
@@ -758,13 +763,16 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 phase: .awaitExistence
             )
         }
-        XCUIRemote.shared.press(.down)
         let epgStatus = app.staticTexts["source.status.epg"]
         try AcceptanceRefreshOutcomeGuard.activate(
             target: .epgRefresh,
             outcomeTarget: .epgRefreshOutcome,
             exists: epgRefresh.exists,
-            selection: { XCUIRemote.shared.press(.select) },
+            selection: {
+                selectIdleRefresh(epgRefresh, status: epgStatus, editor: editor) {
+                    XCUIRemote.shared.press(.down)
+                }
+            },
             outcome: {
                 waitForRefreshOutcome(
                     status: epgStatus,
@@ -813,6 +821,23 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         )
         _ = XCTWaiter.wait(for: [terminal], timeout: timeout)
         return refreshOutcome(status: status, editor: editor)
+    }
+
+    /// Saving a playlist fetches it right away, so by the time the screen is up
+    /// there is usually nothing to press: the button is disabled while that
+    /// fetch runs and the status is already terminal once it lands. Pressing it
+    /// anyway would only queue a duplicate download of the same resource.
+    @MainActor
+    private func selectIdleRefresh(
+        _ button: XCUIElement,
+        status: XCUIElement,
+        editor: XCUIElement,
+        acquireFocus: () -> Void = {}
+    ) {
+        guard button.isEnabled,
+              refreshOutcome(status: status, editor: editor) == .pending else { return }
+        acquireFocus()
+        XCUIRemote.shared.press(.select)
     }
 
     @MainActor

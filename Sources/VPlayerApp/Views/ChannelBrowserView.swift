@@ -9,8 +9,14 @@ struct ChannelBrowserView: View {
     @Bindable var model: AppModel
     @State private var mappingChannel: Channel?
     @State private var searchText = ""
-    @Namespace private var channelFocus
+    @FocusState private var focusedChannelID: String?
     private let focusPolicy = AcceptanceFocusPolicy.current()
+
+    /// Tiles fill the whole canvas: adaptive sizing yields four columns on a
+    /// 1080p screen and still degrades gracefully under larger dynamic type.
+    private static let gridColumns = [
+        GridItem(.adaptive(minimum: 360, maximum: 560), spacing: 48)
+    ]
 
     var body: some View {
         Group {
@@ -31,13 +37,25 @@ struct ChannelBrowserView: View {
                     description: Text("请在“播放列表”中刷新频道列表。")
                 )
             case .channels:
-                channelList
+                // Search is only reachable alongside an actual channel list;
+                // the loading and empty states above stay chrome-free. Default
+                // focus is pinned to the first channel so entering the tab
+                // lands on content rather than the search keyboard.
+                channelGrid
+                    .searchable(text: $searchText, prompt: "搜索频道")
+                    .defaultFocus($focusedChannelID, defaultFocusChannelID)
             }
         }
-        .searchable(text: $searchText, prompt: "搜索频道")
         .sheet(item: $mappingChannel) { channel in
             ChannelEPGMappingView(model: model, channel: channel)
         }
+    }
+
+    private var defaultFocusChannelID: String? {
+        guard !focusPolicy.isEnabled || focusPolicy.focusesFirstChannel else {
+            return nil
+        }
+        return filteredChannels.first?.id
     }
 
     private var contentState: ChannelBrowserContentState {
@@ -49,45 +67,62 @@ struct ChannelBrowserView: View {
     }
 
     @ViewBuilder
-    private var channelList: some View {
+    private var channelGrid: some View {
         if groups.isEmpty {
             ContentUnavailableView.search(text: searchText)
         } else {
-            groupedChannelList
+            groupedChannelGrid
         }
     }
 
-    private var groupedChannelList: some View {
-        List {
-            ForEach(groups) { group in
-                Section(group.title) {
-                    ForEach(group.channels) { channel in
-                        Button {
-                            model.select(channel: channel)
-                        } label: {
-                            ChannelRow(
-                                channel: channel,
-                                programmes: model.programmesByChannelID[channel.id, default: []]
-                            )
+    private var groupedChannelGrid: some View {
+        ScrollView {
+            LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 48) {
+                ForEach(groups) { group in
+                    Section {
+                        ForEach(group.channels) { channel in
+                            channelCard(for: channel)
                         }
-                        .buttonStyle(.card)
-                        .accessibilityIdentifier(channelIdentifier(channel))
-                        .prefersDefaultFocus(
-                            channel.id == filteredChannels.first?.id
-                                && (!focusPolicy.isEnabled || focusPolicy.focusesFirstChannel),
-                            in: channelFocus
-                        )
-                        .contextMenu {
-                            Button("设置 EPG") {
-                                mappingChannel = channel
-                            }
-                            .accessibilityIdentifier("channel.mapping.\(channel.id)")
-                        }
+                    } header: {
+                        groupHeader(for: group)
                     }
                 }
             }
+            .padding(.vertical, 24)
         }
-        .focusScope(channelFocus)
+        .scrollClipDisabled()
+    }
+
+    private func channelCard(for channel: Channel) -> some View {
+        Button {
+            model.select(channel: channel)
+        } label: {
+            ChannelCard(
+                channel: channel,
+                programmes: model.programmesByChannelID[channel.id, default: []]
+            )
+        }
+        .buttonStyle(.card)
+        .accessibilityIdentifier(channelIdentifier(channel))
+        .focused($focusedChannelID, equals: channel.id)
+        .contextMenu {
+            Button("设置 EPG") {
+                mappingChannel = channel
+            }
+            .accessibilityIdentifier("channel.mapping.\(channel.id)")
+        }
+    }
+
+    private func groupHeader(for group: ChannelGroup) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 20) {
+            Text(group.title)
+                .font(.title3.weight(.semibold))
+            Text("\(group.channels.count) 个频道")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 16)
     }
 
     private var groups: [ChannelGroup] {

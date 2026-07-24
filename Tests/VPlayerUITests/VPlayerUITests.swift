@@ -32,12 +32,13 @@ final class VPlayerUITests: XCTestCase {
 
         XCTAssertTrue(app.buttons["channel.udp"].waitForExistence(timeout: 5))
         selectTab(named: "频道", in: app)
-        XCUIRemote.shared.press(.down)
+        // Channels of one group tile left-to-right in the browser grid, so
+        // neighbours are reached with horizontal presses.
         if app.buttons["channel.udp"].hasFocus {
-            XCUIRemote.shared.press(.up)
+            XCUIRemote.shared.press(.left)
         }
         XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
-        XCUIRemote.shared.press(.down)
+        XCUIRemote.shared.press(.right)
         XCTAssertTrue(app.buttons["channel.udp"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.alerts["无法播放"].waitForExistence(timeout: 3))
@@ -46,7 +47,7 @@ final class VPlayerUITests: XCTestCase {
         XCUIRemote.shared.press(.select)
 
         XCTAssertTrue(app.buttons["channel.udp"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
-        XCUIRemote.shared.press(.up)
+        XCUIRemote.shared.press(.left)
         XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.otherElements["player-full-screen"].waitForExistence(timeout: 3))

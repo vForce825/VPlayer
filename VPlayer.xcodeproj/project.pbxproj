@@ -78,7 +78,6 @@
 		51DE1B0CD62B5693CF954F11 /* MediaGenerationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84F5424A7A62E03689F1A0AE /* MediaGenerationTests.swift */; };
 		52A3B2F6147F112EC1A4D951 /* PlaybackMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D84B6637D2D1BC5988140026 /* PlaybackMetricsTests.swift */; };
 		52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */; };
-		5324D682E94BD8CBD749AFE7 /* ChannelRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2130C293D6ED355F03565731 /* ChannelRow.swift */; };
 		550719CB422761BB77BB4867 /* VPlayerAppStartupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A310932D1DA088CF7E99CCF /* VPlayerAppStartupTests.swift */; };
 		5681E70A62EE0F3ADD9E9E3A /* VPlayerCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		5777308D17C83F752A76BAB4 /* PlaybackSerialExecutorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16D419C6385433C4A3DC149C /* PlaybackSerialExecutorTests.swift */; };
@@ -213,6 +212,7 @@
 		F2A6AFCE42866EF2E0998C77 /* MetalDisplayLinkDriverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2D1071374DC489D6103DE84 /* MetalDisplayLinkDriverTests.swift */; };
 		F32E482D55ACCE017FB4B662 /* CompressedVideoAssembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 733DFD5B19470F62F9359302 /* CompressedVideoAssembler.swift */; };
 		F519B8B33A5820F3F5427E24 /* VideoPresentationFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA96E5D8B8DB1F4B794AB8FE /* VideoPresentationFrame.swift */; };
+		F5D330AC0421FA24690AD631 /* ChannelCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C55AF9DF2AE700900D2F5B7 /* ChannelCard.swift */; };
 		F6C7655F0A93CD26F8BB7115 /* PlaybackSerialExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCCAA375F6E915F5A43BA1B3 /* PlaybackSerialExecutor.swift */; };
 		F95C7C2B4DE1CBEA04641638 /* PlayerControlsOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08417B2BBC763477A396A65F /* PlayerControlsOverlay.swift */; };
 		FA017DC65BB2F27B02E187DA /* EPGMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0943F591208BEBF64DAE795E /* EPGMatcher.swift */; };
@@ -333,7 +333,6 @@
 		200B5CF20EF25197640989C4 /* VideoToolboxDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoToolboxDecoderTests.swift; sourceTree = "<group>"; };
 		202FBDFB8F3A4E7A9734E2BD /* MetalVideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalVideoRenderer.swift; sourceTree = "<group>"; };
 		2030AE6C6FA9E597891A75D2 /* PlaybackPresentationContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPresentationContext.swift; sourceTree = "<group>"; };
-		2130C293D6ED355F03565731 /* ChannelRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelRow.swift; sourceTree = "<group>"; };
 		217CD0888A3110536542637F /* VPFFmpegAudioDecoder.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = VPFFmpegAudioDecoder.c; sourceTree = "<group>"; };
 		21F204F78607BC92CFBE8536 /* ScanTypeClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanTypeClassifier.swift; sourceTree = "<group>"; };
 		22E22BA10AD93FB5EDC1FD88 /* HDRPresentationPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HDRPresentationPolicyTests.swift; sourceTree = "<group>"; };
@@ -379,6 +378,7 @@
 		497E40B18823632375706751 /* VideoDecoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoDecoding.swift; sourceTree = "<group>"; };
 		4A25120795ACF8B668C8CBC1 /* VideoPipelineCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPipelineCoordinator.swift; sourceTree = "<group>"; };
 		4C20F5E5ABD832EF5433B511 /* SourceProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceProfile.swift; sourceTree = "<group>"; };
+		4C55AF9DF2AE700900D2F5B7 /* ChannelCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelCard.swift; sourceTree = "<group>"; };
 		4D375E53A4FFEF498BBC75FC /* PlaybackClockTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackClockTests.swift; sourceTree = "<group>"; };
 		4D84D24FBFF0D2C7375C5DA0 /* SourceProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceProfilesView.swift; sourceTree = "<group>"; };
 		4E25D8207AC5FE42D7046523 /* epg */ = {isa = PBXFileReference; lastKnownFileType = folder; name = epg; path = Tests/Fixtures/epg; sourceTree = SOURCE_ROOT; };
@@ -1098,8 +1098,8 @@
 			isa = PBXGroup;
 			children = (
 				EF2312CDCDAAF53C4BA80484 /* ChannelBrowserView.swift */,
+				4C55AF9DF2AE700900D2F5B7 /* ChannelCard.swift */,
 				3A444ABEA3E13FA3A2BD4460 /* ChannelEPGMappingView.swift */,
-				2130C293D6ED355F03565731 /* ChannelRow.swift */,
 				C7E37B08B4CEA0606E850000 /* PlaybackPlaceholderView.swift */,
 				E9021619CDF96872E511E25E /* RootView.swift */,
 				F9EC7EBA35F653A9B7D17F54 /* SourceProfileEditorView.swift */,
@@ -1325,8 +1325,8 @@
 				62E8D03EFAC1CFBE9403ADF5 /* AppModel.swift in Sources */,
 				DFC4CAEA21A686600E575881 /* BackgroundRefreshRegistrar.swift in Sources */,
 				D6FBABC968B226C01CC8D6F8 /* ChannelBrowserView.swift in Sources */,
+				F5D330AC0421FA24690AD631 /* ChannelCard.swift in Sources */,
 				F16342F88880B29F1FA799B0 /* ChannelEPGMappingView.swift in Sources */,
-				5324D682E94BD8CBD749AFE7 /* ChannelRow.swift in Sources */,
 				A3098C1B5C42F7256681B090 /* ForegroundRefreshDriver.swift in Sources */,
 				8A1AA017BA96A8E7786A627D /* FullScreenPlayerView.swift in Sources */,
 				63AFAD23FBE533D5F03741D8 /* FullScreenPlayerViewModel.swift in Sources */,
