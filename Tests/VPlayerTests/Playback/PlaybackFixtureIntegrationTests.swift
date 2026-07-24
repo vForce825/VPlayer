@@ -66,6 +66,22 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         })
     }
 
+    func testMP2DecoderSurvivesRepeatedFlushesAtParsedFrameBoundaries() throws {
+        let result = try assemble(path: "interlaced-h264-mp2.ts")
+        let format = try XCTUnwrap(result.audioFormats.last)
+        let decoder = try FFmpegPCMAudioDecoder(codec: .mp2, format: format)
+        defer { decoder.destroy() }
+
+        var decodedFrameCount = 0
+        for sample in result.audioSamples.prefix(20) {
+            decoder.flush()
+            let outputs = try decoder.push(sample)
+            decodedFrameCount += outputs.count
+        }
+
+        XCTAssertEqual(decodedFrameCount, 20)
+    }
+
     func testSingleVariantHLSUsesHTTPChildRequestAndRealAssemblers() throws {
         let result = try assemble(path: "hls/master.m3u8")
         let direct = try assemble(path: "progressive-h264-aac.ts")

@@ -81,7 +81,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(harness.coordinator.route, .rawWhileClassifying)
         XCTAssertEqual(harness.coordinator.requiredVideoFrameCount, 1)
-        XCTAssertEqual(harness.probe.pendingCount, 2)
+        XCTAssertEqual(harness.probe.pendingCount, 1)
         XCTAssertEqual(harness.host.deliveredFrames.count, 1)
         XCTAssertTrue(harness.yadif.submissions.isEmpty)
     }
@@ -172,7 +172,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             "decoder.finish",
             "decoder.wait",
             "host.advance:3",
-            "host.reset:3:3",
+            "host.reset:3:2",
             "decoder.invalidate",
             "host.open",
         ])
@@ -263,6 +263,79 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             return false
         })
         XCTAssertTrue(harness.yadif.submissions.isEmpty)
+    }
+
+    func testFailedProbeConservativelyRoutesFieldSignalledFramesToSelectedDeinterlacer() throws {
+        let harness = makeHarness(algorithm: .metalYADIF2x)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+        for id in 10...11 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: fieldSignalledParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+
+        harness.probe.completeFirst(.failure(.nonIOSurfaceInput))
+
+        XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
+    func testThreeUnresolvedProbesConservativelyRouteFieldSignalledFrames() throws {
+        let harness = makeHarness(algorithm: .metalYADIF2x)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+
+        for id in 10...13 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: fieldSignalledParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+
+        XCTAssertEqual(harness.probe.pendingCount, 1)
+        XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
+    func testThreeInconclusiveProbeAttemptsReleaseUnknownSourceThroughBypass() throws {
+        let harness = makeHarness(algorithm: .metalYADIF2x)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+
+        for id in 10...13 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+
+        XCTAssertEqual(harness.probe.pendingCount, 1)
+        XCTAssertEqual(harness.coordinator.route, .bypass)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertTrue(harness.yadif.submissions.isEmpty)
+        XCTAssertTrue(harness.host.failures.isEmpty)
     }
 
     func testTemporalConfigureFailureUsesBothFieldsOnSameIDRAndNotifiesOnce() throws {
@@ -448,7 +521,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
                 parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
             )))
         }
-        XCTAssertEqual(harness.probe.pendingCount, 2)
+        XCTAssertEqual(harness.probe.pendingCount, 1)
 
         harness.coordinator.stop(emergency: false)
         harness.passthrough.completePending()
@@ -605,6 +678,197 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.host.failures.map(\.1), [generation])
         XCTAssertTrue(harness.host.notices.isEmpty)
         XCTAssertNotEqual(harness.coordinator.route, .rawTemporalFailure)
+    }
+
+    func testRecoverableNonTemporalDecoderFailureDropsOnlyThatFrame() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+
+        harness.coordinator.handle(decoder: .recoverableFailure(
+            .badData(kVTVideoDecoderBadDataErr),
+            generation: generation
+        ))
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: generation,
+            randomAccess: false
+        ))
+
+        XCTAssertTrue(harness.host.failures.isEmpty)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertEqual(
+            harness.decoder.snapshot().last,
+            .decode(2, generation, ._EnableAsynchronousDecompression)
+        )
+    }
+
+    func testRecoverableSynchronousDecodeFailureDropsOnlyThatAccessUnit() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+        harness.decoder.decodeFailures = [
+            .badData(kVTVideoDecoderReferenceMissingErr),
+        ]
+
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: generation,
+            randomAccess: false
+        ))
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 3,
+            generation: generation,
+            randomAccess: false
+        ))
+
+        XCTAssertTrue(harness.host.failures.isEmpty)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertEqual(
+            harness.decoder.snapshot().last,
+            .decode(3, generation, ._EnableAsynchronousDecompression)
+        )
+    }
+
+    func testDecodeBackpressureTimeoutRebuildsAtNextRandomAccessWithoutDrainingStalledSession() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let oldGeneration = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: oldGeneration,
+            randomAccess: true
+        ))
+        harness.decoder.decodeFailures = [.backpressureTimeout]
+
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: oldGeneration,
+            randomAccess: false
+        ))
+
+        let newGeneration = harness.host.generation
+        XCTAssertGreaterThan(newGeneration, oldGeneration)
+        XCTAssertTrue(harness.host.failures.isEmpty)
+        XCTAssertEqual(harness.host.operations.suffix(4), [
+            "close",
+            "advance:\(newGeneration.rawValue)",
+            "reset:\(newGeneration.rawValue):1",
+            "open",
+        ])
+        XCTAssertEqual(harness.decoder.snapshot().suffix(2), [
+            .decode(2, oldGeneration, ._EnableAsynchronousDecompression),
+            .invalidate,
+        ])
+
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 3,
+            generation: newGeneration,
+            randomAccess: false
+        ))
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 4,
+            generation: newGeneration,
+            randomAccess: true
+        ))
+
+        XCTAssertEqual(harness.decoder.snapshot().suffix(2), [
+            .configure(newGeneration, .bothFields),
+            .decode(4, newGeneration, ._EnableAsynchronousDecompression),
+        ])
+    }
+
+    func testLegacyCodecBadDataSynchronousFailureDropsOnlyThatAccessUnit() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+        harness.decoder.decodeFailures = [.badData(-8_969)]
+
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: generation,
+            randomAccess: false
+        ))
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 3,
+            generation: generation,
+            randomAccess: false
+        ))
+
+        XCTAssertTrue(harness.host.failures.isEmpty)
+        XCTAssertEqual(
+            harness.decoder.snapshot().last,
+            .decode(3, generation, ._EnableAsynchronousDecompression)
+        )
+    }
+
+    func testObservedPositiveStatusSynchronousFailureDropsOnlyThatAccessUnit() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+        harness.decoder.decodeFailures = [.badData(1)]
+
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: generation,
+            randomAccess: false
+        ))
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 3,
+            generation: generation,
+            randomAccess: false
+        ))
+
+        XCTAssertTrue(harness.host.failures.isEmpty)
+        XCTAssertEqual(
+            harness.decoder.snapshot().last,
+            .decode(3, generation, ._EnableAsynchronousDecompression)
+        )
+    }
+
+    func testLegacyCodecBadDataDrainFailureDoesNotBlockAlgorithmSwitch() throws {
+        let harness = makeHarness(algorithm: .metalYADIF2x)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        var generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+        harness.coordinator.handle(decoder: .frame(try decodedFrame(
+            id: 10,
+            generation: generation,
+            parser: interlacedParser(parity: .top, sourcePTS90k: 36_000)
+        )))
+        harness.decoder.finishFailures = [.badData(-8_969)]
+        let oldGeneration = generation
+
+        harness.coordinator.setAlgorithm(.appleTemporal)
+
+        generation = harness.host.generation
+        XCTAssertEqual(generation.rawValue, oldGeneration.rawValue + 1)
+        XCTAssertEqual(harness.coordinator.route, .appleTemporal)
+        XCTAssertTrue(harness.host.failures.isEmpty)
     }
 
     func testSynchronousTemporalDecodeFailureUsesOrderedRawFallback() throws {

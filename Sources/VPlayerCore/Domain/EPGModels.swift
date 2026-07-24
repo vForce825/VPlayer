@@ -25,4 +25,10 @@ public struct ManualEPGMapping: Equatable, Sendable {
     public let sourceProfileID: UUID
     public let channelID: String
     public let xmltvChannelID: String
+
+    public init(sourceProfileID: UUID, channelID: String, xmltvChannelID: String) {
+        self.sourceProfileID = sourceProfileID
+        self.channelID = channelID
+        self.xmltvChannelID = xmltvChannelID
+    }
 }

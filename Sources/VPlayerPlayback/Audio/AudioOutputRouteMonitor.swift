@@ -50,13 +50,11 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
             queue: nil
         ) { [weak self] _ in
             executor.submit { [weak self] in
-                guard let self else { return }
-                let category = Self.category(from: snapshotProvider())
-                let copiedHandler = withLock {
-                    activeLifecycle == lifecycle ? eventHandler : nil
-                }
-                copiedHandler?(category)
+                self?.deliverCurrentRoute(for: lifecycle)
             }
+        }
+        executor.submit { [weak self] in
+            self?.deliverCurrentRoute(for: lifecycle)
         }
     }
 
@@ -76,6 +74,14 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         if ports.contains(AVAudioSession.Port.HDMI) { return .hdmi }
         if ports.contains(.airPlay) { return .airPlay }
         return .other
+    }
+
+    private func deliverCurrentRoute(for lifecycle: UInt64) {
+        let category = Self.category(from: snapshotProvider())
+        let copiedHandler = withLock {
+            activeLifecycle == lifecycle ? eventHandler : nil
+        }
+        copiedHandler?(category)
     }
 
     @discardableResult

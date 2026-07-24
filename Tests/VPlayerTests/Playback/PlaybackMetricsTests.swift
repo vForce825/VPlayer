@@ -24,6 +24,16 @@ final class PlaybackMetricsTests: XCTestCase {
         )
         metrics.update(scanType: .interlaced(top))
         metrics.update(activeRoute: .metalYADIF2x)
+        metrics.updateReadinessDiagnostics(
+            audioRoute: .ffmpegPCM,
+            audioReady: true,
+            readinessOpen: false,
+            retainedAudioCount: 48,
+            retainedVideoCount: 2,
+            audioFirstPTS: CMTime(value: 100, timescale: 10),
+            audioDuration: CMTime(value: 15, timescale: 10),
+            videoFirstPTS: CMTime(value: 103, timescale: 10)
+        )
 
         for second in 1...60 {
             clock.value = TimeInterval(second)
@@ -53,6 +63,14 @@ final class PlaybackMetricsTests: XCTestCase {
         metrics.recordStaleGenerationDrop()
         metrics.recordVideoDrop(count: 1)
         metrics.recordTemporalUnavailableNotice()
+        metrics.recordDemuxPacket()
+        metrics.recordDemuxPacket()
+        metrics.recordVideoAccessUnit()
+        metrics.recordAudioSample()
+        metrics.recordAudioSample()
+        metrics.recordAudioSample()
+        metrics.recordVideoDecodeSubmission(milliseconds: 2.5)
+        metrics.recordVideoDecodeSubmission(milliseconds: 7.5)
 
         clock.value = 60
         let snapshot = metrics.snapshot(window: .seconds(60))
@@ -80,6 +98,19 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 1)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
         XCTAssertEqual(snapshot.automaticAlgorithmSwitchCount, 0)
+        XCTAssertEqual(snapshot.audioRoute, "ffmpegPCM")
+        XCTAssertTrue(snapshot.audioReady)
+        XCTAssertFalse(snapshot.readinessOpen)
+        XCTAssertEqual(snapshot.retainedAudioCount, 48)
+        XCTAssertEqual(snapshot.retainedVideoCount, 2)
+        XCTAssertEqual(snapshot.audioFirstPTSSeconds, 10)
+        XCTAssertEqual(snapshot.audioDurationSeconds, 1.5)
+        XCTAssertEqual(snapshot.videoFirstPTSSeconds, 10.3)
+        XCTAssertEqual(snapshot.demuxPacketCount, 2)
+        XCTAssertEqual(snapshot.videoAccessUnitCount, 1)
+        XCTAssertEqual(snapshot.audioSampleCount, 3)
+        XCTAssertEqual(snapshot.videoDecodeSubmissionCount, 2)
+        XCTAssertEqual(snapshot.maximumVideoDecodeSubmissionMilliseconds, 7.5)
     }
 
     func testWindowedRatesAndPercentilesExcludeOldSamplesWithoutResettingSessionTotals() {

@@ -258,6 +258,8 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             fetchedAt: date(20)
         )
         XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 1))
+        let initialProgrammeCount = try await store.epgProgrammeCount(profileID: profile.id)
+        XCTAssertEqual(initialProgrammeCount, 1)
 
         _ = await XCTAssertThrowsErrorAsync {
             _ = try await store.installEPG(
@@ -268,6 +270,10 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         }
 
         let epgChannels = try await store.epgChannels(profileID: profile.id)
+        let programmeCountAfterFailedReplacement = try await store.epgProgrammeCount(
+            profileID: profile.id
+        )
+        XCTAssertEqual(programmeCountAfterFailedReplacement, 1)
         let programmes = try await store.programmes(
             profileID: profile.id,
             xmltvChannelID: "news",

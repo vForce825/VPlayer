@@ -33,6 +33,40 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         try subject.drain()
     }
 
+    func testDropsParsedFramesUntilRequiredParameterSetsArrive() throws {
+        let earlyFrame = AssemblerTestFixtures.h264AccessUnit(
+            sps: nil,
+            pps: nil,
+            nal: Data([0x41, 0x9A, 0x22])
+        )
+        let decodableFrame = AssemblerTestFixtures.h264AccessUnit()
+        let factory = ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                bytes: index == 0 ? earlyFrame : decodableFrame,
+                pts: Int64(90_000 + index * 3_600),
+                dts: Int64(86_400 + index * 3_600),
+                keyFrame: index != 0
+            ))
+        }
+        let tracks = try AssemblerTestFixtures.videoTracks(extradata: Data())
+        var events: [VideoAssemblerEvent] = []
+        let subject = try CompressedVideoAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { events.append($0) },
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+
+        XCTAssertNoThrow(try subject.push(AssemblerTestFixtures.videoPacket()))
+        XCTAssertTrue(events.isEmpty)
+        try subject.push(AssemblerTestFixtures.videoPacket())
+
+        XCTAssertEqual(events.compactMap(\.formatFingerprint).count, 1)
+        XCTAssertEqual(events.compactMap(\.accessUnit).count, 1)
+        XCTAssertTrue(events.compactMap(\.accessUnit)[0].isRandomAccess)
+    }
+
     func testInjectedFramingBuildsThreeCopiedReadyAccessUnitsWithExactMetadata() throws {
         let firstAU = AssemblerTestFixtures.h264AccessUnit()
         let secondAU = AssemblerTestFixtures.h264AccessUnit(

@@ -313,7 +313,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         }
     }
 
-    private let stateLock = NSLock()
+    private let stateLock = NSCondition()
     private let presentationLock = NSRecursiveLock()
     private let queue: VideoPresentationQueue
     private let textureMapper: any VideoTextureMapping
@@ -325,6 +325,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     private var inFlightCount = 0
     private var completedSinceCacheFlush = 0
     private var previousTargetMediaTime: CMTime?
+    private var generationTransitionPending = false
 
     convenience init(
         device: any MTLDevice,
@@ -372,10 +373,15 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
 
     public func flush(to generation: MediaGeneration) {
         presentationLock.withLock {
-            stateLock.withLock {
-                activeGeneration = generation
-                previousTargetMediaTime = nil
+            stateLock.lock()
+            generationTransitionPending = true
+            while inFlightCount > 0 {
+                stateLock.wait()
             }
+            activeGeneration = generation
+            previousTargetMediaTime = nil
+            generationTransitionPending = false
+            stateLock.unlock()
             queue.flush(to: generation)
         }
     }
@@ -600,6 +606,9 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     private func releaseInFlightSlot(flushCacheIfNeeded: Bool) {
         let shouldFlush = stateLock.withLock {
             inFlightCount = max(0, inFlightCount - 1)
+            if inFlightCount == 0 {
+                stateLock.broadcast()
+            }
             guard flushCacheIfNeeded else { return false }
             completedSinceCacheFlush += 1
             if completedSinceCacheFlush >= 32, inFlightCount == 0 {
@@ -636,19 +645,22 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         presentationTimeStamp: CMTime,
         targetMediaTime: CMTime
     ) {
-        let currentGeneration = stateLock.withLock { activeGeneration }
+        let completionState = stateLock.withLock {
+            (generation: activeGeneration, transitionPending: generationTransitionPending)
+        }
         releaseInFlightSlot(flushCacheIfNeeded: true)
         switch result {
         case .succeeded:
             metrics?.recordPresentationCompletion(
                 generation: submittedGeneration,
-                activeGeneration: currentGeneration,
+                activeGeneration: completionState.generation,
                 isUniquePresentation: action == .presented,
                 presentationTimeStamp: presentationTimeStamp,
                 targetMediaTime: targetMediaTime
             )
         case let .failed(message):
-            guard currentGeneration == submittedGeneration else { return }
+            guard !completionState.transitionPending,
+                  completionState.generation == submittedGeneration else { return }
             emit(
                 .metalCommand(Self.sanitizedCommandMessage(message)),
                 generation: submittedGeneration

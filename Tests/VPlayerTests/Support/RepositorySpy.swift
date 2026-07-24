@@ -36,6 +36,12 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             let overlapping: Range<Date>
         }
 
+        struct ProgrammeBatchRequest: Equatable, Sendable {
+            let profileID: UUID
+            let xmltvChannelIDs: [String]
+            let overlapping: Range<Date>
+        }
+
         let profiles: [SourceProfile]
         let activeProfileID: UUID?
         let channels: [UUID: [Channel]]
@@ -43,6 +49,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         let programmes: [UUID: [Programme]]
         let manualMappings: [UUID: [String: String]]
         let programmeRequests: [ProgrammeRequest]
+        let programmeBatchRequests: [ProgrammeBatchRequest]
         let events: [Event]
         let profileLookupCount: Int
         let playlistInstallCount: Int
@@ -60,6 +67,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var storedProgrammes: [UUID: [Programme]]
     private var storedManualMappings: [UUID: [String: String]]
     private var programmeRequests: [Snapshot.ProgrammeRequest] = []
+    private var programmeBatchRequests: [Snapshot.ProgrammeBatchRequest] = []
     private var recordedEvents: [Event] = []
     private var profileLookupCount = 0
     private var playlistInstallCount = 0
@@ -124,6 +132,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             programmes: storedProgrammes,
             manualMappings: storedManualMappings,
             programmeRequests: programmeRequests,
+            programmeBatchRequests: programmeBatchRequests,
             events: recordedEvents,
             profileLookupCount: profileLookupCount,
             playlistInstallCount: playlistInstallCount,
@@ -393,6 +402,12 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         return storedEPGChannels[profileID, default: []]
     }
 
+    func epgProgrammeCount(profileID: UUID) async throws -> Int {
+        if failsReads { throw InjectedError.read }
+        _ = try profileIndex(profileID)
+        return storedProgrammes[profileID, default: []].count
+    }
+
     func programmes(
         profileID: UUID,
         xmltvChannelID: String,
@@ -422,6 +437,35 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
                 xmltvChannelID: $0
             )
         }
+    }
+
+    func manualMappings(profileID: UUID) throws -> [String: String] {
+        if failsReads { throw InjectedError.read }
+        _ = try profileIndex(profileID)
+        return storedManualMappings[profileID, default: [:]]
+    }
+
+    func programmes(
+        profileID: UUID,
+        xmltvChannelIDs: Set<String>,
+        overlapping: Range<Date>
+    ) throws -> [String: [Programme]] {
+        if failsReads { throw InjectedError.read }
+        _ = try profileIndex(profileID)
+        programmeBatchRequests.append(Snapshot.ProgrammeBatchRequest(
+            profileID: profileID,
+            xmltvChannelIDs: xmltvChannelIDs.sorted(),
+            overlapping: overlapping
+        ))
+        guard !xmltvChannelIDs.isEmpty else { return [:] }
+        var result: [String: [Programme]] = [:]
+        for programme in storedProgrammes[profileID, default: []]
+        where xmltvChannelIDs.contains(programme.xmltvChannelID)
+            && programme.start < overlapping.upperBound
+            && programme.stop > overlapping.lowerBound {
+            result[programme.xmltvChannelID, default: []].append(programme)
+        }
+        return result
     }
 
     func setManualMapping(

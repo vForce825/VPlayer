@@ -82,10 +82,10 @@ if [[ "${VPLAYER_ACCEPTANCE_SIGNAL_TEST_MODE:-0}" == "1" ]]; then
 fi
 
 usage() {
-    echo "usage: $0 DEVICE_UDID {appleTemporal|metalYADIF2x} CHANNEL POSITIVE_SECONDS [M3U_URL]" >&2
+    echo "usage: $0 DEVICE_UDID {appleTemporal|metalYADIF2x} CHANNEL POSITIVE_SECONDS [M3U_URL] [EPG_URL]" >&2
 }
 
-if (( $# < 4 || $# > 5 )); then
+if (( $# < 4 || $# > 6 )); then
     usage
     exit 64
 fi
@@ -95,6 +95,7 @@ algorithm="$2"
 channel="$3"
 duration="$4"
 m3u_url="${5:-https://example.invalid/playlist.m3u}"
+epg_url="${6:-https://example.invalid/epg.xml}"
 
 case "$algorithm" in
     appleTemporal|metalYADIF2x) ;;
@@ -111,6 +112,10 @@ fi
 
 if [[ ! "$m3u_url" =~ ^https?:// ]]; then
     echo "M3U source must use HTTP or HTTPS" >&2
+    exit 64
+fi
+if [[ ! "$epg_url" =~ ^https?:// ]]; then
+    echo "EPG source must use HTTP or HTTPS" >&2
     exit 64
 fi
 
@@ -166,6 +171,7 @@ encode_build_setting() {
 }
 {
     printf 'VPLAYER_ACCEPTANCE_M3U_URL_B64 = %s\n' "$(encode_build_setting "$m3u_url")"
+    printf 'VPLAYER_ACCEPTANCE_EPG_URL_B64 = %s\n' "$(encode_build_setting "$epg_url")"
     printf 'VPLAYER_ACCEPTANCE_CHANNEL_B64 = %s\n' "$(encode_build_setting "$channel")"
     printf 'VPLAYER_ACCEPTANCE_SECONDS_B64 = %s\n' "$(encode_build_setting "$duration")"
     printf 'VPLAYER_ACCEPTANCE_ALGORITHM_B64 = %s\n' "$(encode_build_setting "$algorithm")"
@@ -196,6 +202,10 @@ privacy_violation=0
 if rg -a -F -q -- "$m3u_url" "$console_log"; then
     privacy_violation=1
 elif [[ -e "$result_bundle" ]] && rg -a -F -q -- "$m3u_url" "$result_bundle"; then
+    privacy_violation=1
+elif rg -a -F -q -- "$epg_url" "$console_log"; then
+    privacy_violation=1
+elif [[ -e "$result_bundle" ]] && rg -a -F -q -- "$epg_url" "$result_bundle"; then
     privacy_violation=1
 fi
 if (( privacy_violation != 0 )); then

@@ -143,6 +143,13 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             .map(Self.epgChannel(from:))
     }
 
+    public func epgProgrammeCount(profileID: UUID) async throws -> Int {
+        guard let snapshotID = try profileRecord(id: profileID).epgSnapshotID else { return 0 }
+        return try modelContext.fetch(FetchDescriptor<EPGSnapshotRecord>(
+            predicate: #Predicate { $0.id == snapshotID }
+        )).first?.programmeCount ?? 0
+    }
+
     public func programmes(
         profileID: UUID,
         xmltvChannelID: String,
@@ -175,6 +182,46 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 xmltvChannelID: $0.xmltvChannelID
             )
         }
+    }
+
+    public func manualMappings(profileID: UUID) throws -> [String: String] {
+        _ = try profileRecord(id: profileID)
+        let records = try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>(
+            predicate: #Predicate { $0.sourceProfileID == profileID }
+        ))
+        var result: [String: String] = [:]
+        result.reserveCapacity(records.count)
+        for record in records {
+            result[record.channelID] = record.xmltvChannelID
+        }
+        return result
+    }
+
+    public func programmes(
+        profileID: UUID,
+        xmltvChannelIDs: Set<String>,
+        overlapping: Range<Date>
+    ) throws -> [String: [Programme]] {
+        guard let snapshotID = try profileRecord(id: profileID).epgSnapshotID,
+              !xmltvChannelIDs.isEmpty else { return [:] }
+        let channelIDs = Array(xmltvChannelIDs)
+        let lowerBound = overlapping.lowerBound
+        let upperBound = overlapping.upperBound
+        let records = try modelContext.fetch(FetchDescriptor<ProgrammeRecord>(
+            predicate: #Predicate {
+                $0.snapshotID == snapshotID
+                    && channelIDs.contains($0.xmltvChannelID)
+                    && $0.start < upperBound
+                    && $0.stop > lowerBound
+            }
+        )).sorted {
+            ($0.start, $0.stableID) < ($1.start, $1.stableID)
+        }
+        var result: [String: [Programme]] = [:]
+        for record in records {
+            result[record.xmltvChannelID, default: []].append(Self.programme(from: record))
+        }
+        return result
     }
 
     public func setManualMapping(
@@ -500,29 +547,31 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     public func purgeUnreferencedSnapshots() throws {
         try commit(.purge) {
             let profiles = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
-            let playlistIDs = Set(profiles.compactMap(\.playlistSnapshotID))
-            let epgIDs = Set(profiles.compactMap(\.epgSnapshotID))
+            let playlistIDs = profiles.compactMap(\.playlistSnapshotID)
+            let epgIDs = profiles.compactMap(\.epgSnapshotID)
 
-            for record in try modelContext.fetch(FetchDescriptor<ChannelRecord>())
-            where !playlistIDs.contains(record.snapshotID) {
-                modelContext.delete(record)
-            }
-            for record in try modelContext.fetch(FetchDescriptor<PlaylistSnapshotRecord>())
-            where !playlistIDs.contains(record.id) {
-                modelContext.delete(record)
-            }
-            for record in try modelContext.fetch(FetchDescriptor<EPGChannelRecord>())
-            where !epgIDs.contains(record.snapshotID) {
-                modelContext.delete(record)
-            }
-            for record in try modelContext.fetch(FetchDescriptor<ProgrammeRecord>())
-            where !epgIDs.contains(record.snapshotID) {
-                modelContext.delete(record)
-            }
-            for record in try modelContext.fetch(FetchDescriptor<EPGSnapshotRecord>())
-            where !epgIDs.contains(record.id) {
-                modelContext.delete(record)
-            }
+            // Predicate-based batch deletes push the work to the store instead of
+            // loading every unreferenced row into memory to delete one at a time.
+            try modelContext.delete(
+                model: ChannelRecord.self,
+                where: #Predicate { !playlistIDs.contains($0.snapshotID) }
+            )
+            try modelContext.delete(
+                model: PlaylistSnapshotRecord.self,
+                where: #Predicate { !playlistIDs.contains($0.id) }
+            )
+            try modelContext.delete(
+                model: EPGChannelRecord.self,
+                where: #Predicate { !epgIDs.contains($0.snapshotID) }
+            )
+            try modelContext.delete(
+                model: ProgrammeRecord.self,
+                where: #Predicate { !epgIDs.contains($0.snapshotID) }
+            )
+            try modelContext.delete(
+                model: EPGSnapshotRecord.self,
+                where: #Predicate { !epgIDs.contains($0.id) }
+            )
         }
     }
 

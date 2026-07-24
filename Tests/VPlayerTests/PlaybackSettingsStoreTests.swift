@@ -27,4 +27,17 @@ final class PlaybackSettingsStoreTests: XCTestCase {
         defaults.set("removed-mode", forKey: PlaybackSettingsStore.storageKey)
         XCTAssertEqual(PlaybackSettingsStore(defaults: defaults).deinterlaceAlgorithm, .appleTemporal)
     }
+
+    func testDistinctAlgorithmChangesNotifyTheInstalledApplicationBinding() {
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = PlaybackSettingsStore(defaults: defaults)
+        var observed: [DeinterlaceAlgorithm] = []
+        store.setDeinterlaceAlgorithmChangeHandler { observed.append($0) }
+
+        store.deinterlaceAlgorithm = .metalYADIF2x
+        store.deinterlaceAlgorithm = .metalYADIF2x
+        store.deinterlaceAlgorithm = .appleTemporal
+
+        XCTAssertEqual(observed, [.metalYADIF2x, .appleTemporal])
+    }
 }

@@ -8,6 +8,12 @@ import Foundation
 final class CompressedAudioAssembler {
     static let invalidInputErrorCode: Int32 = -1_448_208_897
     static let idExhaustedErrorCode: Int32 = -1_448_208_899
+    static let malformedParsedFrameErrorCode: Int32 = -1_448_208_900
+    static let parsedFormatMismatchErrorCode: Int32 = -1_448_208_901
+    static let parsedLayoutMismatchErrorCode: Int32 = -1_448_208_902
+    static let missingParsedTimestampErrorCode: Int32 = -1_448_208_903
+    static let parsedFrameSamplesErrorCode: Int32 = -1_448_208_904
+    static let sampleEmissionErrorCode: Int32 = -1_448_208_905
 
     private static let maximumPayloadBytes = 64 * 1_024 * 1_024
     private static let aacSampleRates: [Int32] = [
@@ -145,36 +151,46 @@ final class CompressedAudioAssembler {
     private func receive(_ frame: FFmpegParsedFrame) throws {
         guard descriptor.codec != .aac,
               !frame.bytes.isEmpty,
-              frame.bytes.count <= Self.maximumPayloadBytes,
-              frame.sampleRate == descriptor.sampleRate,
-              frame.channels == descriptor.channelLayout.channelCount,
-              let pts = frame.pts else {
-            throw validationError()
+              frame.bytes.count <= Self.maximumPayloadBytes else {
+            throw validationError(code: Self.malformedParsedFrameErrorCode)
+        }
+        guard frame.sampleRate == descriptor.sampleRate,
+              frame.channels == descriptor.channelLayout.channelCount else {
+            throw validationError(code: Self.parsedFormatMismatchErrorCode)
+        }
+        guard let pts = frame.pts else {
+            throw validationError(code: Self.missingParsedTimestampErrorCode)
         }
         if let parserLayout = frame.channelLayout {
             guard parserLayout.channelCount == descriptor.channelLayout.channelCount else {
-                throw validationError()
+                throw validationError(code: Self.parsedLayoutMismatchErrorCode)
             }
             if let parserMask = parserLayout.nativeMask,
                let selectedMask = descriptor.channelLayout.nativeMask,
                parserMask != selectedMask {
-                throw validationError()
+                throw validationError(code: Self.parsedLayoutMismatchErrorCode)
             }
         }
         switch descriptor.codec {
         case .aac:
-            throw validationError()
+            throw validationError(code: Self.malformedParsedFrameErrorCode)
         case .mp2:
-            guard frame.frameSamples == 1_152 else { throw validationError() }
+            guard frame.frameSamples == 1_152 else {
+                throw validationError(code: Self.parsedFrameSamplesErrorCode)
+            }
         case .ac3:
-            guard frame.frameSamples == 1_536 else { throw validationError() }
+            guard frame.frameSamples == 1_536 else {
+                throw validationError(code: Self.parsedFrameSamplesErrorCode)
+            }
         case .eac3:
             guard [256, 512, 768, 1_536].contains(frame.frameSamples) else {
-                throw validationError()
+                throw validationError(code: Self.parsedFrameSamplesErrorCode)
             }
         }
         let presentationTimeStamp = descriptor.timeBase.cmTime(forFFmpegValue: pts)
-        guard presentationTimeStamp.isNumeric else { throw validationError() }
+        guard presentationTimeStamp.isNumeric else {
+            throw validationError(code: Self.missingParsedTimestampErrorCode)
+        }
         try emitSample(
             data: frame.bytes,
             presentationTimeStamp: presentationTimeStamp,
@@ -305,13 +321,13 @@ final class CompressedAudioAssembler {
               data.count <= Self.maximumPayloadBytes,
               presentationTimeStamp.isNumeric,
               frameSamples > 0 else {
-            throw validationError()
+            throw validationError(code: Self.sampleEmissionErrorCode)
         }
         let fingerprint: MediaFormatFingerprint
         do {
             fingerprint = try formatState.fingerprint()
         } catch {
-            throw validationError()
+            throw validationError(code: Self.sampleEmissionErrorCode)
         }
         if fingerprint != emittedFingerprint {
             eventSink(.format(formatDescription, descriptor.codec, fingerprint))
@@ -403,6 +419,10 @@ final class CompressedAudioAssembler {
 
     private func validationError() -> PlaybackCoreError {
         .audioFallbackDecode(Self.invalidInputErrorCode)
+    }
+
+    private func validationError(code: Int32) -> PlaybackCoreError {
+        .audioFallbackDecode(code)
     }
 
     private static func hasADTSSync(_ data: Data) -> Bool {

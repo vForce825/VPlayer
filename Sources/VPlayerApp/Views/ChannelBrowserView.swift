@@ -8,7 +8,9 @@ import VPlayerCore
 struct ChannelBrowserView: View {
     @Bindable var model: AppModel
     @State private var mappingChannel: Channel?
+    @State private var searchText = ""
     @Namespace private var channelFocus
+    private let focusPolicy = AcceptanceFocusPolicy.current()
 
     var body: some View {
         Group {
@@ -32,6 +34,7 @@ struct ChannelBrowserView: View {
                 channelList
             }
         }
+        .searchable(text: $searchText, prompt: "搜索频道")
         .sheet(item: $mappingChannel) { channel in
             ChannelEPGMappingView(model: model, channel: channel)
         }
@@ -45,7 +48,16 @@ struct ChannelBrowserView: View {
         )
     }
 
+    @ViewBuilder
     private var channelList: some View {
+        if groups.isEmpty {
+            ContentUnavailableView.search(text: searchText)
+        } else {
+            groupedChannelList
+        }
+    }
+
+    private var groupedChannelList: some View {
         List {
             ForEach(groups) { group in
                 Section(group.title) {
@@ -60,7 +72,11 @@ struct ChannelBrowserView: View {
                         }
                         .buttonStyle(.card)
                         .accessibilityIdentifier(channelIdentifier(channel))
-                        .prefersDefaultFocus(channel.id == model.channels.first?.id, in: channelFocus)
+                        .prefersDefaultFocus(
+                            channel.id == filteredChannels.first?.id
+                                && (!focusPolicy.isEnabled || focusPolicy.focusesFirstChannel),
+                            in: channelFocus
+                        )
                         .contextMenu {
                             Button("设置 EPG") {
                                 mappingChannel = channel
@@ -75,17 +91,34 @@ struct ChannelBrowserView: View {
     }
 
     private var groups: [ChannelGroup] {
+        // model.channels is already sorted by (order, id) in AppModel.apply, so
+        // group in a single O(n) pass with a title→index map instead of the
+        // previous re-sort plus O(groups) firstIndex scan per channel.
+        var indexByTitle: [String: Int] = [:]
         var result: [ChannelGroup] = []
-        for channel in model.channels.sorted(by: { ($0.order, $0.id) < ($1.order, $1.id) }) {
+        for channel in filteredChannels {
             let title = channel.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
             let resolvedTitle = title.flatMap { $0.isEmpty ? nil : $0 } ?? "其他"
-            if let index = result.firstIndex(where: { $0.title == resolvedTitle }) {
+            if let index = indexByTitle[resolvedTitle] {
                 result[index].channels.append(channel)
             } else {
+                indexByTitle[resolvedTitle] = result.count
                 result.append(ChannelGroup(title: resolvedTitle, channels: [channel]))
             }
         }
         return result
+    }
+
+    /// Channels narrowed by the search field. Large IPTV playlists are not
+    /// navigable by scrolling alone, so name, group, and tvg-name all match.
+    private var filteredChannels: [Channel] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return model.channels }
+        return model.channels.filter { channel in
+            channel.displayName.localizedCaseInsensitiveContains(query)
+                || channel.groupTitle?.localizedCaseInsensitiveContains(query) == true
+                || channel.tvgName?.localizedCaseInsensitiveContains(query) == true
+        }
     }
 
     private func channelIdentifier(_ channel: Channel) -> String {

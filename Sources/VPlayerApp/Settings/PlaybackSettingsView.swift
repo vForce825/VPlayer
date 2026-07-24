@@ -27,17 +27,25 @@ final class PlaybackAlgorithmSelectionController {
 
 struct PlaybackSettingsView: View {
     @Bindable var settings: PlaybackSettingsStore
-    let onAlgorithmChange: @MainActor (DeinterlaceAlgorithm) -> Void
+    @Namespace private var settingsFocus
+    private let focusPolicy = AcceptanceFocusPolicy.current()
 
-    init(
-        settings: PlaybackSettingsStore,
-        onAlgorithmChange: @escaping @MainActor (DeinterlaceAlgorithm) -> Void = { _ in }
-    ) {
+    init(settings: PlaybackSettingsStore) {
         self.settings = settings
-        self.onAlgorithmChange = onAlgorithmChange
     }
 
     var body: some View {
+        Group {
+            if focusPolicy.isEnabled {
+                content
+                    .focusScope(settingsFocus)
+            } else {
+                content
+            }
+        }
+    }
+
+    private var content: some View {
         NavigationStack {
             List {
                 algorithmRow(
@@ -60,18 +68,21 @@ struct PlaybackSettingsView: View {
         algorithm: DeinterlaceAlgorithm,
         identifier: String
     ) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            Button {
-                settings.deinterlaceAlgorithm = algorithm
-                onAlgorithmChange(algorithm)
-            } label: {
+        Button {
+            settings.deinterlaceAlgorithm = algorithm
+        } label: {
+            HStack {
+                Text(title)
+                Spacer()
                 Image(systemName: settings.deinterlaceAlgorithm == algorithm ? "checkmark.circle.fill" : "circle")
             }
-            .accessibilityLabel(title)
-            .accessibilityIdentifier(identifier)
-            .accessibilityAddTraits(settings.deinterlaceAlgorithm == algorithm ? .isSelected : [])
         }
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(identifier)
+        .accessibilityAddTraits(settings.deinterlaceAlgorithm == algorithm ? .isSelected : [])
+        .prefersDefaultFocus(
+            focusPolicy.settingsControl(for: settings.deinterlaceAlgorithm) == algorithm,
+            in: settingsFocus
+        )
     }
 }

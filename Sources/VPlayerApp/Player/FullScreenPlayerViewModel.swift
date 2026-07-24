@@ -135,11 +135,6 @@ final class FullScreenPlayerViewModel {
         }
     }
 
-    func selectAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
-        settings.deinterlaceAlgorithm = algorithm
-        _ = scheduleAlgorithm(algorithm, lifecycle: lifecycleGeneration)
-    }
-
     func stop() async {
         if let stopTask {
             await stopTask.value

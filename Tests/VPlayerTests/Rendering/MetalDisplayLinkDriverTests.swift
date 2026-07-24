@@ -220,6 +220,26 @@ final class MetalDisplayLinkDriverTests: XCTestCase {
         XCTAssertTrue(view.displayLink.isPaused)
     }
 
+    func testViewUpdatesDrawableSizeFromLaidOutBoundsAndContentScale() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MetalVideoView(
+            frame: .zero,
+            clock: DriverClock(order: DriverOrderRecorder()),
+            renderer: DriverRenderer(order: DriverOrderRecorder()),
+            device: device,
+            displayLinkFactory: { CAMetalDisplayLink(metalLayer: $0) },
+            lifecycle: DriverLifecycleRecorder().lifecycle
+        )
+        view.contentScaleFactor = 2
+        view.bounds = CGRect(x: 0, y: 0, width: 1_920, height: 1_080)
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+
+        let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
+        XCTAssertEqual(metalLayer.drawableSize, CGSize(width: 3_840, height: 2_160))
+    }
+
     private func makeHarness() throws -> DriverHarness {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let layer = CAMetalLayer()

@@ -393,7 +393,11 @@ public actor RefreshCoordinator {
                 didPersistTerminalStatus: persisted
             )
         } catch {
-            let summary = sanitizedSummary(error: error, url: resourceURL)
+            let summary = sanitizedSummary(
+                error: error,
+                resource: resource,
+                url: resourceURL
+            )
             let persisted = await recordFailure(
                 repository: repository,
                 profileID: profileID,
@@ -436,7 +440,11 @@ public actor RefreshCoordinator {
         }
     }
 
-    private nonisolated static func sanitizedSummary(error: any Error, url: URL?) -> String {
+    private nonisolated static func sanitizedSummary(
+        error: any Error,
+        resource: RefreshResource,
+        url: URL?
+    ) -> String {
         let reason: String
         switch error {
         case RemoteDownloadError.invalidResponse:
@@ -461,12 +469,8 @@ public actor RefreshCoordinator {
             }
         }
 
-        let summary: String
-        if let url {
-            summary = "刷新 \(RedactedURL.string(url)) 失败：\(reason)"
-        } else {
-            summary = "刷新失败：\(reason)"
-        }
+        let resourceName = resource == .playlist ? "播放列表" : "EPG"
+        let summary = "刷新\(resourceName)失败：\(reason)"
         return String(summary.prefix(240))
     }
 

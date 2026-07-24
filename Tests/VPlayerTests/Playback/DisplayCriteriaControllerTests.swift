@@ -107,6 +107,35 @@ final class DisplayCriteriaControllerTests: XCTestCase {
         XCTAssertEqual(link.operations, ["pause"])
     }
 
+    func testMissingModeSwitchEndRecoversOnceAfterSafetyDeadline() async throws {
+        let center = NotificationCenter()
+        let manager = FakeDisplayCriteriaManager()
+        let link = FakeDisplayLinkControl()
+        let readiness = FakeDisplayReadinessControl()
+        let subject = DisplayCriteriaController(
+            manager: manager,
+            notificationCenter: center,
+            criteriaFactory: { AVDisplayCriteria(refreshRate: $0, formatDescription: $1) },
+            displayLink: link,
+            readiness: readiness,
+            modeSwitchRecoveryDelay: .milliseconds(10)
+        )
+        subject.enterFullScreen(
+            formatDescription: try makeFormatDescription(),
+            outputFrameRate: 50
+        )
+
+        center.post(name: .AVDisplayManagerModeSwitchStart, object: nil)
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(readiness.operations, ["close", "anchor"])
+        XCTAssertEqual(link.operations, ["pause", "reset", "resume"])
+
+        center.post(name: .AVDisplayManagerModeSwitchEnd, object: nil)
+        XCTAssertEqual(readiness.operations, ["close", "anchor"])
+        XCTAssertEqual(link.operations, ["pause", "reset", "resume"])
+    }
+
     func testLeaveDuringModeSwitchCancelsReadinessWithoutResetOrResume() throws {
         let center = NotificationCenter()
         let manager = FakeDisplayCriteriaManager()

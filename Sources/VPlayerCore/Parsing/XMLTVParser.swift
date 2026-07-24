@@ -297,11 +297,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
                 summary: programme.summary,
                 categories: programme.categories
             )
-        } catch let error as XMLTVParserError {
-            fail(error, parser: parser)
-            return
-        } catch is XMLTVTimeError {
-            fail(XMLTVParserError.invalidProgramme, parser: parser)
+        } catch is XMLTVParserError, is XMLTVTimeError {
             return
         } catch {
             fail(error, parser: parser)

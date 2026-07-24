@@ -5,6 +5,30 @@
 import SwiftUI
 import VPlayerPlayback
 
+enum FullScreenPlayerLifecyclePolicy {
+    static func shouldStopOnDisappear(isPresentingSettings: Bool) -> Bool {
+        !isPresentingSettings
+    }
+}
+
+/// Decides when the transport controls may fade away over live video.
+///
+/// Controls stay pinned whenever the viewer still needs them on screen — while
+/// preparing, paused, or stopped — and only auto-hide during steady playback so
+/// a static overlay never sits on the panel indefinitely.
+enum PlayerControlsVisibilityPolicy {
+    static let idleTimeout = Duration.seconds(5)
+
+    static func staysVisible(for state: PlaybackState) -> Bool {
+        switch state {
+        case .playing:
+            false
+        case .idle, .preparing, .paused, .stopped, .failed:
+            true
+        }
+    }
+}
+
 struct FullScreenPlayerView: View {
     private enum FailureControl: Hashable {
         case retry
@@ -12,9 +36,16 @@ struct FullScreenPlayerView: View {
         case settings
     }
 
+    private struct ControlsAutoHideKey: Equatable {
+        let wake: Int
+        let pinned: Bool
+    }
+
     @State private var model: FullScreenPlayerViewModel
     @State private var showsSettings = false
     @State private var isClosing = false
+    @State private var controlsIdleHidden = false
+    @State private var controlsWakeCount = 0
     #if DEBUG
     @State private var acceptanceMetricsJSON = "unavailable"
     #endif
@@ -22,6 +53,7 @@ struct FullScreenPlayerView: View {
     private let settings: PlaybackSettingsStore
     private let metricsProvider: AppDependencies.PlaybackMetricsProvider
     private let acceptanceMetricsEnabled: Bool
+    private let acceptanceStateEnabled: Bool
     private let onDismiss: () -> Void
 
     init(
@@ -30,6 +62,7 @@ struct FullScreenPlayerView: View {
         presentationProvider: @escaping FullScreenPlayerViewModel.PresentationProvider,
         metricsProvider: @escaping AppDependencies.PlaybackMetricsProvider,
         acceptanceMetricsEnabled: Bool,
+        acceptanceStateEnabled: Bool,
         settings: PlaybackSettingsStore,
         onDismiss: @escaping () -> Void
     ) {
@@ -42,6 +75,7 @@ struct FullScreenPlayerView: View {
         self.settings = settings
         self.metricsProvider = metricsProvider
         self.acceptanceMetricsEnabled = acceptanceMetricsEnabled
+        self.acceptanceStateEnabled = acceptanceStateEnabled
         self.onDismiss = onDismiss
     }
 
@@ -61,6 +95,17 @@ struct FullScreenPlayerView: View {
                 .focusable(false)
 
             #if DEBUG
+            if acceptanceStateEnabled {
+                Color.clear
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityIdentifier("player-acceptance-state")
+                    .accessibilityValue(
+                        AcceptancePlaybackStatePresentation(state: model.state).value
+                    )
+                    .allowsHitTesting(false)
+                    .focusable(false)
+            }
+
             if acceptanceMetricsEnabled {
                 Color.clear
                     .accessibilityElement(children: .ignore)
@@ -86,20 +131,35 @@ struct FullScreenPlayerView: View {
                     onPlayPause: model.togglePause,
                     onSettings: { showsSettings = true }
                 )
+                // Faded rather than removed so the focus engine keeps a target
+                // and the controls stay reachable to the remote at any moment.
+                .opacity(controlsAreVisible ? 1 : 0)
+                .animation(.easeInOut(duration: 0.3), value: controlsAreVisible)
             }
+        }
+        .onMoveCommand { _ in
+            controlsWakeCount &+= 1
+        }
+        .task(id: ControlsAutoHideKey(
+            wake: controlsWakeCount,
+            pinned: controlsArePinned
+        )) {
+            await runControlsAutoHide()
         }
         .task { model.start() }
         #if DEBUG
         .task { await publishAcceptanceMetrics() }
         #endif
-        .onDisappear { Task { await model.stop() } }
+        .onDisappear {
+            guard FullScreenPlayerLifecyclePolicy.shouldStopOnDisappear(
+                isPresentingSettings: showsSettings
+            ) else { return }
+            Task { await model.stop() }
+        }
         .onPlayPauseCommand(perform: model.togglePause)
         .onExitCommand(perform: close)
         .sheet(isPresented: $showsSettings) {
-            PlaybackSettingsView(
-                settings: settings,
-                onAlgorithmChange: model.selectAlgorithm
-            )
+            PlaybackSettingsView(settings: settings)
         }
     }
 
@@ -137,13 +197,37 @@ struct FullScreenPlayerView: View {
         return false
     }
 
+    private var controlsArePinned: Bool {
+        PlayerControlsVisibilityPolicy.staysVisible(for: model.state)
+    }
+
+    private var controlsAreVisible: Bool {
+        controlsArePinned || !controlsIdleHidden
+    }
+
+    /// Re-shows the controls, then fades them out again after an idle period of
+    /// uninterrupted playback. Restarted whenever the viewer moves on the remote
+    /// or playback leaves the steady playing state.
+    private func runControlsAutoHide() async {
+        controlsIdleHidden = false
+        guard !controlsArePinned else { return }
+        do {
+            try await Task.sleep(for: PlayerControlsVisibilityPolicy.idleTimeout)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+        controlsIdleHidden = true
+    }
+
     private func close() {
         guard !isClosing else { return }
         isClosing = true
-        Task {
-            await model.stop()
-            onDismiss()
-        }
+        // Return to the channel list immediately. Engine teardown continues in
+        // the background (also driven by onDisappear) so a hung network stop
+        // never makes the Back button feel frozen.
+        onDismiss()
+        Task { await model.stop() }
     }
 
     #if DEBUG

@@ -96,7 +96,7 @@ final class XMLTVParserTests: XCTestCase {
         XCTAssertTrue(sink.channels.isEmpty)
     }
 
-    func testRejectsProgrammeWhoseStopDoesNotFollowStart() throws {
+    func testSkipsProgrammeWhoseStopDoesNotFollowStart() throws {
         let xml = """
             <tv><programme channel="one" start="20260718150000 Z" stop="20260718150000 Z">
               <title>Zero duration</title>
@@ -105,11 +105,34 @@ final class XMLTVParserTests: XCTestCase {
         let sink = CollectingXMLTVSink()
 
         try withTemporaryXML(xml) {
-            XCTAssertThrowsError(try XMLTVParser().parse(fileURL: $0, into: sink)) {
-                XCTAssertEqual($0 as? XMLTVParserError, .invalidProgramme)
-            }
+            XCTAssertEqual(
+                try XMLTVParser().parse(fileURL: $0, into: sink),
+                XMLTVParseSummary(channelCount: 0, programmeCount: 0)
+            )
         }
         XCTAssertTrue(sink.programmes.isEmpty)
+    }
+
+    func testInvalidProgrammeDoesNotDiscardFollowingValidProgramme() throws {
+        let xml = """
+            <tv>
+              <programme channel="one" start="20260718150000 +0800" stop="20260718150000 +0800">
+                <title>结束</title>
+              </programme>
+              <programme channel="one" start="20260718150000 +0800" stop="20260718160000 +0800">
+                <title>Valid programme</title>
+              </programme>
+            </tv>
+            """
+        let sink = CollectingXMLTVSink()
+
+        try withTemporaryXML(xml) {
+            XCTAssertEqual(
+                try XMLTVParser().parse(fileURL: $0, into: sink),
+                XMLTVParseSummary(channelCount: 0, programmeCount: 1)
+            )
+        }
+        XCTAssertEqual(sink.programmes.map(\.title), ["Valid programme"])
     }
 
     func testPreservesProgrammeSinkError() throws {

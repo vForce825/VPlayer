@@ -600,6 +600,55 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertEqual(events.last, .endOfStream)
     }
 
+    func testLargeReadyQueueYieldsToDecoderAndRendererCallbacksBeforeTerminal() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.demux.fairness")
+        let releaseExecutor = DispatchSemaphore(value: 0)
+        let executorBlocked = expectation(description: "fairness executor blocked")
+        executor.submit {
+            executorBlocked.fulfill()
+            releaseExecutor.wait()
+        }
+        wait(for: [executorBlocked], timeout: 2)
+
+        let producerFinished = DispatchSemaphore(value: 0)
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            for index in 0..<64 {
+                handle.emitPacket(.init(
+                    streamIndex: Int32(index),
+                    codec: VPFF_CODEC_H264,
+                    data: Data([UInt8(index)])
+                ))
+            }
+            handle.emitTerminal(VPFF_EVENT_END)
+            producerFinished.signal()
+            return 0
+        }
+        let events = LockedEventList()
+        let callbackObservation = LockedOptionalInt()
+        let terminal = expectation(description: "fairness terminal")
+        let subject = FFmpegDemuxer(bridge: bridge, executor: executor)
+        try subject.start(url: try httpURL()) { event in
+            events.append(event)
+            if events.snapshot.count == 1 {
+                executor.submit {
+                    callbackObservation.store(events.snapshot.count)
+                }
+            }
+            if event.isTerminal { terminal.fulfill() }
+        }
+
+        XCTAssertEqual(producerFinished.wait(timeout: .now() + 2), .success)
+        releaseExecutor.signal()
+        wait(for: [terminal], timeout: 5)
+        let drained = expectation(description: "fairness callbacks drained")
+        executor.submit { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+
+        let observedCount = try XCTUnwrap(callbackObservation.value)
+        XCTAssertGreaterThan(observedCount, 0)
+        XCTAssertLessThan(observedCount, 65, "media drain must yield before the terminal")
+    }
+
     func testSingleEventLargerThanInjectedByteBudgetFailsInsteadOfWaitingForever() throws {
         let bridge = FakeFFmpegDemuxBridge { handle in
             handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([1, 2, 3, 4])))
@@ -992,6 +1041,19 @@ private final class LockedEventList: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return events
+    }
+}
+
+private final class LockedOptionalInt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Int?
+
+    func store(_ value: Int) {
+        lock.withLock { stored = value }
+    }
+
+    var value: Int? {
+        lock.withLock { stored }
     }
 }
 

@@ -11,6 +11,34 @@ import XCTest
 
 @MainActor
 final class FullScreenPlayerViewModelTests: XCTestCase {
+    func testTransportControlsAutoHideOnlyDuringSteadyPlayback() {
+        let request = makeRequest()
+        let failure = PlaybackFailure(code: "demux.open", userMessage: "failed")
+
+        // Only steady playback may fade the overlay away; every state where the
+        // viewer still needs the controls keeps them pinned on screen.
+        XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .playing(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .idle))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .preparing(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .paused(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .stopped))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .failed(failure)))
+        XCTAssertGreaterThan(PlayerControlsVisibilityPolicy.idleTimeout, .zero)
+    }
+
+    func testPlayerLifecycleStopsOnlyWhenDisappearanceIsNotCausedBySettingsSheet() {
+        XCTAssertFalse(
+            FullScreenPlayerLifecyclePolicy.shouldStopOnDisappear(
+                isPresentingSettings: true
+            )
+        )
+        XCTAssertTrue(
+            FullScreenPlayerLifecyclePolicy.shouldStopOnDisappear(
+                isPresentingSettings: false
+            )
+        )
+    }
+
     func testStartSubscribesBeforeAlgorithmPlayAndPresentationLookup() async throws {
         let log = ViewModelOperationLog()
         let engine = ViewModelPlaybackEngine(log: log)
@@ -271,34 +299,6 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         let pauseEnd = try XCTUnwrap(operations.firstIndex(of: "pause:true:end"))
         let stopStart = try XCTUnwrap(operations.firstIndex(of: "stop:start"))
         XCTAssertLessThan(pauseEnd, stopStart)
-    }
-
-    func testRapidAlgorithmSelectionAlwaysAppliesTheLatestSelectionLast() async throws {
-        let firstAlgorithmGate = ViewModelAsyncGate()
-        let engine = ControlledViewModelPlaybackEngine(
-            suspendedAlgorithmCall: 1,
-            algorithmGate: firstAlgorithmGate
-        )
-        let settings = makeSettings(algorithm: .appleTemporal)
-        let model = FullScreenPlayerViewModel(
-            request: makeRequest(),
-            engine: engine,
-            presentationProvider: { nil },
-            settings: settings
-        )
-
-        model.selectAlgorithm(.metalYADIF2x)
-        try await eventually { await firstAlgorithmGate.hasWaiter }
-        model.selectAlgorithm(.appleTemporal)
-        await Task.yield()
-        let algorithmsBeforeRelease = await engine.completedAlgorithms
-        XCTAssertTrue(algorithmsBeforeRelease.isEmpty)
-        await firstAlgorithmGate.open()
-        try await eventually { await engine.completedAlgorithms.count == 2 }
-
-        let algorithms = await engine.completedAlgorithms
-        XCTAssertEqual(algorithms.last, .appleTemporal)
-        XCTAssertEqual(settings.deinterlaceAlgorithm, .appleTemporal)
     }
 
     func testSettingsAlgorithmSelectionControllerSerializesRapidChanges() async throws {

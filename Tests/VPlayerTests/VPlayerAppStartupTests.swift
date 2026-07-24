@@ -4,6 +4,7 @@
 
 import XCTest
 @testable import VPlayer
+import VPlayerPlayback
 
 @MainActor
 final class VPlayerAppStartupTests: XCTestCase {
@@ -73,14 +74,20 @@ final class VPlayerAppStartupTests: XCTestCase {
     #if DEBUG
     func testAcceptanceSourcePrefillAcceptsOnlyBase64LaunchTransport() throws {
         let source = "https://example.test/list.m3u"
+        let epg = "http://example.test/epg.xml"
         let encoded = Data(source.utf8).base64EncodedString()
+        let encodedEPG = Data(epg.utf8).base64EncodedString()
 
         let prefill = try XCTUnwrap(AcceptanceSourcePrefill.current(
             arguments: ["VPlayer", "-acceptance-playback"],
-            environment: [AcceptanceSourcePrefill.encodedM3UKey: encoded]
+            environment: [
+                AcceptanceSourcePrefill.encodedM3UKey: encoded,
+                AcceptanceSourcePrefill.encodedEPGKey: encodedEPG,
+            ]
         ))
 
         XCTAssertEqual(prefill.m3uURLString, source)
+        XCTAssertEqual(prefill.epgURLString, epg)
         XCTAssertNil(AcceptanceSourcePrefill.current(
             arguments: ["VPlayer"],
             environment: [AcceptanceSourcePrefill.encodedM3UKey: encoded]
@@ -98,6 +105,13 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertFalse(AcceptanceSourcePrefill.isActive(arguments: [
             "VPlayer", "-ui-fixture", "seeded", "-acceptance-playback",
         ]))
+        XCTAssertNil(AcceptanceSourcePrefill.current(
+            arguments: ["VPlayer", "-acceptance-playback"],
+            environment: [
+                AcceptanceSourcePrefill.encodedM3UKey: encoded,
+                AcceptanceSourcePrefill.encodedEPGKey: "not-base64",
+            ]
+        ))
     }
 
     func testAcceptanceM3UFieldPresentationNeverDisplaysRawURL() {
@@ -117,6 +131,113 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertFalse(protected.displayedValue.contains(source))
         XCTAssertFalse(normal.isProtected)
         XCTAssertEqual(normal.displayedValue, source)
+    }
+
+    func testAcceptancePlaybackStatePresentationUsesOnlySanitizedStateAndFailureCode() {
+        let secretChannelID = "secret-channel-id"
+        let secretTitle = "Secret Channel Title"
+        let secretURL = "https://user:password@example.test/live?token=secret"
+        let request = PlaybackRequest(
+            sourceProfileID: UUID(),
+            channelID: secretChannelID,
+            streamURL: URL(string: secretURL)!,
+            title: secretTitle
+        )
+        let failure = PlaybackFailure(
+            code: "decoder.invalid-data",
+            userMessage: "Could not play \(secretTitle) from \(secretURL)"
+        )
+        let presentations = [
+            AcceptancePlaybackStatePresentation(state: .idle).value,
+            AcceptancePlaybackStatePresentation(state: .preparing(request)).value,
+            AcceptancePlaybackStatePresentation(state: .playing(request)).value,
+            AcceptancePlaybackStatePresentation(state: .paused(request)).value,
+            AcceptancePlaybackStatePresentation(state: .stopped).value,
+            AcceptancePlaybackStatePresentation(state: .failed(failure)).value,
+        ]
+
+        XCTAssertEqual(presentations, [
+            "idle", "preparing", "playing", "paused", "stopped",
+            "failed:decoder.invalid-data",
+        ])
+        for presentation in presentations {
+            XCTAssertFalse(presentation.contains(secretChannelID))
+            XCTAssertFalse(presentation.contains(secretTitle))
+            XCTAssertFalse(presentation.contains(secretURL))
+            XCTAssertFalse(presentation.contains(failure.userMessage))
+        }
+    }
+
+    func testAcceptancePlaybackStatePresentationPrefersDiagnosticCodeWithoutSecrets() {
+        let secretChannelID = "secret-channel-id"
+        let secretTitle = "Secret Channel Title"
+        let secretURL = "https://user:password@example.test/live?token=secret"
+        let failure = PlaybackFailure(
+            code: "public-\(secretChannelID)",
+            userMessage: "Could not play \(secretTitle) from \(secretURL)",
+            diagnosticCode: "video.decode.status.-12909"
+        )
+
+        let presentation = AcceptancePlaybackStatePresentation(
+            state: .failed(failure)
+        ).value
+
+        XCTAssertEqual(presentation, "failed:video.decode.status.-12909")
+        XCTAssertFalse(presentation.contains(secretChannelID))
+        XCTAssertFalse(presentation.contains(secretTitle))
+        XCTAssertFalse(presentation.contains(secretURL))
+        XCTAssertFalse(presentation.contains(failure.userMessage))
+    }
+
+    func testExactAcceptanceEditorFocusPolicyStartsOnSave() {
+        XCTAssertEqual(
+            SourceProfileEditorFocusPolicy(
+                protectsAcceptanceSourceValue: true
+            ).initialTarget,
+            .save
+        )
+    }
+
+    func testNormalEditorFocusPolicyDoesNotForceAControl() {
+        XCTAssertNil(
+            SourceProfileEditorFocusPolicy(
+                protectsAcceptanceSourceValue: false
+            ).initialTarget
+        )
+    }
+
+    func testExactAcceptanceSourcesFocusStartsOnAddThenMovesToPlaylistRefresh() {
+        let policy = AcceptanceFocusPolicy(isEnabled: true)
+
+        XCTAssertEqual(policy.initialSourceControl, .add)
+        XCTAssertEqual(policy.sourceControlAfterEditorDismissal, .playlistRefresh)
+    }
+
+    func testNormalSourcesFocusDoesNotForceAControl() {
+        let policy = AcceptanceFocusPolicy(isEnabled: false)
+
+        XCTAssertNil(policy.initialSourceControl)
+        XCTAssertNil(policy.sourceControlAfterEditorDismissal)
+    }
+
+    func testAcceptanceFocusPolicyOwnsEveryRealFlowBoundaryOnlyWhenExactLaunchIsActive() {
+        let acceptance = AcceptanceFocusPolicy(isEnabled: true)
+        XCTAssertEqual(acceptance.initialRootTab, .sources)
+        XCTAssertEqual(acceptance.initialSourceControl, .add)
+        XCTAssertEqual(acceptance.sourceControlAfterEditorDismissal, .playlistRefresh)
+        XCTAssertEqual(acceptance.settingsControl(for: .appleTemporal), .appleTemporal)
+        XCTAssertEqual(acceptance.settingsControl(for: .metalYADIF2x), .metalYADIF2x)
+        XCTAssertTrue(acceptance.focusesFirstChannel)
+        XCTAssertEqual(acceptance.initialPlayerControl, .settings)
+
+        let normal = AcceptanceFocusPolicy(isEnabled: false)
+        XCTAssertEqual(normal.initialRootTab, .channels)
+        XCTAssertNil(normal.initialSourceControl)
+        XCTAssertNil(normal.sourceControlAfterEditorDismissal)
+        XCTAssertNil(normal.settingsControl(for: .appleTemporal))
+        XCTAssertFalse(normal.focusesFirstChannel)
+        XCTAssertEqual(normal.initialPlayerControl, .playPause)
+
     }
     #endif
 

@@ -13,12 +13,23 @@ public protocol LibraryRepository: Sendable {
     func setActiveProfile(id: UUID) async throws
     func channels(profileID: UUID) async throws -> [Channel]
     func epgChannels(profileID: UUID) async throws -> [EPGChannel]
+    func epgProgrammeCount(profileID: UUID) async throws -> Int
     func programmes(
         profileID: UUID,
         xmltvChannelID: String,
         overlapping: Range<Date>
     ) async throws -> [Programme]
     func manualMapping(profileID: UUID, channelID: String) async throws -> ManualEPGMapping?
+    /// All manual channel→XMLTV overrides for a profile, keyed by channel id.
+    /// Batched so a library reload issues one query instead of one per channel.
+    func manualMappings(profileID: UUID) async throws -> [String: String]
+    /// Programmes overlapping `overlapping` for the given XMLTV channel ids,
+    /// grouped by XMLTV channel id. Batched to avoid a per-channel query fan-out.
+    func programmes(
+        profileID: UUID,
+        xmltvChannelIDs: Set<String>,
+        overlapping: Range<Date>
+    ) async throws -> [String: [Programme]]
     func setManualMapping(
         profileID: UUID,
         channelID: String,

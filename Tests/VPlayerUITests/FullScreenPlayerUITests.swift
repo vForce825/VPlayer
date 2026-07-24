@@ -19,6 +19,24 @@ final class FullScreenPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testSettingsRowsSwitchAlgorithmsWithTheRemote() {
+        let app = launchFixture()
+        selectTab(named: "设置", in: app)
+        let apple = app.buttons["settings.deinterlace.apple"]
+        let yadif = app.buttons["settings.deinterlace.yadif"]
+
+        XCUIRemote.shared.press(.down)
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(yadif.wait(for: \.isSelected, toEqual: true, timeout: 2))
+        XCTAssertFalse(apple.isSelected)
+
+        XCUIRemote.shared.press(.up)
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(apple.wait(for: \.isSelected, toEqual: true, timeout: 2))
+        XCTAssertFalse(yadif.isSelected)
+    }
+
+    @MainActor
     func testTemporalFailureBannerDoesNotTakeFocusAndDisappears() {
         let app = launchFixture(playback: "interlaced-temporal-unsupported")
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
@@ -36,6 +54,20 @@ final class FullScreenPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testPlayingFixtureExposesSanitizedAcceptanceState() {
+        let app = launchFixture()
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "playing")
+        XCTAssertFalse(state.hasFocus)
+    }
+
+    @MainActor
     func testFailureOverlayDefaultsFocusToRetry() {
         let app = launchFixture(playback: "failed")
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
@@ -46,6 +78,27 @@ final class FullScreenPlayerUITests: XCTestCase {
         let retry = app.buttons["player-retry"]
         XCTAssertTrue(retry.waitForExistence(timeout: 3))
         XCTAssertTrue(retry.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "failed:ui.fixture")
+        XCTAssertFalse(state.hasFocus)
+    }
+
+    @MainActor
+    func testFailureDiagnosticFixturePrefersSignedStatusWithoutTakingFocus() {
+        let app = launchFixture(playback: "failed-diagnostic")
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        let retry = app.buttons["player-retry"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 3))
+        XCTAssertTrue(retry.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "failed:video.decode.status.-12909")
+        XCTAssertFalse(state.hasFocus)
     }
 
     @MainActor

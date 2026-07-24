@@ -126,6 +126,7 @@ public enum VideoDecoderFailure: Error, Sendable, Equatable {
     case softwareDecoder
     case badData(OSStatus)
     case malfunction(OSStatus)
+    case backpressureTimeout
     case temporalUnavailable(AppleTemporalFailure)
 
     public var isTemporalUnavailable: Bool {

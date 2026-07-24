@@ -20,6 +20,64 @@ enum AcceptanceLaunchSelection {
 }
 #endif
 
+struct AcceptanceFocusPolicy: Equatable {
+    enum RootTab: Hashable {
+        case channels
+        case sources
+        case settings
+    }
+
+    enum SourceControl: Hashable {
+        case add
+        case playlistRefresh
+        case epgRefresh
+    }
+
+    enum PlayerControl: Hashable {
+        case back
+        case playPause
+        case settings
+    }
+
+    let isEnabled: Bool
+
+    static func current(
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> Self {
+        #if DEBUG
+        Self(isEnabled: AcceptanceLaunchSelection.isSelected(arguments: arguments))
+        #else
+        Self(isEnabled: false)
+        #endif
+    }
+
+    var initialRootTab: RootTab {
+        isEnabled ? .sources : .channels
+    }
+
+    var initialSourceControl: SourceControl? {
+        isEnabled ? .add : nil
+    }
+
+    var sourceControlAfterEditorDismissal: SourceControl? {
+        isEnabled ? .playlistRefresh : nil
+    }
+
+    func settingsControl(
+        for algorithm: DeinterlaceAlgorithm
+    ) -> DeinterlaceAlgorithm? {
+        isEnabled ? algorithm : nil
+    }
+
+    var focusesFirstChannel: Bool {
+        isEnabled
+    }
+
+    var initialPlayerControl: PlayerControl {
+        isEnabled ? .settings : .playPause
+    }
+}
+
 struct AppLaunchConfiguration {
     let mode: AppLaunchMode
     let resetsPlaybackSettings: Bool
@@ -43,15 +101,11 @@ struct AppLaunchConfiguration {
             mode = .live
         }
         #else
-        if acceptanceFlags.isEmpty,
-           fixtureFlags.count == 1,
-           let flagIndex = fixtureFlags.first,
-           arguments.indices.contains(flagIndex + 1),
-           arguments[flagIndex + 1] == "seeded" {
-            mode = .seededFixture
-        } else {
-            mode = .live
-        }
+        // Release builds never honor test-only launch flags: seeded fixtures,
+        // the fake playback engine, and acceptance harness paths are DEBUG-only.
+        _ = fixtureFlags
+        _ = acceptanceFlags
+        mode = .live
         #endif
         resetsPlaybackSettings = arguments.contains("-uiTestResetPlaybackSettings")
         let playbackFixtureFlags = arguments.indices.filter {
@@ -70,6 +124,7 @@ struct AppLaunchConfiguration {
 #if DEBUG
 struct AcceptanceSourcePrefill: Equatable {
     static let encodedM3UKey = "VPLAYER_ACCEPTANCE_M3U_URL_B64"
+    static let encodedEPGKey = "VPLAYER_ACCEPTANCE_EPG_URL_B64"
 
     let name: String
     let m3uURLString: String
@@ -84,18 +139,34 @@ struct AcceptanceSourcePrefill: Equatable {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Self? {
         guard isActive(arguments: arguments),
-              let encoded = environment[encodedM3UKey],
+              let m3uURLString = decodedHTTPURL(
+                from: environment[encodedM3UKey]
+              ) else {
+            return nil
+        }
+        let epgURLString: String
+        if let encodedEPG = environment[encodedEPGKey] {
+            guard let decodedEPG = decodedHTTPURL(from: encodedEPG) else { return nil }
+            epgURLString = decodedEPG
+        } else {
+            epgURLString = "https://example.invalid/acceptance.xml"
+        }
+        return Self(
+            name: "Device Acceptance",
+            m3uURLString: m3uURLString,
+            epgURLString: epgURLString
+        )
+    }
+
+    private static func decodedHTTPURL(from encoded: String?) -> String? {
+        guard let encoded,
               let data = Data(base64Encoded: encoded),
               let value = String(data: data, encoding: .utf8),
               let url = URL(string: value),
               ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
             return nil
         }
-        return Self(
-            name: "Device Acceptance",
-            m3uURLString: value,
-            epgURLString: "https://example.invalid/acceptance.xml"
-        )
+        return value
     }
 }
 #endif
@@ -114,7 +185,11 @@ struct VPlayerApp: App {
         case .live:
             self.init(dependencies: .live())
         case .seededFixture:
+            #if DEBUG
             self.init(dependencies: .uiTesting(playbackFixture: configuration.playbackFixture))
+            #else
+            self.init(dependencies: .live())
+            #endif
         case .acceptance:
             #if DEBUG
             self.init(dependencies: .acceptance())

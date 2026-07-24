@@ -90,7 +90,16 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
 
     public override func didMoveToWindow() {
         super.didMoveToWindow()
+        if let window {
+            contentScaleFactor = window.screen.nativeScale
+        }
+        updateDrawableSize()
         windowDidChange?(window)
+    }
+
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        updateDrawableSize()
     }
 
     public func stopDisplayLink() {
@@ -129,5 +138,20 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
             targetPresentationTimestamp: targetPresentationTimestamp,
             drawable: drawable
         )
+    }
+
+    private func updateDrawableSize() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        let scale = contentScaleFactor
+        let size = CGSize(
+            width: bounds.width * scale,
+            height: bounds.height * scale
+        )
+        guard size.width.isFinite,
+              size.height.isFinite,
+              size.width > 0,
+              size.height > 0,
+              metalLayer.drawableSize != size else { return }
+        metalLayer.drawableSize = size
     }
 }

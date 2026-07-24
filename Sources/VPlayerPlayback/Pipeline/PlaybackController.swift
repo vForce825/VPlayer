@@ -161,14 +161,26 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
             PlaybackFailure(code: "video.format", userMessage: "无法解析视频格式，请尝试其他频道。")
         case .hardwareDecoderUnavailable:
             PlaybackFailure(code: "video.hardware", userMessage: "硬件视频解码器不可用，请稍后重试。")
-        case .videoDecode:
-            PlaybackFailure(code: "video.decode", userMessage: "视频解码失败，请尝试其他频道。")
+        case let .videoDecode(status):
+            PlaybackFailure(
+                code: "video.decode",
+                userMessage: "视频解码失败，请尝试其他频道。",
+                diagnosticCode: "video.decode.status.\(status)"
+            )
         case .audioFormatDescription:
             PlaybackFailure(code: "audio.format", userMessage: "无法解析音频格式，请尝试其他频道。")
-        case .audioFallbackDecode:
-            PlaybackFailure(code: "audio.decode", userMessage: "音频解码失败，请尝试其他频道。")
-        case .audioRendererFailed:
-            PlaybackFailure(code: "audio.renderer", userMessage: "音频输出失败，请检查播放设备后重试。")
+        case let .audioFallbackDecode(status):
+            PlaybackFailure(
+                code: "audio.decode",
+                userMessage: "音频解码失败，请尝试其他频道。",
+                diagnosticCode: "audio.decode.status.\(status)"
+            )
+        case let .audioRendererFailed(reason):
+            PlaybackFailure(
+                code: "audio.renderer",
+                userMessage: "音频输出失败，请检查播放设备后重试。",
+                diagnosticCode: "audio.renderer.reason.\(safeAudioRendererReason(reason))"
+            )
         case .renderTextureMapping:
             PlaybackFailure(code: "video.texture", userMessage: "视频纹理处理失败，请稍后重试。")
         case .metalCommand:
@@ -176,6 +188,19 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
         case .cancelled:
             PlaybackFailure(code: "playback.cancelled", userMessage: "播放已取消，请重新选择频道。")
         }
+    }
+
+    private static func safeAudioRendererReason(_ reason: String) -> String {
+        guard !reason.isEmpty, reason.utf8.count <= 128,
+              reason.unicodeScalars.allSatisfy({ scalar in
+                  switch scalar.value {
+                  case 45...46, 48...58, 65...90, 95, 97...122:
+                      true
+                  default:
+                      false
+                  }
+              }) else { return "unknown" }
+        return reason
     }
 
     private func receive(_ event: PlaybackPipelineEvent, sessionID: UInt64) {

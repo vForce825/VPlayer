@@ -182,6 +182,34 @@ public struct ScanTypeClassifier: Sendable {
         return applyRefinement(refinementOrder)
     }
 
+    /// Falls back to the coded field signal only after the content probe has explicitly
+    /// failed. Successful probes still retain precedence so PsF can bypass deinterlacing.
+    public mutating func observeProbeFailure(
+        _ observation: ScanObservation
+    ) -> ScanClassificationChange? {
+        guard observation.generation == generation,
+              hasFieldSignalling(observation) else { return nil }
+        clearStreaks()
+        return transition(to: .interlaced(interlaceOrder(from: explicitOrder(in: observation))))
+    }
+
+    /// Resolves startup after the bounded content-probe budget is exhausted. Field
+    /// signalling remains conservative; an otherwise unknown source starts in raw
+    /// bypass and can still be promoted to interlaced by later comb evidence.
+    public mutating func resolveAfterProbeBudget(
+        _ observation: ScanObservation
+    ) -> ScanClassificationChange? {
+        guard observation.generation == generation,
+              current == .unknown else { return nil }
+        clearStreaks()
+        if hasFieldSignalling(observation) {
+            return transition(
+                to: .interlaced(interlaceOrder(from: explicitOrder(in: observation)))
+            )
+        }
+        return transition(to: .progressive)
+    }
+
     public mutating func reset(generation: MediaGeneration) {
         self.generation = generation
         current = .unknown

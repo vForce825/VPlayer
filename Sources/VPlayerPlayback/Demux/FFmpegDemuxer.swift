@@ -105,6 +105,8 @@ private struct QueuedDemuxEvent: Sendable {
 }
 
 private final class DemuxSessionState: @unchecked Sendable {
+    private static let drainBatchSize = 16
+
     private let condition = NSCondition()
     private let handleLock = NSLock()
     private let executor: PlaybackSerialExecutor
@@ -306,7 +308,8 @@ private final class DemuxSessionState: @unchecked Sendable {
     }
 
     private func drain() {
-        while true {
+        var deliveredCount = 0
+        while deliveredCount < Self.drainBatchSize {
             condition.lock()
             if let queued = queue.popFirst() {
                 queuedBytes -= queued.byteCount
@@ -314,6 +317,7 @@ private final class DemuxSessionState: @unchecked Sendable {
                 condition.broadcast()
                 condition.unlock()
                 currentSink?(queued.event)
+                deliveredCount += 1
                 continue
             }
             if let terminal = pendingTerminal {
@@ -331,6 +335,12 @@ private final class DemuxSessionState: @unchecked Sendable {
             condition.unlock()
             return
         }
+
+        condition.lock()
+        drainScheduled = false
+        let shouldReschedule = scheduleDrainIfNeededLocked()
+        condition.unlock()
+        if shouldReschedule { submitDrain() }
     }
 }
 

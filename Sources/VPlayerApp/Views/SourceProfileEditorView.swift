@@ -17,6 +17,19 @@ struct SourceProfileEditorM3UFieldPresentation: Equatable {
     }
 }
 
+struct SourceProfileEditorFocusPolicy {
+    enum Target: Hashable {
+        case save
+    }
+
+    let initialTarget: Target?
+
+    init(protectsAcceptanceSourceValue: Bool) {
+        initialTarget = protectsAcceptanceSourceValue ? .save : nil
+    }
+
+}
+
 struct SourceProfileEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var model: AppModel
@@ -30,7 +43,9 @@ struct SourceProfileEditorView: View {
     @State private var validationMessage: String?
     @State private var isSaving = false
     @State private var createAttemptID: UUID
+    @FocusState private var focusedTarget: SourceProfileEditorFocusPolicy.Target?
     private let protectsAcceptanceSourceValue: Bool
+    private let focusPolicy: SourceProfileEditorFocusPolicy
 
     init(model: AppModel, profile: SourceProfile?) {
         self.model = model
@@ -48,6 +63,9 @@ struct SourceProfileEditorView: View {
         let protectsAcceptanceSourceValue = false
         #endif
         self.protectsAcceptanceSourceValue = protectsAcceptanceSourceValue
+        focusPolicy = SourceProfileEditorFocusPolicy(
+            protectsAcceptanceSourceValue: protectsAcceptanceSourceValue
+        )
         _name = State(initialValue: initialName)
         _m3uURLString = State(initialValue: initialM3U)
         _epgURLString = State(initialValue: initialEPG)
@@ -57,13 +75,35 @@ struct SourceProfileEditorView: View {
     }
 
     var body: some View {
+        Group {
+            if let initialTarget = focusPolicy.initialTarget {
+                editor
+                    .defaultFocus($focusedTarget, initialTarget)
+                    .task {
+                        await Task.yield()
+                        focusedTarget = initialTarget
+                    }
+            } else {
+                editor
+            }
+        }
+        .onDisappear {
+            guard profile == nil else { return }
+            model.cancelCreateAttempt(createAttemptID)
+        }
+    }
+
+    private var editor: some View {
         NavigationStack {
             Form {
                 TextField("数据源名称", text: $name)
                     .accessibilityIdentifier("source.editor.name")
                 m3uURLField
-                TextField("EPG 地址", text: $epgURLString)
-                    .accessibilityIdentifier("source.editor.epg")
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                epgURLField
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
 
                 Picker("M3U 刷新频率", selection: $m3uRefreshInterval) {
                     refreshIntervalOptions
@@ -71,6 +111,8 @@ struct SourceProfileEditorView: View {
                 Picker("EPG 刷新频率", selection: $epgRefreshInterval) {
                     refreshIntervalOptions
                 }
+
+                saveButton
 
                 if let validationMessage {
                     Text(validationMessage)
@@ -83,17 +125,15 @@ struct SourceProfileEditorView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { cancel() }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") { save() }
-                        .disabled(isSaving)
-                        .accessibilityIdentifier("source.editor.save")
-                }
             }
         }
-        .onDisappear {
-            guard profile == nil else { return }
-            model.cancelCreateAttempt(createAttemptID)
-        }
+    }
+
+    private var saveButton: some View {
+        Button("保存") { save() }
+            .disabled(isSaving)
+            .accessibilityIdentifier("source.editor.save")
+            .focused($focusedTarget, equals: .save)
     }
 
     @ViewBuilder
@@ -109,6 +149,22 @@ struct SourceProfileEditorView: View {
         } else {
             TextField("M3U 地址", text: $m3uURLString)
                 .accessibilityIdentifier("source.editor.m3u")
+        }
+    }
+
+    @ViewBuilder
+    private var epgURLField: some View {
+        let epgFieldPresentation = SourceProfileEditorM3UFieldPresentation(
+            rawValue: epgURLString,
+            protectsValue: protectsAcceptanceSourceValue
+        )
+        if epgFieldPresentation.isProtected {
+            TextField("EPG 地址", text: .constant(epgFieldPresentation.displayedValue))
+                .disabled(true)
+                .accessibilityIdentifier("source.editor.epg")
+        } else {
+            TextField("EPG 地址", text: $epgURLString)
+                .accessibilityIdentifier("source.editor.epg")
         }
     }
 
@@ -163,20 +219,7 @@ struct SourceProfileEditorView: View {
     }
 
     private func validationMessage(for error: any Error) -> String {
-        switch error {
-        case SourceProfileValidationError.emptyName:
-            "请输入数据源名称。"
-        case SourceProfileValidationError.invalidURL(field: .m3u):
-            "请输入有效的 M3U 地址。"
-        case SourceProfileValidationError.invalidURL(field: .epg):
-            "请输入有效的 EPG 地址。"
-        case SourceProfileValidationError.unsupportedURL(field: .m3u):
-            "M3U 地址仅支持 HTTP 或 HTTPS。"
-        case SourceProfileValidationError.unsupportedURL(field: .epg):
-            "EPG 地址仅支持 HTTP 或 HTTPS。"
-        default:
-            "请检查输入内容。"
-        }
+        SourceProfileValidationMessage.text(for: error) ?? "请检查输入内容。"
     }
 }
 

@@ -383,7 +383,7 @@ final class CompressedVideoAssembler {
         let scan = try AnnexBScanner.scan(frame.bytes, codec: descriptor.codec)
         try updateFormatIfNeeded(with: scan.parameterSets)
         guard let formatDescription else {
-            throw PlaybackCoreError.videoDecode(Self.invalidInputErrorCode)
+            return
         }
 
         let fingerprint: MediaFormatFingerprint
@@ -429,9 +429,6 @@ final class CompressedVideoAssembler {
         let candidate = mergedParameterSets(incoming)
         guard candidate != parameterSets || formatDescription == nil else { return }
         guard hasRequiredParameterSets(candidate) else {
-            if formatDescription == nil {
-                throw PlaybackCoreError.videoDecode(Self.invalidInputErrorCode)
-            }
             return
         }
         let candidateDescription = try VideoFormatDescriptionBuilder.make(

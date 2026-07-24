@@ -19,16 +19,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(snapshot.operations, ["create", "set", "copy"])
         XCTAssertEqual(snapshot.creates.count, 1)
         XCTAssertEqual(snapshot.creates.first?.decoderSpecification, [
-            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: .boolean(true),
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
         ])
         XCTAssertEqual(snapshot.creates.first?.imageBufferAttributes, [
             kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
             kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String: .array([
+            kCVPixelBufferPixelFormatTypeKey as String:
                 .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
-            ]),
         ])
         XCTAssertEqual(snapshot.sets, [FakeVideoToolboxAPI.PropertyRecord(
             sessionID: VTSessionID(rawValue: 1),
@@ -41,6 +38,17 @@ final class VideoToolboxDecoderTests: XCTestCase {
         )])
     }
 
+    func testBothFieldsAcceptsUnsupportedOptionalFieldModeProperty() throws {
+        let harness = makeHarness()
+        harness.api.enqueueSetStatus(kVTPropertyNotSupportedErr)
+
+        XCTAssertNoThrow(try configure(harness, generation: 3))
+
+        XCTAssertEqual(harness.api.snapshot.operations, ["create", "set", "copy"])
+        try decode(harness, id: 7, generation: 3)
+        XCTAssertEqual(harness.api.snapshot.decodes.count, 1)
+    }
+
     func testAppleTemporalConfigurationUsesExactCandidateOperationOrderAndProperties() throws {
         let harness = makeHarness()
 
@@ -49,16 +57,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
         let snapshot = harness.api.snapshot
         XCTAssertEqual(snapshot.operations, ["create", "supported", "set", "set", "copy"])
         XCTAssertEqual(snapshot.creates.first?.decoderSpecification, [
-            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: .boolean(true),
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
         ])
         XCTAssertEqual(snapshot.creates.first?.imageBufferAttributes, [
             kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
             kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String: .array([
+            kCVPixelBufferPixelFormatTypeKey as String:
                 .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
-            ]),
         ])
         XCTAssertEqual(snapshot.supportedPropertyQueries, [VTSessionID(rawValue: 1)])
         XCTAssertEqual(snapshot.sets, [
@@ -480,6 +485,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
     func testImmediateDecodeStatusClassificationThrowsOnceWithoutEvent() throws {
         let cases: [(OSStatus, VideoDecoderFailure)] = [
             (kVTVideoDecoderBadDataErr, .badData(kVTVideoDecoderBadDataErr)),
+            (-8_969, .badData(-8_969)),
             (kVTVideoDecoderReferenceMissingErr, .badData(kVTVideoDecoderReferenceMissingErr)),
             (kVTVideoDecoderUnsupportedDataFormatErr, .badData(kVTVideoDecoderUnsupportedDataFormatErr)),
             (kVTVideoDecoderMalfunctionErr, .malfunction(kVTVideoDecoderMalfunctionErr)),
@@ -502,9 +508,36 @@ final class VideoToolboxDecoderTests: XCTestCase {
         }
     }
 
+    func testAsynchronousSubmissionWindowBoundsPendingAccessUnitsAndReopensOnCallback() throws {
+        let harness = makeHarness(
+            maximumInFlightDecodeCount: 2,
+            inFlightWaitInterval: 0.001
+        )
+        try configure(harness, generation: 1)
+
+        try decode(harness, id: 1, generation: 1)
+        try decode(harness, id: 2, generation: 1)
+        assertFailure(.backpressureTimeout) {
+            try decode(harness, id: 3, generation: 1)
+        }
+        XCTAssertEqual(harness.api.snapshot.decodes.count, 2)
+        XCTAssertEqual(harness.api.snapshot.pendingDecodeCount, 2)
+
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        try decode(harness, id: 4, generation: 1)
+
+        XCTAssertEqual(harness.api.snapshot.decodes.map(\.sessionID), [
+            VTSessionID(rawValue: 1),
+            VTSessionID(rawValue: 1),
+            VTSessionID(rawValue: 1),
+        ])
+    }
+
     func testAsynchronousStatusClassificationEmitsExactlyOneDisposition() throws {
         let cases: [(OSStatus, ExpectedDisposition, VideoDecoderFailure)] = [
+            (1, .recoverable, .badData(1)),
             (kVTVideoDecoderBadDataErr, .recoverable, .badData(kVTVideoDecoderBadDataErr)),
+            (-8_969, .recoverable, .badData(-8_969)),
             (kVTVideoDecoderReferenceMissingErr, .recoverable, .badData(kVTVideoDecoderReferenceMissingErr)),
             (kVTVideoDecoderUnsupportedDataFormatErr, .fatal, .badData(kVTVideoDecoderUnsupportedDataFormatErr)),
             (kVTVideoDecoderMalfunctionErr, .recoverable, .malfunction(kVTVideoDecoderMalfunctionErr)),
@@ -533,7 +566,9 @@ final class VideoToolboxDecoderTests: XCTestCase {
 
     func testAppleTemporalImmediateProcessingFailuresAreTemporalButDataFailuresStayBadData() throws {
         let cases: [(OSStatus, VideoDecoderFailure)] = [
+            (1, .badData(1)),
             (kVTVideoDecoderBadDataErr, .badData(kVTVideoDecoderBadDataErr)),
+            (-8_969, .badData(-8_969)),
             (kVTVideoDecoderReferenceMissingErr, .badData(kVTVideoDecoderReferenceMissingErr)),
             (
                 kVTVideoDecoderMalfunctionErr,
@@ -555,7 +590,9 @@ final class VideoToolboxDecoderTests: XCTestCase {
 
     func testAppleTemporalCallbackProcessingFailuresAreRecoverableButDataFailuresStayBadData() throws {
         let cases: [(OSStatus, VideoDecoderFailure)] = [
+            (1, .badData(1)),
             (kVTVideoDecoderBadDataErr, .badData(kVTVideoDecoderBadDataErr)),
+            (-8_969, .badData(-8_969)),
             (kVTVideoDecoderReferenceMissingErr, .badData(kVTVideoDecoderReferenceMissingErr)),
             (
                 kVTVideoDecoderMalfunctionErr,
@@ -849,7 +886,9 @@ final class VideoToolboxDecoderTests: XCTestCase {
     }
 
     private func makeHarness(
-        compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck
+        compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck,
+        maximumInFlightDecodeCount: Int = 8,
+        inFlightWaitInterval: TimeInterval = 0.25
     ) -> DecoderHarness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.decoder")
         let api = FakeVideoToolboxAPI()
@@ -858,7 +897,9 @@ final class VideoToolboxDecoderTests: XCTestCase {
             executor: executor,
             eventSink: { events.record($0) },
             api: api,
-            compatibilityCheck: compatibilityCheck
+            compatibilityCheck: compatibilityCheck,
+            maximumInFlightDecodeCount: maximumInFlightDecodeCount,
+            inFlightWaitInterval: inFlightWaitInterval
         )
         return DecoderHarness(executor: executor, api: api, events: events, decoder: decoder)
     }

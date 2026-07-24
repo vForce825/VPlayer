@@ -16,6 +16,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         let stopRequestCount: Int
         let observationStartCount: Int
         let observationStopCount: Int
+        let readinessCheckCount: Int
     }
 
     let identity: AudioRendererIdentity
@@ -35,6 +36,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var stopRequestCount = 0
     private var observationStartCount = 0
     private var observationStopCount = 0
+    private var readinessCheckCount = 0
     private var attached = false
 
     init(identity: UInt64, mediaKind: AudioRendererMediaKind) {
@@ -43,7 +45,10 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     }
 
     var isReadyForMoreMediaData: Bool {
-        withLock { ready && enqueuesSinceReadyCallback < maximumEnqueuesPerReadyCallback }
+        withLock {
+            readinessCheckCount += 1
+            return ready && enqueuesSinceReadyCallback < maximumEnqueuesPerReadyCallback
+        }
     }
 
     var hasSufficientMediaDataForReliablePlaybackStart: Bool {
@@ -145,7 +150,8 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
                 requestCount: requestCount,
                 stopRequestCount: stopRequestCount,
                 observationStartCount: observationStartCount,
-                observationStopCount: observationStopCount
+                observationStopCount: observationStopCount,
+                readinessCheckCount: readinessCheckCount
             )
         }
     }

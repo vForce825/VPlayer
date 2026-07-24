@@ -174,7 +174,8 @@ final class RefreshCoordinatorTests: XCTestCase {
         let outcome = try XCTUnwrap(outcomes.first)
         XCTAssertFalse(outcome.succeeded)
         let message = try XCTUnwrap(outcome.message)
-        XCTAssertTrue(message.contains("https://example.test/list"))
+        XCTAssertTrue(message.hasPrefix("刷新播放列表失败："))
+        XCTAssertFalse(message.contains("example.test"))
         XCTAssertFalse(message.contains("secret"))
         let snapshot = await repository.snapshot()
         XCTAssertEqual(snapshot.channels[profileID], original)
@@ -425,7 +426,7 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.profiles[0].m3uStatus.state, .failed)
     }
 
-    func testFailureSummaryUsesRedactedURLAndNeverLeaksCredentials() async throws {
+    func testFailureSummaryOmitsTheEntireSourceURL() async throws {
         let sensitiveURL = URL(
             string: "https://user:pass@example.test/path?token=secret#fragment"
         )!
@@ -444,7 +445,9 @@ final class RefreshCoordinatorTests: XCTestCase {
         let outcome = try XCTUnwrap(outcomes.first)
 
         let message = try XCTUnwrap(outcome.message)
-        XCTAssertTrue(message.contains("https://example.test/path"))
+        XCTAssertTrue(message.hasPrefix("刷新播放列表失败："))
+        XCTAssertFalse(message.contains("example.test"))
+        XCTAssertFalse(message.contains("/path"))
         XCTAssertFalse(message.contains("user"))
         XCTAssertFalse(message.contains("pass"))
         XCTAssertFalse(message.contains("token"))
@@ -454,7 +457,7 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.profiles[0].m3uStatus.errorSummary, message)
     }
 
-    func testLongFailureSummaryIsDeterministicallyCappedAt240Characters() async throws {
+    func testFailureSummaryRemainsBoundedWhenSourceURLHasALongPath() async throws {
         let path = String(repeating: "a", count: 400)
         let url = URL(string: "https://example.test/\(path)?token=secret")!
         let repository = RepositorySpy(profiles: [makeProfile(m3uURL: url)])
@@ -472,7 +475,8 @@ final class RefreshCoordinatorTests: XCTestCase {
         let outcome = try XCTUnwrap(outcomes.first)
 
         let message = try XCTUnwrap(outcome.message)
-        XCTAssertEqual(message.count, 240)
+        XCTAssertLessThanOrEqual(message.count, 240)
+        XCTAssertFalse(message.contains(String(repeating: "a", count: 20)))
         XCTAssertFalse(message.contains("token"))
         XCTAssertFalse(message.contains("secret"))
         let snapshot = await repository.snapshot()

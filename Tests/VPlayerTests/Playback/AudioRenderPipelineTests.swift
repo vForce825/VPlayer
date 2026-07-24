@@ -133,6 +133,66 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testCompressedRendererThatConsumesOneSecondWithoutBecomingSufficientFallsBack() throws {
+        let harness = try makeHarness(codec: .mp2)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: false)
+
+        for id in 0..<10 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id + 1),
+                    codec: .mp2,
+                    pts: CMTime(value: Int64(id), timescale: 10),
+                    duration: CMTime(value: 1, timescale: 10)
+                ))
+            }
+        }
+
+        guard harness.synchronizer.removalCount == 1 else {
+            XCTFail("compressed renderer must fall back after one second without readiness")
+            return
+        }
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(harness.decoderFactory.snapshot.first?.pushedIDSnapshot, Array(1...10))
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testCompressedRendererFallsBackAfterThreeQuarterSecondWithoutReadiness() throws {
+        let harness = try makeHarness(codec: .ac3)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: false)
+
+        for id in 0..<3 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id + 1),
+                    codec: .ac3,
+                    pts: CMTime(value: Int64(id), timescale: 4),
+                    duration: CMTime(value: 1, timescale: 4)
+                ))
+            }
+            if id < 2 {
+                XCTAssertEqual(harness.synchronizer.removalCount, 0)
+            }
+        }
+
+        guard harness.synchronizer.removalCount == 1 else {
+            XCTFail("compressed renderer must fall back after three quarters of a second without readiness")
+            return
+        }
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(harness.decoderFactory.snapshot.first?.pushedIDSnapshot, [1, 2, 3])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
     func testNotReadyInputStaysPendingAndReadyCallbackDrainsOnlyCapacity() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
@@ -155,7 +215,26 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 3)
     }
 
-    func testReplayCapacityIsExactly96AndPrunesOnlyFullyExpiredSamples() throws {
+    func testReadyCallbackStormCoalescesAndStopsRequestingWhenThereIsNoWork() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+
+        for _ in 0..<100 { renderer.fireReady() }
+        drain(harness.executor)
+
+        XCTAssertLessThan(renderer.snapshot.readinessCheckCount, 10)
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        XCTAssertEqual(renderer.snapshot.requestCount, 2)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplayCapacityKeepsNewest96WithoutFailingWhenClockCannotAdvance() throws {
         let harness = try makeHarness()
         for id in 0..<96 {
             try perform(on: harness.executor) {
@@ -166,10 +245,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 ))
             }
         }
-        assertCoreError(.audioRendererFailed(AudioRenderPipeline.replayCapacityError)) {
-            try perform(on: harness.executor) {
-                try harness.pipeline.enqueue(try self.makeSample(id: 97, pts: CMTime(value: 30, timescale: 1)))
-            }
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 97,
+                pts: CMTime(value: 30, timescale: 1)
+            ))
         }
 
         harness.synchronizer.setCurrentTime(CMTime(value: 3, timescale: 10))
@@ -183,8 +263,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         drain(harness.executor)
         let pushed = try XCTUnwrap(harness.decoderFactory.snapshot.first).pushedIDSnapshot
         XCTAssertEqual(pushed.count, 96)
-        XCTAssertTrue(pushed.contains(2), "overlapping sample must survive")
-        XCTAssertFalse(pushed.contains(1), "fully expired sample must be pruned")
+        XCTAssertEqual(pushed.first, 3)
+        XCTAssertEqual(pushed.suffix(2), [97, 98])
+        XCTAssertFalse(pushed.contains(1))
+        XCTAssertFalse(pushed.contains(2))
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
     func testAsyncFailureWaitsForSuccessfulRemovalThenReplaysPCMAndAnchorsExactlyOnce() throws {
@@ -218,11 +301,105 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
         XCTAssertEqual(harness.synchronizer.attachedSnapshot, [compressed.identity, pcm.identity])
         XCTAssertEqual(compressed.snapshot.enqueuedFormatIDs, [kAudioFormatMPEG4AAC])
-        XCTAssertEqual(pcm.snapshot.enqueuedFormatIDs, [kAudioFormatLinearPCM])
+        XCTAssertEqual(
+            pcm.snapshot.enqueuedFormatIDs,
+            [kAudioFormatLinearPCM],
+            "fallback renderer did not become ready"
+        )
         XCTAssertEqual(harness.decoderFactory.snapshot.first?.pushedIDSnapshot, [44])
         XCTAssertEqual(pcm.snapshot.enqueuedPTS, [sample.presentationTimeStamp])
         XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.0, 1)
         XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.1, sample.presentationTimeStamp)
+    }
+
+    func testPCMQuarterSecondPrerollBecomesReadyWhenRendererBackpressuresBeforeSufficientFlag() throws {
+        let harness = try makeHarness()
+        harness.decoderFactory.pushBody = { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp, frameCount: 1_024)]
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        let packetDuration = CMTime(value: 1_024, timescale: 48_000)
+        for index in 0..<12 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTimeMultiply(packetDuration, multiplier: Int32(index)),
+                    duration: packetDuration
+                ))
+            }
+        }
+        compressed.emit(.failed("force-pcm-preroll"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcm.configureReadiness(
+            ready: true,
+            sufficient: false,
+            maximumEnqueuesPerCallback: 12
+        )
+        pcm.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(pcm.snapshot.enqueuedPTS.count, 12)
+        XCTAssertTrue(
+            harness.pipeline.isReadyForPlayback,
+            "a contiguous 256 ms PCM preroll must break the paused-clock backpressure deadlock"
+        )
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPCMRouteDropsOneInvalidCompressedPacketAndContinuesDecoding() throws {
+        let harness = try makeHarness()
+        let invalidPacketError: Int32 = -1_094_995_529
+        harness.decoderFactory.pushBody = { sample in
+            if sample.id == 2 {
+                throw PlaybackCoreError.audioFallbackDecode(invalidPacketError)
+            }
+            return [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        for id in 1...3 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: UInt64(id)))
+            }
+        }
+        compressed.emit(.failed("force-pcm-invalid-packet"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        XCTAssertEqual(decoder.pushedIDSnapshot, [1, 2, 3])
+        XCTAssertEqual(decoder.flushCountSnapshot, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+    }
+
+    func testPCMRouteTerminatesOnNinthConsecutiveInvalidCompressedPacket() throws {
+        let harness = try makeHarness()
+        let invalidPacketError: Int32 = -1_094_995_529
+        harness.decoderFactory.pushBody = { _ in
+            throw PlaybackCoreError.audioFallbackDecode(invalidPacketError)
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        for id in 1...9 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: UInt64(id)))
+            }
+        }
+        compressed.emit(.failed("force-pcm-invalid-packets"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        XCTAssertEqual(decoder.pushedIDSnapshot, Array(1...9))
+        XCTAssertEqual(decoder.flushCountSnapshot, 8)
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+            .audioFallbackDecode(invalidPacketError),
+        ])
     }
 
     func testFalseRemovalAndDecoderAndSecondRendererFailuresEachEmitOneExactError() throws {
@@ -598,7 +775,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         performWithoutThrow(on: harness.executor) {
             harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
         }
-        XCTAssertEqual(compressed.snapshot.requestCount, 1)
+        XCTAssertEqual(
+            compressed.snapshot.requestCount,
+            1,
+            "compressed renderer was not removed"
+        )
         XCTAssertEqual(compressed.snapshot.observationStartCount, 1)
         XCTAssertEqual(harness.renderers.snapshot.count, 1)
         try perform(on: harness.executor) {
@@ -620,9 +801,17 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
         XCTAssertEqual(harness.renderers.snapshot.count, 2)
         XCTAssertEqual(harness.decoderFactory.snapshot.first?.pushedIDSnapshot, [2])
-        XCTAssertEqual(pcm.snapshot.enqueuedFormatIDs, [kAudioFormatLinearPCM])
+        XCTAssertEqual(
+            pcm.snapshot.enqueuedFormatIDs,
+            [kAudioFormatLinearPCM],
+            "fallback renderer did not become ready"
+        )
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
-        XCTAssertEqual(compressed.snapshot.requestCount, 1)
+        XCTAssertEqual(
+            compressed.snapshot.requestCount,
+            1,
+            "compressed renderer was not removed"
+        )
         XCTAssertEqual(compressed.snapshot.observationStartCount, 1)
     }
 
@@ -644,8 +833,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         )
         drain(executor)
 
-        XCTAssertEqual(categories.snapshot, [.hdmi])
-        XCTAssertEqual(categories.isolationSnapshot, [true])
+        XCTAssertEqual(categories.snapshot, [.hdmi, .hdmi])
+        XCTAssertEqual(categories.isolationSnapshot, [true, true])
         XCTAssertFalse(String(describing: categories.snapshot).contains("Living Room"))
         monitor.stop()
     }
@@ -665,7 +854,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         monitor.start { categories.append($0) }
         drain(executor)
 
-        XCTAssertTrue(categories.snapshot.isEmpty)
+        XCTAssertEqual(categories.snapshot, [.hdmi])
         monitor.stop()
     }
 
@@ -762,8 +951,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(asbd.mFramesPerPacket, 1)
         XCTAssertEqual(asbd.mBitsPerChannel, 32)
         let layout = try copiedLayout(description)
-        XCTAssertEqual(layout.mChannelLayoutTag, kAudioChannelLayoutTag_UseChannelBitmap)
-        XCTAssertEqual(layout.mChannelBitmap.rawValue, 3)
+        XCTAssertEqual(layout.mChannelLayoutTag, kAudioChannelLayoutTag_Stereo)
+        XCTAssertEqual(layout.mChannelBitmap.rawValue, 0)
     }
 
     func testLivePCMDecoderCreateWithoutCookieUsesNullZeroABIAndDestroys() throws {
@@ -947,7 +1136,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             }, nil, &decoder), 0)
             let handle = try XCTUnwrap(decoder)
             var invalid: UInt8 = 0
-            XCTAssertLessThan(vp_ffmpeg_audio_decoder_push(handle, &invalid, 1, 7), 0)
+            XCTAssertEqual(
+                vp_ffmpeg_audio_decoder_push(handle, &invalid, 1, 7),
+                FFmpegPCMAudioDecoder.invalidPacketErrorCode
+            )
             vp_ffmpeg_audio_decoder_flush(handle)
             vp_ffmpeg_audio_decoder_flush(handle)
             vp_ffmpeg_audio_decoder_destroy(handle)
@@ -1068,12 +1260,15 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         )
     }
 
-    private func makePCMBuffer(pts: CMTime) throws -> CMSampleBuffer {
-        let samples = [Float](repeating: 0, count: 4)
+    private func makePCMBuffer(
+        pts: CMTime,
+        frameCount: Int = 2
+    ) throws -> CMSampleBuffer {
+        let samples = [Float](repeating: 0, count: frameCount * 2)
         let bytes = samples.withUnsafeBytes { Data($0) }
         return try PCMSampleBufferBuilder.make(
             bytes: bytes,
-            frameCount: 2,
+            frameCount: frameCount,
             sampleRate: 48_000,
             channels: 2,
             channelOrder: .native,

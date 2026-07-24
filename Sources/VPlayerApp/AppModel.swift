@@ -40,6 +40,7 @@ final class AppModel {
     var activeProfile: SourceProfile?
     var channels: [Channel] = []
     var epgChannels: [EPGChannel] = []
+    var epgProgrammeCount = 0
     var programmesByChannelID: [String: [Programme]] = [:]
     var presentedPlaybackRequest: PlaybackRequest?
     var alertMessage: String?
@@ -146,6 +147,7 @@ final class AppModel {
                     activeProfile: nil,
                     channels: [],
                     epgChannels: [],
+                    epgProgrammeCount: 0,
                     matches: [:],
                     manualMappings: [:],
                     programmes: [:],
@@ -156,23 +158,39 @@ final class AppModel {
 
             async let channelLoad = repository.channels(profileID: loadedActiveProfile.id)
             async let epgChannelLoad = repository.epgChannels(profileID: loadedActiveProfile.id)
-            let (loadedChannels, loadedEPGChannels) = try await (channelLoad, epgChannelLoad)
+            async let epgProgrammeCountLoad = repository.epgProgrammeCount(
+                profileID: loadedActiveProfile.id
+            )
+            let (loadedChannels, loadedEPGChannels, loadedEPGProgrammeCount) = try await (
+                channelLoad,
+                epgChannelLoad,
+                epgProgrammeCountLoad
+            )
             try Task.checkCancellation()
 
-            var matches: [String: EPGMatchResult] = [:]
-            var manualMappings: [String: String] = [:]
-            var programmes: [String: [Programme]] = [:]
             let windowStart = now().addingTimeInterval(-3_600)
             let windowEnd = windowStart.addingTimeInterval(25 * 3_600)
 
+            let manualMappings = try await repository.manualMappings(
+                profileID: loadedActiveProfile.id
+            )
+            try Task.checkCancellation()
+
+            // Scope to the loaded playlist so stale overrides for channels that
+            // are no longer present stay out of the presented state.
+            var scopedManualMappings: [String: String] = [:]
+            var matches: [String: EPGMatchResult] = [:]
+            var matchedXMLTVChannelIDs: Set<String> = []
             for channel in loadedChannels {
-                try Task.checkCancellation()
-                let manualMapping = try await repository.manualMapping(
-                    profileID: loadedActiveProfile.id,
-                    channelID: channel.id
-                )
-                if let manualMapping {
-                    manualMappings[channel.id] = manualMapping.xmltvChannelID
+                if let xmltvChannelID = manualMappings[channel.id] {
+                    scopedManualMappings[channel.id] = xmltvChannelID
+                }
+                let manualMapping = manualMappings[channel.id].map {
+                    ManualEPGMapping(
+                        sourceProfileID: loadedActiveProfile.id,
+                        channelID: channel.id,
+                        xmltvChannelID: $0
+                    )
                 }
                 let match = EPGMatcher.match(
                     channel: channel,
@@ -180,12 +198,22 @@ final class AppModel {
                     manualMapping: manualMapping
                 )
                 matches[channel.id] = match
-                guard let xmltvChannelID = match.xmltvChannelID else { continue }
-                programmes[channel.id] = try await repository.programmes(
-                    profileID: loadedActiveProfile.id,
-                    xmltvChannelID: xmltvChannelID,
-                    overlapping: windowStart..<windowEnd
-                )
+                if let xmltvChannelID = match.xmltvChannelID {
+                    matchedXMLTVChannelIDs.insert(xmltvChannelID)
+                }
+            }
+
+            let programmesByXMLTVChannelID = try await repository.programmes(
+                profileID: loadedActiveProfile.id,
+                xmltvChannelIDs: matchedXMLTVChannelIDs,
+                overlapping: windowStart..<windowEnd
+            )
+            try Task.checkCancellation()
+
+            var programmes: [String: [Programme]] = [:]
+            for channel in loadedChannels {
+                guard let xmltvChannelID = matches[channel.id]?.xmltvChannelID else { continue }
+                programmes[channel.id] = programmesByXMLTVChannelID[xmltvChannelID] ?? []
             }
 
             return apply(
@@ -194,8 +222,9 @@ final class AppModel {
                 activeProfile: loadedActiveProfile,
                 channels: loadedChannels.sorted { ($0.order, $0.id) < ($1.order, $1.id) },
                 epgChannels: loadedEPGChannels,
+                epgProgrammeCount: loadedEPGProgrammeCount,
                 matches: matches,
-                manualMappings: manualMappings,
+                manualMappings: scopedManualMappings,
                 programmes: programmes,
                 presentedPlaybackRequestAtStart: presentedPlaybackRequestAtStart,
                 terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
@@ -521,6 +550,7 @@ final class AppModel {
         activeProfile: SourceProfile?,
         channels: [Channel],
         epgChannels: [EPGChannel],
+        epgProgrammeCount: Int,
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
         programmes: [String: [Programme]],
@@ -544,6 +574,7 @@ final class AppModel {
         }
         self.channels = channels
         self.epgChannels = epgChannels
+        self.epgProgrammeCount = epgProgrammeCount
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
@@ -600,20 +631,9 @@ final class AppModel {
     }
 
     private func presentOperationError(_ error: any Error) {
-        switch error {
-        case SourceProfileValidationError.emptyName:
-            presentOperationMessage("请输入数据源名称。")
-        case SourceProfileValidationError.invalidURL(field: .m3u):
-            presentOperationMessage("请输入有效的 M3U 地址。")
-        case SourceProfileValidationError.invalidURL(field: .epg):
-            presentOperationMessage("请输入有效的 EPG 地址。")
-        case SourceProfileValidationError.unsupportedURL(field: .m3u):
-            presentOperationMessage("M3U 地址仅支持 HTTP 或 HTTPS。")
-        case SourceProfileValidationError.unsupportedURL(field: .epg):
-            presentOperationMessage("EPG 地址仅支持 HTTP 或 HTTPS。")
-        default:
-            presentOperationMessage("操作失败，请稍后重试。")
-        }
+        presentOperationMessage(
+            SourceProfileValidationMessage.text(for: error) ?? "操作失败，请稍后重试。"
+        )
     }
 
     private func beginActiveTransition(to profile: SourceProfile?) -> ActiveTransition {
@@ -641,6 +661,7 @@ final class AppModel {
             activeProfile: activeProfile,
             channels: channels,
             epgChannels: epgChannels,
+            epgProgrammeCount: epgProgrammeCount,
             matchByChannelID: matchByChannelID,
             manualMappingByChannelID: manualMappingByChannelID,
             programmesByChannelID: programmesByChannelID,
@@ -658,6 +679,7 @@ final class AppModel {
         activeProfile = transition.previousState.activeProfile
         channels = transition.previousState.channels
         epgChannels = transition.previousState.epgChannels
+        epgProgrammeCount = transition.previousState.epgProgrammeCount
         matchByChannelID = transition.previousState.matchByChannelID
         manualMappingByChannelID = transition.previousState.manualMappingByChannelID
         programmesByChannelID = transition.previousState.programmesByChannelID
@@ -675,6 +697,7 @@ final class AppModel {
     private func clearChannelState(preservingPlayback: Bool = false) {
         channels = []
         epgChannels = []
+        epgProgrammeCount = 0
         matchByChannelID = [:]
         manualMappingByChannelID = [:]
         programmesByChannelID = [:]
@@ -1102,6 +1125,7 @@ fileprivate extension AppModel {
         let activeProfile: SourceProfile?
         let channels: [Channel]
         let epgChannels: [EPGChannel]
+        let epgProgrammeCount: Int
         let matchByChannelID: [String: EPGMatchResult]
         let manualMappingByChannelID: [String: String]
         let programmesByChannelID: [String: [Programme]]

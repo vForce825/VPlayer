@@ -11,6 +11,43 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testReloadIssuesOneProgrammeQueryRegardlessOfChannelCount() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let channelCount = 200
+        let channels = (0..<channelCount).map { index in
+            makeChannel(
+                profileID: profile.id,
+                url: "https://example.test/live/\(index)",
+                tvgID: "epg-\(index)",
+                order: index
+            )
+        }
+        let epgChannels = (0..<channelCount).map { index in
+            EPGChannel(id: "epg-\(index)", displayNames: ["Channel \(index)"], iconURL: nil)
+        }
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: channels],
+            epgChannels: [profile.id: epgChannels]
+        )
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        await model.reload()
+
+        let snapshot = await repository.snapshot()
+        // The whole point of batching: query count must not scale with the
+        // playlist size, which is what made large IPTV sources unusable.
+        XCTAssertEqual(model.channels.count, channelCount)
+        XCTAssertEqual(snapshot.programmeBatchRequests.count, 1)
+        XCTAssertTrue(snapshot.programmeRequests.isEmpty)
+        XCTAssertEqual(
+            snapshot.programmeBatchRequests.first?.xmltvChannelIDs.count,
+            channelCount
+        )
+    }
+
     func testReloadUsesOnlyActiveProfileAndLoadsMatchedProgrammesInRequiredWindow() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let inactive = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Inactive", now: now)
@@ -41,17 +78,19 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.profiles, [inactive, active])
         XCTAssertEqual(model.activeProfile, active)
         XCTAssertEqual(model.channels, [activeChannel])
+        XCTAssertEqual(model.epgProgrammeCount, 1)
         XCTAssertEqual(model.programmesByChannelID[activeChannel.id], [current])
         XCTAssertEqual(model.matchedEPGChannelID(for: activeChannel), "active-epg")
         let snapshot = await repository.snapshot()
-        XCTAssertEqual(snapshot.programmeRequests, [
+        XCTAssertEqual(snapshot.programmeBatchRequests, [
             .init(
                 profileID: active.id,
-                xmltvChannelID: "active-epg",
+                xmltvChannelIDs: ["active-epg"],
                 overlapping: now.addingTimeInterval(-3_600)..<now.addingTimeInterval(24 * 3_600)
             )
         ])
-        XCTAssertFalse(snapshot.programmeRequests.contains { $0.profileID == inactive.id })
+        XCTAssertTrue(snapshot.programmeRequests.isEmpty)
+        XCTAssertFalse(snapshot.programmeBatchRequests.contains { $0.profileID == inactive.id })
         XCTAssertFalse(model.isLoading)
     }
 

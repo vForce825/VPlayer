@@ -48,8 +48,10 @@ public final class DisplayCriteriaController: NSObject {
     private let criteriaFactory: CriteriaFactory
     private let displayLink: DisplayLinkControlling
     private let readiness: DisplayReadinessControlling
+    private let modeSwitchRecoveryDelay: Duration
     private var isFullScreen = false
     private var isSwitchingMode = false
+    private var modeSwitchRecoveryTask: Task<Void, Never>?
 
     init(
         manager: DisplayCriteriaManaging,
@@ -58,13 +60,15 @@ public final class DisplayCriteriaController: NSObject {
             AVDisplayCriteria(refreshRate: $0, formatDescription: $1)
         },
         displayLink: DisplayLinkControlling,
-        readiness: DisplayReadinessControlling
+        readiness: DisplayReadinessControlling,
+        modeSwitchRecoveryDelay: Duration = .seconds(5)
     ) {
         self.manager = manager
         self.notificationCenter = notificationCenter
         self.criteriaFactory = criteriaFactory
         self.displayLink = displayLink
         self.readiness = readiness
+        self.modeSwitchRecoveryDelay = modeSwitchRecoveryDelay
     }
 
     public func enterFullScreen(
@@ -106,6 +110,8 @@ public final class DisplayCriteriaController: NSObject {
         }
         isFullScreen = false
         isSwitchingMode = false
+        modeSwitchRecoveryTask?.cancel()
+        modeSwitchRecoveryTask = nil
         displayLink.pause()
         if wasSwitchingMode {
             _ = readiness.reanchorAfterDisplayModeSwitch()
@@ -118,11 +124,31 @@ public final class DisplayCriteriaController: NSObject {
         isSwitchingMode = true
         displayLink.pause()
         readiness.closeForDisplayModeSwitch()
+        scheduleModeSwitchRecovery()
     }
 
     @objc private func modeSwitchEnded() {
+        finishModeSwitch()
+    }
+
+    private func scheduleModeSwitchRecovery() {
+        modeSwitchRecoveryTask?.cancel()
+        let delay = modeSwitchRecoveryDelay
+        modeSwitchRecoveryTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            self?.finishModeSwitch()
+        }
+    }
+
+    private func finishModeSwitch() {
         guard isFullScreen, isSwitchingMode else { return }
         isSwitchingMode = false
+        modeSwitchRecoveryTask?.cancel()
+        modeSwitchRecoveryTask = nil
         if readiness.reanchorAfterDisplayModeSwitch() {
             displayLink.resetPresentationTiming()
             displayLink.resume()

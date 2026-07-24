@@ -333,6 +333,35 @@ static int vpff_emit_frame(
     return 0;
 }
 
+// Audio decoders may surface codec- or platform-specific negative values for a
+// malformed compressed frame. The Swift layer can safely recover from those by
+// flushing and dropping a bounded number of packets, but it must still see
+// allocation, state, and implementation failures unchanged.
+static int vpff_normalize_packet_decode_error(int result) {
+    if (result >= 0 || result == AVERROR_INVALIDDATA) {
+        return result;
+    }
+    switch (result) {
+        case AVERROR(EAGAIN):
+        case AVERROR_EOF:
+        case AVERROR(EINVAL):
+        case AVERROR(ENOMEM):
+        case AVERROR_BUG:
+        case AVERROR_BUG2:
+        case AVERROR_EXTERNAL:
+        case AVERROR_EXIT:
+        case AVERROR_UNKNOWN:
+        case AVERROR_DECODER_NOT_FOUND:
+        case AVERROR_PATCHWELCOME:
+        case AVERROR_EXPERIMENTAL:
+        case AVERROR_INPUT_CHANGED:
+        case AVERROR_OUTPUT_CHANGED:
+            return result;
+        default:
+            return AVERROR_INVALIDDATA;
+    }
+}
+
 static int vpff_receive_available(
     VPFFAudioDecoder *owned,
     size_t *cumulative_bytes,
@@ -347,7 +376,7 @@ static int vpff_receive_available(
             return result;
         }
         if (result < 0) {
-            return result;
+            return vpff_normalize_packet_decode_error(result);
         }
         *made_progress = true;
         result = vpff_emit_frame(owned, owned->frame, cumulative_bytes);
@@ -408,6 +437,9 @@ int32_t vp_ffmpeg_audio_decoder_push(
             continue;
         }
         break;
+    }
+    if (result < 0 && result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+        result = vpff_normalize_packet_decode_error(result);
     }
     if (result >= 0) {
         bool progressed = false;

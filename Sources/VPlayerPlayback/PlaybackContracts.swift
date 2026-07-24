@@ -35,9 +35,16 @@ public struct PlaybackRequest: Identifiable, Equatable, Sendable {
 public struct PlaybackFailure: Error, Equatable, Sendable {
     public let code: String
     public let userMessage: String
-    public init(code: String, userMessage: String) {
+    public let diagnosticCode: String?
+
+    public init(
+        code: String,
+        userMessage: String,
+        diagnosticCode: String? = nil
+    ) {
         self.code = code
         self.userMessage = userMessage
+        self.diagnosticCode = diagnosticCode
     }
 }
 

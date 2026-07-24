@@ -4,10 +4,15 @@
 
 import CoreMedia
 import Foundation
+import OSLog
 
 enum SampleBufferBuilder {
     static let invalidDataErrorCode: Int32 = -1_448_143_362
     private static let maximumPayloadBytes = 64 * 1_024 * 1_024
+    private static let logger = Logger(
+        subsystem: "com.vplayer.playback",
+        category: "SampleBufferBuilder"
+    )
 
     static func makeVideo(
         data: Data,
@@ -37,6 +42,9 @@ enum SampleBufferBuilder {
             sampleBufferOut: &sampleBuffer
         )
         guard status == noErr, let sampleBuffer else {
+            logger.error(
+                "video sample buffer creation failed status=\(status, privacy: .public) hasBuffer=\(sampleBuffer != nil, privacy: .public)"
+            )
             throw PlaybackCoreError.videoDecode(status)
         }
         if !isRandomAccess {
@@ -114,7 +122,12 @@ enum SampleBufferBuilder {
             blockBufferOut: &blockBuffer
         )
         guard status == kCMBlockBufferNoErr, let blockBuffer else {
-            if video { throw PlaybackCoreError.videoDecode(status) }
+            if video {
+                logger.error(
+                    "video block buffer creation failed status=\(status, privacy: .public) hasBuffer=\(blockBuffer != nil, privacy: .public)"
+                )
+                throw PlaybackCoreError.videoDecode(status)
+            }
             throw PlaybackCoreError.audioFormatDescription(status)
         }
         status = data.withUnsafeBytes { rawBuffer in
@@ -129,7 +142,12 @@ enum SampleBufferBuilder {
             )
         }
         guard status == kCMBlockBufferNoErr else {
-            if video { throw PlaybackCoreError.videoDecode(status) }
+            if video {
+                logger.error(
+                    "video block buffer copy failed status=\(status, privacy: .public)"
+                )
+                throw PlaybackCoreError.videoDecode(status)
+            }
             throw PlaybackCoreError.audioFormatDescription(status)
         }
         return blockBuffer

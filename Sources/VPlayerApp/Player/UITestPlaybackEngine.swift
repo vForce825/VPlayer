@@ -5,6 +5,7 @@
 import Foundation
 import VPlayerPlayback
 
+#if DEBUG
 actor UITestPlaybackEngine: PlaybackEngine {
     private let fixture: String?
     private var state: PlaybackState = .idle
@@ -47,10 +48,13 @@ actor UITestPlaybackEngine: PlaybackEngine {
         self.request = request
         publish(.preparing(request))
         await Task.yield()
-        if fixture == "failed" {
+        if fixture == "failed" || fixture == "failed-diagnostic" {
             publish(.failed(PlaybackFailure(
                 code: "ui.fixture",
-                userMessage: "测试播放失败，请重试。"
+                userMessage: "测试播放失败，请重试。",
+                diagnosticCode: fixture == "failed-diagnostic"
+                    ? "video.decode.status.-12909"
+                    : nil
             )))
             return
         }
@@ -100,3 +104,4 @@ actor UITestPlaybackEngine: PlaybackEngine {
         noticeContinuations[id] = nil
     }
 }
+#endif

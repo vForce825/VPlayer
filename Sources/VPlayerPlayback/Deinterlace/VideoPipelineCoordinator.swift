@@ -44,6 +44,8 @@ struct VideoPipelineCoordinatorHooks: Sendable {
 }
 
 final class VideoPipelineCoordinator: @unchecked Sendable {
+    private static let maximumClassificationProbeAttempts = 3
+
     private let decoder: any VideoDecoding
     private let passthrough: any VideoFrameProcessing
     private let yadif: any YADIFFrameProcessing
@@ -60,6 +62,9 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var normalizer: PresentationTimestampNormalizer
     private var videoFormat: CMVideoFormatDescription?
     private var previousProbeBuffer: CVPixelBuffer?
+    private var classificationProbeObservationCount = 0
+    private var nextProbeSubmissionID: UInt64 = 0
+    private var activeProbeSubmissionID: UInt64?
     private var decoderConfigured = false
     private var activeConfiguration: VideoDecodeConfiguration?
     private var waitingForRandomAccess = true
@@ -76,7 +81,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     }
 
     var requiredVideoFrameCount: Int {
-        route == .metalYADIF2x ? 3 : (rawReadinessRequirementOverride ?? 1)
+        // One completed YADIF job yields the two field-rate presentation frames
+        // needed to open readiness. The processor's three-frame reference window
+        // is an input requirement, not a presentation-queue requirement.
+        route == .metalYADIF2x ? 2 : (rawReadinessRequirementOverride ?? 1)
     }
 
     init(
@@ -153,6 +161,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.reset(to: generation)
         probe?.stop(generation: oldGeneration)
         previousProbeBuffer = nil
+        classificationProbeObservationCount = 0
+        activeProbeSubmissionID = nil
         videoFormat = format
         decoderConfigured = false
         activeConfiguration = nil
@@ -197,6 +207,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         do {
             try decoder.decode(accessUnit, flags: ._EnableAsynchronousDecompression)
         } catch let failure as VideoDecoderFailure {
+            if failure == .backpressureTimeout {
+                restartDecoderAfterBackpressureTimeout()
+                return
+            }
             if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
                 temporalRetrySuppressed = true
                 emitTemporalNoticeOnce()
@@ -204,6 +218,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                     to: .rawTemporalFailure,
                     toleratingTemporalDrainFailure: true
                 )
+                return
+            }
+            if Self.isRecoverableDecodeSubmissionFailure(failure) {
+                metrics?.recordVideoDrop()
                 return
             }
             hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
@@ -226,8 +244,22 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             for normalized in normalizer.push(frame, discontinuity: false) {
                 process(normalized)
             }
-        case let .recoverableFailure(failure, eventGeneration),
-             let .fatalFailure(failure, eventGeneration):
+        case let .recoverableFailure(failure, eventGeneration):
+            guard eventGeneration == generation else {
+                metrics?.recordStaleGenerationDrop()
+                return
+            }
+            if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
+                temporalRetrySuppressed = true
+                emitTemporalNoticeOnce()
+                switchDecoderConfiguration(
+                    to: .rawTemporalFailure,
+                    toleratingTemporalDrainFailure: true
+                )
+                return
+            }
+            metrics?.recordVideoDrop()
+        case let .fatalFailure(failure, eventGeneration):
             guard eventGeneration == generation else {
                 metrics?.recordStaleGenerationDrop()
                 return
@@ -273,6 +305,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             yadif.reset(to: generation)
             probe?.stop(generation: oldGeneration)
             previousProbeBuffer = nil
+            classificationProbeObservationCount = 0
+            activeProbeSubmissionID = nil
             decoderConfigured = false
             activeConfiguration = nil
             waitingForRandomAccess = true
@@ -293,10 +327,34 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.reset(to: generation)
         probe?.stop(generation: generation)
         previousProbeBuffer = nil
+        classificationProbeObservationCount = 0
+        activeProbeSubmissionID = nil
     }
 
     private func configuration(for route: DeinterlaceRoute) -> VideoDecodeConfiguration {
         route == .appleTemporal ? .appleTemporal : .bothFields
+    }
+
+    private static func isRecoverableDecodeSubmissionFailure(
+        _ failure: VideoDecoderFailure
+    ) -> Bool {
+        switch failure {
+        case let .badData(status):
+            status == kVTVideoDecoderBadDataErr
+                || status == VideoToolboxDecoder.legacyCodecBadDataErr
+                || status == VideoToolboxDecoder.transientNoFrameStatus
+                || status == kVTVideoDecoderReferenceMissingErr
+        case let .malfunction(status):
+            status == kVTVideoDecoderMalfunctionErr
+                || status == kVTSessionMalfunctionErr
+                || status == kVTVideoDecoderNotAvailableNowErr
+                || status == kVTVideoDecoderRemovedErr
+        case .unsupportedConfiguration, .softwareDecoder, .backpressureTimeout,
+             .temporalUnavailable:
+            false
+        case .sessionCreate:
+            false
+        }
     }
 
     private func performTrueFormatDrainStep(
@@ -306,6 +364,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             try operation()
             return true
         } catch let failure as VideoDecoderFailure {
+            if Self.isRecoverableDecodeSubmissionFailure(failure) {
+                metrics?.recordVideoDrop()
+                return true
+            }
             if activeConfiguration == .appleTemporal, failure.isTemporalUnavailable {
                 temporalRetrySuppressed = true
                 emitTemporalNoticeOnce()
@@ -353,6 +415,27 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         metrics?.update(activeRoute: next)
         yadif.reset(to: generation)
         hooks.routeDidChange(requiredVideoFrameCount)
+    }
+
+    private func restartDecoderAfterBackpressureTimeout() {
+        hooks.closeAdmission()
+        let oldGeneration = generation
+        generation = hooks.advanceGeneration()
+        routeEpoch &+= 1
+        classifier.rebasePreservingClassification(generation: generation)
+        normalizer.reset(generation: generation)
+        passthrough.reset(to: generation)
+        yadif.reset(to: generation)
+        probe?.stop(generation: oldGeneration)
+        previousProbeBuffer = nil
+        classificationProbeObservationCount = 0
+        activeProbeSubmissionID = nil
+        decoderConfigured = false
+        activeConfiguration = nil
+        waitingForRandomAccess = true
+        hooks.resetPlayback(generation, requiredVideoFrameCount)
+        decoder.invalidate()
+        hooks.reopenAdmission()
     }
 
     private func resolvedRoute() -> DeinterlaceRoute {
@@ -437,6 +520,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.reset(to: generation)
         probe?.stop(generation: oldGeneration)
         previousProbeBuffer = nil
+        classificationProbeObservationCount = 0
+        activeProbeSubmissionID = nil
         decoderConfigured = false
         activeConfiguration = nil
         waitingForRandomAccess = true
@@ -453,6 +538,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             try operation()
             return true
         } catch let failure as VideoDecoderFailure {
+            if Self.isRecoverableDecodeSubmissionFailure(failure) {
+                metrics?.recordVideoDrop()
+                return true
+            }
             if toleratingTemporalFailure, failure.isTemporalUnavailable {
                 if selectedAlgorithm == .appleTemporal {
                     temporalRetrySuppressed = true
@@ -475,26 +564,45 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
               let previousProbeBuffer else { return }
         let submittedGeneration = generation
         let submittedEpoch = routeEpoch
-        let token = signposts?.begin(.scanProbe, correlation: frame.accessUnitID)
-        let signposts = signposts
-        probe.submit(
-            current: frame.pixelBuffer,
-            previous: previousProbeBuffer,
-            generation: submittedGeneration
-        ) { [weak self] result in
-            if let token { signposts?.end(token) }
-            guard let self else { return }
-            hooks.schedule { [weak self] in
-                guard let self,
-                      !stopped,
-                      generation == submittedGeneration,
-                      routeEpoch == submittedEpoch else {
-                    self?.metrics?.recordStaleGenerationDrop()
-                    return
+        if route == .rawWhileClassifying { classificationProbeObservationCount += 1 }
+        let shouldResolveStartup = route == .rawWhileClassifying
+            && classificationProbeObservationCount
+                >= Self.maximumClassificationProbeAttempts
+        if activeProbeSubmissionID == nil {
+            nextProbeSubmissionID &+= 1
+            let submissionID = nextProbeSubmissionID
+            activeProbeSubmissionID = submissionID
+            let token = signposts?.begin(.scanProbe, correlation: frame.accessUnitID)
+            let signposts = signposts
+            probe.submit(
+                current: frame.pixelBuffer,
+                previous: previousProbeBuffer,
+                generation: submittedGeneration
+            ) { [weak self] result in
+                if let token { signposts?.end(token) }
+                guard let self else { return }
+                hooks.schedule { [weak self] in
+                    guard let self else { return }
+                    if activeProbeSubmissionID == submissionID {
+                        activeProbeSubmissionID = nil
+                    }
+                    guard !stopped,
+                          generation == submittedGeneration,
+                          routeEpoch == submittedEpoch else {
+                        metrics?.recordStaleGenerationDrop()
+                        return
+                    }
+                    switch result {
+                    case let .success(sample):
+                        observeSupplementalProbe(frame, sample: sample)
+                    case .failure:
+                        observeProbeFailure(frame)
+                    }
                 }
-                guard case let .success(sample) = result else { return }
-                observeSupplementalProbe(frame, sample: sample)
             }
+        }
+        if shouldResolveStartup, route == .rawWhileClassifying {
+            resolveAfterProbeBudget(frame)
         }
     }
 
@@ -513,6 +621,40 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             presentationTimeStamp: frame.presentationTimeStamp
         )
         guard let change = classifier.observeSupplementalProbe(observation) else { return }
+        metrics?.update(scanType: change.current)
+        applyResolvedRoute()
+    }
+
+    private func observeProbeFailure(_ frame: DecodedVideoFrame) {
+        let observation = ScanObservation(
+            generation: frame.generation,
+            parser: frame.parserMetadata,
+            decodedFields: fieldReader.read(
+                formatDescription: videoFormat,
+                pixelBuffer: frame.pixelBuffer
+            ),
+            probe: nil,
+            presentationTimeStamp: frame.presentationTimeStamp
+        )
+        guard let change = classifier.observeProbeFailure(observation) else { return }
+        classificationProbeObservationCount = 0
+        metrics?.update(scanType: change.current)
+        applyResolvedRoute()
+    }
+
+    private func resolveAfterProbeBudget(_ frame: DecodedVideoFrame) {
+        let observation = ScanObservation(
+            generation: frame.generation,
+            parser: frame.parserMetadata,
+            decodedFields: fieldReader.read(
+                formatDescription: videoFormat,
+                pixelBuffer: frame.pixelBuffer
+            ),
+            probe: nil,
+            presentationTimeStamp: frame.presentationTimeStamp
+        )
+        guard let change = classifier.resolveAfterProbeBudget(observation) else { return }
+        classificationProbeObservationCount = 0
         metrics?.update(scanType: change.current)
         applyResolvedRoute()
     }

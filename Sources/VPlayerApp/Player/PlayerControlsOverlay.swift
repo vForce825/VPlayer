@@ -5,7 +5,11 @@
 import SwiftUI
 
 struct PlayerControlsOverlay: View {
-    enum Control: Hashable { case back, playPause, settings }
+    private enum Control: Hashable {
+        case back
+        case playPause
+        case settings
+    }
 
     let title: String
     let isPaused: Bool
@@ -13,6 +17,14 @@ struct PlayerControlsOverlay: View {
     let onPlayPause: () -> Void
     let onSettings: () -> Void
     @FocusState private var focusedControl: Control?
+    @State private var isVisible = true
+    @State private var hideTask: Task<Void, Never>?
+    private let focusPolicy = AcceptanceFocusPolicy.current()
+
+    // Controls fade out after this much inactivity so a permanent overlay never
+    // sits on a live channel (which also risks burn-in on OLED panels). Any
+    // remote navigation, or entering the paused state, brings them back.
+    private static let autoHideDelay: Duration = .seconds(5)
 
     var body: some View {
         VStack {
@@ -37,12 +49,48 @@ struct PlayerControlsOverlay: View {
                     .accessibilityIdentifier("player-settings")
                     .focused($focusedControl, equals: .settings)
             }
-            .defaultFocus($focusedControl, .playPause)
         }
         .padding(56)
+        .opacity(controlsShown ? 1 : 0)
+        .animation(.easeInOut(duration: 0.3), value: controlsShown)
+        .defaultFocus($focusedControl, initialControl)
+        .onMoveCommand { _ in reveal() }
+        .onChange(of: focusedControl) { _, _ in reveal() }
+        .onChange(of: isPaused) { _, _ in reveal() }
         .task {
             await Task.yield()
-            focusedControl = .playPause
+            focusedControl = initialControl
+            reveal()
+        }
+        .onDisappear { hideTask?.cancel() }
+    }
+
+    // Paused playback keeps the controls pinned; otherwise they follow the
+    // auto-hide timer so the live picture is unobstructed.
+    private var controlsShown: Bool {
+        isVisible || isPaused
+    }
+
+    private func reveal() {
+        isVisible = true
+        scheduleHide()
+    }
+
+    private func scheduleHide() {
+        hideTask?.cancel()
+        guard !isPaused else { return }
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(for: Self.autoHideDelay)
+            guard !Task.isCancelled else { return }
+            isVisible = false
+        }
+    }
+
+    private var initialControl: Control {
+        switch focusPolicy.initialPlayerControl {
+        case .back: .back
+        case .playPause: .playPause
+        case .settings: .settings
         }
     }
 }

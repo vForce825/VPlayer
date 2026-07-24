@@ -268,6 +268,8 @@ private final class FFmpegPCMCallbackCollector: @unchecked Sendable {
 
 final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
     static let maximumBytes = 64 * 1_024 * 1_024
+    // FFmpeg's stable AVERROR_INVALIDDATA value (FFERRTAG('I', 'N', 'D', 'A')).
+    static let invalidPacketErrorCode: Int32 = -1_094_995_529
     static let invalidCallbackErrorCode: Int32 = -1_448_339_201
     static let overflowErrorCode: Int32 = -1_448_339_202
     static let tokenCapacityErrorCode: Int32 = -1_448_339_203
@@ -563,6 +565,18 @@ enum PCMSampleBufferBuilder {
                   let bitmap = UInt32(exactly: mask) else {
                 throw PlaybackCoreError.audioFallbackDecode(
                     FFmpegPCMAudioDecoder.invalidCallbackErrorCode
+                )
+            }
+            // AVSampleBufferAudioRenderer's tvOS 18 time-stretching unit
+            // repeatedly rejects a bitmap layout for the standard stereo pair.
+            // A named tag carries the same channel order without provoking a
+            // per-buffer kAudioUnitProperty_ChannelLayout retry.
+            if channels == 2, mask == 0b11 {
+                return AudioToolbox.AudioChannelLayout(
+                    mChannelLayoutTag: kAudioChannelLayoutTag_Stereo,
+                    mChannelBitmap: AudioChannelBitmap(rawValue: 0),
+                    mNumberChannelDescriptions: 0,
+                    mChannelDescriptions: (AudioChannelDescription(),)
                 )
             }
             return AudioToolbox.AudioChannelLayout(

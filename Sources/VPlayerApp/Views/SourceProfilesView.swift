@@ -34,62 +34,24 @@ struct SourceProfilesView: View {
     @State private var editedProfile: SourceProfile?
     @State private var isAdding = false
     @State private var pendingDeletion: SourceProfile?
+    @FocusState private var focusedControl: AcceptanceFocusPolicy.SourceControl?
+    private let focusPolicy = AcceptanceFocusPolicy.current()
 
     var body: some View {
-        NavigationStack {
-            List {
-                if model.profiles.isEmpty && !model.isLoading {
-                    ContentUnavailableView(
-                        "还没有数据源",
-                        systemImage: "externaldrive.badge.plus",
-                        description: Text("添加后即可刷新频道列表和 EPG。")
-                    )
-                }
-
-                ForEach(model.profiles) { profile in
-                    Section {
-                        profileHeader(profile)
-                        resourceStatus(
-                            title: "播放列表",
-                            status: profile.m3uStatus,
-                            refreshIdentifier: "source.refresh.playlist"
-                        ) {
-                            await model.refresh(profileID: profile.id, resource: .playlist)
-                        }
-                        resourceStatus(
-                            title: "EPG",
-                            status: profile.epgStatus,
-                            refreshIdentifier: "source.refresh.epg"
-                        ) {
-                            await model.refresh(profileID: profile.id, resource: .epg)
-                        }
-                        HStack {
-                            Button("编辑") {
-                                editedProfile = profile
-                            }
-                            .accessibilityIdentifier("source.edit.\(profile.id.uuidString)")
-
-                            Button("删除", role: .destructive) {
-                                pendingDeletion = profile
-                            }
-                            .accessibilityIdentifier("source.delete.\(profile.id.uuidString)")
-                        }
-                    }
-                }
-            }
-            .navigationTitle("数据源")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        isAdding = true
-                    } label: {
-                        Label("添加数据源", systemImage: "plus")
-                    }
-                    .accessibilityIdentifier("source.add")
-                }
+        focusedContent
+        #if DEBUG
+        .overlay {
+            if AcceptanceSourcePrefill.isActive() {
+                Color.clear
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityIdentifier("source.acceptance.epg-programme-count")
+                    .accessibilityValue(String(model.epgProgrammeCount))
+                    .allowsHitTesting(false)
+                    .focusable(false)
             }
         }
-        .sheet(isPresented: $isAdding) {
+        #endif
+        .sheet(isPresented: $isAdding, onDismiss: focusAfterAdding) {
             SourceProfileEditorView(model: model, profile: nil)
         }
         .sheet(item: $editedProfile) { profile in
@@ -113,6 +75,90 @@ struct SourceProfilesView: View {
             Button("取消", role: .cancel) {
                 pendingDeletion = nil
             }
+        }
+    }
+
+    @ViewBuilder
+    private var focusedContent: some View {
+        if let initialControl = focusPolicy.initialSourceControl,
+           model.profiles.isEmpty {
+            content
+                .defaultFocus($focusedControl, initialControl)
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
+        NavigationStack {
+            List {
+                Section {
+                    addButton
+                }
+
+                if model.profiles.isEmpty && !model.isLoading {
+                    ContentUnavailableView(
+                        "还没有数据源",
+                        systemImage: "externaldrive.badge.plus",
+                        description: Text("添加后即可刷新频道列表和 EPG。")
+                    )
+                }
+
+                ForEach(model.profiles) { profile in
+                    Section {
+                        profileHeader(profile)
+                        resourceStatus(
+                            title: "播放列表",
+                            status: profile.m3uStatus,
+                            refreshIdentifier: "source.refresh.playlist",
+                            statusIdentifier: "source.status.playlist",
+                            focusTarget: .playlistRefresh
+                        ) {
+                            await model.refresh(profileID: profile.id, resource: .playlist)
+                        }
+                        resourceStatus(
+                            title: "EPG",
+                            status: profile.epgStatus,
+                            refreshIdentifier: "source.refresh.epg",
+                            statusIdentifier: "source.status.epg",
+                            focusTarget: .epgRefresh
+                        ) {
+                            await model.refresh(profileID: profile.id, resource: .epg)
+                        }
+                        HStack {
+                            Button("编辑") {
+                                editedProfile = profile
+                            }
+                            .accessibilityIdentifier("source.edit.\(profile.id.uuidString)")
+
+                            Button("删除", role: .destructive) {
+                                pendingDeletion = profile
+                            }
+                            .accessibilityIdentifier("source.delete.\(profile.id.uuidString)")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("数据源")
+        }
+    }
+
+    private var addButton: some View {
+        Button {
+            isAdding = true
+        } label: {
+            Label("添加数据源", systemImage: "plus")
+        }
+        .accessibilityIdentifier("source.add")
+        .focused($focusedControl, equals: .add)
+    }
+
+    private func focusAfterAdding() {
+        guard let target = focusPolicy.sourceControlAfterEditorDismissal else { return }
+        Task {
+            await Task.yield()
+            guard !model.profiles.isEmpty else { return }
+            focusedControl = target
         }
     }
 
@@ -156,6 +202,8 @@ struct SourceProfilesView: View {
         title: String,
         status: ResourceRefreshStatus,
         refreshIdentifier: String,
+        statusIdentifier: String,
+        focusTarget: AcceptanceFocusPolicy.SourceControl,
         refresh: @escaping @MainActor () async -> Void
     ) -> some View {
         HStack(alignment: .top) {
@@ -164,6 +212,7 @@ struct SourceProfilesView: View {
                 Text(ResourceRefreshStatusPresentation.text(for: status))
                     .font(.caption)
                     .foregroundStyle(status.state == .failed ? .red : .secondary)
+                    .accessibilityIdentifier(statusIdentifier)
                 if let error = status.errorSummary {
                     Text(error)
                         .font(.caption2)
@@ -178,6 +227,7 @@ struct SourceProfilesView: View {
             }
             .disabled(status.state == .refreshing)
             .accessibilityIdentifier(refreshIdentifier)
+            .focused($focusedControl, equals: focusTarget)
         }
     }
 

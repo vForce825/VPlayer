@@ -124,10 +124,20 @@ final class MetalVideoRendererTests: XCTestCase {
         )
         source = nil
         probe = nil
-        harness.renderer.flush(to: MediaGeneration(rawValue: 5))
+        let flushStarted = DispatchSemaphore(value: 0)
+        let flushFinished = DispatchSemaphore(value: 0)
+        let renderer = harness.renderer
+        DispatchQueue.global().async {
+            flushStarted.signal()
+            renderer.flush(to: MediaGeneration(rawValue: 5))
+            flushFinished.signal()
+        }
+        XCTAssertEqual(flushStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 0.1), .timedOut)
         XCTAssertNotNil(weakProbe)
 
         harness.submitter.completeFirst(.succeeded)
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 2), .success)
         XCTAssertNil(weakProbe)
     }
 
@@ -243,8 +253,18 @@ final class MetalVideoRendererTests: XCTestCase {
             ))
         ))
         _ = harness.renderer.draw(targetMediaTime: CMTime(value: 1, timescale: 1), drawable: harness.drawable)
-        harness.renderer.flush(to: MediaGeneration(rawValue: 5))
+        let flushStarted = DispatchSemaphore(value: 0)
+        let flushFinished = DispatchSemaphore(value: 0)
+        let renderer = harness.renderer
+        DispatchQueue.global().async {
+            flushStarted.signal()
+            renderer.flush(to: MediaGeneration(rawValue: 5))
+            flushFinished.signal()
+        }
+        XCTAssertEqual(flushStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 0.1), .timedOut)
         harness.submitter.completeFirst(.failed("stale failure"))
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 2), .success)
         XCTAssertEqual(harness.failures.snapshot.count, 1)
     }
 
@@ -304,7 +324,7 @@ final class MetalVideoRendererTests: XCTestCase {
         XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 1)
     }
 
-    func testFlushBeforeSuccessfulCompletionCountsCrossGenerationWithoutPresentation() throws {
+    func testFlushDrainsSuccessfulPresentationBeforeAdvancingGeneration() throws {
         let metrics = PlaybackMetrics(
             selectedAlgorithm: .appleTemporal,
             channelID: "channel",
@@ -323,12 +343,22 @@ final class MetalVideoRendererTests: XCTestCase {
         ))
         _ = harness.renderer.draw(targetMediaTime: .zero, drawable: harness.drawable)
 
-        harness.renderer.flush(to: MediaGeneration(rawValue: 5))
+        let flushStarted = DispatchSemaphore(value: 0)
+        let flushFinished = DispatchSemaphore(value: 0)
+        let renderer = harness.renderer
+        DispatchQueue.global().async {
+            flushStarted.signal()
+            renderer.flush(to: MediaGeneration(rawValue: 5))
+            flushFinished.signal()
+        }
+        XCTAssertEqual(flushStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 0.1), .timedOut)
         harness.submitter.completeFirst(.succeeded)
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 2), .success)
 
         let snapshot = metrics.snapshot(window: .seconds(60))
-        XCTAssertEqual(snapshot.presentedVideoFrames, 0)
-        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
+        XCTAssertEqual(snapshot.presentedVideoFrames, 1)
+        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
     }
 
     func testSelectionDropsAreCountedExactlyOnceEvenWhenSubmissionFails() throws {
@@ -401,6 +431,8 @@ final class MetalVideoRendererTests: XCTestCase {
 
         allowMappingToFinish.signal()
         XCTAssertEqual(drawFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(flushFinished.wait(timeout: .now() + 0.1), .timedOut)
+        harness.submitter.completeFirst(.succeeded)
         XCTAssertEqual(flushFinished.wait(timeout: .now() + 2), .success)
         XCTAssertEqual(decision.value?.action, .presented)
         XCTAssertEqual(harness.submitter.submitCount, 1)

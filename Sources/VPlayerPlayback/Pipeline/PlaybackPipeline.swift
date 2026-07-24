@@ -135,6 +135,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     }
 
     static let deferredPacketCapacity = 32
+    static let pendingTrackMediaCapacity = 96
+    static let startupRetainedVideoCapacity = 4
     private static let retainedAudioCapacity = 96
     private static let retainedVideoCapacity = VideoPresentationQueue.capacity
 
@@ -184,6 +186,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var readinessCycle: UInt64 = 0
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
+    private var pendingTrackVideo: [CompressedVideoAccessUnit] = []
+    private var pendingTrackAudio: [CompressedAudioSample] = []
     private var retainedAudio: [CompressedAudioSample] = []
     private var retainedVideo: [VideoPresentationFrame] = []
     private var preparedAnchor: PreparedAnchor?
@@ -395,6 +399,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             .hardwareDecoderUnavailable
         case let .badData(status), let .malfunction(status):
             .videoDecode(status)
+        case .backpressureTimeout:
+            .videoDecode(kVTVideoDecoderNotAvailableNowErr)
         case let .temporalUnavailable(failure):
             switch failure {
             case .unsupportedProperty:
@@ -489,6 +495,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             case let .tracks(newTracks):
                 try installTracksIsolated(newTracks, discontinuity: false)
             case let .packet(packet):
+                metrics?.recordDemuxPacket()
                 try routePacketIsolated(packet)
             case let .discontinuity(newTracks):
                 try installTracksIsolated(newTracks, discontinuity: true)
@@ -558,6 +565,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func routePacketIsolated(_ packet: DemuxPacket) throws {
         assertIsolated()
+        guard !packet.isCorrupt else { return }
         guard let tracks else { return }
         if packet.streamIndex == tracks.video?.streamIndex,
            packet.codec == tracks.video.map({ .video($0.codec) }) {
@@ -578,9 +586,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 freshVideoFormatArrived = true
                 try consumeCanonicalFingerprintIsolated(latestEventFingerprint: fingerprint)
             case let .accessUnit(accessUnit):
-                guard mediaAdmissionOpen, videoAdmissionOpen else { return }
-                guard generationController.accepts(accessUnit.generation) else { return }
-                videoCoordinator.handle(accessUnit: accessUnit)
+                metrics?.recordVideoAccessUnit()
+                guard mediaAdmissionOpen, videoAdmissionOpen else {
+                    if awaitingFreshTrackEpoch {
+                        bufferTrackVideoIsolated(accessUnit)
+                    }
+                    return
+                }
+                admitVideoAccessUnitIsolated(accessUnit)
             }
         } catch let error as VideoDecoderFailure {
             failIsolated(Self.coreError(for: error))
@@ -602,21 +615,97 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 freshAudioFormatArrived = true
                 try consumeCanonicalFingerprintIsolated(latestEventFingerprint: fingerprint)
             case let .sample(sample):
-                guard mediaAdmissionOpen else { return }
-                guard generationController.accepts(sample.generation) else { return }
-                try audio.enqueue(sample)
-                retainedAudio.append(sample)
-                retainedAudio.sort { CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp) < 0 }
-                if retainedAudio.count > Self.retainedAudioCapacity {
-                    retainedAudio.removeFirst(retainedAudio.count - Self.retainedAudioCapacity)
+                metrics?.recordAudioSample()
+                guard mediaAdmissionOpen else {
+                    if awaitingFreshTrackEpoch {
+                        bufferTrackAudioIsolated(sample)
+                    }
+                    return
                 }
-                updateReadinessIsolated()
+                try admitAudioSampleIsolated(sample)
             }
         } catch let error as PlaybackCoreError {
             failIsolated(error)
         } catch {
             failIsolated(.audioRendererFailed("audio.pipeline"))
         }
+    }
+
+    private func bufferTrackVideoIsolated(_ accessUnit: CompressedVideoAccessUnit) {
+        assertIsolated()
+        guard generationController.accepts(accessUnit.generation) else { return }
+        // Once a newer random-access point arrives, older undecodable GOP data is
+        // no longer useful for starting the fresh track epoch.
+        if accessUnit.isRandomAccess {
+            pendingTrackVideo.removeAll(keepingCapacity: true)
+        }
+        pendingTrackVideo.append(accessUnit)
+        if pendingTrackVideo.count > Self.pendingTrackMediaCapacity {
+            pendingTrackVideo.removeFirst(
+                pendingTrackVideo.count - Self.pendingTrackMediaCapacity
+            )
+        }
+    }
+
+    private func bufferTrackAudioIsolated(_ sample: CompressedAudioSample) {
+        assertIsolated()
+        guard generationController.accepts(sample.generation) else { return }
+        pendingTrackAudio.append(sample)
+        if pendingTrackAudio.count > Self.pendingTrackMediaCapacity {
+            pendingTrackAudio.removeFirst(
+                pendingTrackAudio.count - Self.pendingTrackMediaCapacity
+            )
+        }
+    }
+
+    private func replayPendingTrackMediaIsolated() throws {
+        assertIsolated()
+        let generation = generationController.current
+        let video = pendingTrackVideo
+        let audioSamples = pendingTrackAudio
+        pendingTrackVideo.removeAll(keepingCapacity: true)
+        pendingTrackAudio.removeAll(keepingCapacity: true)
+
+        for accessUnit in video where !terminal {
+            admitVideoAccessUnitIsolated(CompressedVideoAccessUnit(
+                id: accessUnit.id,
+                sampleBuffer: accessUnit.sampleBuffer,
+                generation: generation,
+                isRandomAccess: accessUnit.isRandomAccess,
+                parserMetadata: accessUnit.parserMetadata
+            ))
+        }
+        for sample in audioSamples where !terminal {
+            try admitAudioSampleIsolated(CompressedAudioSample(
+                id: sample.id,
+                sampleBuffer: sample.sampleBuffer,
+                codec: sample.codec,
+                generation: generation,
+                presentationTimeStamp: sample.presentationTimeStamp,
+                duration: sample.duration
+            ))
+        }
+    }
+
+    private func admitVideoAccessUnitIsolated(_ accessUnit: CompressedVideoAccessUnit) {
+        assertIsolated()
+        guard generationController.accepts(accessUnit.generation) else { return }
+        videoCoordinator.handle(accessUnit: accessUnit)
+    }
+
+    private func admitAudioSampleIsolated(_ sample: CompressedAudioSample) throws {
+        assertIsolated()
+        guard generationController.accepts(sample.generation) else { return }
+        try audio.enqueue(sample)
+        retainedAudio.append(sample)
+        retainedAudio.sort {
+            CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp) < 0
+        }
+        if retainedAudio.count > Self.retainedAudioCapacity {
+            retainedAudio.removeFirst(retainedAudio.count - Self.retainedAudioCapacity)
+        }
+        boundRetainedVideoIsolated()
+        updateReadinessIsolated()
     }
 
     private func handle(decoder event: VideoDecoderEvent) {
@@ -636,7 +725,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         switch result {
         case let .success(frames):
             for frame in frames where generationController.accepts(frame.generation) {
-                renderer.enqueue(frame)
+                if readiness?.isOpen == true {
+                    renderer.enqueue(frame)
+                }
                 retainedVideo.append(frame)
                 let route = videoCoordinator.route
                 if let videoFormat,
@@ -662,9 +753,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 let comparison = CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp)
                 return comparison == 0 ? $0.sequenceNumber < $1.sequenceNumber : comparison < 0
             }
-            if retainedVideo.count > Self.retainedVideoCapacity {
-                retainedVideo.removeFirst(retainedVideo.count - Self.retainedVideoCapacity)
-            }
+            boundRetainedVideoIsolated()
             updateReadinessIsolated()
         case let .failure(failure):
             failIsolated(.metalCommand(failure.code))
@@ -692,6 +781,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             trackEpochAlreadyAdvanced = false
             mediaAdmissionOpen = true
             videoAdmissionOpen = true
+            try replayPendingTrackMediaIsolated()
             return
         }
         guard consumedFingerprint != fingerprint else { return }
@@ -711,6 +801,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         audioFormat = nil
         audioCodec = nil
         trackEpochAlreadyAdvanced = false
+        pendingTrackVideo.removeAll(keepingCapacity: true)
+        pendingTrackAudio.removeAll(keepingCapacity: true)
         readyPublished = false
         readiness?.close(.discontinuity)
         display.pauseSubmission()
@@ -876,6 +968,16 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
            !readyPublished {
             resumeDisplayForOpenReadinessGateIsolated()
         }
+        metrics?.updateReadinessDiagnostics(
+            audioRoute: audio.route,
+            audioReady: audio.isReadyForPlayback,
+            readinessOpen: readiness.isOpen,
+            retainedAudioCount: retainedAudio.count,
+            retainedVideoCount: retainedVideo.count,
+            audioFirstPTS: audioInterval?.first,
+            audioDuration: audioInterval?.duration,
+            videoFirstPTS: retainedVideo.first?.presentationTimeStamp
+        )
     }
 
     private func displayModeSwitchStartedIsolated() {
@@ -936,16 +1038,19 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
     }
 
-    private func contiguousAudioInterval() -> (first: CMTime, duration: CMTime)? {
+    private func contiguousAudioInterval(
+        in samples: [CompressedAudioSample]? = nil
+    ) -> (first: CMTime, duration: CMTime)? {
         assertIsolated()
-        guard let first = retainedAudio.first,
+        let samples = samples ?? retainedAudio
+        guard let first = samples.first,
               first.presentationTimeStamp.isNumeric,
               first.duration.isNumeric,
               CMTimeCompare(first.duration, .zero) > 0 else { return nil }
         let firstPTS = first.presentationTimeStamp
         var end = CMTimeAdd(firstPTS, first.duration)
         guard end.isNumeric else { return nil }
-        for sample in retainedAudio.dropFirst() {
+        for sample in samples.dropFirst() {
             guard sample.presentationTimeStamp.isNumeric,
                   sample.duration.isNumeric,
                   CMTimeCompare(sample.duration, .zero) > 0 else { break }
@@ -960,21 +1065,52 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         return (firstPTS, duration)
     }
 
+    private func boundRetainedVideoIsolated() {
+        assertIsolated()
+        if !paused, readiness?.isOpen == false {
+            if let audioFirstPTS = contiguousAudioInterval()?.first {
+                retainedVideo.removeAll { frame in
+                    let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+                    return end.isNumeric && CMTimeCompare(end, audioFirstPTS) <= 0
+                }
+            }
+            if retainedVideo.count > Self.startupRetainedVideoCapacity {
+                retainedVideo.removeLast(
+                    retainedVideo.count - Self.startupRetainedVideoCapacity
+                )
+            }
+            return
+        }
+
+        guard retainedVideo.count > Self.retainedVideoCapacity else { return }
+        retainedVideo.removeFirst(retainedVideo.count - Self.retainedVideoCapacity)
+    }
+
     private func prepareAnchorIsolated(commonPTS: CMTime) -> Bool {
         assertIsolated()
         let expectedGeneration = generationController.current
         guard !terminal, !paused, let readiness else { return false }
         let expectedCycle = readiness.cycleID
-        retainedAudio.removeAll {
+        let candidateAudio = retainedAudio.filter {
             let end = CMTimeAdd($0.presentationTimeStamp, $0.duration)
-            return end.isNumeric && CMTimeCompare(end, commonPTS) <= 0
+            return !end.isNumeric || CMTimeCompare(end, commonPTS) > 0
         }
-        retainedVideo.removeAll {
+        let candidateVideo = retainedVideo.filter {
             let end = CMTimeAdd($0.presentationTimeStamp, $0.duration)
-            return end.isNumeric && CMTimeCompare(end, commonPTS) <= 0
+            return !end.isNumeric || CMTimeCompare(end, commonPTS) > 0
         }
 
-        guard hasSufficientMediaForAnchor(commonPTS: commonPTS) else { return false }
+        // Readiness is updated in two phases (audio, then video), so its first
+        // attempt can legitimately carry the previous video snapshot. Treat the
+        // trim as a transaction: a rejected candidate must not permanently move
+        // the retained-media window forward and make audio chase video forever.
+        guard hasSufficientMediaForAnchor(
+            commonPTS: commonPTS,
+            audioSamples: candidateAudio,
+            videoFrames: candidateVideo
+        ) else { return false }
+        retainedAudio = candidateAudio
+        retainedVideo = candidateVideo
 
         let alreadyPrepared = preparedAnchor.map {
             $0.cycleID == expectedCycle && CMTimeCompare($0.commonPTS, commonPTS) == 0
@@ -1014,10 +1150,16 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         return true
     }
 
-    private func hasSufficientMediaForAnchor(commonPTS: CMTime) -> Bool {
+    private func hasSufficientMediaForAnchor(
+        commonPTS: CMTime,
+        audioSamples: [CompressedAudioSample]? = nil,
+        videoFrames: [VideoPresentationFrame]? = nil
+    ) -> Bool {
         assertIsolated()
+        let audioSamples = audioSamples ?? retainedAudio
+        let videoFrames = videoFrames ?? retainedVideo
         guard audio.isReadyForPlayback,
-              let interval = contiguousAudioInterval() else { return false }
+              let interval = contiguousAudioInterval(in: audioSamples) else { return false }
         let audioEnd = CMTimeAdd(interval.first, interval.duration)
         guard audioEnd.isNumeric,
               CMTimeCompare(interval.first, commonPTS) <= 0,
@@ -1025,7 +1167,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                   CMTimeSubtract(audioEnd, commonPTS),
                   CMTime(value: 1, timescale: 4)
               ) >= 0 else { return false }
-        let overlappingVideoCount = retainedVideo.filter { frame in
+        let overlappingVideoCount = videoFrames.filter { frame in
             let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
             return end.isNumeric
                 && CMTimeCompare(end, commonPTS) > 0
@@ -1076,6 +1218,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         retainedAudio.removeAll(keepingCapacity: false)
         retainedVideo.removeAll(keepingCapacity: false)
         deferredPackets.removeAll(keepingCapacity: false)
+        pendingTrackVideo.removeAll(keepingCapacity: false)
+        pendingTrackAudio.removeAll(keepingCapacity: false)
         display.pauseSubmission()
         Task { [self] in
             await audio.stopAwaitingRendererRemoval()
@@ -1116,6 +1260,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         terminal = true
         demuxer.cancel()
         releasePendingAdmissionIsolated()
+        pendingTrackVideo.removeAll(keepingCapacity: false)
+        pendingTrackAudio.removeAll(keepingCapacity: false)
         videoCoordinator.stop(emergency: true)
         audio.stop()
         display.pauseSubmission()

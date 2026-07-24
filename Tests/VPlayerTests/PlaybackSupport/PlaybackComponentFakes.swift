@@ -635,7 +635,11 @@ enum PlaybackFakeMedia {
         )
     }
 
-    static func videoPacket(marker: UInt8, pts: Int64 = 90_000) -> DemuxPacket {
+    static func videoPacket(
+        marker: UInt8,
+        pts: Int64 = 90_000,
+        isCorrupt: Bool = false
+    ) -> DemuxPacket {
         DemuxPacket(
             streamIndex: 100,
             codec: .video(.h264),
@@ -644,11 +648,11 @@ enum PlaybackFakeMedia {
             decodeTimeStamp: CMTime(value: pts - 3_000, timescale: 90_000),
             duration: CMTime(value: 3_000, timescale: 90_000),
             isKey: true,
-            isCorrupt: false
+            isCorrupt: isCorrupt
         )
     }
 
-    static func audioPacket(id: UInt8) -> DemuxPacket {
+    static func audioPacket(id: UInt8, isCorrupt: Bool = false) -> DemuxPacket {
         let payload = Data([id, 0xAA])
         let frameLength = 7 + payload.count
         var data = Data([
@@ -667,7 +671,7 @@ enum PlaybackFakeMedia {
             decodeTimeStamp: .invalid,
             duration: .invalid,
             isKey: false,
-            isCorrupt: false
+            isCorrupt: isCorrupt
         )
     }
 

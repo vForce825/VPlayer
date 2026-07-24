@@ -6,14 +6,33 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
+private final class AudioReadyCallbackGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = false
+
+    func claim() -> Bool {
+        lock.withLock {
+            guard !pending else { return false }
+            pending = true
+            return true
+        }
+    }
+
+    func release() {
+        lock.withLock { pending = false }
+    }
+}
+
 final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendable {
     private typealias StopCompletion = @Sendable () -> Void
 
-    static let replayCapacityError = "audio.replay.capacity"
     static let removalFailedError = "audio.renderer.remove"
     static let unsupportedPCMError = "audio.pcm.unsupported"
     static let isolationError = "audio.executor.isolation"
     private static let capacity = 96
+    private static let compressedStartupFallbackDuration = CMTime(value: 3, timescale: 4)
+    private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
+    private static let maximumConsecutiveInvalidPackets = 8
 
     private struct PublicSnapshot {
         var isReadyForPlayback = false
@@ -57,6 +76,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private let clockMode: AudioClockMode
     private let readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)?
     private let snapshotLock = NSLock()
+    private let readyCallbackGate = AudioReadyCallbackGate()
     private var publicSnapshot = PublicSnapshot()
 
     private var nextEpoch: UInt64? = 1
@@ -69,7 +89,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var decoder: (any PCMAudioDecoding)?
     private var replay: [ReplayEntry] = []
     private var pendingPCM: [CMSampleBuffer] = []
+    private var pcmPrerollStart: CMTime?
+    private var pcmPrerollEnd: CMTime?
+    private var consecutiveInvalidPacketCount = 0
     private var rendererAttached = false
+    private var rendererRequesting = false
     private var replacing = false
     private var terminal = false
     private var configured = false
@@ -173,13 +197,16 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             throw PlaybackCoreError.audioRendererFailed("audio.codec.mismatch")
         }
         try pruneExpired(at: synchronizer.currentTime())
-        guard replay.count < Self.capacity else {
-            throw PlaybackCoreError.audioRendererFailed(Self.replayCapacityError)
+        if replay.count >= Self.capacity {
+            replay.removeFirst(replay.count - Self.capacity + 1)
         }
         replay.append(ReplayEntry(sample: sample, sentCompressed: false, decoded: false))
         do {
+            if !replacing, rendererAttached, let renderer {
+                startRequests(on: renderer, epoch: epoch, generation: generation)
+            }
             if route == .systemCompressed {
-                try drainCompressed()
+                try drainCompressedAndEvaluateStartup()
             } else {
                 try decodeAvailable()
                 try drainPCM()
@@ -187,6 +214,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         } catch {
             classifyAndEmitDecode(error)
         }
+        refreshMediaRequestState()
         updateReadiness()
     }
 
@@ -208,6 +236,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         setSynchronizerRate(0, time: synchronizer.currentTime())
         replay.removeAll(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
+        resetPCMPreroll()
+        consecutiveInvalidPacketCount = 0
         decoder?.flush()
 
         if var pendingRemoval {
@@ -226,7 +256,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
 
         replacing = false
-        renderer?.stopRequestingMediaData()
+        if let renderer { stopRequests(on: renderer) }
         renderer?.stopObserving()
         renderer?.flush()
         if let renderer {
@@ -294,6 +324,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         pcmOutputFormat = nil
         replay.removeAll(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
+        resetPCMPreroll()
+        consecutiveInvalidPacketCount = 0
         updateSnapshot(route: route, ready: false)
     }
 
@@ -335,6 +367,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         self.codec = codec
         replay.removeAll(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
+        resetPCMPreroll()
+        consecutiveInvalidPacketCount = 0
         configured = true
         stopped = false
         fallbackUsed = false
@@ -385,10 +419,18 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         epoch: UInt64,
         generation: MediaGeneration
     ) {
+        guard !rendererRequesting else { return }
+        rendererRequesting = true
         let rendererID = renderer.identity
-        renderer.requestMediaDataWhenReady { [weak self] in
-            guard let self else { return }
-            executor.submit { [weak self] in
+        let gate = readyCallbackGate
+        renderer.requestMediaDataWhenReady { [weak self, gate] in
+            guard gate.claim() else { return }
+            guard let self else {
+                gate.release()
+                return
+            }
+            executor.submit { [weak self, gate] in
+                defer { gate.release() }
                 self?.handleReady(
                     epoch: epoch,
                     rendererID: rendererID,
@@ -396,6 +438,12 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 )
             }
         }
+    }
+
+    private func stopRequests(on renderer: any AudioRenderer) {
+        guard rendererRequesting else { return }
+        rendererRequesting = false
+        renderer.stopRequestingMediaData()
     }
 
     private func startRouteMonitor(epoch: UInt64, generation: MediaGeneration) {
@@ -418,10 +466,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         generation: MediaGeneration
     ) {
         guard isCurrent(epoch: epoch, rendererID: rendererID, generation: generation),
-              !terminal, !replacing else { return }
+              rendererRequesting, !terminal, !replacing else { return }
         do {
             if route == .systemCompressed {
-                try drainCompressed()
+                try drainCompressedAndEvaluateStartup()
             } else {
                 try decodeAvailable()
                 try drainPCM()
@@ -429,6 +477,24 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             updateReadiness()
         } catch {
             classifyAndEmitDecode(error)
+        }
+        refreshMediaRequestState()
+    }
+
+    private func refreshMediaRequestState() {
+        guard configured, !stopped, !terminal, !replacing,
+              rendererAttached, let renderer else { return }
+        let hasPendingWork: Bool
+        switch route {
+        case .systemCompressed:
+            hasPendingWork = replay.contains { !$0.sentCompressed }
+        case .ffmpegPCM:
+            hasPendingWork = !pendingPCM.isEmpty || replay.contains { !$0.decoded }
+        }
+        if hasPendingWork {
+            startRequests(on: renderer, epoch: epoch, generation: generation)
+        } else {
+            stopRequests(on: renderer)
         }
     }
 
@@ -571,6 +637,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         updateSnapshot(route: route, ready: false)
         setSynchronizerRate(0, time: time)
         renderer.flush()
+        resetPCMPreroll()
         do {
             try pruneExpired(at: time)
             for index in replay.indices {
@@ -578,10 +645,13 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 replay[index].decoded = false
             }
             pendingPCM.removeAll(keepingCapacity: false)
-            if route == .ffmpegPCM { decoder?.flush() }
+            if route == .ffmpegPCM {
+                consecutiveInvalidPacketCount = 0
+                decoder?.flush()
+            }
             needsAnchor = true
             if route == .systemCompressed {
-                try drainCompressed()
+                try drainCompressedAndEvaluateStartup()
             } else {
                 try decodeAvailable()
                 try drainPCM()
@@ -608,9 +678,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         replacing = true
         updateSnapshot(route: route, ready: false)
         setSynchronizerRate(0, time: synchronizer.currentTime())
-        renderer.stopRequestingMediaData()
+        stopRequests(on: renderer)
         renderer.stopObserving()
         renderer.flush()
+        resetPCMPreroll()
         let transition = PendingRemoval(
             rendererID: renderer.identity,
             originEpoch: epoch,
@@ -687,8 +758,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             let decoder = try decoderFactory.makeDecoder(codec: codec, format: format)
             let replacement = try rendererFactory.makeRenderer(mediaKind: .linearPCM)
             self.decoder = decoder
+            consecutiveInvalidPacketCount = 0
             renderer = replacement
             rendererAttached = false
+            resetPCMPreroll()
             installCallbacks(on: replacement, epoch: epoch, generation: generation)
             synchronizer.attach(replacement)
             rendererAttached = true
@@ -700,6 +773,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             for index in replay.indices { replay[index].decoded = false }
             try decodeAvailable()
             try drainPCM()
+            refreshMediaRequestState()
             updateReadiness()
             if pendingReevaluation {
                 pendingReevaluation = false
@@ -728,11 +802,66 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
+    private func drainCompressedAndEvaluateStartup() throws {
+        try drainCompressed()
+        guard route == .systemCompressed,
+              !fallbackUsed,
+              !replacing,
+              !terminal,
+              let renderer,
+              !renderer.hasSufficientMediaDataForReliablePlaybackStart,
+              let duration = contiguousSentCompressedDuration(),
+              CMTimeCompare(duration, Self.compressedStartupFallbackDuration) >= 0 else {
+            return
+        }
+        beginFallback()
+    }
+
+    private func contiguousSentCompressedDuration() -> CMTime? {
+        guard let first = replay.first,
+              first.sentCompressed,
+              first.sample.presentationTimeStamp.isNumeric,
+              first.sample.duration.isNumeric,
+              CMTimeCompare(first.sample.duration, .zero) > 0 else { return nil }
+        let firstPTS = first.sample.presentationTimeStamp
+        var end = CMTimeAdd(firstPTS, first.sample.duration)
+        guard end.isNumeric else { return nil }
+        for entry in replay.dropFirst() {
+            guard entry.sentCompressed,
+                  entry.sample.presentationTimeStamp.isNumeric,
+                  entry.sample.duration.isNumeric,
+                  CMTimeCompare(entry.sample.duration, .zero) > 0,
+                  CMTimeCompare(entry.sample.presentationTimeStamp, end) <= 0 else { break }
+            let sampleEnd = CMTimeAdd(
+                entry.sample.presentationTimeStamp,
+                entry.sample.duration
+            )
+            guard sampleEnd.isNumeric else { break }
+            if CMTimeCompare(sampleEnd, end) > 0 { end = sampleEnd }
+        }
+        let duration = CMTimeSubtract(end, firstPTS)
+        return duration.isNumeric ? duration : nil
+    }
+
     private func decodeAvailable() throws {
         guard route == .ffmpegPCM, let decoder, !terminal, !replacing else { return }
         for index in replay.indices where !replay[index].decoded {
             guard pendingPCM.count < Self.capacity else { break }
-            let outputs = try decoder.push(replay[index].sample)
+            let outputs: [CMSampleBuffer]
+            do {
+                outputs = try decoder.push(replay[index].sample)
+                consecutiveInvalidPacketCount = 0
+            } catch let error as PlaybackCoreError {
+                guard case let .audioFallbackDecode(status) = error,
+                      status == FFmpegPCMAudioDecoder.invalidPacketErrorCode,
+                      consecutiveInvalidPacketCount < Self.maximumConsecutiveInvalidPackets else {
+                    throw error
+                }
+                consecutiveInvalidPacketCount += 1
+                replay[index].decoded = true
+                decoder.flush()
+                continue
+            }
             guard outputs.count <= Self.capacity - pendingPCM.count else {
                 throw PlaybackCoreError.audioFallbackDecode(
                     FFmpegPCMAudioDecoder.tokenCapacityErrorCode
@@ -761,6 +890,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             while renderer.isReadyForMoreMediaData, !pendingPCM.isEmpty {
                 let sample = pendingPCM.removeFirst()
                 try renderer.enqueue(sample)
+                recordPCMPreroll(sample)
                 anchorIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sample))
             }
             guard renderer.isReadyForMoreMediaData,
@@ -796,10 +926,59 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func updateReadiness() {
+        let rendererHasPreroll = renderer?.hasSufficientMediaDataForReliablePlaybackStart == true
+        let pcmHasPreroll = route == .ffmpegPCM && hasMinimumPCMPreroll
         let ready = configured && !stopped && !terminal && !replacing &&
-            rendererAttached &&
-            renderer?.hasSufficientMediaDataForReliablePlaybackStart == true
+            rendererAttached && (rendererHasPreroll || pcmHasPreroll)
         updateSnapshot(route: route, ready: ready)
+    }
+
+    private var hasMinimumPCMPreroll: Bool {
+        guard let start = pcmPrerollStart,
+              let end = pcmPrerollEnd else { return false }
+        let duration = CMTimeSubtract(end, start)
+        return duration.isNumeric &&
+            CMTimeCompare(duration, Self.pcmStartupPrerollDuration) >= 0
+    }
+
+    private func recordPCMPreroll(_ sampleBuffer: CMSampleBuffer) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard pts.isNumeric,
+              sampleCount > 0,
+              let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mSampleRate.isFinite,
+              asbd.mSampleRate > 0 else { return }
+        let duration = CMTime(
+            seconds: Double(sampleCount) / asbd.mSampleRate,
+            preferredTimescale: 600_000
+        )
+        let end = CMTimeAdd(pts, duration)
+        guard duration.isNumeric,
+              CMTimeCompare(duration, .zero) > 0,
+              end.isNumeric else { return }
+
+        guard let currentStart = pcmPrerollStart,
+              let currentEnd = pcmPrerollEnd else {
+            pcmPrerollStart = pts
+            pcmPrerollEnd = end
+            return
+        }
+        guard CMTimeCompare(pts, currentStart) >= 0,
+              CMTimeCompare(pts, currentEnd) <= 0 else {
+            pcmPrerollStart = pts
+            pcmPrerollEnd = end
+            return
+        }
+        if CMTimeCompare(end, currentEnd) > 0 {
+            pcmPrerollEnd = end
+        }
+    }
+
+    private func resetPCMPreroll() {
+        pcmPrerollStart = nil
+        pcmPrerollEnd = nil
     }
 
     private func classifyAndEmitDecode(_ error: any Error) {
@@ -825,7 +1004,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         guard !terminal else { return }
         terminal = true
         replacing = false
-        renderer?.stopRequestingMediaData()
+        if let renderer { stopRequests(on: renderer) }
         renderer?.stopObserving()
         updateSnapshot(route: route, ready: false)
         failureSink(error, generation)

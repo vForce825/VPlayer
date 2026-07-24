@@ -4,9 +4,84 @@
 
 import CoreMedia
 import CoreVideo
+import Foundation
+import OSLog
 import VideoToolbox
 
+private final class DecodeSubmissionWindow: @unchecked Sendable {
+    private let condition = NSCondition()
+    private let capacity: Int
+    private let waitInterval: TimeInterval
+    private var counts: [VTSessionID: Int] = [:]
+
+    init(capacity: Int, waitInterval: TimeInterval) {
+        self.capacity = max(1, capacity)
+        self.waitInterval = max(0, waitInterval)
+    }
+
+    func claim(sessionID: VTSessionID) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date(timeIntervalSinceNow: waitInterval)
+        while counts[sessionID, default: 0] >= capacity {
+            guard condition.wait(until: deadline) else { return false }
+        }
+        counts[sessionID, default: 0] += 1
+        return true
+    }
+
+    func release(sessionID: VTSessionID) {
+        condition.lock()
+        if let count = counts[sessionID], count > 1 {
+            counts[sessionID] = count - 1
+        } else {
+            counts.removeValue(forKey: sessionID)
+        }
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func reset(sessionID: VTSessionID) {
+        condition.lock()
+        counts.removeValue(forKey: sessionID)
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+private final class DecodeSubmissionLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    private let releaseAction: @Sendable () -> Void
+
+    init(releaseAction: @escaping @Sendable () -> Void) {
+        self.releaseAction = releaseAction
+    }
+
+    func releaseOnce() {
+        let shouldRelease = lock.withLock {
+            guard !released else { return false }
+            released = true
+            return true
+        }
+        if shouldRelease { releaseAction() }
+    }
+}
+
 public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
+    // Legacy Codec Manager bad-data status; VTErrors.h lists it beside
+    // kVTVideoDecoderBadDataErr and tvOS hardware decoders still return it.
+    static let legacyCodecBadDataErr: OSStatus = -8_969
+    // The tvOS 18 simulator can report an isolated positive callback status
+    // with no image after a corrupt access unit. VTErrors.h defines real
+    // VideoToolbox failures as negative values, so preserve this exact observed
+    // value as a recoverable per-frame data failure without masking other codes.
+    static let transientNoFrameStatus: OSStatus = 1
+    private static let logger = Logger(
+        subsystem: "com.vplayer.playback",
+        category: "VideoToolboxDecoder"
+    )
+
     private struct ActiveSession {
         let session: any VideoToolboxSession
         let id: VTSessionID
@@ -29,6 +104,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private let eventSink: @Sendable (VideoDecoderEvent) -> Void
     private let api: any VideoToolboxAPI
     private let compatibilityCheck: PixelBufferCompatibilityCheck
+    private let submissionWindow: DecodeSubmissionWindow
     private let metrics: PlaybackMetrics?
     private let signposts: PlaybackSignposts?
     private var active: ActiveSession?
@@ -67,6 +143,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void,
         api: any VideoToolboxAPI,
         compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck,
+        maximumInFlightDecodeCount: Int = 8,
+        inFlightWaitInterval: TimeInterval = 0.25,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil
     ) {
@@ -74,6 +152,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         self.eventSink = eventSink
         self.api = api
         self.compatibilityCheck = compatibilityCheck
+        submissionWindow = DecodeSubmissionWindow(
+            capacity: maximumInFlightDecodeCount,
+            waitInterval: inFlightWaitInterval
+        )
         self.metrics = metrics
         self.signposts = signposts
     }
@@ -89,16 +171,13 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
 
         let decoderSpecification: [String: VTPropertyValue] = [
-            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: .boolean(true),
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
         ]
         let imageBufferAttributes: [String: VTPropertyValue] = [
             kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
             kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String: .array([
+            kCVPixelBufferPixelFormatTypeKey as String:
                 .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
-            ]),
         ]
         let creation = api.createSession(
             format: format,
@@ -117,7 +196,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 key: kVTDecompressionPropertyKey_FieldMode as String,
                 value: .string(kVTDecompressionProperty_FieldMode_BothFields as String)
             )
-            guard setStatus == noErr else {
+            guard setStatus == noErr || setStatus == kVTPropertyNotSupportedErr else {
                 api.invalidate(candidate)
                 throw VideoDecoderFailure.sessionCreate(setStatus)
             }
@@ -142,11 +221,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             candidate,
             key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder as String
         )
-        guard hardware.status == noErr else {
+        guard hardware.status == noErr || hardware.status == kVTPropertyNotSupportedErr else {
             api.invalidate(candidate)
             throw VideoDecoderFailure.sessionCreate(hardware.status)
         }
-        guard hardware.value == .boolean(true) else {
+        guard hardware.status == kVTPropertyNotSupportedErr
+            || hardware.value == .boolean(true) else {
             api.invalidate(candidate)
             throw VideoDecoderFailure.softwareDecoder
         }
@@ -158,7 +238,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             generation: generation,
             configuration: configuration
         )
-        if let previous { api.invalidate(previous.session) }
+        if let previous {
+            submissionWindow.reset(sessionID: previous.id)
+            api.invalidate(previous.session)
+        }
     }
 
     public func decode(
@@ -172,6 +255,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             parserMetadata: accessUnit.parserMetadata
         )
         let sessionID = active.id
+        guard submissionWindow.claim(sessionID: sessionID) else {
+            throw VideoDecoderFailure.backpressureTimeout
+        }
+        let submissionLease = DecodeSubmissionLease { [submissionWindow] in
+            submissionWindow.release(sessionID: sessionID)
+        }
         let executor = executor
         var decodeFlags = flags
         decodeFlags.insert(._EnableAsynchronousDecompression)
@@ -189,21 +278,36 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             token: signposts?.begin(.videoToolboxDecode, correlation: accessUnit.id)
         )
         let metrics = metrics
+        let submissionStartedAt = ProcessInfo.processInfo.systemUptime
         let status = api.decode(
             active.session,
             sampleBuffer: accessUnit.sampleBuffer,
             flags: decodeFlags,
             frameOptions: nil
         ) { [weak self] output in
+            submissionLease.releaseOnce()
             metrics?.recordDecoderCallback()
             signpostLifetime.finish()
             executor.submit { [weak self] in
                 self?.handle(output: output, token: token, sessionID: sessionID)
             }
         }
+        metrics?.recordVideoDecodeSubmission(
+            milliseconds: max(
+                0,
+                (ProcessInfo.processInfo.systemUptime - submissionStartedAt) * 1_000
+            )
+        )
         guard status == noErr else {
+            submissionLease.releaseOnce()
             signpostLifetime.finish()
-            throw Self.classify(status, configuration: active.configuration).failure
+            let classified = Self.classify(status, configuration: active.configuration)
+            if !classified.isRecoverable {
+                Self.logger.error(
+                    "decode submission failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                )
+            }
+            throw classified.failure
         }
     }
 
@@ -211,6 +315,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard let active else { return }
         let status = api.finishDelayedFrames(active.session)
         guard status == noErr else {
+            Self.logger.error(
+                "finish delayed frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+            )
             throw Self.classify(status, configuration: active.configuration).failure
         }
     }
@@ -219,6 +326,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard let active else { return }
         let status = api.waitForAsynchronousFrames(active.session)
         guard status == noErr else {
+            Self.logger.error(
+                "wait for asynchronous frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+            )
             throw Self.classify(status, configuration: active.configuration).failure
         }
     }
@@ -226,6 +336,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     public func invalidate() {
         guard let current = active else { return }
         active = nil
+        submissionWindow.reset(sessionID: current.id)
         api.invalidate(current.session)
     }
 
@@ -242,10 +353,16 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
 
         guard output.status == noErr else {
-            emit(
-                Self.classify(output.status, configuration: active.configuration),
-                generation: token.generation
+            let classified = Self.classify(
+                output.status,
+                configuration: active.configuration
             )
+            if !classified.isRecoverable {
+                Self.logger.error(
+                    "decode callback failed status=\(output.status, privacy: .public) infoFlags=\(output.infoFlags.rawValue, privacy: .public) hasImage=\(output.imageBuffer != nil, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                )
+            }
+            emit(classified, generation: token.generation)
             return
         }
         guard let pixelBuffer = output.imageBuffer else {
@@ -308,7 +425,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     ) -> ClassifiedFailure {
         if configuration == .appleTemporal {
             switch status {
-            case kVTVideoDecoderBadDataErr, kVTVideoDecoderReferenceMissingErr:
+            case kVTVideoDecoderBadDataErr,
+                 legacyCodecBadDataErr,
+                 transientNoFrameStatus,
+                 kVTVideoDecoderReferenceMissingErr:
                 return ClassifiedFailure(failure: .badData(status), isRecoverable: true)
             case kVTVideoDecoderUnsupportedDataFormatErr:
                 return ClassifiedFailure(failure: .badData(status), isRecoverable: false)
@@ -321,7 +441,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
 
         switch status {
-        case kVTVideoDecoderBadDataErr, kVTVideoDecoderReferenceMissingErr:
+        case kVTVideoDecoderBadDataErr,
+             legacyCodecBadDataErr,
+             transientNoFrameStatus,
+             kVTVideoDecoderReferenceMissingErr:
             return ClassifiedFailure(failure: .badData(status), isRecoverable: true)
         case kVTVideoDecoderUnsupportedDataFormatErr:
             return ClassifiedFailure(failure: .badData(status), isRecoverable: false)

@@ -7,6 +7,46 @@ import VideoToolbox
 @testable import VPlayerPlayback
 
 final class PlaybackErrorMappingTests: XCTestCase {
+    func testPlaybackFailureInitializerRemainsSourceCompatibleAndDiagnosticDefaultsToNil() {
+        let failure = PlaybackFailure(
+            code: "video.decode",
+            userMessage: "视频解码失败，请尝试其他频道。"
+        )
+
+        XCTAssertEqual(failure.code, "video.decode")
+        XCTAssertEqual(failure.userMessage, "视频解码失败，请尝试其他频道。")
+        XCTAssertNil(failure.diagnosticCode)
+    }
+
+    func testVideoDecodeMappingPreservesSignedStatusOnlyInDiagnosticCode() {
+        let secret = "https://user:password@example.test/live?token=secret"
+        let failure = PlaybackController.failure(for: .videoDecode(-12_909))
+
+        XCTAssertEqual(failure.code, "video.decode")
+        XCTAssertEqual(failure.userMessage, "视频解码失败，请尝试其他频道。")
+        XCTAssertEqual(failure.diagnosticCode, "video.decode.status.-12909")
+        XCTAssertFalse(failure.diagnosticCode?.contains(secret) == true)
+    }
+
+    func testAudioFailuresExposeOnlyBoundedMachineSafeDiagnostics() {
+        XCTAssertEqual(
+            PlaybackController.failure(for: .audioFallbackDecode(-12_345)).diagnosticCode,
+            "audio.decode.status.-12345"
+        )
+        XCTAssertEqual(
+            PlaybackController.failure(
+                for: .audioRendererFailed("AVFoundationErrorDomain:-11847")
+            ).diagnosticCode,
+            "audio.renderer.reason.AVFoundationErrorDomain:-11847"
+        )
+        XCTAssertEqual(
+            PlaybackController.failure(
+                for: .audioRendererFailed("https://secret.example/live?token=do-not-export")
+            ).diagnosticCode,
+            "audio.renderer.reason.unknown"
+        )
+    }
+
     func testEveryCoreFailureMapsOnceToStablePublicCodeAndActionableChineseMessage() {
         let cases: [(PlaybackCoreError, String, String)] = [
             (.unsupportedProtocol("udp"), "protocol.unsupported", "不支持此播放协议，请使用 HTTP 或 HTTPS 地址。"),
@@ -27,7 +67,9 @@ final class PlaybackErrorMappingTests: XCTestCase {
         ]
 
         for (core, code, message) in cases {
-            XCTAssertEqual(PlaybackController.failure(for: core), PlaybackFailure(code: code, userMessage: message))
+            let failure = PlaybackController.failure(for: core)
+            XCTAssertEqual(failure.code, code)
+            XCTAssertEqual(failure.userMessage, message)
         }
     }
 

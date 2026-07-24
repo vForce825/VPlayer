@@ -583,6 +583,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         let systemYADIF = try makeSystemYADIF(generation: MediaGeneration(rawValue: 0))
         let yadif = ObservingTraceYADIF(processor: systemYADIF)
         let renderer = AuditTraceRenderer()
+        let audio = FakePipelineAudio()
+        audio.setReady(true)
         let events = TracePipelineEvents()
         let pipeline = PlaybackPipeline(
             executor: PlaybackSerialExecutor(label: "org.vplayer.tests.wrap.pipeline"),
@@ -593,7 +595,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             yadifProcessor: yadif,
             selectedAlgorithm: .metalYADIF2x,
             renderer: renderer,
-            audio: FakePipelineAudio(),
+            audio: audio,
             clock: FakePipelineClock(),
             display: FakePlaybackDisplay(),
             eventSink: { events.append($0) }
@@ -812,6 +814,16 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         renderer: AuditTraceRenderer,
         yadif: ObservingTraceYADIF
     ) async throws -> Set<UInt64> {
+        let audioPTS = trace.frames.first?.parserMetadata.sourcePTS90k.map {
+            CMTime(value: Int64($0), timescale: 90_000)
+        } ?? .zero
+        pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: accessUnitIDOffset + 1,
+            generation: generation,
+            pts: audioPTS,
+            duration: CMTime(value: 1, timescale: 1)
+        )))
+
         let sources = trace.frames + makeFlushFrames(for: trace, generation: generation)
         for source in sources {
             let frame = source.rebased(

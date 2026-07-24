@@ -21,6 +21,8 @@ SPDX-FileComment: Apple App Store distribution is additionally permitted by LICE
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>VPLAYER_ACCEPTANCE_M3U_URL_B64</key>
     <string>$(VPLAYER_ACCEPTANCE_M3U_URL_B64)</string>
+    <key>VPLAYER_ACCEPTANCE_EPG_URL_B64</key>
+    <string>$(VPLAYER_ACCEPTANCE_EPG_URL_B64)</string>
     <key>VPLAYER_ACCEPTANCE_CHANNEL_B64</key>
     <string>$(VPLAYER_ACCEPTANCE_CHANNEL_B64)</string>
     <key>VPLAYER_ACCEPTANCE_SECONDS_B64</key>

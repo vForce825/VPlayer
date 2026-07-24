@@ -72,6 +72,11 @@ struct AppDependencies {
     let playbackPresentationProvider: PlaybackPresentationProvider
     let playbackMetricsProvider: PlaybackMetricsProvider
     let exposesAcceptanceMetrics: Bool
+    let exposesAcceptanceState: Bool
+    /// False when the persistent store could not be opened at all. Every
+    /// repository call then fails, so the UI shows a dedicated explanation
+    /// instead of a generic "try again later" alert on every screen.
+    let isLibraryAvailable: Bool
     let libraryChanges: LibraryChangeSignal
     let libraryStartup: LibraryStartup
     let foregroundRefreshDriver: ForegroundRefreshDriver
@@ -91,19 +96,23 @@ struct AppDependencies {
         playbackPresentationProvider: PlaybackPresentationProvider? = nil,
         playbackMetricsProvider: PlaybackMetricsProvider? = nil,
         exposesAcceptanceMetrics: Bool = false,
+        exposesAcceptanceState: Bool = false,
+        isLibraryAvailable: Bool = true,
         libraryChanges: LibraryChangeSignal = LibraryChangeSignal()
     ) {
+        self.isLibraryAvailable = isLibraryAvailable
         self.repository = repository
         self.refresh = refresh
         self.prepare = prepare
         self.playbackSettings = playbackSettings
+        let resolvedPlaybackEngine: any PlaybackEngine
         if let playbackEngine {
-            self.playbackEngine = playbackEngine
+            resolvedPlaybackEngine = playbackEngine
             self.playbackPresentationProvider = playbackPresentationProvider ?? { nil }
             self.playbackMetricsProvider = playbackMetricsProvider ?? { _ in nil }
         } else {
             let controller = PlaybackController()
-            self.playbackEngine = controller
+            resolvedPlaybackEngine = controller
             self.playbackPresentationProvider = {
                 await controller.presentationContext()
             }
@@ -111,11 +120,20 @@ struct AppDependencies {
                 await controller.playbackMetricsSnapshot(window: window)
             }
         }
+        self.playbackEngine = resolvedPlaybackEngine
         self.libraryChanges = libraryChanges
         self.exposesAcceptanceMetrics = exposesAcceptanceMetrics
+        self.exposesAcceptanceState = exposesAcceptanceState
         self.libraryStartup = libraryStartup
         self.foregroundRefreshDriver = foregroundRefreshDriver
         self.backgroundRefreshRegistrar = backgroundRefreshRegistrar
+
+        let algorithmSelection = PlaybackAlgorithmSelectionController(
+            engine: resolvedPlaybackEngine
+        )
+        playbackSettings.setDeinterlaceAlgorithmChangeHandler(
+            algorithmSelection.select
+        )
     }
 
     static func live() -> Self {
@@ -169,7 +187,8 @@ struct AppDependencies {
                     reportStatus: { _ in }
                 ),
                 repository: repository,
-                refresh: refresh
+                refresh: refresh,
+                isLibraryAvailable: false
             )
         }
     }
@@ -205,13 +224,15 @@ struct AppDependencies {
                 libraryStartup: LibraryStartup {
                     try await repository.purgeUnreferencedSnapshots()
                 },
-                exposesAcceptanceMetrics: true
+                exposesAcceptanceMetrics: true,
+                exposesAcceptanceState: true
             )
         } catch {
-            return live()
+            // Acceptance runs must never silently fall back to the on-disk
+            // production store; fail loudly instead so the harness surfaces it.
+            fatalError("Acceptance dependencies require an in-memory store; container creation failed: \(error)")
         }
     }
-    #endif
 
     static func uiTesting(playbackFixture: String? = nil) -> Self {
         do {
@@ -248,6 +269,7 @@ struct AppDependencies {
                 },
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
                 playbackPresentationProvider: { nil },
+                exposesAcceptanceState: true,
                 libraryChanges: libraryChanges
             )
         } catch {
@@ -271,10 +293,12 @@ struct AppDependencies {
                 repository: repository,
                 refresh: refresh,
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
-                playbackPresentationProvider: { nil }
+                playbackPresentationProvider: { nil },
+                exposesAcceptanceState: true
             )
         }
     }
+    #endif
 
     @discardableResult
     func start() async -> LibraryStartupOutcome {
@@ -292,7 +316,8 @@ struct AppDependencies {
         refresh: @escaping Refresh,
         libraryChanges: LibraryChangeSignal,
         libraryStartup: LibraryStartup,
-        exposesAcceptanceMetrics: Bool = false
+        exposesAcceptanceMetrics: Bool = false,
+        exposesAcceptanceState: Bool = false
     ) -> Self {
         let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
             try await repository.profiles()
@@ -312,6 +337,7 @@ struct AppDependencies {
             repository: repository,
             refresh: refresh,
             exposesAcceptanceMetrics: exposesAcceptanceMetrics,
+            exposesAcceptanceState: exposesAcceptanceState,
             libraryChanges: libraryChanges
         )
     }
@@ -377,6 +403,7 @@ private enum ProductionDependencyError: Error {
     case libraryUnavailable
 }
 
+#if DEBUG
 @MainActor
 private final class InertBackgroundRefreshScheduler: BackgroundRefreshScheduling {
     func register(
@@ -492,6 +519,7 @@ private actor SeededLibrarySeeder {
         """.utf8)
     }
 }
+#endif
 
 private actor UnavailableLibraryRepository: LibraryRepository {
     func profiles() throws -> [SourceProfile] { throw ProductionDependencyError.libraryUnavailable }
@@ -517,6 +545,10 @@ private actor UnavailableLibraryRepository: LibraryRepository {
         _ = profileID
         throw ProductionDependencyError.libraryUnavailable
     }
+    func epgProgrammeCount(profileID: UUID) async throws -> Int {
+        _ = profileID
+        throw ProductionDependencyError.libraryUnavailable
+    }
     func programmes(
         profileID: UUID,
         xmltvChannelID: String,
@@ -530,6 +562,20 @@ private actor UnavailableLibraryRepository: LibraryRepository {
     func manualMapping(profileID: UUID, channelID: String) throws -> ManualEPGMapping? {
         _ = profileID
         _ = channelID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func manualMappings(profileID: UUID) throws -> [String: String] {
+        _ = profileID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func programmes(
+        profileID: UUID,
+        xmltvChannelIDs: Set<String>,
+        overlapping: Range<Date>
+    ) throws -> [String: [Programme]] {
+        _ = profileID
+        _ = xmltvChannelIDs
+        _ = overlapping
         throw ProductionDependencyError.libraryUnavailable
     }
     func setManualMapping(profileID: UUID, channelID: String, xmltvChannelID: String?) throws {

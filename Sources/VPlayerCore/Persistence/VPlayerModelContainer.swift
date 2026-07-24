@@ -7,7 +7,63 @@ import SwiftData
 
 public enum VPlayerModelContainer {
     public static func make(inMemory: Bool = false) throws -> ModelContainer {
-        let schema = Schema([
+        let schema = makeSchema()
+        if inMemory {
+            let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+            return try ModelContainer(for: schema, configurations: [configuration])
+        }
+
+        let applicationSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        try FileManager.default.createDirectory(
+            at: applicationSupport,
+            withIntermediateDirectories: true
+        )
+        return try make(
+            persistentStoreURL: applicationSupport.appendingPathComponent("VPlayer.store"),
+            recoveryRootURL: applicationSupport.appendingPathComponent(
+                "VPlayerStoreRecovery",
+                isDirectory: true
+            )
+        )
+    }
+
+    static func make(
+        persistentStoreURL: URL,
+        recoveryRootURL: URL,
+        fileManager: FileManager = .default
+    ) throws -> ModelContainer {
+        try fileManager.createDirectory(
+            at: persistentStoreURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        do {
+            return try makePersistentContainer(at: persistentStoreURL)
+        } catch {
+            do {
+                return try makePersistentContainer(at: persistentStoreURL)
+            } catch {
+                let components = persistentStoreComponents(
+                    at: persistentStoreURL,
+                    fileManager: fileManager
+                )
+                guard !components.isEmpty else { throw error }
+                try quarantine(
+                    components,
+                    recoveryRootURL: recoveryRootURL,
+                    fileManager: fileManager
+                )
+                return try makePersistentContainer(at: persistentStoreURL)
+            }
+        }
+    }
+
+    private static func makeSchema() -> Schema {
+        Schema([
             LibraryStateRecord.self,
             SourceProfileRecord.self,
             PlaylistSnapshotRecord.self,
@@ -17,25 +73,67 @@ public enum VPlayerModelContainer {
             ProgrammeRecord.self,
             ManualEPGMappingRecord.self
         ])
-        let configuration: ModelConfiguration
-        if inMemory {
-            configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
-        } else {
-            let applicationSupport = try FileManager.default.url(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask,
-                appropriateFor: nil,
-                create: true
-            )
-            try FileManager.default.createDirectory(
-                at: applicationSupport,
-                withIntermediateDirectories: true
-            )
-            configuration = ModelConfiguration(
-                schema: schema,
-                url: applicationSupport.appendingPathComponent("VPlayer.store")
-            )
-        }
+    }
+
+    private static func makePersistentContainer(at storeURL: URL) throws -> ModelContainer {
+        let schema = makeSchema()
+        let configuration = ModelConfiguration(schema: schema, url: storeURL)
         return try ModelContainer(for: schema, configurations: [configuration])
+    }
+
+    private static func persistentStoreComponents(
+        at storeURL: URL,
+        fileManager: FileManager
+    ) -> [URL] {
+        let paths = [
+            storeURL.path,
+            storeURL.path + "-wal",
+            storeURL.path + "-shm",
+            storeURL.path + "-journal",
+            storeURL.path + "_SUPPORT",
+        ]
+        return paths
+            .map(URL.init(fileURLWithPath:))
+            .filter { fileManager.fileExists(atPath: $0.path) }
+    }
+
+    static func quarantine(
+        _ components: [URL],
+        recoveryRootURL: URL,
+        fileManager: FileManager,
+        moveItem injectedMoveItem: ((URL, URL) throws -> Void)? = nil
+    ) throws {
+        let moveItem = injectedMoveItem ?? { source, destination in
+            try fileManager.moveItem(at: source, to: destination)
+        }
+        let recoveryDirectory = recoveryRootURL.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: recoveryDirectory, withIntermediateDirectories: true)
+        var moved: [(original: URL, quarantined: URL)] = []
+        do {
+            for component in components {
+                let destination = recoveryDirectory.appendingPathComponent(
+                    component.lastPathComponent,
+                    isDirectory: component.hasDirectoryPath
+                )
+                try moveItem(component, destination)
+                moved.append((component, destination))
+            }
+        } catch let quarantineError {
+            var rollbackFailed = false
+            for item in moved.reversed() {
+                do {
+                    try moveItem(item.quarantined, item.original)
+                } catch {
+                    rollbackFailed = true
+                }
+            }
+            if !rollbackFailed {
+                try? fileManager.removeItem(at: recoveryDirectory)
+            }
+            throw quarantineError
+        }
     }
 }

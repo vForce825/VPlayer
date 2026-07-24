@@ -37,6 +37,19 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let maximumAbsoluteAVDriftMilliseconds: Double
     public let temporalUnavailableNoticeCount: UInt64
     public let crossGenerationPresentationCount: UInt64
+    public let audioRoute: String
+    public let audioReady: Bool
+    public let readinessOpen: Bool
+    public let retainedAudioCount: Int
+    public let retainedVideoCount: Int
+    public let audioFirstPTSSeconds: Double?
+    public let audioDurationSeconds: Double
+    public let videoFirstPTSSeconds: Double?
+    public let demuxPacketCount: UInt64
+    public let videoAccessUnitCount: UInt64
+    public let audioSampleCount: UInt64
+    public let videoDecodeSubmissionCount: UInt64
+    public let maximumVideoDecodeSubmissionMilliseconds: Double
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -100,6 +113,19 @@ final class PlaybackMetrics: @unchecked Sendable {
         var maximumAbsoluteAVDriftMilliseconds = 0.0
         var temporalUnavailableNoticeCount: UInt64 = 0
         var crossGenerationPresentationCount: UInt64 = 0
+        var audioRoute = "systemCompressed"
+        var audioReady = false
+        var readinessOpen = false
+        var retainedAudioCount = 0
+        var retainedVideoCount = 0
+        var audioFirstPTSSeconds: Double?
+        var audioDurationSeconds = 0.0
+        var videoFirstPTSSeconds: Double?
+        var demuxPacketCount: UInt64 = 0
+        var videoAccessUnitCount: UInt64 = 0
+        var audioSampleCount: UInt64 = 0
+        var videoDecodeSubmissionCount: UInt64 = 0
+        var maximumVideoDecodeSubmissionMilliseconds = 0.0
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
@@ -143,11 +169,58 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock { state.activeRoute = Self.name(for: activeRoute) }
     }
 
+    func updateReadinessDiagnostics(
+        audioRoute: AudioRoute,
+        audioReady: Bool,
+        readinessOpen: Bool,
+        retainedAudioCount: Int,
+        retainedVideoCount: Int,
+        audioFirstPTS: CMTime?,
+        audioDuration: CMTime?,
+        videoFirstPTS: CMTime?
+    ) {
+        lock.withLock {
+            state.audioRoute = audioRoute == .systemCompressed
+                ? "systemCompressed"
+                : "ffmpegPCM"
+            state.audioReady = audioReady
+            state.readinessOpen = readinessOpen
+            state.retainedAudioCount = max(0, retainedAudioCount)
+            state.retainedVideoCount = max(0, retainedVideoCount)
+            state.audioFirstPTSSeconds = Self.numericSeconds(audioFirstPTS)
+            state.audioDurationSeconds = Self.numericSeconds(audioDuration) ?? 0
+            state.videoFirstPTSSeconds = Self.numericSeconds(videoFirstPTS)
+        }
+    }
+
     func recordDecoderCallback() {
         let timestamp = now()
         lock.withLock {
             pruneIfNeeded(at: timestamp)
             state.decoderCallbackTimes.append(timestamp)
+        }
+    }
+
+    func recordDemuxPacket() {
+        lock.withLock { state.demuxPacketCount &+= 1 }
+    }
+
+    func recordVideoAccessUnit() {
+        lock.withLock { state.videoAccessUnitCount &+= 1 }
+    }
+
+    func recordAudioSample() {
+        lock.withLock { state.audioSampleCount &+= 1 }
+    }
+
+    func recordVideoDecodeSubmission(milliseconds: Double) {
+        guard milliseconds.isFinite, milliseconds >= 0 else { return }
+        lock.withLock {
+            state.videoDecodeSubmissionCount &+= 1
+            state.maximumVideoDecodeSubmissionMilliseconds = max(
+                state.maximumVideoDecodeSubmissionMilliseconds,
+                milliseconds
+            )
         }
     }
 
@@ -276,7 +349,21 @@ final class PlaybackMetrics: @unchecked Sendable {
             presentedVideoFrames: captured.presentedVideoFrames,
             maximumAbsoluteAVDriftMilliseconds: captured.maximumAbsoluteAVDriftMilliseconds,
             temporalUnavailableNoticeCount: captured.temporalUnavailableNoticeCount,
-            crossGenerationPresentationCount: captured.crossGenerationPresentationCount
+            crossGenerationPresentationCount: captured.crossGenerationPresentationCount,
+            audioRoute: captured.audioRoute,
+            audioReady: captured.audioReady,
+            readinessOpen: captured.readinessOpen,
+            retainedAudioCount: captured.retainedAudioCount,
+            retainedVideoCount: captured.retainedVideoCount,
+            audioFirstPTSSeconds: captured.audioFirstPTSSeconds,
+            audioDurationSeconds: captured.audioDurationSeconds,
+            videoFirstPTSSeconds: captured.videoFirstPTSSeconds,
+            demuxPacketCount: captured.demuxPacketCount,
+            videoAccessUnitCount: captured.videoAccessUnitCount,
+            audioSampleCount: captured.audioSampleCount,
+            videoDecodeSubmissionCount: captured.videoDecodeSubmissionCount,
+            maximumVideoDecodeSubmissionMilliseconds:
+                captured.maximumVideoDecodeSubmissionMilliseconds
         )
     }
 
@@ -308,6 +395,12 @@ final class PlaybackMetrics: @unchecked Sendable {
         let sorted = values.sorted()
         let index = max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
         return sorted[index]
+    }
+
+    private static func numericSeconds(_ time: CMTime?) -> Double? {
+        guard let time, time.isNumeric else { return nil }
+        let seconds = time.seconds
+        return seconds.isFinite ? seconds : nil
     }
 
     private static func name(for scanType: ScanType) -> String {

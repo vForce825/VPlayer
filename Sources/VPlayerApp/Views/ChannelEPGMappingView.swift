@@ -11,12 +11,16 @@ struct ChannelEPGMappingView: View {
     let channel: Channel
 
     @State private var selection: String?
+    @State private var searchText = ""
     @State private var isSaving = false
 
     init(model: AppModel, channel: Channel) {
         self.model = model
         self.channel = channel
-        _selection = State(initialValue: model.matchedEPGChannelID(for: channel))
+        // Preselect only an existing manual override — not the automatic match.
+        // Preselecting the auto-match meant a plain "save" would freeze today's
+        // guess into a permanent manual mapping, defeating future auto-matching.
+        _selection = State(initialValue: model.manualEPGChannelID(for: channel))
     }
 
     var body: some View {
@@ -38,14 +42,21 @@ struct ChannelEPGMappingView: View {
                         description: Text("请先刷新当前数据源的 EPG。")
                     )
                     .accessibilityIdentifier("mapping.empty")
+                } else if filteredEPGChannels.isEmpty {
+                    ContentUnavailableView(
+                        "没有匹配的频道",
+                        systemImage: "magnifyingglass",
+                        description: Text("试试其他关键字。")
+                    )
+                    .accessibilityIdentifier("mapping.no-results")
                 } else {
-                    ForEach(model.epgChannels) { epgChannel in
+                    ForEach(filteredEPGChannels) { epgChannel in
                         Button {
                             selection = epgChannel.id
                         } label: {
                             mappingLabel(
                                 title: epgChannel.displayNames.first ?? epgChannel.id,
-                                subtitle: epgChannel.id,
+                                subtitle: subtitle(for: epgChannel),
                                 selected: selection == epgChannel.id
                             )
                         }
@@ -53,6 +64,7 @@ struct ChannelEPGMappingView: View {
                     }
                 }
             }
+            .searchable(text: $searchText, prompt: "搜索 EPG 频道")
             .navigationTitle("为“\(channel.displayName)”设置 EPG")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -67,6 +79,25 @@ struct ChannelEPGMappingView: View {
                 }
             }
         }
+    }
+
+    private var filteredEPGChannels: [EPGChannel] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return model.epgChannels }
+        return model.epgChannels.filter { epgChannel in
+            epgChannel.id.lowercased().contains(query)
+                || epgChannel.displayNames.contains { $0.lowercased().contains(query) }
+        }
+    }
+
+    private func subtitle(for epgChannel: EPGChannel) -> String {
+        // Surface the effective match so the user can see today's automatic
+        // guess without it being silently persisted as a manual override.
+        if model.manualEPGChannelID(for: channel) == nil,
+           model.matchedEPGChannelID(for: channel) == epgChannel.id {
+            return "\(epgChannel.id) · 自动匹配"
+        }
+        return epgChannel.id
     }
 
     private func mappingLabel(
