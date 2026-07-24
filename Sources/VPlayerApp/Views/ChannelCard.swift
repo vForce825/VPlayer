@@ -5,9 +5,10 @@
 import SwiftUI
 import VPlayerCore
 
-/// Grid tile for one channel. Logo and name carry the tile; the live EPG state
-/// stays a small secondary footer beneath them. Every slot renders even without
-/// EPG data so all tiles in a grid row keep the same height.
+/// Grid tile for one channel. The logo is the tile: it spans the full card
+/// width in 16:9, with the name as a compact caption underneath and the live
+/// EPG state smaller still. Every slot renders even without EPG data so all
+/// tiles in a grid row keep the same height.
 struct ChannelCard: View {
     let channel: Channel
     let programmes: [Programme]
@@ -15,20 +16,17 @@ struct ChannelCard: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             let current = currentProgramme(at: context.date)
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(spacing: 20) {
-                    logo
-                    Text(channel.displayName)
-                        .font(.title3.weight(.semibold))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.8)
-                    Spacer(minLength: 0)
-                }
+            VStack(alignment: .leading, spacing: 12) {
+                logo
+
+                Text(channel.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
 
                 epgFooter(current: current, at: context.date)
             }
-            .padding(.vertical, 18)
-            .padding(.horizontal, 10)
+            .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -36,7 +34,7 @@ struct ChannelCard: View {
     private func epgFooter(current: Programme?, at date: Date) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(current?.title ?? "暂无当前节目")
-                .font(.caption)
+                .font(.caption2)
                 .lineLimit(1)
 
             ProgressView(value: current.map { progress(for: $0, at: date) } ?? 0)
@@ -50,30 +48,33 @@ struct ChannelCard: View {
         .foregroundStyle(.secondary)
     }
 
-    @ViewBuilder
+    /// A fixed 16:9 plate keeps every tile aligned regardless of how the source
+    /// logo is proportioned, and gives channels without a logo the same weight.
     private var logo: some View {
-        Group {
-            if let logoURL = channel.logoURL {
-                AsyncImage(url: logoURL) { phase in
-                    if let image = phase.image {
-                        image.resizable().scaledToFit()
-                    } else {
-                        logoPlaceholder
+        Rectangle()
+            .fill(.thinMaterial)
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .overlay {
+                if let logoURL = channel.logoURL {
+                    AsyncImage(url: logoURL) { phase in
+                        if let image = phase.image {
+                            image.resizable().scaledToFit().padding(20)
+                        } else {
+                            logoPlaceholder
+                        }
                     }
+                } else {
+                    logoPlaceholder
                 }
-            } else {
-                logoPlaceholder
             }
-        }
-        .frame(width: 132, height: 88)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
     private var logoPlaceholder: some View {
         Image(systemName: "tv")
             .resizable()
             .scaledToFit()
-            .padding(22)
+            .padding(.vertical, 34)
             .foregroundStyle(.secondary)
     }
 

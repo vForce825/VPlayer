@@ -12,10 +12,11 @@ struct ChannelBrowserView: View {
     @FocusState private var focusedChannelID: String?
     private let focusPolicy = AcceptanceFocusPolicy.current()
 
-    /// Tiles fill the whole canvas: adaptive sizing yields four columns on a
-    /// 1080p screen and still degrades gracefully under larger dynamic type.
+    /// Tiles fill the whole canvas: adaptive sizing yields five logo-led
+    /// columns on a 1080p screen and still degrades gracefully under larger
+    /// dynamic type.
     private static let gridColumns = [
-        GridItem(.adaptive(minimum: 360, maximum: 560), spacing: 48)
+        GridItem(.adaptive(minimum: 300, maximum: 420), spacing: 40)
     ]
 
     var body: some View {
@@ -77,7 +78,7 @@ struct ChannelBrowserView: View {
 
     private var groupedChannelGrid: some View {
         ScrollView {
-            LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 48) {
+            LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
                 ForEach(groups) { group in
                     Section {
                         ForEach(group.channels) { channel in
