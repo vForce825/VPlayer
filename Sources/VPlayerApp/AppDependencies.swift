@@ -143,7 +143,10 @@ struct AppDependencies {
     static func live() -> Self {
         do {
             let container = try VPlayerModelContainer.make()
-            let repository = SwiftDataLibraryStore(modelContainer: container)
+            let repository = SwiftDataLibraryStore(
+                modelContainer: container,
+                profileMirror: SourceProfileMirror(defaults: .standard)
+            )
             let libraryChanges = LibraryChangeSignal()
             let coordinator = RefreshCoordinator(
                 repository: repository,
@@ -166,7 +169,15 @@ struct AppDependencies {
                 repository: repository,
                 refresh: refresh,
                 libraryChanges: libraryChanges,
-                libraryStartup: LibraryStartup {
+                libraryStartup: LibraryStartup { [weak libraryChanges] in
+                    // tvOS can delete the Caches-resident store between
+                    // launches. Everything else in it is refetchable, so this
+                    // is the one thing that has to be put back, and anything
+                    // that already read the empty library needs telling.
+                    if try await repository.synchronizeProfileMirror() > 0 {
+                        logger.notice("Restored source profiles after a purged persistent store.")
+                        await MainActor.run { libraryChanges?.notify() }
+                    }
                     try await repository.purgeUnreferencedSnapshots()
                 }
             )

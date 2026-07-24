@@ -9,6 +9,7 @@ enum LibraryStoreSavePhase: Equatable, Sendable {
     case profileCreate
     case profileUpdate
     case profileDelete
+    case profileRestore
     case activeProfile
     case manualMapping
     case playlistStaging
@@ -27,6 +28,23 @@ typealias LibraryStoreSaveFault = @Sendable (LibraryStoreSavePhase) throws -> Vo
 @ModelActor
 public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting {
     private var saveFault: LibraryStoreSaveFault?
+    /// Nil for every store built with `init(modelContainer:)`. Mirroring is
+    /// opt-in so that in-memory fixture and test stores cannot overwrite the
+    /// one copy of the real profiles with seeded data.
+    private var profileMirror: SourceProfileMirror?
+
+    /// Mirrors profile configuration into `profileMirror` on every change, so
+    /// `synchronizeProfileMirror()` can rebuild the profiles after the system
+    /// deletes the store. Only the production store needs this.
+    public init(
+        modelContainer: ModelContainer,
+        profileMirror: SourceProfileMirror
+    ) {
+        let modelContext = ModelContext(modelContainer)
+        self.modelExecutor = DefaultSerialModelExecutor(modelContext: modelContext)
+        self.modelContainer = modelContainer
+        self.profileMirror = profileMirror
+    }
 
     init(
         modelContainer: ModelContainer,
@@ -54,7 +72,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         now: Date
     ) throws -> SourceProfile {
         let profileID = UUID()
-        try commit(.profileCreate) {
+        try commitProfileChange(.profileCreate) {
             let record = SourceProfileRecord(
                 id: profileID,
                 name: input.name,
@@ -79,7 +97,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         input: ValidatedSourceProfileInput,
         now: Date
     ) throws {
-        try commit(.profileUpdate) {
+        try commitProfileChange(.profileUpdate) {
             let record = try profileRecord(id: id)
             record.name = input.name
             record.m3uURLString = input.m3uURL.absoluteString
@@ -91,7 +109,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
 
     public func deleteProfile(id: UUID) throws {
-        try commit(.profileDelete) {
+        try commitProfileChange(.profileDelete) {
             let record = try profileRecord(id: id)
             if let snapshotID = record.playlistSnapshotID {
                 try deletePlaylistSnapshot(id: snapshotID)
@@ -118,11 +136,50 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
 
     public func setActiveProfile(id: UUID) throws {
-        try commit(.activeProfile) {
+        try commitProfileChange(.activeProfile) {
             _ = try profileRecord(id: id)
             let state = try requiredStateRecord()
             state.activeProfileID = id
         }
+    }
+
+    /// Reconciles the store with its UserDefaults mirror, returning how many
+    /// profiles it had to rebuild. Call once per launch, before the library is
+    /// read.
+    ///
+    /// The store lives in `Library/Caches`, which tvOS may delete at any time.
+    /// An empty store with a populated mirror is that deletion, and the mirror
+    /// is the only remaining copy of the profiles, so they are rebuilt from it.
+    /// A store that still holds profiles is instead the authority and refreshes
+    /// the mirror, which is also how installs predating the mirror get one.
+    @discardableResult
+    public func synchronizeProfileMirror() throws -> Int {
+        guard let profileMirror else { return 0 }
+        guard try modelContext.fetch(FetchDescriptor<SourceProfileRecord>()).isEmpty else {
+            try updateProfileMirror()
+            return 0
+        }
+
+        let snapshot = profileMirror.load()
+        guard !snapshot.profiles.isEmpty else { return 0 }
+        var restoredIDs: Set<UUID> = []
+        // Committing through the profile path rewrites the mirror afterwards,
+        // so entries dropped as unrestorable do not linger for the next launch.
+        try commitProfileChange(.profileRestore) {
+            for mirrored in snapshot.profiles {
+                guard let record = mirrored.makeRecord() else { continue }
+                modelContext.insert(record)
+                restoredIDs.insert(record.id)
+            }
+            guard !restoredIDs.isEmpty else { return }
+            let state = try requiredStateRecord()
+            let mirroredSelection = snapshot.activeProfileID.flatMap {
+                restoredIDs.contains($0) ? $0 : nil
+            }
+            state.activeProfileID = mirroredSelection
+                ?? snapshot.profiles.first { restoredIDs.contains($0.id) }?.id
+        }
+        return restoredIDs.count
     }
 
     public func channels(profileID: UUID) throws -> [Channel] {
@@ -654,6 +711,29 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         try commit(.epgCleanup) {
             try deleteEPGSnapshot(id: id)
         }
+    }
+
+    /// A profile mutation, plus the mirror update that keeps the UserDefaults
+    /// copy from lagging the store.
+    private func commitProfileChange(
+        _ phase: LibraryStoreSavePhase,
+        changes: () throws -> Void
+    ) throws {
+        try commit(phase, changes: changes)
+        // The mutation is already durable at this point. A mirror that cannot
+        // be rebuilt leaves the recovery copy one edit stale, which is a far
+        // smaller loss than failing an edit the user watched succeed.
+        try? updateProfileMirror()
+    }
+
+    private func updateProfileMirror() throws {
+        guard let profileMirror else { return }
+        let records = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
+            .sorted(by: Self.profileOrder)
+        profileMirror.save(SourceProfileMirrorSnapshot(
+            profiles: records.map(MirroredSourceProfile.init(record:)),
+            activeProfileID: try stateRecord()?.activeProfileID
+        ))
     }
 
     private func commit(

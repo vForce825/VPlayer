@@ -1098,9 +1098,216 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(epgChannels.map(\.id), ["news"])
     }
 
+    func testPurgedStoreRebuildsMirroredProfilesAndTheActiveSelection() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, original) = try makeMirroringStore(defaults: defaults)
+        _ = try await original.createProfile(input(name: "First"), now: date(10))
+        let second = try await original.createProfile(input(name: "Second"), now: date(20))
+        try await original.setActiveProfile(id: second.id)
+        let mirroredProfiles = try await original.profiles()
+
+        // A purged Caches directory leaves the next launch opening a store with
+        // nothing in it, which a fresh in-memory container reproduces exactly.
+        let (_, afterPurge) = try makeMirroringStore(defaults: defaults)
+        let restoredCount = try await afterPurge.synchronizeProfileMirror()
+
+        let restored = try await afterPurge.profiles()
+        let active = try await afterPurge.activeProfile()
+        XCTAssertEqual(restoredCount, 2)
+        XCTAssertEqual(active?.id, second.id)
+        XCTAssertEqual(restored.map(\.id), mirroredProfiles.map(\.id))
+        XCTAssertEqual(restored.map(\.name), ["First", "Second"])
+        XCTAssertEqual(restored.map(\.m3uURL), mirroredProfiles.map(\.m3uURL))
+        XCTAssertEqual(restored.map(\.epgURL), mirroredProfiles.map(\.epgURL))
+        XCTAssertEqual(
+            restored.map(\.m3uRefreshInterval),
+            mirroredProfiles.map(\.m3uRefreshInterval)
+        )
+        XCTAssertEqual(
+            restored.map(\.epgRefreshInterval),
+            mirroredProfiles.map(\.epgRefreshInterval)
+        )
+        XCTAssertEqual(restored.map(\.createdAt), mirroredProfiles.map(\.createdAt))
+        // The playlist and EPG the profile pointed at went with the purge, so a
+        // restored profile has to read as never refreshed rather than claiming
+        // data it no longer has.
+        XCTAssertEqual(restored.map(\.m3uStatus.state), [.never, .never])
+        XCTAssertEqual(restored.map(\.epgStatus.state), [.never, .never])
+        let restoredChannels = try await afterPurge.channels(profileID: second.id)
+        XCTAssertEqual(restoredChannels, [])
+    }
+
+    func testIntactStoreKeepsItsProfilesAndIsNotDuplicatedByTheMirror() async throws {
+        let defaults = try mirrorDefaults()
+        let (container, store) = try makeMirroringStore(defaults: defaults)
+        let first = try await store.createProfile(input(name: "First"), now: date(10))
+        let second = try await store.createProfile(input(name: "Second"), now: date(20))
+        try await store.setActiveProfile(id: second.id)
+        try await store.installPlaylist(
+            profileID: first.id,
+            channels: [channel(profileID: first.id, name: "Live", path: "live")],
+            fetchedAt: date(30)
+        )
+
+        let restoredCount = try await store.synchronizeProfileMirror()
+
+        let profiles = try await store.profiles()
+        let active = try await store.activeProfile()
+        XCTAssertEqual(restoredCount, 0)
+        XCTAssertEqual(profiles.map(\.id), [first.id, second.id])
+        XCTAssertEqual(active?.id, second.id)
+        // Restoring on top of a live store would double every row rather than
+        // report a count, so count the records instead of trusting the API.
+        XCTAssertEqual(
+            try ModelContext(container).fetch(FetchDescriptor<SourceProfileRecord>()).count,
+            2
+        )
+        let channels = try await store.channels(profileID: first.id)
+        XCTAssertEqual(channels.map(\.displayName), ["Live"])
+    }
+
+    func testMirrorFollowsProfileEditsSoAPurgeCannotResurrectDeletedProfiles() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, original) = try makeMirroringStore(defaults: defaults)
+        let kept = try await original.createProfile(input(name: "Kept"), now: date(10))
+        let removed = try await original.createProfile(input(name: "Removed"), now: date(20))
+        try await original.setActiveProfile(id: removed.id)
+        try await original.updateProfile(id: kept.id, input: input(name: "Renamed"), now: date(30))
+        try await original.deleteProfile(id: removed.id)
+
+        let (_, afterPurge) = try makeMirroringStore(defaults: defaults)
+        let restoredCount = try await afterPurge.synchronizeProfileMirror()
+
+        let restored = try await afterPurge.profiles()
+        let active = try await afterPurge.activeProfile()
+        XCTAssertEqual(restoredCount, 1)
+        XCTAssertEqual(restored.map(\.name), ["Renamed"])
+        XCTAssertEqual(restored.map(\.m3uURL.absoluteString), [
+            "https://playlist.example/Renamed.m3u",
+        ])
+        // Deleting the active profile hands the selection to the survivor, and
+        // the mirror has to have recorded that rather than the deleted id.
+        XCTAssertEqual(active?.id, kept.id)
+    }
+
+    func testStoreWrittenBeforeMirroringExistedIsBackfilledOnFirstSynchronize() async throws {
+        let defaults = try mirrorDefaults()
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let unmirrored = SwiftDataLibraryStore(modelContainer: container)
+        let first = try await unmirrored.createProfile(input(name: "First"), now: date(10))
+        let second = try await unmirrored.createProfile(input(name: "Second"), now: date(20))
+        try await unmirrored.setActiveProfile(id: second.id)
+        XCTAssertNil(defaults.data(forKey: SourceProfileMirror.storageKey))
+
+        let mirroring = SwiftDataLibraryStore(
+            modelContainer: container,
+            profileMirror: SourceProfileMirror(defaults: defaults)
+        )
+        let backfilledCount = try await mirroring.synchronizeProfileMirror()
+        XCTAssertEqual(backfilledCount, 0)
+
+        let (_, afterPurge) = try makeMirroringStore(defaults: defaults)
+        let restoredCount = try await afterPurge.synchronizeProfileMirror()
+        let restored = try await afterPurge.profiles()
+        let active = try await afterPurge.activeProfile()
+        XCTAssertEqual(restoredCount, 2)
+        XCTAssertEqual(restored.map(\.id), [first.id, second.id])
+        XCTAssertEqual(active?.id, second.id)
+    }
+
+    func testUnrestorableMirrorEntriesAreDroppedWithoutLosingTheRest() async throws {
+        let defaults = try mirrorDefaults()
+        let unusableID = UUID()
+        let usableID = UUID()
+        // Written by hand because no store mutation can produce a profile whose
+        // URL never parses, while a hand-edited or truncated defaults plist can.
+        defaults.set(Data("""
+        {
+          "profiles": [
+            {
+              "id": "\(unusableID.uuidString)",
+              "name": "Unusable",
+              "m3uURLString": "not a url",
+              "epgURLString": "https://epg.example/Unusable.xml",
+              "m3uRefreshIntervalRaw": 21600,
+              "epgRefreshIntervalRaw": 86400,
+              "createdAt": 10,
+              "updatedAt": 10
+            },
+            {
+              "id": "\(usableID.uuidString)",
+              "name": "Usable",
+              "m3uURLString": "https://playlist.example/Usable.m3u",
+              "epgURLString": "https://epg.example/Usable.xml",
+              "m3uRefreshIntervalRaw": 21600,
+              "epgRefreshIntervalRaw": 86400,
+              "createdAt": 20,
+              "updatedAt": 20
+            }
+          ],
+          "activeProfileID": "\(unusableID.uuidString)"
+        }
+        """.utf8), forKey: SourceProfileMirror.storageKey)
+
+        let (_, store) = try makeMirroringStore(defaults: defaults)
+        let restoredCount = try await store.synchronizeProfileMirror()
+
+        let restored = try await store.profiles()
+        let active = try await store.activeProfile()
+        XCTAssertEqual(restoredCount, 1)
+        // One unusable entry must not take `profiles()` down with it, and the
+        // selection has to fall back to something that actually came back.
+        XCTAssertEqual(restored.map(\.id), [usableID])
+        XCTAssertEqual(restored.map(\.name), ["Usable"])
+        XCTAssertEqual(active?.id, usableID)
+
+        // The rewritten mirror no longer carries the entry that was dropped.
+        let (_, reopened) = try makeMirroringStore(defaults: defaults)
+        let reopenedCount = try await reopened.synchronizeProfileMirror()
+        let reopenedProfiles = try await reopened.profiles()
+        XCTAssertEqual(reopenedCount, 1)
+        XCTAssertEqual(reopenedProfiles.map(\.id), [usableID])
+    }
+
+    func testStoreWithoutMirrorDefaultsNeverTouchesTheMirror() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, unmirrored) = try makeStore()
+        _ = try await unmirrored.createProfile(input(name: "Fixture"), now: date(10))
+
+        let restoredCount = try await unmirrored.synchronizeProfileMirror()
+        XCTAssertEqual(restoredCount, 0)
+        XCTAssertNil(defaults.data(forKey: SourceProfileMirror.storageKey))
+        XCTAssertNil(
+            UserDefaults.standard.data(forKey: SourceProfileMirror.storageKey)
+        )
+    }
+
     private func makeStore() throws -> (ModelContainer, SwiftDataLibraryStore) {
         let container = try VPlayerModelContainer.make(inMemory: true)
         return (container, SwiftDataLibraryStore(modelContainer: container))
+    }
+
+    private func makeMirroringStore(
+        defaults: UserDefaults
+    ) throws -> (ModelContainer, SwiftDataLibraryStore) {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        return (
+            container,
+            SwiftDataLibraryStore(
+                modelContainer: container,
+                profileMirror: SourceProfileMirror(defaults: defaults)
+            )
+        )
+    }
+
+    /// A suite of its own per test, so the mirror never reads or writes the
+    /// defaults the running simulator's app shares.
+    private func mirrorDefaults() throws -> UserDefaults {
+        let suiteName = "SwiftDataLibraryStoreTests.\(UUID().uuidString)"
+        addTeardownBlock {
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        return try XCTUnwrap(UserDefaults(suiteName: suiteName))
     }
 
     private func makeStore(

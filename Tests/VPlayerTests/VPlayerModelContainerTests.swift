@@ -151,6 +151,65 @@ final class VPlayerModelContainerTests: XCTestCase {
         XCTAssertFalse(root.path.hasPrefix(applicationSupport.path))
     }
 
+    func testStoreFilesDeletedLikeACachesPurgeStillReturnTheConfiguredProfiles() async throws {
+        let fixture = try PersistentStoreFixture()
+        defer { fixture.remove() }
+        let defaults = try mirrorDefaults()
+        let secondProfileID: UUID
+
+        do {
+            let container = try VPlayerModelContainer.make(
+                persistentStoreURL: fixture.storeURL,
+                recoveryRootURL: fixture.recoveryRootURL
+            )
+            let store = SwiftDataLibraryStore(
+                modelContainer: container,
+                profileMirror: SourceProfileMirror(defaults: defaults)
+            )
+            _ = try await store.createProfile(
+                profileInput(name: "Living room"),
+                now: Date(timeIntervalSince1970: 1)
+            )
+            let second = try await store.createProfile(
+                profileInput(name: "Bedroom"),
+                now: Date(timeIntervalSince1970: 2)
+            )
+            try await store.setActiveProfile(id: second.id)
+            secondProfileID = second.id
+        }
+
+        // tvOS reclaims Library/Caches wholesale, so delete the store the same
+        // way rather than emptying it through the repository.
+        try fixture.deleteStoreFiles()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.storeURL.path))
+
+        let reopened = try VPlayerModelContainer.make(
+            persistentStoreURL: fixture.storeURL,
+            recoveryRootURL: fixture.recoveryRootURL
+        )
+        let store = SwiftDataLibraryStore(
+            modelContainer: reopened,
+            profileMirror: SourceProfileMirror(defaults: defaults)
+        )
+        let profilesAfterPurge = try await store.profiles()
+        XCTAssertTrue(profilesAfterPurge.isEmpty)
+
+        let restoredCount = try await store.synchronizeProfileMirror()
+
+        let profiles = try await store.profiles()
+        let active = try await store.activeProfile()
+        XCTAssertEqual(restoredCount, 2)
+        XCTAssertEqual(profiles.map(\.name), ["Living room", "Bedroom"])
+        XCTAssertEqual(active?.id, secondProfileID)
+        XCTAssertEqual(
+            profiles.map(\.m3uURL.absoluteString),
+            ["https://example.test/list.m3u", "https://example.test/list.m3u"]
+        )
+        XCTAssertEqual(profiles.map(\.m3uRefreshInterval), [.sixHours, .sixHours])
+        XCTAssertEqual(profiles.map(\.epgRefreshInterval), [.daily, .daily])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.recoveryRootURL.path))
+    }
+
     private func profileInput(name: String) throws -> ValidatedSourceProfileInput {
         try SourceProfileInput(
             name: name,
@@ -159,6 +218,16 @@ final class VPlayerModelContainerTests: XCTestCase {
             m3uRefreshInterval: .sixHours,
             epgRefreshInterval: .daily
         ).validated()
+    }
+
+    /// A suite of its own per test, so the mirror never reads or writes the
+    /// defaults the running simulator's app shares.
+    private func mirrorDefaults() throws -> UserDefaults {
+        let suiteName = "VPlayerModelContainerTests.\(UUID().uuidString)"
+        addTeardownBlock {
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        return try XCTUnwrap(UserDefaults(suiteName: suiteName))
     }
 }
 
@@ -182,5 +251,17 @@ private final class PersistentStoreFixture {
 
     func remove() {
         try? FileManager.default.removeItem(at: directoryURL)
+    }
+
+    /// Removes the store and every sidecar SQLite leaves next to it, which is
+    /// what the app finds after tvOS reclaims the Caches directory.
+    func deleteStoreFiles() throws {
+        let fileManager = FileManager.default
+        for url in try fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil
+        ) where url.lastPathComponent.hasPrefix(storeURL.lastPathComponent) {
+            try fileManager.removeItem(at: url)
+        }
     }
 }
