@@ -458,7 +458,7 @@ public actor RefreshCoordinator {
         case LibraryRepositoryError.profileNotFound:
             reason = "找不到源配置。"
         case is M3UParserError, is PlaylistTextDecodingError:
-            reason = "播放列表格式无效。"
+            reason = "M3U 内容格式无效。"
         case is XMLTVParserError, LibraryRepositoryError.epgHasNoChannels:
             reason = "EPG 格式无效。"
         default:
@@ -469,7 +469,7 @@ public actor RefreshCoordinator {
             }
         }
 
-        let resourceName = resource == .playlist ? "播放列表" : "EPG"
+        let resourceName = resource == .playlist ? "频道列表" : "EPG"
         let summary = "刷新\(resourceName)失败：\(reason)"
         return String(summary.prefix(240))
     }

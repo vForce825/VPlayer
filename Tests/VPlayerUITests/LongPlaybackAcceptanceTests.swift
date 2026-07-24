@@ -1457,7 +1457,7 @@ private enum AcceptanceTab: Int, CaseIterable {
     var name: String {
         switch self {
         case .channels: "频道"
-        case .sources: "数据源"
+        case .sources: "播放列表"
         case .settings: "设置"
         }
     }

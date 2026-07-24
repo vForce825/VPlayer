@@ -174,7 +174,7 @@ final class RefreshCoordinatorTests: XCTestCase {
         let outcome = try XCTUnwrap(outcomes.first)
         XCTAssertFalse(outcome.succeeded)
         let message = try XCTUnwrap(outcome.message)
-        XCTAssertTrue(message.hasPrefix("刷新播放列表失败："))
+        XCTAssertTrue(message.hasPrefix("刷新频道列表失败："))
         XCTAssertFalse(message.contains("example.test"))
         XCTAssertFalse(message.contains("secret"))
         let snapshot = await repository.snapshot()
@@ -445,7 +445,7 @@ final class RefreshCoordinatorTests: XCTestCase {
         let outcome = try XCTUnwrap(outcomes.first)
 
         let message = try XCTUnwrap(outcome.message)
-        XCTAssertTrue(message.hasPrefix("刷新播放列表失败："))
+        XCTAssertTrue(message.hasPrefix("刷新频道列表失败："))
         XCTAssertFalse(message.contains("example.test"))
         XCTAssertFalse(message.contains("/path"))
         XCTAssertFalse(message.contains("user"))

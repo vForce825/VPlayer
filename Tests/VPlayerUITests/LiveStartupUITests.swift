@@ -14,7 +14,7 @@ final class LiveStartupUITests: XCTestCase {
         XCTAssertFalse(app.alerts["操作失败"].waitForExistence(timeout: 2))
         XCTAssertFalse(app.staticTexts["无法读取数据，请稍后重试。"].exists)
 
-        selectTab(named: "数据源", in: app)
+        selectTab(named: "播放列表", in: app)
         let add = app.buttons["source.add"]
         XCTAssertTrue(add.waitForExistence(timeout: 5))
         XCUIRemote.shared.press(.select)

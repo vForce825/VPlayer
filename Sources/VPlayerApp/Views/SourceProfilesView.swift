@@ -51,10 +51,10 @@ struct SourceProfilesView: View {
             }
         }
         #endif
-        .sheet(isPresented: $isAdding, onDismiss: focusAfterAdding) {
+        .fullScreenCover(isPresented: $isAdding, onDismiss: focusAfterAdding) {
             SourceProfileEditorView(model: model, profile: nil)
         }
-        .sheet(item: $editedProfile) { profile in
+        .fullScreenCover(item: $editedProfile) { profile in
             SourceProfileEditorView(model: model, profile: profile)
         }
         .confirmationDialog(
@@ -75,6 +75,8 @@ struct SourceProfilesView: View {
             Button("取消", role: .cancel) {
                 pendingDeletion = nil
             }
+        } message: {
+            Text("已导入的频道和节目单会一并移除。")
         }
     }
 
@@ -91,55 +93,82 @@ struct SourceProfilesView: View {
 
     private var content: some View {
         NavigationStack {
-            List {
-                Section {
-                    addButton
-                }
-
+            Group {
                 if model.profiles.isEmpty && !model.isLoading {
-                    ContentUnavailableView(
-                        "还没有数据源",
-                        systemImage: "externaldrive.badge.plus",
-                        description: Text("添加后即可刷新频道列表和 EPG。")
-                    )
+                    emptyState
+                } else {
+                    profileList
                 }
+            }
+            .navigationTitle("播放列表")
+        }
+    }
 
-                ForEach(model.profiles) { profile in
-                    Section {
-                        profileHeader(profile)
-                        resourceStatus(
-                            title: "播放列表",
-                            status: profile.m3uStatus,
-                            refreshIdentifier: "source.refresh.playlist",
-                            statusIdentifier: "source.status.playlist",
-                            focusTarget: .playlistRefresh
-                        ) {
-                            await model.refresh(profileID: profile.id, resource: .playlist)
-                        }
-                        resourceStatus(
-                            title: "EPG",
-                            status: profile.epgStatus,
-                            refreshIdentifier: "source.refresh.epg",
-                            statusIdentifier: "source.status.epg",
-                            focusTarget: .epgRefresh
-                        ) {
-                            await model.refresh(profileID: profile.id, resource: .epg)
-                        }
-                        HStack {
-                            Button("编辑") {
-                                editedProfile = profile
-                            }
-                            .accessibilityIdentifier("source.edit.\(profile.id.uuidString)")
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image(systemName: "play.square.stack")
+                .font(.system(size: 96, weight: .regular))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 16)
+            Text("还没有播放列表")
+                .font(.title2.bold())
+            Text("添加 M3U 播放列表和 EPG 节目单地址，即可开始观看频道。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            addButton
+                .padding(.top, 24)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
 
-                            Button("删除", role: .destructive) {
-                                pendingDeletion = profile
-                            }
-                            .accessibilityIdentifier("source.delete.\(profile.id.uuidString)")
+    private var profileList: some View {
+        List {
+            Section {
+                addButton
+            }
+
+            ForEach(model.profiles) { profile in
+                Section {
+                    profileHeader(profile)
+                    resourceStatus(
+                        title: "频道列表",
+                        systemImage: "list.bullet.rectangle",
+                        status: profile.m3uStatus,
+                        refreshIdentifier: "source.refresh.playlist",
+                        statusIdentifier: "source.status.playlist",
+                        focusTarget: .playlistRefresh
+                    ) {
+                        await model.refresh(profileID: profile.id, resource: .playlist)
+                    }
+                    resourceStatus(
+                        title: "节目单（EPG）",
+                        systemImage: "calendar",
+                        status: profile.epgStatus,
+                        refreshIdentifier: "source.refresh.epg",
+                        statusIdentifier: "source.status.epg",
+                        focusTarget: .epgRefresh
+                    ) {
+                        await model.refresh(profileID: profile.id, resource: .epg)
+                    }
+                    HStack(spacing: 24) {
+                        Button {
+                            editedProfile = profile
+                        } label: {
+                            Label("编辑", systemImage: "pencil")
                         }
+                        .accessibilityIdentifier("source.edit.\(profile.id.uuidString)")
+
+                        Button(role: .destructive) {
+                            pendingDeletion = profile
+                        } label: {
+                            Label("删除", systemImage: "trash")
+                        }
+                        .accessibilityIdentifier("source.delete.\(profile.id.uuidString)")
                     }
                 }
             }
-            .navigationTitle("数据源")
         }
     }
 
@@ -147,7 +176,7 @@ struct SourceProfilesView: View {
         Button {
             isAdding = true
         } label: {
-            Label("添加数据源", systemImage: "plus")
+            Label("添加播放列表", systemImage: "plus")
         }
         .accessibilityIdentifier("source.add")
         .focused($focusedControl, equals: .add)
@@ -163,7 +192,12 @@ struct SourceProfilesView: View {
     }
 
     private func profileHeader(_ profile: SourceProfile) -> some View {
-        HStack {
+        let isActive = model.activeProfile?.id == profile.id
+        return HStack(alignment: .center, spacing: 24) {
+            Image(systemName: "play.square.stack.fill")
+                .font(.title3)
+                .foregroundStyle(isActive ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
+                .frame(width: 52)
             VStack(alignment: .leading, spacing: 6) {
                 Text(profile.name)
                     .font(.headline)
@@ -173,11 +207,15 @@ struct SourceProfilesView: View {
                     .lineLimit(1)
             }
             Spacer()
-            if model.activeProfile?.id == profile.id {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .accessibilityLabel("当前数据源")
-                    .accessibilityIdentifier(activeIdentifier(profile))
+            if isActive {
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .accessibilityLabel("当前播放列表")
+                        .accessibilityIdentifier(activeIdentifier(profile))
+                    Text("当前使用")
+                }
+                .font(.callout)
+                .foregroundStyle(.green)
             } else {
                 Button("设为当前") {
                     Task {
@@ -200,23 +238,34 @@ struct SourceProfilesView: View {
 
     private func resourceStatus(
         title: String,
+        systemImage: String,
         status: ResourceRefreshStatus,
         refreshIdentifier: String,
         statusIdentifier: String,
         focusTarget: AcceptanceFocusPolicy.SourceControl,
         refresh: @escaping @MainActor () async -> Void
     ) -> some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 5) {
+        HStack(alignment: .top, spacing: 24) {
+            Image(systemName: systemImage)
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(width: 52)
+            VStack(alignment: .leading, spacing: 6) {
                 Text(title)
-                Text(ResourceRefreshStatusPresentation.text(for: status))
-                    .font(.caption)
-                    .foregroundStyle(status.state == .failed ? .red : .secondary)
-                    .accessibilityIdentifier(statusIdentifier)
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(statusColor(for: status))
+                        .frame(width: 12, height: 12)
+                    Text(ResourceRefreshStatusPresentation.text(for: status))
+                        .font(.caption)
+                        .foregroundStyle(status.state == .failed ? .red : .secondary)
+                        .accessibilityIdentifier(statusIdentifier)
+                }
                 if let error = status.errorSummary {
                     Text(error)
                         .font(.caption2)
                         .foregroundStyle(.red)
+                        .lineLimit(2)
                 }
             }
             Spacer()
@@ -231,7 +280,16 @@ struct SourceProfilesView: View {
         }
     }
 
+    private func statusColor(for status: ResourceRefreshStatus) -> Color {
+        switch status.state {
+        case .never: .gray
+        case .refreshing: .orange
+        case .succeeded: .green
+        case .failed: .red
+        }
+    }
+
     private func activeIdentifier(_ profile: SourceProfile) -> String {
-        profile.name == "测试数据源" ? "source.active.seeded" : "source.active.\(profile.id.uuidString)"
+        profile.name == "测试播放列表" ? "source.active.seeded" : "source.active.\(profile.id.uuidString)"
     }
 }

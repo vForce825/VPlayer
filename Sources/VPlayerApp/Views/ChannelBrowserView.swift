@@ -20,15 +20,15 @@ struct ChannelBrowserView: View {
                     .accessibilityIdentifier("channel.loading")
             case .noSource:
                 ContentUnavailableView(
-                    "还没有数据源",
-                    systemImage: "externaldrive.badge.plus",
-                    description: Text("请前往“数据源”添加 M3U 和 EPG 地址。")
+                    "还没有播放列表",
+                    systemImage: "play.square.stack",
+                    description: Text("请前往“播放列表”添加 M3U 和 EPG 地址。")
                 )
             case .noChannels:
                 ContentUnavailableView(
                     "没有频道",
                     systemImage: "tv.slash",
-                    description: Text("请在“数据源”中刷新播放列表。")
+                    description: Text("请在“播放列表”中刷新频道列表。")
                 )
             case .channels:
                 channelList

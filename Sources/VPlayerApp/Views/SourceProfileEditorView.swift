@@ -95,8 +95,43 @@ struct SourceProfileEditorView: View {
 
     private var editor: some View {
         NavigationStack {
-            Form {
-                TextField("数据源名称", text: $name)
+            HStack(alignment: .top, spacing: 64) {
+                sidebar
+                    .frame(maxWidth: 560, alignment: .topLeading)
+                form
+            }
+            .padding(.vertical, 48)
+        }
+        // fullScreenCover on tvOS has no opaque backdrop of its own; without
+        // this the presenting screen bleeds through the editor.
+        .background(.thickMaterial, ignoresSafeAreaEdges: .all)
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            Image(systemName: "play.square.stack")
+                .font(.system(size: 72, weight: .medium))
+                .foregroundStyle(.tint)
+            Text(profile == nil ? "添加播放列表" : "编辑播放列表")
+                .font(.title.bold())
+            Text("填写 M3U 播放列表与 EPG 节目单地址，保存后 VPlayer 会导入频道和节目信息，并按设定的频率自动刷新。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let validationMessage {
+                Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("source.editor.error")
+            }
+            Spacer()
+        }
+    }
+
+    private var form: some View {
+        Form {
+            Section {
+                TextField("播放列表名称", text: $name)
                     .accessibilityIdentifier("source.editor.name")
                 m3uURLField
                     .textInputAutocapitalization(.never)
@@ -104,33 +139,35 @@ struct SourceProfileEditorView: View {
                 epgURLField
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-
-                Picker("M3U 刷新频率", selection: $m3uRefreshInterval) {
-                    refreshIntervalOptions
-                }
-                Picker("EPG 刷新频率", selection: $epgRefreshInterval) {
-                    refreshIntervalOptions
-                }
-
-                saveButton
-
-                if let validationMessage {
-                    Text(validationMessage)
-                        .foregroundStyle(.red)
-                        .accessibilityIdentifier("source.editor.error")
-                }
+            } header: {
+                Text("基本信息")
+            } footer: {
+                Text("地址仅支持 HTTP 或 HTTPS。")
             }
-            .navigationTitle(profile == nil ? "添加数据源" : "编辑数据源")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { cancel() }
+
+            Section {
+                Picker("频道列表", selection: $m3uRefreshInterval) {
+                    refreshIntervalOptions
                 }
+                Picker("节目单（EPG）", selection: $epgRefreshInterval) {
+                    refreshIntervalOptions
+                }
+            } header: {
+                Text("自动刷新")
+            } footer: {
+                Text("除自动刷新外，也可以随时在播放列表页手动刷新。")
+            }
+
+            Section {
+                saveButton
+                Button("取消") { cancel() }
+                    .accessibilityIdentifier("source.editor.cancel")
             }
         }
     }
 
     private var saveButton: some View {
-        Button("保存") { save() }
+        Button(isSaving ? "保存中…" : "保存") { save() }
             .disabled(isSaving)
             .accessibilityIdentifier("source.editor.save")
             .focused($focusedTarget, equals: .save)

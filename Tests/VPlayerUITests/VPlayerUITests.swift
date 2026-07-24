@@ -11,7 +11,7 @@ final class VPlayerUITests: XCTestCase {
 
         XCTAssertTrue(app.tabBars.buttons["频道"].waitForExistence(timeout: 5))
 
-        selectTab(named: "数据源", in: app)
+        selectTab(named: "播放列表", in: app)
         XCTAssertTrue(app.buttons["source.add"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["source.refresh.playlist"].exists)
         XCTAssertTrue(app.buttons["source.refresh.epg"].exists)

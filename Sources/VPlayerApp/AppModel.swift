@@ -279,7 +279,7 @@ final class AppModel {
                     return false
                 }
                 reconcileCreatedProfile(createdProfile)
-                presentOperationMessage("数据源已保存，但界面未能重新读取。请重试；再次保存不会重复创建。")
+                presentOperationMessage("播放列表已保存，但界面未能重新读取。请重试；再次保存不会重复创建。")
                 return false
             }
             guard !cancelledCreationAttemptIDs.contains(attemptID) else {
@@ -288,7 +288,7 @@ final class AppModel {
             }
             guard profiles.contains(where: { $0.id == createdProfile.id }) else {
                 pendingCreation = nil
-                presentOperationMessage("数据源已保存，但已无法在资料库中找到。请重新添加。")
+                presentOperationMessage("播放列表已保存，但已无法在资料库中找到。请重新添加。")
                 return false
             }
             if pendingCreation?.attemptID == attemptID {
@@ -361,7 +361,7 @@ final class AppModel {
                 if deletedActiveProfile {
                     clearActiveBoundState()
                 }
-                presentOperationMessage("数据源已删除，但界面未能重新读取。请稍后重试。")
+                presentOperationMessage("播放列表已删除，但界面未能重新读取。请稍后重试。")
                 return false
             case .superseded:
                 return false
@@ -409,7 +409,7 @@ final class AppModel {
             case .failedWhileCurrent:
                 activeProfile = profiles.first { $0.id == profileID }
                 clearChannelState()
-                presentOperationMessage("当前数据源已切换，但频道未能重新读取。请稍后重试。")
+                presentOperationMessage("当前播放列表已切换，但频道未能重新读取。请稍后重试。")
                 return false
             case .superseded:
                 return false

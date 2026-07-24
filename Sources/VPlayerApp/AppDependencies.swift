@@ -446,7 +446,7 @@ private actor SeededLibrarySeeder {
             }
             let profile = try await repository.createProfile(
                 SourceProfileInput(
-                    name: "测试数据源",
+                    name: "测试播放列表",
                     m3uURLString: "https://fixture.invalid/playlist.m3u",
                     epgURLString: "https://fixture.invalid/epg.xml",
                     m3uRefreshInterval: .manual,

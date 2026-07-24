@@ -39,7 +39,7 @@ struct ChannelEPGMappingView: View {
                     ContentUnavailableView(
                         "没有可用的 EPG 频道",
                         systemImage: "list.bullet.rectangle",
-                        description: Text("请先刷新当前数据源的 EPG。")
+                        description: Text("请先刷新当前播放列表的 EPG。")
                     )
                     .accessibilityIdentifier("mapping.empty")
                 } else if filteredEPGChannels.isEmpty {

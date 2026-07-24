@@ -49,7 +49,7 @@ struct RootView: View {
 
             SourceProfilesView(model: model)
                 .tabItem {
-                    Label("数据源", systemImage: "externaldrive.connected.to.line.below")
+                    Label("播放列表", systemImage: "play.square.stack")
                 }
                 .tag(AcceptanceFocusPolicy.RootTab.sources)
 

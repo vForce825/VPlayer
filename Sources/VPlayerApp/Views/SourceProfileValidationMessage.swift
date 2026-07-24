@@ -14,7 +14,7 @@ enum SourceProfileValidationMessage {
     static func text(for error: any Error) -> String? {
         switch error {
         case SourceProfileValidationError.emptyName:
-            "请输入数据源名称。"
+            "请输入播放列表名称。"
         case SourceProfileValidationError.invalidURL(field: .m3u):
             "请输入有效的 M3U 地址。"
         case SourceProfileValidationError.invalidURL(field: .epg):
