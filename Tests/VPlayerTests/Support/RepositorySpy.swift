@@ -160,6 +160,10 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         storedChannels[profileID] = channels
     }
 
+    func replaceProgrammes(_ programmes: [Programme], profileID: UUID) {
+        storedProgrammes[profileID] = programmes
+    }
+
     func replaceProfiles(_ profiles: [SourceProfile], activeProfileID: UUID?) {
         storedProfiles = profiles
         storedActiveProfileID = activeProfileID
@@ -406,6 +410,12 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         if failsReads { throw InjectedError.read }
         _ = try profileIndex(profileID)
         return storedProgrammes[profileID, default: []].count
+    }
+
+    func epgCoverageEnd(profileID: UUID) async throws -> Date? {
+        if failsReads { throw InjectedError.read }
+        _ = try profileIndex(profileID)
+        return storedProgrammes[profileID, default: []].map(\.stop).max()
     }
 
     func programmes(

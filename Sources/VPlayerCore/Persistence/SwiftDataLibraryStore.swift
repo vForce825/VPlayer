@@ -150,6 +150,16 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         )).first?.programmeCount ?? 0
     }
 
+    public func epgCoverageEnd(profileID: UUID) throws -> Date? {
+        guard let snapshotID = try profileRecord(id: profileID).epgSnapshotID else { return nil }
+        var descriptor = FetchDescriptor<ProgrammeRecord>(
+            predicate: #Predicate { $0.snapshotID == snapshotID },
+            sortBy: [SortDescriptor(\.stop, order: .reverse)]
+        )
+        descriptor.fetchLimit = 1
+        return try modelContext.fetch(descriptor).first?.stop
+    }
+
     public func programmes(
         profileID: UUID,
         xmltvChannelID: String,

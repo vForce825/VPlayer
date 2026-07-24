@@ -41,6 +41,9 @@ final class AppModel {
     var channels: [Channel] = []
     var epgChannels: [EPGChannel] = []
     var epgProgrammeCount = 0
+    /// Set only when the stored EPG holds programmes that all ended before the
+    /// reload, so screens can say so instead of showing empty schedules.
+    var staleEPGCoverageEnd: Date?
     var programmesByChannelID: [String: [Programme]] = [:]
     var presentedPlaybackRequest: PlaybackRequest?
     var alertMessage: String?
@@ -74,6 +77,9 @@ final class AppModel {
     @ObservationIgnored private var mutationLaneIdleWaiters: [MutationLaneIdleWaiter] = []
     @ObservationIgnored private var refreshReconciliationTasks: [
         RefreshKey: RefreshReconciliationTask
+    ] = [:]
+    @ObservationIgnored private var automaticRefreshTasks: [
+        RefreshKey: AutomaticRefreshTask
     ] = [:]
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private var alertKind = AlertKind.operation
@@ -112,6 +118,9 @@ final class AppModel {
         for reconciliation in refreshReconciliationTasks.values {
             reconciliation.task.cancel()
         }
+        for automaticRefresh in automaticRefreshTasks.values {
+            automaticRefresh.task.cancel()
+        }
     }
 
     @discardableResult
@@ -148,6 +157,7 @@ final class AppModel {
                     channels: [],
                     epgChannels: [],
                     epgProgrammeCount: 0,
+                    epgCoverageEnd: nil,
                     matches: [:],
                     manualMappings: [:],
                     programmes: [:],
@@ -161,10 +171,19 @@ final class AppModel {
             async let epgProgrammeCountLoad = repository.epgProgrammeCount(
                 profileID: loadedActiveProfile.id
             )
-            let (loadedChannels, loadedEPGChannels, loadedEPGProgrammeCount) = try await (
+            async let epgCoverageEndLoad = repository.epgCoverageEnd(
+                profileID: loadedActiveProfile.id
+            )
+            let (
+                loadedChannels,
+                loadedEPGChannels,
+                loadedEPGProgrammeCount,
+                loadedEPGCoverageEnd
+            ) = try await (
                 channelLoad,
                 epgChannelLoad,
-                epgProgrammeCountLoad
+                epgProgrammeCountLoad,
+                epgCoverageEndLoad
             )
             try Task.checkCancellation()
 
@@ -223,6 +242,7 @@ final class AppModel {
                 channels: loadedChannels.sorted { ($0.order, $0.id) < ($1.order, $1.id) },
                 epgChannels: loadedEPGChannels,
                 epgProgrammeCount: loadedEPGProgrammeCount,
+                epgCoverageEnd: loadedEPGCoverageEnd,
                 matches: matches,
                 manualMappings: scopedManualMappings,
                 programmes: programmes,
@@ -294,6 +314,10 @@ final class AppModel {
             if pendingCreation?.attemptID == attemptID {
                 pendingCreation = nil
             }
+            startAutomaticRefresh(
+                profileID: createdProfile.id,
+                resources: Set(RefreshResource.allCases)
+            )
             return true
         } catch {
             presentOperationError(error)
@@ -315,6 +339,10 @@ final class AppModel {
         do {
             let validatedInput = try input.validated()
             let updatedAt = now()
+            let retargetedResources = Self.retargetedResources(
+                by: validatedInput,
+                comparedTo: profiles.first { $0.id == profileID }
+            )
             try await repository.updateProfile(id: profileID, input: validatedInput, now: updatedAt)
             clearPendingCreation(profileID: profileID)
             reconcileUpdatedProfile(id: profileID, input: validatedInput, updatedAt: updatedAt)
@@ -323,6 +351,7 @@ final class AppModel {
                 presentOperationMessage("更改已保存，但界面未能重新读取。请稍后重试。")
                 return false
             }
+            startAutomaticRefresh(profileID: profileID, resources: retargetedResources)
             return true
         } catch {
             presentOperationError(error)
@@ -473,6 +502,51 @@ final class AppModel {
         await reconciliationTask?.value
     }
 
+    /// Fetches resources the user has just pointed somewhere new. A freshly
+    /// saved playlist has no channels and no programmes yet, and the schedulers
+    /// cannot close that gap: the foreground driver only sweeps once a minute,
+    /// and a resource set to 仅手动 is never due at all.
+    private func startAutomaticRefresh(profileID: UUID, resources: Set<RefreshResource>) {
+        for resource in RefreshResource.allCases where resources.contains(resource) {
+            let key = RefreshKey(profileID: profileID, resource: resource)
+            let automaticRefreshID = UUID()
+            cancelAutomaticRefresh(for: key)
+            automaticRefreshTasks[key] = AutomaticRefreshTask(
+                id: automaticRefreshID,
+                task: Task { @MainActor [weak self] in
+                    await self?.refresh(profileID: profileID, resource: resource)
+                    self?.finishAutomaticRefresh(key: key, id: automaticRefreshID)
+                }
+            )
+        }
+    }
+
+    private func cancelAutomaticRefresh(for key: RefreshKey) {
+        automaticRefreshTasks.removeValue(forKey: key)?.task.cancel()
+    }
+
+    private func finishAutomaticRefresh(key: RefreshKey, id: UUID) {
+        guard automaticRefreshTasks[key]?.id == id else { return }
+        automaticRefreshTasks[key] = nil
+    }
+
+    /// The resources whose remote address changed, so their imported content no
+    /// longer describes what the profile points at.
+    private static func retargetedResources(
+        by input: ValidatedSourceProfileInput,
+        comparedTo profile: SourceProfile?
+    ) -> Set<RefreshResource> {
+        guard let profile else { return [] }
+        var resources: Set<RefreshResource> = []
+        if profile.m3uURL != input.m3uURL {
+            resources.insert(.playlist)
+        }
+        if profile.epgURL != input.epgURL {
+            resources.insert(.epg)
+        }
+        return resources
+    }
+
     @discardableResult
     func saveMapping(channel: Channel, xmltvChannelID: String?) async -> Bool {
         guard isCurrentMappingTarget(channel) else {
@@ -551,6 +625,7 @@ final class AppModel {
         channels: [Channel],
         epgChannels: [EPGChannel],
         epgProgrammeCount: Int,
+        epgCoverageEnd: Date?,
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
         programmes: [String: [Programme]],
@@ -575,6 +650,11 @@ final class AppModel {
         self.channels = channels
         self.epgChannels = epgChannels
         self.epgProgrammeCount = epgProgrammeCount
+        self.staleEPGCoverageEnd = EPGCoverageNotice.staleCoverageEnd(
+            coverageEnd: epgCoverageEnd,
+            programmeCount: epgProgrammeCount,
+            now: now()
+        )
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
@@ -662,6 +742,7 @@ final class AppModel {
             channels: channels,
             epgChannels: epgChannels,
             epgProgrammeCount: epgProgrammeCount,
+            staleEPGCoverageEnd: staleEPGCoverageEnd,
             matchByChannelID: matchByChannelID,
             manualMappingByChannelID: manualMappingByChannelID,
             programmesByChannelID: programmesByChannelID,
@@ -680,6 +761,7 @@ final class AppModel {
         channels = transition.previousState.channels
         epgChannels = transition.previousState.epgChannels
         epgProgrammeCount = transition.previousState.epgProgrammeCount
+        staleEPGCoverageEnd = transition.previousState.staleEPGCoverageEnd
         matchByChannelID = transition.previousState.matchByChannelID
         manualMappingByChannelID = transition.previousState.manualMappingByChannelID
         programmesByChannelID = transition.previousState.programmesByChannelID
@@ -698,6 +780,7 @@ final class AppModel {
         channels = []
         epgChannels = []
         epgProgrammeCount = 0
+        staleEPGCoverageEnd = nil
         matchByChannelID = [:]
         manualMappingByChannelID = [:]
         programmesByChannelID = [:]
@@ -1126,6 +1209,7 @@ fileprivate extension AppModel {
         let channels: [Channel]
         let epgChannels: [EPGChannel]
         let epgProgrammeCount: Int
+        let staleEPGCoverageEnd: Date?
         let matchByChannelID: [String: EPGMatchResult]
         let manualMappingByChannelID: [String: String]
         let programmesByChannelID: [String: [Programme]]
@@ -1151,6 +1235,11 @@ fileprivate extension AppModel {
     }
 
     struct RefreshReconciliationTask {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    struct AutomaticRefreshTask {
         let id: UUID
         let task: Task<Void, Never>
     }

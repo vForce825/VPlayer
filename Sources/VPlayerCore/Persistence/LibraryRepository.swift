@@ -14,6 +14,10 @@ public protocol LibraryRepository: Sendable {
     func channels(profileID: UUID) async throws -> [Channel]
     func epgChannels(profileID: UUID) async throws -> [EPGChannel]
     func epgProgrammeCount(profileID: UUID) async throws -> Int
+    /// Latest `stop` across the profile's stored EPG, or nil when it holds no
+    /// programmes. Lets callers tell an EPG that imported cleanly but only
+    /// covers days that already passed from one that was never fetched.
+    func epgCoverageEnd(profileID: UUID) async throws -> Date?
     func programmes(
         profileID: UUID,
         xmltvChannelID: String,

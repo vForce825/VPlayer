@@ -238,6 +238,51 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(installedChannels, [original])
     }
 
+    func testEPGCoverageEndReportsLatestStopAndIsNilWithoutProgrammes() async throws {
+        let (_, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        let coverageWithoutEPG = try await store.epgCoverageEnd(profileID: profile.id)
+        XCTAssertNil(coverageWithoutEPG)
+
+        let channelOnlyURL = try temporaryXML(
+            "<tv><channel id=\"news\"><display-name>News</display-name></channel></tv>"
+        )
+        defer { try? FileManager.default.removeItem(at: channelOnlyURL) }
+        _ = try await store.installEPG(
+            profileID: profile.id,
+            fileURL: channelOnlyURL,
+            fetchedAt: date(20)
+        )
+        let coverageWithoutProgrammes = try await store.epgCoverageEnd(profileID: profile.id)
+        XCTAssertNil(coverageWithoutProgrammes)
+
+        // The latest stop wins even when it belongs to a channel other than the
+        // one carrying the latest start.
+        let scheduleURL = try temporaryXML(
+            """
+            <tv>
+              <channel id="news"><display-name>News</display-name></channel>
+              <channel id="film"><display-name>Film</display-name></channel>
+              <programme channel="news" start="20260718150000 Z" stop="20260718160000 Z">
+                <title>Bulletin</title>
+              </programme>
+              <programme channel="film" start="20260718140000 Z" stop="20260718183000 Z">
+                <title>Feature</title>
+              </programme>
+            </tv>
+            """
+        )
+        defer { try? FileManager.default.removeItem(at: scheduleURL) }
+        _ = try await store.installEPG(
+            profileID: profile.id,
+            fileURL: scheduleURL,
+            fetchedAt: date(30)
+        )
+
+        let coverageEnd = try await store.epgCoverageEnd(profileID: profile.id)
+        XCTAssertEqual(coverageEnd, ISO8601DateFormatter().date(from: "2026-07-18T18:30:00Z"))
+    }
+
     func testMalformedEPGReplacementThrowsAndLeavesPreviousSnapshotQueryable() async throws {
         let (_, store) = try makeStore()
         let profile = try await store.createProfile(input(name: "Home"), now: date(10))

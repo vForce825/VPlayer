@@ -549,6 +549,10 @@ private actor UnavailableLibraryRepository: LibraryRepository {
         _ = profileID
         throw ProductionDependencyError.libraryUnavailable
     }
+    func epgCoverageEnd(profileID: UUID) async throws -> Date? {
+        _ = profileID
+        throw ProductionDependencyError.libraryUnavailable
+    }
     func programmes(
         profileID: UUID,
         xmltvChannelID: String,

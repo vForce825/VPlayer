@@ -78,6 +78,9 @@ struct ChannelBrowserView: View {
 
     private var groupedChannelGrid: some View {
         ScrollView {
+            if let staleCoverageEnd = model.staleEPGCoverageEnd {
+                staleEPGBanner(coverageEnd: staleCoverageEnd)
+            }
             LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
                 ForEach(groups) { group in
                     Section {
@@ -112,6 +115,27 @@ struct ChannelBrowserView: View {
             }
             .accessibilityIdentifier("channel.mapping.\(channel.id)")
         }
+    }
+
+    /// Explains a grid full of "暂无当前节目": the EPG imported, but every
+    /// programme in it already ended. Never focusable — it is a note, not a
+    /// control standing between the remote and the channels.
+    private func staleEPGBanner(coverageEnd: Date) -> some View {
+        Label(
+            EPGCoverageNotice.text(staleCoverageEnd: coverageEnd),
+            systemImage: "calendar.badge.exclamationmark"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 16)
+        .padding(.horizontal, 20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
+        .accessibilityIdentifier("channel.epg.stale")
+        .focusable(false)
     }
 
     private func groupHeader(for group: ChannelGroup) -> some View {

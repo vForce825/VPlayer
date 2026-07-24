@@ -48,6 +48,73 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    func testReloadReportsEPGWhoseProgrammesAllEndedAndClearsItOnceCoverageReachesNow() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let channel = makeChannel(profileID: profile.id, url: "https://active.test/live", tvgID: "epg", order: 0)
+        let staleStop = now.addingTimeInterval(-3 * 24 * 3_600)
+        let stale = Programme(
+            id: "stale",
+            xmltvChannelID: "epg",
+            start: staleStop.addingTimeInterval(-1_800),
+            stop: staleStop,
+            title: "Ended three days ago",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [channel]],
+            epgChannels: [profile.id: [EPGChannel(id: "epg", displayNames: ["Channel 0"], iconURL: nil)]],
+            programmes: [profile.id: [stale]]
+        )
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        await model.reload()
+
+        // The window query returns nothing, so without coverage the screens
+        // could only show empty schedules with no explanation.
+        XCTAssertTrue(model.programmesByChannelID[channel.id, default: []].isEmpty)
+        XCTAssertEqual(model.staleEPGCoverageEnd, staleStop)
+
+        let current = Programme(
+            id: "current",
+            xmltvChannelID: "epg",
+            start: now.addingTimeInterval(-900),
+            stop: now.addingTimeInterval(900),
+            title: "On air",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        )
+        await repository.replaceProgrammes([stale, current], profileID: profile.id)
+        await model.reload()
+
+        XCTAssertEqual(model.programmesByChannelID[channel.id], [current])
+        XCTAssertNil(model.staleEPGCoverageEnd)
+    }
+
+    func testReloadWithoutAnyEPGProgrammesReportsNoStaleCoverage() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let channel = makeChannel(profileID: profile.id, url: "https://active.test/live", tvgID: "epg", order: 0)
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [channel]]
+        )
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        await model.reload()
+
+        // "Never fetched" is already spelled out by the refresh status; a
+        // staleness note on top of it would only be noise.
+        XCTAssertEqual(model.epgProgrammeCount, 0)
+        XCTAssertNil(model.staleEPGCoverageEnd)
+    }
+
     func testReloadUsesOnlyActiveProfileAndLoadsMatchedProgrammesInRequiredWindow() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let inactive = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Inactive", now: now)
@@ -2285,6 +2352,80 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(snapshot.profileUpdateCount, 2)
     }
 
+    func testCreatedProfileFetchesBothResourcesWithoutWaitingForTheScheduler() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let probe = RefreshCallProbe()
+        let model = AppModel(
+            repository: RepositorySpy(profiles: []),
+            refresh: { profileID, resources, trigger in
+                await probe.record(profileID: profileID, resources: resources, trigger: trigger)
+                return resources.map { RefreshOutcome(resource: $0, succeeded: true, message: nil) }
+            },
+            now: { now }
+        )
+        // 仅手动 is never due, so without the fetch that saving starts the
+        // playlist would stay empty until the user pressed 立即刷新 twice.
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+
+        let created = await model.create(input: input, attemptID: UUID())
+        XCTAssertTrue(created)
+        let createdID = try XCTUnwrap(model.profiles.first?.id)
+
+        await probe.waitForCalls(count: 2)
+        let calls = await probe.calls
+        XCTAssertEqual(Set(calls.flatMap(\.resources)), [.playlist, .epg])
+        XCTAssertTrue(calls.allSatisfy { $0.profileID == createdID })
+    }
+
+    func testEditedProfileRefetchesOnlyTheResourceWhoseAddressChanged() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
+        let probe = RefreshCallProbe()
+        let model = AppModel(
+            repository: RepositorySpy(profiles: [profile], activeProfileID: profile.id),
+            refresh: { profileID, resources, trigger in
+                await probe.record(profileID: profileID, resources: resources, trigger: trigger)
+                return resources.map { RefreshOutcome(resource: $0, succeeded: true, message: nil) }
+            },
+            now: { now }
+        )
+        func input(epgURLString: String) -> SourceProfileInput {
+            SourceProfileInput(
+                name: "Renamed",
+                m3uURLString: profile.m3uURL.absoluteString,
+                epgURLString: epgURLString,
+                m3uRefreshInterval: .daily,
+                epgRefreshInterval: .daily
+            )
+        }
+
+        await model.reload()
+        // Renaming and rescheduling leave the imported content valid; a new EPG
+        // address does not, and its stored success timestamp would otherwise
+        // keep the scheduler quiet for a whole day.
+        let renamed = await model.update(
+            profileID: profile.id,
+            input: input(epgURLString: profile.epgURL.absoluteString)
+        )
+        XCTAssertTrue(renamed)
+        let retargeted = await model.update(
+            profileID: profile.id,
+            input: input(epgURLString: "https://example.test/another-epg.xml")
+        )
+        XCTAssertTrue(retargeted)
+
+        await probe.waitForCalls(count: 1)
+        let calls = await probe.calls
+        XCTAssertEqual(calls.map(\.resources), [[.epg]])
+        XCTAssertEqual(calls.first?.profileID, profile.id)
+    }
+
     func testCancellingCreateAttemptAllowsIntentionalIdenticalCreationFromNewSheet() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let repository = RepositorySpy(profiles: [])
@@ -3824,9 +3965,24 @@ private actor RefreshCallProbe {
     }
 
     private(set) var calls: [Call] = []
+    private var waiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     func record(profileID: UUID, resources: Set<RefreshResource>, trigger: RefreshTrigger) {
         calls.append(Call(profileID: profileID, resources: resources, trigger: trigger))
+        let satisfied = waiters.filter { $0.count <= calls.count }
+        waiters.removeAll { $0.count <= calls.count }
+        for waiter in satisfied {
+            waiter.continuation.resume()
+        }
+    }
+
+    /// Join point for refreshes the model starts on its own, which no caller
+    /// awaits.
+    func waitForCalls(count: Int) async {
+        guard calls.count < count else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append((count: count, continuation: continuation))
+        }
     }
 }
 
