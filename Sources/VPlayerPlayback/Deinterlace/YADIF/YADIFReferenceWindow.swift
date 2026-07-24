@@ -143,9 +143,10 @@ struct YADIFReferenceWindow: Sendable {
     private func isGap(_ delta: CMTime) -> Bool {
         guard !acceptedDeltas.isEmpty else { return false }
         let median = medianAcceptedDelta()
+        let doubledDelta = CMTimeMultiply(delta, multiplier: 2)
         let tripledMedian = CMTimeMultiply(median, multiplier: 3)
-        guard delta.isNumeric, tripledMedian.isNumeric else { return true }
-        return CMTimeCompare(delta, tripledMedian) > 0
+        guard doubledDelta.isNumeric, tripledMedian.isNumeric else { return true }
+        return CMTimeCompare(doubledDelta, tripledMedian) > 0
     }
 
     private func medianAcceptedDelta() -> CMTime {

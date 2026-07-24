@@ -684,7 +684,18 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         }
 
         if route == .metalYADIF2x {
-            guard case let .interlaced(order) = classifier.current else { return }
+            let order: ResolvedFieldOrder
+            if case let .interlaced(o) = classifier.current {
+                order = o
+            } else if case let .progressiveSegmentedFrame(o?) = classifier.current {
+                order = o
+            } else {
+                order = ResolvedFieldOrder(
+                    parity: .top,
+                    confidence: .assumed,
+                    source: .contentProbe
+                )
+            }
             yadif.submit(
                 normalized: normalized,
                 order: order,
