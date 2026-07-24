@@ -5,9 +5,9 @@
 import SwiftUI
 import VPlayerCore
 
-/// Grid tile for one channel: identity on the first row, then the live EPG
-/// state. Every slot renders even without EPG data so all tiles in a grid row
-/// keep the same height.
+/// Grid tile for one channel. Logo and name carry the tile; the live EPG state
+/// stays a small secondary footer beneath them. Every slot renders even without
+/// EPG data so all tiles in a grid row keep the same height.
 struct ChannelCard: View {
     let channel: Channel
     let programmes: [Programme]
@@ -15,35 +15,39 @@ struct ChannelCard: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             let current = currentProgramme(at: context.date)
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 20) {
                     logo
                     Text(channel.displayName)
-                        .font(.headline)
-                        .lineLimit(1)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
                     Spacer(minLength: 0)
                 }
 
-                Text(current?.title ?? "暂无当前节目")
-                    .font(.subheadline)
-                    .foregroundStyle(current == nil ? .secondary : .primary)
-                    .lineLimit(1)
+                epgFooter(current: current, at: context.date)
+            }
+            .padding(.vertical, 18)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
 
-                ProgressView(
-                    value: current.map { progress(for: $0, at: context.date) } ?? 0
-                )
+    private func epgFooter(current: Programme?, at date: Date) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(current?.title ?? "暂无当前节目")
+                .font(.caption)
+                .lineLimit(1)
+
+            ProgressView(value: current.map { progress(for: $0, at: date) } ?? 0)
                 .accessibilityLabel("当前节目进度")
                 .opacity(current == nil ? 0 : 1)
 
-                Text(nextProgrammeLine(at: context.date) ?? " ")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .padding(.vertical, 16)
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(nextProgrammeLine(at: date) ?? " ")
+                .font(.caption2)
+                .lineLimit(1)
         }
+        .foregroundStyle(.secondary)
     }
 
     @ViewBuilder
@@ -61,15 +65,15 @@ struct ChannelCard: View {
                 logoPlaceholder
             }
         }
-        .frame(width: 84, height: 56)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .frame(width: 132, height: 88)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var logoPlaceholder: some View {
         Image(systemName: "tv")
             .resizable()
             .scaledToFit()
-            .padding(16)
+            .padding(22)
             .foregroundStyle(.secondary)
     }
 
