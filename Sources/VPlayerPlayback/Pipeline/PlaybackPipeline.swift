@@ -1017,8 +1017,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             renderer.resetPresentationTiming()
             display.resetPresentationTiming()
         }
-        renderer.flush(to: generationController.current)
-        for frame in retainedVideo { renderer.enqueue(frame) }
         display.resumeSubmission()
         metrics?.beginAVDriftGracePeriod(seconds: 5)
         if !readyPublished {
@@ -1069,19 +1067,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func boundRetainedVideoIsolated() {
         assertIsolated()
-        if !paused, readiness?.isOpen == false {
-            if let audioFirstPTS = contiguousAudioInterval()?.first {
-                retainedVideo.removeAll { frame in
-                    let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
-                    return end.isNumeric && CMTimeCompare(end, audioFirstPTS) <= 0
-                }
+        if let audioFirstPTS = contiguousAudioInterval()?.first {
+            retainedVideo.removeAll { frame in
+                let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+                return end.isNumeric && CMTimeCompare(end, audioFirstPTS) <= 0
             }
-            if retainedVideo.count > Self.startupRetainedVideoCapacity {
-                retainedVideo.removeFirst(
-                    retainedVideo.count - Self.startupRetainedVideoCapacity
-                )
-            }
-            return
         }
 
         guard retainedVideo.count > Self.retainedVideoCapacity else { return }
