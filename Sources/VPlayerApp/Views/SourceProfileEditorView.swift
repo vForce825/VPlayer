@@ -133,12 +133,15 @@ struct SourceProfileEditorView: View {
             Section {
                 TextField("播放列表名称", text: $name)
                     .accessibilityIdentifier("source.editor.name")
+                    .font(.title2)
                 m3uURLField
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .font(.title2)
                 epgURLField
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .font(.title2)
             } header: {
                 Text("基本信息")
             } footer: {

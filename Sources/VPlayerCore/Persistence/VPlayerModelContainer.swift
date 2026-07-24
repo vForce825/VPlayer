@@ -13,19 +13,14 @@ public enum VPlayerModelContainer {
             return try ModelContainer(for: schema, configurations: [configuration])
         }
 
-        let applicationSupport = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
+        let storeRoot = try persistentStoreRootURL()
         try FileManager.default.createDirectory(
-            at: applicationSupport,
+            at: storeRoot,
             withIntermediateDirectories: true
         )
         return try make(
-            persistentStoreURL: applicationSupport.appendingPathComponent("VPlayer.store"),
-            recoveryRootURL: applicationSupport.appendingPathComponent(
+            persistentStoreURL: storeRoot.appendingPathComponent("VPlayer.store"),
+            recoveryRootURL: storeRoot.appendingPathComponent(
                 "VPlayerStoreRecovery",
                 isDirectory: true
             )
@@ -60,6 +55,20 @@ public enum VPlayerModelContainer {
                 return try makePersistentContainer(at: persistentStoreURL)
             }
         }
+    }
+
+    /// tvOS only grants the sandbox write access to Caches and tmp. Creating
+    /// `Library/Application Support` fails on device with EPERM even though the
+    /// simulator allows it, so Caches is the only usable store location here.
+    /// The library is a rebuildable mirror of the remote playlist and EPG, so a
+    /// system purge under storage pressure costs a refresh, not user data.
+    static func persistentStoreRootURL(fileManager: FileManager = .default) throws -> URL {
+        try fileManager.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
     }
 
     private static func makeSchema() -> Schema {

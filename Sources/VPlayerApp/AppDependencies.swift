@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import OSLog
 import VPlayerCore
 import VPlayerPlayback
 
@@ -170,6 +171,10 @@ struct AppDependencies {
                 }
             )
         } catch {
+            // The UI can only say "storage is unavailable"; without this the
+            // real reason never leaves the process and the failure is
+            // undiagnosable on a device.
+            logger.error("Persistent library store unavailable: \(error, privacy: .public)")
             let repository = UnavailableLibraryRepository()
             let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
                 throw ProductionDependencyError.libraryUnavailable
@@ -401,6 +406,8 @@ struct AppDependencies {
 }
 
 typealias VPlayerDependencies = AppDependencies
+
+private let logger = Logger(subsystem: "com.vplayer.app", category: "AppDependencies")
 
 private enum ProductionDependencyError: Error {
     case libraryUnavailable

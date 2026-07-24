@@ -144,6 +144,14 @@ struct SourceProfilesView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 40) {
                 addButton
+                    // The remote only crosses between controls that overlap
+                    // along the axis it travels, and this button sits at the
+                    // leading edge while every card control below it is
+                    // trailing-aligned. Widening the row into a focus section
+                    // puts the whole width in the remote's path, so pressing
+                    // down leaves the button instead of dead-ending on it.
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .focusSection()
                 ForEach(model.profiles) { profile in
                     profileCard(profile)
                 }
@@ -261,6 +269,10 @@ struct SourceProfilesView: View {
             }
             .accessibilityIdentifier("source.delete.\(profile.id.uuidString)")
         }
+        // Each row of the card is one focus section spanning the card width, so
+        // the remote steps between rows on any vertical press rather than only
+        // where two controls happen to line up.
+        .focusSection()
     }
 
     private func activeBadge(_ profile: SourceProfile) -> some View {
@@ -336,6 +348,7 @@ struct SourceProfilesView: View {
             .accessibilityIdentifier(refreshIdentifier)
             .focused($focusedControl, equals: focusTarget)
         }
+        .focusSection()
     }
 
     private func statusColor(for status: ResourceRefreshStatus) -> Color {

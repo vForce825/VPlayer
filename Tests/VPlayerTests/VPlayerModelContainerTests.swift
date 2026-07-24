@@ -129,6 +129,28 @@ final class VPlayerModelContainerTests: XCTestCase {
         )
     }
 
+    func testPersistentStoreRootAvoidsSandboxRestrictedApplicationSupport() throws {
+        // On device tvOS denies creating Library/Application Support while the
+        // simulator permits it, so only a path assertion catches a regression
+        // back to a location that fails solely on real hardware.
+        let root = try VPlayerModelContainer.persistentStoreRootURL().standardizedFileURL
+        let applicationSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ).standardizedFileURL
+        let caches = try FileManager.default.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ).standardizedFileURL
+
+        XCTAssertEqual(root.path, caches.path)
+        XCTAssertFalse(root.path.hasPrefix(applicationSupport.path))
+    }
+
     private func profileInput(name: String) throws -> ValidatedSourceProfileInput {
         try SourceProfileInput(
             name: name,

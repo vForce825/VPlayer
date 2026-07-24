@@ -134,6 +134,72 @@ final class VPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testZZDiagnoseSourceFocus() {
+        let app = launchSeededApp()
+        XCTAssertTrue(app.tabBars.buttons["频道"].waitForExistence(timeout: 5))
+        selectTab(named: "播放列表", in: app)
+        XCTAssertTrue(app.buttons["source.add"].waitForExistence(timeout: 3))
+
+        print("DIAG-TREE-LIST\n\(app.debugDescription)\nDIAG-TREE-LIST-END")
+        attachScreenshot(named: "list")
+
+        print("DIAG-FOCUS start: \(focusDump(app))")
+        let moves: [(String, XCUIRemote.Button)] = [
+            ("down", .down), ("down", .down), ("down", .down),
+            ("up", .up), ("up", .up), ("up", .up)
+        ]
+        for (name, button) in moves {
+            XCUIRemote.shared.press(button)
+            print("DIAG-FOCUS after \(name): \(focusDump(app))")
+        }
+
+        XCTAssertTrue(app.buttons["source.add"].hasFocus)
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(app.textFields["source.editor.name"].waitForExistence(timeout: 5))
+        Thread.sleep(forTimeInterval: 3)
+        print("DIAG-TREE-ADD\n\(app.debugDescription)\nDIAG-TREE-ADD-END")
+        attachScreenshot(named: "add-name-focused")
+        XCUIRemote.shared.press(.down)
+        Thread.sleep(forTimeInterval: 2)
+        attachScreenshot(named: "add-m3u-focused")
+        XCUIRemote.shared.press(.down)
+        Thread.sleep(forTimeInterval: 2)
+        attachScreenshot(named: "add-epg-focused")
+        XCUIRemote.shared.press(.down)
+        XCUIRemote.shared.press(.down)
+        XCUIRemote.shared.press(.down)
+        Thread.sleep(forTimeInterval: 2)
+        attachScreenshot(named: "add-away-from-fields")
+    }
+
+    @MainActor
+    private func editButton(in app: XCUIApplication) -> XCUIElement {
+        app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH 'source.edit.'")
+        ).firstMatch
+    }
+
+    @MainActor
+    private func attachScreenshot(named name: String) {
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    private func focusDump(_ app: XCUIApplication) -> String {
+        var found: [String] = []
+        for type in [XCUIElement.ElementType.button, .textField] {
+            for element in app.descendants(matching: type).allElementsBoundByIndex where element.hasFocus {
+                let label = element.identifier.isEmpty ? element.label : element.identifier
+                found.append("\(type.rawValue)/\(label)/\(element.frame)")
+            }
+        }
+        return found.isEmpty ? "<none>" : found.joined(separator: " | ")
+    }
+
+    @MainActor
     private func launchSeededApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = [

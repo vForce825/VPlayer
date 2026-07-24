@@ -66,3 +66,25 @@ final class EPGCoverageNoticeTests: XCTestCase {
         XCTAssertTrue(text.contains("EPG 地址"))
     }
 }
+
+import UIKit
+
+final class ZZFontProbeTests: XCTestCase {
+    @MainActor
+    func testPrintPreferredFontSizes() {
+        let styles: [(String, UIFont.TextStyle)] = [
+            ("largeTitle", .largeTitle), ("title1", .title1), ("title2", .title2),
+            ("title3", .title3), ("headline", .headline), ("subheadline", .subheadline),
+            ("body", .body), ("callout", .callout), ("footnote", .footnote),
+            ("caption1", .caption1), ("caption2", .caption2)
+        ]
+        for (name, style) in styles {
+            let font = UIFont.preferredFont(forTextStyle: style)
+            print("FONTPROBE \(name) size=\(font.pointSize) name=\(font.fontName)")
+        }
+        let field = UITextField()
+        field.placeholder = "EPG 地址"
+        field.text = "https://example.com"
+        print("FONTPROBE UITextField default font=\(String(describing: field.font))")
+    }
+}
