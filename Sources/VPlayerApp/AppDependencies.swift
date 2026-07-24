@@ -68,6 +68,7 @@ struct AppDependencies {
     let refresh: Refresh
     let prepare: Prepare
     let playbackSettings: PlaybackSettingsStore
+    let channelBrowsingSettings: ChannelBrowsingSettingsStore
     let playbackEngine: any PlaybackEngine
     let playbackPresentationProvider: PlaybackPresentationProvider
     let playbackMetricsProvider: PlaybackMetricsProvider
@@ -92,6 +93,7 @@ struct AppDependencies {
         },
         prepare: @escaping Prepare = {},
         playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore(),
+        channelBrowsingSettings: ChannelBrowsingSettingsStore = ChannelBrowsingSettingsStore(),
         playbackEngine: (any PlaybackEngine)? = nil,
         playbackPresentationProvider: PlaybackPresentationProvider? = nil,
         playbackMetricsProvider: PlaybackMetricsProvider? = nil,
@@ -105,6 +107,7 @@ struct AppDependencies {
         self.refresh = refresh
         self.prepare = prepare
         self.playbackSettings = playbackSettings
+        self.channelBrowsingSettings = channelBrowsingSettings
         let resolvedPlaybackEngine: any PlaybackEngine
         if let playbackEngine {
             resolvedPlaybackEngine = playbackEngine
@@ -439,9 +442,16 @@ private actor SeededLibrarySeeder {
         let now = Date()
 
         do {
+            // Channel identity hashes the stream URL, so every fixture channel
+            // needs its own or the playlist install rejects the duplicate.
             guard let relayStreamURL = URL(
                 string: "https://relay.fixture.invalid/rtp/239.1.1.1:5000"
-            ), let multicastStreamURL = URL(string: "udp://239.1.1.1:5000") else {
+            ), let multicastStreamURL = URL(string: "udp://239.1.1.1:5000"),
+                let secondGroupStreamURL = URL(
+                    string: "https://relay.fixture.invalid/rtp/239.1.1.2:5000"
+                ), let ungroupedStreamURL = URL(
+                    string: "https://relay.fixture.invalid/rtp/239.1.1.3:5000"
+                ) else {
                 return
             }
             let profile = try await repository.createProfile(
@@ -478,6 +488,30 @@ private actor SeededLibrarySeeder {
                         groupTitle: "测试分组",
                         attributes: ["ui-test-id": "channel.udp"],
                         order: 1
+                    ),
+                    // A second group makes the group rail real, and a blank
+                    // group-title covers the playlists that leave it out.
+                    Channel(
+                        sourceProfileID: profile.id,
+                        displayName: "另一组频道",
+                        streamURL: secondGroupStreamURL,
+                        tvgID: nil,
+                        tvgName: nil,
+                        logoURL: nil,
+                        groupTitle: "第二分组",
+                        attributes: ["ui-test-id": "channel.grouped"],
+                        order: 2
+                    ),
+                    Channel(
+                        sourceProfileID: profile.id,
+                        displayName: "无分组频道",
+                        streamURL: ungroupedStreamURL,
+                        tvgID: nil,
+                        tvgName: nil,
+                        logoURL: nil,
+                        groupTitle: "   ",
+                        attributes: ["ui-test-id": "channel.ungrouped"],
+                        order: 3
                     ),
                 ],
                 fetchedAt: now

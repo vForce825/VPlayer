@@ -41,7 +41,10 @@ struct RootView: View {
         @Bindable var model = model
 
         return TabView(selection: $selectedTab) {
-            ChannelBrowserView(model: model)
+            ChannelBrowserView(
+                model: model,
+                browsingSettings: dependencies.channelBrowsingSettings
+            )
                 .tabItem {
                     Label("频道", systemImage: "play.rectangle")
                 }
@@ -53,7 +56,10 @@ struct RootView: View {
                 }
                 .tag(AcceptanceFocusPolicy.RootTab.sources)
 
-            PlaybackSettingsView(settings: dependencies.playbackSettings)
+            SettingsView(
+                playback: dependencies.playbackSettings,
+                channelBrowsing: dependencies.channelBrowsingSettings
+            )
                 .tabItem {
                     Label("设置", systemImage: "gearshape")
                 }

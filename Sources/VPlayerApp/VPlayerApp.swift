@@ -180,6 +180,7 @@ struct VPlayerApp: App {
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)
         if configuration.resetsPlaybackSettings {
             UserDefaults.standard.removeObject(forKey: PlaybackSettingsStore.storageKey)
+            UserDefaults.standard.removeObject(forKey: ChannelBrowsingSettingsStore.storageKey)
         }
         switch configuration.mode {
         case .live:

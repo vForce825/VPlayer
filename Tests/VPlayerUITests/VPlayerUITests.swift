@@ -60,6 +60,80 @@ final class VPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testGroupRailJumpsFocusIntoTheChosenGroupIncludingTheUngroupedOne() {
+        let app = launchSeededApp()
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.group.第二分组"].waitForExistence(timeout: 3))
+
+        jumpToGroup(named: "第二分组", in: app)
+        XCTAssertTrue(
+            app.buttons["channel.grouped"].wait(for: \.hasFocus, toEqual: true, timeout: 2)
+        )
+
+        // Channels whose playlist entry carries no group-title collect under
+        // 其他 and stay reachable like any other group.
+        jumpToGroup(named: "其他", in: app)
+        XCTAssertTrue(
+            app.buttons["channel.ungrouped"].wait(for: \.hasFocus, toEqual: true, timeout: 2)
+        )
+    }
+
+    @MainActor
+    func testFlatOrderSettingDropsGroupHeadersAndTheRail() {
+        let app = launchSeededApp()
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.staticTexts["测试分组"].exists)
+        XCTAssertTrue(app.buttons["channel.group.第二分组"].exists)
+
+        selectTab(named: "设置", in: app)
+        let flat = app.buttons["settings.channels.flat"]
+        let grouped = app.buttons["settings.channels.grouped"]
+        XCTAssertTrue(flat.waitForExistence(timeout: 3))
+        XCTAssertTrue(grouped.isSelected)
+        // Rows run apple, yadif, grouped, flat from the top of the list.
+        for _ in 0..<3 {
+            XCUIRemote.shared.press(.down)
+        }
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(flat.wait(for: \.isSelected, toEqual: true, timeout: 2))
+        XCTAssertFalse(grouped.isSelected)
+
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.staticTexts["测试分组"].exists)
+        XCTAssertFalse(app.buttons["channel.group.第二分组"].exists)
+        // Every channel survives the switch, including the ungrouped one.
+        XCTAssertTrue(app.buttons["channel.udp"].exists)
+        XCTAssertTrue(app.buttons["channel.grouped"].exists)
+        XCTAssertTrue(app.buttons["channel.ungrouped"].exists)
+    }
+
+    /// Moves focus up into the pinned rail and along it until `name` is focused,
+    /// then selects it.
+    @MainActor
+    private func jumpToGroup(named name: String, in app: XCUIApplication) {
+        let chip = app.buttons["channel.group.\(name)"]
+        for _ in 0..<3 where !railHasFocus(in: app) {
+            XCUIRemote.shared.press(.up)
+        }
+        XCTAssertTrue(railHasFocus(in: app), "Expected focus to reach the group rail")
+        for _ in 0..<4 where !chip.hasFocus {
+            XCUIRemote.shared.press(.right)
+        }
+        XCTAssertTrue(chip.hasFocus, "Expected the rail to reach the \(name) chip")
+        XCUIRemote.shared.press(.select)
+    }
+
+    @MainActor
+    private func railHasFocus(in app: XCUIApplication) -> Bool {
+        app.buttons.allElementsBoundByIndex.contains {
+            $0.identifier.hasPrefix("channel.group.") && $0.hasFocus
+        }
+    }
+
+    @MainActor
     private func launchSeededApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = [

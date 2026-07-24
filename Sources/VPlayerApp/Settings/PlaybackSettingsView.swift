@@ -25,6 +25,64 @@ final class PlaybackAlgorithmSelectionController {
     }
 }
 
+/// The algorithm rows themselves, shared by the settings tab and the sheet the
+/// player raises mid-playback so both switch algorithms identically.
+struct DeinterlaceAlgorithmRows: View {
+    @Bindable var playback: PlaybackSettingsStore
+    let focusNamespace: Namespace.ID
+    private let focusPolicy = AcceptanceFocusPolicy.current()
+
+    var body: some View {
+        algorithmRow(
+            title: "Apple Temporal（默认）",
+            algorithm: .appleTemporal,
+            identifier: "settings.deinterlace.apple"
+        )
+        algorithmRow(
+            title: "Metal YADIF 2x",
+            algorithm: .metalYADIF2x,
+            identifier: "settings.deinterlace.yadif"
+        )
+    }
+
+    private func algorithmRow(
+        title: String,
+        algorithm: DeinterlaceAlgorithm,
+        identifier: String
+    ) -> some View {
+        Button {
+            playback.deinterlaceAlgorithm = algorithm
+        } label: {
+            SettingsSelectionLabel(
+                title: title,
+                isSelected: playback.deinterlaceAlgorithm == algorithm
+            )
+        }
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(identifier)
+        .accessibilityAddTraits(playback.deinterlaceAlgorithm == algorithm ? .isSelected : [])
+        .prefersDefaultFocus(
+            focusPolicy.settingsControl(for: playback.deinterlaceAlgorithm) == algorithm,
+            in: focusNamespace
+        )
+    }
+}
+
+struct SettingsSelectionLabel: View {
+    let title: String
+    let isSelected: Bool
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+        }
+    }
+}
+
+/// Raised over playback, where only the picture settings make sense — channel
+/// browsing preferences belong to the settings tab, not to a running stream.
 struct PlaybackSettingsView: View {
     @Bindable var settings: PlaybackSettingsStore
     @Namespace private var settingsFocus
@@ -48,41 +106,9 @@ struct PlaybackSettingsView: View {
     private var content: some View {
         NavigationStack {
             List {
-                algorithmRow(
-                    title: "Apple Temporal（默认）",
-                    algorithm: .appleTemporal,
-                    identifier: "settings.deinterlace.apple"
-                )
-                algorithmRow(
-                    title: "Metal YADIF 2x",
-                    algorithm: .metalYADIF2x,
-                    identifier: "settings.deinterlace.yadif"
-                )
+                DeinterlaceAlgorithmRows(playback: settings, focusNamespace: settingsFocus)
             }
             .navigationTitle("设置")
         }
-    }
-
-    private func algorithmRow(
-        title: String,
-        algorithm: DeinterlaceAlgorithm,
-        identifier: String
-    ) -> some View {
-        Button {
-            settings.deinterlaceAlgorithm = algorithm
-        } label: {
-            HStack {
-                Text(title)
-                Spacer()
-                Image(systemName: settings.deinterlaceAlgorithm == algorithm ? "checkmark.circle.fill" : "circle")
-            }
-        }
-        .accessibilityLabel(title)
-        .accessibilityIdentifier(identifier)
-        .accessibilityAddTraits(settings.deinterlaceAlgorithm == algorithm ? .isSelected : [])
-        .prefersDefaultFocus(
-            focusPolicy.settingsControl(for: settings.deinterlaceAlgorithm) == algorithm,
-            in: settingsFocus
-        )
     }
 }

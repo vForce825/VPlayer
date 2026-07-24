@@ -7,6 +7,7 @@ import VPlayerCore
 
 struct ChannelBrowserView: View {
     @Bindable var model: AppModel
+    @Bindable var browsingSettings: ChannelBrowsingSettingsStore
     @State private var mappingChannel: Channel?
     @State private var searchText = ""
     @FocusState private var focusedChannelID: String?
@@ -69,32 +70,79 @@ struct ChannelBrowserView: View {
 
     @ViewBuilder
     private var channelGrid: some View {
-        if groups.isEmpty {
+        if sections.isEmpty {
             ContentUnavailableView.search(text: searchText)
         } else {
-            groupedChannelGrid
+            sectionedChannelGrid
         }
     }
 
-    private var groupedChannelGrid: some View {
-        ScrollView {
-            if let staleCoverageEnd = model.staleEPGCoverageEnd {
-                staleEPGBanner(coverageEnd: staleCoverageEnd)
-            }
-            LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
-                ForEach(groups) { group in
+    private var sectionedChannelGrid: some View {
+        // The rail is a pinned header rather than a sibling above the scroll
+        // view: the search field swallows any focus move out of the top of the
+        // content, so a rail outside the scroll view is unreachable by remote.
+        // Pinned, it both stays on screen and sits in the focus path.
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
                     Section {
-                        ForEach(group.channels) { channel in
-                            channelCard(for: channel)
+                        if let staleCoverageEnd = model.staleEPGCoverageEnd {
+                            staleEPGBanner(coverageEnd: staleCoverageEnd)
+                                .padding(.top, 16)
                         }
+                        LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
+                            ForEach(sections) { section in
+                                Section {
+                                    ForEach(section.channels) { channel in
+                                        channelCard(for: channel)
+                                    }
+                                } header: {
+                                    sectionHeader(for: section)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 24)
                     } header: {
-                        groupHeader(for: group)
+                        if showsGroupRail {
+                            groupRail(proxy: proxy)
+                        }
                     }
                 }
             }
-            .padding(.vertical, 24)
+            .scrollClipDisabled()
         }
+    }
+
+    /// Group jumps for playlists too long to reach by scrolling. Selecting a
+    /// group both scrolls its header to the top — which also realizes the lazy
+    /// rows — and hands focus to its first channel, so the remote ends up in
+    /// the group rather than merely pointing at it.
+    private func groupRail(proxy: ScrollViewProxy) -> some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 16) {
+                ForEach(sections) { section in
+                    Button(section.title ?? "") {
+                        proxy.scrollTo(section.id, anchor: .top)
+                        focusedChannelID = section.channels.first?.id
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("channel.group.\(section.id)")
+                }
+            }
+            .padding(.vertical, 12)
+            .padding(.horizontal, 4)
+        }
+        // Opaque enough that pinned chips never blur into the tiles scrolling
+        // underneath them.
+        .background(.regularMaterial)
         .scrollClipDisabled()
+        // One focus section keeps the rail a single up/down stop rather than a
+        // row the remote has to traverse chip by chip on its way to the grid.
+        .focusSection()
+    }
+
+    private var showsGroupRail: Bool {
+        browsingSettings.grouping == .playlistGroups && sections.count > 1
     }
 
     private func channelCard(for channel: Channel) -> some View {
@@ -138,35 +186,27 @@ struct ChannelBrowserView: View {
         .focusable(false)
     }
 
-    private func groupHeader(for group: ChannelGroup) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 20) {
-            Text(group.title)
-                .font(.title3.weight(.semibold))
-            Text("\(group.channels.count) 个频道")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+    @ViewBuilder
+    private func sectionHeader(for section: ChannelSection) -> some View {
+        if let title = section.title {
+            HStack(alignment: .firstTextBaseline, spacing: 20) {
+                Text(title)
+                    .font(.title3.weight(.semibold))
+                Text("\(section.channels.count) 个频道")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 16)
+            .id(section.id)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.top, 16)
     }
 
-    private var groups: [ChannelGroup] {
-        // model.channels is already sorted by (order, id) in AppModel.apply, so
-        // group in a single O(n) pass with a title→index map instead of the
-        // previous re-sort plus O(groups) firstIndex scan per channel.
-        var indexByTitle: [String: Int] = [:]
-        var result: [ChannelGroup] = []
-        for channel in filteredChannels {
-            let title = channel.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let resolvedTitle = title.flatMap { $0.isEmpty ? nil : $0 } ?? "其他"
-            if let index = indexByTitle[resolvedTitle] {
-                result[index].channels.append(channel)
-            } else {
-                indexByTitle[resolvedTitle] = result.count
-                result.append(ChannelGroup(title: resolvedTitle, channels: [channel]))
-            }
-        }
-        return result
+    private var sections: [ChannelSection] {
+        ChannelSectionBuilder.sections(
+            channels: filteredChannels,
+            grouping: browsingSettings.grouping
+        )
     }
 
     /// Channels narrowed by the search field. Large IPTV playlists are not
@@ -202,10 +242,4 @@ enum ChannelBrowserContentState: Equatable {
         if !hasChannels { return .noChannels }
         return .channels
     }
-}
-
-private struct ChannelGroup: Identifiable {
-    let title: String
-    var channels: [Channel]
-    var id: String { title }
 }
