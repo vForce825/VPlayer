@@ -21,7 +21,9 @@ public enum VideoDropSource: Int, Sendable, CaseIterable {
     case decoderRecoverable
     case deinterlaceQueueFull
     case deinterlaceFailure
-    case presentation
+    case presentationOverflow
+    case presentationExpired
+    case presentationSuperseded
 }
 
 public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {

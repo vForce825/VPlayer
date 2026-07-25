@@ -9,6 +9,13 @@ struct VideoPresentationSelection {
     let action: VideoRenderDecision.Action
     let frame: VideoPresentationFrame?
     let droppedFrameCount: Int
+    // The three ways a frame is lost here answer different questions: overflow
+    // means the producer ran further ahead than the queue spans, expiry means the
+    // clock passed the frame before the display link asked for it, and superseded
+    // means several frames came due on one tick.
+    let overflowDropCount: Int
+    let expiredDropCount: Int
+    let supersededDropCount: Int
 }
 
 public final class VideoPresentationQueue: @unchecked Sendable {
@@ -92,11 +99,21 @@ public final class VideoPresentationQueue: @unchecked Sendable {
             guard targetMediaTime.isNumeric,
                   displayInterval.isNumeric,
                   CMTimeCompare(displayInterval, .zero) > 0 else {
-                return .init(action: .waiting, frame: nil, droppedFrameCount: 0)
+                return .init(
+                    action: .waiting,
+                    frame: nil,
+                    droppedFrameCount: 0,
+                    overflowDropCount: 0,
+                    expiredDropCount: 0,
+                    supersededDropCount: 0
+                )
             }
 
+            let overflowDrops = overflowSinceSelection
             var dropped = overflowSinceSelection
             overflowSinceSelection = 0
+            var expiredDrops = 0
+            var supersededDrops = 0
 
             var retained: [VideoPresentationFrame] = []
             retained.reserveCapacity(frames.count)
@@ -110,6 +127,7 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 let expiry = CMTimeAdd(frame.presentationTimeStamp, expiryDuration)
                 if expiry.isNumeric, CMTimeCompare(expiry, targetMediaTime) < 0 {
                     dropped += 1
+                    expiredDrops += 1
                     epochDroppedFrames += 1
                 } else {
                     retained.append(frame)
@@ -120,7 +138,14 @@ public final class VideoPresentationQueue: @unchecked Sendable {
             let halfInterval = CMTimeMultiplyByRatio(displayInterval, multiplier: 1, divisor: 2)
             let qualificationLimit = CMTimeAdd(targetMediaTime, halfInterval)
             guard halfInterval.isNumeric, qualificationLimit.isNumeric else {
-                return .init(action: .waiting, frame: nil, droppedFrameCount: dropped)
+                return .init(
+                    action: .waiting,
+                    frame: nil,
+                    droppedFrameCount: dropped,
+                    overflowDropCount: overflowDrops,
+                    expiredDropCount: expiredDrops,
+                    supersededDropCount: supersededDrops
+                )
             }
 
             let qualifyingCount = frames.prefix {
@@ -131,17 +156,39 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 if qualifyingCount > 1 {
                     let superseded = qualifyingCount - 1
                     dropped += superseded
+                    supersededDrops += superseded
                     epochDroppedFrames += superseded
                 }
                 frames.removeFirst(qualifyingCount)
                 displayedFrame = selected
-                return .init(action: .presented, frame: selected, droppedFrameCount: dropped)
+                return .init(
+                    action: .presented,
+                    frame: selected,
+                    droppedFrameCount: dropped,
+                    overflowDropCount: overflowDrops,
+                    expiredDropCount: expiredDrops,
+                    supersededDropCount: supersededDrops
+                )
             }
 
             if let displayedFrame {
-                return .init(action: .repeated, frame: displayedFrame, droppedFrameCount: dropped)
+                return .init(
+                    action: .repeated,
+                    frame: displayedFrame,
+                    droppedFrameCount: dropped,
+                    overflowDropCount: overflowDrops,
+                    expiredDropCount: expiredDrops,
+                    supersededDropCount: supersededDrops
+                )
             }
-            return .init(action: .waiting, frame: nil, droppedFrameCount: dropped)
+            return .init(
+                action: .waiting,
+                frame: nil,
+                droppedFrameCount: dropped,
+                overflowDropCount: overflowDrops,
+                expiredDropCount: expiredDrops,
+                supersededDropCount: supersededDrops
+            )
         }
     }
 

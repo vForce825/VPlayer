@@ -50,7 +50,7 @@ final class PlaybackMetricsTests: XCTestCase {
                         CMTime(value: Int64(second % 20 + 1), timescale: 1_000)
                     )
                 )
-                metrics.recordVideoDrop(count: second == 60 ? 2 : 0, source: .presentation)
+                metrics.recordVideoDrop(count: second == 60 ? 2 : 0, source: .presentationExpired)
                 metrics.recordPresentationQueueDepth(min(12, second))
             }
         }
