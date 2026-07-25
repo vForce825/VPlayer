@@ -1474,6 +1474,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let relay = PlaybackPipelineRelay()
         let decoder = VideoToolboxDecoder(
             executor: executor,
+            tuning: tuning,
             diagnostics: (metrics: metrics, signposts: signposts)
         ) { relay.decoder($0) }
         guard let device = MTLCreateSystemDefaultDevice() else {

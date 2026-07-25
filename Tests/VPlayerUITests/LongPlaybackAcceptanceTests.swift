@@ -1829,6 +1829,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let playbackExecutorBusySeconds: Double
     let totalVideoDecodeSubmissionMilliseconds: Double
     let maximumOutstandingDecoderOutputs: Int
+    let maximumDecodeSubmissionDepth: Int
+    let maximumFramesBeingDecoded: Int
     let decoderSessionSummary: String?
     let demuxPacketCount: UInt64
     let videoAccessUnitCount: UInt64

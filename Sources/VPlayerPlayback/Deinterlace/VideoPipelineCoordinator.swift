@@ -224,32 +224,43 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         do {
             try decoder.decode(accessUnit, flags: ._EnableAsynchronousDecompression)
         } catch let failure as VideoDecoderFailure {
-            if failure == .backpressureTimeout {
-                restartDecoderAfterBackpressureTimeout()
-                return
-            }
-            if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
-                temporalRetrySuppressed = true
-                emitTemporalNoticeOnce()
-                switchDecoderConfiguration(
-                    to: .rawTemporalFailure,
-                    toleratingTemporalDrainFailure: true
-                )
-                return
-            }
-            recordDecodeFailureDiagnostic(failure)
-            if Self.isPerFrameDecodeFailure(failure) {
-                handlePerFrameDecodeFailure(failure, generation: generation)
-                return
-            }
-            if Self.requiresDecoderSessionRestart(failure) {
-                restartDecoderAfterSessionFailure(failure, generation: generation)
-                return
-            }
-            hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
+            handleSubmissionFailure(failure, generation: generation)
         } catch {
             hooks.fail(.videoDecode(-1), generation)
         }
+    }
+
+    /// Submission failures reach here from two directions — a decoder that
+    /// rejects a unit on the caller's thread, and the asynchronous
+    /// `submissionFailure` event from one that hands submission to its own
+    /// queue. Both mean the same thing, so both get the same recovery.
+    private func handleSubmissionFailure(
+        _ failure: VideoDecoderFailure,
+        generation: MediaGeneration
+    ) {
+        if failure == .backpressureTimeout {
+            restartDecoderAfterBackpressureTimeout()
+            return
+        }
+        if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
+            temporalRetrySuppressed = true
+            emitTemporalNoticeOnce()
+            switchDecoderConfiguration(
+                to: .rawTemporalFailure,
+                toleratingTemporalDrainFailure: true
+            )
+            return
+        }
+        recordDecodeFailureDiagnostic(failure)
+        if Self.isPerFrameDecodeFailure(failure) {
+            handlePerFrameDecodeFailure(failure, generation: generation)
+            return
+        }
+        if Self.requiresDecoderSessionRestart(failure) {
+            restartDecoderAfterSessionFailure(failure, generation: generation)
+            return
+        }
+        hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
     }
 
     func handle(decoder event: VideoDecoderEvent) {
@@ -269,6 +280,12 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             for normalized in normalizer.push(frame, discontinuity: false) {
                 process(normalized)
             }
+        case let .submissionFailure(failure, eventGeneration):
+            guard eventGeneration == generation else {
+                metrics?.recordStaleGenerationDrop()
+                return
+            }
+            handleSubmissionFailure(failure, generation: eventGeneration)
         case let .recoverableFailure(failure, eventGeneration):
             guard eventGeneration == generation else {
                 metrics?.recordStaleGenerationDrop()
@@ -310,6 +327,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     func applyTuning(_ tuning: PlaybackTuning) {
         guard !stopped else { return }
         yadif.apply(tuning)
+        decoder.setTuning(tuning)
     }
 
     func setAlgorithm(_ algorithm: DeinterlaceAlgorithm) {

@@ -143,6 +143,30 @@ public struct PlaybackTuning: Sendable, Equatable {
         max(24, Int((120 * videoBufferSeconds).rounded()))
     }
 
+    /// The floor the decode session's output pixel-buffer pool is held at.
+    ///
+    /// Derived rather than configured: it is a count of the buffers this
+    /// pipeline provably has checked out at once — the in-flight submission
+    /// window, YADIF's pending queue plus its three-frame reference window, and
+    /// the presentation frames not yet released. Left at the default the pool
+    /// ages buffers out and reallocates them under load, and an IOSurface
+    /// allocation is far too expensive to repeat per frame.
+    public var decoderOutputPoolFloor: Int {
+        deinterlaceBufferFrames + 16
+    }
+
+    /// Undecoded access units allowed to queue ahead of the decoder before the
+    /// pipeline skips to the next random-access point.
+    ///
+    /// Derived rather than configured: this queue exists to absorb bursts, and
+    /// queueing more than the presentation buffer can hold only adds latency to
+    /// frames that the horizon will trim anyway. Its real job is to bound the
+    /// damage when decode falls behind — the alternative is unbounded growth on
+    /// a live source that never slows down to let the decoder catch up.
+    public var decodeSubmissionQueueDepth: Int {
+        max(8, Int((videoBufferSeconds * 16).rounded()))
+    }
+
     /// How far behind the newest decoded frame the clock may be anchored.
     ///
     /// Derived rather than configured: anchoring further back than the buffer

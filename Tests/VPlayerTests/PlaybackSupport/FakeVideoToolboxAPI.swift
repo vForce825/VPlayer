@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import CoreMedia
+import CoreVideo
 import Foundation
 import VideoToolbox
 @testable import VPlayerPlayback
@@ -73,6 +74,20 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
     private var setStatuses: [OSStatus] = []
     private var supportedPropertySnapshots: [VTSupportedPropertySnapshot] = []
     private var copyResults: [VTPropertyCopyResult] = []
+    // Answered by key rather than from the positional queue: both are read on
+    // paths the scripted tests do not care about, and consuming a scripted
+    // result here would silently retarget every `enqueueCopyResult` call.
+    private var supportedPixelFormatsResult = VTPropertyCopyResult(
+        status: noErr,
+        value: .array([
+            .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+        ])
+    )
+    private var framesBeingDecodedResult = VTPropertyCopyResult(
+        status: noErr,
+        value: .unsigned32(0)
+    )
     private var decodeStatuses: [OSStatus] = []
     private var finishStatuses: [OSStatus] = []
     private var waitStatuses: [OSStatus] = []
@@ -101,6 +116,10 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
 
     func enqueueCopyResult(_ result: VTPropertyCopyResult) {
         withLock { copyResults.append(result) }
+    }
+
+    func setSupportedPixelFormatsResult(_ result: VTPropertyCopyResult) {
+        withLock { supportedPixelFormatsResult = result }
     }
 
     func enqueueDecodeStatus(_ status: OSStatus) {
@@ -210,6 +229,12 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
         withLock {
             operations.append("copy")
             copies.append(CopyRecord(sessionID: session.id, key: key))
+            if key == kVTDecompressionPropertyKey_SupportedPixelFormatsOrderedByPerformance as String {
+                return supportedPixelFormatsResult
+            }
+            if key == kVTDecompressionPropertyKey_NumberOfFramesBeingDecoded as String {
+                return framesBeingDecodedResult
+            }
             return copyResults.isEmpty
                 ? VTPropertyCopyResult(status: noErr, value: .boolean(true))
                 : copyResults.removeFirst()

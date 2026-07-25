@@ -56,6 +56,14 @@ enum VTPropertyValue: Sendable, Equatable {
         if typeID == CFNumberGetTypeID(), let number = value as? NSNumber {
             return .unsigned32(number.uint32Value)
         }
+        // The decoder reports its supported pixel formats as an array, and the
+        // order carries the meaning: without reading it back there is no way to
+        // ask which output format is the decoder's own.
+        if typeID == CFArrayGetTypeID(), let array = value as? [AnyObject] {
+            return .array(array.map { element in
+                ownedCopy(of: element as CFTypeRef) ?? .unsupportedType
+            })
+        }
         return .unsupportedType
     }
 }
