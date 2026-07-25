@@ -353,7 +353,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
         metrics?.update(
             demuxQueueFullWaitNanoseconds: demuxer.queueFullWaitNanoseconds,
-            demuxAdmitWaitNanoseconds: admitWaitNanoseconds.value
+            demuxAdmitWaitNanoseconds: admitWaitNanoseconds.value,
+            playbackExecutorBusyNanoseconds: executor.busyNanoseconds
         )
         return metrics?.snapshot(window: window)
     }

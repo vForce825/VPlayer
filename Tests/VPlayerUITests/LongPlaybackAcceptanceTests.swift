@@ -1291,6 +1291,8 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let components = start.duration(to: clock.now).components
         return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
+
+
 }
 
 private enum AcceptanceValidationError: Error, Equatable {
@@ -1816,6 +1818,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let renderSkippedInFlightCount: UInt64
     let demuxQueueFullWaitSeconds: Double
     let demuxAdmitWaitSeconds: Double
+    let playbackExecutorBusySeconds: Double
+    let totalVideoDecodeSubmissionMilliseconds: Double
     let demuxPacketCount: UInt64
     let videoAccessUnitCount: UInt64
     let audioSampleCount: UInt64

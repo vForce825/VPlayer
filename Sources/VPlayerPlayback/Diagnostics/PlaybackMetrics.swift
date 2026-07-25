@@ -99,11 +99,19 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // simply is not delivering realtime, and nothing in the app will fix it.
     public let demuxQueueFullWaitSeconds: Double
     public let demuxAdmitWaitSeconds: Double
+    // Wall time the playback executor spent running work. Near the elapsed time
+    // means it is saturated and the answer is less work on it; well below means
+    // callers are merely queued behind it and the answer is less coupling.
+    public let playbackExecutorBusySeconds: Double
     public let demuxPacketCount: UInt64
     public let videoAccessUnitCount: UInt64
     public let audioSampleCount: UInt64
     public let videoDecodeSubmissionCount: UInt64
     public let maximumVideoDecodeSubmissionMilliseconds: Double
+    // Against `playbackExecutorBusySeconds` this says how much of the executor
+    // decode submission is actually occupying — a maximum alone cannot separate
+    // "one slow frame" from "every frame is slow".
+    public let totalVideoDecodeSubmissionMilliseconds: Double
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -191,11 +199,13 @@ final class PlaybackMetrics: @unchecked Sendable {
         var renderSkippedInFlightCount: UInt64 = 0
         var demuxQueueFullWaitNanoseconds: UInt64 = 0
         var demuxAdmitWaitNanoseconds: UInt64 = 0
+        var playbackExecutorBusyNanoseconds: UInt64 = 0
         var demuxPacketCount: UInt64 = 0
         var videoAccessUnitCount: UInt64 = 0
         var audioSampleCount: UInt64 = 0
         var videoDecodeSubmissionCount: UInt64 = 0
         var maximumVideoDecodeSubmissionMilliseconds = 0.0
+        var totalVideoDecodeSubmissionMilliseconds = 0.0
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
@@ -279,11 +289,13 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func update(
         demuxQueueFullWaitNanoseconds: UInt64,
-        demuxAdmitWaitNanoseconds: UInt64
+        demuxAdmitWaitNanoseconds: UInt64,
+        playbackExecutorBusyNanoseconds: UInt64
     ) {
         lock.withLock {
             state.demuxQueueFullWaitNanoseconds = demuxQueueFullWaitNanoseconds
             state.demuxAdmitWaitNanoseconds = demuxAdmitWaitNanoseconds
+            state.playbackExecutorBusyNanoseconds = playbackExecutorBusyNanoseconds
         }
     }
 
@@ -336,6 +348,7 @@ final class PlaybackMetrics: @unchecked Sendable {
         guard milliseconds.isFinite, milliseconds >= 0 else { return }
         lock.withLock {
             state.videoDecodeSubmissionCount &+= 1
+            state.totalVideoDecodeSubmissionMilliseconds += milliseconds
             state.maximumVideoDecodeSubmissionMilliseconds = max(
                 state.maximumVideoDecodeSubmissionMilliseconds,
                 milliseconds
@@ -499,12 +512,16 @@ final class PlaybackMetrics: @unchecked Sendable {
             renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
             demuxQueueFullWaitSeconds: Double(captured.demuxQueueFullWaitNanoseconds) / 1_000_000_000,
             demuxAdmitWaitSeconds: Double(captured.demuxAdmitWaitNanoseconds) / 1_000_000_000,
+            playbackExecutorBusySeconds:
+                Double(captured.playbackExecutorBusyNanoseconds) / 1_000_000_000,
             demuxPacketCount: captured.demuxPacketCount,
             videoAccessUnitCount: captured.videoAccessUnitCount,
             audioSampleCount: captured.audioSampleCount,
             videoDecodeSubmissionCount: captured.videoDecodeSubmissionCount,
             maximumVideoDecodeSubmissionMilliseconds:
-                captured.maximumVideoDecodeSubmissionMilliseconds
+                captured.maximumVideoDecodeSubmissionMilliseconds,
+            totalVideoDecodeSubmissionMilliseconds:
+                captured.totalVideoDecodeSubmissionMilliseconds
         )
     }
 
