@@ -136,7 +136,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     static let deferredPacketCapacity = 32
     static let pendingTrackMediaCapacity = 96
-    static let startupRetainedVideoCapacity = 12
+    // Must stay strictly below `retainedVideoCapacity` so a closed-readiness
+    // startup window cannot claim the whole presentation queue and starve the
+    // decoder pool. Anchoring needs at most `requiredVideoFrameCount` (2 for
+    // field-rate YADIF) frames, so a small window is sufficient here.
+    static let startupRetainedVideoCapacity = 4
     private static let retainedAudioCapacity = 96
     private static let retainedVideoCapacity = VideoPresentationQueue.capacity
 
@@ -1074,8 +1078,24 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             }
         }
 
+        // The two playback phases need opposite overflow victims, so the bound
+        // cannot be unified. While readiness is closed the anchor is still being
+        // built at the audio's leading edge, so the *earliest* frames are the ones
+        // that must survive until lagging audio reaches them. Once readiness is
+        // open the retained window only exists to reseed the renderer on a
+        // re-anchor, so keeping the earliest frames there replays seconds-old
+        // video and drags the clock backwards. Drop the oldest instead, matching
+        // how `retainedAudio` slides forward.
+        if !paused, readiness?.isOpen != true {
+            guard retainedVideo.count > Self.startupRetainedVideoCapacity else { return }
+            retainedVideo.removeLast(
+                retainedVideo.count - Self.startupRetainedVideoCapacity
+            )
+            return
+        }
+
         guard retainedVideo.count > Self.retainedVideoCapacity else { return }
-        retainedVideo.removeLast(retainedVideo.count - Self.retainedVideoCapacity)
+        retainedVideo.removeFirst(retainedVideo.count - Self.retainedVideoCapacity)
     }
 
     private func prepareAnchorIsolated(commonPTS: CMTime) -> Bool {
