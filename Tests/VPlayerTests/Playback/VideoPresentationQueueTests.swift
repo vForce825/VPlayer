@@ -58,25 +58,23 @@ final class VideoPresentationQueueTests: XCTestCase {
         XCTAssertEqual(queue.unpresentedCount, 1)
     }
 
-    func testCapacityIsExactlyTwelveAndOverflowDropsDeterministicOldest() throws {
+    func testCapacityIsExactlyTwentyFourAndOverflowDropsTheFrameFurthestFromDue() throws {
         let queue = VideoPresentationQueue(generation: generation)
-        for pts in (1...13).reversed() {
+        for pts in (1...25).reversed() {
             XCTAssertTrue(queue.enqueue(try frame(id: UInt64(pts), pts: rational(pts, 1))))
         }
-        XCTAssertEqual(queue.unpresentedCount, 12)
+        XCTAssertEqual(queue.unpresentedCount, 24)
 
-        let waiting = queue.select(
+        // The newest frame is the overflow victim. The next-due frame has to
+        // survive, otherwise a producer running ahead of the clock deletes every
+        // frame just before the clock reaches it and nothing is ever presented.
+        let first = queue.select(
             targetMediaTime: rational(1, 1),
             displayInterval: rational(1, 50)
         )
-        XCTAssertEqual(waiting.action, .waiting)
-        XCTAssertEqual(waiting.droppedFrameCount, 1)
-        let first = queue.select(
-            targetMediaTime: rational(2, 1),
-            displayInterval: rational(1, 50)
-        )
-        XCTAssertEqual(first.frame?.sourceAccessUnitID, 2)
-        XCTAssertEqual(first.droppedFrameCount, 0)
+        XCTAssertEqual(first.action, .presented)
+        XCTAssertEqual(first.frame?.sourceAccessUnitID, 1)
+        XCTAssertEqual(first.droppedFrameCount, 1)
     }
 
     func testExpiryUsesStrictBoundaryAndInvalidDurationFallsBackToInterval() throws {

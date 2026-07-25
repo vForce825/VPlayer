@@ -318,6 +318,58 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(gate.cycleID, UInt64.max)
     }
 
+    func testRunningGateSurvivesRetainedWindowsShorterThanTheStartupRunway() {
+        let harness = makeGate(requiredVideoCount: 2)
+        harness.gate.updateAudio(
+            firstPTS: time(1),
+            contiguousDuration: CMTime(value: 1, timescale: 2),
+            isContiguous: true
+        )
+        harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 2)
+        XCTAssertTrue(harness.gate.isOpen)
+        let openCycle = harness.gate.cycleID
+        let pausesWhenOpened = harness.clock.pauseCount
+
+        // Live steady state: anchoring trims the pipeline's retained windows back
+        // to the anchor, and video output leads the audio ingest edge, so the
+        // runway measured here sits well under the 250 ms startup threshold. It
+        // must not close the gate — every close pauses the clock and the reopen
+        // flushes the renderer, which is what reduced playback to a slideshow.
+        for step in 0..<40 {
+            let base = CMTimeAdd(time(1), CMTime(value: Int64(step) * 24, timescale: 1_000))
+            harness.gate.updateAudio(
+                firstPTS: base,
+                contiguousDuration: CMTime(value: 120, timescale: 1_000),
+                isContiguous: true
+            )
+            harness.gate.updateVideo(
+                firstPTS: CMTimeAdd(base, CMTime(value: 100, timescale: 1_000)),
+                readyFrameCount: 6
+            )
+        }
+
+        XCTAssertTrue(harness.gate.isOpen)
+        XCTAssertEqual(harness.gate.cycleID, openCycle)
+        XCTAssertEqual(harness.clock.pauseCount, pausesWhenOpened)
+    }
+
+    func testRunningGateStillClosesWhenTheVideoWindowStarves() {
+        let harness = makeGate(requiredVideoCount: 2)
+        harness.gate.updateAudio(
+            firstPTS: time(1),
+            contiguousDuration: CMTime(value: 1, timescale: 2),
+            isContiguous: true
+        )
+        harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 2)
+        XCTAssertTrue(harness.gate.isOpen)
+        let openCycle = harness.gate.cycleID
+
+        harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 1)
+
+        XCTAssertFalse(harness.gate.isOpen)
+        XCTAssertEqual(harness.gate.cycleID, openCycle + 1)
+    }
+
     private func makeGate(requiredVideoCount: Int) -> GateHarness {
         let clock = FakePlaybackClock()
         let gate = PlaybackReadinessGate(

@@ -45,6 +45,29 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let audioFirstPTSSeconds: Double?
     public let audioDurationSeconds: Double
     public let videoFirstPTSSeconds: Double?
+    // Newest processed video PTS *before* the retained window is bounded, so a
+    // starved window can be told apart from video that legitimately trails audio.
+    public let videoLatestPTSSeconds: Double?
+    public let audioRelativeVideoPruneCount: UInt64
+    // The gate bumps its cycle on every close, so a large value over a short run
+    // means readiness is flapping rather than staying shut once.
+    public let readinessCycleID: UInt64
+    // Indexed by `PlaybackReadinessCloseReason.rawValue`: flush, buffering,
+    // pause, discontinuity, audioReplacement, displayModeSwitch.
+    public let readinessCloseReasonCounts: [UInt64]
+    // How many times display submission has been resumed for an open gate. If
+    // this stops advancing while frames keep arriving, the submission side is
+    // stranded rather than the decode side.
+    public let displayResumeCount: UInt64
+    // Media time the playback clock currently reports. Compared against
+    // `videoLatestPTSSeconds` this separates "the clock is not running" from
+    // "frames are not reaching the presentation queue".
+    public let clockTimeSeconds: Double?
+    // Times the pipeline re-anchored because the clock had outrun the decoder.
+    public let videoResyncCount: UInt64
+    // Audio renderer recoveries (flush + full replay re-enqueue). Each one is
+    // expensive on the playback executor, so a high rate starves ingest.
+    public let audioRecoveryCount: UInt64
     public let demuxPacketCount: UInt64
     public let videoAccessUnitCount: UInt64
     public let audioSampleCount: UInt64
@@ -121,6 +144,14 @@ final class PlaybackMetrics: @unchecked Sendable {
         var audioFirstPTSSeconds: Double?
         var audioDurationSeconds = 0.0
         var videoFirstPTSSeconds: Double?
+        var videoLatestPTSSeconds: Double?
+        var audioRelativeVideoPruneCount: UInt64 = 0
+        var readinessCycleID: UInt64 = 0
+        var readinessCloseReasonCounts = [UInt64](repeating: 0, count: 6)
+        var displayResumeCount: UInt64 = 0
+        var clockTimeSeconds: Double?
+        var videoResyncCount: UInt64 = 0
+        var audioRecoveryCount: UInt64 = 0
         var demuxPacketCount: UInt64 = 0
         var videoAccessUnitCount: UInt64 = 0
         var audioSampleCount: UInt64 = 0
@@ -177,7 +208,11 @@ final class PlaybackMetrics: @unchecked Sendable {
         retainedVideoCount: Int,
         audioFirstPTS: CMTime?,
         audioDuration: CMTime?,
-        videoFirstPTS: CMTime?
+        videoFirstPTS: CMTime?,
+        readinessCycleID: UInt64 = 0,
+        readinessCloseReasonCounts: [UInt64] = [],
+        clockTime: CMTime? = nil,
+        audioRecoveryCount: UInt64 = 0
     ) {
         lock.withLock {
             state.audioRoute = audioRoute == .systemCompressed
@@ -190,6 +225,34 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.audioFirstPTSSeconds = Self.numericSeconds(audioFirstPTS)
             state.audioDurationSeconds = Self.numericSeconds(audioDuration) ?? 0
             state.videoFirstPTSSeconds = Self.numericSeconds(videoFirstPTS)
+            state.readinessCycleID = readinessCycleID
+            if !readinessCloseReasonCounts.isEmpty {
+                state.readinessCloseReasonCounts = readinessCloseReasonCounts
+            }
+            state.clockTimeSeconds = Self.numericSeconds(clockTime)
+            state.audioRecoveryCount = audioRecoveryCount
+        }
+    }
+
+    func recordVideoResync() {
+        lock.withLock { state.videoResyncCount &+= 1 }
+    }
+
+    func recordDisplaySubmissionResume() {
+        lock.withLock { state.displayResumeCount &+= 1 }
+    }
+
+    func recordProcessedVideo(latestPTS: CMTime?) {
+        guard let seconds = Self.numericSeconds(latestPTS) else { return }
+        lock.withLock {
+            state.videoLatestPTSSeconds = max(state.videoLatestPTSSeconds ?? seconds, seconds)
+        }
+    }
+
+    func recordAudioRelativeVideoPrune(count: Int) {
+        guard count > 0 else { return }
+        lock.withLock {
+            state.audioRelativeVideoPruneCount &+= UInt64(count)
         }
     }
 
@@ -358,6 +421,14 @@ final class PlaybackMetrics: @unchecked Sendable {
             audioFirstPTSSeconds: captured.audioFirstPTSSeconds,
             audioDurationSeconds: captured.audioDurationSeconds,
             videoFirstPTSSeconds: captured.videoFirstPTSSeconds,
+            videoLatestPTSSeconds: captured.videoLatestPTSSeconds,
+            audioRelativeVideoPruneCount: captured.audioRelativeVideoPruneCount,
+            readinessCycleID: captured.readinessCycleID,
+            readinessCloseReasonCounts: captured.readinessCloseReasonCounts,
+            displayResumeCount: captured.displayResumeCount,
+            clockTimeSeconds: captured.clockTimeSeconds,
+            videoResyncCount: captured.videoResyncCount,
+            audioRecoveryCount: captured.audioRecoveryCount,
             demuxPacketCount: captured.demuxPacketCount,
             videoAccessUnitCount: captured.videoAccessUnitCount,
             audioSampleCount: captured.audioSampleCount,

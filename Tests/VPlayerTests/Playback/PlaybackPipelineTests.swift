@@ -1577,6 +1577,57 @@ final class PlaybackPipelineTests: XCTestCase {
         }
     }
 
+    func testDisplaySubmissionResumesOnEveryReadinessOpenNotJustTheFirst() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1, generation: generation, pts: .zero, duration: CMTime(value: 1, timescale: 4)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1, generation: generation, pts: .zero, interlaced: false
+            ),
+        ], in: harness)
+        // `updateDisplayCriteria` also records operations, so compare only the
+        // submission transitions.
+        func lastSubmissionOperation() -> String? {
+            harness.display.snapshot().last { $0 == "pause" || $0 == "resume" }
+        }
+        try await eventually { lastSubmissionOperation() == "resume" }
+
+        // An audio renderer replacement closes the gate and pauses submission.
+        harness.pipeline.receive(
+            audioReadiness: .invalidated,
+            generation: generation
+        )
+        try await eventually { lastSubmissionOperation() == "pause" }
+
+        // Reopening must resume submission again. Leaving it paused strands the
+        // presentation queue: frames keep arriving and overflow without ever
+        // being selected for display.
+        harness.pipeline.receive(
+            audioReadiness: .available,
+            generation: generation
+        )
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 2,
+            generation: generation,
+            pts: CMTime(value: 1, timescale: 4),
+            duration: CMTime(value: 1, timescale: 4)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 2,
+                generation: generation,
+                pts: CMTime(value: 1, timescale: 25),
+                interlaced: false
+            ),
+        ], in: harness)
+
+        try await eventually { lastSubmissionOperation() == "resume" }
+    }
+
     private func configure(_ harness: Harness) async throws -> MediaGeneration {
         harness.pipeline.start(url: makeRequest().streamURL)
         try await eventually { harness.demux.snapshot().startedURLs.count == 1 }

@@ -12,7 +12,14 @@ struct VideoPresentationSelection {
 }
 
 public final class VideoPresentationQueue: @unchecked Sendable {
-    public static let capacity = 12
+    // This is really a time buffer expressed in frames. The pipeline hands frames
+    // to the renderer roughly half a second before they are due, and the
+    // field-rate deinterlace routes emit two frames per input frame, so at 50 fps
+    // a 12-slot queue spans only ~0.24 s — less than the production lead. The
+    // queue then overflowed on every single arrival while the clock never got
+    // close enough to select anything, which is what reduced 1080i live playback
+    // to a few frames per second. 24 slots keep ~0.48 s at field rate.
+    public static let capacity = 24
 
     private let lock = NSLock()
     private var frames: [VideoPresentationFrame] = []
@@ -53,7 +60,12 @@ public final class VideoPresentationQueue: @unchecked Sendable {
             }
             frames.insert(frame, at: insertionIndex)
             if frames.count > Self.capacity {
-                frames.removeFirst()
+                // Evict the frame furthest from being due. `select` already
+                // discards frames whose expiry has passed, so reaching this line
+                // means the producer is ahead of the clock — dropping the oldest
+                // would delete the very frame that is about to be displayed and
+                // guarantee that nothing is ever presented.
+                frames.removeLast()
                 overflowSinceSelection += 1
                 epochDroppedFrames += 1
             }

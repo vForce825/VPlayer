@@ -479,6 +479,99 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.support.checkSnapshot.suffix(2).map(\.1), [.other, .hdmi])
     }
 
+    func testRunningRendererKeepsReadinessAcrossPrerollDipsAndAutomaticFlushes() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.preroll-latch")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let decoderFactory = FakePCMAudioDecoderFactory { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+        }
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { _, _ in },
+            rendererFactory: renderers,
+            decoderFactory: decoderFactory,
+            routeMonitor: FakeAudioRouteMonitor(),
+            supportChecker: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in
+                readiness.append(change, generation: generation)
+            }
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        for id in 1...4 {
+            try perform(on: executor) {
+                try pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id), pts: CMTime(value: Int64(id), timescale: 1)
+                ))
+            }
+        }
+        renderer.fireReady()
+        drain(executor)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+
+        // A running renderer keeps flipping its startup-preroll indicator as it
+        // consumes what it holds, and AVFoundation flushes it automatically from
+        // time to time. Neither is a loss of audio: the pipeline refills the same
+        // renderer from `replay`. Reporting these as invalidations closed the
+        // playback readiness gate several times a second.
+        for _ in 0..<10 {
+            renderer.configureReadiness(ready: true, sufficient: false)
+            renderer.fireReady()
+            drain(executor)
+            renderer.emit(.automaticFlush(CMTime(value: 2, timescale: 1)))
+            drain(executor)
+            renderer.configureReadiness(ready: true, sufficient: true)
+            renderer.fireReady()
+            drain(executor)
+        }
+
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+    }
+
+    func testFlushInvalidatesReadinessAndRequiresFreshPreroll() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        renderer.fireReady()
+        drain(harness.executor)
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+
+        // A real renderer reports no startup preroll once it has been flushed.
+        renderer.configureReadiness(ready: true, sufficient: false)
+        harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+        drain(harness.executor)
+
+        // The preroll latch must not survive a flush: the renderer is empty again,
+        // so readiness has to be re-earned rather than inherited.
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1),
+                generation: MediaGeneration(rawValue: 2)
+            ))
+        }
+        renderer.fireReady()
+        drain(harness.executor)
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+    }
+
     func testExternallyClockedFallbackAndRecoveryReportReadinessWithoutChangingRateOrAnchor() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-clock")
         let synchronizer = FakeAudioSynchronizer()

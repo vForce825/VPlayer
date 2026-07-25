@@ -24,6 +24,10 @@ enum AudioRenderReadinessChange: Sendable, Equatable {
 public protocol AudioRenderPipelineProtocol: AnyObject {
     var isReadyForPlayback: Bool { get }
     var route: AudioRoute { get }
+    // Diagnostics: how many times the renderer has been flushed and refilled from
+    // the replay buffer. Each recovery is expensive, so a high rate shows up as
+    // reduced ingest throughput rather than as an error.
+    var recoveryCount: UInt64 { get }
     func configure(
         format: CMAudioFormatDescription,
         codec: AudioCodec,
@@ -39,6 +43,8 @@ public extension AudioRenderPipelineProtocol {
     func stopAwaitingRendererRemoval() async {
         stop()
     }
+
+    var recoveryCount: UInt64 { 0 }
 }
 
 struct AudioRendererIdentity: RawRepresentable, Hashable, Sendable {

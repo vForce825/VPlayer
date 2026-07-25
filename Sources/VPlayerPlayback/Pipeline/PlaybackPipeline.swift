@@ -141,6 +141,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     // decoder pool. Anchoring needs at most `requiredVideoFrameCount` (2 for
     // field-rate YADIF) frames, so a small window is sufficient here.
     static let startupRetainedVideoCapacity = 4
+    // How far the running clock may outrun the newest decoded frame before the
+    // pipeline re-anchors. A live source only produces at realtime, so once video
+    // falls behind the clock it can never catch up on its own: every frame is
+    // already expired when it reaches the presentation queue and nothing is
+    // displayed again. The margin has to exceed normal jitter but stay well below
+    // the presentation queue's horizon.
+    static let videoResyncThreshold = CMTime(value: 1, timescale: 4)
     private static let retainedAudioCapacity = 96
     private static let retainedVideoCapacity = VideoPresentationQueue.capacity
 
@@ -187,6 +194,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var normalStopPublishes = false
     private var stopCompletions: [StopCompletion] = []
     private var readyPublished = false
+    // Readiness cycle that display submission was last resumed for; `nil` until
+    // the first resume. Paired with `readyPublished` so both an external close
+    // (which clears `readyPublished`) and a gate-internal close (which only bumps
+    // the cycle) let the next open resume submission again.
+    private var displayResumedCycle: UInt64?
     private var readinessCycle: UInt64 = 0
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
@@ -757,6 +769,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 let comparison = CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp)
                 return comparison == 0 ? $0.sequenceNumber < $1.sequenceNumber : comparison < 0
             }
+            metrics?.recordProcessedVideo(latestPTS: retainedVideo.last?.presentationTimeStamp)
             boundRetainedVideoIsolated()
             updateReadinessIsolated()
         case let .failure(failure):
@@ -941,12 +954,33 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         updateReadinessIsolated()
     }
 
+    // Closing the gate here is the recovery, not a failure report: the following
+    // readiness update reopens it and `prepareAnchorIsolated` re-anchors both
+    // renderers on the media the pipeline actually holds. Without this, a single
+    // hiccup that lets the clock overtake the decoder strands playback for good —
+    // the gate stays open, so nothing ever re-anchors, while every arriving frame
+    // expires on contact with the presentation queue.
+    private func resyncIfVideoTrailsClockIsolated() {
+        assertIsolated()
+        guard let readiness, readiness.isOpen, !paused, !terminal,
+              let newest = retainedVideo.last else { return }
+        let newestEnd = CMTimeAdd(newest.presentationTimeStamp, newest.duration)
+        let now = clock.currentTime
+        guard newestEnd.isNumeric, now.isNumeric else { return }
+        let behind = CMTimeSubtract(now, newestEnd)
+        guard behind.isNumeric,
+              CMTimeCompare(behind, Self.videoResyncThreshold) > 0 else { return }
+        readiness.close(.buffering)
+        readyPublished = false
+        display.pauseSubmission()
+        metrics?.recordVideoResync()
+    }
+
     private func updateReadinessIsolated() {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
+        resyncIfVideoTrailsClockIsolated()
         let expectedGeneration = generationController.current
-        let expectedCycle = readiness.cycleID
-        let wasOpen = readiness.isOpen
         let audioInterval = contiguousAudioInterval()
         if audio.isReadyForPlayback, let audioInterval {
             readiness.updateAudio(
@@ -963,13 +997,20 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 duration: $0.duration
             )
         })
-        if !wasOpen,
-           readiness.isOpen,
-           readiness.cycleID == expectedCycle,
+        // Resuming display submission has to follow the gate's *state*, not an
+        // open edge observed inside this call. `updateAudio` can close the gate
+        // and `updateVideo` reopen it before we reach here: the cycle then no
+        // longer matches the one captured on entry, which skipped the resume,
+        // and on the next call the gate was already open so the edge never came
+        // back. Display submission then stayed paused for the rest of playback
+        // while the presentation queue overflowed. Keying on the cycle resumes
+        // exactly once per open period, whichever update opened it.
+        if readiness.isOpen,
            generationController.current == expectedGeneration,
            !terminal,
            !paused,
-           !readyPublished {
+           !readyPublished || displayResumedCycle != readiness.cycleID {
+            displayResumedCycle = readiness.cycleID
             resumeDisplayForOpenReadinessGateIsolated()
         }
         metrics?.updateReadinessDiagnostics(
@@ -980,7 +1021,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             retainedVideoCount: retainedVideo.count,
             audioFirstPTS: audioInterval?.first,
             audioDuration: audioInterval?.duration,
-            videoFirstPTS: retainedVideo.first?.presentationTimeStamp
+            videoFirstPTS: retainedVideo.first?.presentationTimeStamp,
+            readinessCycleID: readiness.cycleID,
+            readinessCloseReasonCounts: readiness.closeReasonCounts,
+            clockTime: clock.currentTime,
+            audioRecoveryCount: audio.recoveryCount
         )
     }
 
@@ -1008,6 +1053,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         guard !terminal, !paused, let readiness else { return }
         _ = readiness.reopenAfterDisplayModeSwitch()
         if readiness.isOpen {
+            displayResumedCycle = readiness.cycleID
             resumeDisplayForOpenReadinessGateIsolated()
         } else {
             updateReadinessIsolated()
@@ -1022,6 +1068,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             display.resetPresentationTiming()
         }
         display.resumeSubmission()
+        metrics?.recordDisplaySubmissionResume()
         metrics?.beginAVDriftGracePeriod(seconds: 5)
         if !readyPublished {
             readyPublished = true
@@ -1072,10 +1119,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func boundRetainedVideoIsolated() {
         assertIsolated()
         if let audioFirstPTS = contiguousAudioInterval()?.first {
+            let before = retainedVideo.count
             retainedVideo.removeAll { frame in
                 let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
                 return end.isNumeric && CMTimeCompare(end, audioFirstPTS) <= 0
             }
+            metrics?.recordAudioRelativeVideoPrune(count: before - retainedVideo.count)
         }
 
         // The two playback phases need opposite overflow victims, so the bound
