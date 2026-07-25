@@ -86,6 +86,14 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // Audio renderer recoveries (flush + full replay re-enqueue). Each one is
     // expensive on the playback executor, so a high rate starves ingest.
     public let audioRecoveryCount: UInt64
+    // Display-link callbacks that reached the renderer. Divided by elapsed time
+    // this is the *actual* tick rate, which is what separates "the display link
+    // is missing ticks" from "the renderer refused ticks it was offered".
+    public let renderTickCount: UInt64
+    // Ticks the renderer declined because every in-flight slot was still held by
+    // an incomplete GPU submission. A declined tick presents nothing, so the
+    // frame that was due lands on the next tick as a superseded drop.
+    public let renderSkippedInFlightCount: UInt64
     public let demuxPacketCount: UInt64
     public let videoAccessUnitCount: UInt64
     public let audioSampleCount: UInt64
@@ -174,6 +182,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         var clockTimeSeconds: Double?
         var videoResyncCount: UInt64 = 0
         var audioRecoveryCount: UInt64 = 0
+        var renderTickCount: UInt64 = 0
+        var renderSkippedInFlightCount: UInt64 = 0
         var demuxPacketCount: UInt64 = 0
         var videoAccessUnitCount: UInt64 = 0
         var audioSampleCount: UInt64 = 0
@@ -258,6 +268,13 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func recordVideoResync() {
         lock.withLock { state.videoResyncCount &+= 1 }
+    }
+
+    func recordRenderTick(skippedInFlight: Bool) {
+        lock.withLock {
+            state.renderTickCount &+= 1
+            if skippedInFlight { state.renderSkippedInFlightCount &+= 1 }
+        }
     }
 
     func recordDisplaySubmissionResume() {
@@ -461,6 +478,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             clockTimeSeconds: captured.clockTimeSeconds,
             videoResyncCount: captured.videoResyncCount,
             audioRecoveryCount: captured.audioRecoveryCount,
+            renderTickCount: captured.renderTickCount,
+            renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
             demuxPacketCount: captured.demuxPacketCount,
             videoAccessUnitCount: captured.videoAccessUnitCount,
             audioSampleCount: captured.audioSampleCount,

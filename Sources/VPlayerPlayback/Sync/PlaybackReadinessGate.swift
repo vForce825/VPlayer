@@ -96,6 +96,11 @@ public final class PlaybackReadinessGate {
         _ = attemptOpen()
     }
 
+    public func setMaximumAnchorLag(_ lag: CMTime) {
+        guard lag.isNumeric, CMTimeCompare(lag, .zero) > 0 else { return }
+        maximumAnchorLag = lag
+    }
+
     public func updateAudio(
         firstPTS: CMTime,
         contiguousDuration: CMTime,
@@ -212,11 +217,11 @@ public final class PlaybackReadinessGate {
     // costs frames for as long as playback runs. `commonReadyPTS` is otherwise
     // free to land anywhere back to the oldest retained audio — measured anchor
     // lags ranged from 0.4 s to 1.8 s across runs of the same stream.
-    // Sits just inside the renderer's one-second span: far enough back to give
-    // the clock real runway before it can overtake the decoder, close enough
-    // that the queue never overflows. Halving it traded overflow drops for twice
-    // as many re-anchors, which cost more frames than they saved.
-    private static let maximumAnchorLag = CMTime(value: 3, timescale: 4)
+    // Sits just inside the renderer's buffered span: far enough back to give the
+    // clock real runway before it can overtake the decoder, close enough that the
+    // queue never overflows. Derived from the configured buffer length, so
+    // lengthening the buffer lengthens the usable anchor window with it.
+    private var maximumAnchorLag = PlaybackTuning.default.maximumAnchorLag
 
     private func reevaluate() {
         if isOpen {
@@ -251,7 +256,7 @@ public final class PlaybackReadinessGate {
             ? audio.firstPTS
             : video.firstPTS
         if let newest = video.frames?.last?.presentationTimeStamp {
-            let latestUsefulAnchor = CMTimeSubtract(newest, Self.maximumAnchorLag)
+            let latestUsefulAnchor = CMTimeSubtract(newest, maximumAnchorLag)
             let runwayLimit = CMTimeSubtract(audioEnd, Self.startupAudioRunway)
             if latestUsefulAnchor.isNumeric,
                runwayLimit.isNumeric,

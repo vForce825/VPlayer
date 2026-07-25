@@ -180,7 +180,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private let outputAllocator: YADIFOutputAllocator
     private let clock: any PlaybackClock
     private let maximumInFlight: Int
-    private let maximumPendingFrames: Int
+    private var maximumPendingFrames: Int
     private let dropSink: @Sendable (YADIFDropEvent) -> Void
     private let metrics: PlaybackMetrics?
     private let signposts: PlaybackSignposts?
@@ -290,6 +290,20 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         self.metrics = metrics
         self.signposts = signposts
         self.dropSink = dropSink
+    }
+
+    /// Applied while playing so a viewer changing the buffer setting sees the
+    /// effect on the stream in front of them. Lowering the bound sheds down to it
+    /// straight away; raising it simply admits more before the next shed.
+    public func setMaximumPendingFrames(_ count: Int) {
+        guard count >= 1 else { return }
+        var actions: [UserAction] = []
+        lock.lock()
+        maximumPendingFrames = count
+        enforcePendingBoundLocked(actions: &actions)
+        lock.unlock()
+        perform(actions)
+        driveScheduler()
     }
 
     public func reset(to generation: MediaGeneration) {

@@ -26,14 +26,15 @@ public final class VideoPresentationQueue: @unchecked Sendable {
     // production lead. Every arrival then overflowed while the clock never got
     // close enough to select anything — 1080i live playback ran at a few frames
     // per second.
-    public static let defaultHorizon = CMTime(value: 1, timescale: 1)
+    public static let defaultHorizon = PlaybackTuning.default.videoBufferHorizon
     // Guard against pathological timestamps only. Normal operation is bounded by
     // the horizon; this stops a stream whose frames all carry one PTS from
     // growing the queue without limit.
-    public static let frameCeiling = 120
+    public static let frameCeiling = PlaybackTuning.default.videoBufferFrameCeiling
 
     private let lock = NSLock()
-    private let horizon: CMTime
+    private var horizon: CMTime
+    private var frameCeiling: Int
     private var frames: [VideoPresentationFrame] = []
     private var displayedFrame: VideoPresentationFrame?
     private var overflowSinceSelection = 0
@@ -42,15 +43,36 @@ public final class VideoPresentationQueue: @unchecked Sendable {
 
     public init(
         generation: MediaGeneration,
-        horizon: CMTime = VideoPresentationQueue.defaultHorizon
+        horizon: CMTime = VideoPresentationQueue.defaultHorizon,
+        frameCeiling: Int = VideoPresentationQueue.frameCeiling
     ) {
         activeGeneration = generation
-        self.horizon = horizon.isNumeric && CMTimeCompare(horizon, .zero) > 0
-            ? horizon
+        self.horizon = Self.validHorizon(horizon)
+        self.frameCeiling = Self.validFrameCeiling(frameCeiling)
+    }
+
+    public var horizonSeconds: Double { lock.withLock { CMTimeGetSeconds(horizon) } }
+
+    /// Applied while playing, so a viewer changing the buffer length in settings
+    /// sees the effect on the stream they are watching. Growing the buffer keeps
+    /// what is queued; shrinking it trims immediately.
+    public func setBuffer(horizon newHorizon: CMTime, frameCeiling newCeiling: Int) {
+        lock.withLock {
+            horizon = Self.validHorizon(newHorizon)
+            frameCeiling = Self.validFrameCeiling(newCeiling)
+            trimToHorizonLocked()
+        }
+    }
+
+    private static func validHorizon(_ candidate: CMTime) -> CMTime {
+        candidate.isNumeric && CMTimeCompare(candidate, .zero) > 0
+            ? candidate
             : VideoPresentationQueue.defaultHorizon
     }
 
-    public var horizonSeconds: Double { CMTimeGetSeconds(horizon) }
+    private static func validFrameCeiling(_ candidate: Int) -> Int {
+        candidate > 1 ? candidate : VideoPresentationQueue.frameCeiling
+    }
 
     public var generation: MediaGeneration {
         lock.withLock { activeGeneration }
@@ -199,7 +221,7 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 frames[0].presentationTimeStamp
             )
             let overHorizon = span.isNumeric && CMTimeCompare(span, horizon) > 0
-            guard overHorizon || frames.count > Self.frameCeiling else { return }
+            guard overHorizon || frames.count > frameCeiling else { return }
             // Evict the frame furthest from being due. `select` already discards
             // frames whose expiry has passed, so reaching here means the producer
             // is ahead of the clock — dropping the oldest would delete the very

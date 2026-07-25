@@ -222,6 +222,34 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertFalse(harness.queue.submittedSourceAccessUnitIDs.contains(4))
     }
 
+    // Raising the bound from the settings sheet has to help the stream already
+    // playing, and lowering it has to shed down to the new bound rather than wait
+    // for the next arrival to notice.
+    func testPendingBoundChangesApplyToAProcessorThatIsAlreadyRunning() throws {
+        let clock = TestYADIFClock()
+        clock.set(CMTime(value: 4, timescale: 25))
+        let harness = try makeHarness(
+            clock: clock,
+            maximumInFlight: 3,
+            maximumPendingFrames: 2
+        )
+        harness.processor.setMaximumPendingFrames(6)
+        for id in 1...8 {
+            submit(try normalized(id: UInt64(id)), to: harness)
+        }
+        XCTAssertTrue(harness.drops.snapshot.isEmpty)
+        XCTAssertEqual(harness.processor.metricsSnapshot.gpuQueueFullDropCount, 0)
+        XCTAssertEqual(harness.processor.metricsSnapshot.pendingFrameCount, 5)
+
+        harness.processor.setMaximumPendingFrames(2)
+        XCTAssertEqual(harness.processor.metricsSnapshot.pendingFrameCount, 2)
+        XCTAssertEqual(harness.processor.metricsSnapshot.gpuQueueFullDropCount, 3)
+
+        // A bound below one would stall the deinterlacer outright.
+        harness.processor.setMaximumPendingFrames(0)
+        XCTAssertEqual(harness.processor.metricsSnapshot.pendingFrameCount, 2)
+    }
+
     func testLateReadyJobsAreNotDroppedWithoutPendingPressure() throws {
         let clock = TestYADIFClock()
         clock.set(CMTime(value: 1_000, timescale: 1))

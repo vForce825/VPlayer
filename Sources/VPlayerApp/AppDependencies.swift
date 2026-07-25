@@ -138,6 +138,10 @@ struct AppDependencies {
         playbackSettings.setDeinterlaceAlgorithmChangeHandler(
             algorithmSelection.select
         )
+        playbackSettings.setTuningChangeHandler(algorithmSelection.apply)
+        // A stored buffer length has to reach the engine before the first stream
+        // starts, otherwise the setting only takes effect once it is changed.
+        algorithmSelection.apply(playbackSettings.tuning)
     }
 
     static func live() -> Self {

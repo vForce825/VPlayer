@@ -1812,6 +1812,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let clockTimeSeconds: Double?
     let videoResyncCount: UInt64
     let audioRecoveryCount: UInt64
+    let renderTickCount: UInt64
+    let renderSkippedInFlightCount: UInt64
     let demuxPacketCount: UInt64
     let videoAccessUnitCount: UInt64
     let audioSampleCount: UInt64

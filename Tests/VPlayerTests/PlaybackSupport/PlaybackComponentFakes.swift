@@ -18,6 +18,7 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     private(set) var stopCount = 0
     private(set) var completedStopCount = 0
     private(set) var algorithms: [DeinterlaceAlgorithm] = []
+    private(set) var tunings: [PlaybackTuning] = []
     var stopAutomaticallyCompletes = true
     private var stopContinuation: CheckedContinuation<Void, Never>?
     let presentationContext: PlaybackPresentationContext?
@@ -46,6 +47,10 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
         lock.withLock { algorithms.append(algorithm) }
         metrics?.update(selectedAlgorithm: algorithm)
+    }
+
+    func setTuning(_ tuning: PlaybackTuning) {
+        lock.withLock { tunings.append(tuning) }
     }
 
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
@@ -82,6 +87,7 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
         starts: [URL],
         pauses: [(Bool, UInt64)],
         algorithms: [DeinterlaceAlgorithm],
+        tunings: [PlaybackTuning],
         stopCount: Int,
         completedStopCount: Int,
         isStopWaiting: Bool
@@ -91,6 +97,7 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
                 starts,
                 pauses,
                 algorithms,
+                tunings,
                 stopCount,
                 completedStopCount,
                 stopContinuation != nil
@@ -104,6 +111,7 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     private var queued: [FakeControllerPipeline]
     private var makeCount = 0
     private var selectedAlgorithms: [DeinterlaceAlgorithm] = []
+    private var requestedTunings: [PlaybackTuning] = []
 
     init(_ pipelines: [FakeControllerPipeline]) {
         queued = pipelines
@@ -111,6 +119,7 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
 
     func makePipeline(
         selectedAlgorithm: DeinterlaceAlgorithm,
+        tuning: PlaybackTuning,
         channelID _: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
@@ -118,6 +127,7 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
             guard !queued.isEmpty else { throw PlaybackCoreError.demuxOpen(-99) }
             makeCount += 1
             selectedAlgorithms.append(selectedAlgorithm)
+            requestedTunings.append(tuning)
             let pipeline = queued.removeFirst()
             pipeline.install(eventSink)
             return pipeline
@@ -127,6 +137,10 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     var makeCountSnapshot: Int { lock.withLock { makeCount } }
     var selectedAlgorithmsSnapshot: [DeinterlaceAlgorithm] {
         lock.withLock { selectedAlgorithms }
+    }
+
+    var requestedTuningsSnapshot: [PlaybackTuning] {
+        lock.withLock { requestedTunings }
     }
 }
 

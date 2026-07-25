@@ -16,6 +16,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
     private var selectedAlgorithm = DeinterlaceAlgorithm.appleTemporal
+    private var tuning = PlaybackTuning.default
 
     public init() {
         factory = SystemPlaybackPipelineFactory()
@@ -76,6 +77,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
         do {
             let next = try factory.makePipeline(
                 selectedAlgorithm: selectedAlgorithm,
+                tuning: tuning,
                 channelID: request.channelID
             ) { [weak self] event in
                 Task { await self?.receive(event, sessionID: id) }
@@ -130,6 +132,11 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
     public func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async {
         selectedAlgorithm = algorithm
         pipeline?.setDeinterlaceAlgorithm(algorithm)
+    }
+
+    public func setTuning(_ tuning: PlaybackTuning) async {
+        self.tuning = tuning
+        pipeline?.setTuning(tuning)
     }
 
     public func presentationContext() -> PlaybackPresentationContext? {

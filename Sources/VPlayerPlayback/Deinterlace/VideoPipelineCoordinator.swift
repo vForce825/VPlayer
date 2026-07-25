@@ -7,7 +7,7 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
-protocol YADIFFrameProcessing: AnyObject, Sendable {
+protocol YADIFFrameProcessing: AnyObject, Sendable, PlaybackTunable {
     func reset(to generation: MediaGeneration)
     func submit(
         normalized frame: NormalizedDecodedFrame,
@@ -24,7 +24,11 @@ protocol YADIFFrameProcessing: AnyObject, Sendable {
     )
 }
 
-extension YADIFProcessor: YADIFFrameProcessing {}
+extension YADIFProcessor: YADIFFrameProcessing {
+    func apply(_ tuning: PlaybackTuning) {
+        setMaximumPendingFrames(tuning.deinterlaceBufferFrames)
+    }
+}
 
 /// Synchronous callbacks into `PlaybackPipeline`.
 ///
@@ -301,6 +305,11 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             }
             hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
         }
+    }
+
+    func applyTuning(_ tuning: PlaybackTuning) {
+        guard !stopped else { return }
+        yadif.apply(tuning)
     }
 
     func setAlgorithm(_ algorithm: DeinterlaceAlgorithm) {

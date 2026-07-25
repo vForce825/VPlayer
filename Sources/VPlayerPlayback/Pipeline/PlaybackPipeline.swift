@@ -22,12 +22,14 @@ protocol PlaybackPipelineProtocol: AnyObject, Sendable {
     func start(url: URL)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
     func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm)
+    func setTuning(_ tuning: PlaybackTuning)
     func stop() async
 }
 
 protocol PlaybackPipelineFactory: Sendable {
     func makePipeline(
         selectedAlgorithm: DeinterlaceAlgorithm,
+        tuning: PlaybackTuning,
         channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol
@@ -94,8 +96,21 @@ struct SystemPlaybackAssemblerBuilder: PlaybackAssemblerBuilding {
     }
 }
 
-protocol PlaybackVideoRendering: VideoRendering, VideoPresentationTimingResetting {}
-extension MetalVideoRenderer: PlaybackVideoRendering {}
+/// Components whose buffering bounds the viewer can change while a stream is
+/// playing. The default no-op keeps the fakes in the tests, which have no
+/// buffers to size, free of ceremony.
+protocol PlaybackTunable: AnyObject {
+    func apply(_ tuning: PlaybackTuning)
+}
+
+extension PlaybackTunable {
+    func apply(_ tuning: PlaybackTuning) {}
+}
+
+protocol PlaybackVideoRendering: VideoRendering, VideoPresentationTimingResetting, PlaybackTunable {}
+extension MetalVideoRenderer: PlaybackVideoRendering {
+    func apply(_ tuning: PlaybackTuning) { setTuning(tuning) }
+}
 
 protocol PlaybackDisplayControlling: Sendable {
     func pauseSubmission()
@@ -149,11 +164,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     // settles just underneath it, showing nothing and never recovering.
     static let videoResyncThreshold = CMTime(value: 1, timescale: 25)
     private static let retainedAudioCapacity = 96
-    // The retained window only exists to reseed the renderer on a re-anchor, so
-    // it is bounded by the same duration as the presentation queue rather than by
-    // a frame count that would shrink whenever the output frame rate doubles.
-    private static let retainedVideoHorizon = VideoPresentationQueue.defaultHorizon
-    private static let retainedVideoFrameCeiling = VideoPresentationQueue.frameCeiling
 
     private struct PendingPacketAdmission {
         let packet: DemuxPacket
@@ -173,6 +183,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var videoCoordinator: VideoPipelineCoordinator!
 
     // Every property below is accessed exclusively from `executor`.
+    private var tuning: PlaybackTuning
     private var generationController = GenerationController()
     private var consumedFingerprint: MediaFormatFingerprint?
     private var awaitingFreshTrackEpoch = false
@@ -225,6 +236,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         yadifProcessor: any YADIFFrameProcessing,
         scanProbe: (any LumaScanProbing)? = nil,
         selectedAlgorithm: DeinterlaceAlgorithm = .appleTemporal,
+        tuning: PlaybackTuning = .default,
         rawReadinessRequirementOverride: Int? = nil,
         renderer: any PlaybackVideoRendering,
         audio: any AudioRenderPipelineProtocol,
@@ -236,6 +248,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         signposts: PlaybackSignposts? = nil
     ) {
         self.executor = executor
+        self.tuning = tuning
         self.demuxer = demuxer
         self.assemblerBuilder = assemblerBuilder
         self.renderer = renderer
@@ -308,6 +321,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             guard let self, !terminal else { return }
             metrics?.update(selectedAlgorithm: algorithm)
             videoCoordinator.setAlgorithm(algorithm)
+        }
+    }
+
+    func setTuning(_ tuning: PlaybackTuning) {
+        executor.submit { [weak self] in
+            guard let self, !terminal, self.tuning != tuning else { return }
+            self.tuning = tuning
+            renderer.apply(tuning)
+            videoCoordinator.applyTuning(tuning)
+            readiness?.setMaximumAnchorLag(tuning.maximumAnchorLag)
+            boundRetainedVideoIsolated()
         }
     }
 
@@ -452,6 +476,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         readiness = PlaybackReadinessGate(clock: clock, prepareAnchorVeto: { [weak self] commonPTS in
             self?.prepareAnchorIsolated(commonPTS: commonPTS) == true
         })
+        readiness?.setMaximumAnchorLag(tuning.maximumAnchorLag)
         readiness?.configure(requiredVideoFrameCount: videoCoordinator.requiredVideoFrameCount)
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
@@ -1152,9 +1177,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 retainedVideo[retainedVideo.count - 1].presentationTimeStamp,
                 retainedVideo[0].presentationTimeStamp
             )
+            // The retained window only exists to reseed the renderer on a
+            // re-anchor, so it is bounded by the same duration as the
+            // presentation queue rather than by a frame count that would shrink
+            // whenever the output frame rate doubles.
             let overHorizon = span.isNumeric
-                && CMTimeCompare(span, Self.retainedVideoHorizon) > 0
-            guard overHorizon || retainedVideo.count > Self.retainedVideoFrameCeiling else {
+                && CMTimeCompare(span, tuning.videoBufferHorizon) > 0
+            guard overHorizon || retainedVideo.count > tuning.videoBufferFrameCeiling else {
                 return
             }
             retainedVideo.removeFirst()
@@ -1402,6 +1431,7 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
 struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
     func makePipeline(
         selectedAlgorithm: DeinterlaceAlgorithm,
+        tuning: PlaybackTuning,
         channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
@@ -1444,7 +1474,8 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
                 commandQueue: commandQueue,
                 textureCache: textureCache,
                 clock: clock,
-                diagnostics: (metrics: metrics, signposts: signposts)
+                diagnostics: (metrics: metrics, signposts: signposts),
+                maximumPendingFrames: tuning.deinterlaceBufferFrames
             )
         } catch {
             throw PlaybackCoreError.metalCommand("yadif.setup")
@@ -1458,6 +1489,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let renderer = try MetalVideoRenderer(
             device: device,
             generation: MediaGeneration(rawValue: 0),
+            tuning: tuning,
             metrics: metrics,
             signposts: signposts,
             failureSink: { relay.failure($0, generation: $1) }
@@ -1486,6 +1518,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             yadifProcessor: yadif,
             scanProbe: probe,
             selectedAlgorithm: selectedAlgorithm,
+            tuning: tuning,
             renderer: renderer,
             audio: audio,
             clock: clock,

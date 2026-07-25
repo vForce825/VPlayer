@@ -303,6 +303,29 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(fake.snapshot().algorithms, [.appleTemporal])
     }
 
+    func testControllerForwardsPrePlayAndLiveBufferTuning() async throws {
+        let first = FakeControllerPipeline()
+        let second = FakeControllerPipeline()
+        let factory = FakeControllerPipelineFactory([first, second])
+        let controller = PlaybackController(factory: factory)
+        let long = PlaybackTuning(videoBufferSeconds: 4, deinterlaceBufferFrames: 16)
+
+        // Set before playing: the pipeline has to be built with it, otherwise a
+        // stored setting only takes effect the second time a channel is opened.
+        await controller.setTuning(long)
+        await controller.play(makeRequest())
+        XCTAssertEqual(factory.requestedTuningsSnapshot, [long])
+        XCTAssertTrue(first.snapshot().tunings.isEmpty)
+
+        // Changed while playing: applied to the running stream, and remembered
+        // for the pipeline built for the next channel.
+        let short = PlaybackTuning(videoBufferSeconds: 0.5, deinterlaceBufferFrames: 4)
+        await controller.setTuning(short)
+        XCTAssertEqual(first.snapshot().tunings, [short])
+        await controller.play(makeRequest())
+        XCTAssertEqual(factory.requestedTuningsSnapshot, [long, short])
+    }
+
     func testControllerPublishesOnlyActiveSessionNotices() async throws {
         let first = FakeControllerPipeline()
         let second = FakeControllerPipeline()
