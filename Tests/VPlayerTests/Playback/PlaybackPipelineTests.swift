@@ -1121,7 +1121,9 @@ final class PlaybackPipelineTests: XCTestCase {
         let harness = makeHarness(metrics: metrics)
         let generation = try await configure(harness)
 
-        let frames = try (0..<VideoPresentationQueue.capacity).map { index in
+        // A full horizon of 25 fps video.
+        let framesPerHorizon = 25
+        let frames = try (0..<framesPerHorizon).map { index in
             try PlaybackFakeMedia.decodedFrame(
                 id: UInt64(index + 1),
                 generation: generation,
@@ -1135,10 +1137,7 @@ final class PlaybackPipelineTests: XCTestCase {
             metrics.snapshot(window: .seconds(60)).retainedVideoCount ==
                 PlaybackPipeline.startupRetainedVideoCapacity
         }
-        XCTAssertLessThan(
-            PlaybackPipeline.startupRetainedVideoCapacity,
-            VideoPresentationQueue.capacity
-        )
+        XCTAssertLessThan(PlaybackPipeline.startupRetainedVideoCapacity, framesPerHorizon)
         XCTAssertTrue(harness.renderer.snapshot().frames.isEmpty)
         XCTAssertFalse(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
     }
@@ -1154,7 +1153,7 @@ final class PlaybackPipelineTests: XCTestCase {
         let generation = try await configure(harness)
         harness.audio.setReady(true)
 
-        let earlyFrames = try (0..<(VideoPresentationQueue.capacity * 2)).map { index in
+        let earlyFrames = try (0..<50).map { index in
             try PlaybackFakeMedia.decodedFrame(
                 id: UInt64(index + 1),
                 generation: generation,

@@ -12,25 +12,38 @@ struct VideoPresentationSelection {
 }
 
 public final class VideoPresentationQueue: @unchecked Sendable {
-    // This is really a time buffer expressed in frames. The pipeline hands frames
-    // to the renderer roughly half a second before they are due, and the
-    // field-rate deinterlace routes emit two frames per input frame, so at 50 fps
-    // a 12-slot queue spans only ~0.24 s — less than the production lead. The
-    // queue then overflowed on every single arrival while the clock never got
-    // close enough to select anything, which is what reduced 1080i live playback
-    // to a few frames per second. 24 slots keep ~0.48 s at field rate.
-    public static let capacity = 24
+    // This queue is a jitter buffer between the decoder and the display link, so
+    // its size is a *duration*, not a frame count. Sizing it in frames made it
+    // depend on the output frame rate: the field-rate deinterlace routes emit two
+    // frames per input frame, which halved the buffer to less than the pipeline's
+    // production lead. Every arrival then overflowed while the clock never got
+    // close enough to select anything — 1080i live playback ran at a few frames
+    // per second.
+    public static let defaultHorizon = CMTime(value: 1, timescale: 1)
+    // Guard against pathological timestamps only. Normal operation is bounded by
+    // the horizon; this stops a stream whose frames all carry one PTS from
+    // growing the queue without limit.
+    public static let frameCeiling = 120
 
     private let lock = NSLock()
+    private let horizon: CMTime
     private var frames: [VideoPresentationFrame] = []
     private var displayedFrame: VideoPresentationFrame?
     private var overflowSinceSelection = 0
     private var epochDroppedFrames = 0
     private var activeGeneration: MediaGeneration
 
-    public init(generation: MediaGeneration) {
+    public init(
+        generation: MediaGeneration,
+        horizon: CMTime = VideoPresentationQueue.defaultHorizon
+    ) {
         activeGeneration = generation
+        self.horizon = horizon.isNumeric && CMTimeCompare(horizon, .zero) > 0
+            ? horizon
+            : VideoPresentationQueue.defaultHorizon
     }
+
+    public var horizonSeconds: Double { CMTimeGetSeconds(horizon) }
 
     public var generation: MediaGeneration {
         lock.withLock { activeGeneration }
@@ -59,16 +72,7 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 Self.isOrderedBefore(frame, $0)
             }
             frames.insert(frame, at: insertionIndex)
-            if frames.count > Self.capacity {
-                // Evict the frame furthest from being due. `select` already
-                // discards frames whose expiry has passed, so reaching this line
-                // means the producer is ahead of the clock — dropping the oldest
-                // would delete the very frame that is about to be displayed and
-                // guarantee that nothing is ever presented.
-                frames.removeLast()
-                overflowSinceSelection += 1
-                epochDroppedFrames += 1
-            }
+            trimToHorizonLocked()
             return true
         }
     }
@@ -138,6 +142,25 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 return .init(action: .repeated, frame: displayedFrame, droppedFrameCount: dropped)
             }
             return .init(action: .waiting, frame: nil, droppedFrameCount: dropped)
+        }
+    }
+
+    private func trimToHorizonLocked() {
+        while frames.count > 1 {
+            let span = CMTimeSubtract(
+                frames[frames.count - 1].presentationTimeStamp,
+                frames[0].presentationTimeStamp
+            )
+            let overHorizon = span.isNumeric && CMTimeCompare(span, horizon) > 0
+            guard overHorizon || frames.count > Self.frameCeiling else { return }
+            // Evict the frame furthest from being due. `select` already discards
+            // frames whose expiry has passed, so reaching here means the producer
+            // is ahead of the clock — dropping the oldest would delete the very
+            // frame that is about to be displayed and guarantee that nothing is
+            // ever presented.
+            frames.removeLast()
+            overflowSinceSelection += 1
+            epochDroppedFrames += 1
         }
     }
 

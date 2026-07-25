@@ -136,20 +136,24 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     static let deferredPacketCapacity = 32
     static let pendingTrackMediaCapacity = 96
-    // Must stay strictly below `retainedVideoCapacity` so a closed-readiness
-    // startup window cannot claim the whole presentation queue and starve the
-    // decoder pool. Anchoring needs at most `requiredVideoFrameCount` (2 for
-    // field-rate YADIF) frames, so a small window is sufficient here.
+    // Must stay well inside `retainedVideoHorizon` so a closed-readiness startup
+    // window cannot claim the whole presentation queue and starve the decoder
+    // pool. Anchoring needs at most `requiredVideoFrameCount` (2 for field-rate
+    // YADIF) frames, so a small window is sufficient here.
     static let startupRetainedVideoCapacity = 4
-    // How far the running clock may outrun the newest decoded frame before the
-    // pipeline re-anchors. A live source only produces at realtime, so once video
-    // falls behind the clock it can never catch up on its own: every frame is
-    // already expired when it reaches the presentation queue and nothing is
-    // displayed again. The margin has to exceed normal jitter but stay well below
-    // the presentation queue's horizon.
-    static let videoResyncThreshold = CMTime(value: 1, timescale: 4)
+    // How far the running clock may outrun the *newest* decoded frame before the
+    // pipeline re-anchors. Once even the newest frame is past due there is
+    // nothing left that can be presented — every earlier frame is older still —
+    // so this is a genuine stall rather than jitter, and the margin only needs to
+    // absorb a single late frame. A larger margin is actively harmful: playback
+    // settles just underneath it, showing nothing and never recovering.
+    static let videoResyncThreshold = CMTime(value: 1, timescale: 25)
     private static let retainedAudioCapacity = 96
-    private static let retainedVideoCapacity = VideoPresentationQueue.capacity
+    // The retained window only exists to reseed the renderer on a re-anchor, so
+    // it is bounded by the same duration as the presentation queue rather than by
+    // a frame count that would shrink whenever the output frame rate doubles.
+    private static let retainedVideoHorizon = VideoPresentationQueue.defaultHorizon
+    private static let retainedVideoFrameCeiling = VideoPresentationQueue.frameCeiling
 
     private struct PendingPacketAdmission {
         let packet: DemuxPacket
@@ -1143,8 +1147,18 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             return
         }
 
-        guard retainedVideo.count > Self.retainedVideoCapacity else { return }
-        retainedVideo.removeFirst(retainedVideo.count - Self.retainedVideoCapacity)
+        while retainedVideo.count > 1 {
+            let span = CMTimeSubtract(
+                retainedVideo[retainedVideo.count - 1].presentationTimeStamp,
+                retainedVideo[0].presentationTimeStamp
+            )
+            let overHorizon = span.isNumeric
+                && CMTimeCompare(span, Self.retainedVideoHorizon) > 0
+            guard overHorizon || retainedVideo.count > Self.retainedVideoFrameCeiling else {
+                return
+            }
+            retainedVideo.removeFirst()
+        }
     }
 
     private func prepareAnchorIsolated(commonPTS: CMTime) -> Bool {
