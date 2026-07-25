@@ -24,8 +24,12 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(snapshot.creates.first?.imageBufferAttributes, [
             kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
             kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String:
+            kCVPixelBufferPixelFormatTypeKey as String: .array([
                 .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange),
+            ]),
         ])
         XCTAssertEqual(snapshot.sets, [FakeVideoToolboxAPI.PropertyRecord(
             sessionID: VTSessionID(rawValue: 1),
@@ -62,8 +66,12 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(snapshot.creates.first?.imageBufferAttributes, [
             kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
             kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String:
+            kCVPixelBufferPixelFormatTypeKey as String: .array([
                 .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange),
+            ]),
         ])
         XCTAssertEqual(snapshot.supportedPropertyQueries, [VTSessionID(rawValue: 1)])
         XCTAssertEqual(snapshot.sets, [

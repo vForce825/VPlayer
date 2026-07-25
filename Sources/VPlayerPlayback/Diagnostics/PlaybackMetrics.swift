@@ -13,6 +13,19 @@ public protocol PlaybackMetricsProviding: Actor {
     func playbackMetricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot?
 }
 
+// Where a discarded video frame was lost. A single total cannot distinguish a
+// pipeline that is merely shedding late frames from one whose decode or
+// deinterlace stage has stopped delivering entirely.
+public enum VideoDropSource: Int, Sendable, CaseIterable {
+    case decoderSubmission
+    case decoderRecoverable
+    case deinterlaceQueueFull
+    case deinterlaceFailure
+    case presentationOverflow
+    case presentationExpired
+    case presentationSuperseded
+}
+
 public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let scanType: String
     public let selectedAlgorithm: DeinterlaceAlgorithm
@@ -24,6 +37,11 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let temporalDecodeFlagCount: UInt64
     public let staleGenerationDropCount: UInt64
     public let droppedVideoFrames: UInt64
+    // Indexed by `VideoDropSource.rawValue`.
+    public let videoDropCountsBySource: [UInt64]
+    // Sanitized classification and status of the most recent decode failure,
+    // e.g. "badData:-12909". A drop total cannot say which fault is repeating.
+    public let lastVideoDecodeFailure: String?
     public let maximumPresentationQueueDepth: Int
     public let maximumYADIFInFlightCount: Int
     public let maximumYADIFInputDepth: Int
@@ -45,11 +63,64 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let audioFirstPTSSeconds: Double?
     public let audioDurationSeconds: Double
     public let videoFirstPTSSeconds: Double?
+    // Newest processed video PTS *before* the retained window is bounded, so a
+    // starved window can be told apart from video that legitimately trails audio.
+    public let videoLatestPTSSeconds: Double?
+    public let audioRelativeVideoPruneCount: UInt64
+    // The gate bumps its cycle on every close, so a large value over a short run
+    // means readiness is flapping rather than staying shut once.
+    public let readinessCycleID: UInt64
+    // Indexed by `PlaybackReadinessCloseReason.rawValue`: flush, buffering,
+    // pause, discontinuity, audioReplacement, displayModeSwitch.
+    public let readinessCloseReasonCounts: [UInt64]
+    // How many times display submission has been resumed for an open gate. If
+    // this stops advancing while frames keep arriving, the submission side is
+    // stranded rather than the decode side.
+    public let displayResumeCount: UInt64
+    // Media time the playback clock currently reports. Compared against
+    // `videoLatestPTSSeconds` this separates "the clock is not running" from
+    // "frames are not reaching the presentation queue".
+    public let clockTimeSeconds: Double?
+    // Times the pipeline re-anchored because the clock had outrun the decoder.
+    public let videoResyncCount: UInt64
+    // Audio renderer recoveries (flush + full replay re-enqueue). Each one is
+    // expensive on the playback executor, so a high rate starves ingest.
+    public let audioRecoveryCount: UInt64
+    // Display-link callbacks that reached the renderer. Divided by elapsed time
+    // this is the *actual* tick rate, which is what separates "the display link
+    // is missing ticks" from "the renderer refused ticks it was offered".
+    public let renderTickCount: UInt64
+    // Ticks the renderer declined because every in-flight slot was still held by
+    // an incomplete GPU submission. A declined tick presents nothing, so the
+    // frame that was due lands on the next tick as a superseded drop.
+    public let renderSkippedInFlightCount: UInt64
+    // Where the read path loses time. `queueFullWait` rising means the app is not
+    // draining fast enough to keep reading; both near zero means the source
+    // simply is not delivering realtime, and nothing in the app will fix it.
+    public let demuxQueueFullWaitSeconds: Double
+    public let demuxAdmitWaitSeconds: Double
+    // Wall time the playback executor spent running work. Near the elapsed time
+    // means it is saturated and the answer is less work on it; well below means
+    // callers are merely queued behind it and the answer is less coupling.
+    public let playbackExecutorBusySeconds: Double
     public let demuxPacketCount: UInt64
     public let videoAccessUnitCount: UInt64
     public let audioSampleCount: UInt64
     public let videoDecodeSubmissionCount: UInt64
     public let maximumVideoDecodeSubmissionMilliseconds: Double
+    // Against `playbackExecutorBusySeconds` this says how much of the executor
+    // decode submission is actually occupying — a maximum alone cannot separate
+    // "one slow frame" from "every frame is slow".
+    public let totalVideoDecodeSubmissionMilliseconds: Double
+    // High-water mark of decode outputs waiting for the playback executor. Each
+    // retains a decoder output buffer, so a mark that climbs and stays is the
+    // decoder starving itself: submission blocks for a buffer that only the
+    // executor can free, while the executor is blocked inside submission.
+    public let maximumOutstandingDecoderOutputs: Int
+    // What the decode session actually reported for field mode and hardware
+    // acceleration. Both are tolerated when unsupported, so without this a
+    // session that silently fell back looks exactly like a healthy one.
+    public let decoderSessionSummary: String?
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -106,6 +177,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         var temporalDecodeFlagCount: UInt64 = 0
         var staleGenerationDropCount: UInt64 = 0
         var droppedVideoFrames: UInt64 = 0
+        var videoDropCountsBySource = [UInt64](
+            repeating: 0, count: VideoDropSource.allCases.count
+        )
+        var lastVideoDecodeFailure: String?
         var maximumPresentationQueueDepth = 0
         var maximumYADIFInFlightCount = 0
         var maximumYADIFInputDepth = 0
@@ -121,11 +196,27 @@ final class PlaybackMetrics: @unchecked Sendable {
         var audioFirstPTSSeconds: Double?
         var audioDurationSeconds = 0.0
         var videoFirstPTSSeconds: Double?
+        var videoLatestPTSSeconds: Double?
+        var audioRelativeVideoPruneCount: UInt64 = 0
+        var readinessCycleID: UInt64 = 0
+        var readinessCloseReasonCounts = [UInt64](repeating: 0, count: 6)
+        var displayResumeCount: UInt64 = 0
+        var clockTimeSeconds: Double?
+        var videoResyncCount: UInt64 = 0
+        var audioRecoveryCount: UInt64 = 0
+        var renderTickCount: UInt64 = 0
+        var renderSkippedInFlightCount: UInt64 = 0
+        var demuxQueueFullWaitNanoseconds: UInt64 = 0
+        var demuxAdmitWaitNanoseconds: UInt64 = 0
+        var playbackExecutorBusyNanoseconds: UInt64 = 0
         var demuxPacketCount: UInt64 = 0
         var videoAccessUnitCount: UInt64 = 0
         var audioSampleCount: UInt64 = 0
         var videoDecodeSubmissionCount: UInt64 = 0
         var maximumVideoDecodeSubmissionMilliseconds = 0.0
+        var totalVideoDecodeSubmissionMilliseconds = 0.0
+        var maximumOutstandingDecoderOutputs = 0
+        var decoderSessionSummary: String?
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
@@ -177,7 +268,11 @@ final class PlaybackMetrics: @unchecked Sendable {
         retainedVideoCount: Int,
         audioFirstPTS: CMTime?,
         audioDuration: CMTime?,
-        videoFirstPTS: CMTime?
+        videoFirstPTS: CMTime?,
+        readinessCycleID: UInt64 = 0,
+        readinessCloseReasonCounts: [UInt64] = [],
+        clockTime: CMTime? = nil,
+        audioRecoveryCount: UInt64 = 0
     ) {
         lock.withLock {
             state.audioRoute = audioRoute == .systemCompressed
@@ -190,6 +285,53 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.audioFirstPTSSeconds = Self.numericSeconds(audioFirstPTS)
             state.audioDurationSeconds = Self.numericSeconds(audioDuration) ?? 0
             state.videoFirstPTSSeconds = Self.numericSeconds(videoFirstPTS)
+            state.readinessCycleID = readinessCycleID
+            if !readinessCloseReasonCounts.isEmpty {
+                state.readinessCloseReasonCounts = readinessCloseReasonCounts
+            }
+            state.clockTimeSeconds = Self.numericSeconds(clockTime)
+            state.audioRecoveryCount = audioRecoveryCount
+        }
+    }
+
+    func recordVideoResync() {
+        lock.withLock { state.videoResyncCount &+= 1 }
+    }
+
+    func update(
+        demuxQueueFullWaitNanoseconds: UInt64,
+        demuxAdmitWaitNanoseconds: UInt64,
+        playbackExecutorBusyNanoseconds: UInt64
+    ) {
+        lock.withLock {
+            state.demuxQueueFullWaitNanoseconds = demuxQueueFullWaitNanoseconds
+            state.demuxAdmitWaitNanoseconds = demuxAdmitWaitNanoseconds
+            state.playbackExecutorBusyNanoseconds = playbackExecutorBusyNanoseconds
+        }
+    }
+
+    func recordRenderTick(skippedInFlight: Bool) {
+        lock.withLock {
+            state.renderTickCount &+= 1
+            if skippedInFlight { state.renderSkippedInFlightCount &+= 1 }
+        }
+    }
+
+    func recordDisplaySubmissionResume() {
+        lock.withLock { state.displayResumeCount &+= 1 }
+    }
+
+    func recordProcessedVideo(latestPTS: CMTime?) {
+        guard let seconds = Self.numericSeconds(latestPTS) else { return }
+        lock.withLock {
+            state.videoLatestPTSSeconds = max(state.videoLatestPTSSeconds ?? seconds, seconds)
+        }
+    }
+
+    func recordAudioRelativeVideoPrune(count: Int) {
+        guard count > 0 else { return }
+        lock.withLock {
+            state.audioRelativeVideoPruneCount &+= UInt64(count)
         }
     }
 
@@ -213,10 +355,24 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock { state.audioSampleCount &+= 1 }
     }
 
+    func recordDecoderSession(summary: String) {
+        lock.withLock { state.decoderSessionSummary = summary }
+    }
+
+    func recordDecoderOutputQueued(outstanding: Int) {
+        lock.withLock {
+            state.maximumOutstandingDecoderOutputs = max(
+                state.maximumOutstandingDecoderOutputs,
+                outstanding
+            )
+        }
+    }
+
     func recordVideoDecodeSubmission(milliseconds: Double) {
         guard milliseconds.isFinite, milliseconds >= 0 else { return }
         lock.withLock {
             state.videoDecodeSubmissionCount &+= 1
+            state.totalVideoDecodeSubmissionMilliseconds += milliseconds
             state.maximumVideoDecodeSubmissionMilliseconds = max(
                 state.maximumVideoDecodeSubmissionMilliseconds,
                 milliseconds
@@ -288,8 +444,16 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock { state.staleGenerationDropCount &+= 1 }
     }
 
-    func recordVideoDrop(count: Int = 1) {
-        lock.withLock { state.droppedVideoFrames &+= UInt64(max(0, count)) }
+    func recordVideoDecodeFailure(kind: String, status: Int32) {
+        lock.withLock { state.lastVideoDecodeFailure = "\(kind):\(status)" }
+    }
+
+    func recordVideoDrop(count: Int = 1, source: VideoDropSource) {
+        let amount = UInt64(max(0, count))
+        lock.withLock {
+            state.droppedVideoFrames &+= amount
+            state.videoDropCountsBySource[source.rawValue] &+= amount
+        }
     }
 
     func recordTemporalUnavailableNotice() {
@@ -337,6 +501,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             temporalDecodeFlagCount: captured.temporalDecodeFlagCount,
             staleGenerationDropCount: captured.staleGenerationDropCount,
             droppedVideoFrames: captured.droppedVideoFrames,
+            videoDropCountsBySource: captured.videoDropCountsBySource,
+            lastVideoDecodeFailure: captured.lastVideoDecodeFailure,
             maximumPresentationQueueDepth: captured.maximumPresentationQueueDepth,
             maximumYADIFInFlightCount: captured.maximumYADIFInFlightCount,
             maximumYADIFInputDepth: captured.maximumYADIFInputDepth,
@@ -358,12 +524,30 @@ final class PlaybackMetrics: @unchecked Sendable {
             audioFirstPTSSeconds: captured.audioFirstPTSSeconds,
             audioDurationSeconds: captured.audioDurationSeconds,
             videoFirstPTSSeconds: captured.videoFirstPTSSeconds,
+            videoLatestPTSSeconds: captured.videoLatestPTSSeconds,
+            audioRelativeVideoPruneCount: captured.audioRelativeVideoPruneCount,
+            readinessCycleID: captured.readinessCycleID,
+            readinessCloseReasonCounts: captured.readinessCloseReasonCounts,
+            displayResumeCount: captured.displayResumeCount,
+            clockTimeSeconds: captured.clockTimeSeconds,
+            videoResyncCount: captured.videoResyncCount,
+            audioRecoveryCount: captured.audioRecoveryCount,
+            renderTickCount: captured.renderTickCount,
+            renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
+            demuxQueueFullWaitSeconds: Double(captured.demuxQueueFullWaitNanoseconds) / 1_000_000_000,
+            demuxAdmitWaitSeconds: Double(captured.demuxAdmitWaitNanoseconds) / 1_000_000_000,
+            playbackExecutorBusySeconds:
+                Double(captured.playbackExecutorBusyNanoseconds) / 1_000_000_000,
             demuxPacketCount: captured.demuxPacketCount,
             videoAccessUnitCount: captured.videoAccessUnitCount,
             audioSampleCount: captured.audioSampleCount,
             videoDecodeSubmissionCount: captured.videoDecodeSubmissionCount,
             maximumVideoDecodeSubmissionMilliseconds:
-                captured.maximumVideoDecodeSubmissionMilliseconds
+                captured.maximumVideoDecodeSubmissionMilliseconds,
+            totalVideoDecodeSubmissionMilliseconds:
+                captured.totalVideoDecodeSubmissionMilliseconds,
+            maximumOutstandingDecoderOutputs: captured.maximumOutstandingDecoderOutputs,
+            decoderSessionSummary: captured.decoderSessionSummary
         )
     }
 

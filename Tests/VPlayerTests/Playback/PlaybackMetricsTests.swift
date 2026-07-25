@@ -50,7 +50,7 @@ final class PlaybackMetricsTests: XCTestCase {
                         CMTime(value: Int64(second % 20 + 1), timescale: 1_000)
                     )
                 )
-                metrics.recordVideoDrop(count: second == 60 ? 2 : 0)
+                metrics.recordVideoDrop(count: second == 60 ? 2 : 0, source: .presentationExpired)
                 metrics.recordPresentationQueueDepth(min(12, second))
             }
         }
@@ -61,7 +61,7 @@ final class PlaybackMetricsTests: XCTestCase {
         metrics.recordTemporalPropertySet(count: 2)
         metrics.recordTemporalDecodeFlag()
         metrics.recordStaleGenerationDrop()
-        metrics.recordVideoDrop(count: 1)
+        metrics.recordVideoDrop(count: 1, source: .deinterlaceQueueFull)
         metrics.recordTemporalUnavailableNotice()
         metrics.recordDemuxPacket()
         metrics.recordDemuxPacket()

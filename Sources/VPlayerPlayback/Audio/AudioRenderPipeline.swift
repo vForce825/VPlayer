@@ -37,6 +37,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private struct PublicSnapshot {
         var isReadyForPlayback = false
         var route = AudioRoute.systemCompressed
+        var recoveryCount: UInt64 = 0
     }
 
     private struct ReplayEntry {
@@ -94,6 +95,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var consecutiveInvalidPacketCount = 0
     private var rendererAttached = false
     private var rendererRequesting = false
+    private var startupPrerollSatisfied = false
     private var replacing = false
     private var terminal = false
     private var configured = false
@@ -151,6 +153,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     var isReadyForPlayback: Bool {
         withSnapshot { $0.isReadyForPlayback }
+    }
+
+    var recoveryCount: UInt64 {
+        withSnapshot { $0.recoveryCount }
     }
 
     var route: AudioRoute {
@@ -634,7 +640,14 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func recover(at time: CMTime) {
         guard !terminal, !replacing, let renderer else { return }
-        updateSnapshot(route: route, ready: false)
+        snapshotLock.lock()
+        publicSnapshot.recoveryCount &+= 1
+        snapshotLock.unlock()
+        // Deliberately no `ready: false` here. Recovery keeps the *same* renderer
+        // and refills it from `replay` before this method returns, all on the one
+        // playback executor, so no observer can see the empty window. Publishing
+        // an invalidation for it made a routine renderer automatic flush tear
+        // down the video anchor and stop display submission.
         setSynchronizerRate(0, time: time)
         renderer.flush()
         resetPCMPreroll()
@@ -925,12 +938,29 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             renderer?.identity == rendererID && configured && !stopped
     }
 
+    // `hasSufficientMediaDataForReliablePlaybackStart` and the PCM preroll window
+    // both answer a *startup* question — "is enough audio buffered to begin
+    // playing" — and a healthy running renderer drops them back to false as it
+    // consumes what it holds. This method is called from the media-data-request
+    // callback, so re-deriving readiness from them toggled readiness several
+    // times a second. Every drop reached the readiness observer as `.invalidated`,
+    // which closed the playback readiness gate as an audio replacement, paused
+    // the clock and stopped display submission — on a live stream that alone cut
+    // playback to a few frames per second. Latch the preroll once satisfied; the
+    // lifecycle flags still revoke readiness for the events that really do
+    // invalidate it (replacement, flush, stop, teardown).
     private func updateReadiness() {
-        let rendererHasPreroll = renderer?.hasSufficientMediaDataForReliablePlaybackStart == true
-        let pcmHasPreroll = route == .ffmpegPCM && hasMinimumPCMPreroll
-        let ready = configured && !stopped && !terminal && !replacing &&
-            rendererAttached && (rendererHasPreroll || pcmHasPreroll)
-        updateSnapshot(route: route, ready: ready)
+        let attached = configured && !stopped && !terminal && !replacing && rendererAttached
+        guard attached else {
+            updateSnapshot(route: route, ready: false)
+            return
+        }
+        if !startupPrerollSatisfied {
+            let rendererHasPreroll = renderer?.hasSufficientMediaDataForReliablePlaybackStart == true
+            let pcmHasPreroll = route == .ffmpegPCM && hasMinimumPCMPreroll
+            startupPrerollSatisfied = rendererHasPreroll || pcmHasPreroll
+        }
+        updateSnapshot(route: route, ready: startupPrerollSatisfied)
     }
 
     private var hasMinimumPCMPreroll: Bool {
@@ -1011,6 +1041,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func updateSnapshot(route: AudioRoute, ready: Bool) {
+        // Publishing "not ready" always clears the preroll latch, so a renderer
+        // replacement or flush cannot carry the previous renderer's satisfied
+        // preroll onto a fresh, empty one. Every caller runs on the playback
+        // executor, which owns this flag.
+        if !ready { startupPrerollSatisfied = false }
         snapshotLock.lock()
         let readinessChanged = publicSnapshot.isReadyForPlayback != ready
         publicSnapshot.route = route

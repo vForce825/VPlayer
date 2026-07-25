@@ -133,70 +133,55 @@ final class VPlayerUITests: XCTestCase {
         }
     }
 
+    /// A playlist card carries its controls at the trailing edge while the add
+    /// button sits at the leading one. Nothing lines up between them, so the
+    /// remote used to dead-end on the add button with the card's own buttons
+    /// unreachable — every vertical press has to cross into the card and back.
     @MainActor
-    func testZZDiagnoseSourceFocus() {
+    func testRemoteReachesEveryControlOnAPlaylistCard() {
         let app = launchSeededApp()
         XCTAssertTrue(app.tabBars.buttons["频道"].waitForExistence(timeout: 5))
         selectTab(named: "播放列表", in: app)
-        XCTAssertTrue(app.buttons["source.add"].waitForExistence(timeout: 3))
 
-        print("DIAG-TREE-LIST\n\(app.debugDescription)\nDIAG-TREE-LIST-END")
-        attachScreenshot(named: "list")
+        let add = app.buttons["source.add"]
+        let edit = cardButton(prefixed: "source.edit.", in: app)
+        let delete = cardButton(prefixed: "source.delete.", in: app)
+        let playlistRefresh = app.buttons["source.refresh.playlist"]
+        let epgRefresh = app.buttons["source.refresh.epg"]
+        XCTAssertTrue(add.waitForExistence(timeout: 3))
+        XCTAssertTrue(add.wait(for: \.hasFocus, toEqual: true, timeout: 2))
 
-        print("DIAG-FOCUS start: \(focusDump(app))")
-        let moves: [(String, XCUIRemote.Button)] = [
-            ("down", .down), ("down", .down), ("down", .down),
-            ("up", .up), ("up", .up), ("up", .up)
-        ]
-        for (name, button) in moves {
-            XCUIRemote.shared.press(button)
-            print("DIAG-FOCUS after \(name): \(focusDump(app))")
-        }
+        // Down off the add button lands on the card rather than going nowhere.
+        XCUIRemote.shared.press(.down)
+        XCTAssertTrue(
+            delete.wait(for: \.hasFocus, toEqual: true, timeout: 2),
+            "Expected the first card's header row to take focus"
+        )
+        XCUIRemote.shared.press(.left)
+        XCTAssertTrue(edit.wait(for: \.hasFocus, toEqual: true, timeout: 2))
 
-        XCTAssertTrue(app.buttons["source.add"].hasFocus)
-        XCUIRemote.shared.press(.select)
-        XCTAssertTrue(app.textFields["source.editor.name"].waitForExistence(timeout: 5))
-        Thread.sleep(forTimeInterval: 3)
-        print("DIAG-TREE-ADD\n\(app.debugDescription)\nDIAG-TREE-ADD-END")
-        attachScreenshot(named: "add-name-focused")
+        // Both resource rows are reachable from the header row.
         XCUIRemote.shared.press(.down)
-        Thread.sleep(forTimeInterval: 2)
-        attachScreenshot(named: "add-m3u-focused")
+        XCTAssertTrue(playlistRefresh.wait(for: \.hasFocus, toEqual: true, timeout: 2))
         XCUIRemote.shared.press(.down)
-        Thread.sleep(forTimeInterval: 2)
-        attachScreenshot(named: "add-epg-focused")
-        XCUIRemote.shared.press(.down)
-        XCUIRemote.shared.press(.down)
-        XCUIRemote.shared.press(.down)
-        Thread.sleep(forTimeInterval: 2)
-        attachScreenshot(named: "add-away-from-fields")
+        XCTAssertTrue(epgRefresh.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+
+        // And the way back out of the card is symmetric.
+        XCUIRemote.shared.press(.up)
+        XCTAssertTrue(playlistRefresh.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.up)
+        XCTAssertTrue(delete.hasFocus || edit.hasFocus)
+        XCUIRemote.shared.press(.up)
+        XCTAssertTrue(add.wait(for: \.hasFocus, toEqual: true, timeout: 2))
     }
 
+    /// Card controls carry the playlist's identifier, which the seeded fixture
+    /// generates fresh on each launch.
     @MainActor
-    private func editButton(in app: XCUIApplication) -> XCUIElement {
+    private func cardButton(prefixed prefix: String, in app: XCUIApplication) -> XCUIElement {
         app.buttons.matching(
-            NSPredicate(format: "identifier BEGINSWITH 'source.edit.'")
+            NSPredicate(format: "identifier BEGINSWITH %@", prefix)
         ).firstMatch
-    }
-
-    @MainActor
-    private func attachScreenshot(named name: String) {
-        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-    }
-
-    @MainActor
-    private func focusDump(_ app: XCUIApplication) -> String {
-        var found: [String] = []
-        for type in [XCUIElement.ElementType.button, .textField] {
-            for element in app.descendants(matching: type).allElementsBoundByIndex where element.hasFocus {
-                let label = element.identifier.isEmpty ? element.label : element.identifier
-                found.append("\(type.rawValue)/\(label)/\(element.frame)")
-            }
-        }
-        return found.isEmpty ? "<none>" : found.joined(separator: " | ")
     }
 
     @MainActor

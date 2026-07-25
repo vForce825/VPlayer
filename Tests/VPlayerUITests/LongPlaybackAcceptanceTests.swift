@@ -1291,6 +1291,16 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let components = start.duration(to: clock.now).components
         return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
+
+
+
+
+
+
+
+
+
+
 }
 
 private enum AcceptanceValidationError: Error, Equatable {
@@ -1781,6 +1791,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let temporalDecodeFlagCount: UInt64
     let staleGenerationDropCount: UInt64
     let droppedVideoFrames: UInt64
+    let videoDropCountsBySource: [UInt64]
+    let lastVideoDecodeFailure: String?
     let maximumPresentationQueueDepth: Int
     let maximumYADIFInFlightCount: Int
     let maximumYADIFInputDepth: Int
@@ -1802,6 +1814,22 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let audioFirstPTSSeconds: Double?
     let audioDurationSeconds: Double
     let videoFirstPTSSeconds: Double?
+    let videoLatestPTSSeconds: Double?
+    let audioRelativeVideoPruneCount: UInt64
+    let readinessCycleID: UInt64
+    let readinessCloseReasonCounts: [UInt64]
+    let displayResumeCount: UInt64
+    let clockTimeSeconds: Double?
+    let videoResyncCount: UInt64
+    let audioRecoveryCount: UInt64
+    let renderTickCount: UInt64
+    let renderSkippedInFlightCount: UInt64
+    let demuxQueueFullWaitSeconds: Double
+    let demuxAdmitWaitSeconds: Double
+    let playbackExecutorBusySeconds: Double
+    let totalVideoDecodeSubmissionMilliseconds: Double
+    let maximumOutstandingDecoderOutputs: Int
+    let decoderSessionSummary: String?
     let demuxPacketCount: UInt64
     let videoAccessUnitCount: UInt64
     let audioSampleCount: UInt64

@@ -180,7 +180,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private let outputAllocator: YADIFOutputAllocator
     private let clock: any PlaybackClock
     private let maximumInFlight: Int
-    private let maximumPendingFrames: Int
+    private var maximumPendingFrames: Int
     private let dropSink: @Sendable (YADIFDropEvent) -> Void
     private let metrics: PlaybackMetrics?
     private let signposts: PlaybackSignposts?
@@ -258,7 +258,12 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         outputAllocator: YADIFOutputAllocator? = nil,
         clock: any PlaybackClock,
         maximumInFlight: Int = 3,
-        maximumPendingFrames: Int = 4,
+        // Absorb GPU bursts rather than shed work. Dropping here is what starts
+        // the cascade on a live stream: the lost pair puts video output behind
+        // the clock, the clock cannot be caught up, and the re-anchor that
+        // follows costs a whole window of frames. The extra pending frames cost
+        // ~80 ms of latency, which the renderer's one-second span absorbs.
+        maximumPendingFrames: Int = 8,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil,
         dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
@@ -285,6 +290,20 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         self.metrics = metrics
         self.signposts = signposts
         self.dropSink = dropSink
+    }
+
+    /// Applied while playing so a viewer changing the buffer setting sees the
+    /// effect on the stream in front of them. Lowering the bound sheds down to it
+    /// straight away; raising it simply admits more before the next shed.
+    public func setMaximumPendingFrames(_ count: Int) {
+        guard count >= 1 else { return }
+        var actions: [UserAction] = []
+        lock.lock()
+        maximumPendingFrames = count
+        enforcePendingBoundLocked(actions: &actions)
+        lock.unlock()
+        perform(actions)
+        driveScheduler()
     }
 
     public func reset(to generation: MediaGeneration) {
@@ -606,7 +625,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             } : nil
             let dropped = readyJobs.remove(at: lateIndex ?? readyJobs.startIndex)
             counters.gpuQueueFullDrops &+= 1
-            metrics?.recordVideoDrop(count: 2)
+            metrics?.recordVideoDrop(count: 2, source: .deinterlaceQueueFull)
             actions.append(.complete(dropped.completion, .success([])))
             actions.append(.drop(dropSink, YADIFDropEvent(
                 reason: .gpuQueueFull,

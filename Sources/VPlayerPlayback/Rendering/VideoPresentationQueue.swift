@@ -9,20 +9,69 @@ struct VideoPresentationSelection {
     let action: VideoRenderDecision.Action
     let frame: VideoPresentationFrame?
     let droppedFrameCount: Int
+    // The three ways a frame is lost here answer different questions: overflow
+    // means the producer ran further ahead than the queue spans, expiry means the
+    // clock passed the frame before the display link asked for it, and superseded
+    // means several frames came due on one tick.
+    let overflowDropCount: Int
+    let expiredDropCount: Int
+    let supersededDropCount: Int
 }
 
 public final class VideoPresentationQueue: @unchecked Sendable {
-    public static let capacity = 12
+    // This queue is a jitter buffer between the decoder and the display link, so
+    // its size is a *duration*, not a frame count. Sizing it in frames made it
+    // depend on the output frame rate: the field-rate deinterlace routes emit two
+    // frames per input frame, which halved the buffer to less than the pipeline's
+    // production lead. Every arrival then overflowed while the clock never got
+    // close enough to select anything — 1080i live playback ran at a few frames
+    // per second.
+    public static let defaultHorizon = PlaybackTuning.default.videoBufferHorizon
+    // Guard against pathological timestamps only. Normal operation is bounded by
+    // the horizon; this stops a stream whose frames all carry one PTS from
+    // growing the queue without limit.
+    public static let frameCeiling = PlaybackTuning.default.videoBufferFrameCeiling
 
     private let lock = NSLock()
+    private var horizon: CMTime
+    private var frameCeiling: Int
     private var frames: [VideoPresentationFrame] = []
     private var displayedFrame: VideoPresentationFrame?
     private var overflowSinceSelection = 0
     private var epochDroppedFrames = 0
     private var activeGeneration: MediaGeneration
 
-    public init(generation: MediaGeneration) {
+    public init(
+        generation: MediaGeneration,
+        horizon: CMTime = VideoPresentationQueue.defaultHorizon,
+        frameCeiling: Int = VideoPresentationQueue.frameCeiling
+    ) {
         activeGeneration = generation
+        self.horizon = Self.validHorizon(horizon)
+        self.frameCeiling = Self.validFrameCeiling(frameCeiling)
+    }
+
+    public var horizonSeconds: Double { lock.withLock { CMTimeGetSeconds(horizon) } }
+
+    /// Applied while playing, so a viewer changing the buffer length in settings
+    /// sees the effect on the stream they are watching. Growing the buffer keeps
+    /// what is queued; shrinking it trims immediately.
+    public func setBuffer(horizon newHorizon: CMTime, frameCeiling newCeiling: Int) {
+        lock.withLock {
+            horizon = Self.validHorizon(newHorizon)
+            frameCeiling = Self.validFrameCeiling(newCeiling)
+            trimToHorizonLocked()
+        }
+    }
+
+    private static func validHorizon(_ candidate: CMTime) -> CMTime {
+        candidate.isNumeric && CMTimeCompare(candidate, .zero) > 0
+            ? candidate
+            : VideoPresentationQueue.defaultHorizon
+    }
+
+    private static func validFrameCeiling(_ candidate: Int) -> Int {
+        candidate > 1 ? candidate : VideoPresentationQueue.frameCeiling
     }
 
     public var generation: MediaGeneration {
@@ -52,11 +101,7 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 Self.isOrderedBefore(frame, $0)
             }
             frames.insert(frame, at: insertionIndex)
-            if frames.count > Self.capacity {
-                frames.removeFirst()
-                overflowSinceSelection += 1
-                epochDroppedFrames += 1
-            }
+            trimToHorizonLocked()
             return true
         }
     }
@@ -76,11 +121,21 @@ public final class VideoPresentationQueue: @unchecked Sendable {
             guard targetMediaTime.isNumeric,
                   displayInterval.isNumeric,
                   CMTimeCompare(displayInterval, .zero) > 0 else {
-                return .init(action: .waiting, frame: nil, droppedFrameCount: 0)
+                return .init(
+                    action: .waiting,
+                    frame: nil,
+                    droppedFrameCount: 0,
+                    overflowDropCount: 0,
+                    expiredDropCount: 0,
+                    supersededDropCount: 0
+                )
             }
 
+            let overflowDrops = overflowSinceSelection
             var dropped = overflowSinceSelection
             overflowSinceSelection = 0
+            var expiredDrops = 0
+            var supersededDrops = 0
 
             var retained: [VideoPresentationFrame] = []
             retained.reserveCapacity(frames.count)
@@ -94,6 +149,7 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 let expiry = CMTimeAdd(frame.presentationTimeStamp, expiryDuration)
                 if expiry.isNumeric, CMTimeCompare(expiry, targetMediaTime) < 0 {
                     dropped += 1
+                    expiredDrops += 1
                     epochDroppedFrames += 1
                 } else {
                     retained.append(frame)
@@ -104,7 +160,14 @@ public final class VideoPresentationQueue: @unchecked Sendable {
             let halfInterval = CMTimeMultiplyByRatio(displayInterval, multiplier: 1, divisor: 2)
             let qualificationLimit = CMTimeAdd(targetMediaTime, halfInterval)
             guard halfInterval.isNumeric, qualificationLimit.isNumeric else {
-                return .init(action: .waiting, frame: nil, droppedFrameCount: dropped)
+                return .init(
+                    action: .waiting,
+                    frame: nil,
+                    droppedFrameCount: dropped,
+                    overflowDropCount: overflowDrops,
+                    expiredDropCount: expiredDrops,
+                    supersededDropCount: supersededDrops
+                )
             }
 
             let qualifyingCount = frames.prefix {
@@ -115,17 +178,58 @@ public final class VideoPresentationQueue: @unchecked Sendable {
                 if qualifyingCount > 1 {
                     let superseded = qualifyingCount - 1
                     dropped += superseded
+                    supersededDrops += superseded
                     epochDroppedFrames += superseded
                 }
                 frames.removeFirst(qualifyingCount)
                 displayedFrame = selected
-                return .init(action: .presented, frame: selected, droppedFrameCount: dropped)
+                return .init(
+                    action: .presented,
+                    frame: selected,
+                    droppedFrameCount: dropped,
+                    overflowDropCount: overflowDrops,
+                    expiredDropCount: expiredDrops,
+                    supersededDropCount: supersededDrops
+                )
             }
 
             if let displayedFrame {
-                return .init(action: .repeated, frame: displayedFrame, droppedFrameCount: dropped)
+                return .init(
+                    action: .repeated,
+                    frame: displayedFrame,
+                    droppedFrameCount: dropped,
+                    overflowDropCount: overflowDrops,
+                    expiredDropCount: expiredDrops,
+                    supersededDropCount: supersededDrops
+                )
             }
-            return .init(action: .waiting, frame: nil, droppedFrameCount: dropped)
+            return .init(
+                action: .waiting,
+                frame: nil,
+                droppedFrameCount: dropped,
+                overflowDropCount: overflowDrops,
+                expiredDropCount: expiredDrops,
+                supersededDropCount: supersededDrops
+            )
+        }
+    }
+
+    private func trimToHorizonLocked() {
+        while frames.count > 1 {
+            let span = CMTimeSubtract(
+                frames[frames.count - 1].presentationTimeStamp,
+                frames[0].presentationTimeStamp
+            )
+            let overHorizon = span.isNumeric && CMTimeCompare(span, horizon) > 0
+            guard overHorizon || frames.count > frameCeiling else { return }
+            // Evict the frame furthest from being due. `select` already discards
+            // frames whose expiry has passed, so reaching here means the producer
+            // is ahead of the clock — dropping the oldest would delete the very
+            // frame that is about to be displayed and guarantee that nothing is
+            // ever presented.
+            frames.removeLast()
+            overflowSinceSelection += 1
+            epochDroppedFrames += 1
         }
     }
 

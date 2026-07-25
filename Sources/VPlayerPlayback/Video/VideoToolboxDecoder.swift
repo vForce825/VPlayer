@@ -196,6 +196,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             throw VideoDecoderFailure.sessionCreate(creation.status)
         }
 
+        var fieldModeStatus: OSStatus?
         switch configuration {
         case .bothFields:
             let setStatus = api.setProperty(
@@ -207,6 +208,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 api.invalidate(candidate)
                 throw VideoDecoderFailure.sessionCreate(setStatus)
             }
+            fieldModeStatus = setStatus
         case .appleTemporal:
             do {
                 try AppleTemporalConfigurator(
@@ -237,6 +239,18 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             api.invalidate(candidate)
             throw VideoDecoderFailure.softwareDecoder
         }
+        // Both tolerances above accept `kVTPropertyNotSupportedErr`, so on their
+        // own they prove nothing: a session that never reported its acceleration
+        // and one that reported hardware look identical afterwards. Record what
+        // actually came back.
+        metrics?.recordDecoderSession(
+            summary: Self.sessionSummary(
+                configuration: configuration,
+                fieldModeStatus: fieldModeStatus,
+                hardwareStatus: hardware.status,
+                hardwareValue: hardware.value
+            )
+        )
 
         let previous = active
         active = ActiveSession(
@@ -250,6 +264,13 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             api.invalidate(previous.session)
         }
     }
+
+    /// Decode outputs handed back by VideoToolbox that are still waiting for the
+    /// playback executor to process them. Each one retains a decoder output
+    /// buffer, so if this grows and stays high the session runs out of buffers
+    /// and the *next* submission blocks — on the very executor whose backlog is
+    /// holding them. That is a loop the decoder cannot escape on its own.
+    private let outstandingOutputs = OutstandingOutputCounter()
 
     public func decode(
         _ accessUnit: CompressedVideoAccessUnit,
@@ -291,11 +312,13 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             sampleBuffer: accessUnit.sampleBuffer,
             flags: decodeFlags,
             frameOptions: nil
-        ) { [weak self] output in
+        ) { [weak self, outstandingOutputs] output in
             submissionLease.releaseOnce()
             metrics?.recordDecoderCallback()
             signpostLifetime.finish()
+            metrics?.recordDecoderOutputQueued(outstanding: outstandingOutputs.enter())
             executor.submit { [weak self] in
+                outstandingOutputs.leave()
                 self?.handle(output: output, token: token, sessionID: sessionID)
             }
         }
@@ -347,6 +370,25 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         api.invalidate(current.session)
     }
 
+    static func sessionSummary(
+        configuration: VideoDecodeConfiguration,
+        fieldModeStatus: OSStatus?,
+        hardwareStatus: OSStatus,
+        hardwareValue: VTPropertyValue?
+    ) -> String {
+        let field = fieldModeStatus.map { $0 == noErr ? "applied" : "unsupported(\($0))" }
+            ?? "n/a"
+        let hardware: String
+        if hardwareStatus == kVTPropertyNotSupportedErr {
+            hardware = "unreported"
+        } else if hardwareValue == .boolean(true) {
+            hardware = "yes"
+        } else {
+            hardware = "no"
+        }
+        return "config=\(configuration) fieldMode=\(field) hardware=\(hardware)"
+    }
+
     private func handle(
         output: VTDecodeOutput,
         token: DecodeToken,
@@ -375,7 +417,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard let pixelBuffer = output.imageBuffer else {
             if output.infoFlags.contains(.frameDropped)
                 || output.infoFlags.contains(.frameInterrupted) {
-                metrics?.recordVideoDrop()
+                metrics?.recordVideoDrop(source: .decoderSubmission)
                 return
             }
             emit(
@@ -461,5 +503,23 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         default:
             return ClassifiedFailure(failure: .malfunction(status), isRecoverable: false)
         }
+    }
+}
+
+/// Guarded by its own lock: incremented on the VideoToolbox callback thread and
+/// decremented on the playback executor.
+private final class OutstandingOutputCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func enter() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
+
+    func leave() {
+        lock.withLock { count = max(0, count - 1) }
     }
 }

@@ -13,11 +13,11 @@ final class VideoPresentationQueueTests: XCTestCase {
     func testOutOfOrderCallbacksPresentInExactPTSOrder() throws {
         let queue = VideoPresentationQueue(generation: generation)
         for pts in [3, 1, 2] {
-            XCTAssertTrue(queue.enqueue(try frame(id: UInt64(pts), pts: rational(pts, 1))))
+            XCTAssertTrue(queue.enqueue(try frame(id: UInt64(pts), pts: rational(pts, 25))))
         }
 
         let selections = [1, 2, 3].map {
-            queue.select(targetMediaTime: rational($0, 1), displayInterval: rational(1, 50))
+            queue.select(targetMediaTime: rational($0, 25), displayInterval: rational(1, 50))
         }
         XCTAssertEqual(selections.map(\.action), [.presented, .presented, .presented])
         XCTAssertEqual(selections.compactMap { $0.frame?.sourceAccessUnitID }, [1, 2, 3])
@@ -58,25 +58,96 @@ final class VideoPresentationQueueTests: XCTestCase {
         XCTAssertEqual(queue.unpresentedCount, 1)
     }
 
-    func testCapacityIsExactlyTwelveAndOverflowDropsDeterministicOldest() throws {
-        let queue = VideoPresentationQueue(generation: generation)
-        for pts in (1...13).reversed() {
-            XCTAssertTrue(queue.enqueue(try frame(id: UInt64(pts), pts: rational(pts, 1))))
+    func testQueueIsBoundedByOneSecondOfVideoRegardlessOfFrameRate() throws {
+        // 60 field-rate frames span 1.18 s, so the queue keeps the 51 that fit in
+        // its one-second horizon. Bounding by frames instead made this depend on
+        // the output frame rate, which field-rate deinterlacing doubles.
+        let fieldRate = VideoPresentationQueue(generation: generation)
+        for index in (0..<60).reversed() {
+            XCTAssertTrue(fieldRate.enqueue(
+                try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))
+            ))
         }
-        XCTAssertEqual(queue.unpresentedCount, 12)
+        XCTAssertEqual(fieldRate.unpresentedCount, 51)
 
-        let waiting = queue.select(
-            targetMediaTime: rational(1, 1),
+        // Half the frame rate, same duration, so half as many frames survive.
+        let frameRate = VideoPresentationQueue(generation: generation)
+        for index in (0..<60).reversed() {
+            XCTAssertTrue(frameRate.enqueue(
+                try frame(id: UInt64(index), pts: rational(index, 25), duration: rational(1, 25))
+            ))
+        }
+        XCTAssertEqual(frameRate.unpresentedCount, 26)
+
+        // The newest frame is the overflow victim. The next-due frame has to
+        // survive, otherwise a producer running ahead of the clock deletes every
+        // frame just before the clock reaches it and nothing is ever presented.
+        let first = fieldRate.select(
+            targetMediaTime: .zero,
             displayInterval: rational(1, 50)
         )
-        XCTAssertEqual(waiting.action, .waiting)
-        XCTAssertEqual(waiting.droppedFrameCount, 1)
-        let first = queue.select(
-            targetMediaTime: rational(2, 1),
-            displayInterval: rational(1, 50)
-        )
-        XCTAssertEqual(first.frame?.sourceAccessUnitID, 2)
-        XCTAssertEqual(first.droppedFrameCount, 0)
+        XCTAssertEqual(first.action, .presented)
+        XCTAssertEqual(first.frame?.sourceAccessUnitID, 0)
+        XCTAssertEqual(first.droppedFrameCount, 9)
+    }
+
+    func testHorizonIsConfigurableAndRejectsNonPositiveValues() throws {
+        let half = VideoPresentationQueue(generation: generation, horizon: rational(1, 2))
+        XCTAssertEqual(half.horizonSeconds, 0.5, accuracy: 0.0001)
+        for index in (0..<60).reversed() {
+            XCTAssertTrue(half.enqueue(
+                try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))
+            ))
+        }
+        XCTAssertEqual(half.unpresentedCount, 26)
+
+        for invalid in [CMTime.invalid, .zero, rational(-1, 1)] {
+            let fallback = VideoPresentationQueue(generation: generation, horizon: invalid)
+            XCTAssertEqual(fallback.horizonSeconds, 1, accuracy: 0.0001)
+        }
+    }
+
+    // The viewer changes the buffer length from a sheet raised over the running
+    // stream, so it has to take effect without restarting playback.
+    func testBufferLengthAppliesToAQueueThatIsAlreadyRunning() throws {
+        let queue = VideoPresentationQueue(generation: generation, horizon: rational(1, 2))
+        for index in (0..<120).reversed() {
+            XCTAssertTrue(queue.enqueue(
+                try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))
+            ))
+        }
+        XCTAssertEqual(queue.unpresentedCount, 26)
+
+        queue.setBuffer(horizon: rational(2, 1), frameCeiling: 240)
+        XCTAssertEqual(queue.horizonSeconds, 2, accuracy: 0.0001)
+        for index in (26..<120).reversed() {
+            XCTAssertTrue(queue.enqueue(
+                try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))
+            ))
+        }
+        XCTAssertEqual(queue.unpresentedCount, 101, "a longer buffer must hold more video")
+
+        // Shrinking trims straight away rather than waiting for the next arrival,
+        // and the next-due frame still has to survive the trim.
+        queue.setBuffer(horizon: rational(1, 2), frameCeiling: 120)
+        XCTAssertEqual(queue.unpresentedCount, 26)
+        let next = queue.select(targetMediaTime: .zero, displayInterval: rational(1, 50))
+        XCTAssertEqual(next.action, .presented)
+        XCTAssertEqual(next.frame?.sourceAccessUnitID, 0)
+    }
+
+    func testInvalidBufferChangesLeaveTheQueueOnItsDefaults() throws {
+        let queue = VideoPresentationQueue(generation: generation)
+        for invalid in [CMTime.invalid, .zero, rational(-1, 1)] {
+            queue.setBuffer(horizon: invalid, frameCeiling: 0)
+            XCTAssertEqual(queue.horizonSeconds, 1, accuracy: 0.0001)
+        }
+        for index in (0..<60).reversed() {
+            XCTAssertTrue(queue.enqueue(
+                try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))
+            ))
+        }
+        XCTAssertEqual(queue.unpresentedCount, 51)
     }
 
     func testExpiryUsesStrictBoundaryAndInvalidDurationFallsBackToInterval() throws {
@@ -162,9 +233,9 @@ final class VideoPresentationQueueTests: XCTestCase {
     func testGenerationFlushClearsQueueCurrentOverflowIntervalAndMetricsEpoch() throws {
         let queue = VideoPresentationQueue(generation: generation)
         for pts in 1...13 {
-            XCTAssertTrue(queue.enqueue(try frame(id: UInt64(pts), pts: rational(pts, 1))))
+            XCTAssertTrue(queue.enqueue(try frame(id: UInt64(pts), pts: rational(pts, 25))))
         }
-        _ = queue.select(targetMediaTime: rational(13, 1), displayInterval: rational(1, 50))
+        _ = queue.select(targetMediaTime: rational(13, 25), displayInterval: rational(1, 50))
         XCTAssertNotNil(queue.currentFrame)
         XCTAssertGreaterThan(queue.metricsEpochDroppedFrameCount, 0)
 

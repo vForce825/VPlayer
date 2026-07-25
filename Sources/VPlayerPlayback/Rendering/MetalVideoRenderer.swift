@@ -330,6 +330,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     convenience init(
         device: any MTLDevice,
         generation: MediaGeneration,
+        tuning: PlaybackTuning = .default,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
@@ -339,6 +340,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             generation: generation,
             textureMapperFactory: { try CVMetalVideoTextureMapper(device: $0) },
             commandSubmitter: try SystemMetalCommandSubmitter(device: device),
+            tuning: tuning,
             metrics: metrics,
             signposts: signposts,
             failureSink: failureSink
@@ -350,17 +352,29 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         generation: MediaGeneration,
         textureMapperFactory: (any MTLDevice) throws -> any VideoTextureMapping,
         commandSubmitter: any MetalCommandSubmitting,
+        tuning: PlaybackTuning = .default,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     ) throws {
         activeGeneration = generation
-        queue = VideoPresentationQueue(generation: generation)
+        queue = VideoPresentationQueue(
+            generation: generation,
+            horizon: tuning.videoBufferHorizon,
+            frameCeiling: tuning.videoBufferFrameCeiling
+        )
         textureMapper = try textureMapperFactory(device)
         self.commandSubmitter = commandSubmitter
         self.metrics = metrics
         self.signposts = signposts
         self.failureSink = failureSink
+    }
+
+    public func setTuning(_ tuning: PlaybackTuning) {
+        queue.setBuffer(
+            horizon: tuning.videoBufferHorizon,
+            frameCeiling: tuning.videoBufferFrameCeiling
+        )
     }
 
     public func enqueue(_ frame: VideoPresentationFrame) {
@@ -401,16 +415,23 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         presentationLock.lock()
         defer { presentationLock.unlock() }
         guard reserveInFlightSlot() else {
+            metrics?.recordRenderTick(skippedInFlight: true)
             _ = nextDisplayInterval(for: targetMediaTime)
             return decision(action: .skippedInFlight, frame: nil, dropped: 0)
         }
+        metrics?.recordRenderTick(skippedInFlight: false)
 
         let displayInterval = nextDisplayInterval(for: targetMediaTime)
         let selection = queue.select(
             targetMediaTime: targetMediaTime,
             displayInterval: displayInterval
         )
-        metrics?.recordVideoDrop(count: selection.droppedFrameCount)
+        metrics?.recordVideoDrop(count: selection.overflowDropCount, source: .presentationOverflow)
+        metrics?.recordVideoDrop(count: selection.expiredDropCount, source: .presentationExpired)
+        metrics?.recordVideoDrop(
+            count: selection.supersededDropCount,
+            source: .presentationSuperseded
+        )
         metrics?.recordPresentationQueueDepth(queue.unpresentedCount)
         guard let frame = selection.frame else {
             releaseInFlightSlot(flushCacheIfNeeded: false)

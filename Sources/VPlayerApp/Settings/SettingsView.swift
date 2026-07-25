@@ -37,6 +37,12 @@ struct SettingsView: View {
                 Section("反交错") {
                     DeinterlaceAlgorithmRows(playback: playback, focusNamespace: settingsFocus)
                 }
+                Section("视频缓冲") {
+                    PlaybackBufferRows(playback: playback)
+                }
+                Section("反交错缓冲") {
+                    DeinterlaceBufferRows(playback: playback)
+                }
                 Section("频道排列") {
                     groupingRow(
                         title: "按播放列表分组（默认）",

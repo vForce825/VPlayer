@@ -128,20 +128,29 @@ struct SourceProfileEditorView: View {
         }
     }
 
+    /// Headline is the size tvOS gives text typed into a field; the weight is
+    /// reset so only the placeholder changes and entered text stays as it was.
+    private static let fieldFont = Font.headline.weight(.regular)
+
     private var form: some View {
         Form {
+            // tvOS draws a text field's placeholder a size smaller than the text
+            // typed into it, so a field left empty reads as shrunken beside the
+            // ones already filled in — most visibly on EPG, the field people
+            // fill last. Pinning every field to the size tvOS uses for entered
+            // text keeps the section even however much of it is filled in.
             Section {
                 TextField("播放列表名称", text: $name)
                     .accessibilityIdentifier("source.editor.name")
-                    .font(.title2)
+                    .font(Self.fieldFont)
                 m3uURLField
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .font(.title2)
+                    .font(Self.fieldFont)
                 epgURLField
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .font(.title2)
+                    .font(Self.fieldFont)
             } header: {
                 Text("基本信息")
             } footer: {

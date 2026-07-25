@@ -146,7 +146,7 @@ final class MetalVideoRendererTests: XCTestCase {
         for id in 1...4 {
             harness.renderer.enqueue(frame(
                 id: UInt64(id),
-                pts: CMTime(value: Int64(id), timescale: 1),
+                pts: CMTime(value: Int64(id), timescale: 25),
                 storage: .metalPlanes(.init(
                     luma: harness.mapper.texture,
                     chroma: harness.mapper.texture,
@@ -156,7 +156,7 @@ final class MetalVideoRendererTests: XCTestCase {
         }
         for id in 1...3 {
             let decision = harness.renderer.draw(
-                targetMediaTime: CMTime(value: Int64(id), timescale: 1),
+                targetMediaTime: CMTime(value: Int64(id), timescale: 25),
                 drawable: harness.drawable
             )
             XCTAssertEqual(decision.action, .presented)
@@ -164,7 +164,7 @@ final class MetalVideoRendererTests: XCTestCase {
         }
 
         let skipped = harness.renderer.draw(
-            targetMediaTime: CMTime(value: 4, timescale: 1),
+            targetMediaTime: CMTime(value: 4, timescale: 25),
             drawable: harness.drawable
         )
         XCTAssertEqual(skipped.action, .skippedInFlight)
@@ -172,7 +172,7 @@ final class MetalVideoRendererTests: XCTestCase {
 
         harness.submitter.completeFirst(.succeeded)
         let fourth = harness.renderer.draw(
-            targetMediaTime: CMTime(value: 4, timescale: 1),
+            targetMediaTime: CMTime(value: 4, timescale: 25),
             drawable: harness.drawable
         )
         XCTAssertEqual(fourth.action, .presented)

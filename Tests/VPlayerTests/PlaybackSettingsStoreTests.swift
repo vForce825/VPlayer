@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreMedia
 import XCTest
 @testable import VPlayerPlayback
 
@@ -39,5 +40,67 @@ final class PlaybackSettingsStoreTests: XCTestCase {
         store.deinterlaceAlgorithm = .appleTemporal
 
         XCTAssertEqual(observed, [.metalYADIF2x, .appleTemporal])
+    }
+
+    func testBufferLengthsDefaultAndPersistAcrossLaunches() {
+        let defaults = UserDefaults(suiteName: suite)!
+        var store: PlaybackSettingsStore? = PlaybackSettingsStore(defaults: defaults)
+        XCTAssertEqual(store?.videoBufferSeconds, 1)
+        XCTAssertEqual(store?.deinterlaceBufferFrames, 8)
+
+        store?.videoBufferSeconds = 4
+        store?.deinterlaceBufferFrames = 16
+        store = PlaybackSettingsStore(defaults: defaults)
+
+        XCTAssertEqual(store?.videoBufferSeconds, 4)
+        XCTAssertEqual(store?.deinterlaceBufferFrames, 16)
+        XCTAssertEqual(store?.tuning.videoBufferHorizon, CMTime(seconds: 4, preferredTimescale: 1_000))
+    }
+
+    // A key an older build never wrote reads back as zero, which would otherwise
+    // become a zero-length buffer and stall playback outright.
+    func testUnwrittenOrOutOfRangeBufferKeysFallBackToTheDefaults() {
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(37.5, forKey: PlaybackSettingsStore.videoBufferSecondsKey)
+        defaults.set(-3, forKey: PlaybackSettingsStore.deinterlaceBufferFramesKey)
+
+        let store = PlaybackSettingsStore(defaults: defaults)
+
+        XCTAssertEqual(store.videoBufferSeconds, 1)
+        XCTAssertEqual(store.deinterlaceBufferFrames, 8)
+    }
+
+    func testDistinctBufferChangesNotifyTheInstalledApplicationBinding() {
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = PlaybackSettingsStore(defaults: defaults)
+        var observed: [PlaybackTuning] = []
+        store.setTuningChangeHandler { observed.append($0) }
+
+        store.videoBufferSeconds = 2
+        store.videoBufferSeconds = 2
+        store.deinterlaceBufferFrames = 12
+
+        XCTAssertEqual(observed, [
+            PlaybackTuning(videoBufferSeconds: 2, deinterlaceBufferFrames: 8),
+            PlaybackTuning(videoBufferSeconds: 2, deinterlaceBufferFrames: 12)
+        ])
+    }
+
+    // The anchor is only meaningful relative to the buffer: anchoring further
+    // back than the buffer spans overflows every arriving frame for the whole
+    // session, so lengthening one has to lengthen the other.
+    func testAnchorLagTracksTheConfiguredBufferLength() {
+        for seconds in PlaybackTuning.videoBufferSecondsChoices {
+            let tuning = PlaybackTuning(videoBufferSeconds: seconds)
+            XCTAssertEqual(
+                CMTimeGetSeconds(tuning.maximumAnchorLag),
+                seconds * 0.75,
+                accuracy: 0.001
+            )
+            XCTAssertLessThan(
+                CMTimeGetSeconds(tuning.maximumAnchorLag),
+                CMTimeGetSeconds(tuning.videoBufferHorizon)
+            )
+        }
     }
 }

@@ -63,6 +63,8 @@ final class FFmpegDemuxer: MediaDemuxing, @unchecked Sendable {
         state.cancel()
     }
 
+    var queueFullWaitNanoseconds: UInt64 { state.queueFullWaitNanoseconds }
+
     func start(url: URL, sink: @escaping @Sendable (DemuxEvent) -> Void) throws {
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
@@ -113,6 +115,8 @@ private final class DemuxSessionState: @unchecked Sendable {
     private let maximumQueuedBytes: Int
     private var queue: BoundedMediaQueue<QueuedDemuxEvent>
     private var queuedBytes = 0
+    // Guarded by `condition`, like every other counter here.
+    private var queueFullWaitNanosecondsLocked: UInt64 = 0
     private var drainScheduled = false
     private var pendingTerminal: DemuxEvent?
     private var terminalDelivered = false
@@ -247,11 +251,16 @@ private final class DemuxSessionState: @unchecked Sendable {
             return
         }
 
+        var waitStart: UInt64?
         while (queue.count == queue.capacity || queuedBytes > maximumQueuedBytes - copied.byteCount),
               pendingTerminal == nil,
               !terminalDelivered,
               !cancelled {
+            if waitStart == nil { waitStart = DispatchTime.now().uptimeNanoseconds }
             condition.wait()
+        }
+        if let waitStart {
+            queueFullWaitNanosecondsLocked &+= DispatchTime.now().uptimeNanoseconds &- waitStart
         }
         guard pendingTerminal == nil, !terminalDelivered, !cancelled else {
             condition.unlock()
@@ -270,6 +279,12 @@ private final class DemuxSessionState: @unchecked Sendable {
         let shouldSchedule = scheduleDrainIfNeededLocked()
         condition.unlock()
         if shouldSchedule { submitDrain() }
+    }
+
+    var queueFullWaitNanoseconds: UInt64 {
+        condition.lock()
+        defer { condition.unlock() }
+        return queueFullWaitNanosecondsLocked
     }
 
     func cancel() {

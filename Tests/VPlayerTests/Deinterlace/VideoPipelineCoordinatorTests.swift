@@ -740,6 +740,57 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         )
     }
 
+    func testSessionMalfunctionRebuildsTheDecoderInsteadOfDroppingEveryFrame() throws {
+        for status in [
+            kVTVideoDecoderMalfunctionErr,
+            kVTSessionMalfunctionErr,
+            kVTVideoDecoderNotAvailableNowErr,
+            kVTVideoDecoderRemovedErr,
+        ] {
+            let harness = makeHarness()
+            harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+            let oldGeneration = harness.host.generation
+            harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+                id: 1,
+                generation: oldGeneration,
+                randomAccess: true
+            ))
+            harness.decoder.decodeFailures = [.malfunction(status)]
+
+            harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+                id: 2,
+                generation: oldGeneration,
+                randomAccess: false
+            ))
+
+            // A malfunctioning session fails every later submission the same way,
+            // so counting this as one more dropped frame froze video for good
+            // while access units kept arriving.
+            XCTAssertGreaterThan(harness.host.generation, oldGeneration)
+            XCTAssertTrue(harness.host.failures.isEmpty)
+            XCTAssertEqual(harness.decoder.snapshot().last, .invalidate)
+        }
+    }
+
+    func testUnrecoverableSessionMalfunctionIsReportedRatherThanRestartedForever() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        var identifier: UInt64 = 1
+        for _ in 0...8 where harness.host.failures.isEmpty {
+            harness.decoder.decodeFailures = [.malfunction(kVTVideoDecoderMalfunctionErr)]
+            harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+                id: identifier,
+                generation: harness.host.generation,
+                randomAccess: true
+            ))
+            identifier += 1
+        }
+
+        // Restarting is bounded: a session that never comes back has to surface
+        // as a real failure instead of silently discarding every frame.
+        XCTAssertFalse(harness.host.failures.isEmpty)
+    }
+
     func testDecodeBackpressureTimeoutRebuildsAtNextRandomAccessWithoutDrainingStalledSession() throws {
         let harness = makeHarness()
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())

@@ -303,6 +303,29 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(fake.snapshot().algorithms, [.appleTemporal])
     }
 
+    func testControllerForwardsPrePlayAndLiveBufferTuning() async throws {
+        let first = FakeControllerPipeline()
+        let second = FakeControllerPipeline()
+        let factory = FakeControllerPipelineFactory([first, second])
+        let controller = PlaybackController(factory: factory)
+        let long = PlaybackTuning(videoBufferSeconds: 4, deinterlaceBufferFrames: 16)
+
+        // Set before playing: the pipeline has to be built with it, otherwise a
+        // stored setting only takes effect the second time a channel is opened.
+        await controller.setTuning(long)
+        await controller.play(makeRequest())
+        XCTAssertEqual(factory.requestedTuningsSnapshot, [long])
+        XCTAssertTrue(first.snapshot().tunings.isEmpty)
+
+        // Changed while playing: applied to the running stream, and remembered
+        // for the pipeline built for the next channel.
+        let short = PlaybackTuning(videoBufferSeconds: 0.5, deinterlaceBufferFrames: 4)
+        await controller.setTuning(short)
+        XCTAssertEqual(first.snapshot().tunings, [short])
+        await controller.play(makeRequest())
+        XCTAssertEqual(factory.requestedTuningsSnapshot, [long, short])
+    }
+
     func testControllerPublishesOnlyActiveSessionNotices() async throws {
         let first = FakeControllerPipeline()
         let second = FakeControllerPipeline()
@@ -1121,7 +1144,9 @@ final class PlaybackPipelineTests: XCTestCase {
         let harness = makeHarness(metrics: metrics)
         let generation = try await configure(harness)
 
-        let frames = try (0..<VideoPresentationQueue.capacity).map { index in
+        // A full horizon of 25 fps video.
+        let framesPerHorizon = 25
+        let frames = try (0..<framesPerHorizon).map { index in
             try PlaybackFakeMedia.decodedFrame(
                 id: UInt64(index + 1),
                 generation: generation,
@@ -1135,10 +1160,7 @@ final class PlaybackPipelineTests: XCTestCase {
             metrics.snapshot(window: .seconds(60)).retainedVideoCount ==
                 PlaybackPipeline.startupRetainedVideoCapacity
         }
-        XCTAssertLessThan(
-            PlaybackPipeline.startupRetainedVideoCapacity,
-            VideoPresentationQueue.capacity
-        )
+        XCTAssertLessThan(PlaybackPipeline.startupRetainedVideoCapacity, framesPerHorizon)
         XCTAssertTrue(harness.renderer.snapshot().frames.isEmpty)
         XCTAssertFalse(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
     }
@@ -1154,7 +1176,7 @@ final class PlaybackPipelineTests: XCTestCase {
         let generation = try await configure(harness)
         harness.audio.setReady(true)
 
-        let earlyFrames = try (0..<(VideoPresentationQueue.capacity * 2)).map { index in
+        let earlyFrames = try (0..<50).map { index in
             try PlaybackFakeMedia.decodedFrame(
                 id: UInt64(index + 1),
                 generation: generation,
@@ -1575,6 +1597,57 @@ final class PlaybackPipelineTests: XCTestCase {
             XCTAssertFalse(harness.renderer.snapshot().frames.contains { $0.generation == oldGeneration })
             await harness.pipeline.stop()
         }
+    }
+
+    func testDisplaySubmissionResumesOnEveryReadinessOpenNotJustTheFirst() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1, generation: generation, pts: .zero, duration: CMTime(value: 1, timescale: 4)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1, generation: generation, pts: .zero, interlaced: false
+            ),
+        ], in: harness)
+        // `updateDisplayCriteria` also records operations, so compare only the
+        // submission transitions.
+        func lastSubmissionOperation() -> String? {
+            harness.display.snapshot().last { $0 == "pause" || $0 == "resume" }
+        }
+        try await eventually { lastSubmissionOperation() == "resume" }
+
+        // An audio renderer replacement closes the gate and pauses submission.
+        harness.pipeline.receive(
+            audioReadiness: .invalidated,
+            generation: generation
+        )
+        try await eventually { lastSubmissionOperation() == "pause" }
+
+        // Reopening must resume submission again. Leaving it paused strands the
+        // presentation queue: frames keep arriving and overflow without ever
+        // being selected for display.
+        harness.pipeline.receive(
+            audioReadiness: .available,
+            generation: generation
+        )
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 2,
+            generation: generation,
+            pts: CMTime(value: 1, timescale: 4),
+            duration: CMTime(value: 1, timescale: 4)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 2,
+                generation: generation,
+                pts: CMTime(value: 1, timescale: 25),
+                interlaced: false
+            ),
+        ], in: harness)
+
+        try await eventually { lastSubmissionOperation() == "resume" }
     }
 
     private func configure(_ harness: Harness) async throws -> MediaGeneration {
