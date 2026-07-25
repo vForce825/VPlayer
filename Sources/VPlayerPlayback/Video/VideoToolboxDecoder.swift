@@ -129,11 +129,14 @@ private final class SessionIdentityBox: @unchecked Sendable {
     }
 }
 
-/// Cancels submissions queued against a session that is being torn down.
+/// Cancels submissions queued against a session that is being replaced or
+/// invalidated.
 ///
 /// Without it, tearing a session down would have to wait behind every access
 /// unit already queued for it — on the playback executor, which is the thread
-/// this whole change exists to keep free.
+/// this whole change exists to keep free. Cancelling is also the more faithful
+/// outcome: those units belong to the generation being abandoned, so their
+/// output would be discarded on arrival anyway.
 private final class SubmissionEpoch: @unchecked Sendable {
     private let lock = NSLock()
     private var current: UInt64 = 0
@@ -647,8 +650,11 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         executor.submit { eventSink(.submissionFailure(failure, generation: generation)) }
     }
 
+    /// Flushes, and so waits for units already queued rather than cancelling
+    /// them: a caller asking the decoder to emit what it is holding means the
+    /// ones it has not been handed yet too. Teardown paths follow this with
+    /// `invalidate`, which is where cancellation belongs.
     public func finishDelayedFrames() throws {
-        submissionEpoch.bump()
         try submissionQueue.sync {
             guard let active else { return }
             let status = api.finishDelayedFrames(active.session)
@@ -662,7 +668,6 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     }
 
     public func waitForAsynchronousFrames() throws {
-        submissionEpoch.bump()
         try submissionQueue.sync {
             guard let active else { return }
             let status = api.waitForAsynchronousFrames(active.session)
