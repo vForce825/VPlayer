@@ -49,6 +49,105 @@ private final class DecodeSubmissionWindow: @unchecked Sendable {
     }
 }
 
+/// Bounds how much undecoded work may queue ahead of the decode session.
+///
+/// Submission runs off the playback executor, so nothing upstream slows down
+/// when decode does — which is the point, but it also means a decoder that has
+/// fallen behind would accumulate access units until memory ran out. The bound
+/// converts that into dropped frames, and drops to the next random-access point
+/// rather than an arbitrary unit: every frame between a gap and the next
+/// keyframe references pictures that were never decoded, so submitting them
+/// only produces a run of reference-missing failures.
+final class DecodeSubmissionBacklog: @unchecked Sendable {
+    enum Admission: Equatable {
+        case submit
+        case skip
+    }
+
+    private let lock = NSLock()
+    private var depth: Int
+    private var pending = 0
+    private var skipping = false
+    private var maximumPending = 0
+
+    init(depth: Int) {
+        self.depth = max(1, depth)
+    }
+
+    func admit(isRandomAccess: Bool) -> Admission {
+        lock.withLock {
+            if skipping {
+                // Resume only once the decoder has actually caught up; resuming
+                // at the bound just overflows again on the next unit.
+                guard isRandomAccess, pending <= depth / 2 else { return .skip }
+                skipping = false
+            } else if pending >= depth {
+                skipping = true
+                return .skip
+            }
+            pending += 1
+            maximumPending = max(maximumPending, pending)
+            return .submit
+        }
+    }
+
+    func complete() {
+        lock.withLock { pending = max(0, pending - 1) }
+    }
+
+    /// A rebuilt session decodes from its own first random-access unit, so a
+    /// skip left over from the previous one would drop a whole further GOP.
+    func resumeAfterSessionChange() {
+        lock.withLock { skipping = false }
+    }
+
+    func setDepth(_ newDepth: Int) {
+        lock.withLock { depth = max(1, newDepth) }
+    }
+
+    var maximumDepth: Int {
+        lock.withLock { maximumPending }
+    }
+}
+
+/// Written on the submission queue, read on the playback executor when an
+/// output comes back: the executor can no longer read the session itself.
+private final class SessionIdentityBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identity: (id: VTSessionID, generation: MediaGeneration)?
+
+    func set(id: VTSessionID, generation: MediaGeneration) {
+        lock.withLock { identity = (id, generation) }
+    }
+
+    func clear() {
+        lock.withLock { identity = nil }
+    }
+
+    func matches(id: VTSessionID, generation: MediaGeneration) -> Bool {
+        lock.withLock { identity?.id == id && identity?.generation == generation }
+    }
+}
+
+/// Cancels submissions queued against a session that is being replaced or
+/// invalidated.
+///
+/// Without it, tearing a session down would have to wait behind every access
+/// unit already queued for it — on the playback executor, which is the thread
+/// this whole change exists to keep free. Cancelling is also the more faithful
+/// outcome: those units belong to the generation being abandoned, so their
+/// output would be discarded on arrival anyway.
+private final class SubmissionEpoch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: UInt64 = 0
+
+    var value: UInt64 { lock.withLock { current } }
+
+    func bump() {
+        lock.withLock { current &+= 1 }
+    }
+}
+
 private final class DecodeSubmissionLease: @unchecked Sendable {
     private let lock = NSLock()
     private var released = false
@@ -93,7 +192,22 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let accessUnitID: UInt64
         let generation: MediaGeneration
         let parserMetadata: VideoParserMetadata
+        // Carried with the submission because the executor no longer owns the
+        // session and so cannot look up how to classify a failed output.
+        let configuration: VideoDecodeConfiguration
     }
+
+    /// Pixel formats this pipeline can actually turn into a Metal texture.
+    ///
+    /// Ordered by preference and deliberately narrower than what VideoToolbox
+    /// will produce: `VideoFormatMetadataReader` rejects anything else, so
+    /// asking for a format that is not on this list buys a decode session that
+    /// fails on its first frame.
+    static let renderablePixelFormats: [UInt32] = [
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+    ]
 
     private struct ClassifiedFailure {
         let failure: VideoDecoderFailure
@@ -107,7 +221,22 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private let submissionWindow: DecodeSubmissionWindow
     private let metrics: PlaybackMetrics?
     private let signposts: PlaybackSignposts?
+
+    /// Everything below is confined to `submissionQueue`.
+    ///
+    /// Handing an access unit to VideoToolbox blocks — on a busy decoder for
+    /// tens of milliseconds per frame — so it cannot run on the playback
+    /// executor that also admits demuxed packets, completes deinterlace jobs and
+    /// updates readiness. Saturating that executor stops the read path and takes
+    /// the whole session down; here it costs frames instead.
+    private let submissionQueue: DispatchQueue
     private var active: ActiveSession?
+    private var submissionsSinceDepthSample = 0
+
+    private let submissionEpoch = SubmissionEpoch()
+    private let sessionIdentity = SessionIdentityBox()
+    private let backlog: DecodeSubmissionBacklog
+    private let tuningBox = TuningBox()
 
     public convenience init(
         executor: PlaybackSerialExecutor,
@@ -125,6 +254,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
 
     convenience init(
         executor: PlaybackSerialExecutor,
+        tuning: PlaybackTuning,
         diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
     ) {
@@ -133,6 +263,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             eventSink: eventSink,
             api: SystemVideoToolboxAPI(),
             compatibilityCheck: VideoFormatMetadataReader.systemCompatibilityCheck,
+            tuning: tuning,
             metrics: diagnostics.metrics,
             signposts: diagnostics.signposts
         )
@@ -145,9 +276,15 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck,
         maximumInFlightDecodeCount: Int = 8,
         inFlightWaitInterval: TimeInterval = 0.25,
+        tuning: PlaybackTuning = .default,
+        submissionQueue: DispatchQueue = DispatchQueue(
+            label: "org.vplayer.playback.decode.submit",
+            qos: .userInitiated
+        ),
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil
     ) {
+        self.submissionQueue = submissionQueue
         self.executor = executor
         self.eventSink = eventSink
         self.api = api
@@ -156,11 +293,36 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             capacity: maximumInFlightDecodeCount,
             waitInterval: inFlightWaitInterval
         )
+        backlog = DecodeSubmissionBacklog(depth: tuning.decodeSubmissionQueueDepth)
+        tuningBox.value = tuning
         self.metrics = metrics
         self.signposts = signposts
     }
 
+    public func setTuning(_ tuning: PlaybackTuning) {
+        tuningBox.value = tuning
+        backlog.setDepth(tuning.decodeSubmissionQueueDepth)
+        // The output pool floor is fixed when the session is built, so a change
+        // reaches the decoder at the next configure rather than immediately.
+    }
+
     public func configure(
+        format: CMVideoFormatDescription,
+        generation: MediaGeneration,
+        configuration: VideoDecodeConfiguration
+    ) throws {
+        submissionEpoch.bump()
+        backlog.resumeAfterSessionChange()
+        try submissionQueue.sync {
+            try configureIsolated(
+                format: format,
+                generation: generation,
+                configuration: configuration
+            )
+        }
+    }
+
+    private func configureIsolated(
         format: CMVideoFormatDescription,
         generation: MediaGeneration,
         configuration: VideoDecodeConfiguration
@@ -173,28 +335,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             throw VideoDecoderFailure.sessionCreate(kVTVideoDecoderUnsupportedDataFormatErr)
         }
 
-        let decoderSpecification: [String: VTPropertyValue] = [
-            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
-        ]
-        let imageBufferAttributes: [String: VTPropertyValue] = [
-            kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
-            kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
-            kCVPixelBufferPixelFormatTypeKey as String: .array([
-                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
-                .unsigned32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange),
-            ]),
-        ]
-        let creation = api.createSession(
-            format: format,
-            decoderSpecification: decoderSpecification,
-            imageBufferAttributes: imageBufferAttributes
-        )
-        guard creation.status == noErr, let candidate = creation.session else {
-            if let candidate = creation.session { api.invalidate(candidate) }
-            throw VideoDecoderFailure.sessionCreate(creation.status)
-        }
+        let selection = try makeSession(format: format)
+        let candidate = selection.session
+        let tuning = tuningBox.value
 
         var fieldModeStatus: OSStatus?
         switch configuration {
@@ -226,6 +369,21 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             }
         }
 
+        // Set last, so a decoder that rejects it cannot mask a field-mode or
+        // temporal failure that says something far more useful. The default pool
+        // ages buffers out, and this pipeline legitimately holds a known number
+        // of them at once; reallocating an IOSurface per frame is exactly the
+        // kind of cost that shows up as submission time.
+        let poolStatus = api.setProperty(
+            candidate,
+            key: kVTDecompressionPropertyKey_OutputPoolRequestedMinimumBufferCount as String,
+            value: .unsigned32(UInt32(tuning.decoderOutputPoolFloor))
+        )
+        guard poolStatus == noErr || poolStatus == kVTPropertyNotSupportedErr else {
+            api.invalidate(candidate)
+            throw VideoDecoderFailure.sessionCreate(poolStatus)
+        }
+
         let hardware = api.copyProperty(
             candidate,
             key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder as String
@@ -245,7 +403,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         // actually came back.
         metrics?.recordDecoderSession(
             summary: Self.sessionSummary(
+                format: format,
                 configuration: configuration,
+                pixelFormatChoice: selection.choice,
+                outputPoolFloor: poolStatus == noErr ? tuning.decoderOutputPoolFloor : nil,
                 fieldModeStatus: fieldModeStatus,
                 hardwareStatus: hardware.status,
                 hardwareValue: hardware.value
@@ -259,10 +420,106 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             generation: generation,
             configuration: configuration
         )
+        sessionIdentity.set(id: candidate.id, generation: generation)
         if let previous {
             submissionWindow.reset(sessionID: previous.id)
             api.invalidate(previous.session)
         }
+    }
+
+    private struct SessionSelection {
+        let session: any VideoToolboxSession
+        let choice: String
+    }
+
+    /// Builds the session against the decoder's own output format where that is
+    /// something this renderer can map.
+    ///
+    /// Naming a pixel format constrains the decoder, and a constraint it cannot
+    /// meet natively is satisfied by converting every frame on the way out. The
+    /// only way to ask what it would have produced is to create the session
+    /// unconstrained and read its preference back, so that is the first attempt
+    /// and the named formats are the fallback.
+    private func makeSession(format: CMVideoFormatDescription) throws -> SessionSelection {
+        let decoderSpecification: [String: VTPropertyValue] = [
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
+        ]
+        var attributes: [String: VTPropertyValue] = [
+            kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
+            kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
+        ]
+        let candidate = try create(
+            format: format,
+            decoderSpecification: decoderSpecification,
+            imageBufferAttributes: attributes
+        )
+        let preferred = fastestRenderablePixelFormat(of: candidate)
+        if let preferred, preferred.isDecoderPreference {
+            return SessionSelection(
+                session: candidate,
+                choice: "native(\(Self.formatName(preferred.format)))"
+            )
+        }
+        // Whatever this session would have produced is not what we can use, and
+        // it has served its purpose as a question.
+        api.invalidate(candidate)
+
+        // Either the decoder would not say what it prefers, or what it prefers
+        // cannot be rendered. Name what it should produce instead.
+        let choice: String
+        if let preferred {
+            attributes[kCVPixelBufferPixelFormatTypeKey as String] =
+                .unsigned32(preferred.format)
+            choice = "fastestRenderable(\(Self.formatName(preferred.format)))"
+        } else {
+            attributes[kCVPixelBufferPixelFormatTypeKey as String] = .array(
+                Self.renderablePixelFormats.map { .unsigned32($0) }
+            )
+            choice = "listed"
+        }
+        return SessionSelection(
+            session: try create(
+                format: format,
+                decoderSpecification: decoderSpecification,
+                imageBufferAttributes: attributes
+            ),
+            choice: choice
+        )
+    }
+
+    private func create(
+        format: CMVideoFormatDescription,
+        decoderSpecification: [String: VTPropertyValue],
+        imageBufferAttributes: [String: VTPropertyValue]
+    ) throws -> any VideoToolboxSession {
+        let creation = api.createSession(
+            format: format,
+            decoderSpecification: decoderSpecification,
+            imageBufferAttributes: imageBufferAttributes
+        )
+        guard creation.status == noErr, let session = creation.session else {
+            if let session = creation.session { api.invalidate(session) }
+            throw VideoDecoderFailure.sessionCreate(creation.status)
+        }
+        return session
+    }
+
+    private func fastestRenderablePixelFormat(
+        of session: any VideoToolboxSession
+    ) -> (format: UInt32, isDecoderPreference: Bool)? {
+        let supported = api.copyProperty(
+            session,
+            key: kVTDecompressionPropertyKey_SupportedPixelFormatsOrderedByPerformance as String
+        )
+        guard supported.status == noErr,
+              case let .array(entries) = supported.value else { return nil }
+        let formats: [UInt32] = entries.compactMap {
+            guard case let .unsigned32(value) = $0 else { return nil }
+            return value
+        }
+        guard let best = formats.first(where: { Self.renderablePixelFormats.contains($0) })
+        else { return nil }
+        return (best, formats.first == best)
     }
 
     /// Decode outputs handed back by VideoToolbox that are still waiting for the
@@ -276,15 +533,44 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         _ accessUnit: CompressedVideoAccessUnit,
         flags: VTDecodeFrameFlags
     ) throws {
+        guard backlog.admit(isRandomAccess: accessUnit.isRandomAccess) == .submit else {
+            metrics?.recordVideoDrop(source: .decodeSubmissionBacklog)
+            return
+        }
+        let epoch = submissionEpoch.value
+        submissionQueue.async { [weak self] in
+            guard let self else { return }
+            defer {
+                backlog.complete()
+                metrics?.recordDecodeSubmissionDepth(backlog.maximumDepth)
+            }
+            // The session this unit was meant for has already been torn down;
+            // submitting to its replacement would decode a frame whose
+            // references were never sent.
+            guard submissionEpoch.value == epoch else {
+                metrics?.recordStaleGenerationDrop()
+                return
+            }
+            submitIsolated(accessUnit, flags: flags)
+        }
+    }
+
+    private func submitIsolated(
+        _ accessUnit: CompressedVideoAccessUnit,
+        flags: VTDecodeFrameFlags
+    ) {
         guard let active, accessUnit.generation == active.generation else { return }
         let token = DecodeToken(
             accessUnitID: accessUnit.id,
             generation: accessUnit.generation,
-            parserMetadata: accessUnit.parserMetadata
+            parserMetadata: accessUnit.parserMetadata,
+            configuration: active.configuration
         )
         let sessionID = active.id
+        sampleFramesBeingDecoded(active)
         guard submissionWindow.claim(sessionID: sessionID) else {
-            throw VideoDecoderFailure.backpressureTimeout
+            report(.backpressureTimeout, generation: accessUnit.generation)
+            return
         }
         let submissionLease = DecodeSubmissionLease { [submissionWindow] in
             submissionWindow.release(sessionID: sessionID)
@@ -337,41 +623,80 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     "decode submission failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
                 )
             }
-            throw classified.failure
+            report(classified.failure, generation: accessUnit.generation)
+            return
         }
     }
 
+    /// Distinguishes a decoder that is slow from one that is merely backed up:
+    /// a submission that blocks while the decoder holds nothing is compute,
+    /// while one that blocks with a full pipeline is waiting for buffers this
+    /// app has not returned yet.
+    private func sampleFramesBeingDecoded(_ session: ActiveSession) {
+        submissionsSinceDepthSample += 1
+        guard submissionsSinceDepthSample >= 4 else { return }
+        submissionsSinceDepthSample = 0
+        let result = api.copyProperty(
+            session.session,
+            key: kVTDecompressionPropertyKey_NumberOfFramesBeingDecoded as String
+        )
+        guard result.status == noErr,
+              case let .unsigned32(count) = result.value else { return }
+        metrics?.recordFramesBeingDecoded(Int(count))
+    }
+
+    private func report(_ failure: VideoDecoderFailure, generation: MediaGeneration) {
+        let eventSink = eventSink
+        executor.submit { eventSink(.submissionFailure(failure, generation: generation)) }
+    }
+
+    /// Flushes, and so waits for units already queued rather than cancelling
+    /// them: a caller asking the decoder to emit what it is holding means the
+    /// ones it has not been handed yet too. Teardown paths follow this with
+    /// `invalidate`, which is where cancellation belongs.
     public func finishDelayedFrames() throws {
-        guard let active else { return }
-        let status = api.finishDelayedFrames(active.session)
-        guard status == noErr else {
-            Self.logger.error(
-                "finish delayed frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
-            )
-            throw Self.classify(status, configuration: active.configuration).failure
+        try submissionQueue.sync {
+            guard let active else { return }
+            let status = api.finishDelayedFrames(active.session)
+            guard status == noErr else {
+                Self.logger.error(
+                    "finish delayed frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                )
+                throw Self.classify(status, configuration: active.configuration).failure
+            }
         }
     }
 
     public func waitForAsynchronousFrames() throws {
-        guard let active else { return }
-        let status = api.waitForAsynchronousFrames(active.session)
-        guard status == noErr else {
-            Self.logger.error(
-                "wait for asynchronous frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
-            )
-            throw Self.classify(status, configuration: active.configuration).failure
+        try submissionQueue.sync {
+            guard let active else { return }
+            let status = api.waitForAsynchronousFrames(active.session)
+            guard status == noErr else {
+                Self.logger.error(
+                    "wait for asynchronous frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                )
+                throw Self.classify(status, configuration: active.configuration).failure
+            }
         }
     }
 
     public func invalidate() {
-        guard let current = active else { return }
-        active = nil
-        submissionWindow.reset(sessionID: current.id)
-        api.invalidate(current.session)
+        submissionEpoch.bump()
+        backlog.resumeAfterSessionChange()
+        sessionIdentity.clear()
+        submissionQueue.sync {
+            guard let current = active else { return }
+            active = nil
+            submissionWindow.reset(sessionID: current.id)
+            api.invalidate(current.session)
+        }
     }
 
     static func sessionSummary(
+        format: CMVideoFormatDescription?,
         configuration: VideoDecodeConfiguration,
+        pixelFormatChoice: String,
+        outputPoolFloor: Int?,
         fieldModeStatus: OSStatus?,
         hardwareStatus: OSStatus,
         hardwareValue: VTPropertyValue?
@@ -386,7 +711,26 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         } else {
             hardware = "no"
         }
-        return "config=\(configuration) fieldMode=\(field) hardware=\(hardware)"
+        var codec = "unknown"
+        if let format {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+            codec = "\(formatName(CMFormatDescriptionGetMediaSubType(format)))"
+                + " \(dimensions.width)x\(dimensions.height)"
+        }
+        let pool = outputPoolFloor.map(String.init) ?? "unsupported"
+        return "config=\(configuration) codec=\(codec) pixelFormat=\(pixelFormatChoice)"
+            + " pool=\(pool) fieldMode=\(field) hardware=\(hardware)"
+    }
+
+    /// Four-character codes read far better than their decimal values in a
+    /// metrics blob that is only ever read by a human.
+    static func formatName(_ code: UInt32) -> String {
+        let characters = (0..<4).compactMap { index -> Character? in
+            let byte = UInt8((code >> UInt32((3 - index) * 8)) & 0xFF)
+            guard (0x20...0x7E).contains(byte) else { return nil }
+            return Character(UnicodeScalar(byte))
+        }
+        return characters.count == 4 ? String(characters) : String(code)
     }
 
     private func handle(
@@ -394,9 +738,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         token: DecodeToken,
         sessionID: VTSessionID
     ) {
-        guard let active,
-              active.id == sessionID,
-              active.generation == token.generation else {
+        guard sessionIdentity.matches(id: sessionID, generation: token.generation) else {
             metrics?.recordStaleGenerationDrop()
             return
         }
@@ -404,11 +746,11 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard output.status == noErr else {
             let classified = Self.classify(
                 output.status,
-                configuration: active.configuration
+                configuration: token.configuration
             )
             if !classified.isRecoverable {
                 Self.logger.error(
-                    "decode callback failed status=\(output.status, privacy: .public) infoFlags=\(output.infoFlags.rawValue, privacy: .public) hasImage=\(output.imageBuffer != nil, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                    "decode callback failed status=\(output.status, privacy: .public) infoFlags=\(output.infoFlags.rawValue, privacy: .public) hasImage=\(output.imageBuffer != nil, privacy: .public) configuration=\(String(describing: token.configuration), privacy: .public)"
                 )
             }
             emit(classified, generation: token.generation)
@@ -423,7 +765,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             emit(
                 Self.classify(
                     kVTVideoDecoderMalfunctionErr,
-                    configuration: active.configuration
+                    configuration: token.configuration
                 ),
                 generation: token.generation
             )
@@ -503,6 +845,17 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         default:
             return ClassifiedFailure(failure: .malfunction(status), isRecoverable: false)
         }
+    }
+}
+
+/// Settings arrive on the main actor and are read on the submission queue.
+private final class TuningBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = PlaybackTuning.default
+
+    var value: PlaybackTuning {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }
 

@@ -107,7 +107,16 @@ public struct PlaybackTuning: Sendable, Equatable {
     /// field-rate deinterlace routes emit two frames per input frame, so a
     /// frame-count bound silently halves for interlaced content — which is
     /// exactly the material that needs the buffer most.
+    ///
+    /// The default has to cover two opposing margins at once: the anchor sits
+    /// `maximumAnchorLag` behind the newest frame so a supply hiccup does not
+    /// let the clock overtake it, and whatever is left over is the room video
+    /// has to creep further ahead before the horizon starts discarding. One
+    /// second could not hold both — halving the anchor lag to stop the
+    /// discarding just moved the failure to the other side and re-anchored on
+    /// every hiccup instead.
     public static let videoBufferSecondsChoices: [Double] = [0.5, 1, 2, 4]
+    public static let defaultVideoBufferSeconds: Double = 2
     /// How many deinterlace inputs may wait for the GPU before work is shed.
     /// Shedding here starts the cascade on a live stream: the lost field pair
     /// puts video behind the clock, a live source cannot be caught up, and the
@@ -120,12 +129,12 @@ public struct PlaybackTuning: Sendable, Equatable {
     public let deinterlaceBufferFrames: Int
 
     public init(
-        videoBufferSeconds: Double = 1,
+        videoBufferSeconds: Double = PlaybackTuning.defaultVideoBufferSeconds,
         deinterlaceBufferFrames: Int = 8
     ) {
         self.videoBufferSeconds = Self.videoBufferSecondsChoices.contains(videoBufferSeconds)
             ? videoBufferSeconds
-            : 1
+            : Self.defaultVideoBufferSeconds
         self.deinterlaceBufferFrames = Self.deinterlaceBufferFramesChoices
             .contains(deinterlaceBufferFrames)
             ? deinterlaceBufferFrames
@@ -143,15 +152,45 @@ public struct PlaybackTuning: Sendable, Equatable {
         max(24, Int((120 * videoBufferSeconds).rounded()))
     }
 
+    /// The floor the decode session's output pixel-buffer pool is held at.
+    ///
+    /// Derived rather than configured: it is a count of the buffers this
+    /// pipeline provably has checked out at once — the in-flight submission
+    /// window, YADIF's pending queue plus its three-frame reference window, and
+    /// the presentation frames not yet released. Left at the default the pool
+    /// ages buffers out and reallocates them under load, and an IOSurface
+    /// allocation is far too expensive to repeat per frame.
+    public var decoderOutputPoolFloor: Int {
+        deinterlaceBufferFrames + 16
+    }
+
+    /// Undecoded access units allowed to queue ahead of the decoder before the
+    /// pipeline skips to the next random-access point.
+    ///
+    /// Derived rather than configured: this queue exists to absorb bursts, and
+    /// queueing more than the presentation buffer can hold only adds latency to
+    /// frames that the horizon will trim anyway. Its real job is to bound the
+    /// damage when decode falls behind — the alternative is unbounded growth on
+    /// a live source that never slows down to let the decoder catch up.
+    public var decodeSubmissionQueueDepth: Int {
+        max(8, Int((videoBufferSeconds * 16).rounded()))
+    }
+
     /// How far behind the newest decoded frame the clock may be anchored.
     ///
     /// Derived rather than configured: anchoring further back than the buffer
     /// spans makes every arriving frame overflow before the clock reaches it,
     /// for as long as playback runs, so this is only meaningful relative to the
-    /// buffer. Three quarters leaves the clock real runway before it can overtake
-    /// the decoder while staying inside the span. Halving the fraction traded
-    /// overflow drops for twice as many re-anchors, which cost more.
+    /// buffer. What it buys is the margin between where the anchor lands and
+    /// where the horizon starts discarding: video creeps further ahead of the
+    /// clock for as long as playback runs, so the smaller this is, the longer
+    /// the run before the next re-anchor.
+    ///
+    /// Three quarters was measured while ingest was starved and video could
+    /// never get ahead at all; with the read path no longer throttled it leaves
+    /// only a quarter of the buffer of margin, which the drift crosses in well
+    /// under a minute.
     public var maximumAnchorLag: CMTime {
-        CMTime(seconds: videoBufferSeconds * 0.75, preferredTimescale: 1_000)
+        CMTime(seconds: videoBufferSeconds * 0.5, preferredTimescale: 1_000)
     }
 }

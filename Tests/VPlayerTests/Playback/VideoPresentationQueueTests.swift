@@ -58,11 +58,11 @@ final class VideoPresentationQueueTests: XCTestCase {
         XCTAssertEqual(queue.unpresentedCount, 1)
     }
 
-    func testQueueIsBoundedByOneSecondOfVideoRegardlessOfFrameRate() throws {
-        // 60 field-rate frames span 1.18 s, so the queue keeps the 51 that fit in
-        // its one-second horizon. Bounding by frames instead made this depend on
-        // the output frame rate, which field-rate deinterlacing doubles.
-        let fieldRate = VideoPresentationQueue(generation: generation)
+    func testQueueIsBoundedByDurationRegardlessOfFrameRate() throws {
+        // 60 field-rate frames span 1.18 s, so a one-second horizon keeps the 51
+        // that fit. Bounding by frames instead made this depend on the output
+        // frame rate, which field-rate deinterlacing doubles.
+        let fieldRate = VideoPresentationQueue(generation: generation, horizon: rational(1, 1))
         for index in (0..<60).reversed() {
             XCTAssertTrue(fieldRate.enqueue(
                 try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))
@@ -71,7 +71,7 @@ final class VideoPresentationQueueTests: XCTestCase {
         XCTAssertEqual(fieldRate.unpresentedCount, 51)
 
         // Half the frame rate, same duration, so half as many frames survive.
-        let frameRate = VideoPresentationQueue(generation: generation)
+        let frameRate = VideoPresentationQueue(generation: generation, horizon: rational(1, 1))
         for index in (0..<60).reversed() {
             XCTAssertTrue(frameRate.enqueue(
                 try frame(id: UInt64(index), pts: rational(index, 25), duration: rational(1, 25))
@@ -103,7 +103,11 @@ final class VideoPresentationQueueTests: XCTestCase {
 
         for invalid in [CMTime.invalid, .zero, rational(-1, 1)] {
             let fallback = VideoPresentationQueue(generation: generation, horizon: invalid)
-            XCTAssertEqual(fallback.horizonSeconds, 1, accuracy: 0.0001)
+            XCTAssertEqual(
+                fallback.horizonSeconds,
+                PlaybackTuning.default.videoBufferSeconds,
+                accuracy: 0.0001
+            )
         }
     }
 
@@ -137,11 +141,19 @@ final class VideoPresentationQueueTests: XCTestCase {
     }
 
     func testInvalidBufferChangesLeaveTheQueueOnItsDefaults() throws {
-        let queue = VideoPresentationQueue(generation: generation)
+        let queue = VideoPresentationQueue(generation: generation, horizon: rational(1, 1))
         for invalid in [CMTime.invalid, .zero, rational(-1, 1)] {
             queue.setBuffer(horizon: invalid, frameCeiling: 0)
-            XCTAssertEqual(queue.horizonSeconds, 1, accuracy: 0.0001)
+            XCTAssertEqual(
+                queue.horizonSeconds,
+                PlaybackTuning.default.videoBufferSeconds,
+                accuracy: 0.0001
+            )
         }
+        queue.setBuffer(
+            horizon: rational(1, 1),
+            frameCeiling: PlaybackTuning.default.videoBufferFrameCeiling
+        )
         for index in (0..<60).reversed() {
             XCTAssertTrue(queue.enqueue(
                 try frame(id: UInt64(index), pts: rational(index, 50), duration: rational(1, 50))

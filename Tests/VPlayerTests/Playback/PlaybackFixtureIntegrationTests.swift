@@ -146,7 +146,9 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
                 switch event {
                 case let .frame(frame):
                     processor.submit(frame) { decoded.record($0) }
-                case let .recoverableFailure(failure, _), let .fatalFailure(failure, _):
+                case let .recoverableFailure(failure, _),
+                     let .fatalFailure(failure, _),
+                     let .submissionFailure(failure, _):
                     decoded.record(failure)
                 }
             }

@@ -24,6 +24,10 @@ public enum VideoDropSource: Int, Sendable, CaseIterable {
     case presentationOverflow
     case presentationExpired
     case presentationSuperseded
+    /// Access units skipped because decode had fallen far enough behind that
+    /// queueing more would only grow. Distinct from every other source: it is
+    /// the pipeline choosing frames over a stall, not a fault.
+    case decodeSubmissionBacklog
 }
 
 public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
@@ -117,6 +121,15 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // decoder starving itself: submission blocks for a buffer that only the
     // executor can free, while the executor is blocked inside submission.
     public let maximumOutstandingDecoderOutputs: Int
+    // High-water mark of access units queued for submission. Submission runs
+    // off the playback executor, so this is where a slow decoder now shows up:
+    // a mark parked at the configured depth means it is not keeping up, and the
+    // `decodeSubmissionBacklog` drop count says what that cost.
+    public let maximumDecodeSubmissionDepth: Int
+    // What VideoToolbox itself reports it is still working on. Submission time
+    // that climbs while this stays low is decode compute; submission time that
+    // climbs with this pinned high is the decoder waiting for buffers back.
+    public let maximumFramesBeingDecoded: Int
     // What the decode session actually reported for field mode and hardware
     // acceleration. Both are tolerated when unsupported, so without this a
     // session that silently fell back looks exactly like a healthy one.
@@ -216,6 +229,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         var maximumVideoDecodeSubmissionMilliseconds = 0.0
         var totalVideoDecodeSubmissionMilliseconds = 0.0
         var maximumOutstandingDecoderOutputs = 0
+        var maximumDecodeSubmissionDepth = 0
+        var maximumFramesBeingDecoded = 0
         var decoderSessionSummary: String?
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
@@ -364,6 +379,24 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.maximumOutstandingDecoderOutputs = max(
                 state.maximumOutstandingDecoderOutputs,
                 outstanding
+            )
+        }
+    }
+
+    func recordDecodeSubmissionDepth(_ depth: Int) {
+        lock.withLock {
+            state.maximumDecodeSubmissionDepth = max(
+                state.maximumDecodeSubmissionDepth,
+                max(0, depth)
+            )
+        }
+    }
+
+    func recordFramesBeingDecoded(_ count: Int) {
+        lock.withLock {
+            state.maximumFramesBeingDecoded = max(
+                state.maximumFramesBeingDecoded,
+                max(0, count)
             )
         }
     }
@@ -547,6 +580,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             totalVideoDecodeSubmissionMilliseconds:
                 captured.totalVideoDecodeSubmissionMilliseconds,
             maximumOutstandingDecoderOutputs: captured.maximumOutstandingDecoderOutputs,
+            maximumDecodeSubmissionDepth: captured.maximumDecodeSubmissionDepth,
+            maximumFramesBeingDecoded: captured.maximumFramesBeingDecoded,
             decoderSessionSummary: captured.decoderSessionSummary
         )
     }

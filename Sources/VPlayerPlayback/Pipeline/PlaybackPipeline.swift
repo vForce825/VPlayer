@@ -1031,10 +1031,36 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         metrics?.recordVideoResync()
     }
 
+    // The mirror of the case above, and the one that only appears once ingest
+    // actually keeps up with a live source. The renderer's clock advances a
+    // little slower than the source produces presentation timestamps, so video
+    // creeps ahead, and on a live feed that gap never closes on its own. Once it
+    // passes the buffer horizon the presentation queue cannot hold the arrivals
+    // at all — every one is discarded on contact while the pipeline is otherwise
+    // healthy. Re-anchoring costs one hiccup and buys back the whole margin,
+    // which is far cheaper than shedding half the frames for the rest of the
+    // session.
+    private func resyncIfVideoLeadsClockIsolated() {
+        assertIsolated()
+        guard let readiness, readiness.isOpen, !paused, !terminal,
+              let newest = retainedVideo.last else { return }
+        let newestPTS = newest.presentationTimeStamp
+        let now = clock.currentTime
+        guard newestPTS.isNumeric, now.isNumeric else { return }
+        let ahead = CMTimeSubtract(newestPTS, now)
+        guard ahead.isNumeric,
+              CMTimeCompare(ahead, tuning.videoBufferHorizon) > 0 else { return }
+        readiness.close(.buffering)
+        readyPublished = false
+        display.pauseSubmission()
+        metrics?.recordVideoResync()
+    }
+
     private func updateReadinessIsolated() {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         resyncIfVideoTrailsClockIsolated()
+        resyncIfVideoLeadsClockIsolated()
         let expectedGeneration = generationController.current
         let audioInterval = contiguousAudioInterval()
         if audio.isReadyForPlayback, let audioInterval {
@@ -1474,6 +1500,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let relay = PlaybackPipelineRelay()
         let decoder = VideoToolboxDecoder(
             executor: executor,
+            tuning: tuning,
             diagnostics: (metrics: metrics, signposts: signposts)
         ) { relay.decoder($0) }
         guard let device = MTLCreateSystemDefaultDevice() else {

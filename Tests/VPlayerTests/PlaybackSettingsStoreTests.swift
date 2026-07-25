@@ -45,7 +45,7 @@ final class PlaybackSettingsStoreTests: XCTestCase {
     func testBufferLengthsDefaultAndPersistAcrossLaunches() {
         let defaults = UserDefaults(suiteName: suite)!
         var store: PlaybackSettingsStore? = PlaybackSettingsStore(defaults: defaults)
-        XCTAssertEqual(store?.videoBufferSeconds, 1)
+        XCTAssertEqual(store?.videoBufferSeconds, PlaybackTuning.default.videoBufferSeconds)
         XCTAssertEqual(store?.deinterlaceBufferFrames, 8)
 
         store?.videoBufferSeconds = 4
@@ -66,7 +66,7 @@ final class PlaybackSettingsStoreTests: XCTestCase {
 
         let store = PlaybackSettingsStore(defaults: defaults)
 
-        XCTAssertEqual(store.videoBufferSeconds, 1)
+        XCTAssertEqual(store.videoBufferSeconds, PlaybackTuning.default.videoBufferSeconds)
         XCTAssertEqual(store.deinterlaceBufferFrames, 8)
     }
 
@@ -76,13 +76,13 @@ final class PlaybackSettingsStoreTests: XCTestCase {
         var observed: [PlaybackTuning] = []
         store.setTuningChangeHandler { observed.append($0) }
 
-        store.videoBufferSeconds = 2
-        store.videoBufferSeconds = 2
+        store.videoBufferSeconds = 4
+        store.videoBufferSeconds = 4
         store.deinterlaceBufferFrames = 12
 
         XCTAssertEqual(observed, [
-            PlaybackTuning(videoBufferSeconds: 2, deinterlaceBufferFrames: 8),
-            PlaybackTuning(videoBufferSeconds: 2, deinterlaceBufferFrames: 12)
+            PlaybackTuning(videoBufferSeconds: 4, deinterlaceBufferFrames: 8),
+            PlaybackTuning(videoBufferSeconds: 4, deinterlaceBufferFrames: 12)
         ])
     }
 
@@ -94,7 +94,7 @@ final class PlaybackSettingsStoreTests: XCTestCase {
             let tuning = PlaybackTuning(videoBufferSeconds: seconds)
             XCTAssertEqual(
                 CMTimeGetSeconds(tuning.maximumAnchorLag),
-                seconds * 0.75,
+                seconds * 0.5,
                 accuracy: 0.001
             )
             XCTAssertLessThan(
