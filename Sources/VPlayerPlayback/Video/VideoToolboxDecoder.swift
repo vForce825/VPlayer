@@ -375,7 +375,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard let pixelBuffer = output.imageBuffer else {
             if output.infoFlags.contains(.frameDropped)
                 || output.infoFlags.contains(.frameInterrupted) {
-                metrics?.recordVideoDrop()
+                metrics?.recordVideoDrop(source: .decoderSubmission)
                 return
             }
             emit(

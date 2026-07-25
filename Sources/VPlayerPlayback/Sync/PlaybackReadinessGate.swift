@@ -206,6 +206,17 @@ public final class PlaybackReadinessGate {
     // Opening waits for this much buffered audio past the anchor so the first
     // anchor does not start out starved.
     private static let startupAudioRunway = CMTime(value: 1, timescale: 4)
+    // The renderer buffers only a bounded span of decoded video. Anchoring
+    // further behind the newest frame than that makes every arriving frame
+    // overflow the presentation queue before the clock ever reaches it, which
+    // costs frames for as long as playback runs. `commonReadyPTS` is otherwise
+    // free to land anywhere back to the oldest retained audio — measured anchor
+    // lags ranged from 0.4 s to 1.8 s across runs of the same stream.
+    // Sits just inside the renderer's one-second span: far enough back to give
+    // the clock real runway before it can overtake the decoder, close enough
+    // that the queue never overflows. Halving it traded overflow drops for twice
+    // as many re-anchors, which cost more frames than they saved.
+    private static let maximumAnchorLag = CMTime(value: 3, timescale: 4)
 
     private func reevaluate() {
         if isOpen {
@@ -236,9 +247,20 @@ public final class PlaybackReadinessGate {
               video.readyFrameCount >= requiredVideoFrameCount else { return nil }
         let audioEnd = CMTimeAdd(audio.firstPTS, audio.contiguousDuration)
         guard audioEnd.isNumeric else { return nil }
-        let commonPTS = CMTimeCompare(audio.firstPTS, video.firstPTS) >= 0
+        var commonPTS = CMTimeCompare(audio.firstPTS, video.firstPTS) >= 0
             ? audio.firstPTS
             : video.firstPTS
+        if let newest = video.frames?.last?.presentationTimeStamp {
+            let latestUsefulAnchor = CMTimeSubtract(newest, Self.maximumAnchorLag)
+            let runwayLimit = CMTimeSubtract(audioEnd, Self.startupAudioRunway)
+            if latestUsefulAnchor.isNumeric,
+               runwayLimit.isNumeric,
+               CMTimeCompare(latestUsefulAnchor, commonPTS) > 0 {
+                commonPTS = CMTimeCompare(latestUsefulAnchor, runwayLimit) <= 0
+                    ? latestUsefulAnchor
+                    : runwayLimit
+            }
+        }
         guard commonPTS.isNumeric,
               CMTimeCompare(commonPTS, audioEnd) < 0,
               CMTimeCompare(

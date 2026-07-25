@@ -13,6 +13,17 @@ public protocol PlaybackMetricsProviding: Actor {
     func playbackMetricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot?
 }
 
+// Where a discarded video frame was lost. A single total cannot distinguish a
+// pipeline that is merely shedding late frames from one whose decode or
+// deinterlace stage has stopped delivering entirely.
+public enum VideoDropSource: Int, Sendable, CaseIterable {
+    case decoderSubmission
+    case decoderRecoverable
+    case deinterlaceQueueFull
+    case deinterlaceFailure
+    case presentation
+}
+
 public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let scanType: String
     public let selectedAlgorithm: DeinterlaceAlgorithm
@@ -24,6 +35,11 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let temporalDecodeFlagCount: UInt64
     public let staleGenerationDropCount: UInt64
     public let droppedVideoFrames: UInt64
+    // Indexed by `VideoDropSource.rawValue`.
+    public let videoDropCountsBySource: [UInt64]
+    // Sanitized classification and status of the most recent decode failure,
+    // e.g. "badData:-12909". A drop total cannot say which fault is repeating.
+    public let lastVideoDecodeFailure: String?
     public let maximumPresentationQueueDepth: Int
     public let maximumYADIFInFlightCount: Int
     public let maximumYADIFInputDepth: Int
@@ -129,6 +145,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         var temporalDecodeFlagCount: UInt64 = 0
         var staleGenerationDropCount: UInt64 = 0
         var droppedVideoFrames: UInt64 = 0
+        var videoDropCountsBySource = [UInt64](
+            repeating: 0, count: VideoDropSource.allCases.count
+        )
+        var lastVideoDecodeFailure: String?
         var maximumPresentationQueueDepth = 0
         var maximumYADIFInFlightCount = 0
         var maximumYADIFInputDepth = 0
@@ -351,8 +371,16 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock { state.staleGenerationDropCount &+= 1 }
     }
 
-    func recordVideoDrop(count: Int = 1) {
-        lock.withLock { state.droppedVideoFrames &+= UInt64(max(0, count)) }
+    func recordVideoDecodeFailure(kind: String, status: Int32) {
+        lock.withLock { state.lastVideoDecodeFailure = "\(kind):\(status)" }
+    }
+
+    func recordVideoDrop(count: Int = 1, source: VideoDropSource) {
+        let amount = UInt64(max(0, count))
+        lock.withLock {
+            state.droppedVideoFrames &+= amount
+            state.videoDropCountsBySource[source.rawValue] &+= amount
+        }
     }
 
     func recordTemporalUnavailableNotice() {
@@ -400,6 +428,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             temporalDecodeFlagCount: captured.temporalDecodeFlagCount,
             staleGenerationDropCount: captured.staleGenerationDropCount,
             droppedVideoFrames: captured.droppedVideoFrames,
+            videoDropCountsBySource: captured.videoDropCountsBySource,
+            lastVideoDecodeFailure: captured.lastVideoDecodeFailure,
             maximumPresentationQueueDepth: captured.maximumPresentationQueueDepth,
             maximumYADIFInFlightCount: captured.maximumYADIFInFlightCount,
             maximumYADIFInputDepth: captured.maximumYADIFInputDepth,

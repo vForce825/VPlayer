@@ -1781,6 +1781,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let temporalDecodeFlagCount: UInt64
     let staleGenerationDropCount: UInt64
     let droppedVideoFrames: UInt64
+    let videoDropCountsBySource: [UInt64]
+    let lastVideoDecodeFailure: String?
     let maximumPresentationQueueDepth: Int
     let maximumYADIFInFlightCount: Int
     let maximumYADIFInputDepth: Int

@@ -45,6 +45,11 @@ struct VideoPipelineCoordinatorHooks: Sendable {
 
 final class VideoPipelineCoordinator: @unchecked Sendable {
     private static let maximumClassificationProbeAttempts = 3
+    private static let maximumDecoderSessionRestarts = 4
+    // A healthy stream produces at most a short burst of undecodable access
+    // units. A run this long means the reference chain is gone, which no amount
+    // of further per-frame dropping repairs.
+    private static let maximumConsecutivePerFrameFailures = 8
 
     private let decoder: any VideoDecoding
     private let passthrough: any VideoFrameProcessing
@@ -69,6 +74,9 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var activeConfiguration: VideoDecodeConfiguration?
     private var waitingForRandomAccess = true
     private var routeEpoch: UInt64 = 0
+    // Decode failures since the last frame that actually decoded.
+    private var consecutiveDecoderSessionFailures = 0
+    private var consecutivePerFrameDecodeFailures = 0
     private var temporalRetrySuppressed = false
     private var temporalNoticeGate = TemporalNoticeGate()
     private let playbackSessionID = PlaybackSessionID(rawValue: UUID())
@@ -225,8 +233,13 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 )
                 return
             }
-            if Self.isRecoverableDecodeSubmissionFailure(failure) {
-                metrics?.recordVideoDrop()
+            recordDecodeFailureDiagnostic(failure)
+            if Self.isPerFrameDecodeFailure(failure) {
+                handlePerFrameDecodeFailure(failure, generation: generation)
+                return
+            }
+            if Self.requiresDecoderSessionRestart(failure) {
+                restartDecoderAfterSessionFailure(failure, generation: generation)
                 return
             }
             hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
@@ -243,6 +256,9 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 metrics?.recordStaleGenerationDrop()
                 return
             }
+            // A frame arrived, so whatever broke decoding has cleared.
+            consecutiveDecoderSessionFailures = 0
+            consecutivePerFrameDecodeFailures = 0
             observe(frame, probe: nil)
             guard frame.generation == generation else { return }
             submitProbe(for: frame)
@@ -263,7 +279,12 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 )
                 return
             }
-            metrics?.recordVideoDrop()
+            recordDecodeFailureDiagnostic(failure)
+            if Self.requiresDecoderSessionRestart(failure) {
+                restartDecoderAfterSessionFailure(failure, generation: eventGeneration)
+                return
+            }
+            handlePerFrameDecodeFailure(failure, generation: eventGeneration)
         case let .fatalFailure(failure, eventGeneration):
             guard eventGeneration == generation else {
                 metrics?.recordStaleGenerationDrop()
@@ -340,7 +361,26 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         route == .appleTemporal ? .appleTemporal : .bothFields
     }
 
-    private static func isRecoverableDecodeSubmissionFailure(
+    private static func diagnosticName(for failure: VideoDecoderFailure) -> (String, Int32) {
+        switch failure {
+        case let .badData(status): ("badData", status)
+        case let .malfunction(status): ("malfunction", status)
+        case let .sessionCreate(status): ("sessionCreate", status)
+        case .unsupportedConfiguration: ("unsupportedConfiguration", 0)
+        case .softwareDecoder: ("softwareDecoder", 0)
+        case .backpressureTimeout: ("backpressureTimeout", 0)
+        case .temporalUnavailable: ("temporalUnavailable", 0)
+        }
+    }
+
+    private func recordDecodeFailureDiagnostic(_ failure: VideoDecoderFailure) {
+        let (kind, status) = Self.diagnosticName(for: failure)
+        metrics?.recordVideoDecodeFailure(kind: kind, status: status)
+    }
+
+    // Corrupt or unreferenced access units: the session is healthy, this one
+    // frame cannot be decoded, and the next one usually can. Dropping is right.
+    private static func isPerFrameDecodeFailure(
         _ failure: VideoDecoderFailure
     ) -> Bool {
         switch failure {
@@ -349,17 +389,67 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 || status == VideoToolboxDecoder.legacyCodecBadDataErr
                 || status == VideoToolboxDecoder.transientNoFrameStatus
                 || status == kVTVideoDecoderReferenceMissingErr
+        default:
+            false
+        }
+    }
+
+    // A malfunctioning or withdrawn decompression session does not heal by
+    // itself: every later submission fails identically. Counting these as
+    // per-frame drops turned one bad moment into permanently frozen video while
+    // access units kept arriving — the session has to be rebuilt instead.
+    private static func requiresDecoderSessionRestart(
+        _ failure: VideoDecoderFailure
+    ) -> Bool {
+        switch failure {
         case let .malfunction(status):
             status == kVTVideoDecoderMalfunctionErr
                 || status == kVTSessionMalfunctionErr
                 || status == kVTVideoDecoderNotAvailableNowErr
                 || status == kVTVideoDecoderRemovedErr
-        case .unsupportedConfiguration, .softwareDecoder, .backpressureTimeout,
-             .temporalUnavailable:
-            false
-        case .sessionCreate:
+        default:
             false
         }
+    }
+
+    private static func isRecoverableDecodeSubmissionFailure(
+        _ failure: VideoDecoderFailure
+    ) -> Bool {
+        isPerFrameDecodeFailure(failure) || requiresDecoderSessionRestart(failure)
+    }
+
+    // One undecodable access unit is normal on a live feed and is simply
+    // dropped. A sustained run is not: it means the decoder has lost its
+    // reference chain, and every later frame fails identically no matter how
+    // many are discarded — video froze while access units kept arriving. Rebuild
+    // and resume from the next random-access point instead.
+    private func handlePerFrameDecodeFailure(
+        _ failure: VideoDecoderFailure,
+        generation: MediaGeneration
+    ) {
+        metrics?.recordVideoDrop(source: .decoderRecoverable)
+        consecutivePerFrameDecodeFailures += 1
+        guard consecutivePerFrameDecodeFailures > Self.maximumConsecutivePerFrameFailures else {
+            return
+        }
+        consecutivePerFrameDecodeFailures = 0
+        restartDecoderAfterSessionFailure(failure, generation: generation)
+    }
+
+    // Rebuilding costs the frames up to the next random-access point, so a
+    // session that will not come back must be reported rather than restarted
+    // forever: silently dropping every frame is the failure mode this replaces.
+    private func restartDecoderAfterSessionFailure(
+        _ failure: VideoDecoderFailure,
+        generation: MediaGeneration
+    ) {
+        consecutiveDecoderSessionFailures += 1
+        guard consecutiveDecoderSessionFailures <= Self.maximumDecoderSessionRestarts else {
+            hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
+            return
+        }
+        metrics?.recordVideoDrop(source: .decoderRecoverable)
+        restartDecoderAfterBackpressureTimeout()
     }
 
     private func performTrueFormatDrainStep(
@@ -370,7 +460,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             return true
         } catch let failure as VideoDecoderFailure {
             if Self.isRecoverableDecodeSubmissionFailure(failure) {
-                metrics?.recordVideoDrop()
+                metrics?.recordVideoDrop(source: .decoderRecoverable)
                 return true
             }
             if activeConfiguration == .appleTemporal, failure.isTemporalUnavailable {
@@ -544,7 +634,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             return true
         } catch let failure as VideoDecoderFailure {
             if Self.isRecoverableDecodeSubmissionFailure(failure) {
-                metrics?.recordVideoDrop()
+                metrics?.recordVideoDrop(source: .decoderRecoverable)
                 return true
             }
             if toleratingTemporalFailure, failure.isTemporalUnavailable {
@@ -683,7 +773,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 case let .success(frames):
                     hooks.deliver(frames, submittedGeneration)
                 case .failure:
-                    metrics?.recordVideoDrop()
+                    metrics?.recordVideoDrop(source: .deinterlaceFailure)
                     hooks.deliver([], submittedGeneration)
                 }
             }

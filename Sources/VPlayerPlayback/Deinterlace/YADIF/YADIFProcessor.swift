@@ -606,7 +606,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             } : nil
             let dropped = readyJobs.remove(at: lateIndex ?? readyJobs.startIndex)
             counters.gpuQueueFullDrops &+= 1
-            metrics?.recordVideoDrop(count: 2)
+            metrics?.recordVideoDrop(count: 2, source: .deinterlaceQueueFull)
             actions.append(.complete(dropped.completion, .success([])))
             actions.append(.drop(dropSink, YADIFDropEvent(
                 reason: .gpuQueueFull,

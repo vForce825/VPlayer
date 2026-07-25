@@ -410,7 +410,7 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             targetMediaTime: targetMediaTime,
             displayInterval: displayInterval
         )
-        metrics?.recordVideoDrop(count: selection.droppedFrameCount)
+        metrics?.recordVideoDrop(count: selection.droppedFrameCount, source: .presentation)
         metrics?.recordPresentationQueueDepth(queue.unpresentedCount)
         guard let frame = selection.frame else {
             releaseInFlightSlot(flushCacheIfNeeded: false)
