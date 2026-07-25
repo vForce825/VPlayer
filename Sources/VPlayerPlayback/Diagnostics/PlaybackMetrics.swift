@@ -94,6 +94,11 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // an incomplete GPU submission. A declined tick presents nothing, so the
     // frame that was due lands on the next tick as a superseded drop.
     public let renderSkippedInFlightCount: UInt64
+    // Where the read path loses time. `queueFullWait` rising means the app is not
+    // draining fast enough to keep reading; both near zero means the source
+    // simply is not delivering realtime, and nothing in the app will fix it.
+    public let demuxQueueFullWaitSeconds: Double
+    public let demuxAdmitWaitSeconds: Double
     public let demuxPacketCount: UInt64
     public let videoAccessUnitCount: UInt64
     public let audioSampleCount: UInt64
@@ -184,6 +189,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         var audioRecoveryCount: UInt64 = 0
         var renderTickCount: UInt64 = 0
         var renderSkippedInFlightCount: UInt64 = 0
+        var demuxQueueFullWaitNanoseconds: UInt64 = 0
+        var demuxAdmitWaitNanoseconds: UInt64 = 0
         var demuxPacketCount: UInt64 = 0
         var videoAccessUnitCount: UInt64 = 0
         var audioSampleCount: UInt64 = 0
@@ -268,6 +275,16 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func recordVideoResync() {
         lock.withLock { state.videoResyncCount &+= 1 }
+    }
+
+    func update(
+        demuxQueueFullWaitNanoseconds: UInt64,
+        demuxAdmitWaitNanoseconds: UInt64
+    ) {
+        lock.withLock {
+            state.demuxQueueFullWaitNanoseconds = demuxQueueFullWaitNanoseconds
+            state.demuxAdmitWaitNanoseconds = demuxAdmitWaitNanoseconds
+        }
     }
 
     func recordRenderTick(skippedInFlight: Bool) {
@@ -480,6 +497,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             audioRecoveryCount: captured.audioRecoveryCount,
             renderTickCount: captured.renderTickCount,
             renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
+            demuxQueueFullWaitSeconds: Double(captured.demuxQueueFullWaitNanoseconds) / 1_000_000_000,
+            demuxAdmitWaitSeconds: Double(captured.demuxAdmitWaitNanoseconds) / 1_000_000_000,
             demuxPacketCount: captured.demuxPacketCount,
             videoAccessUnitCount: captured.videoAccessUnitCount,
             audioSampleCount: captured.audioSampleCount,

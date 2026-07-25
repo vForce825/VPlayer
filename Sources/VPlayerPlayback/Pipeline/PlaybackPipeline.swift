@@ -170,6 +170,21 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         let acknowledgement: DispatchSemaphore
     }
 
+    /// Written from the demux delivery thread, read from whichever thread asks
+    /// for a metrics snapshot, so it cannot live with the executor-isolated state.
+    private final class AtomicNanoseconds: @unchecked Sendable {
+        private let lock = NSLock()
+        private var total: UInt64 = 0
+
+        func add(_ nanoseconds: UInt64) {
+            lock.withLock { total &+= nanoseconds }
+        }
+
+        var value: UInt64 { lock.withLock { total } }
+    }
+
+    private let admitWaitNanoseconds = AtomicNanoseconds()
+
     private let executor: PlaybackSerialExecutor
     private let demuxer: any MediaDemuxing
     private let assemblerBuilder: any PlaybackAssemblerBuilding
@@ -336,7 +351,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     }
 
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
-        metrics?.snapshot(window: window)
+        metrics?.update(
+            demuxQueueFullWaitNanoseconds: demuxer.queueFullWaitNanoseconds,
+            demuxAdmitWaitNanoseconds: admitWaitNanoseconds.value
+        )
+        return metrics?.snapshot(window: window)
     }
 
     func stop() async {
@@ -507,7 +526,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             }
             handleDemux(event, acknowledgement: acknowledgement)
         }
+        // Delivery is a blocking round trip per packet, so this is the playback
+        // executor's backlog measured from the demux side. Compared against the
+        // demuxer's own queue-full wait it says which side of the handshake is
+        // holding the read path back.
+        let waitStart = DispatchTime.now().uptimeNanoseconds
         acknowledgement.wait()
+        admitWaitNanoseconds.add(DispatchTime.now().uptimeNanoseconds &- waitStart)
     }
 
     private func handleDemux(_ event: DemuxEvent, acknowledgement: DispatchSemaphore) {
