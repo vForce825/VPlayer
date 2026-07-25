@@ -117,6 +117,10 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // decoder starving itself: submission blocks for a buffer that only the
     // executor can free, while the executor is blocked inside submission.
     public let maximumOutstandingDecoderOutputs: Int
+    // What the decode session actually reported for field mode and hardware
+    // acceleration. Both are tolerated when unsupported, so without this a
+    // session that silently fell back looks exactly like a healthy one.
+    public let decoderSessionSummary: String?
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -212,6 +216,7 @@ final class PlaybackMetrics: @unchecked Sendable {
         var maximumVideoDecodeSubmissionMilliseconds = 0.0
         var totalVideoDecodeSubmissionMilliseconds = 0.0
         var maximumOutstandingDecoderOutputs = 0
+        var decoderSessionSummary: String?
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
@@ -348,6 +353,10 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func recordAudioSample() {
         lock.withLock { state.audioSampleCount &+= 1 }
+    }
+
+    func recordDecoderSession(summary: String) {
+        lock.withLock { state.decoderSessionSummary = summary }
     }
 
     func recordDecoderOutputQueued(outstanding: Int) {
@@ -537,7 +546,8 @@ final class PlaybackMetrics: @unchecked Sendable {
                 captured.maximumVideoDecodeSubmissionMilliseconds,
             totalVideoDecodeSubmissionMilliseconds:
                 captured.totalVideoDecodeSubmissionMilliseconds,
-            maximumOutstandingDecoderOutputs: captured.maximumOutstandingDecoderOutputs
+            maximumOutstandingDecoderOutputs: captured.maximumOutstandingDecoderOutputs,
+            decoderSessionSummary: captured.decoderSessionSummary
         )
     }
 

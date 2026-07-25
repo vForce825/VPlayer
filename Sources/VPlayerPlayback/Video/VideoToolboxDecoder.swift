@@ -196,6 +196,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             throw VideoDecoderFailure.sessionCreate(creation.status)
         }
 
+        var fieldModeStatus: OSStatus?
         switch configuration {
         case .bothFields:
             let setStatus = api.setProperty(
@@ -207,6 +208,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 api.invalidate(candidate)
                 throw VideoDecoderFailure.sessionCreate(setStatus)
             }
+            fieldModeStatus = setStatus
         case .appleTemporal:
             do {
                 try AppleTemporalConfigurator(
@@ -237,6 +239,18 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             api.invalidate(candidate)
             throw VideoDecoderFailure.softwareDecoder
         }
+        // Both tolerances above accept `kVTPropertyNotSupportedErr`, so on their
+        // own they prove nothing: a session that never reported its acceleration
+        // and one that reported hardware look identical afterwards. Record what
+        // actually came back.
+        metrics?.recordDecoderSession(
+            summary: Self.sessionSummary(
+                configuration: configuration,
+                fieldModeStatus: fieldModeStatus,
+                hardwareStatus: hardware.status,
+                hardwareValue: hardware.value
+            )
+        )
 
         let previous = active
         active = ActiveSession(
@@ -354,6 +368,25 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         active = nil
         submissionWindow.reset(sessionID: current.id)
         api.invalidate(current.session)
+    }
+
+    static func sessionSummary(
+        configuration: VideoDecodeConfiguration,
+        fieldModeStatus: OSStatus?,
+        hardwareStatus: OSStatus,
+        hardwareValue: VTPropertyValue?
+    ) -> String {
+        let field = fieldModeStatus.map { $0 == noErr ? "applied" : "unsupported(\($0))" }
+            ?? "n/a"
+        let hardware: String
+        if hardwareStatus == kVTPropertyNotSupportedErr {
+            hardware = "unreported"
+        } else if hardwareValue == .boolean(true) {
+            hardware = "yes"
+        } else {
+            hardware = "no"
+        }
+        return "config=\(configuration) fieldMode=\(field) hardware=\(hardware)"
     }
 
     private func handle(
