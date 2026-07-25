@@ -258,7 +258,12 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         outputAllocator: YADIFOutputAllocator? = nil,
         clock: any PlaybackClock,
         maximumInFlight: Int = 3,
-        maximumPendingFrames: Int = 4,
+        // Absorb GPU bursts rather than shed work. Dropping here is what starts
+        // the cascade on a live stream: the lost pair puts video output behind
+        // the clock, the clock cannot be caught up, and the re-anchor that
+        // follows costs a whole window of frames. The extra pending frames cost
+        // ~80 ms of latency, which the renderer's one-second span absorbs.
+        maximumPendingFrames: Int = 8,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil,
         dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
