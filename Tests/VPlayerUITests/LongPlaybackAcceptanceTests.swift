@@ -1293,6 +1293,12 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     }
 
 
+
+
+
+
+
+
 }
 
 private enum AcceptanceValidationError: Error, Equatable {
@@ -1820,6 +1826,7 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let demuxAdmitWaitSeconds: Double
     let playbackExecutorBusySeconds: Double
     let totalVideoDecodeSubmissionMilliseconds: Double
+    let maximumOutstandingDecoderOutputs: Int
     let demuxPacketCount: UInt64
     let videoAccessUnitCount: UInt64
     let audioSampleCount: UInt64

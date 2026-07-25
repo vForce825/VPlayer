@@ -112,6 +112,11 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // decode submission is actually occupying — a maximum alone cannot separate
     // "one slow frame" from "every frame is slow".
     public let totalVideoDecodeSubmissionMilliseconds: Double
+    // High-water mark of decode outputs waiting for the playback executor. Each
+    // retains a decoder output buffer, so a mark that climbs and stays is the
+    // decoder starving itself: submission blocks for a buffer that only the
+    // executor can free, while the executor is blocked inside submission.
+    public let maximumOutstandingDecoderOutputs: Int
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -206,6 +211,7 @@ final class PlaybackMetrics: @unchecked Sendable {
         var videoDecodeSubmissionCount: UInt64 = 0
         var maximumVideoDecodeSubmissionMilliseconds = 0.0
         var totalVideoDecodeSubmissionMilliseconds = 0.0
+        var maximumOutstandingDecoderOutputs = 0
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
@@ -342,6 +348,15 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func recordAudioSample() {
         lock.withLock { state.audioSampleCount &+= 1 }
+    }
+
+    func recordDecoderOutputQueued(outstanding: Int) {
+        lock.withLock {
+            state.maximumOutstandingDecoderOutputs = max(
+                state.maximumOutstandingDecoderOutputs,
+                outstanding
+            )
+        }
     }
 
     func recordVideoDecodeSubmission(milliseconds: Double) {
@@ -521,7 +536,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             maximumVideoDecodeSubmissionMilliseconds:
                 captured.maximumVideoDecodeSubmissionMilliseconds,
             totalVideoDecodeSubmissionMilliseconds:
-                captured.totalVideoDecodeSubmissionMilliseconds
+                captured.totalVideoDecodeSubmissionMilliseconds,
+            maximumOutstandingDecoderOutputs: captured.maximumOutstandingDecoderOutputs
         )
     }
 
