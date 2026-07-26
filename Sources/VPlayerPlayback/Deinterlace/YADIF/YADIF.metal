@@ -43,17 +43,29 @@ template <> struct PlaneCodec<short2> {
 };
 
 template <typename Codes, bool TenBit>
-inline Codes sampleCodes(
+inline Codes readCodes(
     texture2d<uint, access::read> image,
     int x,
     int y
 ) {
-    int boundedX = clamp(x, 0, int(image.get_width()) - 1);
-    int boundedY = clamp(y, 0, int(image.get_height()) - 1);
     return PlaneCodec<Codes>::decode(
-        image.read(uint2(uint(boundedX), uint(boundedY))),
+        image.read(uint2(uint(x), uint(y))),
         TenBit
     );
+}
+
+// Only the horizontal threadgroup halo can leave the image. Every vertical
+// coordinate and every temporal sample is derived from an in-range output row,
+// so keeping their old per-read size queries and clamps wastes ALU work in the
+// hottest part of the filter.
+template <typename Codes, bool TenBit>
+inline Codes readCodesClampedX(
+    texture2d<uint, access::read> image,
+    int x,
+    int y,
+    int width
+) {
+    return readCodes<Codes, TenBit>(image, clamp(x, 0, width - 1), y);
 }
 
 // The spatial search only ever touches seven taps of the row above the missing
@@ -148,20 +160,20 @@ inline Codes synthesize(
         ? current
         : next;
 
-    Codes temporalBefore = sampleCodes<Codes, TenBit>(before, x, y);
-    Codes temporalAfter = sampleCodes<Codes, TenBit>(after, x, y);
+    Codes temporalBefore = readCodes<Codes, TenBit>(before, x, y);
+    Codes temporalAfter = readCodes<Codes, TenBit>(after, x, y);
     Codes center = (temporalBefore + temporalAfter) >> 1;
     Codes centerDifference = abs(temporalBefore - temporalAfter) >> 1;
 
     Codes currentAbove = window.above[3];
     Codes currentBelow = window.below[3];
     Codes previousDifference = (
-        abs(sampleCodes<Codes, TenBit>(previous, x, aboveY) - currentAbove)
-        + abs(sampleCodes<Codes, TenBit>(previous, x, belowY) - currentBelow)
+        abs(readCodes<Codes, TenBit>(previous, x, aboveY) - currentAbove)
+        + abs(readCodes<Codes, TenBit>(previous, x, belowY) - currentBelow)
     ) >> 1;
     Codes nextDifference = (
-        abs(sampleCodes<Codes, TenBit>(next, x, aboveY) - currentAbove)
-        + abs(sampleCodes<Codes, TenBit>(next, x, belowY) - currentBelow)
+        abs(readCodes<Codes, TenBit>(next, x, aboveY) - currentAbove)
+        + abs(readCodes<Codes, TenBit>(next, x, belowY) - currentBelow)
     ) >> 1;
     Codes bound = max(centerDifference, max(previousDifference, nextDifference));
 
@@ -169,12 +181,12 @@ inline Codes synthesize(
         int farAboveY = y + 2 * (aboveY - y);
         int farBelowY = y + 2 * (belowY - y);
         Codes farAbove = (
-            sampleCodes<Codes, TenBit>(before, x, farAboveY)
-            + sampleCodes<Codes, TenBit>(after, x, farAboveY)
+            readCodes<Codes, TenBit>(before, x, farAboveY)
+            + readCodes<Codes, TenBit>(after, x, farAboveY)
         ) >> 1;
         Codes farBelow = (
-            sampleCodes<Codes, TenBit>(before, x, farBelowY)
-            + sampleCodes<Codes, TenBit>(after, x, farBelowY)
+            readCodes<Codes, TenBit>(before, x, farBelowY)
+            + readCodes<Codes, TenBit>(after, x, farBelowY)
         ) >> 1;
         Codes upper = max(
             center - currentBelow,
@@ -232,27 +244,27 @@ inline void runYADIF(
     uint aboveBase = localPosition.y * rowStride * 2;
     uint belowBase = aboveBase + rowStride;
     uint sharedX = localPosition.x + 3;
-    spatialRows[aboveBase + sharedX] = sampleCodes<Codes, TenBit>(
-        current, x, safeAboveY
+    spatialRows[aboveBase + sharedX] = readCodesClampedX<Codes, TenBit>(
+        current, x, safeAboveY, width
     );
-    spatialRows[belowBase + sharedX] = sampleCodes<Codes, TenBit>(
-        current, x, safeBelowY
+    spatialRows[belowBase + sharedX] = readCodesClampedX<Codes, TenBit>(
+        current, x, safeBelowY, width
     );
     if (localPosition.x < 3) {
         int leftX = groupOriginX + int(localPosition.x) - 3;
         int rightX = groupOriginX
             + int(threadsPerThreadgroup.x)
             + int(localPosition.x);
-        spatialRows[aboveBase + localPosition.x] = sampleCodes<Codes, TenBit>(
-            current, leftX, safeAboveY
+        spatialRows[aboveBase + localPosition.x] = readCodesClampedX<Codes, TenBit>(
+            current, leftX, safeAboveY, width
         );
-        spatialRows[belowBase + localPosition.x] = sampleCodes<Codes, TenBit>(
-            current, leftX, safeBelowY
+        spatialRows[belowBase + localPosition.x] = readCodesClampedX<Codes, TenBit>(
+            current, leftX, safeBelowY, width
         );
         spatialRows[aboveBase + threadsPerThreadgroup.x + 3 + localPosition.x]
-            = sampleCodes<Codes, TenBit>(current, rightX, safeAboveY);
+            = readCodesClampedX<Codes, TenBit>(current, rightX, safeAboveY, width);
         spatialRows[belowBase + threadsPerThreadgroup.x + 3 + localPosition.x]
-            = sampleCodes<Codes, TenBit>(current, rightX, safeBelowY);
+            = readCodesClampedX<Codes, TenBit>(current, rightX, safeBelowY, width);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -266,7 +278,7 @@ inline void runYADIF(
     if (copiedY < height) {
         output.write(
             PlaneCodec<Codes>::encode(
-                sampleCodes<Codes, TenBit>(current, x, copiedY),
+                readCodes<Codes, TenBit>(current, x, copiedY),
                 TenBit
             ),
             uint2(uint(x), uint(copiedY))
