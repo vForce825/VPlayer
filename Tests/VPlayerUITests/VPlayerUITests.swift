@@ -18,8 +18,23 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(app.images["source.active.seeded"].exists)
 
         selectTab(named: "设置", in: app)
+        let videoSummary = app.buttons["settings.buffer.video.current"]
+        let channelSummary = app.buttons["settings.channels.current"]
+        XCTAssertTrue(videoSummary.waitForExistence(timeout: 3))
+        XCTAssertEqual(videoSummary.value as? String, "2 秒（默认）")
+        XCTAssertEqual(channelSummary.value as? String, "按播放列表分组（默认）")
+        XCTAssertFalse(app.buttons["settings.buffer.video.2"].exists)
+        XCTAssertFalse(app.buttons["settings.channels.grouped"].exists)
+
+        focusSettingsRow(videoSummary, in: app)
+        XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.buttons["settings.buffer.video.2"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["settings.buffer.video.2"].isSelected)
+        XCUIRemote.shared.press(.menu)
+
+        focusSettingsRow(channelSummary, in: app)
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(app.buttons["settings.channels.grouped"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["settings.channels.grouped"].isSelected)
         XCTAssertFalse(app.staticTexts["关闭自动检测"].exists)
         XCTAssertFalse(app.buttons["关闭自动检测"].exists)
@@ -92,13 +107,14 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(app.buttons["channel.group.第二分组"].exists)
 
         selectTab(named: "设置", in: app)
+        let channelSummary = app.buttons["settings.channels.current"]
+        XCTAssertTrue(channelSummary.waitForExistence(timeout: 3))
+        focusSettingsRow(channelSummary, in: app)
+        XCUIRemote.shared.press(.select)
         let flat = app.buttons["settings.channels.flat"]
         let grouped = app.buttons["settings.channels.grouped"]
         XCTAssertTrue(flat.waitForExistence(timeout: 3))
         XCTAssertTrue(grouped.isSelected)
-        // The buffer sections sit above the grouping rows, so walk down to the
-        // target rather than counting a list length that settings changes move.
-        // Focus lands on the row, not on the button inside it.
         let flatRow = app.cells.containing(
             .button,
             identifier: "settings.channels.flat"
@@ -110,6 +126,8 @@ final class VPlayerUITests: XCTestCase {
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(flat.wait(for: \.isSelected, toEqual: true, timeout: 2))
         XCTAssertFalse(grouped.isSelected)
+        XCUIRemote.shared.press(.menu)
+        XCTAssertEqual(channelSummary.value as? String, "按原始顺序平铺")
 
         selectTab(named: "频道", in: app)
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 3))
@@ -223,5 +241,17 @@ final class VPlayerUITests: XCTestCase {
         }
         XCTAssertTrue(tab.hasFocus, "Expected focus to reach the \(name) tab")
         XCUIRemote.shared.press(.select)
+    }
+
+    @MainActor
+    private func focusSettingsRow(_ row: XCUIElement, in app: XCUIApplication) {
+        let cell = app.cells.containing(.button, identifier: row.identifier).element
+        for _ in 0..<5 where !row.hasFocus && !cell.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        XCTAssertTrue(
+            row.hasFocus || cell.hasFocus,
+            "Expected focus to reach settings row \(row.identifier)"
+        )
     }
 }
