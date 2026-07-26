@@ -599,7 +599,13 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                     nextMinute = nextMinute.advanced(by: .seconds(60))
                 } while nextMinute <= clock.now
             }
-            try await clock.sleep(for: .seconds(1))
+            // Sampling is not free and is not neutral. Every heartbeat walks the
+            // app's accessibility tree on its main thread, which is the thread
+            // the display-link callback runs on, so a one-second cadence held
+            // the measured presentation rate roughly a quarter below what the
+            // app achieves unobserved. Ten seconds still proves liveness between
+            // the per-minute assertions without deciding the result.
+            try await clock.sleep(for: .seconds(10))
         }
 
         let final = try await activeHeartbeat(
@@ -836,7 +842,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                     return snapshot
                 }
             }
-            try await clock.sleep(for: .milliseconds(250))
+            try await clock.sleep(for: .milliseconds(500))
         }
         if let lastSnapshot {
             try attach(lastSnapshot, name: "playback-metrics-timeout.json")
@@ -855,7 +861,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     ) async throws -> AcceptanceMetricsSnapshot {
         try assertActiveControls(in: app)
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(4))
+        let deadline = clock.now.advanced(by: .seconds(6))
         while clock.now < deadline {
             if let candidate = try? snapshot(from: metricsElement),
                candidate.elapsedSeconds > previousElapsed {
@@ -864,7 +870,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 XCTAssertGreaterThan(candidate.residentMemoryBytes, 0)
                 return candidate
             }
-            try await clock.sleep(for: .milliseconds(250))
+            try await clock.sleep(for: .milliseconds(500))
         }
         throw AcceptanceFailure.metricsDidNotAdvance
     }
@@ -1522,6 +1528,10 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let audioRecoveryCount: UInt64
     let renderTickCount: UInt64
     let renderSkippedInFlightCount: UInt64
+    let displayLinkCallbackCount: UInt64
+    let nativeDisplayIntervalMilliseconds: Double
+    let missedDisplayLinkVSyncCount: UInt64
+    let displayRefreshHz: Double
     let demuxQueueFullWaitSeconds: Double
     let demuxAdmitWaitSeconds: Double
     let playbackExecutorBusySeconds: Double

@@ -9,241 +9,185 @@ struct YADIFKernelUniforms {
     uint outputIndex;
     uint topFieldFirst;
     uint spatialOnly;
-    uint componentCount;
 };
 
-inline int sampleCode(
+// The component count is a compile-time property of the entry point rather than
+// a uniform. Indexing a vector with a runtime value cannot stay in registers, so
+// the compiler spills the whole texel to scratch memory and reads one lane back
+// — once per sample, and a synthesized pixel takes two dozen samples.
+template <typename Codes> struct PlaneCodec;
+
+template <> struct PlaneCodec<int> {
+    static inline int decode(float4 texel, bool tenBit) {
+        float value = clamp(texel.x, 0.0f, 1.0f);
+        return tenBit
+            ? (int(round(value * 65535.0f)) >> 6)
+            : int(round(value * 255.0f));
+    }
+
+    static inline float4 encode(int codes, bool tenBit) {
+        float value = tenBit
+            ? float(codes << 6) / 65535.0f
+            : float(codes) / 255.0f;
+        return float4(value, 0.0f, 0.0f, 1.0f);
+    }
+};
+
+template <> struct PlaneCodec<int2> {
+    static inline int2 decode(float4 texel, bool tenBit) {
+        float2 value = clamp(texel.xy, 0.0f, 1.0f);
+        return tenBit
+            ? (int2(round(value * 65535.0f)) >> 6)
+            : int2(round(value * 255.0f));
+    }
+
+    static inline float4 encode(int2 codes, bool tenBit) {
+        float2 value = tenBit
+            ? float2(codes << 6) / 65535.0f
+            : float2(codes) / 255.0f;
+        return float4(value.x, value.y, 0.0f, 1.0f);
+    }
+};
+
+template <typename Codes, bool TenBit>
+inline Codes sampleCodes(
     texture2d<float, access::read> image,
     int x,
-    int y,
-    uint component,
-    bool tenBit
+    int y
 ) {
     int boundedX = clamp(x, 0, int(image.get_width()) - 1);
     int boundedY = clamp(y, 0, int(image.get_height()) - 1);
-    float value = clamp(image.read(uint2(boundedX, boundedY))[component], 0.0f, 1.0f);
-    if (tenBit) {
-        return int(round(value * 65535.0f)) >> 6;
-    }
-    return int(round(value * 255.0f));
+    return PlaneCodec<Codes>::decode(
+        image.read(uint2(uint(boundedX), uint(boundedY))),
+        TenBit
+    );
 }
 
-struct SpatialSearchState {
-    int score;
-    int prediction;
+// The spatial search only ever touches seven taps of the row above the missing
+// line and seven of the row below it, but it revisits them along five candidate
+// directions. Staging the fourteen in registers turns forty texture reads into
+// fourteen without changing a single comparison.
+template <typename Codes>
+struct FieldWindow {
+    Codes above[7];
+    Codes below[7];
 };
 
-inline int directionalScore(
-    texture2d<float, access::read> current,
-    int x,
-    int aboveY,
-    int belowY,
-    int direction,
-    uint component,
-    bool tenBit
-) {
-    int score = 0;
-    for (int offset = -1; offset <= 1; ++offset) {
-        score += abs(
-            sampleCode(
-                current,
-                x + offset + direction,
-                aboveY,
-                component,
-                tenBit
-            )
-            - sampleCode(
-                current,
-                x + offset - direction,
-                belowY,
-                component,
-                tenBit
-            )
-        );
-    }
-    return score;
+template <typename Codes, int Direction>
+inline Codes directionalScore(thread const FieldWindow<Codes> &window) {
+    return abs(window.above[2 + Direction] - window.below[2 - Direction])
+        + abs(window.above[3 + Direction] - window.below[3 - Direction])
+        + abs(window.above[4 + Direction] - window.below[4 - Direction]);
 }
 
-inline SpatialSearchState refineDirectionPair(
-    texture2d<float, access::read> current,
-    int x,
-    int aboveY,
-    int belowY,
-    int sign,
-    uint component,
-    bool tenBit,
-    SpatialSearchState state
-) {
-    int nearDirection = sign;
-    int nearScore = directionalScore(
-        current, x, aboveY, belowY, nearDirection, component, tenBit
-    );
-    if (nearScore >= state.score) {
-        return state;
-    }
-    state.score = nearScore;
-    state.prediction = (
-        sampleCode(current, x + nearDirection, aboveY, component, tenBit)
-        + sampleCode(current, x - nearDirection, belowY, component, tenBit)
-    ) >> 1;
-
-    int farDirection = sign * 2;
-    int farScore = directionalScore(
-        current, x, aboveY, belowY, farDirection, component, tenBit
-    );
-    if (farScore < state.score) {
-        state.score = farScore;
-        state.prediction = (
-            sampleCode(current, x + farDirection, aboveY, component, tenBit)
-            + sampleCode(current, x - farDirection, belowY, component, tenBit)
-        ) >> 1;
-    }
-    return state;
+template <typename Codes, int Direction>
+inline Codes directionalPrediction(thread const FieldWindow<Codes> &window) {
+    return (window.above[3 + Direction] + window.below[3 - Direction]) >> 1;
 }
 
-inline int spatialPrediction(
-    texture2d<float, access::read> current,
-    int x,
-    int aboveY,
-    int belowY,
-    uint component,
-    bool tenBit
+// The scalar original returns early when the near direction does not improve on
+// the running score, which also skips the far direction. Two components cannot
+// share one branch, so the far candidate is scored unconditionally and masked
+// out with a sentinel that no real score can beat.
+template <typename Codes, int Sign>
+inline void refineDirectionPair(
+    thread const FieldWindow<Codes> &window,
+    thread Codes &score,
+    thread Codes &prediction
 ) {
-    int prediction = (
-        sampleCode(current, x, aboveY, component, tenBit)
-        + sampleCode(current, x, belowY, component, tenBit)
-    ) >> 1;
-    int width = int(current.get_width());
-    if (x < 3 || x + 3 >= width) {
+    Codes nearScore = directionalScore<Codes, Sign>(window);
+    Codes nearPrediction = directionalPrediction<Codes, Sign>(window);
+    Codes farScore = directionalScore<Codes, Sign * 2>(window);
+    Codes farPrediction = directionalPrediction<Codes, Sign * 2>(window);
+
+    Codes bestScore = select(score, nearScore, nearScore < score);
+    Codes bestPrediction = select(prediction, nearPrediction, nearScore < score);
+    Codes maskedFarScore = select(Codes(0x7fffffff), farScore, nearScore < score);
+
+    score = select(bestScore, farScore, maskedFarScore < bestScore);
+    prediction = select(bestPrediction, farPrediction, maskedFarScore < bestScore);
+}
+
+template <typename Codes>
+inline Codes spatialPrediction(
+    thread const FieldWindow<Codes> &window,
+    bool interior
+) {
+    Codes prediction = (window.above[3] + window.below[3]) >> 1;
+    if (!interior) {
         return prediction;
     }
-
-    int defaultScore = -1;
-    for (int offset = -1; offset <= 1; ++offset) {
-        defaultScore += abs(
-            sampleCode(current, x + offset, aboveY, component, tenBit)
-            - sampleCode(current, x + offset, belowY, component, tenBit)
-        );
-    }
-    SpatialSearchState state = {defaultScore, prediction};
-    state = refineDirectionPair(
-        current, x, aboveY, belowY, -1, component, tenBit, state
-    );
-    state = refineDirectionPair(
-        current, x, aboveY, belowY, 1, component, tenBit, state
-    );
-    return state.prediction;
+    Codes score = abs(window.above[2] - window.below[2])
+        + abs(window.above[3] - window.below[3])
+        + abs(window.above[4] - window.below[4])
+        - Codes(1);
+    refineDirectionPair<Codes, -1>(window, score, prediction);
+    refineDirectionPair<Codes, 1>(window, score, prediction);
+    return prediction;
 }
 
-inline int synthesize(
+template <typename Codes, bool TenBit>
+inline Codes synthesize(
     texture2d<float, access::read> previous,
     texture2d<float, access::read> current,
     texture2d<float, access::read> next,
+    thread const FieldWindow<Codes> &window,
     int x,
     int y,
-    uint component,
-    bool tenBit,
+    int aboveY,
+    int belowY,
+    int width,
+    int height,
     constant YADIFKernelUniforms &uniforms
 ) {
-    int height = int(current.get_height());
-    int aboveY = y == 0 ? 1 : y - 1;
-    int belowY = y + 1 == height ? height - 2 : y + 1;
-    int prediction = spatialPrediction(
-        current,
-        x,
-        aboveY,
-        belowY,
-        component,
-        tenBit
+    Codes prediction = spatialPrediction<Codes>(
+        window,
+        x >= 3 && x + 3 < width
     );
     if (uniforms.spatialOnly != 0) {
         return prediction;
     }
 
     bool firstOutput = uniforms.outputIndex == 0;
-    int temporalBefore = sampleCode(
-        firstOutput ? previous : current,
-        x,
-        y,
-        component,
-        tenBit
-    );
-    int temporalAfter = sampleCode(
-        firstOutput ? current : next,
-        x,
-        y,
-        component,
-        tenBit
-    );
-    int center = (temporalBefore + temporalAfter) >> 1;
-    int centerDifference = abs(temporalBefore - temporalAfter) >> 1;
-    int previousDifference = (
-        abs(
-            sampleCode(previous, x, aboveY, component, tenBit)
-            - sampleCode(current, x, aboveY, component, tenBit)
-        )
-        + abs(
-            sampleCode(previous, x, belowY, component, tenBit)
-            - sampleCode(current, x, belowY, component, tenBit)
-        )
+    texture2d<float, access::read> before = firstOutput ? previous : current;
+    texture2d<float, access::read> after = firstOutput ? current : next;
+
+    Codes temporalBefore = sampleCodes<Codes, TenBit>(before, x, y);
+    Codes temporalAfter = sampleCodes<Codes, TenBit>(after, x, y);
+    Codes center = (temporalBefore + temporalAfter) >> 1;
+    Codes centerDifference = abs(temporalBefore - temporalAfter) >> 1;
+
+    Codes currentAbove = window.above[3];
+    Codes currentBelow = window.below[3];
+    Codes previousDifference = (
+        abs(sampleCodes<Codes, TenBit>(previous, x, aboveY) - currentAbove)
+        + abs(sampleCodes<Codes, TenBit>(previous, x, belowY) - currentBelow)
     ) >> 1;
-    int nextDifference = (
-        abs(
-            sampleCode(next, x, aboveY, component, tenBit)
-            - sampleCode(current, x, aboveY, component, tenBit)
-        )
-        + abs(
-            sampleCode(next, x, belowY, component, tenBit)
-            - sampleCode(current, x, belowY, component, tenBit)
-        )
+    Codes nextDifference = (
+        abs(sampleCodes<Codes, TenBit>(next, x, aboveY) - currentAbove)
+        + abs(sampleCodes<Codes, TenBit>(next, x, belowY) - currentBelow)
     ) >> 1;
-    int bound = max(centerDifference, max(previousDifference, nextDifference));
+    Codes bound = max(centerDifference, max(previousDifference, nextDifference));
 
     if (y != 1 && y + 2 != height) {
         int farAboveY = y + 2 * (aboveY - y);
         int farBelowY = y + 2 * (belowY - y);
-        int farAbove = (
-            sampleCode(
-                firstOutput ? previous : current,
-                x,
-                farAboveY,
-                component,
-                tenBit
-            )
-            + sampleCode(
-                firstOutput ? current : next,
-                x,
-                farAboveY,
-                component,
-                tenBit
-            )
+        Codes farAbove = (
+            sampleCodes<Codes, TenBit>(before, x, farAboveY)
+            + sampleCodes<Codes, TenBit>(after, x, farAboveY)
         ) >> 1;
-        int farBelow = (
-            sampleCode(
-                firstOutput ? previous : current,
-                x,
-                farBelowY,
-                component,
-                tenBit
-            )
-            + sampleCode(
-                firstOutput ? current : next,
-                x,
-                farBelowY,
-                component,
-                tenBit
-            )
+        Codes farBelow = (
+            sampleCodes<Codes, TenBit>(before, x, farBelowY)
+            + sampleCodes<Codes, TenBit>(after, x, farBelowY)
         ) >> 1;
-        int currentAbove = sampleCode(current, x, aboveY, component, tenBit);
-        int currentBelow = sampleCode(current, x, belowY, component, tenBit);
-        int upper = max(
+        Codes upper = max(
             center - currentBelow,
             max(
                 center - currentAbove,
                 min(farAbove - currentAbove, farBelow - currentBelow)
             )
         );
-        int lower = min(
+        Codes lower = min(
             center - currentBelow,
             min(
                 center - currentAbove,
@@ -255,40 +199,80 @@ inline int synthesize(
     return clamp(prediction, center - bound, center + bound);
 }
 
+// One thread owns one row pair: the line copied straight from the current
+// picture and the line synthesized between its neighbours. Dispatching over the
+// full output instead made half the threads do a texture copy and the other half
+// the whole filter, for twice the threads and no extra work done.
+template <typename Codes, bool TenBit>
 inline void runYADIF(
     texture2d<float, access::read> previous,
     texture2d<float, access::read> current,
     texture2d<float, access::read> next,
     texture2d<float, access::write> output,
     constant YADIFKernelUniforms &uniforms,
-    uint2 position,
-    bool tenBit
+    uint2 position
 ) {
-    if (position.x >= output.get_width() || position.y >= output.get_height()) {
+    int width = int(output.get_width());
+    int height = int(output.get_height());
+    int x = int(position.x);
+    if (x >= width) {
         return;
     }
-    uint firstParity = uniforms.topFieldFirst != 0 ? 0 : 1;
-    uint copiedParity = uniforms.outputIndex == 0 ? firstParity : 1 - firstParity;
-    bool copyCurrent = (position.y & 1) == copiedParity;
-    float4 result = float4(0.0f, 0.0f, 0.0f, 1.0f);
-    for (uint component = 0; component < uniforms.componentCount; ++component) {
-        int code = copyCurrent
-            ? sampleCode(current, int(position.x), int(position.y), component, tenBit)
-            : synthesize(
-                previous,
-                current,
-                next,
-                int(position.x),
-                int(position.y),
-                component,
-                tenBit,
-                uniforms
-            );
-        result[component] = tenBit
-            ? float(code << 6) / 65535.0f
-            : float(code) / 255.0f;
+
+    int firstParity = uniforms.topFieldFirst != 0 ? 0 : 1;
+    int copiedParity = uniforms.outputIndex == 0 ? firstParity : 1 - firstParity;
+    int rowPair = int(position.y) * 2;
+    int copiedY = rowPair + copiedParity;
+    int synthesizedY = rowPair + 1 - copiedParity;
+
+    if (copiedY < height) {
+        output.write(
+            PlaneCodec<Codes>::encode(
+                sampleCodes<Codes, TenBit>(current, x, copiedY),
+                TenBit
+            ),
+            uint2(uint(x), uint(copiedY))
+        );
     }
-    output.write(result, position);
+    if (synthesizedY >= height) {
+        return;
+    }
+
+    int aboveY = synthesizedY == 0 ? 1 : synthesizedY - 1;
+    int belowY = synthesizedY + 1 == height ? height - 2 : synthesizedY + 1;
+    FieldWindow<Codes> window;
+    window.above[0] = sampleCodes<Codes, TenBit>(current, x - 3, aboveY);
+    window.above[1] = sampleCodes<Codes, TenBit>(current, x - 2, aboveY);
+    window.above[2] = sampleCodes<Codes, TenBit>(current, x - 1, aboveY);
+    window.above[3] = sampleCodes<Codes, TenBit>(current, x, aboveY);
+    window.above[4] = sampleCodes<Codes, TenBit>(current, x + 1, aboveY);
+    window.above[5] = sampleCodes<Codes, TenBit>(current, x + 2, aboveY);
+    window.above[6] = sampleCodes<Codes, TenBit>(current, x + 3, aboveY);
+    window.below[0] = sampleCodes<Codes, TenBit>(current, x - 3, belowY);
+    window.below[1] = sampleCodes<Codes, TenBit>(current, x - 2, belowY);
+    window.below[2] = sampleCodes<Codes, TenBit>(current, x - 1, belowY);
+    window.below[3] = sampleCodes<Codes, TenBit>(current, x, belowY);
+    window.below[4] = sampleCodes<Codes, TenBit>(current, x + 1, belowY);
+    window.below[5] = sampleCodes<Codes, TenBit>(current, x + 2, belowY);
+    window.below[6] = sampleCodes<Codes, TenBit>(current, x + 3, belowY);
+
+    Codes code = synthesize<Codes, TenBit>(
+        previous,
+        current,
+        next,
+        window,
+        x,
+        synthesizedY,
+        aboveY,
+        belowY,
+        width,
+        height,
+        uniforms
+    );
+    output.write(
+        PlaneCodec<Codes>::encode(code, TenBit),
+        uint2(uint(x), uint(synthesizedY))
+    );
 }
 
 kernel void yadifPlane8(
@@ -299,7 +283,7 @@ kernel void yadifPlane8(
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
     uint2 position [[thread_position_in_grid]]
 ) {
-    runYADIF(previous, current, next, output, uniforms, position, false);
+    runYADIF<int, false>(previous, current, next, output, uniforms, position);
 }
 
 kernel void yadifPlane16(
@@ -310,5 +294,27 @@ kernel void yadifPlane16(
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
     uint2 position [[thread_position_in_grid]]
 ) {
-    runYADIF(previous, current, next, output, uniforms, position, true);
+    runYADIF<int, true>(previous, current, next, output, uniforms, position);
+}
+
+kernel void yadifChroma8(
+    texture2d<float, access::read> previous [[texture(0)]],
+    texture2d<float, access::read> current [[texture(1)]],
+    texture2d<float, access::read> next [[texture(2)]],
+    texture2d<float, access::write> output [[texture(3)]],
+    constant YADIFKernelUniforms &uniforms [[buffer(0)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    runYADIF<int2, false>(previous, current, next, output, uniforms, position);
+}
+
+kernel void yadifChroma16(
+    texture2d<float, access::read> previous [[texture(0)]],
+    texture2d<float, access::read> current [[texture(1)]],
+    texture2d<float, access::read> next [[texture(2)]],
+    texture2d<float, access::write> output [[texture(3)]],
+    constant YADIFKernelUniforms &uniforms [[buffer(0)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    runYADIF<int2, true>(previous, current, next, output, uniforms, position);
 }

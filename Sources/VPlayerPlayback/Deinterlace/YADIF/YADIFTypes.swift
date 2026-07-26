@@ -294,7 +294,6 @@ private struct YADIFKernelUniforms {
     var outputIndex: UInt32
     var topFieldFirst: UInt32
     var spatialOnly: UInt32
-    var componentCount: UInt32
 }
 
 final class YADIFNV12Kernel: @unchecked Sendable {
@@ -302,8 +301,10 @@ final class YADIFNV12Kernel: @unchecked Sendable {
     private static let shaderBundle = Bundle(for: ShaderBundleToken.self)
 
     private let mapper: YADIFTextureMapper
-    private let pipeline8: any MTLComputePipelineState
-    private let pipeline16: any MTLComputePipelineState
+    private let lumaPipeline8: any MTLComputePipelineState
+    private let lumaPipeline16: any MTLComputePipelineState
+    private let chromaPipeline8: any MTLComputePipelineState
+    private let chromaPipeline16: any MTLComputePipelineState
     private let encoderFactory: YADIFEncoderFactory
 
     init(
@@ -311,6 +312,8 @@ final class YADIFNV12Kernel: @unchecked Sendable {
         textureMapper: YADIFTextureMapper? = nil,
         functionName: String = "yadifPlane8",
         p010FunctionName: String = "yadifPlane16",
+        chromaFunctionName: String = "yadifChroma8",
+        p010ChromaFunctionName: String = "yadifChroma16",
         libraryFactory: YADIFLibraryFactory? = nil,
         pipelineFactory: YADIFPipelineFactory? = nil,
         encoderFactory: YADIFEncoderFactory? = nil
@@ -347,9 +350,16 @@ final class YADIFNV12Kernel: @unchecked Sendable {
                 throw .pipelineCreationFailed
             }
         }
-        pipeline8 = try makePipeline(named: functionName)
-        pipeline16 = try makePipeline(named: p010FunctionName)
-        self.encoderFactory = encoderFactory ?? { $0.makeComputeCommandEncoder() }
+        lumaPipeline8 = try makePipeline(named: functionName)
+        lumaPipeline16 = try makePipeline(named: p010FunctionName)
+        chromaPipeline8 = try makePipeline(named: chromaFunctionName)
+        chromaPipeline16 = try makePipeline(named: p010ChromaFunctionName)
+        // The four dispatches write four disjoint planes and share only
+        // read-only inputs, so serialising them buys nothing and costs a drain
+        // to one thread at the tail of each.
+        self.encoderFactory = encoderFactory ?? {
+            $0.makeComputeCommandEncoder(dispatchType: .concurrent)
+        }
     }
 
     func encode(
@@ -369,14 +379,14 @@ final class YADIFNV12Kernel: @unchecked Sendable {
         guard descriptions.dropFirst().allSatisfy({ $0 == descriptions[0] }) else {
             throw .invalidDimensions
         }
-        let pipeline: any MTLComputePipelineState
+        let planePipelines: (luma: any MTLComputePipelineState, chroma: any MTLComputePipelineState)
         switch descriptions[0].pixelFormat {
         case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            pipeline = pipeline8
+            planePipelines = (lumaPipeline8, chromaPipeline8)
         case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
-            pipeline = pipeline16
+            planePipelines = (lumaPipeline16, chromaPipeline16)
         default:
             throw .unsupportedPixelFormat(descriptions[0].pixelFormat)
         }
@@ -388,37 +398,40 @@ final class YADIFNV12Kernel: @unchecked Sendable {
         guard let encoder = encoderFactory(commandBuffer) else {
             throw .commandEncoderAllocationFailed
         }
-        encoder.setComputePipelineState(pipeline)
 
         for outputIndex in 0..<2 {
             let output = mappings[3 + outputIndex]
             for plane in 0..<2 {
+                let pipeline = plane == 0 ? planePipelines.luma : planePipelines.chroma
                 let previous = plane == 0 ? mappings[0].luma : mappings[0].chroma
                 let current = plane == 0 ? mappings[1].luma : mappings[1].chroma
                 let next = plane == 0 ? mappings[2].luma : mappings[2].chroma
                 let destination = plane == 0 ? output.luma : output.chroma
+                encoder.setComputePipelineState(pipeline)
                 encoder.setTexture(previous, index: 0)
                 encoder.setTexture(current, index: 1)
                 encoder.setTexture(next, index: 2)
                 encoder.setTexture(destination, index: 3)
+                // One thread per row pair. An odd plane height leaves a single
+                // trailing row, which the last pair covers and the kernel bounds.
+                let rowPairCount = (destination.height + 1) / 2
+                let threadWidth = max(1, min(destination.width, pipeline.threadExecutionWidth))
+                let threadHeight = max(
+                    1,
+                    min(rowPairCount, pipeline.maxTotalThreadsPerThreadgroup / threadWidth)
+                )
                 var uniforms = YADIFKernelUniforms(
                     outputIndex: UInt32(outputIndex),
                     topFieldFirst: job.order.parity == .top ? 1 : 0,
-                    spatialOnly: job.spatialOnly ? 1 : 0,
-                    componentCount: plane == 0 ? 1 : 2
+                    spatialOnly: job.spatialOnly ? 1 : 0
                 )
                 encoder.setBytes(
                     &uniforms,
                     length: MemoryLayout<YADIFKernelUniforms>.stride,
                     index: 0
                 )
-                let threadWidth = max(1, min(destination.width, pipeline.threadExecutionWidth))
-                let threadHeight = max(
-                    1,
-                    min(destination.height, pipeline.maxTotalThreadsPerThreadgroup / threadWidth)
-                )
                 encoder.dispatchThreads(
-                    MTLSize(width: destination.width, height: destination.height, depth: 1),
+                    MTLSize(width: destination.width, height: rowPairCount, depth: 1),
                     threadsPerThreadgroup: MTLSize(
                         width: threadWidth,
                         height: threadHeight,

@@ -146,6 +146,22 @@ public final class MetalDisplayLinkDriver: NSObject {
         (renderer as? VideoPresentationTimingResetting)?.resetPresentationTiming()
     }
 
+    /// Left to itself CAMetalDisplayLink picks a rate from how the layer has
+    /// been presenting, and for field-rate video that settles well under the
+    /// panel: every callback it withholds is a field that has to be discarded,
+    /// because two of them then come due on the following one. Pinning the range
+    /// to the panel is the app stating the cadence it actually needs.
+    public func setPreferredFrameRate(framesPerSecond: Int) {
+        guard !isStopped, framesPerSecond > 0 else { return }
+        let rate = Float(framesPerSecond)
+        displayLink.preferredFrameRateRange = CAFrameRateRange(
+            minimum: rate,
+            maximum: rate,
+            preferred: rate
+        )
+        renderer.recordDisplayRefreshRate(framesPerSecond: Double(framesPerSecond))
+    }
+
     func render(
         targetPresentationTimestamp: CFTimeInterval,
         drawable: any CAMetalDrawable
@@ -173,6 +189,12 @@ extension MetalDisplayLinkDriver: @MainActor CAMetalDisplayLinkDelegate {
         needsUpdate update: CAMetalDisplayLink.Update
     ) {
         guard link === displayLink else { return }
+        // Counted before every guard below: a callback the driver discards is
+        // still a callback CoreAnimation delivered, and conflating the two hides
+        // which side is losing the vsync.
+        renderer.recordDisplayLinkCallback(
+            targetPresentationTimestamp: update.targetPresentationTimestamp
+        )
         render(
             targetPresentationTimestamp: update.targetPresentationTimestamp,
             drawable: update.drawable

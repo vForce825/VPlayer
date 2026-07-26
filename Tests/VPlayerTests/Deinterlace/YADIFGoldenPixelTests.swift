@@ -470,6 +470,12 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertEqual(processor.components(separatedBy: ".commit()").count - 1, 1)
         XCTAssertTrue(metal.contains("kernel void yadifPlane8"))
         XCTAssertTrue(metal.contains("kernel void yadifPlane16"))
+        XCTAssertTrue(metal.contains("kernel void yadifChroma8"))
+        XCTAssertTrue(metal.contains("kernel void yadifChroma16"))
+        // A per-sample component index taken from a uniform cannot live in a
+        // register, so every one of the two dozen samples a synthesized pixel
+        // takes would round-trip through scratch memory.
+        XCTAssertFalse(metal.contains("componentCount"))
         XCTAssertFalse(metal.lowercased().contains("placeholder"))
     }
 
