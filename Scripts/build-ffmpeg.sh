@@ -144,7 +144,20 @@ fi
 [[ "$(git -C "$source" remote get-url origin)" == "$source_url" ]] || fail "existing source origin differs from lock"
 # The official server does not permit fetching the unadvertised commit by SHA.
 # Fetch the advertised annotated tag, then prove that it peels to the lock.
-git -C "$source" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
+#
+# A checkout that already contains the locked commit does not need the server at
+# all: every check below reads the local object graph, and the lock is what
+# decides whether the source is the right source. git.ffmpeg.org is regularly
+# unreachable for pack negotiation even where plain HTTPS to it succeeds, and a
+# reproducible build should not be hostage to that. A checkout that does *not*
+# already have the commit still has to fetch, and still fails if it cannot.
+if git -C "$source" rev-parse --verify --quiet "$commit^{commit}" >/dev/null &&
+   [[ "$(git -C "$source" rev-parse --verify --quiet "refs/tags/$tag^{}" || true)" == "$commit" ]]; then
+  git -C "$source" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null ||
+    echo "build-ffmpeg: origin unreachable; using the locked commit already present" >&2
+else
+  git -C "$source" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
+fi
 [[ "$(git -C "$source" rev-parse "refs/tags/$tag^{}")" == "$commit" ]] || fail "$tag does not peel to the locked commit"
 git -C "$source" checkout --detach "$commit"
 [[ "$(git -C "$source" rev-parse HEAD)" == "$commit" ]] || fail "source checkout differs from lock"
