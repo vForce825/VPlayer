@@ -154,8 +154,16 @@ public struct PlaybackTuning: Sendable, Equatable {
     /// the presentation frames not yet released. Left at the default the pool
     /// ages buffers out and reallocates them under load, and an IOSurface
     /// allocation is far too expensive to repeat per frame.
+    ///
+    /// This is also the decode session's blocking threshold, not just a hint:
+    /// `VTDecompressionSessionDecodeFrame` waits when the pool is empty. Counted
+    /// exactly, the pipeline holds around twenty at once — YADIF's window and
+    /// its pending queue reference three consecutive frames each — so the
+    /// previous `+ 16` sat on the boundary, and every transient above it stalled
+    /// submission for a whole decode. The margin is what stops a queue depth
+    /// from becoming a stall.
     public var decoderOutputPoolFloor: Int {
-        deinterlaceBufferFrames + 16
+        deinterlaceBufferFrames + 32
     }
 
     /// Undecoded access units allowed to queue ahead of the decoder before the
