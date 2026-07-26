@@ -10,7 +10,8 @@ struct ChannelBrowserView: View {
     @Bindable var browsingSettings: ChannelBrowsingSettingsStore
     @State private var mappingChannel: Channel?
     @State private var searchText = ""
-    @FocusState private var focusedChannelID: String?
+    @State private var pendingGroupFocusID: String?
+    @FocusState private var focusedElement: ChannelBrowserFocus?
     private let focusPolicy = AcceptanceFocusPolicy.current()
 
     /// Tiles fill the whole canvas: adaptive sizing yields five logo-led
@@ -45,7 +46,7 @@ struct ChannelBrowserView: View {
                 // lands on content rather than the search keyboard.
                 channelGrid
                     .searchable(text: $searchText, prompt: "搜索频道")
-                    .defaultFocus($focusedChannelID, defaultFocusChannelID)
+                    .defaultFocus($focusedElement, defaultFocusElement)
             }
         }
         .sheet(item: $mappingChannel) { channel in
@@ -53,11 +54,11 @@ struct ChannelBrowserView: View {
         }
     }
 
-    private var defaultFocusChannelID: String? {
+    private var defaultFocusElement: ChannelBrowserFocus? {
         guard !focusPolicy.isEnabled || focusPolicy.focusesFirstChannel else {
             return nil
         }
-        return filteredChannels.first?.id
+        return filteredChannels.first.map { .channel($0.id) }
     }
 
     private var contentState: ChannelBrowserContentState {
@@ -78,35 +79,31 @@ struct ChannelBrowserView: View {
     }
 
     private var sectionedChannelGrid: some View {
-        // The rail is a pinned header rather than a sibling above the scroll
-        // view: the search field swallows any focus move out of the top of the
-        // content, so a rail outside the scroll view is unreachable by remote.
-        // Pinned, it both stays on screen and sits in the focus path.
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    Section {
-                        if let staleCoverageEnd = model.staleEPGCoverageEnd {
-                            staleEPGBanner(coverageEnd: staleCoverageEnd)
-                                .padding(.top, 16)
-                        }
-                        LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
-                            ForEach(sections) { section in
-                                Section {
-                                    ForEach(section.channels) { channel in
-                                        channelCard(for: channel)
-                                    }
-                                } header: {
-                                    sectionHeader(for: section)
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    // The group rail is ordinary scroll content: it is visible
+                    // at the top of the browser and leaves the screen with the
+                    // channel rows instead of occupying a permanent viewport.
+                    if showsGroupRail {
+                        groupRail(proxy: proxy)
+                    }
+                    if let staleCoverageEnd = model.staleEPGCoverageEnd {
+                        staleEPGBanner(coverageEnd: staleCoverageEnd)
+                            .padding(.top, 16)
+                    }
+                    LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
+                        ForEach(sections) { section in
+                            Section {
+                                ForEach(section.channels) { channel in
+                                    channelCard(for: channel)
                                 }
+                            } header: {
+                                sectionHeader(for: section)
                             }
                         }
-                        .padding(.vertical, 24)
-                    } header: {
-                        if showsGroupRail {
-                            groupRail(proxy: proxy)
-                        }
                     }
+                    .padding(.vertical, 24)
                 }
             }
             .scrollClipDisabled()
@@ -122,18 +119,28 @@ struct ChannelBrowserView: View {
             HStack(spacing: 16) {
                 ForEach(sections) { section in
                     Button(section.title ?? "") {
-                        proxy.scrollTo(section.id, anchor: .top)
-                        focusedChannelID = section.channels.first?.id
+                        guard let channelID = section.channels.first?.id else { return }
+                        pendingGroupFocusID = channelID
+                        focusedElement = nil
+                        proxy.scrollTo(sectionScrollID(for: section), anchor: .top)
+                        // A distant lazy section is realized by `scrollTo` on
+                        // the following layout pass. Move focus after that pass
+                        // and ignore stale jumps if another chip is selected.
+                        Task { @MainActor in
+                            await Task.yield()
+                            guard pendingGroupFocusID == channelID else { return }
+                            focusedElement = .channel(channelID)
+                            pendingGroupFocusID = nil
+                        }
                     }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("channel.group.\(section.id)")
+                    .focused($focusedElement, equals: .group(section.id))
                 }
             }
             .padding(.vertical, 12)
             .padding(.horizontal, 4)
         }
-        // Opaque enough that pinned chips never blur into the tiles scrolling
-        // underneath them.
         .background(.regularMaterial)
         .scrollClipDisabled()
         // One focus section keeps the rail a single up/down stop rather than a
@@ -156,7 +163,7 @@ struct ChannelBrowserView: View {
         }
         .buttonStyle(.card)
         .accessibilityIdentifier(channelIdentifier(channel))
-        .focused($focusedChannelID, equals: channel.id)
+        .focused($focusedElement, equals: .channel(channel.id))
         .contextMenu {
             Button("设置 EPG") {
                 mappingChannel = channel
@@ -198,8 +205,12 @@ struct ChannelBrowserView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 16)
-            .id(section.id)
+            .id(sectionScrollID(for: section))
         }
+    }
+
+    private func sectionScrollID(for section: ChannelSection) -> String {
+        "channel.section.\(section.id)"
     }
 
     private var sections: [ChannelSection] {
@@ -224,6 +235,11 @@ struct ChannelBrowserView: View {
     private func channelIdentifier(_ channel: Channel) -> String {
         channel.attributes["ui-test-id"] ?? "channel.\(channel.id)"
     }
+}
+
+private enum ChannelBrowserFocus: Hashable {
+    case channel(String)
+    case group(String)
 }
 
 enum ChannelBrowserContentState: Equatable {

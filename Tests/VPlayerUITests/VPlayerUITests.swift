@@ -70,6 +70,10 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(
             app.buttons["channel.grouped"].wait(for: \.hasFocus, toEqual: true, timeout: 2)
         )
+        XCTAssertFalse(
+            app.buttons["channel.group.测试分组"].isHittable,
+            "Expected the group rail to scroll off screen with the channel grid"
+        )
 
         // Channels whose playlist entry carries no group-title collect under
         // 其他 and stay reachable like any other group.
@@ -117,8 +121,8 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(app.buttons["channel.ungrouped"].exists)
     }
 
-    /// Moves focus up into the pinned rail and along it until `name` is focused,
-    /// then selects it.
+    /// Moves focus back up to the scrolling rail and along it until `name` is
+    /// focused, then selects it.
     @MainActor
     private func jumpToGroup(named name: String, in app: XCUIApplication) {
         let chip = app.buttons["channel.group.\(name)"]
@@ -135,8 +139,9 @@ final class VPlayerUITests: XCTestCase {
 
     @MainActor
     private func railHasFocus(in app: XCUIApplication) -> Bool {
-        app.buttons.allElementsBoundByIndex.contains {
-            $0.identifier.hasPrefix("channel.group.") && $0.hasFocus
+        ["测试分组", "第二分组", "其他"].contains { group in
+            let button = app.buttons["channel.group.\(group)"]
+            return button.exists && button.hasFocus
         }
     }
 
