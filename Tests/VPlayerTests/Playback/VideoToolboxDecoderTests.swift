@@ -16,7 +16,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         try configure(harness, generation: 3)
 
         let snapshot = harness.api.snapshot
-        XCTAssertEqual(snapshot.operations, ["create", "copy", "set", "set", "copy"])
+        XCTAssertEqual(snapshot.operations, ["create", "copy", "set", "set", "set", "copy"])
         XCTAssertEqual(snapshot.creates.count, 1)
         XCTAssertEqual(snapshot.creates.first?.decoderSpecification, [
             kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
@@ -33,6 +33,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
                 sessionID: VTSessionID(rawValue: 1),
                 key: kVTDecompressionPropertyKey_FieldMode as String,
                 value: .string(kVTDecompressionProperty_FieldMode_BothFields as String)
+            ),
+            // Interlaced H.264 has no hardware path on Apple silicon, so this
+            // decodes in software; a single thread cannot keep up with 1080i25.
+            FakeVideoToolboxAPI.PropertyRecord(
+                sessionID: VTSessionID(rawValue: 1),
+                key: kVTDecompressionPropertyKey_ThreadCount as String,
+                value: .unsigned32(UInt32(ProcessInfo.processInfo.activeProcessorCount))
             ),
             FakeVideoToolboxAPI.PropertyRecord(
                 sessionID: VTSessionID(rawValue: 1),
@@ -113,7 +120,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
 
         XCTAssertEqual(
             harness.api.snapshot.operations,
-            ["create", "copy", "set", "set", "copy"]
+            ["create", "copy", "set", "set", "set", "copy"]
         )
         try decode(harness, id: 7, generation: 3)
         XCTAssertEqual(harness.api.snapshot.decodes.count, 1)
@@ -147,7 +154,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
 
         XCTAssertEqual(
             harness.api.snapshot.operations,
-            ["create", "copy", "set", "set", "copy"]
+            ["create", "copy", "set", "set", "set", "copy"]
         )
         try decode(harness, id: 11, generation: 1)
         XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))

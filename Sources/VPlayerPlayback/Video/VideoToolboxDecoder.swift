@@ -342,6 +342,21 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             throw VideoDecoderFailure.sessionCreate(fieldModeStatus)
         }
 
+        // Interlaced H.264 has no hardware path on Apple silicon, so this
+        // stream decodes in software — measured at 54 ms a frame against a
+        // 40 ms budget at 25 fps, with the output callback landing exactly when
+        // the submitting call returns, which is what a synchronous decode looks
+        // like. The software decoder is single-threaded unless asked otherwise.
+        let threadCountStatus = api.setProperty(
+            candidate,
+            key: kVTDecompressionPropertyKey_ThreadCount as String,
+            value: .unsigned32(UInt32(max(1, ProcessInfo.processInfo.activeProcessorCount)))
+        )
+        guard threadCountStatus == noErr || threadCountStatus == kVTPropertyNotSupportedErr else {
+            api.invalidate(candidate)
+            throw VideoDecoderFailure.sessionCreate(threadCountStatus)
+        }
+
         // Set last, so a decoder that rejects it cannot mask a field-mode
         // failure that says something far more useful. The default pool ages
         // buffers out, and this pipeline legitimately holds a known number of
@@ -380,6 +395,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 pixelFormatChoice: selection.choice,
                 outputPoolFloor: poolStatus == noErr ? tuning.decoderOutputPoolFloor : nil,
                 fieldModeStatus: fieldModeStatus,
+                threadCountStatus: threadCountStatus,
                 hardwareStatus: hardware.status,
                 hardwareValue: hardware.value
             )
@@ -564,6 +580,17 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             frameOptions: nil
         ) { [weak self, outstandingOutputs] output in
             submissionLease.releaseOnce()
+            // Against the submission's own duration this says what the
+            // submission was waiting for. Equal means the decode ran to
+            // completion inside the call and the wall time is compute; much
+            // longer means the call blocked on something the decoder needed and
+            // the decode itself happened afterwards.
+            metrics?.recordDecodeCallbackLatency(
+                milliseconds: max(
+                    0,
+                    (ProcessInfo.processInfo.systemUptime - submissionStartedAt) * 1_000
+                )
+            )
             metrics?.recordDecoderCallback()
             signpostLifetime.finish()
             metrics?.recordDecoderOutputQueued(outstanding: outstandingOutputs.enter())
@@ -661,11 +688,17 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         pixelFormatChoice: String,
         outputPoolFloor: Int?,
         fieldModeStatus: OSStatus?,
+        threadCountStatus: OSStatus? = nil,
         hardwareStatus: OSStatus,
         hardwareValue: VTPropertyValue?
     ) -> String {
         let field = fieldModeStatus.map { $0 == noErr ? "applied" : "unsupported(\($0))" }
             ?? "n/a"
+        let threads = threadCountStatus.map {
+            $0 == noErr
+                ? "threads=\(max(1, ProcessInfo.processInfo.activeProcessorCount))"
+                : "threads=unsupported(\($0))"
+        } ?? "threads=n/a"
         let hardware: String
         if hardwareStatus == kVTPropertyNotSupportedErr {
             hardware = "unreported"
@@ -682,7 +715,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
         let pool = outputPoolFloor.map(String.init) ?? "unsupported"
         return "codec=\(codec) pixelFormat=\(pixelFormatChoice)"
-            + " pool=\(pool) fieldMode=\(field) hardware=\(hardware)"
+            + " pool=\(pool) fieldMode=\(field) \(threads) hardware=\(hardware)"
     }
 
     /// Four-character codes read far better than their decimal values in a

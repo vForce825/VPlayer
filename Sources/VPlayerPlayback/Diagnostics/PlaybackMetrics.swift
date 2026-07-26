@@ -144,6 +144,13 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // acceleration. Both are tolerated when unsupported, so without this a
     // session that silently fell back looks exactly like a healthy one.
     public let decoderSessionSummary: String?
+    // Submission start to the decoder's output callback for the same frame.
+    // Read against the submission's own duration: equal means the decode ran
+    // inside the call and the wall time is compute, much longer means the call
+    // blocked on something else and the decode followed.
+    public let decodeCallbackLatencyP95Milliseconds: Double
+    // Same distribution point as the latency above, so the two are comparable.
+    public let videoDecodeSubmissionP95Milliseconds: Double
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -193,6 +200,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         var decoderCallbackTimes: [TimeInterval] = []
         var presentationTimes: [TimeInterval] = []
         var gpuDurations: [TimedValue] = []
+        var decodeCallbackLatencies: [TimedValue] = []
+        var decodeSubmissions: [TimedValue] = []
         var avDrifts: [TimedValue] = []
         var yadifKernelDispatchCount: UInt64 = 0
         var staleGenerationDropCount: UInt64 = 0
@@ -441,7 +450,12 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func recordVideoDecodeSubmission(milliseconds: Double) {
         guard milliseconds.isFinite, milliseconds >= 0 else { return }
+        let timestamp = now()
         lock.withLock {
+            pruneIfNeeded(at: timestamp)
+            state.decodeSubmissions.append(
+                TimedValue(timestamp: timestamp, value: milliseconds)
+            )
             state.videoDecodeSubmissionCount &+= 1
             state.totalVideoDecodeSubmissionMilliseconds += milliseconds
             state.maximumVideoDecodeSubmissionMilliseconds = max(
@@ -524,6 +538,17 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock { state.avDriftGraceUntil = max(state.avDriftGraceUntil, graceUntil) }
     }
 
+    func recordDecodeCallbackLatency(milliseconds: Double) {
+        guard milliseconds.isFinite, milliseconds >= 0 else { return }
+        let timestamp = now()
+        lock.withLock {
+            pruneIfNeeded(at: timestamp)
+            state.decodeCallbackLatencies.append(
+                TimedValue(timestamp: timestamp, value: milliseconds)
+            )
+        }
+    }
+
     func recordGPUDuration(milliseconds: Double) {
         guard milliseconds.isFinite, milliseconds >= 0 else { return }
         let timestamp = now()
@@ -547,6 +572,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         let decoderCount = captured.decoderCallbackTimes.lazy.filter { $0 >= cutoff }.count
         let presentationCount = captured.presentationTimes.lazy.filter { $0 >= cutoff }.count
         let gpu = captured.gpuDurations.lazy.filter { $0.timestamp >= cutoff }.map(\.value)
+        let decodeLatency = captured.decodeCallbackLatencies
+            .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
+        let decodeSubmission = captured.decodeSubmissions
+            .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let drift = captured.avDrifts.lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let rateDivisor = windowSeconds > 0 ? windowSeconds : 1
         return PlaybackMetricsSnapshot(
@@ -607,7 +636,9 @@ final class PlaybackMetrics: @unchecked Sendable {
             maximumOutstandingDecoderOutputs: captured.maximumOutstandingDecoderOutputs,
             maximumDecodeSubmissionDepth: captured.maximumDecodeSubmissionDepth,
             maximumFramesBeingDecoded: captured.maximumFramesBeingDecoded,
-            decoderSessionSummary: captured.decoderSessionSummary
+            decoderSessionSummary: captured.decoderSessionSummary,
+            decodeCallbackLatencyP95Milliseconds: Self.percentile95(Array(decodeLatency)),
+            videoDecodeSubmissionP95Milliseconds: Self.percentile95(Array(decodeSubmission))
         )
     }
 
@@ -625,6 +656,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         state.decoderCallbackTimes.removeAll { $0 < cutoff }
         state.presentationTimes.removeAll { $0 < cutoff }
         state.gpuDurations.removeAll { $0.timestamp < cutoff }
+        state.decodeCallbackLatencies.removeAll { $0.timestamp < cutoff }
+        state.decodeSubmissions.removeAll { $0.timestamp < cutoff }
         state.avDrifts.removeAll { $0.timestamp < cutoff }
         state.lastPrunedAt = timestamp
     }

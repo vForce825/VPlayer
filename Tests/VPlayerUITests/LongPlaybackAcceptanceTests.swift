@@ -1540,6 +1540,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let maximumDecodeSubmissionDepth: Int
     let maximumFramesBeingDecoded: Int
     let decoderSessionSummary: String?
+    let decodeCallbackLatencyP95Milliseconds: Double
+    let videoDecodeSubmissionP95Milliseconds: Double
     let demuxPacketCount: UInt64
     let videoAccessUnitCount: UInt64
     let audioSampleCount: UInt64
