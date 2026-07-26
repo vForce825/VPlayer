@@ -64,6 +64,10 @@ enum PlaybackVideoMemoryBudget {
     static let retainedAnchorBytes = 256 * 1_024 * 1_024
     static let decoderPoolBytes = 256 * 1_024 * 1_024
     static let minimumDecoderPoolFrames = 8
+    // Leave a few surfaces for a frame arriving while the display link is
+    // selecting and submitting the one that is due. Treating every byte as
+    // usable runway makes the first transient allocation an overflow.
+    static let presentationQueueReserveFrames = 3
 
     static func estimated420SurfaceBytes(
         dimensions: CMVideoDimensions,
@@ -93,6 +97,28 @@ enum PlaybackVideoMemoryBudget {
         return max(minimum, byteBudget / estimatedFrameBytes)
     }
 
+    /// Duration the memory-bounded queue can safely hold for this format. The
+    /// playback clock must use the same effective horizon: if it deliberately
+    /// trails 4K50 by a full second while the queue can retain only ~0.4 s, the
+    /// queue discards most future frames and turns a healthy 50 fps decoder into
+    /// a slideshow.
+    static func presentationHorizon(
+        frameDuration: CMTime,
+        estimatedFrameBytes: Int
+    ) -> CMTime? {
+        guard frameDuration.isNumeric,
+              CMTimeCompare(frameDuration, .zero) > 0 else { return nil }
+        let capacity = maximumFrameCount(
+            byteBudget: presentationQueueBytes,
+            estimatedFrameBytes: estimatedFrameBytes
+        )
+        let usableFrames = max(1, capacity - presentationQueueReserveFrames)
+        return CMTimeMultiply(
+            frameDuration,
+            multiplier: Int32(clamping: usableFrames)
+        )
+    }
+
     private static func multiplied(_ lhs: Int, _ rhs: Int) -> Int? {
         let result = lhs.multipliedReportingOverflow(by: rhs)
         return result.overflow ? nil : result.partialValue
@@ -104,6 +130,13 @@ extension VideoPresentationFrame {
         PlaybackVideoMemoryBudget.estimated420SurfaceBytes(
             dimensions: formatMetadata.dimensions,
             bitDepth: formatMetadata.bitDepth
+        )
+    }
+
+    var memoryLimitedPresentationHorizon: CMTime? {
+        PlaybackVideoMemoryBudget.presentationHorizon(
+            frameDuration: duration,
+            estimatedFrameBytes: estimatedStorageBytes
         )
     }
 }

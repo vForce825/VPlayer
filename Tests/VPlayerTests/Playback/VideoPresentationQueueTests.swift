@@ -104,6 +104,13 @@ final class VideoPresentationQueueTests: XCTestCase {
             ),
             21
         )
+        let safeHorizon = try XCTUnwrap(
+            PlaybackVideoMemoryBudget.presentationHorizon(
+                frameDuration: rational(1, 50),
+                estimatedFrameBytes: estimatedFrameBytes
+            )
+        )
+        XCTAssertEqual(CMTimeGetSeconds(safeHorizon), 0.36, accuracy: 0.000_1)
         let queue = VideoPresentationQueue(
             generation: generation,
             horizon: rational(2, 1),

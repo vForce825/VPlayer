@@ -148,6 +148,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     static let deferredPacketCapacity = 32
     static let pendingTrackMediaCapacity = 96
+    // Compressed access units are tiny beside decoded 4K P010 surfaces. Holding
+    // several seconds here lets demux continue far enough to reach interleaved
+    // audio without checking out video surfaces the presentation queue cannot
+    // retain yet.
+    static let pendingVideoDecodeCapacity = 240
     // Must stay well inside `retainedVideoHorizon` so a closed-readiness startup
     // window cannot claim the whole presentation queue and starve the decoder
     // pool. Anchoring needs at most `requiredVideoFrameCount` (2 for field-rate
@@ -231,6 +236,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var pendingPacketAdmission: PendingPacketAdmission?
     private var pendingTrackVideo: [CompressedVideoAccessUnit] = []
     private var pendingTrackAudio: [CompressedAudioSample] = []
+    private var pendingVideoDecode: [CompressedVideoAccessUnit] = []
+    private var videoDecodeBufferHorizon: CMTime?
     private var retainedAudio: [CompressedAudioSample] = []
     private var retainedVideo: [VideoPresentationFrame] = []
     private var preparedAnchor: PreparedAnchor?
@@ -326,8 +333,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             self.tuning = tuning
             renderer.apply(tuning)
             videoCoordinator.applyTuning(tuning)
-            readiness?.setMaximumAnchorLag(tuning.maximumAnchorLag)
             boundRetainedVideoIsolated()
+            if let frame = retainedVideo.last {
+                videoDecodeBufferHorizon = effectiveVideoBufferHorizon(for: frame)
+            }
+            updateMaximumAnchorLagIsolated(for: retainedVideo.last)
+            drainPendingVideoDecodeIsolated()
         }
     }
 
@@ -731,6 +742,26 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func admitVideoAccessUnitIsolated(_ accessUnit: CompressedVideoAccessUnit) {
         assertIsolated()
         guard generationController.accepts(accessUnit.generation) else { return }
+        pendingVideoDecode.removeAll {
+            !generationController.accepts($0.generation)
+        }
+        drainPendingVideoDecodeIsolated()
+        guard pendingVideoDecode.isEmpty,
+              !shouldDeferVideoDecodeIsolated(accessUnit) else {
+            let capacity = max(
+                Self.pendingVideoDecodeCapacity,
+                tuning.videoBufferFrameCeiling
+            )
+            if pendingVideoDecode.count < capacity {
+                pendingVideoDecode.append(accessUnit)
+            } else if accessUnit.isRandomAccess {
+                pendingVideoDecode.removeAll(keepingCapacity: true)
+                pendingVideoDecode.append(accessUnit)
+            } else {
+                metrics?.recordVideoDrop(source: .decodeSubmissionBacklog)
+            }
+            return
+        }
         videoCoordinator.handle(accessUnit: accessUnit)
     }
 
@@ -745,8 +776,48 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         if retainedAudio.count > Self.retainedAudioCapacity {
             retainedAudio.removeFirst(retainedAudio.count - Self.retainedAudioCapacity)
         }
+        drainPendingVideoDecodeIsolated()
         boundRetainedVideoIsolated()
         updateReadinessIsolated()
+    }
+
+    private func shouldDeferVideoDecodeIsolated(
+        _ accessUnit: CompressedVideoAccessUnit
+    ) -> Bool {
+        assertIsolated()
+        guard let bufferHorizon = videoDecodeBufferHorizon,
+              let audioInterval = contiguousAudioInterval() else { return false }
+        let videoPTS = CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer)
+        let audioEnd = CMTimeAdd(audioInterval.first, audioInterval.duration)
+        guard videoPTS.isNumeric,
+              audioEnd.isNumeric,
+              bufferHorizon.isNumeric else { return false }
+        // Audio already carries the startup runway that keeps decoded video
+        // ahead of the playback clock, but system-compressed audio can retain
+        // several seconds while its renderer consumes from the middle of that
+        // window. During playback, cap video against the actual media clock as
+        // well as the audio edge so decoded P010 surfaces can never occupy more
+        // time than the presentation queue's memory-backed horizon.
+        var decodeLimit = audioEnd
+        if readiness?.isOpen == true {
+            let clockLimit = CMTimeAdd(clock.currentTime, bufferHorizon)
+            if clockLimit.isNumeric, CMTimeCompare(clockLimit, decodeLimit) < 0 {
+                decodeLimit = clockLimit
+            }
+        }
+        return CMTimeCompare(videoPTS, decodeLimit) > 0
+    }
+
+    private func drainPendingVideoDecodeIsolated() {
+        assertIsolated()
+        pendingVideoDecode.removeAll {
+            !generationController.accepts($0.generation)
+        }
+        while let accessUnit = pendingVideoDecode.first,
+              !shouldDeferVideoDecodeIsolated(accessUnit) {
+            pendingVideoDecode.removeFirst()
+            videoCoordinator.handle(accessUnit: accessUnit)
+        }
     }
 
     private func handle(decoder event: VideoDecoderEvent) {
@@ -766,6 +837,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         switch result {
         case let .success(frames):
             for frame in frames where generationController.accepts(frame.generation) {
+                videoDecodeBufferHorizon = effectiveVideoBufferHorizon(for: frame)
+                updateMaximumAnchorLagIsolated(for: frame)
                 if readiness?.isOpen == true {
                     renderer.enqueue(frame)
                 }
@@ -845,6 +918,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         trackEpochAlreadyAdvanced = false
         pendingTrackVideo.removeAll(keepingCapacity: true)
         pendingTrackAudio.removeAll(keepingCapacity: true)
+        pendingVideoDecode.removeAll(keepingCapacity: true)
+        videoDecodeBufferHorizon = nil
         readyPublished = false
         readiness?.close(.discontinuity)
         display.pauseSubmission()
@@ -906,6 +981,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         retainedAudio.removeAll(keepingCapacity: true)
         retainedVideo.removeAll(keepingCapacity: true)
         deferredPackets.removeAll(keepingCapacity: true)
+        pendingVideoDecode.removeAll(keepingCapacity: true)
+        videoDecodeBufferHorizon = nil
         renderer.flush(to: generation)
         audio.flush(to: generation)
         display.pauseSubmission()
@@ -1001,36 +1078,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         metrics?.recordVideoResync()
     }
 
-    // The mirror of the case above, and the one that only appears once ingest
-    // actually keeps up with a live source. The renderer's clock advances a
-    // little slower than the source produces presentation timestamps, so video
-    // creeps ahead, and on a live feed that gap never closes on its own. Once it
-    // passes the buffer horizon the presentation queue cannot hold the arrivals
-    // at all — every one is discarded on contact while the pipeline is otherwise
-    // healthy. Re-anchoring costs one hiccup and buys back the whole margin,
-    // which is far cheaper than shedding half the frames for the rest of the
-    // session.
-    private func resyncIfVideoLeadsClockIsolated() {
-        assertIsolated()
-        guard let readiness, readiness.isOpen, !paused, !terminal,
-              let newest = retainedVideo.last else { return }
-        let newestPTS = newest.presentationTimeStamp
-        let now = clock.currentTime
-        guard newestPTS.isNumeric, now.isNumeric else { return }
-        let ahead = CMTimeSubtract(newestPTS, now)
-        guard ahead.isNumeric,
-              CMTimeCompare(ahead, tuning.videoBufferHorizon) > 0 else { return }
-        readiness.close(.buffering)
-        readyPublished = false
-        display.pauseSubmission()
-        metrics?.recordVideoResync()
-    }
-
     private func updateReadinessIsolated() {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         resyncIfVideoTrailsClockIsolated()
-        resyncIfVideoLeadsClockIsolated()
         let expectedGeneration = generationController.current
         let audioInterval = contiguousAudioInterval()
         if audio.isReadyForPlayback, let audioInterval {
@@ -1078,6 +1129,24 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             clockTime: clock.currentTime,
             audioRecoveryCount: audio.recoveryCount
         )
+    }
+
+    private func updateMaximumAnchorLagIsolated(for frame: VideoPresentationFrame?) {
+        let horizon = effectiveVideoBufferHorizon(for: frame)
+        let lag = CMTimeMultiplyByRatio(horizon, multiplier: 1, divisor: 2)
+        readiness?.setMaximumAnchorLag(lag)
+    }
+
+    private func effectiveVideoBufferHorizon(
+        for frame: VideoPresentationFrame?
+    ) -> CMTime {
+        guard let memoryHorizon = frame?.memoryLimitedPresentationHorizon,
+              memoryHorizon.isNumeric,
+              CMTimeCompare(memoryHorizon, .zero) > 0,
+              CMTimeCompare(memoryHorizon, tuning.videoBufferHorizon) < 0 else {
+            return tuning.videoBufferHorizon
+        }
+        return memoryHorizon
     }
 
     private func displayModeSwitchStartedIsolated() {
@@ -1351,6 +1420,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         deferredPackets.removeAll(keepingCapacity: false)
         pendingTrackVideo.removeAll(keepingCapacity: false)
         pendingTrackAudio.removeAll(keepingCapacity: false)
+        pendingVideoDecode.removeAll(keepingCapacity: false)
+        videoDecodeBufferHorizon = nil
         display.pauseSubmission()
         Task { [self] in
             await audio.stopAwaitingRendererRemoval()
@@ -1393,6 +1464,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         releasePendingAdmissionIsolated()
         pendingTrackVideo.removeAll(keepingCapacity: false)
         pendingTrackAudio.removeAll(keepingCapacity: false)
+        pendingVideoDecode.removeAll(keepingCapacity: false)
+        videoDecodeBufferHorizon = nil
         videoCoordinator.stop(emergency: true)
         audio.stop()
         display.pauseSubmission()

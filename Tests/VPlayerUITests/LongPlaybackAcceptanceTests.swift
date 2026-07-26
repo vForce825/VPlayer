@@ -588,7 +588,8 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 ) {
                     assertSteadyStateCounterDelta(
                         from: previousSteadySnapshot,
-                        to: heartbeat
+                        to: heartbeat,
+                        configuration: configuration
                     )
                 }
                 try attach(heartbeat, elapsed: elapsedSeconds(from: startedAt, clock: clock))
@@ -600,12 +601,16 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 } while nextMinute <= clock.now
             }
             // Sampling is not free and is not neutral. Every heartbeat walks the
-            // app's accessibility tree on its main thread, which is the thread
-            // the display-link callback runs on, so a one-second cadence held
-            // the measured presentation rate roughly a quarter below what the
-            // app achieves unobserved. Ten seconds still proves liveness between
-            // the per-minute assertions without deciding the result.
-            try await clock.sleep(for: .seconds(10))
+            // app's accessibility tree on its main thread, which is also where
+            // CAMetalDisplayLink delivers callbacks. During steady-state
+            // performance validation, sample only at the same one-minute cadence
+            // as the assertions; otherwise the observer itself manufactures the
+            // missed callbacks and presentation drops it is trying to measure.
+            let heartbeatInterval: Duration =
+                AcceptanceValidationPolicy.requiresSteadyStatePerformance(
+                    duration: configuration.duration
+                ) ? .seconds(60) : .seconds(10)
+            try await clock.sleep(for: heartbeatInterval)
         }
 
         let final = try await activeHeartbeat(
@@ -619,7 +624,11 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         if AcceptanceValidationPolicy.requiresSteadyStatePerformance(
             duration: configuration.duration
         ) {
-            assertSteadyStateCounterDelta(from: previousSteadySnapshot, to: final)
+            assertSteadyStateCounterDelta(
+                from: previousSteadySnapshot,
+                to: final,
+                configuration: configuration
+            )
         }
         try attach(final, elapsed: elapsedSeconds(from: startedAt, clock: clock))
         assertSteadyStateThresholds(final, configuration: configuration)
@@ -1032,6 +1041,10 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertEqual(snapshot.scanType, "progressive")
             XCTAssertEqual(snapshot.activeRoute, "bypass")
             XCTAssertEqual(snapshot.yadifKernelDispatchCount, 0)
+            if validatesSteadyStatePerformance {
+                XCTAssertTrue((48...52).contains(snapshot.decoderCallbacksPerSecond))
+                XCTAssertTrue((48...52).contains(snapshot.presentationsPerSecond))
+            }
             return
         }
         if ["东方卫视 HD", "五星体育 HD"].contains(configuration.channel) {
@@ -1051,13 +1064,29 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
 
     private func assertSteadyStateCounterDelta(
         from previous: AcceptanceMetricsSnapshot,
-        to current: AcceptanceMetricsSnapshot
+        to current: AcceptanceMetricsSnapshot,
+        configuration: AcceptanceConfiguration
     ) {
+        let excludesCadenceSupersededDrops = configuration.channel == "东方卫视 4K"
+        // PlaybackVideoDropSource.presentationSuperseded. The explicit 48–52fps
+        // assertion above owns cadence quality; the 1% ratio remains focused on
+        // decoder, backlog, expiry, and memory-overflow losses.
+        let supersededSourceIndex = 6
+        let previousSuperseded = excludesCadenceSupersededDrops
+            && previous.videoDropCountsBySource.indices.contains(supersededSourceIndex)
+                ? previous.videoDropCountsBySource[supersededSourceIndex]
+                : 0
+        let currentSuperseded = excludesCadenceSupersededDrops
+            && current.videoDropCountsBySource.indices.contains(supersededSourceIndex)
+                ? current.videoDropCountsBySource[supersededSourceIndex]
+                : 0
+        XCTAssertGreaterThanOrEqual(previous.droppedVideoFrames, previousSuperseded)
+        XCTAssertGreaterThanOrEqual(current.droppedVideoFrames, currentSuperseded)
         XCTAssertNoThrow(try AcceptanceSnapshotValidator.validateCounterDelta(
             previousPresented: previous.presentedVideoFrames,
-            previousDropped: previous.droppedVideoFrames,
+            previousDropped: previous.droppedVideoFrames - previousSuperseded,
             currentPresented: current.presentedVideoFrames,
-            currentDropped: current.droppedVideoFrames
+            currentDropped: current.droppedVideoFrames - currentSuperseded
         ))
     }
 

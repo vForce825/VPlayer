@@ -674,14 +674,20 @@ enum PlaybackFakeMedia {
         )
     }
 
-    static func accessUnit(id: UInt64, generation: MediaGeneration, randomAccess: Bool) throws -> CompressedVideoAccessUnit {
+    static func accessUnit(
+        id: UInt64,
+        generation: MediaGeneration,
+        randomAccess: Bool,
+        pts: CMTime? = nil,
+        duration: CMTime? = nil
+    ) throws -> CompressedVideoAccessUnit {
         let format = try videoFormat()
         let buffer = try SampleBufferBuilder.makeVideo(
             data: Data([0x00, 0x00, 0x00, 0x01]),
             formatDescription: format,
-            presentationTimeStamp: CMTime(value: Int64(id), timescale: 25),
+            presentationTimeStamp: pts ?? CMTime(value: Int64(id), timescale: 25),
             decodeTimeStamp: .invalid,
-            duration: CMTime(value: 1, timescale: 25),
+            duration: duration ?? CMTime(value: 1, timescale: 25),
             isRandomAccess: randomAccess
         )
         return CompressedVideoAccessUnit(
@@ -697,7 +703,10 @@ enum PlaybackFakeMedia {
         id: UInt64,
         generation: MediaGeneration,
         pts: CMTime,
-        interlaced: Bool
+        interlaced: Bool,
+        duration: CMTime = CMTime(value: 1, timescale: 25),
+        dimensions: CMVideoDimensions = CMVideoDimensions(width: 16, height: 16),
+        bitDepth: Int = 8
     ) throws -> DecodedVideoFrame {
         var pixelBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
@@ -721,7 +730,7 @@ enum PlaybackFakeMedia {
             accessUnitID: id,
             pixelBuffer: pixelBuffer,
             presentationTimeStamp: pts,
-            duration: CMTime(value: 1, timescale: 25),
+            duration: duration,
             generation: generation,
             parserMetadata: VideoParserMetadata(
                 fieldOrder: interlaced ? .tb : .progressive,
@@ -732,8 +741,8 @@ enum PlaybackFakeMedia {
                 sourcePTS90k: sourcePTS90k
             ),
             formatMetadata: VideoFormatMetadata(
-                dimensions: CMVideoDimensions(width: 16, height: 16),
-                bitDepth: 8,
+                dimensions: dimensions,
+                bitDepth: bitDepth,
                 range: .video,
                 matrix: .bt709,
                 transfer: .bt709,
