@@ -293,6 +293,7 @@ final class MetalVideoRendererTests: XCTestCase {
         harness.submitter.completeFirst(.succeeded)
         XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 1)
 
+        let submittedBeforeRepeat = harness.submitter.jobs.count
         XCTAssertEqual(
             harness.renderer.draw(
                 targetMediaTime: CMTime(value: 1, timescale: 60),
@@ -300,6 +301,10 @@ final class MetalVideoRendererTests: XCTestCase {
             ).action,
             .repeated
         )
+        // The repeat still presents: CAMetalDisplayLink paces itself to the rate
+        // the layer presents at, so a tick that presents nothing lowers the
+        // callback rate. It just must not count as a new frame.
+        XCTAssertEqual(harness.submitter.jobs.count, submittedBeforeRepeat + 1)
         harness.submitter.completeFirst(.succeeded)
         XCTAssertEqual(metrics.snapshot(window: .seconds(60)).presentedVideoFrames, 1)
 

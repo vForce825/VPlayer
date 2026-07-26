@@ -40,6 +40,17 @@ public protocol VideoRendering: AnyObject {
         targetMediaTime: CMTime,
         drawable: any CAMetalDrawable
     ) -> VideoRenderDecision
+    /// Reported for every display-link callback, including ones the driver goes
+    /// on to discard, so the cadence measured here is CoreAnimation's own.
+    func recordDisplayLinkCallback(targetPresentationTimestamp: CFTimeInterval)
+    /// The panel's own refresh rate, as reported by the screen the layer is on.
+    /// Callback gaps only mean something measured against it.
+    func recordDisplayRefreshRate(framesPerSecond: Double)
+}
+
+public extension VideoRendering {
+    func recordDisplayLinkCallback(targetPresentationTimestamp: CFTimeInterval) {}
+    func recordDisplayRefreshRate(framesPerSecond: Double) {}
 }
 
 protocol VideoPresentationTimingResetting: AnyObject {

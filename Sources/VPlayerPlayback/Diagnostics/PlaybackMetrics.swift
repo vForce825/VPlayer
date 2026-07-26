@@ -93,6 +93,21 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // an incomplete GPU submission. A declined tick presents nothing, so the
     // frame that was due lands on the next tick as a superseded drop.
     public let renderSkippedInFlightCount: UInt64
+    // Every delegate callback CoreAnimation delivered, counted before the driver
+    // decides whether to draw. Against `renderTickCount` this separates a
+    // display link that is not calling us from one whose callbacks we discard.
+    public let displayLinkCallbackCount: UInt64
+    // The shortest gap seen between two callbacks. Kept as a cross-check on
+    // `displayRefreshHz` rather than as the period itself: the link's target
+    // timestamps are not strictly quantized to vsync boundaries, so this reads
+    // slightly short of the true one.
+    public let nativeDisplayIntervalMilliseconds: Double
+    // Vsyncs that passed with no callback, derived from gaps that are whole
+    // multiples of the native period.
+    public let missedDisplayLinkVSyncCount: UInt64
+    // What the screen itself reports, which is also what the display link's
+    // frame-rate range is pinned to.
+    public let displayRefreshHz: Double
     // Where the read path loses time. `queueFullWait` rising means the app is not
     // draining fast enough to keep reading; both near zero means the source
     // simply is not delivering realtime, and nothing in the app will fix it.
@@ -210,6 +225,11 @@ final class PlaybackMetrics: @unchecked Sendable {
         var audioRecoveryCount: UInt64 = 0
         var renderTickCount: UInt64 = 0
         var renderSkippedInFlightCount: UInt64 = 0
+        var displayLinkCallbackCount: UInt64 = 0
+        var previousDisplayLinkTimestamp: CFTimeInterval?
+        var nativeDisplayIntervalSeconds = 0.0
+        var missedDisplayLinkVSyncCount: UInt64 = 0
+        var displayRefreshHz = 0.0
         var demuxQueueFullWaitNanoseconds: UInt64 = 0
         var demuxAdmitWaitNanoseconds: UInt64 = 0
         var playbackExecutorBusyNanoseconds: UInt64 = 0
@@ -314,6 +334,39 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock {
             state.renderTickCount &+= 1
             if skippedInFlight { state.renderSkippedInFlightCount &+= 1 }
+        }
+    }
+
+    func recordDisplayRefreshRate(framesPerSecond: Double) {
+        guard framesPerSecond.isFinite, framesPerSecond > 0 else { return }
+        lock.withLock { state.displayRefreshHz = framesPerSecond }
+    }
+
+    /// Gaps are measured against the panel's own period when the screen has
+    /// reported one. The shortest gap ever seen is a poor stand-in: the display
+    /// link's target timestamps are not strictly quantized to vsync boundaries,
+    /// so a single short outlier would rescale every later gap into a miss.
+    func recordDisplayLinkCallback(targetPresentationTimestamp: CFTimeInterval) {
+        guard targetPresentationTimestamp.isFinite else { return }
+        lock.withLock {
+            state.displayLinkCallbackCount &+= 1
+            let previous = state.previousDisplayLinkTimestamp
+            state.previousDisplayLinkTimestamp = targetPresentationTimestamp
+            guard let previous else { return }
+            let delta = targetPresentationTimestamp - previous
+            // A second of silence is a stall, not a cadence, and folding it into
+            // the miss count would bury the one-vsync gaps this exists to find.
+            guard delta > 0.001, delta < 1 else { return }
+            state.nativeDisplayIntervalSeconds = state.nativeDisplayIntervalSeconds > 0
+                ? min(state.nativeDisplayIntervalSeconds, delta)
+                : delta
+            let period = state.displayRefreshHz > 0
+                ? 1 / state.displayRefreshHz
+                : state.nativeDisplayIntervalSeconds
+            let periods = Int((delta / period).rounded())
+            if periods > 1 {
+                state.missedDisplayLinkVSyncCount &+= UInt64(periods - 1)
+            }
         }
     }
 
@@ -535,6 +588,10 @@ final class PlaybackMetrics: @unchecked Sendable {
             audioRecoveryCount: captured.audioRecoveryCount,
             renderTickCount: captured.renderTickCount,
             renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
+            displayLinkCallbackCount: captured.displayLinkCallbackCount,
+            nativeDisplayIntervalMilliseconds: captured.nativeDisplayIntervalSeconds * 1_000,
+            missedDisplayLinkVSyncCount: captured.missedDisplayLinkVSyncCount,
+            displayRefreshHz: captured.displayRefreshHz,
             demuxQueueFullWaitSeconds: Double(captured.demuxQueueFullWaitNanoseconds) / 1_000_000_000,
             demuxAdmitWaitSeconds: Double(captured.demuxAdmitWaitNanoseconds) / 1_000_000_000,
             playbackExecutorBusySeconds:

@@ -104,6 +104,49 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.maximumVideoDecodeSubmissionMilliseconds, 7.5)
     }
 
+    // A 50 Hz panel presenting every frame and a 60 Hz panel losing one tick in
+    // six produce the same callback rate, and only the native period tells them
+    // apart.
+    func testDisplayLinkCadenceReportsTheNativePeriodAndCountsOnlyWholeMissedVSyncs() {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
+        let period = 1.0 / 60
+        var timestamp = 100.0
+        for step in [1, 1, 2, 1, 3, 1] {
+            metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
+            timestamp += period * Double(step)
+        }
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
+        // A stall is not a cadence: folding it in would bury the single-vsync
+        // gaps this counter exists to find.
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp + 5)
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.displayLinkCallbackCount, 8)
+        XCTAssertEqual(snapshot.nativeDisplayIntervalMilliseconds, period * 1_000, accuracy: 0.001)
+        XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 3)
+    }
+
+    // The shortest gap ever seen reads short of the true period, so one outlier
+    // would rescale every later gap into a miss. The screen's own rate does not.
+    func testReportedRefreshRateRatherThanTheShortestGapDecidesWhatCountsAsAMiss() {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
+        metrics.recordDisplayRefreshRate(framesPerSecond: 60)
+        var timestamp = 100.0
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
+        // An early outlier three quarters of a period long.
+        timestamp += 0.75 / 60
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
+        for _ in 0..<4 {
+            timestamp += 1.0 / 60
+            metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
+        }
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.displayRefreshHz, 60)
+        XCTAssertLessThan(snapshot.nativeDisplayIntervalMilliseconds, 1_000 / 60)
+        XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 0)
+    }
+
     func testWindowedRatesAndPercentilesExcludeOldSamplesWithoutResettingSessionTotals() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(

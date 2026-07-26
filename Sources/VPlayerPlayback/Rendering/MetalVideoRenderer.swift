@@ -385,6 +385,16 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         }
     }
 
+    public func recordDisplayLinkCallback(targetPresentationTimestamp: CFTimeInterval) {
+        metrics?.recordDisplayLinkCallback(
+            targetPresentationTimestamp: targetPresentationTimestamp
+        )
+    }
+
+    public func recordDisplayRefreshRate(framesPerSecond: Double) {
+        metrics?.recordDisplayRefreshRate(framesPerSecond: framesPerSecond)
+    }
+
     public func flush(to generation: MediaGeneration) {
         presentationLock.withLock {
             stateLock.lock()
@@ -441,7 +451,11 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
                 dropped: selection.droppedFrameCount
             )
         }
-
+        // A repeat re-presents the picture already on screen rather than leaving
+        // the drawable unpresented. Skipping the submission looks free and is
+        // not: CAMetalDisplayLink paces itself to the rate the layer actually
+        // presents at, so a tick that presents nothing lowers the callback rate
+        // and costs more frames than the redundant draw ever did.
         let textures: MappedVideoTextures
         let isTenBit: Bool
         do {

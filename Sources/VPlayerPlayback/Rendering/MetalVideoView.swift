@@ -92,6 +92,9 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
         super.didMoveToWindow()
         if let window {
             contentScaleFactor = window.screen.nativeScale
+            driver.setPreferredFrameRate(
+                framesPerSecond: window.screen.maximumFramesPerSecond
+            )
         }
         updateDrawableSize()
         windowDidChange?(window)
