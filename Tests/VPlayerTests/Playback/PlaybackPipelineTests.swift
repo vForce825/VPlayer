@@ -1044,6 +1044,79 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertFalse(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
     }
 
+    func testFourKDecodeWaitsForInterleavedAudioInsteadOfOverflowingDecodedSurfaces() async throws {
+        let metrics = PlaybackMetrics(
+            channelID: "4k-compressed-video-pacing",
+            now: { 1 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = makeHarness(metrics: metrics)
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+
+        let duration = CMTime(value: 1, timescale: 50)
+        let dimensions = CMVideoDimensions(width: 3_840, height: 2_160)
+        for index in 0..<8 {
+            harness.pipeline.receive(decoder: .frame(try PlaybackFakeMedia.decodedFrame(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTime(value: Int64(index), timescale: 50),
+                interlaced: false,
+                duration: duration,
+                dimensions: dimensions,
+                bitDepth: 10
+            )))
+        }
+        try await eventually {
+            metrics.snapshot(window: .seconds(60)).retainedVideoCount > 0
+        }
+
+        let futureID: UInt64 = 900
+        harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+            id: futureID,
+            generation: generation,
+            randomAccess: false,
+            pts: CMTime(value: 1, timescale: 1),
+            duration: duration
+        )))
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(harness.decoder.snapshot().contains {
+            if case let .decode(id, _, _) = $0 { return id == futureID }
+            return false
+        })
+
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 2,
+            generation: generation,
+            pts: CMTime(value: 1, timescale: 2),
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(harness.decoder.snapshot().contains {
+            if case let .decode(id, _, _) = $0 { return id == futureID }
+            return false
+        })
+        harness.clock.setTime(CMTime(value: 7, timescale: 10))
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 3,
+            generation: generation,
+            pts: CMTime(value: 1, timescale: 1),
+            duration: duration
+        )))
+        try await eventually {
+            harness.decoder.snapshot().contains {
+                if case let .decode(id, _, _) = $0 { return id == futureID }
+                return false
+            }
+        }
+    }
+
     func testLateStartingAudioReleasesBoundedEarlyVideoWindowBeforeAnotherDecoderCallback() async throws {
         let metrics = PlaybackMetrics(
             channelID: "late-audio",
