@@ -26,6 +26,18 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertGreaterThan(PlayerControlsVisibilityPolicy.idleTimeout, .zero)
     }
 
+    func testIdleTimerIsDisabledOnlyWhilePreparingOrPlaying() {
+        let request = makeRequest()
+        let failure = PlaybackFailure(code: "demux.open", userMessage: "failed")
+
+        XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .idle))
+        XCTAssertTrue(PlaybackIdleTimerPolicy.isDisabled(for: .preparing(request)))
+        XCTAssertTrue(PlaybackIdleTimerPolicy.isDisabled(for: .playing(request)))
+        XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .paused(request)))
+        XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .stopped))
+        XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .failed(failure)))
+    }
+
     func testPlayerLifecycleStopsOnlyWhenDisappearanceIsNotCausedBySettingsSheet() {
         XCTAssertFalse(
             FullScreenPlayerLifecyclePolicy.shouldStopOnDisappear(
