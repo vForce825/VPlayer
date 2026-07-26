@@ -60,7 +60,9 @@ final class FFmpegVideoDecoderTests: XCTestCase {
     }
 
     func testPlanarChromaIsInterleavedIntoOneBiPlanarSurfaceAtHalfGeometry() throws {
-        let width = 16
+        // Wide enough that the interleave runs its vector body and still leaves
+        // a scalar tail: twenty chroma columns is one sixteen-wide block plus four.
+        let width = 40
         let height = 8
         let captured = CapturedReceiver()
         let handle = FakeFFmpegVideoDecoderHandle()

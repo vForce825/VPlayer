@@ -66,6 +66,20 @@ int32_t vp_ffmpeg_video_decoder_push(
     int64_t pts
 );
 
+/* Writes one decoded picture into a bi-planar destination: the luma plane row
+   by row, and the two chroma planes interleaved into one. Separate from the
+   decoder so the interleave can use the vector store built for exactly this,
+   rather than a per-byte loop in a language whose debug builds do not optimise
+   one. Buffers must not overlap. */
+void vp_ffmpeg_video_write_biplanar(
+    const uint8_t *luma, int32_t luma_stride,
+    const uint8_t *chroma_b, int32_t chroma_b_stride,
+    const uint8_t *chroma_r, int32_t chroma_r_stride,
+    uint8_t *destination_luma, size_t destination_luma_stride,
+    uint8_t *destination_chroma, size_t destination_chroma_stride,
+    int32_t width, int32_t height
+);
+
 void vp_ffmpeg_video_decoder_flush(VPFFVideoDecoder *decoder);
 void vp_ffmpeg_video_decoder_destroy(VPFFVideoDecoder *decoder);
 

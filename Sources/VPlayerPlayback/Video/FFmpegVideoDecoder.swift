@@ -394,8 +394,10 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     }
 
     /// The decoder produces three planes and the pipeline consumes two. The
-    /// interleave is the only conversion, and it is done here rather than through
-    /// swscale, which this FFmpeg build deliberately does not include.
+    /// interleave is the only conversion, and it happens in the shim rather than
+    /// through swscale, which this FFmpeg build deliberately does not include —
+    /// and rather than here, because a per-byte loop over half a million pixels
+    /// costs more than the decode it is serving.
     private func makePixelBuffer(
         width: Int,
         height: Int,
@@ -431,28 +433,20 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         guard let lumaOut = CVPixelBufferGetBaseAddressOfPlane(output, 0),
               let chromaOut = CVPixelBufferGetBaseAddressOfPlane(output, 1) else { return nil }
 
-        let lumaOutStride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
-        for row in 0..<height {
-            memcpy(
-                lumaOut.advanced(by: row * lumaOutStride),
-                luma.advanced(by: row * lumaStride),
-                width
-            )
-        }
-
-        let chromaHeight = height / 2
-        let chromaWidth = width / 2
-        let chromaOutStride = CVPixelBufferGetBytesPerRowOfPlane(output, 1)
-        for row in 0..<chromaHeight {
-            let destination = chromaOut.advanced(by: row * chromaOutStride)
-                .assumingMemoryBound(to: UInt8.self)
-            let sourceB = chromaB.advanced(by: row * chromaBStride)
-            let sourceR = chromaR.advanced(by: row * chromaRStride)
-            for column in 0..<chromaWidth {
-                destination[column * 2] = sourceB[column]
-                destination[column * 2 + 1] = sourceR[column]
-            }
-        }
+        vp_ffmpeg_video_write_biplanar(
+            luma,
+            Int32(lumaStride),
+            chromaB,
+            Int32(chromaBStride),
+            chromaR,
+            Int32(chromaRStride),
+            lumaOut.assumingMemoryBound(to: UInt8.self),
+            CVPixelBufferGetBytesPerRowOfPlane(output, 0),
+            chromaOut.assumingMemoryBound(to: UInt8.self),
+            CVPixelBufferGetBytesPerRowOfPlane(output, 1),
+            Int32(width),
+            Int32(height)
+        )
         return output
     }
 
@@ -560,7 +554,36 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
     }
 
     func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws {
+        try switchToFFmpegIfNeeded(for: accessUnit)
         try lock.withLock { active }?.decode(accessUnit, flags: flags)
+    }
+
+    /// Format descriptions frequently do not admit that a stream is field coded;
+    /// the parser reads it from the pictures themselves. Switching only on a
+    /// random-access unit means the new decoder opens on a keyframe rather than
+    /// mid-GOP, where it would emit nothing usable until the next one anyway.
+    private func switchToFFmpegIfNeeded(for accessUnit: CompressedVideoAccessUnit) throws {
+        guard accessUnit.parserMetadata.isInterlaced == true, accessUnit.isRandomAccess else {
+            return
+        }
+        let pending = lock.withLock { () -> (CMVideoFormatDescription, MediaGeneration)? in
+            guard !isOnFFmpeg,
+                  let format,
+                  generation == accessUnit.generation,
+                  CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264 else {
+                return nil
+            }
+            return (format, generation)
+        }
+        guard let (format, generation) = pending else { return }
+        try ffmpeg.configure(format: format, generation: generation)
+        let previous = lock.withLock { () -> (any VideoDecoding)? in
+            let stale = active
+            active = ffmpeg
+            isOnFFmpeg = true
+            return stale === ffmpeg ? nil : stale
+        }
+        previous?.invalidate()
     }
 
     func finishDelayedFrames() throws {
