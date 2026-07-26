@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import SwiftUI
+import UIKit
 import VPlayerPlayback
 
 enum FullScreenPlayerLifecyclePolicy {
@@ -25,6 +26,20 @@ enum PlayerControlsVisibilityPolicy {
             false
         case .idle, .preparing, .paused, .stopped, .failed:
             true
+        }
+    }
+}
+
+/// Keeps tvOS from treating uninterrupted video watching as user inactivity.
+/// Paused, stopped, and failed playback deliberately return control to the
+/// system so the app cannot suppress the screen saver indefinitely.
+enum PlaybackIdleTimerPolicy {
+    static func isDisabled(for state: PlaybackState) -> Bool {
+        switch state {
+        case .preparing, .playing:
+            true
+        case .idle, .paused, .stopped, .failed:
+            false
         }
     }
 }
@@ -81,11 +96,14 @@ struct FullScreenPlayerView: View {
 
     var body: some View {
         ZStack {
+            // fullScreenCover is transparent on tvOS. Keep an opaque backing
+            // below Metal even after its context exists, because the drawable
+            // has no video content until the first frame is presented.
+            Color.black.ignoresSafeArea()
+
             if let context = model.presentationContext {
                 MetalPlayerView(context: context)
                     .ignoresSafeArea()
-            } else {
-                Color.black.ignoresSafeArea()
             }
 
             Color.clear
@@ -147,6 +165,10 @@ struct FullScreenPlayerView: View {
             await runControlsAutoHide()
         }
         .task { model.start() }
+        .onChange(of: model.state, initial: true) { _, state in
+            UIApplication.shared.isIdleTimerDisabled =
+                PlaybackIdleTimerPolicy.isDisabled(for: state)
+        }
         #if DEBUG
         .task { await publishAcceptanceMetrics() }
         #endif
@@ -154,6 +176,7 @@ struct FullScreenPlayerView: View {
             guard FullScreenPlayerLifecyclePolicy.shouldStopOnDisappear(
                 isPresentingSettings: showsSettings
             ) else { return }
+            UIApplication.shared.isIdleTimerDisabled = false
             Task { await model.stop() }
         }
         .onPlayPauseCommand(perform: model.togglePause)
