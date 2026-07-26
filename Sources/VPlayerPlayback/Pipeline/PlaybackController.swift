@@ -15,7 +15,6 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
     private var pendingTeardown: Task<Void, Never>?
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
-    private var selectedAlgorithm = DeinterlaceAlgorithm.appleTemporal
     private var tuning = PlaybackTuning.default
 
     public init() {
@@ -76,7 +75,6 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
 
         do {
             let next = try factory.makePipeline(
-                selectedAlgorithm: selectedAlgorithm,
                 tuning: tuning,
                 channelID: request.channelID
             ) { [weak self] event in
@@ -129,11 +127,6 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
         publish(.stopped)
     }
 
-    public func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async {
-        selectedAlgorithm = algorithm
-        pipeline?.setDeinterlaceAlgorithm(algorithm)
-    }
-
     public func setTuning(_ tuning: PlaybackTuning) async {
         self.tuning = tuning
         pipeline?.setTuning(tuning)
@@ -148,7 +141,6 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
     }
 
     var currentStateForTesting: PlaybackState { state }
-    var selectedDeinterlaceAlgorithmForTesting: DeinterlaceAlgorithm { selectedAlgorithm }
 
     static func failure(for error: PlaybackCoreError) -> PlaybackFailure {
         switch error {
@@ -218,10 +210,6 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
                   !userPaused,
                   eventCycle == readinessCycle else { return }
             publish(.playing(request))
-        case let .notice(notice):
-            for continuation in noticeContinuations.values {
-                _ = continuation.yield(notice)
-            }
         case .stopped:
             pipeline = nil
             request = nil

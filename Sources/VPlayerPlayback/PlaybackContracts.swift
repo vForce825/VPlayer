@@ -78,17 +78,11 @@ public protocol PlaybackEngine: Actor {
     func play(_ request: PlaybackRequest) async
     func setPaused(_ paused: Bool) async
     func stop() async
-    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async
     func setTuning(_ tuning: PlaybackTuning) async
 }
 
 public extension PlaybackEngine {
     func setTuning(_ tuning: PlaybackTuning) async {}
-}
-
-public enum DeinterlaceAlgorithm: String, Codable, CaseIterable, Sendable {
-    case appleTemporal
-    case metalYADIF2x
 }
 
 /// The buffering knobs that decide how much slack the pipeline keeps between the

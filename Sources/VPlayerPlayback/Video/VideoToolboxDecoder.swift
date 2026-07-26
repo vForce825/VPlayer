@@ -185,16 +185,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let session: any VideoToolboxSession
         let id: VTSessionID
         let generation: MediaGeneration
-        let configuration: VideoDecodeConfiguration
     }
 
     private struct DecodeToken: @unchecked Sendable {
         let accessUnitID: UInt64
         let generation: MediaGeneration
         let parserMetadata: VideoParserMetadata
-        // Carried with the submission because the executor no longer owns the
-        // session and so cannot look up how to classify a failed output.
-        let configuration: VideoDecodeConfiguration
     }
 
     /// Pixel formats this pipeline can actually turn into a Metal texture.
@@ -308,24 +304,18 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
 
     public func configure(
         format: CMVideoFormatDescription,
-        generation: MediaGeneration,
-        configuration: VideoDecodeConfiguration
+        generation: MediaGeneration
     ) throws {
         submissionEpoch.bump()
         backlog.resumeAfterSessionChange()
         try submissionQueue.sync {
-            try configureIsolated(
-                format: format,
-                generation: generation,
-                configuration: configuration
-            )
+            try configureIsolated(format: format, generation: generation)
         }
     }
 
     private func configureIsolated(
         format: CMVideoFormatDescription,
-        generation: MediaGeneration,
-        configuration: VideoDecodeConfiguration
+        generation: MediaGeneration
     ) throws {
         let subtype = CMFormatDescriptionGetMediaSubType(format)
         guard subtype == kCMVideoCodecType_H264 ||
@@ -339,41 +329,24 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let candidate = selection.session
         let tuning = tuningBox.value
 
-        var fieldModeStatus: OSStatus?
-        switch configuration {
-        case .bothFields:
-            let setStatus = api.setProperty(
-                candidate,
-                key: kVTDecompressionPropertyKey_FieldMode as String,
-                value: .string(kVTDecompressionProperty_FieldMode_BothFields as String)
-            )
-            guard setStatus == noErr || setStatus == kVTPropertyNotSupportedErr else {
-                api.invalidate(candidate)
-                throw VideoDecoderFailure.sessionCreate(setStatus)
-            }
-            fieldModeStatus = setStatus
-        case .appleTemporal:
-            do {
-                try AppleTemporalConfigurator(
-                    api: api,
-                    propertyDidSet: { [metrics] in metrics?.recordTemporalPropertySet() }
-                ).configure(session: candidate)
-            } catch let failure as AppleTemporalFailure {
-                api.invalidate(candidate)
-                throw VideoDecoderFailure.temporalUnavailable(failure)
-            } catch {
-                api.invalidate(candidate)
-                throw VideoDecoderFailure.temporalUnavailable(
-                    .initializationFailed(status: kVTParameterErr)
-                )
-            }
+        // Both fields woven into one frame per coded frame, which is what the
+        // deinterlacer takes as input. It is also the decoder default, so a
+        // decoder that does not implement the property is already doing this.
+        let fieldModeStatus = api.setProperty(
+            candidate,
+            key: kVTDecompressionPropertyKey_FieldMode as String,
+            value: .string(kVTDecompressionProperty_FieldMode_BothFields as String)
+        )
+        guard fieldModeStatus == noErr || fieldModeStatus == kVTPropertyNotSupportedErr else {
+            api.invalidate(candidate)
+            throw VideoDecoderFailure.sessionCreate(fieldModeStatus)
         }
 
-        // Set last, so a decoder that rejects it cannot mask a field-mode or
-        // temporal failure that says something far more useful. The default pool
-        // ages buffers out, and this pipeline legitimately holds a known number
-        // of them at once; reallocating an IOSurface per frame is exactly the
-        // kind of cost that shows up as submission time.
+        // Set last, so a decoder that rejects it cannot mask a field-mode
+        // failure that says something far more useful. The default pool ages
+        // buffers out, and this pipeline legitimately holds a known number of
+        // them at once; reallocating an IOSurface per frame is exactly the kind
+        // of cost that shows up as submission time.
         let poolStatus = api.setProperty(
             candidate,
             key: kVTDecompressionPropertyKey_OutputPoolRequestedMinimumBufferCount as String,
@@ -404,7 +377,6 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         metrics?.recordDecoderSession(
             summary: Self.sessionSummary(
                 format: format,
-                configuration: configuration,
                 pixelFormatChoice: selection.choice,
                 outputPoolFloor: poolStatus == noErr ? tuning.decoderOutputPoolFloor : nil,
                 fieldModeStatus: fieldModeStatus,
@@ -417,8 +389,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         active = ActiveSession(
             session: candidate,
             id: candidate.id,
-            generation: generation,
-            configuration: configuration
+            generation: generation
         )
         sessionIdentity.set(id: candidate.id, generation: generation)
         if let previous {
@@ -563,8 +534,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let token = DecodeToken(
             accessUnitID: accessUnit.id,
             generation: accessUnit.generation,
-            parserMetadata: accessUnit.parserMetadata,
-            configuration: active.configuration
+            parserMetadata: accessUnit.parserMetadata
         )
         let sessionID = active.id
         sampleFramesBeingDecoded(active)
@@ -578,15 +548,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let executor = executor
         var decodeFlags = flags
         decodeFlags.insert(._EnableAsynchronousDecompression)
-        switch active.configuration {
-        case .bothFields:
-            decodeFlags.remove(._EnableTemporalProcessing)
-        case .appleTemporal:
-            decodeFlags.insert(._EnableTemporalProcessing)
-        }
-        if decodeFlags.contains(._EnableTemporalProcessing) {
-            metrics?.recordTemporalDecodeFlag()
-        }
+        // Temporal processing only ever meant the decoder's own deinterlace,
+        // which this pipeline does on the GPU instead.
+        decodeFlags.remove(._EnableTemporalProcessing)
         let signpostLifetime = PlaybackSignpostLifetime(
             signposts: signposts,
             token: signposts?.begin(.videoToolboxDecode, correlation: accessUnit.id)
@@ -617,10 +581,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard status == noErr else {
             submissionLease.releaseOnce()
             signpostLifetime.finish()
-            let classified = Self.classify(status, configuration: active.configuration)
+            let classified = Self.classify(status)
             if !classified.isRecoverable {
                 Self.logger.error(
-                    "decode submission failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                    "decode submission failed status=\(status, privacy: .public)"
                 )
             }
             report(classified.failure, generation: accessUnit.generation)
@@ -660,9 +624,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             let status = api.finishDelayedFrames(active.session)
             guard status == noErr else {
                 Self.logger.error(
-                    "finish delayed frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                    "finish delayed frames failed status=\(status, privacy: .public)"
                 )
-                throw Self.classify(status, configuration: active.configuration).failure
+                throw Self.classify(status).failure
             }
         }
     }
@@ -673,9 +637,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             let status = api.waitForAsynchronousFrames(active.session)
             guard status == noErr else {
                 Self.logger.error(
-                    "wait for asynchronous frames failed status=\(status, privacy: .public) configuration=\(String(describing: active.configuration), privacy: .public)"
+                    "wait for asynchronous frames failed status=\(status, privacy: .public)"
                 )
-                throw Self.classify(status, configuration: active.configuration).failure
+                throw Self.classify(status).failure
             }
         }
     }
@@ -694,7 +658,6 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
 
     static func sessionSummary(
         format: CMVideoFormatDescription?,
-        configuration: VideoDecodeConfiguration,
         pixelFormatChoice: String,
         outputPoolFloor: Int?,
         fieldModeStatus: OSStatus?,
@@ -718,7 +681,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 + " \(dimensions.width)x\(dimensions.height)"
         }
         let pool = outputPoolFloor.map(String.init) ?? "unsupported"
-        return "config=\(configuration) codec=\(codec) pixelFormat=\(pixelFormatChoice)"
+        return "codec=\(codec) pixelFormat=\(pixelFormatChoice)"
             + " pool=\(pool) fieldMode=\(field) hardware=\(hardware)"
     }
 
@@ -744,13 +707,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
 
         guard output.status == noErr else {
-            let classified = Self.classify(
-                output.status,
-                configuration: token.configuration
-            )
+            let classified = Self.classify(output.status)
             if !classified.isRecoverable {
                 Self.logger.error(
-                    "decode callback failed status=\(output.status, privacy: .public) infoFlags=\(output.infoFlags.rawValue, privacy: .public) hasImage=\(output.imageBuffer != nil, privacy: .public) configuration=\(String(describing: token.configuration), privacy: .public)"
+                    "decode callback failed status=\(output.status, privacy: .public) infoFlags=\(output.infoFlags.rawValue, privacy: .public) hasImage=\(output.imageBuffer != nil, privacy: .public)"
                 )
             }
             emit(classified, generation: token.generation)
@@ -763,10 +723,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 return
             }
             emit(
-                Self.classify(
-                    kVTVideoDecoderMalfunctionErr,
-                    configuration: token.configuration
-                ),
+                Self.classify(kVTVideoDecoderMalfunctionErr),
                 generation: token.generation
             )
             return
@@ -810,25 +767,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
     }
 
-    private static func classify(
-        _ status: OSStatus,
-        configuration: VideoDecodeConfiguration
-    ) -> ClassifiedFailure {
-        if configuration == .appleTemporal {
-            switch status {
-            case kVTVideoDecoderBadDataErr,
-                 legacyCodecBadDataErr,
-                 transientNoFrameStatus,
-                 kVTVideoDecoderReferenceMissingErr:
-                return ClassifiedFailure(failure: .badData(status), isRecoverable: true)
-            default:
-                return ClassifiedFailure(
-                    failure: .temporalUnavailable(.processingFailed(status: status)),
-                    isRecoverable: true
-                )
-            }
-        }
-
+    private static func classify(_ status: OSStatus) -> ClassifiedFailure {
         switch status {
         case kVTVideoDecoderBadDataErr,
              legacyCodecBadDataErr,

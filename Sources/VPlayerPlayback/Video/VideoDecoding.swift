@@ -108,31 +108,12 @@ public struct DecodedVideoFrame: @unchecked Sendable {
     }
 }
 
-public enum VideoDecodeConfiguration: Sendable, Equatable {
-    case bothFields
-    case appleTemporal
-}
-
-public enum AppleTemporalFailure: Error, Equatable, Sendable {
-    case unsupportedProperty(String)
-    case propertySetFailed(key: String, status: OSStatus)
-    case initializationFailed(status: OSStatus)
-    case processingFailed(status: OSStatus)
-}
-
 public enum VideoDecoderFailure: Error, Sendable, Equatable {
-    case unsupportedConfiguration(VideoDecodeConfiguration)
     case sessionCreate(OSStatus)
     case softwareDecoder
     case badData(OSStatus)
     case malfunction(OSStatus)
     case backpressureTimeout
-    case temporalUnavailable(AppleTemporalFailure)
-
-    public var isTemporalUnavailable: Bool {
-        if case .temporalUnavailable = self { return true }
-        return false
-    }
 }
 
 public enum VideoDecoderEvent: @unchecked Sendable {
@@ -148,11 +129,7 @@ public enum VideoDecoderEvent: @unchecked Sendable {
 }
 
 public protocol VideoDecoding: AnyObject {
-    func configure(
-        format: CMVideoFormatDescription,
-        generation: MediaGeneration,
-        configuration: VideoDecodeConfiguration
-    ) throws
+    func configure(format: CMVideoFormatDescription, generation: MediaGeneration) throws
     /// Hands an access unit to the decoder. Submission is asynchronous, so a
     /// failure to submit arrives as `VideoDecoderEvent.submissionFailure`
     /// rather than as a `throw`; the signature stays throwing for decoders that

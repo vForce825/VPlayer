@@ -9,7 +9,7 @@ import VideoToolbox
 
 final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
     enum Operation: Equatable {
-        case configure(MediaGeneration, VideoDecodeConfiguration)
+        case configure(MediaGeneration)
         case decode(UInt64, MediaGeneration, VTDecodeFrameFlags)
         case finish
         case wait
@@ -25,11 +25,10 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
 
     func configure(
         format _: CMVideoFormatDescription,
-        generation: MediaGeneration,
-        configuration: VideoDecodeConfiguration
+        generation: MediaGeneration
     ) throws {
         if let configureError { throw configureError }
-        lock.withLock { operations.append(.configure(generation, configuration)) }
+        lock.withLock { operations.append(.configure(generation)) }
     }
 
     func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws {

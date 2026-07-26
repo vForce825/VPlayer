@@ -21,13 +21,11 @@ final class FullScreenPlayerViewModel {
     private var noticeTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
-    private var algorithmTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
     private var noticeDismissalTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
-    private var algorithmRevision: UInt64 = 0
     private var started = false
     private var stopped = false
 
@@ -81,14 +79,6 @@ final class FullScreenPlayerViewModel {
                           isCurrent(lifecycle: lifecycle) else { return }
                     self.present(notice)
                 }
-            }
-            let algorithm = scheduleAlgorithm(
-                settings.deinterlaceAlgorithm,
-                lifecycle: lifecycle
-            )
-            await algorithm.value
-            if let latestAlgorithm = algorithmTask {
-                await latestAlgorithm.value
             }
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             await engine.play(request)
@@ -144,24 +134,20 @@ final class FullScreenPlayerViewModel {
         stopped = true
         lifecycleGeneration &+= 1
         playbackGeneration &+= 1
-        algorithmRevision &+= 1
 
         let playback = playbackTask
         let presentation = presentationTask
-        let algorithm = algorithmTask
         let pause = pauseTask
         let states = stateTask
         let notices = noticeTask
         playback?.cancel()
         presentation?.cancel()
-        algorithm?.cancel()
         pause?.cancel()
         states?.cancel()
         notices?.cancel()
         noticeDismissalTask?.cancel()
         playbackTask = nil
         presentationTask = nil
-        algorithmTask = nil
         pauseTask = nil
         stateTask = nil
         noticeTask = nil
@@ -173,7 +159,6 @@ final class FullScreenPlayerViewModel {
         let engine = engine
         let task = Task {
             await playback?.value
-            await algorithm?.value
             await pause?.value
             await states?.value
             await notices?.value
@@ -194,25 +179,6 @@ final class FullScreenPlayerViewModel {
             }
             presentationContext = context
         }
-    }
-
-    private func scheduleAlgorithm(
-        _ algorithm: DeinterlaceAlgorithm,
-        lifecycle: UInt64
-    ) -> Task<Void, Never> {
-        algorithmRevision &+= 1
-        let revision = algorithmRevision
-        let predecessor = algorithmTask
-        let engine = engine
-        let task = Task { [weak self] in
-            await predecessor?.value
-            guard let self,
-                  isCurrent(lifecycle: lifecycle),
-                  algorithmRevision == revision else { return }
-            await engine.setDeinterlaceAlgorithm(algorithm)
-        }
-        algorithmTask = task
-        return task
     }
 
     private func isCurrent(lifecycle: UInt64, playback: UInt64? = nil) -> Bool {

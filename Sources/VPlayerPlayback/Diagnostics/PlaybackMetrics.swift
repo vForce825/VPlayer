@@ -32,13 +32,10 @@ public enum VideoDropSource: Int, Sendable, CaseIterable {
 
 public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let scanType: String
-    public let selectedAlgorithm: DeinterlaceAlgorithm
     public let activeRoute: String
     public let decoderCallbacksPerSecond: Double
     public let presentationsPerSecond: Double
     public let yadifKernelDispatchCount: UInt64
-    public let temporalPropertySetCount: UInt64
-    public let temporalDecodeFlagCount: UInt64
     public let staleGenerationDropCount: UInt64
     public let droppedVideoFrames: UInt64
     // Indexed by `VideoDropSource.rawValue`.
@@ -52,12 +49,10 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let gpuDurationP95Milliseconds: Double
     public let avDriftP95Milliseconds: Double
     public let residentMemoryBytes: UInt64
-    public let automaticAlgorithmSwitchCount: UInt64
     public let elapsedSeconds: Double
     public let windowDurationSeconds: Double
     public let presentedVideoFrames: UInt64
     public let maximumAbsoluteAVDriftMilliseconds: Double
-    public let temporalUnavailableNoticeCount: UInt64
     public let crossGenerationPresentationCount: UInt64
     public let audioRoute: String
     public let audioReady: Bool
@@ -179,15 +174,12 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     private struct State: Sendable {
         var scanType = "unknown"
-        var selectedAlgorithm: DeinterlaceAlgorithm
         var activeRoute = "rawWhileClassifying"
         var decoderCallbackTimes: [TimeInterval] = []
         var presentationTimes: [TimeInterval] = []
         var gpuDurations: [TimedValue] = []
         var avDrifts: [TimedValue] = []
         var yadifKernelDispatchCount: UInt64 = 0
-        var temporalPropertySetCount: UInt64 = 0
-        var temporalDecodeFlagCount: UInt64 = 0
         var staleGenerationDropCount: UInt64 = 0
         var droppedVideoFrames: UInt64 = 0
         var videoDropCountsBySource = [UInt64](
@@ -199,7 +191,6 @@ final class PlaybackMetrics: @unchecked Sendable {
         var maximumYADIFInputDepth = 0
         var presentedVideoFrames: UInt64 = 0
         var maximumAbsoluteAVDriftMilliseconds = 0.0
-        var temporalUnavailableNoticeCount: UInt64 = 0
         var crossGenerationPresentationCount: UInt64 = 0
         var audioRoute = "systemCompressed"
         var audioReady = false
@@ -235,8 +226,7 @@ final class PlaybackMetrics: @unchecked Sendable {
         var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
-        init(selectedAlgorithm: DeinterlaceAlgorithm, startedAt: TimeInterval) {
-            self.selectedAlgorithm = selectedAlgorithm
+        init(startedAt: TimeInterval) {
             lastPrunedAt = startedAt
         }
     }
@@ -250,7 +240,6 @@ final class PlaybackMetrics: @unchecked Sendable {
     private var state: State
 
     init(
-        selectedAlgorithm: DeinterlaceAlgorithm,
         channelID: String,
         now: @escaping Now = { ProcessInfo.processInfo.systemUptime },
         residentMemoryProvider: @escaping ResidentMemoryProvider = PlaybackMetrics.readResidentMemory
@@ -260,15 +249,11 @@ final class PlaybackMetrics: @unchecked Sendable {
         channelIdentifier = PlaybackDiagnosticsChannelID(rawValue: channelID)
         let startedAt = now()
         self.startedAt = startedAt
-        state = State(selectedAlgorithm: selectedAlgorithm, startedAt: startedAt)
+        state = State(startedAt: startedAt)
     }
 
     func update(scanType: ScanType) {
         lock.withLock { state.scanType = Self.name(for: scanType) }
-    }
-
-    func update(selectedAlgorithm: DeinterlaceAlgorithm) {
-        lock.withLock { state.selectedAlgorithm = selectedAlgorithm }
     }
 
     func update(activeRoute: DeinterlaceRoute) {
@@ -465,14 +450,6 @@ final class PlaybackMetrics: @unchecked Sendable {
         }
     }
 
-    func recordTemporalPropertySet(count: Int = 1) {
-        lock.withLock { state.temporalPropertySetCount &+= UInt64(max(0, count)) }
-    }
-
-    func recordTemporalDecodeFlag() {
-        lock.withLock { state.temporalDecodeFlagCount &+= 1 }
-    }
-
     func recordStaleGenerationDrop() {
         lock.withLock { state.staleGenerationDropCount &+= 1 }
     }
@@ -487,10 +464,6 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.droppedVideoFrames &+= amount
             state.videoDropCountsBySource[source.rawValue] &+= amount
         }
-    }
-
-    func recordTemporalUnavailableNotice() {
-        lock.withLock { state.temporalUnavailableNoticeCount &+= 1 }
     }
 
     func beginAVDriftGracePeriod(seconds: TimeInterval) {
@@ -525,13 +498,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         let rateDivisor = windowSeconds > 0 ? windowSeconds : 1
         return PlaybackMetricsSnapshot(
             scanType: captured.scanType,
-            selectedAlgorithm: captured.selectedAlgorithm,
             activeRoute: captured.activeRoute,
             decoderCallbacksPerSecond: Double(decoderCount) / rateDivisor,
             presentationsPerSecond: Double(presentationCount) / rateDivisor,
             yadifKernelDispatchCount: captured.yadifKernelDispatchCount,
-            temporalPropertySetCount: captured.temporalPropertySetCount,
-            temporalDecodeFlagCount: captured.temporalDecodeFlagCount,
             staleGenerationDropCount: captured.staleGenerationDropCount,
             droppedVideoFrames: captured.droppedVideoFrames,
             videoDropCountsBySource: captured.videoDropCountsBySource,
@@ -542,12 +512,10 @@ final class PlaybackMetrics: @unchecked Sendable {
             gpuDurationP95Milliseconds: Self.percentile95(Array(gpu)),
             avDriftP95Milliseconds: Self.percentile95(Array(drift)),
             residentMemoryBytes: residentMemoryProvider(),
-            automaticAlgorithmSwitchCount: 0,
             elapsedSeconds: elapsed,
             windowDurationSeconds: windowSeconds,
             presentedVideoFrames: captured.presentedVideoFrames,
             maximumAbsoluteAVDriftMilliseconds: captured.maximumAbsoluteAVDriftMilliseconds,
-            temporalUnavailableNoticeCount: captured.temporalUnavailableNoticeCount,
             crossGenerationPresentationCount: captured.crossGenerationPresentationCount,
             audioRoute: captured.audioRoute,
             audioReady: captured.audioReady,
@@ -634,9 +602,7 @@ final class PlaybackMetrics: @unchecked Sendable {
     private static func name(for route: DeinterlaceRoute) -> String {
         switch route {
         case .rawWhileClassifying: "rawWhileClassifying"
-        case .rawTemporalFailure: "rawTemporalFailure"
         case .bypass: "bypass"
-        case .appleTemporal: "appleTemporal"
         case .metalYADIF2x: "metalYADIF2x"
         }
     }

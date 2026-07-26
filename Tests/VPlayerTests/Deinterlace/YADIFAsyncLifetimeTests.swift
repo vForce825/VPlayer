@@ -880,7 +880,6 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
     func testMetricsUseCompletedCommandBufferGPUIntervalInsteadOfWallClock() throws {
         let queue = FakeMetalCommandQueue()
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .metalYADIF2x,
             channelID: "channel",
             now: { 120 },
             residentMemoryProvider: { 1 }

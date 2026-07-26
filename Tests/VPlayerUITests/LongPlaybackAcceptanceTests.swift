@@ -11,7 +11,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         "VPLAYER_ACCEPTANCE_EPG_URL",
         "VPLAYER_ACCEPTANCE_CHANNEL",
         "VPLAYER_ACCEPTANCE_SECONDS",
-        "VPLAYER_ACCEPTANCE_ALGORITHM",
     ]
 
     func testPlaybackDiagnosticStateParsesOnlySanitizedVocabulary() {
@@ -105,15 +104,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         }
     }
 
-    func testAppleCadenceRejectsMismatchedTwentyFiveAndFiftyBands() {
-        XCTAssertThrowsError(try AcceptanceSnapshotValidator.validateMatchingAppleCadence(
-            decoderCallbacksPerSecond: 25,
-            presentationsPerSecond: 50
-        )) { error in
-            XCTAssertEqual(error as? AcceptanceValidationError, .cadenceBandMismatch)
-        }
-    }
-
     func testNavigationGuardDoesNotReadFocusOrSelectWhenElementIsAbsent() {
         var didReadFocus = false
         var didSelect = false
@@ -187,15 +177,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         ))
     }
 
-    func testAlgorithmSelectionPolicySkipsFocusWhenTargetIsAlreadySelected() {
-        XCTAssertFalse(AcceptanceAlgorithmSelectionPolicy.requiresSelection(
-            isSelected: true
-        ))
-        XCTAssertTrue(AcceptanceAlgorithmSelectionPolicy.requiresSelection(
-            isSelected: false
-        ))
-    }
-
     func testTabFocusNavigatorAcquiresNormalizesAndSelectsExactlyOnce() {
         var moves: [AcceptanceTabFocusMove] = []
         var selectCount = 0
@@ -262,7 +243,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         var moves: [AcceptanceVerticalFocusMove] = []
 
         XCTAssertNoThrow(try AcceptanceVerticalFocusNavigator.acquire(
-            target: .selectedAlgorithm,
+            target: .playerSettings,
             direction: .up,
             targetHasFocus: { focusChecks.removeFirst() },
             move: { moves.append($0) }
@@ -274,7 +255,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         var moves: [AcceptanceVerticalFocusMove] = []
 
         XCTAssertThrowsError(try AcceptanceVerticalFocusNavigator.acquire(
-            target: .selectedAlgorithm,
+            target: .playerSettings,
             direction: .down,
             targetHasFocus: { false },
             move: { moves.append($0) }
@@ -282,7 +263,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertEqual(
                 error as? AcceptanceNavigationFailure,
                 AcceptanceNavigationFailure(
-                    target: .selectedAlgorithm,
+                    target: .playerSettings,
                     phase: .acquireFocus
                 )
             )
@@ -498,7 +479,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
 
         do {
             try await AcceptanceContentActivationGuard.activateAsync(
-                target: .selectedAlgorithm,
+                target: .playerSettings,
                 exists: true,
                 selection: {},
                 outcome: { throw diagnostic }
@@ -518,7 +499,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         app.launch()
 
         try importPrefilledProfile(in: app)
-        try selectAlgorithm(configuration.algorithm, in: app)
         let channelButton = app.buttons.containing(
             .staticText,
             identifier: configuration.channel
@@ -571,26 +551,15 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 phase: .awaitExistence
             )
         }
-        let bannerTracker = CapabilityBannerTracker(app: app)
         _ = try await awaitStableRoute(
-            algorithm: configuration.algorithm,
             from: metricsElement,
             stateElement: stateElement,
-            tracker: bannerTracker,
             timeout: .seconds(90)
-        )
-        try await performTwentyManualAlgorithmSwitches(
-            initialAlgorithm: configuration.algorithm,
-            metricsElement: metricsElement,
-            stateElement: stateElement,
-            tracker: bannerTracker,
-            in: app
         )
 
         let runBaseline = try await activeHeartbeat(
             after: -Double.infinity,
             metricsElement: metricsElement,
-            tracker: bannerTracker,
             in: app
         )
 
@@ -607,7 +576,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             let heartbeat = try await activeHeartbeat(
                 after: lastObservedElapsed,
                 metricsElement: metricsElement,
-                tracker: bannerTracker,
                 in: app
             )
             lastObservedElapsed = heartbeat.elapsedSeconds
@@ -637,7 +605,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let final = try await activeHeartbeat(
             after: lastObservedElapsed,
             metricsElement: metricsElement,
-            tracker: bannerTracker,
             in: app
         )
         if let prior = snapshots.last {
@@ -658,11 +625,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             configuration.duration
         )
         try assertLongRunMemoryEvidence(snapshots, configuration: configuration)
-        assertTemporalCapabilityOutcome(
-            final,
-            configuration: configuration,
-            tracker: bannerTracker
-        )
     }
 
     private func acceptanceConfiguration() throws -> AcceptanceConfiguration {
@@ -692,14 +654,10 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let channel = try XCTUnwrap(decoded["VPLAYER_ACCEPTANCE_CHANNEL"])
         let duration = try XCTUnwrap(TimeInterval(decoded["VPLAYER_ACCEPTANCE_SECONDS"] ?? ""))
         XCTAssertGreaterThan(duration, 0)
-        let algorithm = try XCTUnwrap(AcceptanceAlgorithm(
-            rawValue: decoded["VPLAYER_ACCEPTANCE_ALGORITHM"] ?? ""
-        ))
         return AcceptanceConfiguration(
             encodedEnvironment: encodedEnvironment,
             channel: channel,
-            duration: duration,
-            algorithm: algorithm
+            duration: duration
         )
     }
 
@@ -854,110 +812,9 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     }
 
     @MainActor
-    private func selectAlgorithm(_ algorithm: AcceptanceAlgorithm, in app: XCUIApplication) throws {
-        let button = app.buttons[algorithm.accessibilityIdentifier]
-        let otherButton = app.buttons[algorithm.opposite.accessibilityIdentifier]
-        let settingsDestination = app.buttons[
-            AcceptanceAlgorithm.appleTemporal.accessibilityIdentifier
-        ]
-        try selectTab(
-            .settings,
-            target: .settingsTab,
-            destination: settingsDestination,
-            in: app
-        )
-        guard button.waitForExistence(timeout: 10),
-              otherButton.waitForExistence(timeout: 10) else {
-            throw AcceptanceNavigationFailure(
-                target: .selectedAlgorithm,
-                phase: .awaitExistence
-            )
-        }
-        guard AcceptanceAlgorithmSelectionPolicy.requiresSelection(
-            isSelected: button.isSelected
-        ) else { return }
-        try focusAlgorithmButton(button, algorithm: algorithm, in: app)
-        try activateContent(button, target: .selectedAlgorithm) {
-            button.wait(for: \.isSelected, toEqual: true, timeout: 2)
-        }
-    }
-
-    @MainActor
-    private func performTwentyManualAlgorithmSwitches(
-        initialAlgorithm: AcceptanceAlgorithm,
-        metricsElement: XCUIElement,
-        stateElement: XCUIElement,
-        tracker: CapabilityBannerTracker,
-        in app: XCUIApplication
-    ) async throws {
-        let apple = app.buttons[AcceptanceAlgorithm.appleTemporal.accessibilityIdentifier]
-        let yadif = app.buttons[AcceptanceAlgorithm.metalYADIF2x.accessibilityIdentifier]
-        try openPlaybackSettings(apple: apple, yadif: yadif, in: app)
-
-        var selected = initialAlgorithm
-        for switchIndex in 0..<20 {
-            let target = selected.opposite
-            let targetButton = app.buttons[target.accessibilityIdentifier]
-            guard targetButton.waitForExistence(timeout: 10) else {
-                throw AcceptanceNavigationFailure(
-                    target: .selectedAlgorithm,
-                    phase: .awaitExistence
-                )
-            }
-            try focusAlgorithmButton(targetButton, algorithm: target, in: app)
-            try activateContent(targetButton, target: .selectedAlgorithm) {
-                targetButton.wait(for: \.isSelected, toEqual: true, timeout: 2)
-            }
-
-            // A SwiftUI sheet is modal in the tvOS 18 simulator. While it is
-            // presented, XCTest intentionally removes the underlying player
-            // diagnostics from the accessibility tree. Dismiss the sheet before
-            // observing the route so an absent element cannot become an XCTest
-            // framework exception rather than a useful acceptance failure.
-            XCUIRemote.shared.press(.menu)
-            guard app.otherElements["player-full-screen"].waitForExistence(timeout: 10),
-                  stateElement.waitForExistence(timeout: 10),
-                  metricsElement.waitForExistence(timeout: 10) else {
-                throw AcceptanceNavigationFailure(
-                    target: .acceptanceState,
-                    phase: .awaitExistence
-                )
-            }
-            _ = try await awaitStableRoute(
-                algorithm: target,
-                from: metricsElement,
-                stateElement: stateElement,
-                tracker: tracker,
-                timeout: .seconds(20)
-            )
-            selected = target
-
-            if switchIndex < 19 {
-                try openPlaybackSettings(apple: apple, yadif: yadif, in: app)
-            }
-        }
-
-        XCTAssertEqual(selected, initialAlgorithm)
-        try assertActiveControls(in: app)
-    }
-
-    @MainActor
-    private func openPlaybackSettings(
-        apple: XCUIElement,
-        yadif: XCUIElement,
-        in app: XCUIApplication
-    ) throws {
-        try activateContent(app.buttons["player-settings"], target: .playerSettings) {
-            apple.waitForExistence(timeout: 10) && yadif.waitForExistence(timeout: 10)
-        }
-    }
-
-    @MainActor
     private func awaitStableRoute(
-        algorithm: AcceptanceAlgorithm,
         from element: XCUIElement,
         stateElement: XCUIElement,
-        tracker: CapabilityBannerTracker,
         timeout: Duration
     ) async throws -> AcceptanceMetricsSnapshot {
         let clock = ContinuousClock()
@@ -969,18 +826,13 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             let state = try playbackState(from: stateElement)
             try AcceptanceStableRouteFailureClassifier.validate(state: state)
             lastState = state
-            tracker.observe()
             if let snapshot = try? snapshot(from: element) {
                 didDecodeMetrics = true
                 lastSnapshot = snapshot
                 if state == .playing,
-                   snapshot.selectedAlgorithm == algorithm.rawValue,
                    snapshot.scanType != "unknown",
                    snapshot.activeRoute != "rawWhileClassifying",
-                   routeMatches(snapshot, algorithm: algorithm) {
-                    if snapshot.temporalUnavailableNoticeCount == 1 {
-                        tracker.observeExpectedNotice()
-                    }
+                   routeMatches(snapshot) {
                     return snapshot
                 }
             }
@@ -999,11 +851,9 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     private func activeHeartbeat(
         after previousElapsed: Double,
         metricsElement: XCUIElement,
-        tracker: CapabilityBannerTracker,
         in app: XCUIApplication
     ) async throws -> AcceptanceMetricsSnapshot {
         try assertActiveControls(in: app)
-        tracker.observe()
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(4))
         while clock.now < deadline {
@@ -1131,57 +981,24 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         )
     }
 
-    private func routeMatches(
-        _ snapshot: AcceptanceMetricsSnapshot,
-        algorithm: AcceptanceAlgorithm
-    ) -> Bool {
+    private func routeMatches(_ snapshot: AcceptanceMetricsSnapshot) -> Bool {
         if ["progressive", "progressiveSegmentedFrame"].contains(snapshot.scanType) {
             return snapshot.activeRoute == "bypass"
         }
         guard snapshot.scanType == "interlaced" else { return false }
-        switch algorithm {
-        case .appleTemporal:
-            return snapshot.activeRoute == "appleTemporal"
-                || snapshot.activeRoute == "rawTemporalFailure"
-        case .metalYADIF2x:
-            return snapshot.activeRoute == "metalYADIF2x"
-        }
-    }
-
-    @MainActor
-    private func focusAlgorithmButton(
-        _ button: XCUIElement,
-        algorithm: AcceptanceAlgorithm,
-        in app: XCUIApplication
-    ) throws {
-        let row = app.cells.containing(
-            .button,
-            identifier: algorithm.accessibilityIdentifier
-        ).element
-        try AcceptanceVerticalFocusNavigator.acquire(
-            target: .selectedAlgorithm,
-            direction: algorithm == .appleTemporal ? .up : .down,
-            targetHasFocus: {
-                row.wait(for: \.hasFocus, toEqual: true, timeout: 0.75)
-            },
-            move: { move in
-                XCUIRemote.shared.press(move == .up ? .up : .down)
-            }
-        )
+        return snapshot.activeRoute == "metalYADIF2x"
     }
 
     private func assertSteadyStateThresholds(
         _ snapshot: AcceptanceMetricsSnapshot,
         configuration: AcceptanceConfiguration
     ) {
-        XCTAssertEqual(snapshot.selectedAlgorithm, configuration.algorithm.rawValue)
         XCTAssertGreaterThan(snapshot.decoderCallbacksPerSecond, 0)
         XCTAssertGreaterThan(snapshot.presentationsPerSecond, 0)
         XCTAssertGreaterThan(snapshot.residentMemoryBytes, 0)
         XCTAssertLessThanOrEqual(snapshot.maximumPresentationQueueDepth, 12)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
-        XCTAssertEqual(snapshot.automaticAlgorithmSwitchCount, 0)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
         XCTAssertGreaterThan(snapshot.presentedVideoFrames, 0)
         if snapshot.elapsedSeconds >= 60 {
@@ -1203,7 +1020,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertEqual(snapshot.scanType, "progressive")
             XCTAssertEqual(snapshot.activeRoute, "bypass")
             XCTAssertEqual(snapshot.yadifKernelDispatchCount, 0)
-            XCTAssertEqual(snapshot.temporalDecodeFlagCount, 0)
             return
         }
         if ["东方卫视 HD", "五星体育 HD"].contains(configuration.channel) {
@@ -1211,29 +1027,13 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         }
         guard snapshot.scanType == "interlaced" else { return }
 
-        switch configuration.algorithm {
-        case .metalYADIF2x:
-            XCTAssertEqual(snapshot.activeRoute, "metalYADIF2x")
-            XCTAssertGreaterThan(snapshot.yadifKernelDispatchCount, 0)
-            XCTAssertGreaterThan(snapshot.gpuDurationP95Milliseconds, 0)
-            if validatesSteadyStatePerformance {
-                XCTAssertTrue((22...28).contains(snapshot.decoderCallbacksPerSecond))
-                XCTAssertTrue((45...55).contains(snapshot.presentationsPerSecond))
-                XCTAssertLessThanOrEqual(snapshot.gpuDurationP95Milliseconds, 16)
-            }
-        case .appleTemporal where snapshot.temporalUnavailableNoticeCount == 0:
-            XCTAssertEqual(snapshot.activeRoute, "appleTemporal")
-            XCTAssertGreaterThan(snapshot.temporalPropertySetCount, 0)
-            XCTAssertGreaterThan(snapshot.temporalDecodeFlagCount, 0)
-            if validatesSteadyStatePerformance {
-                XCTAssertNoThrow(try AcceptanceSnapshotValidator.validateMatchingAppleCadence(
-                    decoderCallbacksPerSecond: snapshot.decoderCallbacksPerSecond,
-                    presentationsPerSecond: snapshot.presentationsPerSecond
-                ))
-            }
-        case .appleTemporal:
-            XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 1)
-            XCTAssertEqual(snapshot.activeRoute, "rawTemporalFailure")
+        XCTAssertEqual(snapshot.activeRoute, "metalYADIF2x")
+        XCTAssertGreaterThan(snapshot.yadifKernelDispatchCount, 0)
+        XCTAssertGreaterThan(snapshot.gpuDurationP95Milliseconds, 0)
+        if validatesSteadyStatePerformance {
+            XCTAssertTrue((22...28).contains(snapshot.decoderCallbacksPerSecond))
+            XCTAssertTrue((45...55).contains(snapshot.presentationsPerSecond))
+            XCTAssertLessThanOrEqual(snapshot.gpuDurationP95Milliseconds, 16)
         }
     }
 
@@ -1266,24 +1066,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         XCTAssertLessThanOrEqual(growth, 32 * 1_024 * 1_024)
     }
 
-    @MainActor
-    private func assertTemporalCapabilityOutcome(
-        _ snapshot: AcceptanceMetricsSnapshot,
-        configuration: AcceptanceConfiguration,
-        tracker: CapabilityBannerTracker
-    ) {
-        guard configuration.algorithm == .appleTemporal,
-              snapshot.scanType == "interlaced" else { return }
-        if snapshot.temporalUnavailableNoticeCount == 1 {
-            XCTAssertEqual(snapshot.activeRoute, "rawTemporalFailure")
-            XCTAssertEqual(tracker.appearanceCount, 1)
-        } else {
-            XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 0)
-            XCTAssertEqual(snapshot.activeRoute, "appleTemporal")
-            XCTAssertEqual(tracker.appearanceCount, 0)
-        }
-    }
-
     private func elapsedSeconds(
         from start: ContinuousClock.Instant,
         clock: ContinuousClock
@@ -1307,8 +1089,6 @@ private enum AcceptanceValidationError: Error, Equatable {
     case counterRegressed
     case emptyCounterDelta
     case dropRatioExceeded
-    case cadenceOutsideBroadcastBands
-    case cadenceBandMismatch
 }
 
 private enum AcceptanceValidationPolicy {
@@ -1317,18 +1097,7 @@ private enum AcceptanceValidationPolicy {
     }
 }
 
-private enum AcceptanceAlgorithmSelectionPolicy {
-    static func requiresSelection(isSelected: Bool) -> Bool {
-        !isSelected
-    }
-}
-
 private enum AcceptanceSnapshotValidator {
-    private enum CadenceBand: Equatable {
-        case broadcast25
-        case broadcast50
-    }
-
     static func validateCounterDelta(
         previousPresented: UInt64,
         previousDropped: UInt64,
@@ -1350,51 +1119,6 @@ private enum AcceptanceSnapshotValidator {
         }
     }
 
-    static func validateMatchingAppleCadence(
-        decoderCallbacksPerSecond: Double,
-        presentationsPerSecond: Double
-    ) throws {
-        let decoderBand = try cadenceBand(for: decoderCallbacksPerSecond)
-        let presentationBand = try cadenceBand(for: presentationsPerSecond)
-        guard decoderBand == presentationBand else {
-            throw AcceptanceValidationError.cadenceBandMismatch
-        }
-    }
-
-    private static func cadenceBand(for rate: Double) throws -> CadenceBand {
-        if (22...28).contains(rate) { return .broadcast25 }
-        if (45...55).contains(rate) { return .broadcast50 }
-        throw AcceptanceValidationError.cadenceOutsideBroadcastBands
-    }
-}
-
-@MainActor
-private final class CapabilityBannerTracker {
-    private let banners: XCUIElementQuery
-    private let banner: XCUIElement
-    private var wasVisible = false
-    private(set) var appearanceCount = 0
-
-    init(app: XCUIApplication) {
-        banners = app.staticTexts.matching(identifier: "player-capability-notice")
-        banner = banners.element
-    }
-
-    func observe() {
-        let isVisible = banner.exists
-        XCTAssertLessThanOrEqual(banners.count, 1)
-        if isVisible, !wasVisible {
-            appearanceCount += 1
-        }
-        wasVisible = isVisible
-    }
-
-    func observeExpectedNotice() {
-        if appearanceCount == 0 {
-            XCTAssertTrue(banner.waitForExistence(timeout: 3))
-        }
-        observe()
-    }
 }
 
 private enum AcceptanceFailure: Error, Equatable, CustomStringConvertible {
@@ -1538,7 +1262,6 @@ private enum AcceptanceNavigationTarget: String, Equatable {
     case epgRefreshOutcome
     case epgProgrammeImport
     case settingsTab
-    case selectedAlgorithm
     case channelTab
     case requestedChannel
     case fullScreenPlayer
@@ -1749,7 +1472,6 @@ private struct AcceptanceConfiguration {
     let encodedEnvironment: [String: String]
     let channel: String
     let duration: TimeInterval
-    let algorithm: AcceptanceAlgorithm
 
     var channelOffsetFromFirst: Int? {
         switch channel {
@@ -1761,34 +1483,12 @@ private struct AcceptanceConfiguration {
     }
 }
 
-private enum AcceptanceAlgorithm: String {
-    case appleTemporal
-    case metalYADIF2x
-
-    var accessibilityIdentifier: String {
-        switch self {
-        case .appleTemporal: "settings.deinterlace.apple"
-        case .metalYADIF2x: "settings.deinterlace.yadif"
-        }
-    }
-
-    var opposite: Self {
-        switch self {
-        case .appleTemporal: .metalYADIF2x
-        case .metalYADIF2x: .appleTemporal
-        }
-    }
-}
-
 private struct AcceptanceMetricsSnapshot: Codable {
     let scanType: String
-    let selectedAlgorithm: String
     let activeRoute: String
     let decoderCallbacksPerSecond: Double
     let presentationsPerSecond: Double
     let yadifKernelDispatchCount: UInt64
-    let temporalPropertySetCount: UInt64
-    let temporalDecodeFlagCount: UInt64
     let staleGenerationDropCount: UInt64
     let droppedVideoFrames: UInt64
     let videoDropCountsBySource: [UInt64]
@@ -1799,12 +1499,10 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let gpuDurationP95Milliseconds: Double
     let avDriftP95Milliseconds: Double
     let residentMemoryBytes: UInt64
-    let automaticAlgorithmSwitchCount: UInt64
     let elapsedSeconds: Double
     let windowDurationSeconds: Double
     let presentedVideoFrames: UInt64
     let maximumAbsoluteAVDriftMilliseconds: Double
-    let temporalUnavailableNoticeCount: UInt64
     let crossGenerationPresentationCount: UInt64
     let audioRoute: String
     let audioReady: Bool

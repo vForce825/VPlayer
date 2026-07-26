@@ -53,7 +53,9 @@ final class PlaybackPresentationContextTests: XCTestCase {
         XCTAssertNil(view.displayLink.delegate)
     }
 
-    func testCadencePolicyUsesProcessedDurationAndRawTemporalFailureDoublesSourceCadence() throws {
+    // The cadence is the processed frame's own duration: the field-rate route
+    // has already doubled it by the time a frame reaches here.
+    func testCadencePolicyUsesProcessedDurationOnEveryRoute() throws {
         let frame25 = try presentationFrame(duration: CMTime(value: 1, timescale: 25))
         let frame50 = try presentationFrame(duration: CMTime(value: 1, timescale: 50))
 
@@ -62,19 +64,12 @@ final class PlaybackPresentationContextTests: XCTestCase {
             25
         )
         XCTAssertEqual(
-            PlaybackPresentationCadencePolicy.outputFrameRate(for: frame50, route: .appleTemporal),
-            50
-        )
-        XCTAssertEqual(
             PlaybackPresentationCadencePolicy.outputFrameRate(for: frame50, route: .metalYADIF2x),
             50
         )
         XCTAssertEqual(
-            PlaybackPresentationCadencePolicy.outputFrameRate(
-                for: frame25,
-                route: .rawInterlacedAfterTemporalFailure
-            ),
-            50
+            PlaybackPresentationCadencePolicy.outputFrameRate(for: frame25, route: .metalYADIF2x),
+            25
         )
         XCTAssertNil(PlaybackPresentationCadencePolicy.outputFrameRate(
             for: try presentationFrame(duration: .invalid),
@@ -82,7 +77,7 @@ final class PlaybackPresentationContextTests: XCTestCase {
         ))
         XCTAssertNil(PlaybackPresentationCadencePolicy.outputFrameRate(
             for: try presentationFrame(duration: .zero),
-            route: .rawInterlacedAfterTemporalFailure
+            route: .metalYADIF2x
         ))
     }
 
