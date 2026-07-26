@@ -116,6 +116,53 @@ struct SettingsSelectionLabel: View {
     }
 }
 
+/// A compact settings row. The choices live one navigation level deeper so the
+/// root settings screen stays short even as more tuning values are added.
+struct SettingsSummaryLink<Destination: View>: View {
+    let title: String
+    let value: String
+    let identifier: String
+    @ViewBuilder let destination: () -> Destination
+
+    var body: some View {
+        NavigationLink {
+            destination()
+        } label: {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(value)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
+        .accessibilityIdentifier(identifier)
+    }
+}
+
+struct VideoBufferSelectionView: View {
+    @Bindable var playback: PlaybackSettingsStore
+
+    var body: some View {
+        List {
+            PlaybackBufferRows(playback: playback)
+        }
+        .navigationTitle("视频缓冲")
+    }
+}
+
+struct DeinterlaceBufferSelectionView: View {
+    @Bindable var playback: PlaybackSettingsStore
+
+    var body: some View {
+        List {
+            DeinterlaceBufferRows(playback: playback)
+        }
+        .navigationTitle("反交错缓冲")
+    }
+}
+
 /// Raised over playback, where only the picture settings make sense — channel
 /// browsing preferences belong to the settings tab, not to a running stream.
 struct PlaybackSettingsView: View {
@@ -128,11 +175,19 @@ struct PlaybackSettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("视频缓冲") {
-                    PlaybackBufferRows(playback: settings)
+                SettingsSummaryLink(
+                    title: "视频缓冲",
+                    value: PlaybackBufferRows.videoBufferTitle(settings.videoBufferSeconds),
+                    identifier: "settings.buffer.video.current"
+                ) {
+                    VideoBufferSelectionView(playback: settings)
                 }
-                Section("反交错缓冲") {
-                    DeinterlaceBufferRows(playback: settings)
+                SettingsSummaryLink(
+                    title: "反交错缓冲",
+                    value: DeinterlaceBufferRows.title(settings.deinterlaceBufferFrames),
+                    identifier: "settings.buffer.deinterlace.current"
+                ) {
+                    DeinterlaceBufferSelectionView(playback: settings)
                 }
             }
             .navigationTitle("设置")

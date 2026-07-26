@@ -19,27 +19,59 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("视频缓冲") {
-                    PlaybackBufferRows(playback: playback)
+                SettingsSummaryLink(
+                    title: "视频缓冲",
+                    value: PlaybackBufferRows.videoBufferTitle(playback.videoBufferSeconds),
+                    identifier: "settings.buffer.video.current"
+                ) {
+                    VideoBufferSelectionView(playback: playback)
                 }
-                Section("反交错缓冲") {
-                    DeinterlaceBufferRows(playback: playback)
+                SettingsSummaryLink(
+                    title: "反交错缓冲",
+                    value: DeinterlaceBufferRows.title(playback.deinterlaceBufferFrames),
+                    identifier: "settings.buffer.deinterlace.current"
+                ) {
+                    DeinterlaceBufferSelectionView(playback: playback)
                 }
-                Section("频道排列") {
-                    groupingRow(
-                        title: "按播放列表分组（默认）",
-                        grouping: .playlistGroups,
-                        identifier: "settings.channels.grouped"
-                    )
-                    groupingRow(
-                        title: "按原始顺序平铺",
-                        grouping: .playlistOrder,
-                        identifier: "settings.channels.flat"
-                    )
+                SettingsSummaryLink(
+                    title: "频道排列",
+                    value: groupingTitle(channelBrowsing.grouping),
+                    identifier: "settings.channels.current"
+                ) {
+                    ChannelGroupingSelectionView(channelBrowsing: channelBrowsing)
                 }
             }
             .navigationTitle("设置")
         }
+    }
+
+    private func groupingTitle(_ grouping: ChannelGrouping) -> String {
+        switch grouping {
+        case .playlistGroups:
+            "按播放列表分组（默认）"
+        case .playlistOrder:
+            "按原始顺序平铺"
+        }
+    }
+}
+
+private struct ChannelGroupingSelectionView: View {
+    @Bindable var channelBrowsing: ChannelBrowsingSettingsStore
+
+    var body: some View {
+        List {
+            groupingRow(
+                title: "按播放列表分组（默认）",
+                grouping: .playlistGroups,
+                identifier: "settings.channels.grouped"
+            )
+            groupingRow(
+                title: "按原始顺序平铺",
+                grouping: .playlistOrder,
+                identifier: "settings.channels.flat"
+            )
+        }
+        .navigationTitle("频道排列")
     }
 
     private func groupingRow(
