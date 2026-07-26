@@ -512,8 +512,8 @@ final class YADIFNV12Kernel: @unchecked Sendable {
                     threadExecutionWidth: pipeline.threadExecutionWidth,
                     maxTotalThreadsPerThreadgroup: pipeline.maxTotalThreadsPerThreadgroup,
                     bytesPerCode: plane == 0
-                        ? MemoryLayout<Int32>.stride
-                        : MemoryLayout<SIMD2<Int32>>.stride,
+                        ? MemoryLayout<Int16>.stride
+                        : MemoryLayout<SIMD2<Int16>>.stride,
                     maximumDynamicMemoryLength: max(
                         0,
                         maximumThreadgroupMemoryLength - pipeline.staticThreadgroupMemoryLength

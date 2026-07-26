@@ -17,24 +17,27 @@ struct YADIFKernelUniforms {
 // — once per sample, and a synthesized pixel takes two dozen samples.
 template <typename Codes> struct PlaneCodec;
 
-template <> struct PlaneCodec<int> {
-    static inline int decode(uint4 texel, bool tenBit) {
-        return tenBit ? int(texel.x >> 6) : int(texel.x);
+// YADIF receives at most 10-bit code values. Its largest intermediate here is
+// a sum of three absolute differences (3 * 1023), so signed 16-bit lanes are
+// exact while using half the register and threadgroup storage of int lanes.
+template <> struct PlaneCodec<short> {
+    static inline short decode(uint4 texel, bool tenBit) {
+        return tenBit ? short(texel.x >> 6) : short(texel.x);
     }
 
-    static inline uint4 encode(int codes, bool tenBit) {
-        uint value = tenBit ? uint(codes << 6) : uint(codes);
+    static inline uint4 encode(short codes, bool tenBit) {
+        uint value = tenBit ? (uint(codes) << 6) : uint(codes);
         return uint4(value, 0, 0, 0);
     }
 };
 
-template <> struct PlaneCodec<int2> {
-    static inline int2 decode(uint4 texel, bool tenBit) {
-        return tenBit ? int2(texel.xy >> 6) : int2(texel.xy);
+template <> struct PlaneCodec<short2> {
+    static inline short2 decode(uint4 texel, bool tenBit) {
+        return tenBit ? short2(texel.xy >> 6) : short2(texel.xy);
     }
 
-    static inline uint4 encode(int2 codes, bool tenBit) {
-        uint2 value = tenBit ? uint2(codes << 6) : uint2(codes);
+    static inline uint4 encode(short2 codes, bool tenBit) {
+        uint2 value = tenBit ? (uint2(codes) << 6) : uint2(codes);
         return uint4(value.x, value.y, 0, 0);
     }
 };
@@ -92,7 +95,7 @@ inline void refineDirectionPair(
 
     Codes bestScore = select(score, nearScore, nearScore < score);
     Codes bestPrediction = select(prediction, nearPrediction, nearScore < score);
-    Codes maskedFarScore = select(Codes(0x7fffffff), farScore, nearScore < score);
+    Codes maskedFarScore = select(Codes(0x7fff), farScore, nearScore < score);
 
     score = select(bestScore, farScore, maskedFarScore < bestScore);
     prediction = select(bestPrediction, farPrediction, maskedFarScore < bestScore);
@@ -187,9 +190,12 @@ inline Codes synthesize(
                 max(farAbove - currentAbove, farBelow - currentBelow)
             )
         );
-        bound = max(bound, max(lower, -upper));
+        Codes negatedUpper = -upper;
+        bound = max(bound, max(lower, negatedUpper));
     }
-    return clamp(prediction, center - bound, center + bound);
+    Codes minimum = center - bound;
+    Codes maximum = center + bound;
+    return clamp(prediction, minimum, maximum);
 }
 
 // One thread owns one row pair: the line copied straight from the current
@@ -312,13 +318,13 @@ kernel void yadifPlane8(
     texture2d<uint, access::read> current [[texture(1)]],
     texture2d<uint, access::read> next [[texture(2)]],
     texture2d<uint, access::write> output [[texture(3)]],
-    threadgroup int *spatialRows [[threadgroup(0)]],
+    threadgroup short *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
     uint2 position [[thread_position_in_grid]],
     uint2 localPosition [[thread_position_in_threadgroup]],
     uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int, false>(
+    runYADIF<short, false>(
         previous, current, next, output, spatialRows, uniforms,
         position, localPosition, threadsPerThreadgroup
     );
@@ -329,13 +335,13 @@ kernel void yadifPlane16(
     texture2d<uint, access::read> current [[texture(1)]],
     texture2d<uint, access::read> next [[texture(2)]],
     texture2d<uint, access::write> output [[texture(3)]],
-    threadgroup int *spatialRows [[threadgroup(0)]],
+    threadgroup short *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
     uint2 position [[thread_position_in_grid]],
     uint2 localPosition [[thread_position_in_threadgroup]],
     uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int, true>(
+    runYADIF<short, true>(
         previous, current, next, output, spatialRows, uniforms,
         position, localPosition, threadsPerThreadgroup
     );
@@ -346,13 +352,13 @@ kernel void yadifChroma8(
     texture2d<uint, access::read> current [[texture(1)]],
     texture2d<uint, access::read> next [[texture(2)]],
     texture2d<uint, access::write> output [[texture(3)]],
-    threadgroup int2 *spatialRows [[threadgroup(0)]],
+    threadgroup short2 *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
     uint2 position [[thread_position_in_grid]],
     uint2 localPosition [[thread_position_in_threadgroup]],
     uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int2, false>(
+    runYADIF<short2, false>(
         previous, current, next, output, spatialRows, uniforms,
         position, localPosition, threadsPerThreadgroup
     );
@@ -363,13 +369,13 @@ kernel void yadifChroma16(
     texture2d<uint, access::read> current [[texture(1)]],
     texture2d<uint, access::read> next [[texture(2)]],
     texture2d<uint, access::write> output [[texture(3)]],
-    threadgroup int2 *spatialRows [[threadgroup(0)]],
+    threadgroup short2 *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
     uint2 position [[thread_position_in_grid]],
     uint2 localPosition [[thread_position_in_threadgroup]],
     uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int2, true>(
+    runYADIF<short2, true>(
         previous, current, next, output, spatialRows, uniforms,
         position, localPosition, threadsPerThreadgroup
     );
