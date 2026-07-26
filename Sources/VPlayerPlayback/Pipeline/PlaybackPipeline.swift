@@ -1190,6 +1190,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             return
         }
 
+        var estimatedBytes = retainedVideo.reduce(into: 0) { total, frame in
+            let addition = total.addingReportingOverflow(frame.estimatedStorageBytes)
+            total = addition.overflow ? Int.max : addition.partialValue
+        }
         while retainedVideo.count > 1 {
             let span = CMTimeSubtract(
                 retainedVideo[retainedVideo.count - 1].presentationTimeStamp,
@@ -1201,10 +1205,15 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             // whenever the output frame rate doubles.
             let overHorizon = span.isNumeric
                 && CMTimeCompare(span, tuning.videoBufferHorizon) > 0
-            guard overHorizon || retainedVideo.count > tuning.videoBufferFrameCeiling else {
+            let overMemoryBudget = estimatedBytes
+                > PlaybackVideoMemoryBudget.retainedAnchorBytes
+            guard overHorizon
+                    || overMemoryBudget
+                    || retainedVideo.count > tuning.videoBufferFrameCeiling else {
                 return
             }
-            retainedVideo.removeFirst()
+            let removed = retainedVideo.removeFirst()
+            estimatedBytes = max(0, estimatedBytes - removed.estimatedStorageBytes)
         }
     }
 

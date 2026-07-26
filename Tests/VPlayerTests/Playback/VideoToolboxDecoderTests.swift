@@ -10,6 +10,21 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VideoToolboxDecoderTests: XCTestCase {
+    func testDecoderOutputPoolFloorShrinksForFourKP010Memory() {
+        XCTAssertEqual(
+            PlaybackTuning.default.decoderOutputPoolFloor(
+                for: CMVideoDimensions(width: 1_920, height: 1_080)
+            ),
+            PlaybackTuning.default.decoderOutputPoolFloor
+        )
+        XCTAssertEqual(
+            PlaybackTuning.default.decoderOutputPoolFloor(
+                for: CMVideoDimensions(width: 3_840, height: 2_160)
+            ),
+            10
+        )
+    }
+
     func testBothFieldsConfigurationUsesExactHardwareAndImageProperties() throws {
         let harness = makeHarness()
 

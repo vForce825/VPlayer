@@ -91,6 +91,43 @@ final class VideoPresentationQueueTests: XCTestCase {
         XCTAssertEqual(first.droppedFrameCount, 9)
     }
 
+    func testFourKHDRQueueIsBoundedByDecodedSurfaceMemory() throws {
+        let estimatedFrameBytes = PlaybackVideoMemoryBudget.estimated420SurfaceBytes(
+            dimensions: CMVideoDimensions(width: 3_840, height: 2_160),
+            bitDepth: 10
+        )
+        XCTAssertEqual(estimatedFrameBytes, 24_883_200)
+        XCTAssertEqual(
+            PlaybackVideoMemoryBudget.maximumFrameCount(
+                byteBudget: PlaybackVideoMemoryBudget.presentationQueueBytes,
+                estimatedFrameBytes: estimatedFrameBytes
+            ),
+            21
+        )
+        let queue = VideoPresentationQueue(
+            generation: generation,
+            horizon: rational(2, 1),
+            frameCeiling: 240,
+            byteBudget: estimatedFrameBytes * 3
+        )
+        for index in (0..<8).reversed() {
+            XCTAssertTrue(queue.enqueue(try frame(
+                id: UInt64(index),
+                pts: rational(index, 50),
+                duration: rational(1, 50),
+                metadata: makeMetadata(
+                    dimensions: CMVideoDimensions(width: 3_840, height: 2_160),
+                    bitDepth: 10
+                )
+            )))
+        }
+
+        XCTAssertEqual(queue.unpresentedCount, 3)
+        let next = queue.select(targetMediaTime: .zero, displayInterval: rational(1, 50))
+        XCTAssertEqual(next.frame?.sourceAccessUnitID, 0)
+        XCTAssertEqual(next.overflowDropCount, 5)
+    }
+
     func testHorizonIsConfigurableAndRejectsNonPositiveValues() throws {
         let half = VideoPresentationQueue(generation: generation, horizon: rational(1, 2))
         XCTAssertEqual(half.horizonSeconds, 0.5, accuracy: 0.0001)
@@ -283,7 +320,8 @@ final class VideoPresentationQueueTests: XCTestCase {
         sequence: UInt64 = 0,
         pts: CMTime,
         duration: CMTime = CMTime(value: 1, timescale: 25),
-        generation: MediaGeneration? = nil
+        generation: MediaGeneration? = nil,
+        metadata: VideoFormatMetadata? = nil
     ) throws -> VideoPresentationFrame {
         var pixelBuffer: CVPixelBuffer?
         XCTAssertEqual(CVPixelBufferCreate(nil, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixelBuffer), kCVReturnSuccess)
@@ -294,14 +332,17 @@ final class VideoPresentationQueueTests: XCTestCase {
             generation: generation ?? self.generation,
             sequenceNumber: sequence,
             sourceAccessUnitID: id,
-            formatMetadata: makeMetadata()
+            formatMetadata: metadata ?? makeMetadata()
         )
     }
 
-    private func makeMetadata() -> VideoFormatMetadata {
+    private func makeMetadata(
+        dimensions: CMVideoDimensions = CMVideoDimensions(width: 2, height: 2),
+        bitDepth: Int = 8
+    ) -> VideoFormatMetadata {
         VideoFormatMetadata(
-            dimensions: CMVideoDimensions(width: 2, height: 2),
-            bitDepth: 8,
+            dimensions: dimensions,
+            bitDepth: bitDepth,
             range: .video,
             matrix: .bt709,
             transfer: .bt709,
