@@ -4,22 +4,17 @@
 
 public enum DeinterlaceRoute: Equatable, Sendable {
     case rawWhileClassifying
-    case rawTemporalFailure
     case bypass
-    case appleTemporal
     case metalYADIF2x
 
-    public static func resolve(
-        scan: ScanType,
-        selected: DeinterlaceAlgorithm
-    ) -> DeinterlaceRoute {
+    public static func resolve(scan: ScanType) -> DeinterlaceRoute {
         switch scan {
         case .unknown:
             .rawWhileClassifying
         case .progressive, .progressiveSegmentedFrame:
             .bypass
         case .interlaced:
-            selected == .appleTemporal ? .appleTemporal : .metalYADIF2x
+            .metalYADIF2x
         }
     }
 }

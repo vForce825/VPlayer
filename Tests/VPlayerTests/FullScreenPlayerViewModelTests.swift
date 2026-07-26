@@ -39,10 +39,10 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         )
     }
 
-    func testStartSubscribesBeforeAlgorithmPlayAndPresentationLookup() async throws {
+    func testStartSubscribesBeforePlayAndPresentationLookup() async throws {
         let log = ViewModelOperationLog()
         let engine = ViewModelPlaybackEngine(log: log)
-        let settings = makeSettings(algorithm: .metalYADIF2x)
+        let settings = makeSettings()
         let model = FullScreenPlayerViewModel(
             request: makeRequest(),
             engine: engine,
@@ -54,10 +54,10 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         )
 
         model.start()
-        try await eventually { log.values.count >= 5 }
+        try await eventually { log.values.count >= 4 }
 
-        XCTAssertEqual(Array(log.values.prefix(5)), [
-            "events", "notices", "algorithm:metalYADIF2x", "play", "presentation",
+        XCTAssertEqual(Array(log.values.prefix(4)), [
+            "events", "notices", "play", "presentation",
         ])
     }
 
@@ -69,7 +69,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             request: request,
             engine: engine,
             presentationProvider: { nil },
-            settings: makeSettings(algorithm: .appleTemporal)
+            settings: makeSettings()
         )
         model.start()
         try await eventually { await engine.playCount == 1 }
@@ -94,7 +94,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             request: makeRequest(),
             engine: engine,
             presentationProvider: { nil },
-            settings: makeSettings(algorithm: .appleTemporal),
+            settings: makeSettings(),
             sleep: { try await sleep.sleep(for: $0) }
         )
         model.start()
@@ -128,7 +128,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             request: makeRequest(),
             engine: engine,
             presentationProvider: { nil },
-            settings: makeSettings(algorithm: .appleTemporal)
+            settings: makeSettings()
         )
         let firstFinished = ViewModelFlag()
         let secondFinished = ViewModelFlag()
@@ -177,7 +177,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
                 await providerGate.wait()
                 return lateContext
             },
-            settings: makeSettings(algorithm: .appleTemporal)
+            settings: makeSettings()
         )
         let stopFinished = ViewModelFlag()
 
@@ -214,7 +214,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             request: makeRequest(),
             engine: engine,
             presentationProvider: { await provider.next() },
-            settings: makeSettings(algorithm: .appleTemporal)
+            settings: makeSettings()
         )
 
         model.start()
@@ -244,7 +244,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             request: makeRequest(),
             engine: engine,
             presentationProvider: { nil },
-            settings: makeSettings(algorithm: .appleTemporal)
+            settings: makeSettings()
         )
         model.start()
         try await eventually { await engine.playCount == 1 }
@@ -276,7 +276,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             request: request,
             engine: engine,
             presentationProvider: { nil },
-            settings: makeSettings(algorithm: .appleTemporal)
+            settings: makeSettings()
         )
         model.start()
         try await eventually { await engine.subscriberCount == 2 }
@@ -301,34 +301,34 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertLessThan(pauseEnd, stopStart)
     }
 
-    func testSettingsAlgorithmSelectionControllerSerializesRapidChanges() async throws {
-        let firstAlgorithmGate = ViewModelAsyncGate()
+    func testSettingsTuningSelectionControllerSerializesRapidChanges() async throws {
+        let firstTuningGate = ViewModelAsyncGate()
         let engine = ControlledViewModelPlaybackEngine(
-            suspendedAlgorithmCall: 1,
-            algorithmGate: firstAlgorithmGate
+            suspendedTuningCall: 1,
+            tuningGate: firstTuningGate
         )
-        let controller = PlaybackAlgorithmSelectionController(engine: engine)
+        let controller = PlaybackTuningSelectionController(engine: engine)
+        let first = PlaybackTuning(videoBufferSeconds: 1)
+        let second = PlaybackTuning(videoBufferSeconds: 4)
 
-        controller.select(.metalYADIF2x)
-        try await eventually { await firstAlgorithmGate.hasWaiter }
-        controller.select(.appleTemporal)
+        controller.apply(first)
+        try await eventually { await firstTuningGate.hasWaiter }
+        controller.apply(second)
         await Task.yield()
-        let algorithmsBeforeRelease = await engine.completedAlgorithms
-        XCTAssertTrue(algorithmsBeforeRelease.isEmpty)
+        let tuningsBeforeRelease = await engine.completedTunings
+        XCTAssertTrue(tuningsBeforeRelease.isEmpty)
 
-        await firstAlgorithmGate.open()
-        try await eventually { await engine.completedAlgorithms.count == 2 }
-        let algorithms = await engine.completedAlgorithms
-        XCTAssertEqual(algorithms.last, .appleTemporal)
+        await firstTuningGate.open()
+        try await eventually { await engine.completedTunings.count == 2 }
+        let tunings = await engine.completedTunings
+        XCTAssertEqual(tunings, [first, second])
     }
 
-    private func makeSettings(algorithm: DeinterlaceAlgorithm) -> PlaybackSettingsStore {
+    private func makeSettings() -> PlaybackSettingsStore {
         let suite = "FullScreenPlayerViewModelTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite) ?? .standard
         defaults.removePersistentDomain(forName: suite)
-        let settings = PlaybackSettingsStore(defaults: defaults)
-        settings.deinterlaceAlgorithm = algorithm
-        return settings
+        return PlaybackSettingsStore(defaults: defaults)
     }
 
     private func makeRequest() -> PlaybackRequest {
@@ -445,16 +445,16 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     private let stopGate: ViewModelAsyncGate?
     private let suspendedPlayCall: Int?
     private let playGate: ViewModelAsyncGate?
-    private let suspendedAlgorithmCall: Int?
-    private let algorithmGate: ViewModelAsyncGate?
+    private let suspendedTuningCall: Int?
+    private let tuningGate: ViewModelAsyncGate?
     private let pauseGate: ViewModelAsyncGate?
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
     private(set) var playCount = 0
     private(set) var stopCount = 0
-    private(set) var completedAlgorithms: [DeinterlaceAlgorithm] = []
+    private(set) var completedTunings: [PlaybackTuning] = []
     private(set) var operations: [String] = []
-    private var algorithmCallCount = 0
+    private var tuningCallCount = 0
 
     var subscriberCount: Int { eventContinuations.count + noticeContinuations.count }
 
@@ -463,16 +463,16 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         stopGate: ViewModelAsyncGate? = nil,
         suspendedPlayCall: Int? = nil,
         playGate: ViewModelAsyncGate? = nil,
-        suspendedAlgorithmCall: Int? = nil,
-        algorithmGate: ViewModelAsyncGate? = nil,
+        suspendedTuningCall: Int? = nil,
+        tuningGate: ViewModelAsyncGate? = nil,
         pauseGate: ViewModelAsyncGate? = nil
     ) {
         self.eventsGate = eventsGate
         self.stopGate = stopGate
         self.suspendedPlayCall = suspendedPlayCall
         self.playGate = playGate
-        self.suspendedAlgorithmCall = suspendedAlgorithmCall
-        self.algorithmGate = algorithmGate
+        self.suspendedTuningCall = suspendedTuningCall
+        self.tuningGate = tuningGate
         self.pauseGate = pauseGate
     }
 
@@ -523,11 +523,11 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         operations.append("stop:end")
     }
 
-    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async {
-        algorithmCallCount += 1
-        let call = algorithmCallCount
-        if suspendedAlgorithmCall == call, let algorithmGate { await algorithmGate.wait() }
-        completedAlgorithms.append(algorithm)
+    func setTuning(_ tuning: PlaybackTuning) async {
+        tuningCallCount += 1
+        let call = tuningCallCount
+        if suspendedTuningCall == call, let tuningGate { await tuningGate.wait() }
+        completedTunings.append(tuning)
     }
 
     private func removeEventContinuation(_ id: UUID) {
@@ -607,8 +607,8 @@ private actor ViewModelPlaybackEngine: PlaybackEngine {
         log.append("stop")
     }
 
-    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async {
-        log.append("algorithm:\(algorithm.rawValue)")
+    func setTuning(_ tuning: PlaybackTuning) async {
+        log.append("tuning:\(tuning.videoBufferSeconds)")
     }
 
     func emit(state: PlaybackState) {

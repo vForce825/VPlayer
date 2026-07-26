@@ -270,7 +270,6 @@ final class MetalVideoRendererTests: XCTestCase {
 
     func testAcceptanceMetricsCountOnlySuccessfulNewFrameCompletions() throws {
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: "channel",
             now: { 60 },
             residentMemoryProvider: { 1 }
@@ -326,7 +325,6 @@ final class MetalVideoRendererTests: XCTestCase {
 
     func testFlushDrainsSuccessfulPresentationBeforeAdvancingGeneration() throws {
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: "channel",
             now: { 60 },
             residentMemoryProvider: { 1 }
@@ -363,7 +361,6 @@ final class MetalVideoRendererTests: XCTestCase {
 
     func testSelectionDropsAreCountedExactlyOnceEvenWhenSubmissionFails() throws {
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: "channel",
             now: { 60 },
             residentMemoryProvider: { 1 }

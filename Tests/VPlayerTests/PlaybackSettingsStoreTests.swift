@@ -14,34 +14,6 @@ final class PlaybackSettingsStoreTests: XCTestCase {
         UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
     }
 
-    func testDefaultsToAppleTemporalAndPersistsYADIF() {
-        let defaults = UserDefaults(suiteName: suite)!
-        var store: PlaybackSettingsStore? = PlaybackSettingsStore(defaults: defaults)
-        XCTAssertEqual(store?.deinterlaceAlgorithm, .appleTemporal)
-        store?.deinterlaceAlgorithm = .metalYADIF2x
-        store = PlaybackSettingsStore(defaults: defaults)
-        XCTAssertEqual(store?.deinterlaceAlgorithm, .metalYADIF2x)
-    }
-
-    func testUnknownStoredValueFallsBackToAppleTemporal() {
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.set("removed-mode", forKey: PlaybackSettingsStore.storageKey)
-        XCTAssertEqual(PlaybackSettingsStore(defaults: defaults).deinterlaceAlgorithm, .appleTemporal)
-    }
-
-    func testDistinctAlgorithmChangesNotifyTheInstalledApplicationBinding() {
-        let defaults = UserDefaults(suiteName: suite)!
-        let store = PlaybackSettingsStore(defaults: defaults)
-        var observed: [DeinterlaceAlgorithm] = []
-        store.setDeinterlaceAlgorithmChangeHandler { observed.append($0) }
-
-        store.deinterlaceAlgorithm = .metalYADIF2x
-        store.deinterlaceAlgorithm = .metalYADIF2x
-        store.deinterlaceAlgorithm = .appleTemporal
-
-        XCTAssertEqual(observed, [.metalYADIF2x, .appleTemporal])
-    }
-
     func testBufferLengthsDefaultAndPersistAcrossLaunches() {
         let defaults = UserDefaults(suiteName: suite)!
         var store: PlaybackSettingsStore? = PlaybackSettingsStore(defaults: defaults)

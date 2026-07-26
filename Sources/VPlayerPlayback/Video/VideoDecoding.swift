@@ -108,31 +108,12 @@ public struct DecodedVideoFrame: @unchecked Sendable {
     }
 }
 
-public enum VideoDecodeConfiguration: Sendable, Equatable {
-    case bothFields
-    case appleTemporal
-}
-
-public enum AppleTemporalFailure: Error, Equatable, Sendable {
-    case unsupportedProperty(String)
-    case propertySetFailed(key: String, status: OSStatus)
-    case initializationFailed(status: OSStatus)
-    case processingFailed(status: OSStatus)
-}
-
 public enum VideoDecoderFailure: Error, Sendable, Equatable {
-    case unsupportedConfiguration(VideoDecodeConfiguration)
     case sessionCreate(OSStatus)
     case softwareDecoder
     case badData(OSStatus)
     case malfunction(OSStatus)
     case backpressureTimeout
-    case temporalUnavailable(AppleTemporalFailure)
-
-    public var isTemporalUnavailable: Bool {
-        if case .temporalUnavailable = self { return true }
-        return false
-    }
 }
 
 public enum VideoDecoderEvent: @unchecked Sendable {
@@ -148,11 +129,7 @@ public enum VideoDecoderEvent: @unchecked Sendable {
 }
 
 public protocol VideoDecoding: AnyObject {
-    func configure(
-        format: CMVideoFormatDescription,
-        generation: MediaGeneration,
-        configuration: VideoDecodeConfiguration
-    ) throws
+    func configure(format: CMVideoFormatDescription, generation: MediaGeneration) throws
     /// Hands an access unit to the decoder. Submission is asynchronous, so a
     /// failure to submit arrives as `VideoDecoderEvent.submissionFailure`
     /// rather than as a `throw`; the signature stays throwing for decoders that
@@ -162,20 +139,8 @@ public protocol VideoDecoding: AnyObject {
     func waitForAsynchronousFrames() throws
     func invalidate()
     func setTuning(_ tuning: PlaybackTuning)
-    /// Whether the decoder behind the session built so far implements what a
-    /// configuration needs.
-    ///
-    /// Answering before the route commits is the whole point: reconfiguring the
-    /// decoder costs a generation reset and the frames up to the next
-    /// random-access point, and paying that to discover a configuration the
-    /// decoder never had is a hiccup on every channel start.
-    ///
-    /// `true` when nothing is known yet — an unproven configuration is worth one
-    /// attempt, an impossible one is not.
-    func supportsConfiguration(_ configuration: VideoDecodeConfiguration) -> Bool
 }
 
 public extension VideoDecoding {
     func setTuning(_ tuning: PlaybackTuning) {}
-    func supportsConfiguration(_ configuration: VideoDecodeConfiguration) -> Bool { true }
 }

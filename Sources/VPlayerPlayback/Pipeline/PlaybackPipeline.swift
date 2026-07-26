@@ -11,7 +11,6 @@ import VideoToolbox
 
 enum PlaybackPipelineEvent: Sendable, Equatable {
     case ready(readinessCycle: UInt64)
-    case notice(PlaybackNotice)
     case stopped
     case failed(PlaybackCoreError)
 }
@@ -21,14 +20,12 @@ protocol PlaybackPipelineProtocol: AnyObject, Sendable {
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot?
     func start(url: URL)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
-    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm)
     func setTuning(_ tuning: PlaybackTuning)
     func stop() async
 }
 
 protocol PlaybackPipelineFactory: Sendable {
     func makePipeline(
-        selectedAlgorithm: DeinterlaceAlgorithm,
         tuning: PlaybackTuning,
         channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
@@ -250,7 +247,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         processor: any VideoFrameProcessing,
         yadifProcessor: any YADIFFrameProcessing,
         scanProbe: (any LumaScanProbing)? = nil,
-        selectedAlgorithm: DeinterlaceAlgorithm = .appleTemporal,
         tuning: PlaybackTuning = .default,
         rawReadinessRequirementOverride: Int? = nil,
         renderer: any PlaybackVideoRendering,
@@ -280,7 +276,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             yadif: yadifProcessor,
             probe: scanProbe,
             initialGeneration: generationController.current,
-            selectedAlgorithm: selectedAlgorithm,
             rawReadinessRequirementOverride: rawReadinessRequirementOverride,
             metrics: metrics,
             signposts: signposts,
@@ -305,12 +300,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 deliver: { [weak self] frames, generation in
                     self?.handleProcessedFrames(.success(frames), generation: generation)
                 },
-                notice: { [weak self] notice, generation in
-                    guard let self,
-                          generationController.accepts(generation),
-                          !terminal else { return }
-                    eventSink(.notice(notice))
-                },
                 fail: { [weak self] failure, generation in
                     guard let self,
                           generationController.accepts(generation) else { return }
@@ -328,14 +317,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     func setPaused(_ paused: Bool, readinessCycle: UInt64) {
         executor.submit { [weak self] in
             self?.setPausedIsolated(paused, readinessCycle: readinessCycle)
-        }
-    }
-
-    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
-        executor.submit { [weak self] in
-            guard let self, !terminal else { return }
-            metrics?.update(selectedAlgorithm: algorithm)
-            videoCoordinator.setAlgorithm(algorithm)
         }
     }
 
@@ -455,8 +436,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     static func coreError(for failure: VideoDecoderFailure) -> PlaybackCoreError {
         switch failure {
-        case .unsupportedConfiguration:
-            .videoDecode(kVTVideoDecoderUnsupportedDataFormatErr)
         case let .sessionCreate(status):
             .videoDecode(status)
         case .softwareDecoder:
@@ -465,15 +444,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             .videoDecode(status)
         case .backpressureTimeout:
             .videoDecode(kVTVideoDecoderNotAvailableNowErr)
-        case let .temporalUnavailable(failure):
-            switch failure {
-            case .unsupportedProperty:
-                .videoDecode(kVTPropertyNotSupportedErr)
-            case let .propertySetFailed(_, status),
-                 let .initializationFailed(status),
-                 let .processingFailed(status):
-                .videoDecode(status)
-            }
         }
     }
 
@@ -1161,12 +1131,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         switch route {
         case .bypass, .rawWhileClassifying:
             .progressive
-        case .appleTemporal:
-            .appleTemporal
         case .metalYADIF2x:
             .metalYADIF2x
-        case .rawTemporalFailure:
-            .rawInterlacedAfterTemporalFailure
         }
     }
 
@@ -1482,13 +1448,11 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
 
 struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
     func makePipeline(
-        selectedAlgorithm: DeinterlaceAlgorithm,
         tuning: PlaybackTuning,
         channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) throws -> any PlaybackPipelineProtocol {
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: selectedAlgorithm,
             channelID: channelID
         )
         let signposts = PlaybackSignposts(channelIdentifier: metrics.channelIdentifier)
@@ -1570,7 +1534,6 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             processor: PassthroughVideoProcessor(),
             yadifProcessor: yadif,
             scanProbe: probe,
-            selectedAlgorithm: selectedAlgorithm,
             tuning: tuning,
             renderer: renderer,
             audio: audio,

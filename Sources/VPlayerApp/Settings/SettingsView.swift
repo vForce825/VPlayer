@@ -10,8 +10,6 @@ import VPlayerPlayback
 struct SettingsView: View {
     @Bindable var playback: PlaybackSettingsStore
     @Bindable var channelBrowsing: ChannelBrowsingSettingsStore
-    @Namespace private var settingsFocus
-    private let focusPolicy = AcceptanceFocusPolicy.current()
 
     init(playback: PlaybackSettingsStore, channelBrowsing: ChannelBrowsingSettingsStore) {
         self.playback = playback
@@ -19,24 +17,8 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        Group {
-            if focusPolicy.isEnabled {
-                content
-                    .focusScope(settingsFocus)
-            } else {
-                content
-            }
-        }
-    }
-
-    private var content: some View {
         NavigationStack {
             List {
-                // Deinterlacing stays first: the acceptance harness enters this
-                // screen expecting an algorithm row to be the first stop.
-                Section("反交错") {
-                    DeinterlaceAlgorithmRows(playback: playback, focusNamespace: settingsFocus)
-                }
                 Section("视频缓冲") {
                     PlaybackBufferRows(playback: playback)
                 }

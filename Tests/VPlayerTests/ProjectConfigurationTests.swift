@@ -334,10 +334,10 @@ final class ProjectConfigurationTests: XCTestCase {
             editor.components(separatedBy: ".autocorrectionDisabled()").count - 1,
             2
         )
-        XCTAssertTrue(settings.contains("@Namespace private var settingsFocus"))
-        XCTAssertTrue(settings.contains(".prefersDefaultFocus("))
-        XCTAssertTrue(settings.contains(".focusScope(settingsFocus)"))
-        XCTAssertTrue(settings.contains("focusPolicy.settingsControl"))
+        // The picture settings are plain selection rows now; nothing on the
+        // screen needs a scoped default focus target.
+        XCTAssertFalse(settings.contains(".prefersDefaultFocus("))
+        XCTAssertFalse(settings.contains(".focusScope("))
         XCTAssertTrue(channels.contains(
             "@FocusState private var focusedChannelID: String?"
         ))

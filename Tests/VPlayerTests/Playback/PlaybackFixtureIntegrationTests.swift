@@ -157,11 +157,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
 
             try perform(on: executor) {
                 processor.reset(to: generation)
-                try decoder.configure(
-                    format: format,
-                    generation: generation,
-                    configuration: .bothFields
-                )
+                try decoder.configure(format: format, generation: generation)
                 for accessUnit in assembled.videoAccessUnits {
                     try decoder.decode(accessUnit, flags: [])
                 }

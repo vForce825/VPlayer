@@ -9,9 +9,7 @@ import UIKit
 
 public enum PlaybackPresentationRoute: UInt8, Sendable, Equatable {
     case progressive
-    case appleTemporal
     case metalYADIF2x
-    case rawInterlacedAfterTemporalFailure
 }
 
 public enum PlaybackPresentationCadencePolicy {
@@ -24,10 +22,7 @@ public enum PlaybackPresentationCadencePolicy {
               duration.epoch == 0,
               duration.value > 0,
               duration.timescale > 0 else { return nil }
-        var rate = Float(duration.timescale) / Float(duration.value)
-        if route == .rawInterlacedAfterTemporalFailure {
-            rate *= 2
-        }
+        let rate = Float(duration.timescale) / Float(duration.value)
         guard rate.isFinite, rate > 0 else { return nil }
         return min(rate, 120)
     }

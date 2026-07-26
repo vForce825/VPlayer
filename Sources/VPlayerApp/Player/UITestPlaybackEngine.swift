@@ -59,14 +59,6 @@ actor UITestPlaybackEngine: PlaybackEngine {
             return
         }
         publish(.playing(request))
-        if fixture == "interlaced-temporal-unsupported" {
-            publish(PlaybackNotice(
-                id: "temporal-unavailable",
-                message: "Apple 反交错不可用，可在设置中切换到 Metal YADIF 2x。",
-                duration: .seconds(3),
-                isFocusStealing: false
-            ))
-        }
     }
 
     func setPaused(_ paused: Bool) async {
@@ -77,10 +69,6 @@ actor UITestPlaybackEngine: PlaybackEngine {
     func stop() async {
         request = nil
         publish(.stopped)
-    }
-
-    func setDeinterlaceAlgorithm(_ algorithm: DeinterlaceAlgorithm) async {
-        _ = algorithm
     }
 
     private func publish(_ state: PlaybackState) {

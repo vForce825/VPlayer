@@ -132,16 +132,13 @@ struct AppDependencies {
         self.foregroundRefreshDriver = foregroundRefreshDriver
         self.backgroundRefreshRegistrar = backgroundRefreshRegistrar
 
-        let algorithmSelection = PlaybackAlgorithmSelectionController(
+        let tuningSelection = PlaybackTuningSelectionController(
             engine: resolvedPlaybackEngine
         )
-        playbackSettings.setDeinterlaceAlgorithmChangeHandler(
-            algorithmSelection.select
-        )
-        playbackSettings.setTuningChangeHandler(algorithmSelection.apply)
+        playbackSettings.setTuningChangeHandler(tuningSelection.apply)
         // A stored buffer length has to reach the engine before the first stream
         // starts, otherwise the setting only takes effect once it is changed.
-        algorithmSelection.apply(playbackSettings.tuning)
+        tuningSelection.apply(playbackSettings.tuning)
     }
 
     static func live() -> Self {

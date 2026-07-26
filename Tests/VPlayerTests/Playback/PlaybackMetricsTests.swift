@@ -11,7 +11,6 @@ final class PlaybackMetricsTests: XCTestCase {
     func testMetricsSnapshotTracksBoundedQueuesRatesAndRequiredCounters() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .metalYADIF2x,
             channelID: "https://secret.example/live?token=do-not-export",
             now: { clock.value },
             residentMemoryProvider: { 123_456 }
@@ -58,11 +57,8 @@ final class PlaybackMetricsTests: XCTestCase {
             metrics.recordYADIFKernelDispatch(inFlightCount: min(3, duration), inputDepth: min(4, duration))
             metrics.recordGPUDuration(milliseconds: Double(duration))
         }
-        metrics.recordTemporalPropertySet(count: 2)
-        metrics.recordTemporalDecodeFlag()
         metrics.recordStaleGenerationDrop()
         metrics.recordVideoDrop(count: 1, source: .deinterlaceQueueFull)
-        metrics.recordTemporalUnavailableNotice()
         metrics.recordDemuxPacket()
         metrics.recordDemuxPacket()
         metrics.recordVideoAccessUnit()
@@ -76,7 +72,6 @@ final class PlaybackMetricsTests: XCTestCase {
         let snapshot = metrics.snapshot(window: .seconds(60))
 
         XCTAssertEqual(snapshot.scanType, "interlaced")
-        XCTAssertEqual(snapshot.selectedAlgorithm, .metalYADIF2x)
         XCTAssertEqual(snapshot.activeRoute, "metalYADIF2x")
         XCTAssertEqual(snapshot.elapsedSeconds, 60, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.windowDurationSeconds, 60, accuracy: 0.000_001)
@@ -84,8 +79,6 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.presentationsPerSecond, 0.5, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.presentedVideoFrames, 30)
         XCTAssertEqual(snapshot.yadifKernelDispatchCount, 20)
-        XCTAssertEqual(snapshot.temporalPropertySetCount, 2)
-        XCTAssertEqual(snapshot.temporalDecodeFlagCount, 1)
         XCTAssertEqual(snapshot.staleGenerationDropCount, 1)
         XCTAssertEqual(snapshot.droppedVideoFrames, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumPresentationQueueDepth, 12)
@@ -95,9 +88,7 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertLessThanOrEqual(snapshot.avDriftP95Milliseconds, 20)
         XCTAssertLessThanOrEqual(snapshot.maximumAbsoluteAVDriftMilliseconds, 20)
         XCTAssertEqual(snapshot.residentMemoryBytes, 123_456)
-        XCTAssertEqual(snapshot.temporalUnavailableNoticeCount, 1)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
-        XCTAssertEqual(snapshot.automaticAlgorithmSwitchCount, 0)
         XCTAssertEqual(snapshot.audioRoute, "ffmpegPCM")
         XCTAssertTrue(snapshot.audioReady)
         XCTAssertFalse(snapshot.readinessOpen)
@@ -116,7 +107,6 @@ final class PlaybackMetricsTests: XCTestCase {
     func testWindowedRatesAndPercentilesExcludeOldSamplesWithoutResettingSessionTotals() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: "channel",
             now: { clock.value },
             residentMemoryProvider: { 0 }
@@ -148,7 +138,6 @@ final class PlaybackMetricsTests: XCTestCase {
     func testFiveSecondReanchorGraceExcludesTransientDrift() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: "channel",
             now: { clock.value },
             residentMemoryProvider: { 0 }
@@ -182,7 +171,6 @@ final class PlaybackMetricsTests: XCTestCase {
     func testSnapshotNeverClaimsAWindowLongerThanItsRetainedHistory() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: "channel",
             now: { clock.value },
             residentMemoryProvider: { 0 }
@@ -196,7 +184,6 @@ final class PlaybackMetricsTests: XCTestCase {
 
     func testCollectorIsThreadSafeAcrossRealCallbackLanes() {
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .metalYADIF2x,
             channelID: "channel",
             now: { 60 },
             residentMemoryProvider: { 0 }
@@ -230,7 +217,6 @@ final class PlaybackMetricsTests: XCTestCase {
     func testSnapshotJSONAndSignpostChannelIdentifierAreIrreversiblyRedacted() throws {
         let secret = "五星体育 HD https://iptv.router/live?token=secret"
         let metrics = PlaybackMetrics(
-            selectedAlgorithm: .appleTemporal,
             channelID: secret,
             now: { 1 },
             residentMemoryProvider: { 42 }

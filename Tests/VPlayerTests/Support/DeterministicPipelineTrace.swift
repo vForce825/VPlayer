@@ -38,11 +38,8 @@ struct TraceGenerationBoundaryAudit: Equatable, Sendable {
 
 struct DeterministicPipelineMetrics: Equatable, Sendable {
     var yadifKernelDispatchCount: UInt64 = 0
-    var bothFieldsConfigurationCount: UInt64 = 0
+    var configurationCount: UInt64 = 0
     var decodedAccessUnitCount: UInt64 = 0
-    var temporalConfigurationCount: UInt64 = 0
-    var temporalPropertySetCount: UInt64 = 0
-    var temporalDecodeFlagCount: UInt64 = 0
     var crossGenerationRendererDeliveryCount: UInt64 = 0
     var staleGenerationDropCount: UInt64 = 0
 }
@@ -88,38 +85,15 @@ struct ClassifierAndTimingEdgeResult: Sendable {
     var repeatFieldMetadataReachedProcessor = false
 }
 
-struct TemporalFailureRegressionResult: Sendable {
-    var initializationFallbackRoute = DeinterlaceRoute.rawWhileClassifying
-    var runtimeFallbackRoute = DeinterlaceRoute.rawWhileClassifying
-    var temporalPropertySetCount = 0
-    var temporalDecodeFlagCount = 0
-    var initializationNoticeCount = 0
-    var runtimeNoticeCount = 0
-    var initializationSelectedAlgorithm = DeinterlaceAlgorithm.appleTemporal
-    var runtimeSelectedAlgorithm = DeinterlaceAlgorithm.appleTemporal
-    var failures: [PlaybackCoreError] = []
-}
-
 struct GPUCommandErrorRegressionResult: Sendable {
     var failure: PlaybackFailure?
     var successfulPresentationCount = 0
     var commandSubmissionCount = 0
 }
 
-struct RapidAlgorithmSwitchRegressionResult: Sendable {
-    var routes: [DeinterlaceRoute] = []
-    var injectedLateCallbackCount = 0
-    var crossGenerationDeliveryCount = 0
-    var lateYADIFCompletionCount = 0
-    var productionSinkDeliveryCountBeforeLateCompletion = 0
-    var productionSinkDeliveryCountAfterLateCompletion = 0
-    var generationAdvanceDuringFinalSwitch: UInt64 = 0
-}
-
 final class DeterministicPipelineHarness: @unchecked Sendable {
     func play(
         fixture: DeterministicPipelineFixture,
-        algorithm: DeinterlaceAlgorithm,
         frames: Int? = nil,
         seconds: Int? = nil,
         fields: Int? = nil
@@ -145,7 +119,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             yadif: yadif,
             probe: fixture == .h2641080PsF25 ? ImmediatePsFTraceProbe() : nil,
             initialGeneration: host.generation,
-            selectedAlgorithm: algorithm,
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 1,
                 psfConfirmationFrames: 1,
@@ -196,11 +169,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         let decoderSnapshot = decoder.snapshot()
         let metrics = DeterministicPipelineMetrics(
             yadifKernelDispatchCount: systemYADIF.metricsSnapshot.completedJobCount,
-            bothFieldsConfigurationCount: UInt64(decoderSnapshot.bothFieldsConfigurationCount),
+            configurationCount: UInt64(decoderSnapshot.configurationCount),
             decodedAccessUnitCount: UInt64(decoderSnapshot.decodedAccessUnitCount),
-            temporalConfigurationCount: UInt64(decoderSnapshot.temporalConfigurationCount),
-            temporalPropertySetCount: UInt64(decoderSnapshot.temporalPropertySetCount),
-            temporalDecodeFlagCount: UInt64(decoderSnapshot.temporalDecodeFlagCount),
             crossGenerationRendererDeliveryCount: UInt64(
                 hostSnapshot.crossGenerationDeliveryCount
             ),
@@ -239,7 +209,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             yadif: yadif,
             probe: nil,
             initialGeneration: host.generation,
-            selectedAlgorithm: .metalYADIF2x,
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 1,
                 psfConfirmationFrames: 1,
@@ -309,7 +278,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             ) != 0
         }.count
 
-        let unknownRoutes = try DeinterlaceAlgorithm.allCases.map { algorithm in
+        let unknownRoutes = try [DeinterlaceRoute.rawWhileClassifying].map { _ in
             let unknownHost = TraceCoordinatorHost()
             let unknownCoordinator = VideoPipelineCoordinator(
                 decoder: TraceCoordinatorDecoder(),
@@ -317,8 +286,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
                 yadif: ImmediateRecordingTraceYADIF(),
                 probe: nil,
                 initialGeneration: unknownHost.generation,
-                selectedAlgorithm: algorithm,
-                classifierConfiguration: ScanClassifierConfiguration(
+                    classifierConfiguration: ScanClassifierConfiguration(
                     progressiveConfirmationFrames: 1,
                     psfConfirmationFrames: 1,
                     exitInterlacedConfirmationFrames: 1
@@ -361,7 +329,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             yadif: repeatYADIF,
             probe: nil,
             initialGeneration: repeatHost.generation,
-            selectedAlgorithm: .metalYADIF2x,
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 1,
                 psfConfirmationFrames: 1,
@@ -417,68 +384,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         )
     }
 
-    func runTemporalFailureRegression() throws -> TemporalFailureRegressionResult {
-        let initialization = try makeCoordinatorHarness(algorithm: .appleTemporal)
-        initialization.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
-        var generation = initialization.host.generation
-        initialization.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
-            id: 1,
-            generation: generation,
-            randomAccess: true
-        ))
-        initialization.coordinator.handle(decoder: .frame(try interlacedFrame(
-            id: 10,
-            generation: generation,
-            sourcePTS90k: 36_000
-        )))
-        generation = initialization.host.generation
-        initialization.decoder.failNextTemporalConfiguration = true
-        initialization.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
-            id: 2,
-            generation: generation,
-            randomAccess: true
-        ))
-
-        let runtime = try makeCoordinatorHarness(algorithm: .appleTemporal)
-        runtime.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
-        generation = runtime.host.generation
-        runtime.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
-            id: 1,
-            generation: generation,
-            randomAccess: true
-        ))
-        runtime.coordinator.handle(decoder: .frame(try interlacedFrame(
-            id: 10,
-            generation: generation,
-            sourcePTS90k: 36_000
-        )))
-        generation = runtime.host.generation
-        runtime.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
-            id: 2,
-            generation: generation,
-            randomAccess: true
-        ))
-        runtime.coordinator.handle(decoder: .recoverableFailure(
-            .temporalUnavailable(.processingFailed(status: -77_711)),
-            generation: generation
-        ))
-
-        return TemporalFailureRegressionResult(
-            initializationFallbackRoute: initialization.coordinator.route,
-            runtimeFallbackRoute: runtime.coordinator.route,
-            temporalPropertySetCount: initialization.decoder.temporalPropertySetCount
-                + runtime.decoder.temporalPropertySetCount,
-            temporalDecodeFlagCount: initialization.decoder.temporalDecodeFlagCount
-                + runtime.decoder.temporalDecodeFlagCount,
-            initializationNoticeCount: initialization.host.notices.count,
-            runtimeNoticeCount: runtime.host.notices.count,
-            initializationSelectedAlgorithm: initialization.coordinator
-                .selectedDeinterlaceAlgorithm,
-            runtimeSelectedAlgorithm: runtime.coordinator.selectedDeinterlaceAlgorithm,
-            failures: initialization.host.failures + runtime.host.failures
-        )
-    }
-
     func runGPUCommandErrorRegression() async throws -> GPUCommandErrorRegressionResult {
         let submitter = FailingTraceCommandSubmitter()
         let processor = try YADIFProcessor(
@@ -520,57 +425,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         )
     }
 
-    func runRapidAlgorithmSwitchRegression() throws -> RapidAlgorithmSwitchRegressionResult {
-        let harness = try makeCoordinatorHarness(algorithm: .appleTemporal)
-        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
-        var generation = harness.host.generation
-        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
-            id: 1,
-            generation: generation,
-            randomAccess: true
-        ))
-        harness.coordinator.handle(decoder: .frame(try interlacedFrame(
-            id: 10,
-            generation: generation,
-            sourcePTS90k: 36_000
-        )))
-        var routes = [harness.coordinator.route]
-
-        harness.coordinator.setAlgorithm(.metalYADIF2x)
-        routes.append(harness.coordinator.route)
-        generation = harness.host.generation
-        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
-            id: 2,
-            generation: generation,
-            randomAccess: true
-        ))
-        for index in 0..<3 {
-            harness.coordinator.handle(decoder: .frame(try interlacedFrame(
-                id: UInt64(20 + index),
-                generation: generation,
-                sourcePTS90k: UInt64(72_000 + index * 3_600)
-            )))
-        }
-        let lateCount = harness.yadif.pendingCompletionCount
-        let generationBeforeFinalSwitch = harness.host.generation
-        let deliveriesBeforeLateCompletion = harness.host.deliveredFrames.count
-        harness.coordinator.setAlgorithm(.appleTemporal)
-        routes.append(harness.coordinator.route)
-        harness.yadif.completeAll()
-        let deliveriesAfterLateCompletion = harness.host.deliveredFrames.count
-
-        return RapidAlgorithmSwitchRegressionResult(
-            routes: routes,
-            injectedLateCallbackCount: lateCount,
-            crossGenerationDeliveryCount: harness.host.crossGenerationDeliveryCount,
-            lateYADIFCompletionCount: harness.yadif.completedCallbackCount,
-            productionSinkDeliveryCountBeforeLateCompletion: deliveriesBeforeLateCompletion,
-            productionSinkDeliveryCountAfterLateCompletion: deliveriesAfterLateCompletion,
-            generationAdvanceDuringFinalSwitch: harness.host.generation.rawValue
-                - generationBeforeFinalSwitch.rawValue
-        )
-    }
-
     private func playWrapAndFormatChangeTrace() async throws -> DeterministicPipelineResult {
         let trace = try DeterministicPipelineTrace.make(
             fixture: .wrapThenSPSAndPMTChange,
@@ -593,7 +447,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             decoder: decoder,
             processor: PassthroughVideoProcessor(),
             yadifProcessor: yadif,
-            selectedAlgorithm: .metalYADIF2x,
             renderer: renderer,
             audio: audio,
             clock: FakePipelineClock(),
@@ -748,15 +601,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             presentations: generationPresentations,
             metrics: DeterministicPipelineMetrics(
                 yadifKernelDispatchCount: systemYADIF.metricsSnapshot.completedJobCount,
-                bothFieldsConfigurationCount: UInt64(
-                    decoder.snapshot().bothFieldsConfigurationCount
-                ),
+                configurationCount: UInt64(decoder.snapshot().configurationCount),
                 decodedAccessUnitCount: UInt64(decoder.snapshot().decodedAccessUnitCount),
-                temporalConfigurationCount: UInt64(
-                    decoder.snapshot().temporalConfigurationCount
-                ),
-                temporalPropertySetCount: UInt64(decoder.snapshot().temporalPropertySetCount),
-                temporalDecodeFlagCount: UInt64(decoder.snapshot().temporalDecodeFlagCount),
                 crossGenerationRendererDeliveryCount: UInt64(
                     rendererSnapshot.crossGenerationDeliveryCount
                 ),
@@ -968,35 +814,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
     ) -> Bool {
         let comparison = CMTimeCompare(lhs.presentationTimeStamp, rhs.presentationTimeStamp)
         return comparison == 0 ? lhs.sequenceNumber < rhs.sequenceNumber : comparison < 0
-    }
-
-    private func makeCoordinatorHarness(
-        algorithm: DeinterlaceAlgorithm
-    ) throws -> TraceCoordinatorHarness {
-        let host = TraceCoordinatorHost()
-        let decoder = TraceCoordinatorDecoder()
-        let yadif = DelayedTraceYADIF()
-        let passthrough = PassthroughVideoProcessor()
-        let coordinator = VideoPipelineCoordinator(
-            decoder: decoder,
-            passthrough: passthrough,
-            yadif: yadif,
-            probe: nil,
-            initialGeneration: host.generation,
-            selectedAlgorithm: algorithm,
-            classifierConfiguration: ScanClassifierConfiguration(
-                progressiveConfirmationFrames: 1,
-                psfConfirmationFrames: 1,
-                exitInterlacedConfirmationFrames: 1
-            ),
-            hooks: host.hooks
-        )
-        return TraceCoordinatorHarness(
-            coordinator: coordinator,
-            decoder: decoder,
-            yadif: yadif,
-            host: host
-        )
     }
 
     private func interlacedFrame(
@@ -1568,13 +1385,6 @@ private final class GPURegressionBox: @unchecked Sendable {
     }
 }
 
-private struct TraceCoordinatorHarness {
-    let coordinator: VideoPipelineCoordinator
-    let decoder: TraceCoordinatorDecoder
-    let yadif: DelayedTraceYADIF
-    let host: TraceCoordinatorHost
-}
-
 private struct TraceCoordinatorHostSnapshot: Sendable {
     let generation: MediaGeneration
     let deliveredFrames: [VideoPresentationFrame]
@@ -1585,7 +1395,6 @@ private final class TraceCoordinatorHost: @unchecked Sendable {
     private let gate: TraceSerialGate?
     private(set) var generation = MediaGeneration(rawValue: 0)
     private(set) var deliveredFrames: [VideoPresentationFrame] = []
-    private(set) var notices: [PlaybackNotice] = []
     private(set) var failures: [PlaybackCoreError] = []
     private(set) var crossGenerationDeliveryCount = 0
 
@@ -1622,7 +1431,6 @@ private final class TraceCoordinatorHost: @unchecked Sendable {
                     $0.generation != generation || generation != self.generation
                 }.count
             },
-            notice: { [weak self] notice, _ in self?.notices.append(notice) },
             fail: { [weak self] failure, _ in self?.failures.append(failure) },
             schedule: { [weak self] operation in
                 if let gate = self?.gate {
@@ -1636,128 +1444,40 @@ private final class TraceCoordinatorHost: @unchecked Sendable {
 }
 
 private struct TraceCoordinatorDecoderSnapshot: Sendable {
-    let bothFieldsConfigurationCount: Int
+    let configurationCount: Int
     let decodedAccessUnitCount: Int
-    let temporalConfigurationCount: Int
-    let temporalPropertySetCount: Int
-    let temporalDecodeFlagCount: Int
 }
 
 private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable {
     private let lock = NSLock()
-    var failNextTemporalConfiguration = false
-    private(set) var temporalPropertySetCount = 0
-    private(set) var temporalConfigurationCount = 0
-    private(set) var temporalDecodeFlagCount = 0
-    private(set) var bothFieldsConfigurationCount = 0
+    private(set) var configurationCount = 0
     private(set) var decodedAccessUnitCount = 0
-    private var activeConfiguration: VideoDecodeConfiguration?
 
     func configure(
         format _: CMVideoFormatDescription,
-        generation _: MediaGeneration,
-        configuration: VideoDecodeConfiguration
+        generation _: MediaGeneration
     ) throws {
-        try lock.withLock {
-            if configuration == .appleTemporal {
-                temporalConfigurationCount += 1
-                temporalPropertySetCount += 2
-                if failNextTemporalConfiguration {
-                    failNextTemporalConfiguration = false
-                    throw VideoDecoderFailure.temporalUnavailable(
-                        .initializationFailed(status: -77_710)
-                    )
-                }
-            } else {
-                bothFieldsConfigurationCount += 1
-            }
-            activeConfiguration = configuration
-        }
+        lock.withLock { configurationCount += 1 }
     }
 
     func decode(
         _ accessUnit: CompressedVideoAccessUnit,
-        flags: VTDecodeFrameFlags
+        flags _: VTDecodeFrameFlags
     ) throws {
-        lock.withLock {
-            decodedAccessUnitCount += 1
-            if activeConfiguration == .appleTemporal,
-               flags.contains(._EnableAsynchronousDecompression) {
-                temporalDecodeFlagCount += 1
-            }
-        }
+        lock.withLock { decodedAccessUnitCount += 1 }
         _ = accessUnit
     }
 
     func finishDelayedFrames() throws {}
     func waitForAsynchronousFrames() throws {}
-    func invalidate() { lock.withLock { activeConfiguration = nil } }
+    func invalidate() {}
 
     func snapshot() -> TraceCoordinatorDecoderSnapshot {
         lock.withLock {
             TraceCoordinatorDecoderSnapshot(
-                bothFieldsConfigurationCount: bothFieldsConfigurationCount,
-                decodedAccessUnitCount: decodedAccessUnitCount,
-                temporalConfigurationCount: temporalConfigurationCount,
-                temporalPropertySetCount: temporalPropertySetCount,
-                temporalDecodeFlagCount: temporalDecodeFlagCount
+                configurationCount: configurationCount,
+                decodedAccessUnitCount: decodedAccessUnitCount
             )
-        }
-    }
-}
-
-private final class DelayedTraceYADIF: YADIFFrameProcessing, @unchecked Sendable {
-    private struct Pending: @unchecked Sendable {
-        let frames: [VideoPresentationFrame]
-        let completion: @Sendable (Result<[VideoPresentationFrame], PlaybackFailure>) -> Void
-    }
-
-    private var pending: [Pending] = []
-    private var sequence: UInt64 = 0
-    private(set) var completedCallbackCount = 0
-    var pendingCompletionCount: Int { pending.count }
-
-    func reset(to _: MediaGeneration) {}
-
-    func submit(
-        normalized frame: NormalizedDecodedFrame,
-        order _: ResolvedFieldOrder,
-        discontinuity _: Bool,
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
-    ) {
-        let fields = [0, 1].map { index in
-            sequence &+= 1
-            return VideoPresentationFrame(
-                storage: .pixelBuffer(frame.frame.pixelBuffer),
-                presentationTimeStamp: index == 0
-                    ? frame.presentationTimeStamp
-                    : CMTimeAdd(frame.presentationTimeStamp, frame.fieldDuration),
-                duration: frame.fieldDuration,
-                generation: frame.frame.generation,
-                sequenceNumber: sequence,
-                sourceAccessUnitID: frame.frame.accessUnitID,
-                formatMetadata: frame.frame.formatMetadata
-            )
-        }
-        pending.append(Pending(frames: fields, completion: completion))
-    }
-
-    func drain(
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
-    ) {
-        completion(.success([]))
-    }
-
-    func completeAll() {
-        let completions = pending
-        pending.removeAll()
-        for item in completions {
-            completedCallbackCount += 1
-            item.completion(.success(item.frames))
         }
     }
 }

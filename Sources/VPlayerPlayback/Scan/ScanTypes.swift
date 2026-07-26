@@ -110,6 +110,5 @@ public struct ScanObservation: Equatable, Sendable {
 
 public enum PresentationOrigin: Equatable, Sendable {
     case raw
-    case appleTemporal
     case metalYADIF(field: FieldParity)
 }

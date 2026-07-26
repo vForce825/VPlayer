@@ -38,9 +38,9 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertEqual(
             AppLaunchConfiguration(arguments: [
                 "VPlayer", "-ui-fixture", "seeded",
-                "-ui-playback-fixture", "interlaced-temporal-unsupported",
+                "-ui-playback-fixture", "failed-diagnostic",
             ]).playbackFixture,
-            "interlaced-temporal-unsupported"
+            "failed-diagnostic"
         )
         XCTAssertNil(AppLaunchConfiguration(arguments: [
             "VPlayer", "-ui-playback-fixture",
@@ -225,8 +225,6 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertEqual(acceptance.initialRootTab, .sources)
         XCTAssertEqual(acceptance.initialSourceControl, .add)
         XCTAssertEqual(acceptance.sourceControlAfterEditorDismissal, .playlistRefresh)
-        XCTAssertEqual(acceptance.settingsControl(for: .appleTemporal), .appleTemporal)
-        XCTAssertEqual(acceptance.settingsControl(for: .metalYADIF2x), .metalYADIF2x)
         XCTAssertTrue(acceptance.focusesFirstChannel)
         XCTAssertEqual(acceptance.initialPlayerControl, .settings)
 
@@ -234,7 +232,6 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertEqual(normal.initialRootTab, .channels)
         XCTAssertNil(normal.initialSourceControl)
         XCTAssertNil(normal.sourceControlAfterEditorDismissal)
-        XCTAssertNil(normal.settingsControl(for: .appleTemporal))
         XCTAssertFalse(normal.focusesFirstChannel)
         XCTAssertEqual(normal.initialPlayerControl, .playPause)
 

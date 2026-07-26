@@ -398,7 +398,7 @@ private extension PresentationTimestampNormalizerTests {
         MediaGeneration(rawValue: rawValue)
     }
 
-    func testAppleTemporalMultiFieldFramesUseFieldDurationAndSingleFieldStepPTS() throws {
+    func testMultiFieldFramesUseFieldDurationAndSingleFieldStepPTS() throws {
         var sut = PresentationTimestampNormalizer(generation: generation(1))
         sut.configureMaximumReorderDepth(4)
         let frames = try [

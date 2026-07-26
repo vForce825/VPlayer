@@ -63,12 +63,6 @@ struct AcceptanceFocusPolicy: Equatable {
         isEnabled ? .playlistRefresh : nil
     }
 
-    func settingsControl(
-        for algorithm: DeinterlaceAlgorithm
-    ) -> DeinterlaceAlgorithm? {
-        isEnabled ? algorithm : nil
-    }
-
     var focusesFirstChannel: Bool {
         isEnabled
     }
@@ -179,7 +173,12 @@ struct VPlayerApp: App {
     init() {
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)
         if configuration.resetsPlaybackSettings {
-            UserDefaults.standard.removeObject(forKey: PlaybackSettingsStore.storageKey)
+            UserDefaults.standard.removeObject(
+                forKey: PlaybackSettingsStore.videoBufferSecondsKey
+            )
+            UserDefaults.standard.removeObject(
+                forKey: PlaybackSettingsStore.deinterlaceBufferFramesKey
+            )
             UserDefaults.standard.removeObject(forKey: ChannelBrowsingSettingsStore.storageKey)
         }
         switch configuration.mode {

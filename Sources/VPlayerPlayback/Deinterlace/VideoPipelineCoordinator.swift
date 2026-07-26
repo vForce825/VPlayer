@@ -42,7 +42,6 @@ struct VideoPipelineCoordinatorHooks: Sendable {
     let reopenAdmission: @Sendable () -> Void
     let routeDidChange: @Sendable (Int) -> Void
     let deliver: @Sendable ([VideoPresentationFrame], MediaGeneration) -> Void
-    let notice: @Sendable (PlaybackNotice, MediaGeneration) -> Void
     let fail: @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     let schedule: @Sendable (@escaping @Sendable () -> Void) -> Void
 }
@@ -66,7 +65,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private let signposts: PlaybackSignposts?
 
     private var generation: MediaGeneration
-    private var selectedAlgorithm: DeinterlaceAlgorithm
     private var classifier: ScanTypeClassifier
     private var normalizer: PresentationTimestampNormalizer
     private var videoFormat: CMVideoFormatDescription?
@@ -75,22 +73,14 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var nextProbeSubmissionID: UInt64 = 0
     private var activeProbeSubmissionID: UInt64?
     private var decoderConfigured = false
-    private var activeConfiguration: VideoDecodeConfiguration?
     private var waitingForRandomAccess = true
     private var routeEpoch: UInt64 = 0
     // Decode failures since the last frame that actually decoded.
     private var consecutiveDecoderSessionFailures = 0
     private var consecutivePerFrameDecodeFailures = 0
-    private var temporalRetrySuppressed = false
-    private var temporalNoticeGate = TemporalNoticeGate()
-    private let playbackSessionID = PlaybackSessionID(rawValue: UUID())
     private var stopped = false
 
     private(set) var route = DeinterlaceRoute.rawWhileClassifying
-
-    var selectedDeinterlaceAlgorithm: DeinterlaceAlgorithm {
-        selectedAlgorithm
-    }
 
     var requiredVideoFrameCount: Int {
         // One completed YADIF job yields the two field-rate presentation frames
@@ -105,7 +95,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif: any YADIFFrameProcessing,
         probe: (any LumaScanProbing)?,
         initialGeneration: MediaGeneration,
-        selectedAlgorithm: DeinterlaceAlgorithm,
         classifierConfiguration: ScanClassifierConfiguration = .init(),
         rawReadinessRequirementOverride: Int? = nil,
         metrics: PlaybackMetrics? = nil,
@@ -117,7 +106,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         self.yadif = yadif
         self.probe = probe
         generation = initialGeneration
-        self.selectedAlgorithm = selectedAlgorithm
         classifier = ScanTypeClassifier(
             generation: initialGeneration,
             configuration: classifierConfiguration
@@ -147,7 +135,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         guard !stopped else { return }
         videoFormat = format
         decoderConfigured = false
-        activeConfiguration = nil
         waitingForRandomAccess = true
     }
 
@@ -177,7 +164,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         activeProbeSubmissionID = nil
         videoFormat = format
         decoderConfigured = false
-        activeConfiguration = nil
         waitingForRandomAccess = true
         hooks.resetPlayback(generation, requiredVideoFrameCount)
         decoder.invalidate()
@@ -194,31 +180,17 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         }
         if waitingForRandomAccess {
             guard accessUnit.isRandomAccess, let videoFormat else { return }
-            let targetConfiguration = configuration(for: route)
             do {
-                try decoder.configure(
-                    format: videoFormat,
-                    generation: generation,
-                    configuration: targetConfiguration
-                )
+                try decoder.configure(format: videoFormat, generation: generation)
                 decoderConfigured = true
-                activeConfiguration = targetConfiguration
                 waitingForRandomAccess = false
             } catch let failure as VideoDecoderFailure {
-                if targetConfiguration == .appleTemporal {
-                    recordDecodeFailureDiagnostic(failure)
-                    guard configureRawTemporalFallback(format: videoFormat) else { return }
-                } else {
-                    hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
-                    return
-                }
+                recordDecodeFailureDiagnostic(failure)
+                hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
+                return
             } catch {
-                if targetConfiguration == .appleTemporal {
-                    guard configureRawTemporalFallback(format: videoFormat) else { return }
-                } else {
-                    hooks.fail(.videoDecode(-1), generation)
-                    return
-                }
+                hooks.fail(.videoDecode(-1), generation)
+                return
             }
         }
 
@@ -244,15 +216,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             return
         }
         recordDecodeFailureDiagnostic(failure)
-        if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
-            temporalRetrySuppressed = true
-            emitTemporalNoticeOnce()
-            switchDecoderConfiguration(
-                to: .rawTemporalFailure,
-                toleratingTemporalDrainFailure: true
-            )
-            return
-        }
         if Self.isPerFrameDecodeFailure(failure) {
             handlePerFrameDecodeFailure(failure, generation: generation)
             return
@@ -293,15 +256,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 return
             }
             recordDecodeFailureDiagnostic(failure)
-            if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
-                temporalRetrySuppressed = true
-                emitTemporalNoticeOnce()
-                switchDecoderConfiguration(
-                    to: .rawTemporalFailure,
-                    toleratingTemporalDrainFailure: true
-                )
-                return
-            }
             if Self.requiresDecoderSessionRestart(failure) {
                 restartDecoderAfterSessionFailure(failure, generation: eventGeneration)
                 return
@@ -312,15 +266,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 metrics?.recordStaleGenerationDrop()
                 return
             }
-            if activeConfiguration == .appleTemporal {
-                temporalRetrySuppressed = true
-                emitTemporalNoticeOnce()
-                switchDecoderConfiguration(
-                    to: .rawTemporalFailure,
-                    toleratingTemporalDrainFailure: true
-                )
-                return
-            }
+            recordDecodeFailureDiagnostic(failure)
             hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
         }
     }
@@ -329,17 +275,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         guard !stopped else { return }
         yadif.apply(tuning)
         decoder.setTuning(tuning)
-    }
-
-    func setAlgorithm(_ algorithm: DeinterlaceAlgorithm) {
-        guard !stopped else { return }
-        guard selectedAlgorithm != algorithm else { return }
-        selectedAlgorithm = algorithm
-        metrics?.update(selectedAlgorithm: algorithm)
-        if algorithm != .appleTemporal {
-            temporalRetrySuppressed = false
-        }
-        applyResolvedRoute()
     }
 
     func stop(emergency: Bool) {
@@ -362,7 +297,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             classificationProbeObservationCount = 0
             activeProbeSubmissionID = nil
             decoderConfigured = false
-            activeConfiguration = nil
             waitingForRandomAccess = true
             hooks.resetPlayback(generation, requiredVideoFrameCount)
             decoder.invalidate()
@@ -375,7 +309,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         }
         decoder.invalidate()
         decoderConfigured = false
-        activeConfiguration = nil
         normalizer.reset(generation: generation)
         passthrough.reset(to: generation)
         yadif.reset(to: generation)
@@ -385,37 +318,13 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         activeProbeSubmissionID = nil
     }
 
-    private func configuration(for route: DeinterlaceRoute) -> VideoDecodeConfiguration {
-        route == .appleTemporal ? .appleTemporal : .bothFields
-    }
-
     private static func diagnosticName(for failure: VideoDecoderFailure) -> (String, Int32) {
         switch failure {
         case let .badData(status): ("badData", status)
         case let .malfunction(status): ("malfunction", status)
         case let .sessionCreate(status): ("sessionCreate", status)
-        case .unsupportedConfiguration: ("unsupportedConfiguration", 0)
         case .softwareDecoder: ("softwareDecoder", 0)
         case .backpressureTimeout: ("backpressureTimeout", 0)
-        // Which property the decoder was missing is the whole content of this
-        // failure. Reported as a bare name it said only that the route was off,
-        // which is the one thing already visible from the active route.
-        case let .temporalUnavailable(temporal): temporalDiagnosticName(for: temporal)
-        }
-    }
-
-    private static func temporalDiagnosticName(
-        for failure: AppleTemporalFailure
-    ) -> (String, Int32) {
-        switch failure {
-        case let .unsupportedProperty(key):
-            ("temporalUnsupportedProperty.\(key)", 0)
-        case let .propertySetFailed(key, status):
-            ("temporalPropertySetFailed.\(key)", status)
-        case let .initializationFailed(status):
-            ("temporalInitializationFailed", status)
-        case let .processingFailed(status):
-            ("temporalProcessingFailed", status)
         }
     }
 
@@ -509,11 +418,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 metrics?.recordVideoDrop(source: .decoderRecoverable)
                 return true
             }
-            if activeConfiguration == .appleTemporal, failure.isTemporalUnavailable {
-                temporalRetrySuppressed = true
-                emitTemporalNoticeOnce()
-                return true
-            }
             hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
         } catch {
             hooks.fail(.videoDecode(-1), generation)
@@ -537,41 +441,12 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         applyResolvedRoute()
     }
 
-    /// Retires the Apple route before it costs anything when the decoder has
-    /// already said it cannot deinterlace.
-    ///
-    /// Discovering it the other way round — switch route, reconfigure, fail,
-    /// fall back — spends a generation reset and the frames up to the next
-    /// random-access point, on every channel start, to reach a state that was
-    /// knowable from the session already open. Suppressing first makes the
-    /// resolved route `.rawTemporalFailure`, which shares `.bothFields` with the
-    /// configuration already running, so nothing is torn down at all.
-    private func suppressTemporalIfDecoderCannotDeinterlace() {
-        guard !temporalRetrySuppressed,
-              selectedAlgorithm == .appleTemporal,
-              decoderConfigured,
-              case .interlaced = classifier.current,
-              !decoder.supportsConfiguration(.appleTemporal) else { return }
-        temporalRetrySuppressed = true
-        recordDecodeFailureDiagnostic(
-            .temporalUnavailable(
-                .unsupportedProperty(AppleTemporalConfigurator.requiredPropertyKey)
-            )
-        )
-        emitTemporalNoticeOnce()
-    }
-
+    /// Every route decodes the same way — both fields woven into one frame per
+    /// coded frame — so a route change only redirects finished frames to a
+    /// different processor. Nothing about the decode session changes with it.
     private func applyResolvedRoute() {
-        suppressTemporalIfDecoderCannotDeinterlace()
-        let next = resolvedRoute()
+        let next = DeinterlaceRoute.resolve(scan: classifier.current)
         guard next != route else { return }
-        let nextConfiguration = configuration(for: next)
-        if decoderConfigured,
-           let activeConfiguration,
-           activeConfiguration != nextConfiguration {
-            switchDecoderConfiguration(to: next)
-            return
-        }
         let token = signposts?.begin(.modeSwitch, correlation: routeEpoch &+ 1)
         defer {
             if let token { signposts?.end(token) }
@@ -597,130 +472,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         classificationProbeObservationCount = 0
         activeProbeSubmissionID = nil
         decoderConfigured = false
-        activeConfiguration = nil
         waitingForRandomAccess = true
         hooks.resetPlayback(generation, requiredVideoFrameCount)
         decoder.invalidate()
         hooks.reopenAdmission()
-    }
-
-    private func resolvedRoute() -> DeinterlaceRoute {
-        if temporalRetrySuppressed,
-           selectedAlgorithm == .appleTemporal,
-           case .interlaced = classifier.current {
-            return .rawTemporalFailure
-        }
-        return DeinterlaceRoute.resolve(
-            scan: classifier.current,
-            selected: selectedAlgorithm
-        )
-    }
-
-    private func configureRawTemporalFallback(
-        format: CMVideoFormatDescription
-    ) -> Bool {
-        let token = signposts?.begin(.modeSwitch, correlation: routeEpoch &+ 1)
-        defer {
-            if let token { signposts?.end(token) }
-        }
-        temporalRetrySuppressed = true
-        route = .rawTemporalFailure
-        routeEpoch &+= 1
-        metrics?.update(activeRoute: .rawTemporalFailure)
-        passthrough.reset(to: generation)
-        yadif.reset(to: generation)
-        hooks.routeDidChange(requiredVideoFrameCount)
-        do {
-            try decoder.configure(
-                format: format,
-                generation: generation,
-                configuration: .bothFields
-            )
-            decoderConfigured = true
-            activeConfiguration = .bothFields
-            waitingForRandomAccess = false
-            emitTemporalNoticeOnce()
-            return true
-        } catch let failure as VideoDecoderFailure {
-            hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
-        } catch {
-            hooks.fail(.videoDecode(-1), generation)
-        }
-        return false
-    }
-
-    private func emitTemporalNoticeOnce() {
-        guard temporalNoticeGate.consume(sessionID: playbackSessionID) else { return }
-        metrics?.recordTemporalUnavailableNotice()
-        hooks.notice(.appleTemporalUnavailable, generation)
-    }
-
-    private func switchDecoderConfiguration(
-        to next: DeinterlaceRoute,
-        toleratingTemporalDrainFailure: Bool = false
-    ) {
-        let token = signposts?.begin(.modeSwitch, correlation: routeEpoch &+ 1)
-        defer {
-            if let token { signposts?.end(token) }
-        }
-        hooks.closeAdmission()
-        let toleratesOldAppleSessionFailure = toleratingTemporalDrainFailure
-            || activeConfiguration == .appleTemporal
-        guard performDrainStep(
-            decoder.finishDelayedFrames,
-            toleratingTemporalFailure: toleratesOldAppleSessionFailure
-        ) else { return }
-        guard performDrainStep(
-            decoder.waitForAsynchronousFrames,
-            toleratingTemporalFailure: toleratesOldAppleSessionFailure
-        ) else { return }
-
-        let oldGeneration = generation
-        generation = hooks.advanceGeneration()
-        route = next
-        routeEpoch &+= 1
-        metrics?.update(activeRoute: next)
-        classifier.rebasePreservingClassification(generation: generation)
-        normalizer.reset(generation: generation)
-        passthrough.reset(to: generation)
-        yadif.reset(to: generation)
-        probe?.stop(generation: oldGeneration)
-        previousProbeBuffer = nil
-        classificationProbeObservationCount = 0
-        activeProbeSubmissionID = nil
-        decoderConfigured = false
-        activeConfiguration = nil
-        waitingForRandomAccess = true
-        hooks.resetPlayback(generation, requiredVideoFrameCount)
-        decoder.invalidate()
-        hooks.reopenAdmission()
-    }
-
-    private func performDrainStep(
-        _ operation: () throws -> Void,
-        toleratingTemporalFailure: Bool
-    ) -> Bool {
-        do {
-            try operation()
-            return true
-        } catch let failure as VideoDecoderFailure {
-            if Self.isRecoverableDecodeSubmissionFailure(failure) {
-                metrics?.recordVideoDrop(source: .decoderRecoverable)
-                return true
-            }
-            if toleratingTemporalFailure, failure.isTemporalUnavailable {
-                if selectedAlgorithm == .appleTemporal {
-                    temporalRetrySuppressed = true
-                }
-                emitTemporalNoticeOnce()
-                return true
-            }
-            hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
-            return false
-        } catch {
-            hooks.fail(.videoDecode(-1), generation)
-            return false
-        }
     }
 
     private func submitProbe(for frame: DecodedVideoFrame) {

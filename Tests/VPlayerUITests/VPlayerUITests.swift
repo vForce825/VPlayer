@@ -18,9 +18,9 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(app.images["source.active.seeded"].exists)
 
         selectTab(named: "设置", in: app)
-        XCTAssertTrue(app.staticTexts["Apple Temporal（默认）"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["Metal YADIF 2x"].exists)
-        XCTAssertTrue(app.buttons["settings.deinterlace.apple"].isSelected)
+        XCTAssertTrue(app.buttons["settings.buffer.video.2"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["settings.buffer.video.2"].isSelected)
+        XCTAssertTrue(app.buttons["settings.channels.grouped"].isSelected)
         XCTAssertFalse(app.staticTexts["关闭自动检测"].exists)
         XCTAssertFalse(app.buttons["关闭自动检测"].exists)
         XCTAssertFalse(app.switches["关闭自动检测"].exists)
@@ -92,10 +92,17 @@ final class VPlayerUITests: XCTestCase {
         let grouped = app.buttons["settings.channels.grouped"]
         XCTAssertTrue(flat.waitForExistence(timeout: 3))
         XCTAssertTrue(grouped.isSelected)
-        // Rows run apple, yadif, grouped, flat from the top of the list.
-        for _ in 0..<3 {
+        // The buffer sections sit above the grouping rows, so walk down to the
+        // target rather than counting a list length that settings changes move.
+        // Focus lands on the row, not on the button inside it.
+        let flatRow = app.cells.containing(
+            .button,
+            identifier: "settings.channels.flat"
+        ).element
+        for _ in 0..<12 where !flatRow.hasFocus {
             XCUIRemote.shared.press(.down)
         }
+        XCTAssertTrue(flatRow.hasFocus)
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(flat.wait(for: \.isSelected, toEqual: true, timeout: 2))
         XCTAssertFalse(grouped.isSelected)
@@ -198,7 +205,9 @@ final class VPlayerUITests: XCTestCase {
     @MainActor
     private func selectTab(named name: String, in app: XCUIApplication) {
         let tab = app.tabBars.buttons[name]
-        for _ in 0..<8 where !app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) {
+        // Bounded by the longest list this suite navigates away from — the
+        // settings screen, whose buffer sections put ten rows below the tab bar.
+        for _ in 0..<16 where !app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) {
             XCUIRemote.shared.press(.up)
         }
         for _ in 0..<3 {

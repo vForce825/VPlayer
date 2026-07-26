@@ -6,19 +6,15 @@ import SwiftUI
 import VPlayerPlayback
 
 /// Serialises picture-setting changes onto the playback engine. The rows can be
-/// pressed faster than the engine applies a change, and both settings reach the
-/// same pipeline, so they share one chain rather than racing each other.
+/// pressed faster than the engine applies a change, so they share one chain
+/// rather than racing each other.
 @MainActor
-final class PlaybackAlgorithmSelectionController {
+final class PlaybackTuningSelectionController {
     private let engine: any PlaybackEngine
     private var task: Task<Void, Never>?
 
     init(engine: any PlaybackEngine) {
         self.engine = engine
-    }
-
-    func select(_ algorithm: DeinterlaceAlgorithm) {
-        enqueue { engine in await engine.setDeinterlaceAlgorithm(algorithm) }
     }
 
     func apply(_ tuning: PlaybackTuning) {
@@ -35,49 +31,6 @@ final class PlaybackAlgorithmSelectionController {
             guard !Task.isCancelled else { return }
             await operation(engine)
         }
-    }
-}
-
-/// The algorithm rows themselves, shared by the settings tab and the sheet the
-/// player raises mid-playback so both switch algorithms identically.
-struct DeinterlaceAlgorithmRows: View {
-    @Bindable var playback: PlaybackSettingsStore
-    let focusNamespace: Namespace.ID
-    private let focusPolicy = AcceptanceFocusPolicy.current()
-
-    var body: some View {
-        algorithmRow(
-            title: "Apple Temporal（默认）",
-            algorithm: .appleTemporal,
-            identifier: "settings.deinterlace.apple"
-        )
-        algorithmRow(
-            title: "Metal YADIF 2x",
-            algorithm: .metalYADIF2x,
-            identifier: "settings.deinterlace.yadif"
-        )
-    }
-
-    private func algorithmRow(
-        title: String,
-        algorithm: DeinterlaceAlgorithm,
-        identifier: String
-    ) -> some View {
-        Button {
-            playback.deinterlaceAlgorithm = algorithm
-        } label: {
-            SettingsSelectionLabel(
-                title: title,
-                isSelected: playback.deinterlaceAlgorithm == algorithm
-            )
-        }
-        .accessibilityLabel(title)
-        .accessibilityIdentifier(identifier)
-        .accessibilityAddTraits(playback.deinterlaceAlgorithm == algorithm ? .isSelected : [])
-        .prefersDefaultFocus(
-            focusPolicy.settingsControl(for: playback.deinterlaceAlgorithm) == algorithm,
-            in: focusNamespace
-        )
     }
 }
 
@@ -167,30 +120,14 @@ struct SettingsSelectionLabel: View {
 /// browsing preferences belong to the settings tab, not to a running stream.
 struct PlaybackSettingsView: View {
     @Bindable var settings: PlaybackSettingsStore
-    @Namespace private var settingsFocus
-    private let focusPolicy = AcceptanceFocusPolicy.current()
 
     init(settings: PlaybackSettingsStore) {
         self.settings = settings
     }
 
     var body: some View {
-        Group {
-            if focusPolicy.isEnabled {
-                content
-                    .focusScope(settingsFocus)
-            } else {
-                content
-            }
-        }
-    }
-
-    private var content: some View {
         NavigationStack {
             List {
-                Section("反交错") {
-                    DeinterlaceAlgorithmRows(playback: settings, focusNamespace: settingsFocus)
-                }
                 Section("视频缓冲") {
                     PlaybackBufferRows(playback: settings)
                 }
