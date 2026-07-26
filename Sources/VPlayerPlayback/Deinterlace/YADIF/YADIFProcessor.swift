@@ -67,6 +67,12 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
         func releaseBeforeUserCompletion() {
             encoded = nil
         }
+
+        func takeOutputPlanesBeforeUserCompletion() -> YADIFOutputPlaneSets? {
+            let outputPlanes = encoded?.makeOutputPlaneSets()
+            encoded = nil
+            return outputPlanes
+        }
     }
 
     private let commandQueue: any MTLCommandQueue
@@ -88,7 +94,7 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
     func submit(
         job: YADIFJob,
         outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
-        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+        completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure) {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw .commandBufferAllocationFailed
@@ -97,14 +103,18 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
             try kernel.encode(job, outputs: outputs, into: commandBuffer)
         )
         commandBuffer.addCompletedHandler { buffer in
-            resources.releaseBeforeUserCompletion()
             if buffer.status == .completed {
-                completion(.completedWithGPUInterval(.init(
-                    gpuStartTime: buffer.gpuStartTime,
-                    gpuEndTime: buffer.gpuEndTime
-                )))
+                let outputPlanes = resources.takeOutputPlanesBeforeUserCompletion()
+                completion(YADIFCommandCompletion(
+                    result: .completedWithGPUInterval(.init(
+                        gpuStartTime: buffer.gpuStartTime,
+                        gpuEndTime: buffer.gpuEndTime
+                    )),
+                    outputPlanes: outputPlanes
+                ))
             } else {
-                completion(.failed)
+                resources.releaseBeforeUserCompletion()
+                completion(YADIFCommandCompletion(result: .failed, outputPlanes: nil))
             }
         }
         commandBuffer.commit()
@@ -582,12 +592,18 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         )
         lock.unlock()
 
+        let cpuEncodeStartedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            metrics?.recordYADIFCPUEncode(
+                milliseconds: (ProcessInfo.processInfo.systemUptime - cpuEncodeStartedAt) * 1_000
+            )
+        }
         do {
             try commandSubmitter.submit(
                 job: attempt.ready.job,
                 outputs: outputs
-            ) { result in
-                self.commandCompleted(identifier: identifier, result: result)
+            ) { completion in
+                self.commandCompleted(identifier: identifier, completion: completion)
             }
         } catch let failure {
             var actions: [UserAction] = []
@@ -637,7 +653,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
 
     private func commandCompleted(
         identifier: UInt64,
-        result: YADIFCommandResult
+        completion: YADIFCommandCompletion
     ) {
         var actions: [UserAction] = []
         lock.lock()
@@ -647,7 +663,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         }
         let isCurrent = isCurrentLocked(completed.ready)
         completed.signpostLifetime.finish()
-        if case let .completedWithGPUInterval(interval) = result,
+        if case let .completedWithGPUInterval(interval) = completion.result,
            let duration = interval.durationMilliseconds {
             metrics?.recordGPUDuration(milliseconds: duration)
         }
@@ -657,11 +673,14 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         if !isCurrent {
             actions.append(.complete(completed.ready.completion, .success([])))
         } else {
-            switch result {
+            switch completion.result {
             case .completed, .completedWithGPUInterval:
                 actions.append(.complete(
                     completed.ready.completion,
-                    .success(Self.presentationFrames(for: completed))
+                    .success(Self.presentationFrames(
+                        for: completed,
+                        outputPlanes: completion.outputPlanes
+                    ))
                 ))
             case .failed:
                 actions.append(.complete(
@@ -743,13 +762,20 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     }
 
     private static func presentationFrames(
-        for completed: InFlightJob
+        for completed: InFlightJob,
+        outputPlanes: YADIFOutputPlaneSets?
     ) -> [VideoPresentationFrame] {
         let normalized = completed.ready.job.current
         return [completed.outputs.first, completed.outputs.second].enumerated().map {
             index, output in
-            VideoPresentationFrame(
-                storage: .pixelBuffer(output),
+            let storage: VideoFrameStorage
+            if let outputPlanes {
+                storage = .metalPlanes(index == 0 ? outputPlanes.first : outputPlanes.second)
+            } else {
+                storage = .pixelBuffer(output)
+            }
+            return VideoPresentationFrame(
+                storage: storage,
                 presentationTimeStamp: index == 0
                     ? normalized.presentationTimeStamp
                     : CMTimeAdd(normalized.presentationTimeStamp, normalized.fieldDuration),

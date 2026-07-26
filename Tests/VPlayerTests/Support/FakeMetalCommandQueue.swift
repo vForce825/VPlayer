@@ -29,7 +29,7 @@ final class FakeMetalCommandQueue: YADIFCommandSubmitting, @unchecked Sendable {
     private struct PendingSubmission: @unchecked Sendable {
         let identifier: UInt64
         let token: FakeYADIFSubmissionToken
-        let completion: @Sendable (YADIFCommandResult) -> Void
+        let completion: @Sendable (YADIFCommandCompletion) -> Void
     }
 
     private let lock = NSLock()
@@ -55,7 +55,7 @@ final class FakeMetalCommandQueue: YADIFCommandSubmitting, @unchecked Sendable {
     func submit(
         job: YADIFJob,
         outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
-        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+        completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure) {
         let queuedFailure = lock.withLock {
             queuedFailures.isEmpty ? nil : queuedFailures.removeFirst()
@@ -95,13 +95,20 @@ final class FakeMetalCommandQueue: YADIFCommandSubmitting, @unchecked Sendable {
     }
 
     func complete(identifier: UInt64, result: YADIFCommandResult) {
-        let callback = lock.withLock { () -> (@Sendable (YADIFCommandResult) -> Void)? in
+        complete(
+            identifier: identifier,
+            completion: YADIFCommandCompletion(result: result, outputPlanes: nil)
+        )
+    }
+
+    func complete(identifier: UInt64, completion: YADIFCommandCompletion) {
+        let callback = lock.withLock { () -> (@Sendable (YADIFCommandCompletion) -> Void)? in
             guard let index = pending.firstIndex(where: { $0.identifier == identifier }) else {
                 return nil
             }
             return pending.remove(at: index).completion
         }
-        callback?(result)
+        callback?(completion)
     }
 
     func completeNext(_ result: YADIFCommandResult) {

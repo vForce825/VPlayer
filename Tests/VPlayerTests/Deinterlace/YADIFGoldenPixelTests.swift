@@ -365,23 +365,23 @@ final class YADIFGoldenPixelTests: XCTestCase {
         for (pixelFormat, expectedLuma, expectedChroma) in [
             (
                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                MTLPixelFormat.r8Unorm,
-                MTLPixelFormat.rg8Unorm
+                MTLPixelFormat.r8Uint,
+                MTLPixelFormat.rg8Uint
             ),
             (
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                MTLPixelFormat.r8Unorm,
-                MTLPixelFormat.rg8Unorm
+                MTLPixelFormat.r8Uint,
+                MTLPixelFormat.rg8Uint
             ),
             (
                 kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-                MTLPixelFormat.r16Unorm,
-                MTLPixelFormat.rg16Unorm
+                MTLPixelFormat.r16Uint,
+                MTLPixelFormat.rg16Uint
             ),
             (
                 kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
-                MTLPixelFormat.r16Unorm,
-                MTLPixelFormat.rg16Unorm
+                MTLPixelFormat.r16Uint,
+                MTLPixelFormat.rg16Uint
             ),
         ] {
             let mapped = try YADIFTextureMapper(device: device).map(
@@ -472,11 +472,32 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertTrue(metal.contains("kernel void yadifPlane16"))
         XCTAssertTrue(metal.contains("kernel void yadifChroma8"))
         XCTAssertTrue(metal.contains("kernel void yadifChroma16"))
+        XCTAssertTrue(metal.contains("threadgroup_barrier"))
+        XCTAssertTrue(metal.contains("[[threadgroup(0)]]"))
+        XCTAssertTrue(lowLevelSwift.contains("setThreadgroupMemoryLength"))
         // A per-sample component index taken from a uniform cannot live in a
         // register, so every one of the two dozen samples a synthesized pixel
         // takes would round-trip through scratch memory.
         XCTAssertFalse(metal.contains("componentCount"))
         XCTAssertFalse(metal.lowercased().contains("placeholder"))
+    }
+
+    func testThreadgroupLayoutCapsHeightAndHonorsDynamicMemoryLimit() {
+        let layout = YADIFThreadgroupLayout.make(
+            destinationWidth: 1_920,
+            rowPairCount: 540,
+            threadExecutionWidth: 32,
+            maxTotalThreadsPerThreadgroup: 128,
+            bytesPerCode: MemoryLayout<SIMD2<Int32>>.stride,
+            maximumDynamicMemoryLength: 4_096
+        )
+
+        XCTAssertEqual(layout.threads.width, 32)
+        XCTAssertEqual(layout.threads.height, 4)
+        XCTAssertEqual(layout.threads.depth, 1)
+        XCTAssertLessThanOrEqual(layout.threads.height, YADIFThreadgroupLayout.maximumTileHeight)
+        XCTAssertLessThanOrEqual(layout.memoryLength, 4_096)
+        XCTAssertEqual(layout.memoryLength % 16, 0)
     }
 
     private func verifyGolden(order: FieldParity, stem: String) async throws {

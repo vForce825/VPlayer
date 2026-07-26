@@ -161,6 +161,63 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertEqual(harness.processor.metricsSnapshot.inFlightCount, 0)
     }
 
+    func testMappedCommandOutputsBecomeMetalPresentationFrames() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal device unavailable")
+        }
+        let lumaDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm,
+            width: 4,
+            height: 4,
+            mipmapped: false
+        )
+        let chromaDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg8Unorm,
+            width: 2,
+            height: 2,
+            mipmapped: false
+        )
+        let firstLuma = try XCTUnwrap(device.makeTexture(descriptor: lumaDescriptor))
+        let firstChroma = try XCTUnwrap(device.makeTexture(descriptor: chromaDescriptor))
+        let secondLuma = try XCTUnwrap(device.makeTexture(descriptor: lumaDescriptor))
+        let secondChroma = try XCTUnwrap(device.makeTexture(descriptor: chromaDescriptor))
+        let outputPlanes = YADIFOutputPlaneSets(
+            first: MetalPlaneSet(
+                luma: firstLuma,
+                chroma: firstChroma,
+                retainedObjects: []
+            ),
+            second: MetalPlaneSet(
+                luma: secondLuma,
+                chroma: secondChroma,
+                retainedObjects: []
+            )
+        )
+        let harness = try makeHarness(maximumInFlight: 1)
+        submit(try normalized(id: 1), to: harness)
+        submit(try normalized(id: 2), to: harness)
+        let identifier = try XCTUnwrap(harness.queue.submissionIdentifiers.first)
+
+        harness.queue.complete(
+            identifier: identifier,
+            completion: YADIFCommandCompletion(
+                result: .completed,
+                outputPlanes: outputPlanes
+            )
+        )
+
+        let frames = try success(harness.results.singleResult(for: 1))
+        XCTAssertEqual(frames.count, 2)
+        guard case let .metalPlanes(first) = frames[0].storage,
+              case let .metalPlanes(second) = frames[1].storage else {
+            return XCTFail("mapped YADIF outputs must bypass renderer remapping")
+        }
+        XCTAssertTrue((first.luma as AnyObject) === (firstLuma as AnyObject))
+        XCTAssertTrue((first.chroma as AnyObject) === (firstChroma as AnyObject))
+        XCTAssertTrue((second.luma as AnyObject) === (secondLuma as AnyObject))
+        XCTAssertTrue((second.chroma as AnyObject) === (secondChroma as AnyObject))
+    }
+
     func testMaximumThreeInflightJobsAndArbitraryCompletionResumeFIFOReadyWorkWithoutWait() throws {
         let harness = try makeHarness(
             maximumInFlight: 3,
@@ -870,9 +927,11 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         }
 
         wait(for: [completed], timeout: 5)
-        guard case let .completedWithGPUInterval(interval) = try XCTUnwrap(result.snapshot.first) else {
+        let completion = try XCTUnwrap(result.snapshot.first)
+        guard case let .completedWithGPUInterval(interval) = completion.result else {
             return XCTFail("expected completed Metal GPU interval")
         }
+        XCTAssertNotNil(completion.outputPlanes)
         XCTAssertGreaterThanOrEqual(interval.gpuStartTime, 0)
         XCTAssertGreaterThanOrEqual(interval.gpuEndTime, interval.gpuStartTime)
     }
@@ -1113,9 +1172,9 @@ private final class YADIFDropRecorder: @unchecked Sendable {
 
 private final class YADIFCommandResultRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var results: [YADIFCommandResult] = []
-    var snapshot: [YADIFCommandResult] { lock.withLock { results } }
-    func record(_ result: YADIFCommandResult) { lock.withLock { results.append(result) } }
+    private var results: [YADIFCommandCompletion] = []
+    var snapshot: [YADIFCommandCompletion] { lock.withLock { results } }
+    func record(_ result: YADIFCommandCompletion) { lock.withLock { results.append(result) } }
 }
 
 private final class ImmediateYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Sendable {
@@ -1126,16 +1185,16 @@ private final class ImmediateYADIFCommandSubmitter: YADIFCommandSubmitting, @unc
     func submit(
         job: YADIFJob,
         outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
-        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+        completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure) {
         lock.withLock { storedSubmitCount += 1 }
-        completion(.completed)
+        completion(YADIFCommandCompletion(result: .completed, outputPlanes: nil))
     }
 }
 
 private final class BlockingYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Sendable {
     private struct Pending: @unchecked Sendable {
-        let completion: @Sendable (YADIFCommandResult) -> Void
+        let completion: @Sendable (YADIFCommandCompletion) -> Void
     }
 
     private let lock = NSLock()
@@ -1146,7 +1205,7 @@ private final class BlockingYADIFCommandSubmitter: YADIFCommandSubmitting, @unch
     func submit(
         job: YADIFJob,
         outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
-        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+        completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure) {
         lock.withLock { pending.append(Pending(completion: completion)) }
         entered.signal()
@@ -1163,7 +1222,7 @@ private final class BlockingYADIFCommandSubmitter: YADIFCommandSubmitting, @unch
         let completion = lock.withLock {
             pending.isEmpty ? nil : pending.removeFirst().completion
         }
-        completion?(result)
+        completion?(YADIFCommandCompletion(result: result, outputPlanes: nil))
     }
 }
 

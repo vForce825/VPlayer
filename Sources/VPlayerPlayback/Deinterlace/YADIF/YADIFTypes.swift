@@ -10,7 +10,7 @@ protocol YADIFCommandSubmitting: AnyObject, Sendable {
     func submit(
         job: YADIFJob,
         outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
-        completion: @escaping @Sendable (YADIFCommandResult) -> Void
+        completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure)
 }
 
@@ -18,6 +18,16 @@ enum YADIFCommandResult: Sendable, Equatable {
     case completed
     case completedWithGPUInterval(MetalGPUInterval)
     case failed
+}
+
+struct YADIFOutputPlaneSets: @unchecked Sendable {
+    let first: MetalPlaneSet
+    let second: MetalPlaneSet
+}
+
+struct YADIFCommandCompletion: @unchecked Sendable {
+    let result: YADIFCommandResult
+    let outputPlanes: YADIFOutputPlaneSets?
 }
 
 public struct YADIFJob: @unchecked Sendable {
@@ -193,10 +203,10 @@ final class YADIFTextureMapper: @unchecked Sendable {
         switch description.pixelFormat {
         case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            planeFormats = (.r8Unorm, .rg8Unorm)
+            planeFormats = (.r8Uint, .rg8Uint)
         case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
-            planeFormats = (.r16Unorm, .rg16Unorm)
+            planeFormats = (.r16Uint, .rg16Uint)
         default:
             throw .unsupportedPixelFormat(description.pixelFormat)
         }
@@ -288,12 +298,88 @@ final class YADIFEncodedResources: @unchecked Sendable {
         self.outputs = outputs
         self.mappings = mappings
     }
+
+    func makeOutputPlaneSets() -> YADIFOutputPlaneSets? {
+        let presentationFormats: (luma: MTLPixelFormat, chroma: MTLPixelFormat)
+        switch CVPixelBufferGetPixelFormatType(outputs.0) {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            presentationFormats = (.r8Unorm, .rg8Unorm)
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            presentationFormats = (.r16Unorm, .rg16Unorm)
+        default:
+            return nil
+        }
+
+        func planeSet(
+            mapping: YADIFMappedTextures,
+            pixelBuffer: CVPixelBuffer
+        ) -> MetalPlaneSet? {
+            guard let luma = mapping.luma.makeTextureView(
+                pixelFormat: presentationFormats.luma
+            ), let chroma = mapping.chroma.makeTextureView(
+                pixelFormat: presentationFormats.chroma
+            ) else { return nil }
+            return MetalPlaneSet(
+                luma: luma,
+                chroma: chroma,
+                retainedObjects: [
+                    pixelBuffer as AnyObject,
+                    textureMapper,
+                    mapping.luma as AnyObject,
+                    mapping.chroma as AnyObject,
+                ] + mapping.wrappers.map { $0 as AnyObject }
+            )
+        }
+        guard let first = planeSet(mapping: mappings[3], pixelBuffer: outputs.0),
+              let second = planeSet(mapping: mappings[4], pixelBuffer: outputs.1) else {
+            return nil
+        }
+        return YADIFOutputPlaneSets(first: first, second: second)
+    }
 }
 
 private struct YADIFKernelUniforms {
     var outputIndex: UInt32
     var topFieldFirst: UInt32
     var spatialOnly: UInt32
+}
+
+struct YADIFThreadgroupLayout {
+    static let maximumTileHeight = 8
+    static let horizontalHalo = 3
+
+    let threads: MTLSize
+    let memoryLength: Int
+
+    static func make(
+        destinationWidth: Int,
+        rowPairCount: Int,
+        threadExecutionWidth: Int,
+        maxTotalThreadsPerThreadgroup: Int,
+        bytesPerCode: Int,
+        maximumDynamicMemoryLength: Int
+    ) -> YADIFThreadgroupLayout {
+        let width = max(1, min(destinationWidth, threadExecutionWidth))
+        let maximumHeightByThreads = max(1, maxTotalThreadsPerThreadgroup / width)
+        let bytesPerRowPair = 2 * (width + 2 * horizontalHalo) * bytesPerCode
+        let maximumHeightByMemory = max(1, maximumDynamicMemoryLength / bytesPerRowPair)
+        let height = max(
+            1,
+            min(
+                rowPairCount,
+                maximumTileHeight,
+                maximumHeightByThreads,
+                maximumHeightByMemory
+            )
+        )
+        let rawMemoryLength = bytesPerRowPair * height
+        return YADIFThreadgroupLayout(
+            threads: MTLSize(width: width, height: height, depth: 1),
+            memoryLength: (rawMemoryLength + 15) & ~15
+        )
+    }
 }
 
 final class YADIFNV12Kernel: @unchecked Sendable {
@@ -306,6 +392,7 @@ final class YADIFNV12Kernel: @unchecked Sendable {
     private let chromaPipeline8: any MTLComputePipelineState
     private let chromaPipeline16: any MTLComputePipelineState
     private let encoderFactory: YADIFEncoderFactory
+    private let maximumThreadgroupMemoryLength: Int
 
     init(
         device: any MTLDevice,
@@ -354,6 +441,7 @@ final class YADIFNV12Kernel: @unchecked Sendable {
         lumaPipeline16 = try makePipeline(named: p010FunctionName)
         chromaPipeline8 = try makePipeline(named: chromaFunctionName)
         chromaPipeline16 = try makePipeline(named: p010ChromaFunctionName)
+        maximumThreadgroupMemoryLength = device.maxThreadgroupMemoryLength
         // The four dispatches write four disjoint planes and share only
         // read-only inputs, so serialising them buys nothing and costs a drain
         // to one thread at the tail of each.
@@ -379,7 +467,10 @@ final class YADIFNV12Kernel: @unchecked Sendable {
         guard descriptions.dropFirst().allSatisfy({ $0 == descriptions[0] }) else {
             throw .invalidDimensions
         }
-        let planePipelines: (luma: any MTLComputePipelineState, chroma: any MTLComputePipelineState)
+        let planePipelines: (
+            luma: any MTLComputePipelineState,
+            chroma: any MTLComputePipelineState
+        )
         switch descriptions[0].pixelFormat {
         case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
@@ -415,10 +506,18 @@ final class YADIFNV12Kernel: @unchecked Sendable {
                 // One thread per row pair. An odd plane height leaves a single
                 // trailing row, which the last pair covers and the kernel bounds.
                 let rowPairCount = (destination.height + 1) / 2
-                let threadWidth = max(1, min(destination.width, pipeline.threadExecutionWidth))
-                let threadHeight = max(
-                    1,
-                    min(rowPairCount, pipeline.maxTotalThreadsPerThreadgroup / threadWidth)
+                let layout = YADIFThreadgroupLayout.make(
+                    destinationWidth: destination.width,
+                    rowPairCount: rowPairCount,
+                    threadExecutionWidth: pipeline.threadExecutionWidth,
+                    maxTotalThreadsPerThreadgroup: pipeline.maxTotalThreadsPerThreadgroup,
+                    bytesPerCode: plane == 0
+                        ? MemoryLayout<Int32>.stride
+                        : MemoryLayout<SIMD2<Int32>>.stride,
+                    maximumDynamicMemoryLength: max(
+                        0,
+                        maximumThreadgroupMemoryLength - pipeline.staticThreadgroupMemoryLength
+                    )
                 )
                 var uniforms = YADIFKernelUniforms(
                     outputIndex: UInt32(outputIndex),
@@ -430,13 +529,16 @@ final class YADIFNV12Kernel: @unchecked Sendable {
                     length: MemoryLayout<YADIFKernelUniforms>.stride,
                     index: 0
                 )
-                encoder.dispatchThreads(
-                    MTLSize(width: destination.width, height: rowPairCount, depth: 1),
-                    threadsPerThreadgroup: MTLSize(
-                        width: threadWidth,
-                        height: threadHeight,
+                encoder.setThreadgroupMemoryLength(layout.memoryLength, index: 0)
+                encoder.dispatchThreadgroups(
+                    MTLSize(
+                        width: (destination.width + layout.threads.width - 1)
+                            / layout.threads.width,
+                        height: (rowPairCount + layout.threads.height - 1)
+                            / layout.threads.height,
                         depth: 1
-                    )
+                    ),
+                    threadsPerThreadgroup: layout.threads
                 )
             }
         }
