@@ -451,6 +451,14 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
                 dropped: selection.droppedFrameCount
             )
         }
+        let cpuPreparationStartedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            metrics?.recordRenderCPUPreparation(
+                milliseconds: (
+                    ProcessInfo.processInfo.systemUptime - cpuPreparationStartedAt
+                ) * 1_000
+            )
+        }
         // A repeat re-presents the picture already on screen rather than leaving
         // the drawable unpresented. Skipping the submission looks free and is
         // not: CAMetalDisplayLink paces itself to the rate the layer actually

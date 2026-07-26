@@ -1503,6 +1503,8 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let maximumYADIFInFlightCount: Int
     let maximumYADIFInputDepth: Int
     let gpuDurationP95Milliseconds: Double
+    let yadifCPUEncodeP95Milliseconds: Double
+    let renderCPUPreparationP95Milliseconds: Double
     let avDriftP95Milliseconds: Double
     let residentMemoryBytes: UInt64
     let elapsedSeconds: Double

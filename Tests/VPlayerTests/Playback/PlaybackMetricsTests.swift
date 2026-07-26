@@ -56,6 +56,8 @@ final class PlaybackMetricsTests: XCTestCase {
         for duration in 1...20 {
             metrics.recordYADIFKernelDispatch(inFlightCount: min(3, duration), inputDepth: min(4, duration))
             metrics.recordGPUDuration(milliseconds: Double(duration))
+            metrics.recordYADIFCPUEncode(milliseconds: Double(duration) / 10)
+            metrics.recordRenderCPUPreparation(milliseconds: Double(duration) / 20)
         }
         metrics.recordStaleGenerationDrop()
         metrics.recordVideoDrop(count: 1, source: .deinterlaceQueueFull)
@@ -85,6 +87,8 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
         XCTAssertEqual(snapshot.gpuDurationP95Milliseconds, 19, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.yadifCPUEncodeP95Milliseconds, 1.9, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.renderCPUPreparationP95Milliseconds, 0.95, accuracy: 0.000_001)
         XCTAssertLessThanOrEqual(snapshot.avDriftP95Milliseconds, 20)
         XCTAssertLessThanOrEqual(snapshot.maximumAbsoluteAVDriftMilliseconds, 20)
         XCTAssertEqual(snapshot.residentMemoryBytes, 123_456)
@@ -157,9 +161,13 @@ final class PlaybackMetricsTests: XCTestCase {
         let generation = MediaGeneration(rawValue: 1)
         metrics.recordDecoderCallback()
         metrics.recordGPUDuration(milliseconds: 99)
+        metrics.recordYADIFCPUEncode(milliseconds: 88)
+        metrics.recordRenderCPUPreparation(milliseconds: 77)
         clock.value = 120
         metrics.recordDecoderCallback()
         metrics.recordGPUDuration(milliseconds: 4)
+        metrics.recordYADIFCPUEncode(milliseconds: 3)
+        metrics.recordRenderCPUPreparation(milliseconds: 2)
         metrics.recordPresentationCompletion(
             generation: generation,
             activeGeneration: MediaGeneration(rawValue: 2),
@@ -174,6 +182,8 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.decoderCallbacksPerSecond, 1.0 / 60.0, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.presentationsPerSecond, 0, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.gpuDurationP95Milliseconds, 4, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.yadifCPUEncodeP95Milliseconds, 3, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.renderCPUPreparationP95Milliseconds, 2, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.presentedVideoFrames, 0)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
     }

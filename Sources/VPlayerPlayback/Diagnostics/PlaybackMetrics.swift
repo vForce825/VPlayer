@@ -47,6 +47,8 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let maximumYADIFInFlightCount: Int
     public let maximumYADIFInputDepth: Int
     public let gpuDurationP95Milliseconds: Double
+    public let yadifCPUEncodeP95Milliseconds: Double
+    public let renderCPUPreparationP95Milliseconds: Double
     public let avDriftP95Milliseconds: Double
     public let residentMemoryBytes: UInt64
     public let elapsedSeconds: Double
@@ -200,6 +202,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         var decoderCallbackTimes: [TimeInterval] = []
         var presentationTimes: [TimeInterval] = []
         var gpuDurations: [TimedValue] = []
+        var yadifCPUEncodeDurations: [TimedValue] = []
+        var renderCPUPreparationDurations: [TimedValue] = []
         var decodeCallbackLatencies: [TimedValue] = []
         var decodeSubmissions: [TimedValue] = []
         var avDrifts: [TimedValue] = []
@@ -558,6 +562,28 @@ final class PlaybackMetrics: @unchecked Sendable {
         }
     }
 
+    func recordYADIFCPUEncode(milliseconds: Double) {
+        guard milliseconds.isFinite, milliseconds >= 0 else { return }
+        let timestamp = now()
+        lock.withLock {
+            pruneIfNeeded(at: timestamp)
+            state.yadifCPUEncodeDurations.append(
+                TimedValue(timestamp: timestamp, value: milliseconds)
+            )
+        }
+    }
+
+    func recordRenderCPUPreparation(milliseconds: Double) {
+        guard milliseconds.isFinite, milliseconds >= 0 else { return }
+        let timestamp = now()
+        lock.withLock {
+            pruneIfNeeded(at: timestamp)
+            state.renderCPUPreparationDurations.append(
+                TimedValue(timestamp: timestamp, value: milliseconds)
+            )
+        }
+    }
+
     func snapshot(window requestedWindow: Duration) -> PlaybackMetricsSnapshot {
         let timestamp = now()
         let requestedSeconds = max(0, Self.seconds(requestedWindow))
@@ -572,6 +598,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         let decoderCount = captured.decoderCallbackTimes.lazy.filter { $0 >= cutoff }.count
         let presentationCount = captured.presentationTimes.lazy.filter { $0 >= cutoff }.count
         let gpu = captured.gpuDurations.lazy.filter { $0.timestamp >= cutoff }.map(\.value)
+        let yadifCPUEncode = captured.yadifCPUEncodeDurations
+            .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
+        let renderCPUPreparation = captured.renderCPUPreparationDurations
+            .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let decodeLatency = captured.decodeCallbackLatencies
             .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let decodeSubmission = captured.decodeSubmissions
@@ -592,6 +622,10 @@ final class PlaybackMetrics: @unchecked Sendable {
             maximumYADIFInFlightCount: captured.maximumYADIFInFlightCount,
             maximumYADIFInputDepth: captured.maximumYADIFInputDepth,
             gpuDurationP95Milliseconds: Self.percentile95(Array(gpu)),
+            yadifCPUEncodeP95Milliseconds: Self.percentile95(Array(yadifCPUEncode)),
+            renderCPUPreparationP95Milliseconds: Self.percentile95(
+                Array(renderCPUPreparation)
+            ),
             avDriftP95Milliseconds: Self.percentile95(Array(drift)),
             residentMemoryBytes: residentMemoryProvider(),
             elapsedSeconds: elapsed,
@@ -656,6 +690,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         state.decoderCallbackTimes.removeAll { $0 < cutoff }
         state.presentationTimes.removeAll { $0 < cutoff }
         state.gpuDurations.removeAll { $0.timestamp < cutoff }
+        state.yadifCPUEncodeDurations.removeAll { $0.timestamp < cutoff }
+        state.renderCPUPreparationDurations.removeAll { $0.timestamp < cutoff }
         state.decodeCallbackLatencies.removeAll { $0.timestamp < cutoff }
         state.decodeSubmissions.removeAll { $0.timestamp < cutoff }
         state.avDrifts.removeAll { $0.timestamp < cutoff }

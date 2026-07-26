@@ -18,40 +18,30 @@ struct YADIFKernelUniforms {
 template <typename Codes> struct PlaneCodec;
 
 template <> struct PlaneCodec<int> {
-    static inline int decode(float4 texel, bool tenBit) {
-        float value = clamp(texel.x, 0.0f, 1.0f);
-        return tenBit
-            ? (int(round(value * 65535.0f)) >> 6)
-            : int(round(value * 255.0f));
+    static inline int decode(uint4 texel, bool tenBit) {
+        return tenBit ? int(texel.x >> 6) : int(texel.x);
     }
 
-    static inline float4 encode(int codes, bool tenBit) {
-        float value = tenBit
-            ? float(codes << 6) / 65535.0f
-            : float(codes) / 255.0f;
-        return float4(value, 0.0f, 0.0f, 1.0f);
+    static inline uint4 encode(int codes, bool tenBit) {
+        uint value = tenBit ? uint(codes << 6) : uint(codes);
+        return uint4(value, 0, 0, 0);
     }
 };
 
 template <> struct PlaneCodec<int2> {
-    static inline int2 decode(float4 texel, bool tenBit) {
-        float2 value = clamp(texel.xy, 0.0f, 1.0f);
-        return tenBit
-            ? (int2(round(value * 65535.0f)) >> 6)
-            : int2(round(value * 255.0f));
+    static inline int2 decode(uint4 texel, bool tenBit) {
+        return tenBit ? int2(texel.xy >> 6) : int2(texel.xy);
     }
 
-    static inline float4 encode(int2 codes, bool tenBit) {
-        float2 value = tenBit
-            ? float2(codes << 6) / 65535.0f
-            : float2(codes) / 255.0f;
-        return float4(value.x, value.y, 0.0f, 1.0f);
+    static inline uint4 encode(int2 codes, bool tenBit) {
+        uint2 value = tenBit ? uint2(codes << 6) : uint2(codes);
+        return uint4(value.x, value.y, 0, 0);
     }
 };
 
 template <typename Codes, bool TenBit>
 inline Codes sampleCodes(
-    texture2d<float, access::read> image,
+    texture2d<uint, access::read> image,
     int x,
     int y
 ) {
@@ -128,9 +118,9 @@ inline Codes spatialPrediction(
 
 template <typename Codes, bool TenBit>
 inline Codes synthesize(
-    texture2d<float, access::read> previous,
-    texture2d<float, access::read> current,
-    texture2d<float, access::read> next,
+    texture2d<uint, access::read> previous,
+    texture2d<uint, access::read> current,
+    texture2d<uint, access::read> next,
     thread const FieldWindow<Codes> &window,
     int x,
     int y,
@@ -148,9 +138,12 @@ inline Codes synthesize(
         return prediction;
     }
 
-    bool firstOutput = uniforms.outputIndex == 0;
-    texture2d<float, access::read> before = firstOutput ? previous : current;
-    texture2d<float, access::read> after = firstOutput ? current : next;
+    texture2d<uint, access::read> before = uniforms.outputIndex == 0
+        ? previous
+        : current;
+    texture2d<uint, access::read> after = uniforms.outputIndex == 0
+        ? current
+        : next;
 
     Codes temporalBefore = sampleCodes<Codes, TenBit>(before, x, y);
     Codes temporalAfter = sampleCodes<Codes, TenBit>(after, x, y);
@@ -205,22 +198,61 @@ inline Codes synthesize(
 // the whole filter, for twice the threads and no extra work done.
 template <typename Codes, bool TenBit>
 inline void runYADIF(
-    texture2d<float, access::read> previous,
-    texture2d<float, access::read> current,
-    texture2d<float, access::read> next,
-    texture2d<float, access::write> output,
+    texture2d<uint, access::read> previous,
+    texture2d<uint, access::read> current,
+    texture2d<uint, access::read> next,
+    texture2d<uint, access::write> output,
+    threadgroup Codes *spatialRows,
     constant YADIFKernelUniforms &uniforms,
-    uint2 position
+    uint2 position,
+    uint2 localPosition,
+    uint2 threadsPerThreadgroup
 ) {
     int width = int(output.get_width());
     int height = int(output.get_height());
     int x = int(position.x);
-    if (x >= width) {
-        return;
-    }
-
     int firstParity = uniforms.topFieldFirst != 0 ? 0 : 1;
     int copiedParity = uniforms.outputIndex == 0 ? firstParity : 1 - firstParity;
+    int rowPairCount = (height + 1) / 2;
+
+    int safeRowPair = min(int(position.y), rowPairCount - 1) * 2;
+    int safeSynthesizedY = safeRowPair + 1 - copiedParity;
+    int safeAboveY = safeSynthesizedY == 0 ? 1 : safeSynthesizedY - 1;
+    int safeBelowY = safeSynthesizedY + 1 == height
+        ? height - 2
+        : safeSynthesizedY + 1;
+    int groupOriginX = x - int(localPosition.x);
+    uint rowStride = threadsPerThreadgroup.x + 6;
+    uint aboveBase = localPosition.y * rowStride * 2;
+    uint belowBase = aboveBase + rowStride;
+    uint sharedX = localPosition.x + 3;
+    spatialRows[aboveBase + sharedX] = sampleCodes<Codes, TenBit>(
+        current, x, safeAboveY
+    );
+    spatialRows[belowBase + sharedX] = sampleCodes<Codes, TenBit>(
+        current, x, safeBelowY
+    );
+    if (localPosition.x < 3) {
+        int leftX = groupOriginX + int(localPosition.x) - 3;
+        int rightX = groupOriginX
+            + int(threadsPerThreadgroup.x)
+            + int(localPosition.x);
+        spatialRows[aboveBase + localPosition.x] = sampleCodes<Codes, TenBit>(
+            current, leftX, safeAboveY
+        );
+        spatialRows[belowBase + localPosition.x] = sampleCodes<Codes, TenBit>(
+            current, leftX, safeBelowY
+        );
+        spatialRows[aboveBase + threadsPerThreadgroup.x + 3 + localPosition.x]
+            = sampleCodes<Codes, TenBit>(current, rightX, safeAboveY);
+        spatialRows[belowBase + threadsPerThreadgroup.x + 3 + localPosition.x]
+            = sampleCodes<Codes, TenBit>(current, rightX, safeBelowY);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (x >= width || int(position.y) >= rowPairCount) {
+        return;
+    }
     int rowPair = int(position.y) * 2;
     int copiedY = rowPair + copiedParity;
     int synthesizedY = rowPair + 1 - copiedParity;
@@ -241,20 +273,20 @@ inline void runYADIF(
     int aboveY = synthesizedY == 0 ? 1 : synthesizedY - 1;
     int belowY = synthesizedY + 1 == height ? height - 2 : synthesizedY + 1;
     FieldWindow<Codes> window;
-    window.above[0] = sampleCodes<Codes, TenBit>(current, x - 3, aboveY);
-    window.above[1] = sampleCodes<Codes, TenBit>(current, x - 2, aboveY);
-    window.above[2] = sampleCodes<Codes, TenBit>(current, x - 1, aboveY);
-    window.above[3] = sampleCodes<Codes, TenBit>(current, x, aboveY);
-    window.above[4] = sampleCodes<Codes, TenBit>(current, x + 1, aboveY);
-    window.above[5] = sampleCodes<Codes, TenBit>(current, x + 2, aboveY);
-    window.above[6] = sampleCodes<Codes, TenBit>(current, x + 3, aboveY);
-    window.below[0] = sampleCodes<Codes, TenBit>(current, x - 3, belowY);
-    window.below[1] = sampleCodes<Codes, TenBit>(current, x - 2, belowY);
-    window.below[2] = sampleCodes<Codes, TenBit>(current, x - 1, belowY);
-    window.below[3] = sampleCodes<Codes, TenBit>(current, x, belowY);
-    window.below[4] = sampleCodes<Codes, TenBit>(current, x + 1, belowY);
-    window.below[5] = sampleCodes<Codes, TenBit>(current, x + 2, belowY);
-    window.below[6] = sampleCodes<Codes, TenBit>(current, x + 3, belowY);
+    window.above[0] = spatialRows[aboveBase + localPosition.x];
+    window.above[1] = spatialRows[aboveBase + localPosition.x + 1];
+    window.above[2] = spatialRows[aboveBase + localPosition.x + 2];
+    window.above[3] = spatialRows[aboveBase + localPosition.x + 3];
+    window.above[4] = spatialRows[aboveBase + localPosition.x + 4];
+    window.above[5] = spatialRows[aboveBase + localPosition.x + 5];
+    window.above[6] = spatialRows[aboveBase + localPosition.x + 6];
+    window.below[0] = spatialRows[belowBase + localPosition.x];
+    window.below[1] = spatialRows[belowBase + localPosition.x + 1];
+    window.below[2] = spatialRows[belowBase + localPosition.x + 2];
+    window.below[3] = spatialRows[belowBase + localPosition.x + 3];
+    window.below[4] = spatialRows[belowBase + localPosition.x + 4];
+    window.below[5] = spatialRows[belowBase + localPosition.x + 5];
+    window.below[6] = spatialRows[belowBase + localPosition.x + 6];
 
     Codes code = synthesize<Codes, TenBit>(
         previous,
@@ -276,45 +308,69 @@ inline void runYADIF(
 }
 
 kernel void yadifPlane8(
-    texture2d<float, access::read> previous [[texture(0)]],
-    texture2d<float, access::read> current [[texture(1)]],
-    texture2d<float, access::read> next [[texture(2)]],
-    texture2d<float, access::write> output [[texture(3)]],
+    texture2d<uint, access::read> previous [[texture(0)]],
+    texture2d<uint, access::read> current [[texture(1)]],
+    texture2d<uint, access::read> next [[texture(2)]],
+    texture2d<uint, access::write> output [[texture(3)]],
+    threadgroup int *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
-    uint2 position [[thread_position_in_grid]]
+    uint2 position [[thread_position_in_grid]],
+    uint2 localPosition [[thread_position_in_threadgroup]],
+    uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int, false>(previous, current, next, output, uniforms, position);
+    runYADIF<int, false>(
+        previous, current, next, output, spatialRows, uniforms,
+        position, localPosition, threadsPerThreadgroup
+    );
 }
 
 kernel void yadifPlane16(
-    texture2d<float, access::read> previous [[texture(0)]],
-    texture2d<float, access::read> current [[texture(1)]],
-    texture2d<float, access::read> next [[texture(2)]],
-    texture2d<float, access::write> output [[texture(3)]],
+    texture2d<uint, access::read> previous [[texture(0)]],
+    texture2d<uint, access::read> current [[texture(1)]],
+    texture2d<uint, access::read> next [[texture(2)]],
+    texture2d<uint, access::write> output [[texture(3)]],
+    threadgroup int *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
-    uint2 position [[thread_position_in_grid]]
+    uint2 position [[thread_position_in_grid]],
+    uint2 localPosition [[thread_position_in_threadgroup]],
+    uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int, true>(previous, current, next, output, uniforms, position);
+    runYADIF<int, true>(
+        previous, current, next, output, spatialRows, uniforms,
+        position, localPosition, threadsPerThreadgroup
+    );
 }
 
 kernel void yadifChroma8(
-    texture2d<float, access::read> previous [[texture(0)]],
-    texture2d<float, access::read> current [[texture(1)]],
-    texture2d<float, access::read> next [[texture(2)]],
-    texture2d<float, access::write> output [[texture(3)]],
+    texture2d<uint, access::read> previous [[texture(0)]],
+    texture2d<uint, access::read> current [[texture(1)]],
+    texture2d<uint, access::read> next [[texture(2)]],
+    texture2d<uint, access::write> output [[texture(3)]],
+    threadgroup int2 *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
-    uint2 position [[thread_position_in_grid]]
+    uint2 position [[thread_position_in_grid]],
+    uint2 localPosition [[thread_position_in_threadgroup]],
+    uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int2, false>(previous, current, next, output, uniforms, position);
+    runYADIF<int2, false>(
+        previous, current, next, output, spatialRows, uniforms,
+        position, localPosition, threadsPerThreadgroup
+    );
 }
 
 kernel void yadifChroma16(
-    texture2d<float, access::read> previous [[texture(0)]],
-    texture2d<float, access::read> current [[texture(1)]],
-    texture2d<float, access::read> next [[texture(2)]],
-    texture2d<float, access::write> output [[texture(3)]],
+    texture2d<uint, access::read> previous [[texture(0)]],
+    texture2d<uint, access::read> current [[texture(1)]],
+    texture2d<uint, access::read> next [[texture(2)]],
+    texture2d<uint, access::write> output [[texture(3)]],
+    threadgroup int2 *spatialRows [[threadgroup(0)]],
     constant YADIFKernelUniforms &uniforms [[buffer(0)]],
-    uint2 position [[thread_position_in_grid]]
+    uint2 position [[thread_position_in_grid]],
+    uint2 localPosition [[thread_position_in_threadgroup]],
+    uint2 threadsPerThreadgroup [[threads_per_threadgroup]]
 ) {
-    runYADIF<int2, true>(previous, current, next, output, uniforms, position);
+    runYADIF<int2, true>(
+        previous, current, next, output, spatialRows, uniforms,
+        position, localPosition, threadsPerThreadgroup
+    );
 }
