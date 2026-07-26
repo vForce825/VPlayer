@@ -35,6 +35,7 @@ public final class VideoPresentationQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var horizon: CMTime
     private var frameCeiling: Int
+    private let byteBudget: Int
     private var frames: [VideoPresentationFrame] = []
     private var displayedFrame: VideoPresentationFrame?
     private var overflowSinceSelection = 0
@@ -49,6 +50,21 @@ public final class VideoPresentationQueue: @unchecked Sendable {
         activeGeneration = generation
         self.horizon = Self.validHorizon(horizon)
         self.frameCeiling = Self.validFrameCeiling(frameCeiling)
+        byteBudget = PlaybackVideoMemoryBudget.presentationQueueBytes
+    }
+
+    init(
+        generation: MediaGeneration,
+        horizon: CMTime,
+        frameCeiling: Int,
+        byteBudget: Int
+    ) {
+        activeGeneration = generation
+        self.horizon = Self.validHorizon(horizon)
+        self.frameCeiling = Self.validFrameCeiling(frameCeiling)
+        self.byteBudget = byteBudget > 0
+            ? byteBudget
+            : PlaybackVideoMemoryBudget.presentationQueueBytes
     }
 
     public var horizonSeconds: Double { lock.withLock { CMTimeGetSeconds(horizon) } }
@@ -215,22 +231,34 @@ public final class VideoPresentationQueue: @unchecked Sendable {
     }
 
     private func trimToHorizonLocked() {
+        var estimatedBytes = frames.reduce(into: 0) { total, frame in
+            total = Self.addingClamped(total, frame.estimatedStorageBytes)
+        }
         while frames.count > 1 {
             let span = CMTimeSubtract(
                 frames[frames.count - 1].presentationTimeStamp,
                 frames[0].presentationTimeStamp
             )
             let overHorizon = span.isNumeric && CMTimeCompare(span, horizon) > 0
-            guard overHorizon || frames.count > frameCeiling else { return }
+            let overMemoryBudget = estimatedBytes > byteBudget
+            guard overHorizon || overMemoryBudget || frames.count > frameCeiling else {
+                return
+            }
             // Evict the frame furthest from being due. `select` already discards
             // frames whose expiry has passed, so reaching here means the producer
             // is ahead of the clock — dropping the oldest would delete the very
             // frame that is about to be displayed and guarantee that nothing is
             // ever presented.
-            frames.removeLast()
+            let removed = frames.removeLast()
+            estimatedBytes = max(0, estimatedBytes - removed.estimatedStorageBytes)
             overflowSinceSelection += 1
             epochDroppedFrames += 1
         }
+    }
+
+    private static func addingClamped(_ lhs: Int, _ rhs: Int) -> Int {
+        let result = lhs.addingReportingOverflow(rhs)
+        return result.overflow ? Int.max : result.partialValue
     }
 
     private static func isOrderedBefore(

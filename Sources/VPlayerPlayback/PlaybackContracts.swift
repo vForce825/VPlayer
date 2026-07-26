@@ -166,6 +166,23 @@ public struct PlaybackTuning: Sendable, Equatable {
         deinterlaceBufferFrames + 32
     }
 
+    /// Keeps VideoToolbox's requested pool from reserving a gigabyte of 4K
+    /// P010 surfaces before the presentation queue has retained its first
+    /// second. HD keeps the measured pool floor; larger formats trade pool
+    /// reuse for a process-wide memory ceiling.
+    func decoderOutputPoolFloor(for dimensions: CMVideoDimensions) -> Int {
+        let estimatedBytes = PlaybackVideoMemoryBudget.estimated420SurfaceBytes(
+            dimensions: dimensions,
+            bitDepth: 10
+        )
+        let memoryBound = PlaybackVideoMemoryBudget.maximumFrameCount(
+            byteBudget: PlaybackVideoMemoryBudget.decoderPoolBytes,
+            estimatedFrameBytes: estimatedBytes,
+            minimum: PlaybackVideoMemoryBudget.minimumDecoderPoolFrames
+        )
+        return min(decoderOutputPoolFloor, memoryBound)
+    }
+
     /// Undecoded access units allowed to queue ahead of the decoder before the
     /// pipeline skips to the next random-access point.
     ///

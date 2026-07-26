@@ -54,3 +54,56 @@ public struct VideoPresentationFrame: @unchecked Sendable {
         self.formatMetadata = formatMetadata
     }
 }
+
+/// A decoded 4:2:0 frame is cheap at HD and enormous at 4K P010. Duration-only
+/// queue bounds therefore turn the same two-second setting from roughly 150 MB
+/// into multiple gigabytes. These budgets preserve the configured duration for
+/// normal HD playback while putting a hard ceiling on decoded-surface memory.
+enum PlaybackVideoMemoryBudget {
+    static let presentationQueueBytes = 512 * 1_024 * 1_024
+    static let retainedAnchorBytes = 256 * 1_024 * 1_024
+    static let decoderPoolBytes = 256 * 1_024 * 1_024
+    static let minimumDecoderPoolFrames = 8
+
+    static func estimated420SurfaceBytes(
+        dimensions: CMVideoDimensions,
+        bitDepth: Int
+    ) -> Int {
+        let width = Int(dimensions.width)
+        let height = Int(dimensions.height)
+        guard width > 0, height > 0,
+              let pixels = multiplied(width, height),
+              let samples = multiplied(pixels, 3) else { return Int.max }
+        // NV12 stores 12 bits per pixel. P010 stores each 10-bit component in a
+        // 16-bit lane, so its physical footprint is 24 bits per pixel.
+        let bytesPerComponent = bitDepth > 8 ? 2 : 1
+        guard let bytes = multiplied(samples, bytesPerComponent) else {
+            return Int.max
+        }
+        return max(1, bytes / 2)
+    }
+
+    static func maximumFrameCount(
+        byteBudget: Int,
+        estimatedFrameBytes: Int,
+        minimum: Int = 1
+    ) -> Int {
+        guard byteBudget > 0, estimatedFrameBytes > 0,
+              estimatedFrameBytes != Int.max else { return max(1, minimum) }
+        return max(minimum, byteBudget / estimatedFrameBytes)
+    }
+
+    private static func multiplied(_ lhs: Int, _ rhs: Int) -> Int? {
+        let result = lhs.multipliedReportingOverflow(by: rhs)
+        return result.overflow ? nil : result.partialValue
+    }
+}
+
+extension VideoPresentationFrame {
+    var estimatedStorageBytes: Int {
+        PlaybackVideoMemoryBudget.estimated420SurfaceBytes(
+            dimensions: formatMetadata.dimensions,
+            bitDepth: formatMetadata.bitDepth
+        )
+    }
+}

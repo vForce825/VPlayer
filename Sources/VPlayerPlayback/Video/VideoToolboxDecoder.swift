@@ -328,6 +328,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let selection = try makeSession(format: format)
         let candidate = selection.session
         let tuning = tuningBox.value
+        let outputPoolFloor = tuning.decoderOutputPoolFloor(
+            for: CMVideoFormatDescriptionGetDimensions(format)
+        )
 
         // Both fields woven into one frame per coded frame, which is what the
         // deinterlacer takes as input. It is also the decoder default, so a
@@ -365,7 +368,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let poolStatus = api.setProperty(
             candidate,
             key: kVTDecompressionPropertyKey_OutputPoolRequestedMinimumBufferCount as String,
-            value: .unsigned32(UInt32(tuning.decoderOutputPoolFloor))
+            value: .unsigned32(UInt32(outputPoolFloor))
         )
         guard poolStatus == noErr || poolStatus == kVTPropertyNotSupportedErr else {
             api.invalidate(candidate)
@@ -393,7 +396,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             summary: Self.sessionSummary(
                 format: format,
                 pixelFormatChoice: selection.choice,
-                outputPoolFloor: poolStatus == noErr ? tuning.decoderOutputPoolFloor : nil,
+                outputPoolFloor: poolStatus == noErr ? outputPoolFloor : nil,
                 fieldModeStatus: fieldModeStatus,
                 threadCountStatus: threadCountStatus,
                 hardwareStatus: hardware.status,
