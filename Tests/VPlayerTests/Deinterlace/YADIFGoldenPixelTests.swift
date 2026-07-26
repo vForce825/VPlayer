@@ -488,7 +488,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
             rowPairCount: 540,
             threadExecutionWidth: 32,
             maxTotalThreadsPerThreadgroup: 128,
-            bytesPerCode: MemoryLayout<SIMD2<Int32>>.stride,
+            bytesPerCode: MemoryLayout<SIMD2<Int16>>.stride,
             maximumDynamicMemoryLength: 4_096
         )
 
@@ -497,6 +497,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
         XCTAssertEqual(layout.threads.depth, 1)
         XCTAssertLessThanOrEqual(layout.threads.height, YADIFThreadgroupLayout.maximumTileHeight)
         XCTAssertLessThanOrEqual(layout.memoryLength, 4_096)
+        XCTAssertEqual(layout.memoryLength, 1_216)
         XCTAssertEqual(layout.memoryLength % 16, 0)
     }
 
