@@ -5,6 +5,25 @@
 import VideoToolbox
 
 struct AppleTemporalConfigurator {
+    /// The one property the route cannot do without: it is what makes the
+    /// decoder deinterlace at all.
+    static let requiredPropertyKey = kVTDecompressionPropertyKey_FieldMode as String
+    /// Which algorithm the decoder deinterlaces with, and *optional* — the SDK
+    /// says a decoder that does not implement it simply picks its own, and the
+    /// temporal algorithm is asked for per frame through
+    /// `kVTDecodeFrame_EnableTemporalProcessing` regardless.
+    ///
+    /// Requiring it rejected every decoder Apple currently ships: none of them
+    /// implement it, including the ones that do implement `FieldMode`. That
+    /// turned "this decoder deinterlaces, just not with the algorithm you asked
+    /// for" into "Apple Temporal is unavailable".
+    static let optionalPropertyKey = kVTDecompressionPropertyKey_DeinterlaceMode as String
+
+    /// Whether a decoder that reports these keys can run the route at all.
+    static func supportsDeinterlaceFields(_ supportedKeys: Set<String>) -> Bool {
+        supportedKeys.contains(requiredPropertyKey)
+    }
+
     private let api: any VTSessionPropertyAPI
     private let propertyDidSet: @Sendable () -> Void
 
@@ -24,21 +43,19 @@ struct AppleTemporalConfigurator {
         guard let supportedKeys = snapshot.supportedPropertyKeys else {
             throw AppleTemporalFailure.initializationFailed(status: kVTParameterErr)
         }
-
-        let fieldModeKey = kVTDecompressionPropertyKey_FieldMode as String
-        let deinterlaceModeKey = kVTDecompressionPropertyKey_DeinterlaceMode as String
-        for key in [fieldModeKey, deinterlaceModeKey] where !supportedKeys.contains(key) {
-            throw AppleTemporalFailure.unsupportedProperty(key)
+        guard Self.supportsDeinterlaceFields(supportedKeys) else {
+            throw AppleTemporalFailure.unsupportedProperty(Self.requiredPropertyKey)
         }
 
         try set(
             session: session,
-            key: fieldModeKey,
+            key: Self.requiredPropertyKey,
             value: .string(kVTDecompressionProperty_FieldMode_DeinterlaceFields as String)
         )
+        guard supportedKeys.contains(Self.optionalPropertyKey) else { return }
         try set(
             session: session,
-            key: deinterlaceModeKey,
+            key: Self.optionalPropertyKey,
             value: .string(kVTDecompressionProperty_DeinterlaceMode_Temporal as String)
         )
     }

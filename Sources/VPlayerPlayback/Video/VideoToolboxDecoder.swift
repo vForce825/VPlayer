@@ -237,6 +237,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private let sessionIdentity = SessionIdentityBox()
     private let backlog: DecodeSubmissionBacklog
     private let tuningBox = TuningBox()
+    private let temporalSupport = TemporalSupportBox()
 
     public convenience init(
         executor: PlaybackSerialExecutor,
@@ -306,6 +307,11 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         // reaches the decoder at the next configure rather than immediately.
     }
 
+    public func supportsConfiguration(_ configuration: VideoDecodeConfiguration) -> Bool {
+        guard configuration == .appleTemporal else { return true }
+        return temporalSupport.value ?? true
+    }
+
     public func configure(
         format: CMVideoFormatDescription,
         generation: MediaGeneration,
@@ -342,6 +348,11 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         var fieldModeStatus: OSStatus?
         switch configuration {
         case .bothFields:
+            // Learn here whether the Apple deinterlace route is even possible.
+            // This session is the one built while the scan type is still being
+            // classified, so the answer is in hand before anything decides to
+            // switch to a configuration this decoder never had.
+            recordTemporalSupport(of: candidate)
             let setStatus = api.setProperty(
                 candidate,
                 key: kVTDecompressionPropertyKey_FieldMode as String,
@@ -358,7 +369,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     api: api,
                     propertyDidSet: { [metrics] in metrics?.recordTemporalPropertySet() }
                 ).configure(session: candidate)
+                temporalSupport.value = true
             } catch let failure as AppleTemporalFailure {
+                if case .unsupportedProperty = failure { temporalSupport.value = false }
                 api.invalidate(candidate)
                 throw VideoDecoderFailure.temporalUnavailable(failure)
             } catch {
@@ -425,6 +438,16 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             submissionWindow.reset(sessionID: previous.id)
             api.invalidate(previous.session)
         }
+    }
+
+    /// A query the decoder cannot answer is left unknown rather than recorded as
+    /// unsupported: it costs one attempt to find out, and a wrong "no" would
+    /// disable the route for the whole session.
+    private func recordTemporalSupport(of session: any VideoToolboxSession) {
+        let snapshot = api.copySupportedPropertySnapshot(session)
+        guard snapshot.status == noErr,
+              let keys = snapshot.supportedPropertyKeys else { return }
+        temporalSupport.value = AppleTemporalConfigurator.supportsDeinterlaceFields(keys)
     }
 
     private struct SessionSelection {
@@ -845,6 +868,18 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         default:
             return ClassifiedFailure(failure: .malfunction(status), isRecoverable: false)
         }
+    }
+}
+
+/// Written on the submission queue when a session is built, read on the
+/// playback executor when the route is resolved.
+private final class TemporalSupportBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool?
+
+    var value: Bool? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }
 

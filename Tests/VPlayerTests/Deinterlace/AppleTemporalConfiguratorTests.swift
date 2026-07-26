@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreMedia
+import CoreVideo
 import Foundation
 import VideoToolbox
 import XCTest
@@ -89,14 +91,8 @@ final class AppleTemporalConfiguratorTests: XCTestCase {
         }
     }
 
-    func testEveryMissingKeyIsPreflightedBeforeAnyPropertyMutation() {
-        let cases: [(Set<String>, String)] = [
-            ([deinterlaceModeKey], fieldModeKey),
-            ([fieldModeKey], deinterlaceModeKey),
-            ([], fieldModeKey),
-        ]
-
-        for (keys, expectedMissingKey) in cases {
+    func testTheOnlyRequiredPropertyIsPreflightedBeforeAnyPropertyMutation() {
+        for keys: Set<String> in [[deinterlaceModeKey], []] {
             let api = FakeVideoToolboxAPI()
             let session = FakeVideoToolboxSession(id: VTSessionID(rawValue: 1))
             api.enqueueSupportedPropertySnapshot(.init(
@@ -104,13 +100,37 @@ final class AppleTemporalConfiguratorTests: XCTestCase {
                 supportedPropertyKeys: keys
             ))
 
-            assertFailure(.unsupportedProperty(expectedMissingKey)) {
+            assertFailure(.unsupportedProperty(fieldModeKey)) {
                 try AppleTemporalConfigurator(api: api).configure(session: session)
             }
 
             XCTAssertEqual(api.snapshot.operations, ["supported"])
             XCTAssertTrue(api.snapshot.sets.isEmpty)
         }
+    }
+
+    // Every decoder Apple currently ships omits DeinterlaceMode, including the
+    // ones that implement FieldMode. Requiring it made the Apple route report
+    // itself unavailable on every platform rather than deinterlacing with the
+    // decoder's own algorithm.
+    func testAnUnlistedDeinterlaceModeStillDeinterlacesWithFieldModeAlone() throws {
+        let api = FakeVideoToolboxAPI()
+        let session = FakeVideoToolboxSession(id: VTSessionID(rawValue: 7))
+        api.enqueueSupportedPropertySnapshot(.init(
+            status: noErr,
+            supportedPropertyKeys: [fieldModeKey]
+        ))
+
+        try AppleTemporalConfigurator(api: api).configure(session: session)
+
+        XCTAssertEqual(api.snapshot.operations, ["supported", "set"])
+        XCTAssertEqual(api.snapshot.sets, [
+            .init(
+                sessionID: VTSessionID(rawValue: 7),
+                key: fieldModeKey,
+                value: .string(kVTDecompressionProperty_FieldMode_DeinterlaceFields as String)
+            ),
+        ])
     }
 
     func testFirstSetFailureStopsBeforeSecondSet() {
@@ -140,6 +160,89 @@ final class AppleTemporalConfiguratorTests: XCTestCase {
 
         XCTAssertEqual(api.snapshot.operations, ["supported", "set", "set"])
         XCTAssertEqual(api.snapshot.sets.map(\.key), [fieldModeKey, deinterlaceModeKey])
+    }
+
+    // Runs against the real VideoToolbox, on whatever this suite executes on.
+    //
+    // It deliberately does not assert that Apple implements the deinterlace
+    // properties — as of tvOS 26.2 no decoder there does, on device or in the
+    // simulator, which is why the Apple route always reports itself
+    // unavailable. What it pins down is that the pipeline's answer comes from
+    // the decoder rather than from an assumption: the day a decoder lists
+    // FieldMode, the route has to configure instead of falling back, and the
+    // day one stops, it has to fall back instead of failing to decode.
+    func testRealDecoderCapabilityDecidesWhetherTheAppleRouteConfigures() throws {
+        let format = try interlacedH264FormatDescription()
+        let api = SystemVideoToolboxAPI()
+        let creation = api.createSession(
+            format: format,
+            decoderSpecification: [
+                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String:
+                    .boolean(true),
+            ],
+            imageBufferAttributes: [
+                kCVPixelBufferMetalCompatibilityKey as String: .boolean(true),
+                kCVPixelBufferIOSurfacePropertiesKey as String: .dictionary([:]),
+            ]
+        )
+        let session = try XCTUnwrap(creation.session, "session create \(creation.status)")
+        defer { api.invalidate(session) }
+        let snapshot = api.copySupportedPropertySnapshot(session)
+        XCTAssertEqual(snapshot.status, noErr)
+        let supportedKeys = try XCTUnwrap(snapshot.supportedPropertyKeys)
+        let deinterlaces = AppleTemporalConfigurator.supportsDeinterlaceFields(supportedKeys)
+
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.temporal.capability")
+        let decoder = VideoToolboxDecoder(executor: executor) { _ in }
+        defer { decoder.invalidate() }
+        let generation = MediaGeneration(rawValue: 1)
+        try decoder.configure(
+            format: format,
+            generation: generation,
+            configuration: .bothFields
+        )
+
+        XCTAssertEqual(decoder.supportsConfiguration(.bothFields), true)
+        XCTAssertEqual(
+            decoder.supportsConfiguration(.appleTemporal),
+            deinterlaces,
+            "the route decision must follow the decoder's own property list"
+        )
+
+        do {
+            try decoder.configure(
+                format: format,
+                generation: generation,
+                configuration: .appleTemporal
+            )
+            XCTAssertTrue(deinterlaces, "a decoder without FieldMode must not configure")
+        } catch let failure as VideoDecoderFailure {
+            XCTAssertFalse(deinterlaces, "a decoder with FieldMode must configure: \(failure)")
+            XCTAssertEqual(
+                failure,
+                .temporalUnavailable(.unsupportedProperty(fieldModeKey))
+            )
+        }
+    }
+
+    /// 1080i H.264 High@4.1 parameter sets lifted from
+    /// `Tests/VPlayerTests/Fixtures/Media/interlaced-h264-mp2.ts`, so the
+    /// decoder is asked about exactly the content the Apple route exists for.
+    private func interlacedH264FormatDescription() throws -> CMVideoFormatDescription {
+        let sps: [UInt8] = [
+            0x67, 0x64, 0x00, 0x29, 0xAC, 0xD9, 0x40, 0x78, 0x04, 0x4F,
+            0xDE, 0x02, 0xD4, 0x04, 0x04, 0x05, 0x00, 0x00, 0x03, 0x00,
+            0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x9F, 0x16, 0x2D, 0x96,
+        ]
+        let pps: [UInt8] = [0x68, 0xFE, 0x8F, 0xCB]
+        let format = try VideoFormatDescriptionBuilder.make(
+            codec: .h264,
+            parameterSets: [Data(sps), Data(pps)]
+        )
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+        XCTAssertEqual(dimensions.width, 1_920)
+        XCTAssertEqual(dimensions.height, 1_080)
+        return format
     }
 
     private func assertFailure(

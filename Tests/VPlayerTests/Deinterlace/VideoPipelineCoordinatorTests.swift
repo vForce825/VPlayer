@@ -380,6 +380,48 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         XCTAssertTrue(harness.yadif.submissions.isEmpty)
     }
 
+    // A decoder that never had the deinterlace properties is knowable from the
+    // session already open, so the route must retire before it costs anything.
+    // Learning it the other way round — switch, reconfigure, fail, fall back —
+    // spent a generation reset and the frames up to the next random-access
+    // point on every channel start, which is the whole of what the Apple route
+    // cost on tvOS.
+    func testDecoderWithoutDeinterlaceSupportNeverReconfiguresOrResetsThePipeline() throws {
+        let harness = makeHarness(algorithm: .appleTemporal)
+        harness.decoder.supportsAppleTemporal = false
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+
+        let beforeClassification = harness.decoder.snapshot().count
+
+        harness.coordinator.handle(decoder: .frame(try decodedFrame(
+            id: 10,
+            generation: generation,
+            parser: interlacedParser(parity: .top, sourcePTS90k: 36_000)
+        )))
+
+        XCTAssertEqual(harness.coordinator.route, .rawTemporalFailure)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertEqual(
+            harness.decoder.snapshot().dropFirst(beforeClassification).map { $0 },
+            [],
+            "classifying interlaced must not touch a decoder that cannot deinterlace"
+        )
+        XCTAssertEqual(harness.host.notices.map(\.0), [.appleTemporalUnavailable])
+        XCTAssertTrue(harness.host.failures.isEmpty)
+
+        // The reason belongs in the diagnostics, not only in the active route.
+        XCTAssertEqual(
+            harness.metrics.snapshot(window: .seconds(60)).lastVideoDecodeFailure,
+            "temporalUnsupportedProperty.\(kVTDecompressionPropertyKey_FieldMode as String):0"
+        )
+    }
+
     func testTemporalRuntimeFailureRebuildsRawOnceAndAwayBackReenablesAttempt() throws {
         let harness = makeHarness(algorithm: .appleTemporal)
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
@@ -1297,6 +1339,7 @@ private final class RecordingCoordinatorDecoder: VideoDecoding, @unchecked Senda
     private let trace: CoordinatorTrace
     private var operations: [Operation] = []
     var temporalConfigureFailures: [VideoDecoderFailure] = []
+    var supportsAppleTemporal = true
     var decodeFailures: [VideoDecoderFailure] = []
     var finishFailures: [VideoDecoderFailure] = []
     var waitFailures: [VideoDecoderFailure] = []
@@ -1340,6 +1383,10 @@ private final class RecordingCoordinatorDecoder: VideoDecoding, @unchecked Senda
     func invalidate() {
         lock.withLock { operations.append(.invalidate) }
         trace.append("decoder.invalidate")
+    }
+
+    func supportsConfiguration(_ configuration: VideoDecodeConfiguration) -> Bool {
+        configuration == .appleTemporal ? supportsAppleTemporal : true
     }
 
     func snapshot() -> [Operation] { lock.withLock { operations } }

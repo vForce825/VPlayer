@@ -16,7 +16,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         try configure(harness, generation: 3)
 
         let snapshot = harness.api.snapshot
-        XCTAssertEqual(snapshot.operations, ["create", "copy", "set", "set", "copy"])
+        XCTAssertEqual(snapshot.operations, ["create", "copy", "supported", "set", "set", "copy"])
         XCTAssertEqual(snapshot.creates.count, 1)
         XCTAssertEqual(snapshot.creates.first?.decoderSpecification, [
             kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: .boolean(true),
@@ -113,7 +113,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
 
         XCTAssertEqual(
             harness.api.snapshot.operations,
-            ["create", "copy", "set", "set", "copy"]
+            ["create", "copy", "supported", "set", "set", "copy"]
         )
         try decode(harness, id: 7, generation: 3)
         XCTAssertEqual(harness.api.snapshot.decodes.count, 1)
@@ -195,7 +195,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
 
         XCTAssertEqual(
             harness.api.snapshot.operations,
-            ["create", "copy", "set", "set", "copy"]
+            ["create", "copy", "supported", "set", "set", "copy"]
         )
         try decode(harness, id: 11, generation: 1)
         XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
@@ -325,13 +325,6 @@ final class VideoToolboxDecoderTests: XCTestCase {
                 { $0.enqueueSupportedPropertySnapshot(.init(
                     status: noErr,
                     supportedPropertyKeys: [deinterlaceModeKey]
-                )) }
-            ),
-            (
-                .unsupportedProperty(deinterlaceModeKey),
-                { $0.enqueueSupportedPropertySnapshot(.init(
-                    status: noErr,
-                    supportedPropertyKeys: [fieldModeKey]
                 )) }
             ),
             (

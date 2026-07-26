@@ -162,8 +162,20 @@ public protocol VideoDecoding: AnyObject {
     func waitForAsynchronousFrames() throws
     func invalidate()
     func setTuning(_ tuning: PlaybackTuning)
+    /// Whether the decoder behind the session built so far implements what a
+    /// configuration needs.
+    ///
+    /// Answering before the route commits is the whole point: reconfiguring the
+    /// decoder costs a generation reset and the frames up to the next
+    /// random-access point, and paying that to discover a configuration the
+    /// decoder never had is a hiccup on every channel start.
+    ///
+    /// `true` when nothing is known yet — an unproven configuration is worth one
+    /// attempt, an impossible one is not.
+    func supportsConfiguration(_ configuration: VideoDecodeConfiguration) -> Bool
 }
 
 public extension VideoDecoding {
     func setTuning(_ tuning: PlaybackTuning) {}
+    func supportsConfiguration(_ configuration: VideoDecodeConfiguration) -> Bool { true }
 }

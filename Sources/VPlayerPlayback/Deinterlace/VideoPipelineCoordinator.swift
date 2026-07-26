@@ -206,6 +206,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 waitingForRandomAccess = false
             } catch let failure as VideoDecoderFailure {
                 if targetConfiguration == .appleTemporal {
+                    recordDecodeFailureDiagnostic(failure)
                     guard configureRawTemporalFallback(format: videoFormat) else { return }
                 } else {
                     hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
@@ -242,6 +243,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             restartDecoderAfterBackpressureTimeout()
             return
         }
+        recordDecodeFailureDiagnostic(failure)
         if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
             temporalRetrySuppressed = true
             emitTemporalNoticeOnce()
@@ -251,7 +253,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             )
             return
         }
-        recordDecodeFailureDiagnostic(failure)
         if Self.isPerFrameDecodeFailure(failure) {
             handlePerFrameDecodeFailure(failure, generation: generation)
             return
@@ -291,6 +292,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 metrics?.recordStaleGenerationDrop()
                 return
             }
+            recordDecodeFailureDiagnostic(failure)
             if failure.isTemporalUnavailable, activeConfiguration == .appleTemporal {
                 temporalRetrySuppressed = true
                 emitTemporalNoticeOnce()
@@ -300,7 +302,6 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 )
                 return
             }
-            recordDecodeFailureDiagnostic(failure)
             if Self.requiresDecoderSessionRestart(failure) {
                 restartDecoderAfterSessionFailure(failure, generation: eventGeneration)
                 return
@@ -396,7 +397,25 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         case .unsupportedConfiguration: ("unsupportedConfiguration", 0)
         case .softwareDecoder: ("softwareDecoder", 0)
         case .backpressureTimeout: ("backpressureTimeout", 0)
-        case .temporalUnavailable: ("temporalUnavailable", 0)
+        // Which property the decoder was missing is the whole content of this
+        // failure. Reported as a bare name it said only that the route was off,
+        // which is the one thing already visible from the active route.
+        case let .temporalUnavailable(temporal): temporalDiagnosticName(for: temporal)
+        }
+    }
+
+    private static func temporalDiagnosticName(
+        for failure: AppleTemporalFailure
+    ) -> (String, Int32) {
+        switch failure {
+        case let .unsupportedProperty(key):
+            ("temporalUnsupportedProperty.\(key)", 0)
+        case let .propertySetFailed(key, status):
+            ("temporalPropertySetFailed.\(key)", status)
+        case let .initializationFailed(status):
+            ("temporalInitializationFailed", status)
+        case let .processingFailed(status):
+            ("temporalProcessingFailed", status)
         }
     }
 
@@ -518,7 +537,32 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         applyResolvedRoute()
     }
 
+    /// Retires the Apple route before it costs anything when the decoder has
+    /// already said it cannot deinterlace.
+    ///
+    /// Discovering it the other way round — switch route, reconfigure, fail,
+    /// fall back — spends a generation reset and the frames up to the next
+    /// random-access point, on every channel start, to reach a state that was
+    /// knowable from the session already open. Suppressing first makes the
+    /// resolved route `.rawTemporalFailure`, which shares `.bothFields` with the
+    /// configuration already running, so nothing is torn down at all.
+    private func suppressTemporalIfDecoderCannotDeinterlace() {
+        guard !temporalRetrySuppressed,
+              selectedAlgorithm == .appleTemporal,
+              decoderConfigured,
+              case .interlaced = classifier.current,
+              !decoder.supportsConfiguration(.appleTemporal) else { return }
+        temporalRetrySuppressed = true
+        recordDecodeFailureDiagnostic(
+            .temporalUnavailable(
+                .unsupportedProperty(AppleTemporalConfigurator.requiredPropertyKey)
+            )
+        )
+        emitTemporalNoticeOnce()
+    }
+
     private func applyResolvedRoute() {
+        suppressTemporalIfDecoderCannotDeinterlace()
         let next = resolvedRoute()
         guard next != route else { return }
         let nextConfiguration = configuration(for: next)
