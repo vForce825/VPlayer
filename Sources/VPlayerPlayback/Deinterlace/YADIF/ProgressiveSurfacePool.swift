@@ -42,6 +42,26 @@ public final class ProgressiveSurfacePool: @unchecked Sendable {
         return (first, second)
     }
 
+    /// A single surface of a named geometry, for producers that have no source
+    /// buffer to match — a software decoder writing its own output rather than
+    /// the deinterlacer transforming one.
+    public func allocate(
+        width: Int,
+        height: Int,
+        pixelFormat: OSType
+    ) throws(YADIFFailure) -> CVPixelBuffer {
+        let key = PoolKey(
+            width: width,
+            height: height,
+            pixelFormat: pixelFormat,
+            range: Self.rangeIdentity(for: pixelFormat)
+        )
+        let output = try allocate(from: try pool(for: key))
+        guard CVPixelBufferGetIOSurface(output) != nil else { throw .nonIOSurfaceOutput }
+        try YADIFSurfaceValidator.validate(YADIFSurfaceDescription(pixelBuffer: output))
+        return output
+    }
+
     private func pool(for key: PoolKey) throws(YADIFFailure) -> CVPixelBufferPool {
         lock.lock()
         defer { lock.unlock() }

@@ -1462,11 +1462,18 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
         let clock = RenderSynchronizerClock(synchronizer: synchronizer)
         let relay = PlaybackPipelineRelay()
-        let decoder = VideoToolboxDecoder(
-            executor: executor,
-            tuning: tuning,
-            diagnostics: (metrics: metrics, signposts: signposts)
-        ) { relay.decoder($0) }
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: VideoToolboxDecoder(
+                executor: executor,
+                tuning: tuning,
+                diagnostics: (metrics: metrics, signposts: signposts)
+            ) { relay.decoder($0) },
+            ffmpeg: FFmpegVideoDecoder(
+                executor: executor,
+                eventSink: { relay.decoder($0) },
+                metrics: metrics
+            )
+        )
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw PlaybackCoreError.metalCommand("device.unavailable")
         }
