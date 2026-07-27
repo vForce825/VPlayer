@@ -8,6 +8,85 @@ import VPlayerPlayback
 
 @MainActor
 final class VPlayerAppStartupTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        StubURLProtocol.reset()
+    }
+
+    override func tearDown() {
+        StubURLProtocol.reset()
+        super.tearDown()
+    }
+
+    func testChannelLogoCacheUsesWritableCachesDirectory() throws {
+        let fileManager = FileManager.default
+        let cachesRoot = try fileManager.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let directory = try ChannelLogoCache.defaultCacheDirectory(fileManager: fileManager)
+        _ = ChannelLogoCache(fileManager: fileManager, cacheDirectory: directory)
+
+        XCTAssertEqual(directory.deletingLastPathComponent().lastPathComponent, "VPlayer")
+        XCTAssertEqual(directory.lastPathComponent, "ChannelLogos")
+        XCTAssertTrue(directory.path.hasPrefix(cachesRoot.path + "/"))
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    func testChannelLogoCachePersistsDownloadedImageAndAvoidsSecondRequest() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let session = logoTestSession()
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/oriental-4k.png"))
+        StubURLProtocol.enqueue(.init(
+            response: .http(statusCode: 200, headers: ["Content-Type": "image/png"]),
+            chunks: [Self.onePixelPNG]
+        ))
+
+        let firstCache = ChannelLogoCache(session: session, cacheDirectory: cacheDirectory)
+        let downloadedImage = await firstCache.image(for: logoURL)
+        let memoryCachedImage = await firstCache.image(for: logoURL)
+        XCTAssertNotNil(downloadedImage)
+        XCTAssertNotNil(memoryCachedImage)
+        XCTAssertEqual(StubURLProtocol.requests.count, 1)
+
+        let relaunchedCache = ChannelLogoCache(session: session, cacheDirectory: cacheDirectory)
+        let diskCachedImage = await relaunchedCache.image(for: logoURL)
+        XCTAssertNotNil(diskCachedImage)
+        XCTAssertEqual(StubURLProtocol.requests.count, 1)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path).count,
+            1
+        )
+    }
+
+    func testChannelLogoCacheCoalescesConcurrentRequestsForSameURL() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/shared.png"))
+        StubURLProtocol.enqueue(.init(
+            response: .http(statusCode: 200),
+            chunks: [Self.onePixelPNG],
+            callbackDelay: 0.02
+        ))
+        let cache = ChannelLogoCache(
+            session: logoTestSession(),
+            cacheDirectory: cacheDirectory
+        )
+
+        let first = Task { await cache.image(for: logoURL) }
+        let second = Task { await cache.image(for: logoURL) }
+        let firstImage = await first.value
+        let secondImage = await second.value
+        XCTAssertNotNil(firstImage)
+        XCTAssertNotNil(secondImage)
+        XCTAssertEqual(StubURLProtocol.requests.count, 1)
+    }
+
     func testLaunchArgumentsSelectOnlyTheExactSeededFixturePair() {
         XCTAssertEqual(
             AppLaunchConfiguration(arguments: ["VPlayer", "-ui-fixture", "seeded"]).mode,
@@ -45,6 +124,21 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertNil(AppLaunchConfiguration(arguments: [
             "VPlayer", "-ui-playback-fixture",
         ]).playbackFixture)
+    }
+
+    private static let onePixelPNG = Data(base64Encoded:
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )!
+
+    private func temporaryLogoCacheDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("VPlayerLogoCacheTests-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    private func logoTestSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        return URLSession(configuration: configuration)
     }
 
     func testAcceptanceLaunchIsExactDebugOnlyAndNeverSelectsTheFixtureEngine() {

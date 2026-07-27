@@ -70,6 +70,7 @@ targets:
     dependencies:
       - target: VPlayerCore
       - target: VPlayerPlayback
+      - sdk: CryptoKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.app
