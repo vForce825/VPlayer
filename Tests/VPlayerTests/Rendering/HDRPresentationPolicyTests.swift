@@ -26,6 +26,8 @@ final class HDRPresentationPolicyTests: XCTestCase {
         XCTAssertEqual(configuration.primaries, .bt709)
         XCTAssertFalse(configuration.isHDR)
         XCTAssertEqual(configuration.bitDepth, 8)
+        XCTAssertEqual(configuration.drawablePixelFormat, .bgr10a2Unorm)
+        XCTAssertEqual(configuration.layerColorSpaceName, CGColorSpace.itur_709 as String)
     }
 
     func testKnownSDRAndUnusualExplicitMetadataArePreserved() {
@@ -47,8 +49,12 @@ final class HDRPresentationPolicyTests: XCTestCase {
         XCTAssertFalse(configuration.isHDR)
     }
 
-    func testPQAndHLGDefaultUnknownMatrixAndPrimariesToBT2020WithLinearOutputPolicy() {
-        for transfer: VideoFormatMetadata.Transfer in [.pq, .hlg] {
+    func testPQAndHLGUseTransferEncodedTenBitOutputForSystemDisplayMapping() {
+        let cases: [(VideoFormatMetadata.Transfer, CFString)] = [
+            (.pq, CGColorSpace.itur_2100_PQ),
+            (.hlg, CGColorSpace.itur_2100_HLG),
+        ]
+        for (transfer, colorSpaceName) in cases {
             let configuration = HDRPresentationPolicy.systemManaged.configuration(
                 for: metadata(
                     bitDepth: 10,
@@ -65,10 +71,10 @@ final class HDRPresentationPolicyTests: XCTestCase {
             XCTAssertEqual(configuration.primaries, .bt2020)
             XCTAssertTrue(configuration.isHDR)
             XCTAssertEqual(configuration.bitDepth, 10)
-            XCTAssertEqual(configuration.drawablePixelFormat, .rgba16Float)
+            XCTAssertEqual(configuration.drawablePixelFormat, .bgr10a2Unorm)
             XCTAssertEqual(
                 configuration.layerColorSpaceName,
-                CGColorSpace.extendedLinearITUR_2020 as String
+                colorSpaceName as String
             )
             XCTAssertEqual(configuration.layerToneMapMode, .automatic)
         }
@@ -133,16 +139,11 @@ final class HDRPresentationPolicyTests: XCTestCase {
             metadata: source,
             pixelFormatIsTenBit: false
         )
-        let uniforms = MetalVideoRenderer.makeGPUUniforms(
-            shaderState: state,
-            metadata: source
-        )
-
         XCTAssertEqual(state.uniforms.matrixKind, .bt709)
         XCTAssertEqual(state.uniforms.transfer, .bt709)
         XCTAssertEqual(state.uniforms.primaries, .bt709)
         XCTAssertEqual(state.uniforms.yOffset, Float(16) / 255, accuracy: 0.000_001)
-        XCTAssertEqual(uniforms.applyGamutTransform, 1)
+        XCTAssertEqual(state.outputConfiguration.layerColorSpaceName, CGColorSpace.itur_709 as String)
     }
 
     private func metadata(

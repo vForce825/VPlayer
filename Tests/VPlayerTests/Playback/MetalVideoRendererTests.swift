@@ -525,7 +525,6 @@ final class MetalVideoRendererTests: XCTestCase {
         XCTAssertEqual(state.uniforms.sampleNormalization, Float(65_535) / 65_472, accuracy: 0.000_001)
         XCTAssertEqual(state.uniforms.yuvToRGB.columns.2.x, 1.4746, accuracy: 0.000_1)
         XCTAssertEqual(state.uniforms.transfer, .pq)
-        XCTAssertEqual(state.uniforms.gamut709To2020.columns.0.x, 0.627404, accuracy: 0.000_1)
         XCTAssertEqual(state.outputConfiguration.cleanAperture, metadata.cleanAperture)
         XCTAssertEqual(state.outputConfiguration.chromaLocation, metadata.chromaLocation)
         XCTAssertEqual(state.outputConfiguration.hdrStaticMetadata, metadata.hdrStaticMetadata)
@@ -561,11 +560,9 @@ final class MetalVideoRendererTests: XCTestCase {
             metadata: metadata
         )
 
-        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.stride, 144)
-        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.offset(of: \.range), 96)
-        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.offset(of: \.textureTransform), 112)
-        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.offset(of: \.transferKind), 128)
-        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.offset(of: \.applyGamutTransform), 132)
+        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.stride, 80)
+        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.offset(of: \.range), 48)
+        XCTAssertEqual(MemoryLayout<MetalGPUUniforms>.offset(of: \.textureTransform), 64)
         XCTAssertEqual(uniforms.yuvColumn0.w, Float(65_535) / 65_472, accuracy: 0.000_001)
         XCTAssertEqual(uniforms.textureTransform.x, 4.0 / 1_920, accuracy: 0.000_001)
         XCTAssertEqual(uniforms.textureTransform.y, 2.0 / 1_080, accuracy: 0.000_001)
@@ -606,10 +603,9 @@ final class MetalVideoRendererTests: XCTestCase {
         XCTAssertEqual(harness.submitter.jobs.first?.outputConfiguration, .init(
             cleanAperture: metadata.cleanAperture,
             chromaLocation: metadata.chromaLocation,
-            hdrStaticMetadata: metadata.hdrStaticMetadata
+            hdrStaticMetadata: metadata.hdrStaticMetadata,
+            layerColorSpaceName: CGColorSpace.itur_2100_HLG as String
         ))
-        XCTAssertEqual(harness.submitter.jobs.first?.uniforms.transferKind, 3)
-        XCTAssertEqual(harness.submitter.jobs.first?.uniforms.applyGamutTransform, 0)
     }
 
     func testProductionShaderBundleIsPlaybackFrameworkInsteadOfHostApplication() {
@@ -654,7 +650,7 @@ final class MetalVideoRendererTests: XCTestCase {
             pixelFormatIsTenBit: false
         )
 
-        let rgb = state.uniforms.referenceLinearOutput(y: 0.25, cb: 0.75, cr: 0.5)
+        let rgb = state.uniforms.referenceEncodedOutput(y: 0.25, cb: 0.75, cr: 0.5)
 
         XCTAssertEqual(state.uniforms.chromaOffset, 0, accuracy: 0.000_001)
         XCTAssertEqual(rgb.x, 0.5, accuracy: 0.000_001)
@@ -673,7 +669,7 @@ final class MetalVideoRendererTests: XCTestCase {
             pixelFormatIsTenBit: false
         )
 
-        let rgb = state.uniforms.referenceLinearOutput(
+        let rgb = state.uniforms.referenceEncodedOutput(
             y: 16.0 / 255,
             cb: 235.0 / 255,
             cr: 16.0 / 255
@@ -684,7 +680,7 @@ final class MetalVideoRendererTests: XCTestCase {
         XCTAssertEqual(rgb.z, 1, accuracy: 0.000_001)
     }
 
-    func testHLGReferenceAppliesInverseOETFAndDisplayOOTFAtNominalPeak() {
+    func testHLGReferencePreservesEncodedSignalForSystemDisplayMapping() {
         let state = MetalVideoRenderer.makeShaderState(
             metadata: makeMetadata(
                 range: .full,
@@ -695,11 +691,26 @@ final class MetalVideoRendererTests: XCTestCase {
             pixelFormatIsTenBit: false
         )
 
-        let output = state.uniforms.referenceLinearOutput(y: 0.75, cb: 0.75, cr: 0.75)
+        let output = state.uniforms.referenceEncodedOutput(y: 0.75, cb: 0.75, cr: 0.75)
 
         for component in [output.x, output.y, output.z] {
-            XCTAssertEqual(component, 2.031_521_6, accuracy: 0.000_01)
+            XCTAssertEqual(component, 0.75, accuracy: 0.000_01)
         }
+    }
+
+    func testSystemSubmitterSelectsHLGColorSpaceOnDrawableLayer() {
+        let configuration = HDRPresentationPolicy.systemManaged.configuration(
+            for: makeMetadata(transfer: .hlg, primaries: .bt2020)
+        )
+        let layer = CAMetalLayer()
+        layer.colorspace = CGColorSpace(name: CGColorSpace.itur_709)
+
+        SystemMetalCommandSubmitter.configure(
+            layer: layer,
+            for: configuration.outputConfiguration
+        )
+
+        XCTAssertEqual(layer.colorspace?.name, CGColorSpace.itur_2100_HLG)
     }
 
     func testVideoRenderDecisionHasFrozenPublicInitializerAndValues() {
@@ -733,10 +744,10 @@ final class MetalVideoRendererTests: XCTestCase {
         )
         let layer = try XCTUnwrap(view.layer as? CAMetalLayer)
         XCTAssertEqual(factoryCount, 1)
-        XCTAssertEqual(layer.pixelFormat, .rgba16Float)
+        XCTAssertEqual(layer.pixelFormat, .bgr10a2Unorm)
         XCTAssertTrue(layer.framebufferOnly)
         XCTAssertEqual(layer.toneMapMode, .automatic)
-        XCTAssertEqual(layer.colorspace?.name, CGColorSpace.extendedLinearITUR_2020)
+        XCTAssertEqual(layer.colorspace?.name, CGColorSpace.itur_709)
 
         view.render(targetPresentationTimestamp: 123.456_789_123, drawable: drawable)
         let expectedHost = CMTime(seconds: 123.456_789_123, preferredTimescale: 1_000_000_000)
@@ -966,7 +977,7 @@ private final class FakeDrawable: NSObject, CAMetalDrawable, @unchecked Sendable
 
     init(device: any MTLDevice) throws {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba16Float,
+            pixelFormat: .bgr10a2Unorm,
             width: 2,
             height: 2,
             mipmapped: false

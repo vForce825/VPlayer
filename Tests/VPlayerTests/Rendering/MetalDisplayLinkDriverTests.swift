@@ -206,9 +206,9 @@ final class MetalDisplayLinkDriverTests: XCTestCase {
         XCTAssertTrue(MetalVideoView.layerClass === CAMetalLayer.self)
         XCTAssertEqual(factoryCount, 1)
         XCTAssertEqual(lifecycle.operations, ["add:kCFRunLoopCommonModes"])
-        XCTAssertEqual(metalLayer.pixelFormat, .rgba16Float)
+        XCTAssertEqual(metalLayer.pixelFormat, .bgr10a2Unorm)
         XCTAssertTrue(metalLayer.framebufferOnly)
-        XCTAssertEqual(metalLayer.colorspace?.name, CGColorSpace.extendedLinearITUR_2020)
+        XCTAssertEqual(metalLayer.colorspace?.name, CGColorSpace.itur_709)
         XCTAssertEqual(metalLayer.toneMapMode, .automatic)
 
         view.pauseDisplayLink()
