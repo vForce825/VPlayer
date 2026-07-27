@@ -58,7 +58,6 @@ struct MetalYUVUniforms: Sendable, Equatable {
     let chromaScale: Float
     let sampleNormalization: Float
     let yuvToRGB: simd_float3x3
-    let gamut709To2020: simd_float3x3
     let transfer: VideoFormatMetadata.Transfer
     let matrixKind: VideoFormatMetadata.Matrix
     let primaries: VideoFormatMetadata.Primaries
@@ -74,51 +73,8 @@ struct MetalYUVUniforms: Sendable, Equatable {
         )
     }
 
-    func referenceLinearOutput(y: Float, cb: Float, cr: Float) -> SIMD3<Float> {
-        var rgb = referenceRGB(y: y, cb: cb, cr: cr)
-        switch transfer {
-        case .linear:
-            break
-        case .bt709, .unknown:
-            rgb = map(rgb) {
-                $0 < 0.081 ? $0 / 4.5 : pow(($0 + 0.099) / 1.099, 1 / 0.45)
-            }
-        case .pq:
-            let m1: Float = 2_610 / 16_384
-            let m2: Float = 2_523 / 32
-            let c1: Float = 3_424 / 4_096
-            let c2: Float = 2_413 / 128
-            let c3: Float = 2_392 / 128
-            rgb = map(rgb) {
-                let p = pow($0, 1 / m2)
-                return pow(max(p - c1, 0) / max(c2 - c3 * p, 0.000_001), 1 / m1) * 100
-            }
-        case .hlg:
-            let a: Float = 0.178_832_77
-            let b: Float = 0.284_668_92
-            let c: Float = 0.559_910_73
-            let scene = map(rgb) {
-                $0 <= 0.5 ? ($0 * $0) / 3 : (exp(($0 - c) / a) + b) / 12
-            }
-            let luma: Float
-            if primaries == .bt709 {
-                luma = simd_dot(scene, SIMD3<Float>(0.2126, 0.7152, 0.0722))
-            } else {
-                luma = simd_dot(scene, SIMD3<Float>(0.2627, 0.6780, 0.0593))
-            }
-            rgb = scene * (pow(max(luma, 0.000_001), 0.2) * 10)
-        }
-        if primaries == .bt709 {
-            rgb = gamut709To2020 * rgb
-        }
-        return rgb
-    }
-
-    private func map(
-        _ value: SIMD3<Float>,
-        transform: (Float) -> Float
-    ) -> SIMD3<Float> {
-        SIMD3<Float>(transform(value.x), transform(value.y), transform(value.z))
+    func referenceEncodedOutput(y: Float, cb: Float, cr: Float) -> SIMD3<Float> {
+        referenceRGB(y: y, cb: cb, cr: cr)
     }
 }
 
@@ -126,6 +82,7 @@ struct MetalOutputConfiguration: Sendable, Equatable {
     let cleanAperture: CGRect?
     let chromaLocation: VideoFormatMetadata.ChromaLocation
     let hdrStaticMetadata: VideoFormatMetadata.HDRStaticMetadata
+    let layerColorSpaceName: String
 }
 
 struct MetalShaderState: Sendable, Equatable {
@@ -137,15 +94,8 @@ struct MetalGPUUniforms: Sendable {
     var yuvColumn0: SIMD4<Float>
     var yuvColumn1: SIMD4<Float>
     var yuvColumn2: SIMD4<Float>
-    var gamutColumn0: SIMD4<Float>
-    var gamutColumn1: SIMD4<Float>
-    var gamutColumn2: SIMD4<Float>
     var range: SIMD4<Float>
     var textureTransform: SIMD4<Float>
-    var transferKind: UInt32
-    var applyGamutTransform: UInt32
-    var padding0: UInt32 = 0
-    var padding1: UInt32 = 0
 }
 
 private enum MetalVideoRendererError: Error {
@@ -226,6 +176,16 @@ final class SystemMetalCommandSubmitter: MetalCommandSubmitting, @unchecked Send
     private let pipeline: any MTLRenderPipelineState
     private let sampler: any MTLSamplerState
 
+    static func configure(
+        layer: CAMetalLayer,
+        for outputConfiguration: MetalOutputConfiguration
+    ) {
+        let colorSpaceName = outputConfiguration.layerColorSpaceName as CFString
+        if layer.colorspace?.name != colorSpaceName {
+            layer.colorspace = CGColorSpace(name: colorSpaceName)
+        }
+    }
+
     init(device: any MTLDevice) throws {
         guard let queue = device.makeCommandQueue() else {
             throw MetalVideoRendererError.commandQueue
@@ -243,7 +203,7 @@ final class SystemMetalCommandSubmitter: MetalCommandSubmitting, @unchecked Send
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.vertexFunction = vertex
         descriptor.fragmentFunction = fragment
-        descriptor.colorAttachments[0].pixelFormat = .rgba16Float
+        descriptor.colorAttachments[0].pixelFormat = .bgr10a2Unorm
         do {
             pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
         } catch {
@@ -266,6 +226,7 @@ final class SystemMetalCommandSubmitter: MetalCommandSubmitting, @unchecked Send
         drawable: any CAMetalDrawable,
         completion: @escaping @Sendable (MetalCommandCompletion) -> Void
     ) throws {
+        Self.configure(layer: drawable.layer, for: job.outputConfiguration)
         guard let commandBuffer = queue.makeCommandBuffer() else {
             throw MetalVideoRendererError.commandBuffer
         }
@@ -561,11 +522,6 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         let normalization: Float = pixelFormatIsTenBit ? 65_535 / 65_472 : 1
 
         let matrix = yuvMatrix(for: configuration.matrix)
-        let gamut = simd_float3x3(columns: (
-            SIMD3<Float>(0.627404, 0.069097, 0.016392),
-            SIMD3<Float>(0.329283, 0.919540, 0.088013),
-            SIMD3<Float>(0.043313, 0.011362, 0.895595)
-        ))
         return MetalShaderState(
             uniforms: MetalYUVUniforms(
                 yOffset: yOffsetCode / maximumCode,
@@ -574,7 +530,6 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
                 chromaScale: maximumCode / chromaRangeCode,
                 sampleNormalization: normalization,
                 yuvToRGB: matrix,
-                gamut709To2020: gamut,
                 transfer: configuration.transfer,
                 matrixKind: configuration.matrix,
                 primaries: configuration.primaries
@@ -796,13 +751,6 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         } else {
             transform = SIMD4<Float>(0, 0, 1, 1)
         }
-        let transferKind: UInt32
-        switch uniforms.transfer {
-        case .linear: transferKind = 0
-        case .bt709, .unknown: transferKind = 1
-        case .pq: transferKind = 2
-        case .hlg: transferKind = 3
-        }
         return MetalGPUUniforms(
             yuvColumn0: SIMD4<Float>(
                 uniforms.yuvToRGB.columns.0,
@@ -810,18 +758,13 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
             ),
             yuvColumn1: SIMD4<Float>(uniforms.yuvToRGB.columns.1, 0),
             yuvColumn2: SIMD4<Float>(uniforms.yuvToRGB.columns.2, 0),
-            gamutColumn0: SIMD4<Float>(uniforms.gamut709To2020.columns.0, 0),
-            gamutColumn1: SIMD4<Float>(uniforms.gamut709To2020.columns.1, 0),
-            gamutColumn2: SIMD4<Float>(uniforms.gamut709To2020.columns.2, 0),
             range: SIMD4<Float>(
                 uniforms.yOffset,
                 uniforms.yScale,
                 uniforms.chromaOffset,
                 uniforms.chromaScale
             ),
-            textureTransform: transform,
-            transferKind: transferKind,
-            applyGamutTransform: configuration.primaries == .bt709 ? 1 : 0
+            textureTransform: transform
         )
     }
 }

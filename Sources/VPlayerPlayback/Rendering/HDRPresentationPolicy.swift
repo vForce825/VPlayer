@@ -27,7 +27,8 @@ struct HDRPresentationConfiguration: Equatable {
         MetalOutputConfiguration(
             cleanAperture: cleanAperture,
             chromaLocation: chromaLocation,
-            hdrStaticMetadata: hdrStaticMetadata
+            hdrStaticMetadata: hdrStaticMetadata,
+            layerColorSpaceName: layerColorSpaceName
         )
     }
 
@@ -71,6 +72,22 @@ struct HDRPresentationPolicy: Sendable, Equatable {
             contentLightLevelInfo: metadata.hdrStaticMetadata.contentLightLevelInfo
         )
 
+        let layerColorSpaceName: CFString
+        switch effectiveTransfer {
+        case .hlg:
+            layerColorSpaceName = CGColorSpace.itur_2100_HLG
+        case .pq:
+            layerColorSpaceName = CGColorSpace.itur_2100_PQ
+        case .linear:
+            layerColorSpaceName = effectivePrimaries == .bt2020
+                ? CGColorSpace.extendedLinearITUR_2020
+                : CGColorSpace.extendedLinearSRGB
+        case .bt709, .unknown:
+            layerColorSpaceName = effectivePrimaries == .bt2020
+                ? CGColorSpace.itur_2020
+                : CGColorSpace.itur_709
+        }
+
         return HDRPresentationConfiguration(
             dimensions: metadata.dimensions,
             bitDepth: metadata.bitDepth,
@@ -79,8 +96,8 @@ struct HDRPresentationPolicy: Sendable, Equatable {
             transfer: effectiveTransfer,
             primaries: effectivePrimaries,
             isHDR: isHDR,
-            drawablePixelFormat: .rgba16Float,
-            layerColorSpaceName: CGColorSpace.extendedLinearITUR_2020 as String,
+            drawablePixelFormat: .bgr10a2Unorm,
+            layerColorSpaceName: layerColorSpaceName as String,
             layerToneMapMode: .automatic,
             cleanAperture: metadata.cleanAperture,
             chromaLocation: metadata.chromaLocation,
@@ -90,9 +107,13 @@ struct HDRPresentationPolicy: Sendable, Equatable {
 
     @MainActor
     func configure(layer: CAMetalLayer) {
-        layer.pixelFormat = .rgba16Float
+        // CAEDRMetadata and wantsExtendedDynamicRangeContent are unavailable on
+        // tvOS. Keep transfer-encoded RGB in a 10-bit drawable and describe the
+        // signal with the matching colorspace so Core Animation and the display
+        // pipeline own the HLG/PQ display mapping.
+        layer.pixelFormat = .bgr10a2Unorm
         layer.framebufferOnly = true
-        layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
+        layer.colorspace = CGColorSpace(name: CGColorSpace.itur_709)
         layer.toneMapMode = .automatic
     }
 }

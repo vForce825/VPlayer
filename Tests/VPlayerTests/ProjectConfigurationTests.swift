@@ -339,10 +339,14 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertFalse(settings.contains(".prefersDefaultFocus("))
         XCTAssertFalse(settings.contains(".focusScope("))
         XCTAssertTrue(channels.contains(
-            "@FocusState private var focusedChannelID: String?"
+            "@FocusState private var focusedElement: ChannelBrowserFocus?"
         ))
-        XCTAssertTrue(channels.contains(".focused($focusedChannelID, equals: channel.id)"))
-        XCTAssertTrue(channels.contains(".defaultFocus($focusedChannelID, defaultFocusChannelID)"))
+        XCTAssertTrue(channels.contains(
+            ".focused($focusedElement, equals: .channel(channel.id))"
+        ))
+        XCTAssertTrue(channels.contains(
+            ".defaultFocus($focusedElement, defaultFocusElement)"
+        ))
         XCTAssertTrue(channels.contains("focusPolicy.focusesFirstChannel"))
         XCTAssertTrue(playerControls.contains("@FocusState private var focusedControl"))
         XCTAssertTrue(playerControls.contains(".defaultFocus($focusedControl, initialControl)"))
