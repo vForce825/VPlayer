@@ -2,8 +2,44 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import Foundation
 import SwiftUI
+import UIKit
 import VPlayerCore
+
+private struct CachedChannelLogo: View {
+    let url: URL
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image = image ?? ChannelLogoCache.shared.memoryCachedImage(for: url) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(20)
+            } else {
+                ChannelLogoPlaceholder()
+            }
+        }
+        .task(id: url) {
+            image = nil
+            let loadedImage = await ChannelLogoCache.shared.image(for: url)
+            guard !Task.isCancelled else { return }
+            image = loadedImage
+        }
+    }
+}
+
+private struct ChannelLogoPlaceholder: View {
+    var body: some View {
+        Image(systemName: "tv")
+            .resizable()
+            .scaledToFit()
+            .padding(.vertical, 34)
+            .foregroundStyle(.secondary)
+    }
+}
 
 /// Grid tile for one channel. The logo is the tile: it spans the full card
 /// width in 16:9, with the name as a compact caption underneath and the live
@@ -56,13 +92,7 @@ struct ChannelCard: View {
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
             .overlay {
                 if let logoURL = channel.logoURL {
-                    AsyncImage(url: logoURL) { phase in
-                        if let image = phase.image {
-                            image.resizable().scaledToFit().padding(20)
-                        } else {
-                            logoPlaceholder
-                        }
-                    }
+                    CachedChannelLogo(url: logoURL)
                 } else {
                     logoPlaceholder
                 }
@@ -71,11 +101,7 @@ struct ChannelCard: View {
     }
 
     private var logoPlaceholder: some View {
-        Image(systemName: "tv")
-            .resizable()
-            .scaledToFit()
-            .padding(.vertical, 34)
-            .foregroundStyle(.secondary)
+        ChannelLogoPlaceholder()
     }
 
     private func currentProgramme(at date: Date) -> Programme? {

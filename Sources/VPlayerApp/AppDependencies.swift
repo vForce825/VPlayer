@@ -2,10 +2,245 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CryptoKit
 import Foundation
 import OSLog
+import UIKit
 import VPlayerCore
 import VPlayerPlayback
+
+@MainActor
+final class ChannelLogoCache {
+    static let shared = ChannelLogoCache()
+
+    private struct LoadedLogo {
+        let image: UIImage
+        let cost: Int
+    }
+
+    private let memoryCache = NSCache<NSURL, UIImage>()
+    private let session: URLSession
+    private let diskCache: ChannelLogoDiskCache?
+    private let maximumResponseBytes: Int
+    private var inFlight: [URL: Task<LoadedLogo?, Never>] = [:]
+
+    init(
+        session: URLSession = .shared,
+        fileManager: FileManager = .default,
+        cacheDirectory: URL? = nil,
+        memoryCostLimit: Int = 64 * 1_024 * 1_024,
+        diskCapacity: Int = 128 * 1_024 * 1_024,
+        maximumResponseBytes: Int = 8 * 1_024 * 1_024
+    ) {
+        self.session = session
+        self.maximumResponseBytes = maximumResponseBytes
+        memoryCache.totalCostLimit = memoryCostLimit
+        memoryCache.countLimit = 256
+
+        do {
+            let directory = try cacheDirectory
+                ?? Self.defaultCacheDirectory(fileManager: fileManager)
+            diskCache = try ChannelLogoDiskCache(
+                directory: directory,
+                capacity: diskCapacity
+            )
+        } catch {
+            // A cache failure must not prevent the channel browser from loading.
+            // The in-memory layer and direct network request remain available.
+            diskCache = nil
+        }
+    }
+
+    func image(for url: URL) async -> UIImage? {
+        let cacheKey = url as NSURL
+        if let image = memoryCache.object(forKey: cacheKey) {
+            return image
+        }
+        if let task = inFlight[url] {
+            return await task.value?.image
+        }
+
+        let task = Task { [weak self] () -> LoadedLogo? in
+            guard let self else { return nil }
+            return await self.loadLogo(for: url)
+        }
+        inFlight[url] = task
+        let loaded = await task.value
+        inFlight[url] = nil
+        if let loaded {
+            memoryCache.setObject(loaded.image, forKey: cacheKey, cost: loaded.cost)
+        }
+        return loaded?.image
+    }
+
+    func memoryCachedImage(for url: URL) -> UIImage? {
+        memoryCache.object(forKey: url as NSURL)
+    }
+
+    static func defaultCacheDirectory(
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        let cachesRoot = try fileManager.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        return cachesRoot
+            .appendingPathComponent("VPlayer", isDirectory: true)
+            .appendingPathComponent("ChannelLogos", isDirectory: true)
+    }
+
+    private func loadLogo(for url: URL) async -> LoadedLogo? {
+        let diskKey = Self.diskKey(for: url)
+        if let diskCache,
+           let data = await diskCache.data(forKey: diskKey) {
+            if let image = await preparedImage(from: data) {
+                return LoadedLogo(image: image, cost: Self.memoryCost(for: image, data: data))
+            }
+            await diskCache.removeData(forKey: diskKey)
+        }
+
+        guard let data = await downloadLogo(from: url),
+              let image = await preparedImage(from: data) else {
+            return nil
+        }
+        if let diskCache {
+            await diskCache.store(data, forKey: diskKey)
+        }
+        return LoadedLogo(image: image, cost: Self.memoryCost(for: image, data: data))
+    }
+
+    private func preparedImage(from data: Data) async -> UIImage? {
+        guard let image = UIImage(data: data, scale: 1) else { return nil }
+        return await image.byPreparingForDisplay() ?? image
+    }
+
+    private func downloadLogo(from url: URL) async -> Data? {
+        if url.isFileURL {
+            return await Task.detached(priority: .utility) { [maximumResponseBytes] in
+                guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+                      let fileSize = values.fileSize,
+                      fileSize <= maximumResponseBytes else {
+                    return nil
+                }
+                return try? Data(contentsOf: url, options: .mappedIfSafe)
+            }.value
+        }
+
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            return nil
+        }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            let (data, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse,
+                  (200..<300).contains(response.statusCode),
+                  data.count <= maximumResponseBytes else {
+                return nil
+            }
+            return data
+        } catch {
+            return nil
+        }
+    }
+
+    private static func diskKey(for url: URL) -> String {
+        SHA256.hash(data: Data(url.absoluteString.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func memoryCost(for image: UIImage, data: Data) -> Int {
+        guard let cgImage = image.cgImage else { return data.count }
+        return cgImage.bytesPerRow * cgImage.height
+    }
+}
+
+private actor ChannelLogoDiskCache {
+    private struct Entry {
+        let url: URL
+        let size: Int
+        let modificationDate: Date
+    }
+
+    private let directory: URL
+    private let capacity: Int
+    private let fileManager: FileManager
+
+    init(directory: URL, capacity: Int) throws {
+        self.directory = directory
+        self.capacity = capacity
+        fileManager = .default
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+    }
+
+    func data(forKey key: String) -> Data? {
+        let fileURL = fileURL(forKey: key)
+        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
+            return nil
+        }
+        try? fileManager.setAttributes(
+            [.modificationDate: Date()],
+            ofItemAtPath: fileURL.path
+        )
+        return data
+    }
+
+    func store(_ data: Data, forKey key: String) {
+        guard data.count <= capacity else { return }
+        do {
+            try data.write(to: fileURL(forKey: key), options: .atomic)
+            try pruneIfNeeded()
+        } catch {
+            // Disk caching is best-effort; the memory cache already owns the image.
+        }
+    }
+
+    func removeData(forKey key: String) {
+        try? fileManager.removeItem(at: fileURL(forKey: key))
+    }
+
+    private func fileURL(forKey key: String) -> URL {
+        directory.appendingPathComponent(key, isDirectory: false)
+    }
+
+    private func pruneIfNeeded() throws {
+        let resourceKeys: Set<URLResourceKey> = [
+            .contentModificationDateKey,
+            .fileSizeKey,
+            .isRegularFileKey,
+        ]
+        let fileURLs = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        )
+        var entries: [Entry] = []
+        var totalSize = 0
+        for fileURL in fileURLs {
+            let values = try fileURL.resourceValues(forKeys: resourceKeys)
+            guard values.isRegularFile == true else { continue }
+            let size = values.fileSize ?? 0
+            totalSize += size
+            entries.append(Entry(
+                url: fileURL,
+                size: size,
+                modificationDate: values.contentModificationDate ?? .distantPast
+            ))
+        }
+        guard totalSize > capacity else { return }
+        for entry in entries.sorted(by: { $0.modificationDate < $1.modificationDate }) {
+            try? fileManager.removeItem(at: entry.url)
+            totalSize -= entry.size
+            if totalSize <= capacity { break }
+        }
+    }
+}
 
 protocol LibrarySnapshotMaintenance: Sendable {
     func purgeUnreferencedSnapshots() async throws
