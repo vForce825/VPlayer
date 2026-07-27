@@ -24,7 +24,7 @@ protocol BackgroundRefreshScheduling: AnyObject, Sendable {
 
 @MainActor
 final class BackgroundRefreshRegistrar {
-    static let identifier = "com.vplayer.app.refresh"
+    static let identifier = "com.vforce.vplayer.refresh"
 
     typealias LoadProfiles = @Sendable () async throws -> [SourceProfile]
     typealias Refresh = @Sendable (

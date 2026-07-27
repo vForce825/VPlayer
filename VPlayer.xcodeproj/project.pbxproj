@@ -14,6 +14,7 @@
 		067C3B0BB081230076493002 /* VideoFormatMetadataReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = C87CC7DF5C7D599592035C6D /* VideoFormatMetadataReader.swift */; };
 		079771228F4B60F9A3DF01D8 /* RepositorySpy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64C377C392800022FACE5ABD /* RepositorySpy.swift */; };
 		07C2100BA21FC019DEF50DD3 /* LumaScanProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27B68E071F13D11FE4E3172F /* LumaScanProbeTests.swift */; };
+		084657C6353B8FD6F55AE8DA /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 2E5A1AFACCCDA01B53F2BEF0 /* PrivacyInfo.xcprivacy */; };
 		0A25C610AB41093D2CD55D06 /* SampleBufferBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 460EB275B3622D0E3E5390E7 /* SampleBufferBuilder.swift */; };
 		0A692EB833438DA6599A24A1 /* VPFFmpegParser.h in Headers */ = {isa = PBXBuildFile; fileRef = 170C0A10B1C0AB8C360B8689 /* VPFFmpegParser.h */; settings = {ATTRIBUTES = (Public, ); }; };
 		0AED7EB317A1BB335E999F9F /* FFmpeg.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE9A0691FB5910ABD8C1717C /* FFmpeg.xcframework */; };
@@ -78,6 +79,7 @@
 		51DE1B0CD62B5693CF954F11 /* MediaGenerationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84F5424A7A62E03689F1A0AE /* MediaGenerationTests.swift */; };
 		52A3B2F6147F112EC1A4D951 /* PlaybackMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D84B6637D2D1BC5988140026 /* PlaybackMetricsTests.swift */; };
 		52B66F11D3C9BE46DE9E60AC /* M3UParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05BAEE81C41AEC56B0932B95 /* M3UParserTests.swift */; };
+		53C6CFBEB7999CF72DF0732E /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = D5546A39D4287D25B56F2A35 /* PrivacyInfo.xcprivacy */; };
 		550719CB422761BB77BB4867 /* VPlayerAppStartupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A310932D1DA088CF7E99CCF /* VPlayerAppStartupTests.swift */; };
 		5681E70A62EE0F3ADD9E9E3A /* VPlayerCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		5777308D17C83F752A76BAB4 /* PlaybackSerialExecutorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16D419C6385433C4A3DC149C /* PlaybackSerialExecutorTests.swift */; };
@@ -168,6 +170,7 @@
 		AE5F5F87B9AB412130D84582 /* StreamProtocolPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BD849891A41E876402BADA1 /* StreamProtocolPolicy.swift */; };
 		AF8B3BCB2701E1123A7A08E7 /* PlaybackReadinessGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38CD3F35D0C9F65CC0186CC7 /* PlaybackReadinessGate.swift */; };
 		B10731BB096FE0B534BC5789 /* VideoPipelineCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75E8DEA4295BE7A57470DD29 /* VideoPipelineCoordinatorTests.swift */; };
+		B1B9C10AC736737BC1272DD8 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 0B493CE54CC5A173AD759949 /* PrivacyInfo.xcprivacy */; };
 		BD0915983FDEEEA04D4E067D /* RefreshCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E8424C82A7C430CDF059354 /* RefreshCoordinator.swift */; };
 		C3EEEE2FC8642259A578A436 /* VPlayerPlayback.h in Headers */ = {isa = PBXBuildFile; fileRef = 7A19FD5198D43E6FD15F4765 /* VPlayerPlayback.h */; settings = {ATTRIBUTES = (Public, ); }; };
 		C648174FC89BC63CBF4A7835 /* LumaScanProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 095B97BC1B9F72919A64CCD8 /* LumaScanProbe.swift */; };
@@ -180,6 +183,7 @@
 		CF8C42C2AD93FE06D5E4E8CB /* URLSessionBoundedDownloaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A374572AB4C09649EC5D3BA0 /* URLSessionBoundedDownloaderTests.swift */; };
 		D018311C8CC679326D1CD087 /* DeinterlaceRoute.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94E574F09A28A4EFAA8AE738 /* DeinterlaceRoute.swift */; };
 		D08145F590CC1E8ED1D9AFD0 /* MetalVideoRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3718B8EC717BB70E148F43C5 /* MetalVideoRendererTests.swift */; };
+		D18EC4C7838E343384F588F8 /* CryptoKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 403AED4B11B4E79784EE8F88 /* CryptoKit.framework */; };
 		D268B0941547FB9C94B92413 /* LibraryChangeSignal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F11824742B40C13E58B8D0A /* LibraryChangeSignal.swift */; };
 		D339B98DF72A1A69C1B3FF81 /* PlaybackPlaceholderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E37B08B4CEA0606E850000 /* PlaybackPlaceholderView.swift */; };
 		D4B8A301C9BB0F22F50AF766 /* DeinterlacePipelineIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1731EB3A61E099F8F230CC99 /* DeinterlacePipelineIntegrationTests.swift */; };
@@ -320,6 +324,7 @@
 		08417B2BBC763477A396A65F /* PlayerControlsOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerControlsOverlay.swift; sourceTree = "<group>"; };
 		0943F591208BEBF64DAE795E /* EPGMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGMatcher.swift; sourceTree = "<group>"; };
 		095B97BC1B9F72919A64CCD8 /* LumaScanProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LumaScanProbe.swift; sourceTree = "<group>"; };
+		0B493CE54CC5A173AD759949 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		0C06659A8D23E58B934CA205 /* DomainTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainTests.swift; sourceTree = "<group>"; };
 		0C8E604CB846FBCA82EAA8EF /* ChannelSections.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelSections.swift; sourceTree = "<group>"; };
 		0D6C1E3CD98E49564D4D04AE /* YADIFReferenceWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YADIFReferenceWindow.swift; sourceTree = "<group>"; };
@@ -363,6 +368,7 @@
 		2A7EA58422986C2DB4A63358 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		2B453473F16826ECE25CBF8F /* ScanTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanTypes.swift; sourceTree = "<group>"; };
 		2DD0D67B5CBFF9BB7A512770 /* GenerationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenerationController.swift; sourceTree = "<group>"; };
+		2E5A1AFACCCDA01B53F2BEF0 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		2EDD280A51F04392D9227EC5 /* DisplayCriteriaControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayCriteriaControllerTests.swift; sourceTree = "<group>"; };
 		2FE81A60ECC3F3F1EB27A4BA /* AppDependencies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDependencies.swift; sourceTree = "<group>"; };
 		314F56BC5F5A5B5D42DD6971 /* MetalDisplayLinkDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDisplayLinkDriver.swift; sourceTree = "<group>"; };
@@ -490,6 +496,7 @@
 		D35EF5E1F35EDC0F97775C25 /* FullScreenPlayerViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullScreenPlayerViewModelTests.swift; sourceTree = "<group>"; };
 		D3FACBFFC6C2E98E7C958E27 /* PlaybackPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPipeline.swift; sourceTree = "<group>"; };
 		D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = VPlayerCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		D5546A39D4287D25B56F2A35 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		D5BF62AE53443B1D95C61E19 /* RenderSynchronizerClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderSynchronizerClock.swift; sourceTree = "<group>"; };
 		D76A0ADCC4357738AB36D065 /* SHA256SUMS */ = {isa = PBXFileReference; path = SHA256SUMS; sourceTree = "<group>"; };
 		D84B6637D2D1BC5988140026 /* PlaybackMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackMetricsTests.swift; sourceTree = "<group>"; };
@@ -544,6 +551,7 @@
 			files = (
 				FE2044038713D72497DCF740 /* VPlayerCore.framework in Frameworks */,
 				03C2431CE143F84391408374 /* VPlayerPlayback.framework in Frameworks */,
+				D18EC4C7838E343384F588F8 /* CryptoKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -582,6 +590,7 @@
 				395AB9E2F7C6412541BB50BF /* Media */,
 				6B408604EE9A0BD6040A8755 /* Pipeline */,
 				9D99AB1BE4BDEDECB5B119D2 /* Rendering */,
+				6615EACE9DD1FBCE7B19EAA6 /* Resources */,
 				257837699987616C4D0B02E4 /* Scan */,
 				DFEE6258FA9825D20FE18E0E /* Sync */,
 				740B81C111B5CC159018701F /* Timing */,
@@ -642,6 +651,14 @@
 				17C14E42AA6106141D92DD14 /* SettingsView.swift */,
 			);
 			path = Settings;
+			sourceTree = "<group>";
+		};
+		201A75A6D652A04B6559F3C1 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				2E5A1AFACCCDA01B53F2BEF0 /* PrivacyInfo.xcprivacy */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		257837699987616C4D0B02E4 /* Scan */ = {
@@ -705,6 +722,14 @@
 				460EB275B3622D0E3E5390E7 /* SampleBufferBuilder.swift */,
 			);
 			path = Media;
+			sourceTree = "<group>";
+		};
+		3BF6008D5ADE1654EAFCCF53 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				0B493CE54CC5A173AD759949 /* PrivacyInfo.xcprivacy */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		3CEFA870A29521FFF46D2AF3 /* EPG */ = {
@@ -786,6 +811,14 @@
 				1731EB3A61E099F8F230CC99 /* DeinterlacePipelineIntegrationTests.swift */,
 			);
 			path = Integration;
+			sourceTree = "<group>";
+		};
+		6615EACE9DD1FBCE7B19EAA6 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				D5546A39D4287D25B56F2A35 /* PrivacyInfo.xcprivacy */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		683D8B48F6091BFDCFBA163B /* Playback */ = {
@@ -899,6 +932,7 @@
 				2CCB28B2C32693B0011AA820 /* Parsing */,
 				BDD172686D3A1DC535D4CE19 /* Persistence */,
 				518016F10AF478BAE679915D /* Refresh */,
+				201A75A6D652A04B6559F3C1 /* Resources */,
 				236D71D3D61B0D1A240B639D /* VPlayerCore.swift */,
 			);
 			path = VPlayerCore;
@@ -1102,6 +1136,7 @@
 			children = (
 				ADB3FA7EB42D9BDEC6027311 /* Lifecycle */,
 				3F1BBE819170EF55A225BC3D /* Player */,
+				3BF6008D5ADE1654EAFCCF53 /* Resources */,
 				175C5ADE52E943E77E7D3BA3 /* Settings */,
 				F9BBD733025E50B49E7BEF7B /* Views */,
 				2FE81A60ECC3F3F1EB27A4BA /* AppDependencies.swift */,
@@ -1200,6 +1235,7 @@
 			buildConfigurationList = 402DE72F733F674F66FEA614 /* Build configuration list for PBXNativeTarget "VPlayerCore" */;
 			buildPhases = (
 				2FED8EC6ACC66695BE031310 /* Sources */,
+				0445141678676C3A60F75F1B /* Resources */,
 			);
 			buildRules = (
 			);
@@ -1258,6 +1294,7 @@
 			buildPhases = (
 				B718C99183B8F4287214348B /* Headers */,
 				F59A9C14120146B2422E1DE5 /* Sources */,
+				090B81C3EB4CA15866CA528F /* Resources */,
 				5FBB8E705AD500BAE9889E1F /* Frameworks */,
 			);
 			buildRules = (
@@ -1313,11 +1350,28 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		0445141678676C3A60F75F1B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				084657C6353B8FD6F55AE8DA /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		090B81C3EB4CA15866CA528F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				53C6CFBEB7999CF72DF0732E /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		E320B932B17C4A1EEF8DE520 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				89AEE68FBBBBD0C5147A7010 /* Assets.xcassets in Resources */,
+				B1B9C10AC736737BC1272DD8 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1671,12 +1725,14 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = Sources/VPlayerApp/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.app;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = appletvos;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1765,12 +1821,14 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = Sources/VPlayerApp/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.app;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = appletvos;
 				TARGETED_DEVICE_FAMILY = 3;

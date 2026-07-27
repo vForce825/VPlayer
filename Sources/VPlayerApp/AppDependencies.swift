@@ -654,7 +654,7 @@ struct AppDependencies {
 
 typealias VPlayerDependencies = AppDependencies
 
-private let logger = Logger(subsystem: "com.vplayer.app", category: "AppDependencies")
+private let logger = Logger(subsystem: "com.vforce.vplayer", category: "AppDependencies")
 
 private enum ProductionDependencyError: Error {
     case libraryUnavailable

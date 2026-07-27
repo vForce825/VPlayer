@@ -12,6 +12,62 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertEqual(PlaybackFoundation.contractVersion, 1)
     }
 
+    func testAppStoreIdentityVersioningAndPrivacyManifestsStayReleaseReady() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let projectYAML = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("project.yml"),
+            encoding: .utf8
+        )
+        let infoPlist = try propertyList(
+            at: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Resources/Info.plist"
+            )
+        )
+
+        XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
+        XCTAssertTrue(projectYAML.contains("MARKETING_VERSION: \"1.0\""))
+        XCTAssertTrue(projectYAML.contains("CURRENT_PROJECT_VERSION: \"1\""))
+        XCTAssertEqual(infoPlist["CFBundleShortVersionString"] as? String, "$(MARKETING_VERSION)")
+        XCTAssertEqual(infoPlist["CFBundleVersion"] as? String, "$(CURRENT_PROJECT_VERSION)")
+        XCTAssertEqual(infoPlist["ITSAppUsesNonExemptEncryption"] as? Bool, false)
+        XCTAssertEqual(
+            infoPlist["BGTaskSchedulerPermittedIdentifiers"] as? [String],
+            ["com.vforce.vplayer.refresh"]
+        )
+
+        let expectedReasons: [String: [String: Set<String>]] = [
+            "Sources/VPlayerApp/Resources/PrivacyInfo.xcprivacy": [
+                "NSPrivacyAccessedAPICategoryFileTimestamp": ["C617.1"],
+                "NSPrivacyAccessedAPICategoryUserDefaults": ["CA92.1"]
+            ],
+            "Sources/VPlayerCore/Resources/PrivacyInfo.xcprivacy": [
+                "NSPrivacyAccessedAPICategoryUserDefaults": ["CA92.1"]
+            ],
+            "Sources/VPlayerPlayback/Resources/PrivacyInfo.xcprivacy": [
+                "NSPrivacyAccessedAPICategorySystemBootTime": ["35F9.1"],
+                "NSPrivacyAccessedAPICategoryUserDefaults": ["CA92.1"]
+            ]
+        ]
+
+        for (path, expected) in expectedReasons {
+            let manifest = try propertyList(at: repositoryRoot.appendingPathComponent(path))
+            XCTAssertEqual(manifest["NSPrivacyTracking"] as? Bool, false)
+            XCTAssertEqual((manifest["NSPrivacyCollectedDataTypes"] as? [Any])?.count, 0)
+            let entries = try XCTUnwrap(
+                manifest["NSPrivacyAccessedAPITypes"] as? [[String: Any]]
+            )
+            let actual = Dictionary(uniqueKeysWithValues: try entries.map { entry in
+                let category = try XCTUnwrap(entry["NSPrivacyAccessedAPIType"] as? String)
+                let reasons = try XCTUnwrap(entry["NSPrivacyAccessedAPITypeReasons"] as? [String])
+                return (category, Set(reasons))
+            })
+            XCTAssertEqual(actual, expected, path)
+        }
+    }
+
     func testPlaybackMetalAndFutureVideoFixturesHaveExplicitTargetConfiguration() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -38,6 +94,13 @@ final class ProjectConfigurationTests: XCTestCase {
         )
         XCTAssertTrue(generatedProject.contains("Shaders.metal in Sources"))
         XCTAssertTrue(generatedProject.contains("Video in Resources"))
+    }
+
+    private func propertyList(at url: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: url)
+        return try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        )
     }
 
     func testAcceptanceDiagnosticsAndRunnerKeepSensitivePayloadsOutOfLogsAndArtifacts() throws {
