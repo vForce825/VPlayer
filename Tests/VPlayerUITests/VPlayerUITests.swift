@@ -20,9 +20,12 @@ final class VPlayerUITests: XCTestCase {
         selectTab(named: "设置", in: app)
         let videoSummary = app.buttons["settings.buffer.video.current"]
         let channelSummary = app.buttons["settings.channels.current"]
+        let aboutSummary = app.buttons["settings.about.current"]
         XCTAssertTrue(videoSummary.waitForExistence(timeout: 3))
         XCTAssertEqual(videoSummary.value as? String, "2 秒（默认）")
         XCTAssertEqual(channelSummary.value as? String, "按播放列表分组（默认）")
+        XCTAssertTrue(aboutSummary.exists)
+        XCTAssertEqual(aboutSummary.value as? String, "版本 1.0（1）")
         XCTAssertFalse(app.buttons["settings.buffer.video.2"].exists)
         XCTAssertFalse(app.buttons["settings.channels.grouped"].exists)
 

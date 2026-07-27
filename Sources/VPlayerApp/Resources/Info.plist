@@ -4,7 +4,7 @@
 <dict>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
     <array>
-        <string>com.vplayer.app.refresh</string>
+        <string>com.vforce.vplayer.refresh</string>
     </array>
     <key>CFBundleDevelopmentRegion</key>
     <string>zh-Hans</string>
@@ -21,9 +21,11 @@
     <key>CFBundlePackageType</key>
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>NSAppTransportSecurity</key>
