@@ -127,10 +127,13 @@ done
 command -v xcodebuild >/dev/null 2>&1 || fail "xcodebuild is required"
 
 source_url="$(jq -er '.sourceURL' "$lock")"
+mirror_urls_json="$(jq -cer '.mirrorURLs' "$lock")"
+mirror_url="$(jq -er '.mirrorURLs[0]' "$lock")"
 tag="$(jq -er '.tag' "$lock")"
 commit="$(jq -er '.commit' "$lock")"
 license_mode="$(jq -er '.licenseMode' "$lock")"
 [[ "$source_url" == "https://git.ffmpeg.org/ffmpeg.git" ]] || fail "unexpected source URL"
+[[ "$mirror_urls_json" == '["https://github.com/FFmpeg/FFmpeg.git"]' ]] || fail "unexpected source mirror URLs"
 [[ "$tag" == "n8.1.2" ]] || fail "unexpected tag"
 [[ "$commit" == "38b88335f99e76ed89ff3c93f877fdefce736c13" ]] || fail "unexpected commit"
 [[ "$license_mode" == "LGPL-2.1-or-later" ]] || fail "unexpected license mode"
@@ -142,21 +145,64 @@ if [[ ! -d "$source/.git" ]]; then
   git -C "$source" remote add origin "$source_url"
 fi
 [[ "$(git -C "$source" remote get-url origin)" == "$source_url" ]] || fail "existing source origin differs from lock"
-# The official server does not permit fetching the unadvertised commit by SHA.
-# Fetch the advertised annotated tag, then prove that it peels to the lock.
-#
-# A checkout that already contains the locked commit does not need the server at
-# all: every check below reads the local object graph, and the lock is what
-# decides whether the source is the right source. git.ffmpeg.org is regularly
-# unreachable for pack negotiation even where plain HTTPS to it succeeds, and a
-# reproducible build should not be hostage to that. A checkout that does *not*
-# already have the commit still has to fetch, and still fails if it cannot.
+
+# The canonical server does not permit fetching an unadvertised commit by SHA.
+# Fetch the advertised annotated tag into a temporary ref, prove that it peels
+# to the locked commit, and only then publish the local tag. Each locked source
+# gets bounded retries; the second URL is FFmpeg's official GitHub mirror.
+# Existing, already-verified source is entirely offline-capable.
+fetch_ref="refs/vplayer-fetch/$tag"
+source_urls=("$source_url" "$mirror_url")
+
+clear_fetch_ref() {
+  git -C "$source" update-ref -d "$fetch_ref" 2>/dev/null || true
+}
+
+fetch_locked_tag() {
+  local fetch_url attempt delay fetch_status peeled tag_object
+  for fetch_url in "${source_urls[@]}"; do
+    for attempt in 1 2 3; do
+      clear_fetch_ref
+      echo "build-ffmpeg: fetching $tag from $fetch_url (attempt $attempt/3)" >&2
+      if GIT_TERMINAL_PROMPT=0 git -C "$source" \
+        -c http.lowSpeedLimit=1024 \
+        -c http.lowSpeedTime=30 \
+        fetch --force --no-tags --depth 1 "$fetch_url" \
+        "refs/tags/$tag:$fetch_ref"; then
+        peeled="$(git -C "$source" rev-parse --verify "$fetch_ref^{}")"
+        if [[ "$peeled" != "$commit" ]]; then
+          clear_fetch_ref
+          fail "$tag fetched from $fetch_url does not peel to the locked commit"
+        fi
+        tag_object="$(git -C "$source" rev-parse --verify "$fetch_ref")"
+        git -C "$source" update-ref "refs/tags/$tag" "$tag_object"
+        clear_fetch_ref
+        echo "build-ffmpeg: verified $tag from $fetch_url at $commit" >&2
+        return 0
+      else
+        fetch_status=$?
+      fi
+      clear_fetch_ref
+      if [[ "$fetch_status" -ne 128 ]]; then
+        echo "build-ffmpeg: fetch exited with non-network status $fetch_status; not retrying" >&2
+        return "$fetch_status"
+      fi
+      if [[ "$attempt" -lt 3 ]]; then
+        if [[ "$attempt" -eq 1 ]]; then delay=2; else delay=5; fi
+        echo "build-ffmpeg: fetch failed; retrying in ${delay}s" >&2
+        sleep "$delay"
+      fi
+    done
+    echo "build-ffmpeg: exhausted $fetch_url; trying the next locked source" >&2
+  done
+  fail "unable to fetch $tag from the canonical source or official mirror"
+}
+
 if git -C "$source" rev-parse --verify --quiet "$commit^{commit}" >/dev/null &&
    [[ "$(git -C "$source" rev-parse --verify --quiet "refs/tags/$tag^{}" || true)" == "$commit" ]]; then
-  git -C "$source" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null ||
-    echo "build-ffmpeg: origin unreachable; using the locked commit already present" >&2
+  echo "build-ffmpeg: using the locked source already present at $commit" >&2
 else
-  git -C "$source" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
+  fetch_locked_tag
 fi
 [[ "$(git -C "$source" rev-parse "refs/tags/$tag^{}")" == "$commit" ]] || fail "$tag does not peel to the locked commit"
 git -C "$source" checkout --detach "$commit"
