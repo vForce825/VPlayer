@@ -149,6 +149,7 @@ new_build_repo() {
     'set -euo pipefail' \
     'repo=""' \
     'if [[ "${1:-}" == "-C" ]]; then repo="$2"; shift 2; fi' \
+    'while [[ "${1:-}" == "-c" ]]; do shift 2; done' \
     'case "${1:-}" in' \
     '  init) mkdir -p "$repo/.git" ;;' \
     '  remote)' \
@@ -308,7 +309,7 @@ grep -F 'remove only the three state files' "$stale_control/output" >/dev/null
 
 acquire_line="$(grep -nF 'acquire_build_lock' "$build" | tail -1 | cut -d: -f1)"
 cleanup_line="$(grep -nF 'clear_generated_directory "$artifacts"' "$build" | head -1 | cut -d: -f1)"
-fetch_line="$(grep -nF 'git -C "$source" fetch' "$build" | head -1 | cut -d: -f1)"
+fetch_line="$(grep -nF 'fetch --force --no-tags --depth 1 "$fetch_url"' "$build" | head -1 | cut -d: -f1)"
 test "$acquire_line" -lt "$cleanup_line"
 test "$acquire_line" -lt "$fetch_line"
 grep -F 'candidate="$artifacts/.FFmpeg.candidate.$lock_token.xcframework"' "$build" >/dev/null

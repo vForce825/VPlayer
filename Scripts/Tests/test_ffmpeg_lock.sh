@@ -14,6 +14,7 @@ optional_system_symbols="$root/Vendor/FFmpeg/optional-system-symbol-allowlist.tx
 test "$(jq -r .tag "$lock")" = "n8.1.2"
 test "$(jq -r .commit "$lock")" = "38b88335f99e76ed89ff3c93f877fdefce736c13"
 test "$(jq -r .sourceURL "$lock")" = "https://git.ffmpeg.org/ffmpeg.git"
+test "$(jq -c .mirrorURLs "$lock")" = '["https://github.com/FFmpeg/FFmpeg.git"]'
 test "$(jq -r .licenseMode "$lock")" = "LGPL-2.1-or-later"
 test -f "$upstream_license"
 test -f "$ijg_changes"
@@ -97,6 +98,11 @@ grep -Fx 'export ZERO_AR_DATE=1' "$root/Scripts/build-ffmpeg.sh" >/dev/null
 # Xcode Cloud's UTF-8 locale sorts libFFmpeg.a differently from the POSIX
 # locale. The artifact audit must normalize collation before comparing names.
 grep -Fx 'export LC_ALL=C' "$root/Scripts/audit-ffmpeg.sh" >/dev/null
+
+# Source acquisition must remain resilient without weakening the source pin.
+grep -F 'source_urls=("$source_url" "$mirror_url")' "$root/Scripts/build-ffmpeg.sh" >/dev/null
+grep -F 'for attempt in 1 2 3; do' "$root/Scripts/build-ffmpeg.sh" >/dev/null
+grep -F 'does not peel to the locked commit' "$root/Scripts/build-ffmpeg.sh" >/dev/null
 
 grep -Ev '^[[:space:]]*(#|$)' "$optional_system_symbols" | LC_ALL=C sort -u | diff -u - <(printf '_wcslen\n')
 

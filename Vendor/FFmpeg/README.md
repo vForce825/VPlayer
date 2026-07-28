@@ -5,6 +5,13 @@ VPlayer pins the official FFmpeg `n8.1.2` annotated tag at commit
 `LGPL-2.1-or-later` mode for tvOS 18.0. The generated XCFramework is not
 committed.
 
+Source acquisition tries the canonical `git.ffmpeg.org` repository first and
+FFmpeg's official GitHub mirror second, with three bounded attempts per URL.
+Both URLs are fixed in `ffmpeg.lock.json`. A fetched annotated tag is accepted
+only when it peels to the exact locked commit, so mirror fallback changes
+availability but not build inputs. An already-verified local checkout performs
+no network fetch.
+
 Rebuild and audit it from the repository root:
 
 ```sh
