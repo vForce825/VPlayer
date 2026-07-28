@@ -45,11 +45,6 @@ struct SettingsView: View {
                         PrivacyStatementView()
                     }
                     .accessibilityIdentifier("settings.privacy")
-
-                    NavigationLink("开源许可") {
-                        OpenSourceNoticesView()
-                    }
-                    .accessibilityIdentifier("settings.open-source")
                 }
             }
             .navigationTitle("设置")
@@ -67,19 +62,7 @@ struct SettingsView: View {
 }
 
 private enum AppLegalInformation {
-    static let sourceURL = URL(string: "https://github.com/vForce825/VPlayer")!
-    static let privacyURL = URL(
-        string: "https://vplayerdemom3u.vercel.app/privacy.html"
-    )!
-    static let licenseURL = URL(
-        string: "https://github.com/vForce825/VPlayer/blob/main/LICENSE"
-    )!
-    static let appStoreExceptionURL = URL(
-        string: "https://github.com/vForce825/VPlayer/blob/main/LICENSE.APPSTORE-EXCEPTION"
-    )!
-    static let thirdPartyNoticesURL = URL(
-        string: "https://github.com/vForce825/VPlayer/blob/main/THIRD_PARTY_NOTICES"
-    )!
+    static let privacyURL = "https://vplayerdemom3u.vercel.app/privacy.html"
 }
 
 private struct PrivacyStatementView: View {
@@ -101,30 +84,12 @@ private struct PrivacyStatementView: View {
                 Text("当播放源位于家庭网络时，VPlayer 会请求本地网络访问权限。")
             }
 
-            Link("查看完整在线隐私政策", destination: AppLegalInformation.privacyURL)
+            Section("在线隐私政策") {
+                Text(AppLegalInformation.privacyURL)
+                    .accessibilityIdentifier("settings.privacy.url")
+            }
         }
         .navigationTitle("隐私政策")
-    }
-}
-
-private struct OpenSourceNoticesView: View {
-    var body: some View {
-        List {
-            Section("VPlayer") {
-                Text("Copyright © 2026 VPlayer contributors")
-                Text("VPlayer 是自由软件，按 GNU GPL 第 3 版（仅该版本）授权。通过 Apple App Store 分发同时受项目的 App Store 分发例外条款约束。本软件不提供任何担保。")
-                Link("GNU GPLv3 许可全文", destination: AppLegalInformation.licenseURL)
-                Link("App Store 分发例外", destination: AppLegalInformation.appStoreExceptionURL)
-                Link("VPlayer 源代码", destination: AppLegalInformation.sourceURL)
-            }
-
-            Section("FFmpeg") {
-                Text("本产品使用 FFmpeg 8.1.2 的 libavcodec、libavformat、libavutil 和 libswresample，按 GNU LGPL 2.1 或更高版本授权。")
-                Text("This software is based in part on the work of the Independent JPEG Group.")
-                Link("第三方软件声明", destination: AppLegalInformation.thirdPartyNoticesURL)
-            }
-        }
-        .navigationTitle("开源许可")
     }
 }
 
