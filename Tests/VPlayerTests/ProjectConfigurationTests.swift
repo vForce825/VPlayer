@@ -28,8 +28,16 @@ final class ProjectConfigurationTests: XCTestCase {
         )
 
         XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
-        XCTAssertTrue(projectYAML.contains("MARKETING_VERSION: \"1.0\""))
-        XCTAssertTrue(projectYAML.contains("CURRENT_PROJECT_VERSION: \"1\""))
+        XCTAssertEqual(
+            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.0\"").count - 1,
+            3,
+            "the app and both embedded frameworks need a marketing version"
+        )
+        XCTAssertEqual(
+            projectYAML.components(separatedBy: "CURRENT_PROJECT_VERSION: \"1\"").count - 1,
+            3,
+            "the app and both embedded frameworks need a build version"
+        )
         XCTAssertEqual(infoPlist["CFBundleShortVersionString"] as? String, "$(MARKETING_VERSION)")
         XCTAssertEqual(infoPlist["CFBundleVersion"] as? String, "$(CURRENT_PROJECT_VERSION)")
         XCTAssertEqual(infoPlist["ITSAppUsesNonExemptEncryption"] as? Bool, false)
@@ -37,6 +45,36 @@ final class ProjectConfigurationTests: XCTestCase {
             infoPlist["BGTaskSchedulerPermittedIdentifiers"] as? [String],
             ["com.vforce.vplayer.refresh"]
         )
+        XCTAssertEqual(
+            infoPlist["TVTopShelfImage"] as? [String: String],
+            [
+                "TVTopShelfPrimaryImage": "Top Shelf Image",
+                "TVTopShelfPrimaryImageWide": "Top Shelf Image Wide"
+            ]
+        )
+
+        let brandAssets = try jsonObject(
+            at: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Assets.xcassets/App Icon & Top Shelf Image.brandassets/Contents.json"
+            )
+        )
+        let assets = try XCTUnwrap(brandAssets["assets"] as? [[String: String]])
+        XCTAssertTrue(assets.contains {
+            $0["role"] == "top-shelf-image" && $0["size"] == "1920x720"
+        })
+        XCTAssertTrue(assets.contains {
+            $0["role"] == "top-shelf-image-wide" && $0["size"] == "2320x720"
+        })
+
+        let smallIconLayerPaths = ["Back", "Middle", "Front"].map {
+            "Sources/VPlayerApp/Assets.xcassets/App Icon & Top Shelf Image.brandassets/" +
+                "App Icon.imagestack/\($0).imagestacklayer/Content.imageset/Contents.json"
+        }
+        for path in smallIconLayerPaths {
+            let layer = try jsonObject(at: repositoryRoot.appendingPathComponent(path))
+            let images = try XCTUnwrap(layer["images"] as? [[String: String]])
+            XCTAssertEqual(Set(images.compactMap { $0["scale"] }), ["1x", "2x"], path)
+        }
 
         let expectedReasons: [String: [String: Set<String>]] = [
             "Sources/VPlayerApp/Resources/PrivacyInfo.xcprivacy": [
@@ -101,6 +139,11 @@ final class ProjectConfigurationTests: XCTestCase {
         return try XCTUnwrap(
             PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
         )
+    }
+
+    private func jsonObject(at url: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: url)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     func testAcceptanceDiagnosticsAndRunnerKeepSensitivePayloadsOutOfLogsAndArtifacts() throws {

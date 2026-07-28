@@ -35,6 +35,13 @@
     </dict>
     <key>NSLocalNetworkUsageDescription</key>
     <string>VPlayer 需要访问您添加的局域网 IPTV 播放列表、EPG 和视频流。</string>
+    <key>TVTopShelfImage</key>
+    <dict>
+        <key>TVTopShelfPrimaryImage</key>
+        <string>Top Shelf Image</string>
+        <key>TVTopShelfPrimaryImageWide</key>
+        <string>Top Shelf Image Wide</string>
+    </dict>
     <key>UIBackgroundModes</key>
     <array>
         <string>fetch</string>
