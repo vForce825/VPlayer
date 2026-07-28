@@ -134,6 +134,30 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(generatedProject.contains("Video in Resources"))
     }
 
+    func testXcodeCloudPreparesTheIgnoredFFmpegArtifactAfterClone() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let scriptURL = repositoryRoot.appendingPathComponent("ci_scripts/ci_post_clone.sh")
+        let script = try String(contentsOf: scriptURL, encoding: .utf8)
+        let attributes = try FileManager.default.attributesOfItem(atPath: scriptURL.path)
+        let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        let gitignore = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(".gitignore"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(script.hasPrefix("#!/bin/sh\n"))
+        XCTAssertNotEqual(permissions.intValue & 0o111, 0, "Xcode Cloud scripts must be executable")
+        XCTAssertTrue(script.contains("CI_PRIMARY_REPOSITORY_PATH"))
+        XCTAssertTrue(script.contains("./Scripts/build-ffmpeg.sh"))
+        XCTAssertTrue(script.contains("./Scripts/audit-ffmpeg.sh"))
+        XCTAssertTrue(script.contains("HOMEBREW_NO_AUTO_UPDATE=1 brew install jq"))
+        XCTAssertFalse(script.contains("set -x"))
+        XCTAssertTrue(gitignore.contains("/Vendor/FFmpeg/Artifacts/"))
+    }
+
     private func propertyList(at url: URL) throws -> [String: Any] {
         let data = try Data(contentsOf: url)
         return try XCTUnwrap(

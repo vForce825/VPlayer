@@ -12,6 +12,12 @@ Rebuild and audit it from the repository root:
 ./Scripts/audit-ffmpeg.sh Vendor/FFmpeg/Artifacts/FFmpeg.xcframework
 ```
 
+Xcode Cloud runs `ci_scripts/ci_post_clone.sh` after cloning the repository.
+That script installs `jq` only when necessary, builds this pinned artifact in
+the temporary checkout, and leaves the audited XCFramework in the path used by
+the Xcode project. If a valid build is already present in the same temporary
+environment, the script audits it instead of rebuilding it.
+
 The behavioral audit tests require that real artifact and its bounded `Work`
 inputs already exist. Run them in this order; they fail with the actionable
 build command instead of skipping when those inputs are absent:
