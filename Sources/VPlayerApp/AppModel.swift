@@ -1017,6 +1017,9 @@ final class AppModel {
         for operation: ActiveMutationLaneEvent.Operation
     ) async -> ActiveMutationLease? {
         let lease = ActiveMutationLease(id: UUID(), operation: operation)
+        let cancelQueuedMutation: @MainActor @Sendable () -> Void = { [weak self] in
+            self?.cancelQueuedActiveMutation(id: lease.id)
+        }
         let granted = await withTaskCancellationHandler(
             operation: {
                 guard !Task.isCancelled else {
@@ -1037,9 +1040,9 @@ final class AppModel {
                     }
                 }
             },
-            onCancel: { [weak self] in
+            onCancel: {
                 Task { @MainActor in
-                    self?.cancelQueuedActiveMutation(id: lease.id)
+                    cancelQueuedMutation()
                 }
             }
         )
@@ -1082,6 +1085,9 @@ final class AppModel {
     private func waitForActiveMutationLaneIdle() async -> Bool {
         while activeMutationLease != nil || !queuedActiveMutations.isEmpty {
             let waiterID = UUID()
+            let cancelIdleWait: @MainActor @Sendable () -> Void = { [weak self] in
+                self?.cancelMutationLaneIdleWaiter(id: waiterID)
+            }
             let reachedIdle = await withTaskCancellationHandler(
                 operation: {
                     guard !Task.isCancelled else { return false }
@@ -1097,9 +1103,9 @@ final class AppModel {
                         mutationLaneEvent?(.reloadWaiting)
                     }
                 },
-                onCancel: { [weak self] in
+                onCancel: {
                     Task { @MainActor in
-                        self?.cancelMutationLaneIdleWaiter(id: waiterID)
+                        cancelIdleWait()
                     }
                 }
             )
