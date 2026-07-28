@@ -4,6 +4,11 @@
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 set -euo pipefail
 
+# Keep filename inventories deterministic across Xcode Cloud images. Locale-aware
+# collation can place libFFmpeg.a after the lowercase FFmpeg archives and make an
+# identical inventory look different from the audited list below.
+export LC_ALL=C
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 physical_root="$(cd -P "$(dirname "$0")/.." && pwd)"
 vendor="$root/Vendor/FFmpeg"
@@ -260,13 +265,16 @@ audit_build_record() {
   audit_empty_component_category "$components" _OUTDEV output-devices
 
   find "$prefix/lib" -maxdepth 1 -type f -name '*.a' -exec basename {} \; | sort > "$tmp/$slice-archives.txt"
-  diff -u - "$tmp/$slice-archives.txt" <<'ARCHIVES' >/dev/null || fail "$slice installed unexpected static libraries"
+  if ! diff -u - "$tmp/$slice-archives.txt" <<'ARCHIVES'
 libFFmpeg.a
 libavcodec.a
 libavformat.a
 libavutil.a
 libswresample.a
 ARCHIVES
+  then
+    fail "$slice installed unexpected static libraries"
+  fi
 
   local archive_name expected_sha actual_sha extracted
   for archive_name in libFFmpeg.a libavcodec.a libavformat.a libavutil.a libswresample.a; do
