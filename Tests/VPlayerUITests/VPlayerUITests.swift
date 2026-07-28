@@ -24,7 +24,7 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertEqual(videoSummary.value as? String, "2 秒（默认）")
         XCTAssertEqual(channelSummary.value as? String, "按播放列表分组（默认）")
         XCTAssertTrue(app.buttons["settings.privacy"].exists)
-        XCTAssertTrue(app.buttons["settings.open-source"].exists)
+        XCTAssertFalse(app.buttons["settings.open-source"].exists)
         XCTAssertFalse(app.buttons["settings.about.current"].exists)
         XCTAssertFalse(app.buttons["settings.buffer.video.2"].exists)
         XCTAssertFalse(app.buttons["settings.channels.grouped"].exists)
@@ -42,6 +42,15 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["关闭自动检测"].exists)
         XCTAssertFalse(app.buttons["关闭自动检测"].exists)
         XCTAssertFalse(app.switches["关闭自动检测"].exists)
+        XCUIRemote.shared.press(.menu)
+
+        let privacy = app.buttons["settings.privacy"]
+        focusSettingsRow(privacy, in: app)
+        XCUIRemote.shared.press(.select)
+        let privacyURL = app.staticTexts["settings.privacy.url"]
+        XCTAssertTrue(privacyURL.waitForExistence(timeout: 3))
+        XCTAssertEqual(privacyURL.label, "https://vplayerdemom3u.vercel.app/privacy.html")
+        XCTAssertFalse(app.buttons["查看完整在线隐私政策"].exists)
     }
 
     @MainActor
