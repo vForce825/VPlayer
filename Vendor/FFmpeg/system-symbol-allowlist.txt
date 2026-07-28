@@ -1,6 +1,8 @@
-# Exact unresolved symbol inventory for FFmpeg n8.1.2 built by Xcode 26.3.
+# Required unresolved symbol inventory for FFmpeg n8.1.2 built by Xcode 26.3.
 # Every symbol was verified in both the AppleTVOS and AppleTVSimulator SDK
 # system-library/framework .tbd stubs. Comments are ignored; wildcards are not.
+# Reviewed symbols emitted only by some Xcode toolchains are kept separately in
+# optional-system-symbol-allowlist.txt.
 _CFRelease
 _SSLClose
 _SSLCopyPeerTrust

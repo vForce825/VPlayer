@@ -1,0 +1,4 @@
+# Optional unresolved system symbols emitted by supported Xcode toolchains.
+# Entries must be verified in both AppleTVOS and AppleTVSimulator SDK stubs.
+# Absence is allowed; unexpected symbols outside both allowlists are rejected.
+_wcslen

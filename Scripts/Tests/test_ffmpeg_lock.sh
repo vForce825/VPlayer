@@ -9,6 +9,7 @@ lock="$root/Vendor/FFmpeg/ffmpeg.lock.json"
 flags="$root/Vendor/FFmpeg/configure.flags"
 upstream_license="$root/Vendor/FFmpeg/UPSTREAM-LICENSE.md"
 ijg_changes="$root/Vendor/FFmpeg/IJG-CHANGES.md"
+optional_system_symbols="$root/Vendor/FFmpeg/optional-system-symbol-allowlist.txt"
 
 test "$(jq -r .tag "$lock")" = "n8.1.2"
 test "$(jq -r .commit "$lock")" = "38b88335f99e76ed89ff3c93f877fdefce736c13"
@@ -96,6 +97,8 @@ grep -Fx 'export ZERO_AR_DATE=1' "$root/Scripts/build-ffmpeg.sh" >/dev/null
 # Xcode Cloud's UTF-8 locale sorts libFFmpeg.a differently from the POSIX
 # locale. The artifact audit must normalize collation before comparing names.
 grep -Fx 'export LC_ALL=C' "$root/Scripts/audit-ffmpeg.sh" >/dev/null
+
+grep -Ev '^[[:space:]]*(#|$)' "$optional_system_symbols" | LC_ALL=C sort -u | diff -u - <(printf '_wcslen\n')
 
 artifact_cleanup_line="$(grep -nF 'clear_generated_directory "$artifacts"' "$root/Scripts/build-ffmpeg.sh" | head -1 | cut -d: -f1)"
 first_slice_line="$(grep -nF 'build_slice device appletvos arm64' "$root/Scripts/build-ffmpeg.sh" | cut -d: -f1)"

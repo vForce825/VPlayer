@@ -14,6 +14,8 @@ physical_root="$(cd -P "$(dirname "$0")/.." && pwd)"
 vendor="$root/Vendor/FFmpeg"
 lock="$vendor/ffmpeg.lock.json"
 manifest="$vendor/component-manifest.json"
+required_system_symbols="$vendor/system-symbol-allowlist.txt"
+optional_system_symbols="$vendor/optional-system-symbol-allowlist.txt"
 work="$vendor/Work"
 source="$work/source"
 virtual_checkout='/VPlayer/FFmpeg/Checkout'
@@ -44,6 +46,8 @@ fi
 xcframework="$1"
 [[ -d "$xcframework" ]] || fail "XCFramework not found: $xcframework"
 [[ -f "$xcframework/Info.plist" ]] || fail "Info.plist is missing"
+[[ -f "$required_system_symbols" ]] || fail "required system symbol allowlist is missing"
+[[ -f "$optional_system_symbols" ]] || fail "optional system symbol allowlist is missing"
 
 source_url="$(jq -er '.sourceURL' "$lock")"
 tag="$(jq -er '.tag' "$lock")"
@@ -341,10 +345,18 @@ while IFS= read -r archive; do
   LC_ALL=C comm -23 "$tmp/undefined-$archive_index.txt" "$tmp/defined-$archive_index.txt" >> "$tmp/all-unresolved.txt"
 done < "$tmp/symbol-archives.txt"
 LC_ALL=C sort -u "$tmp/all-unresolved.txt" > "$tmp/unresolved.txt"
-grep -Ev '^[[:space:]]*(#|$)' "$vendor/system-symbol-allowlist.txt" | LC_ALL=C sort -u > "$tmp/allowed.txt" || true
+grep -Ev '^[[:space:]]*(#|$)' "$required_system_symbols" | LC_ALL=C sort -u > "$tmp/required.txt" || true
+grep -Ev '^[[:space:]]*(#|$)' "$optional_system_symbols" | LC_ALL=C sort -u > "$tmp/optional.txt" || true
+LC_ALL=C comm -12 "$tmp/required.txt" "$tmp/optional.txt" > "$tmp/overlap.txt"
+if [[ -s "$tmp/overlap.txt" ]]; then
+  echo "Symbols listed as both required and optional:" >&2
+  cat "$tmp/overlap.txt" >&2
+  fail "system symbol allowlists overlap"
+fi
+LC_ALL=C sort -u "$tmp/required.txt" "$tmp/optional.txt" > "$tmp/allowed.txt"
 
 LC_ALL=C comm -23 "$tmp/unresolved.txt" "$tmp/allowed.txt" > "$tmp/unexpected.txt"
-LC_ALL=C comm -13 "$tmp/unresolved.txt" "$tmp/allowed.txt" > "$tmp/stale.txt"
+LC_ALL=C comm -13 "$tmp/unresolved.txt" "$tmp/required.txt" > "$tmp/stale.txt"
 if [[ -s "$tmp/unexpected.txt" || -s "$tmp/stale.txt" ]]; then
   if [[ -s "$tmp/unexpected.txt" ]]; then
     echo "Unexpected unresolved symbols:" >&2
