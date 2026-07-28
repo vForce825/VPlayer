@@ -81,7 +81,7 @@ diff -u - "$flags" <<'FLAGS'
 --enable-demuxer=mpegts,hls,mov
 --enable-parser=h264,hevc,aac,aac_latm,ac3,mpegaudio
 --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb
---enable-decoder=aac,ac3,eac3,mp2
+--enable-decoder=aac,ac3,eac3,h264,mp2
 FLAGS
 
 if grep -Eq -- '--enable-(gpl|nonfree|version3)|--enable-protocol=[^#]*(udp|rtp)' "$flags"; then
@@ -92,6 +92,10 @@ fi
 # Darwin archive tools otherwise stamp every member with the current time,
 # making equivalent rebuilds byte-different.
 grep -Fx 'export ZERO_AR_DATE=1' "$root/Scripts/build-ffmpeg.sh" >/dev/null
+
+# Xcode Cloud's UTF-8 locale sorts libFFmpeg.a differently from the POSIX
+# locale. The artifact audit must normalize collation before comparing names.
+grep -Fx 'export LC_ALL=C' "$root/Scripts/audit-ffmpeg.sh" >/dev/null
 
 artifact_cleanup_line="$(grep -nF 'clear_generated_directory "$artifacts"' "$root/Scripts/build-ffmpeg.sh" | head -1 | cut -d: -f1)"
 first_slice_line="$(grep -nF 'build_slice device appletvos arm64' "$root/Scripts/build-ffmpeg.sh" | cut -d: -f1)"

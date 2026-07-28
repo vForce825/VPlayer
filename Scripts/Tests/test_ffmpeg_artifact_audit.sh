@@ -106,7 +106,10 @@ assert_rejected() {
   echo "Artifact audit rejected $description"
 }
 
-"$base/Scripts/audit-ffmpeg.sh" "$base/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework" >/dev/null
+# Reproduce Xcode Cloud's locale: without an explicit POSIX collation,
+# libFFmpeg.a sorts after the lowercase archives and caused a false rejection.
+LC_ALL=en_US.UTF-8 "$base/Scripts/audit-ffmpeg.sh" \
+  "$base/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework" >/dev/null
 
 case_root="$(new_case info-platform)"
 /usr/bin/plutil -replace "AvailableLibraries.$device_index.SupportedPlatform" -string ios \
@@ -142,6 +145,11 @@ case_root="$(new_case archive-hash)"
 materialize_device_install "$case_root"
 printf 'tamper' >> "$case_root/Vendor/FFmpeg/Work/install-device/lib/libavcodec.a"
 assert_rejected "$case_root" "device libavcodec.a differs from recorded build output" "a tampered input archive hash"
+
+case_root="$(new_case archive-inventory)"
+materialize_device_install "$case_root"
+printf 'unexpected' > "$case_root/Vendor/FFmpeg/Work/install-device/lib/libunexpected.a"
+assert_rejected "$case_root" "libunexpected.a" "an unexpected installed static library"
 
 case_root="$(new_case lgpl-license)"
 printf '\nTampered.\n' >> "$case_root/Vendor/FFmpeg/LICENSE.md"
