@@ -66,6 +66,8 @@ private enum AppLegalInformation {
 }
 
 private struct PrivacyStatementView: View {
+    @Environment(\.dismiss) private var dismiss
+
     var body: some View {
         List {
             Section("不收集个人数据") {
@@ -87,9 +89,13 @@ private struct PrivacyStatementView: View {
             Section("在线隐私政策") {
                 Text(AppLegalInformation.privacyURL)
                     .accessibilityIdentifier("settings.privacy.url")
+                    .focusable()
             }
         }
         .navigationTitle("隐私政策")
+        .onExitCommand {
+            dismiss()
+        }
     }
 }
 

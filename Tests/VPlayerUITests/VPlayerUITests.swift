@@ -51,6 +51,9 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(privacyURL.waitForExistence(timeout: 3))
         XCTAssertEqual(privacyURL.label, "https://vplayerdemom3u.vercel.app/privacy.html")
         XCTAssertFalse(app.buttons["查看完整在线隐私政策"].exists)
+        XCUIRemote.shared.press(.menu)
+        XCTAssertTrue(app.buttons["settings.privacy"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.state, .runningForeground)
     }
 
     @MainActor
