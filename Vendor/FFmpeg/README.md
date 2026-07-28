@@ -66,11 +66,14 @@ The audit reads each architecture's real `config.h` and
 `config_components.h`, checks the source/tag/license and input archive
 hashes, validates the XCFramework platform/architectures, and independently
 subtracts archive definitions from undefined references for each thin
-architecture. The remaining exact symbols are recorded in
-`system-symbol-allowlist.txt`; they are Apple libc/libm/pthread/BSD system
-interfaces, CoreFoundation and Security/Secure Transport interfaces, zlib,
-and compiler runtime interfaces. Consumers must link CoreFoundation,
-Security, and zlib (`-lz`). Wildcards are not accepted by the audit.
+architecture. The remaining required symbols are recorded in
+`system-symbol-allowlist.txt`; reviewed system symbols emitted only by some
+supported Xcode toolchains are recorded in
+`optional-system-symbol-allowlist.txt`. They are Apple
+libc/libm/pthread/BSD system interfaces, CoreFoundation and Security/Secure
+Transport interfaces, zlib, and compiler runtime interfaces. Consumers must
+link CoreFoundation, Security, and zlib (`-lz`). Wildcards are not accepted by
+the audit, and required entries must still match exactly.
 
 For checkout-independent output, each Clang slice uses file, macro, and debug
 prefix maps. Immediately after configure and before make, the build

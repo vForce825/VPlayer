@@ -36,6 +36,7 @@ for metadata in \
   component-manifest.json \
   configure.flags \
   ffmpeg.lock.json \
+  optional-system-symbol-allowlist.txt \
   system-symbol-allowlist.txt; do
   cp "$vendor/$metadata" "$base/Vendor/FFmpeg/"
 done
@@ -184,6 +185,27 @@ record="$(device_record "$case_root")"
 jq --arg sha "$combined_sha" '.archives["libFFmpeg.a"] = $sha' "$record" > "$record.new"
 mv "$record.new" "$record"
 assert_rejected "$case_root" "_vplayer_audit_unexpected_symbol" "an unexpected unresolved symbol"
+
+case_root="$(new_case optional-system-symbol)"
+materialize_device_install "$case_root"
+printf 'extern unsigned long vplayer_test_wcslen(const void *) __asm("_wcslen"); unsigned long vplayer_audit_optional_probe(const void *value) { return vplayer_test_wcslen(value); }\n' | \
+  "$cc" -target arm64-apple-tvos18.0 -fapplication-extension -x c -c -o "$case_root/optional.o" -
+device_install_archive="$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
+/usr/bin/xcrun --sdk appletvos ar -r "$device_install_archive" "$case_root/optional.o"
+/usr/bin/xcrun --sdk appletvos ranlib "$device_install_archive"
+cp "$device_install_archive" \
+  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/$device_identifier/libFFmpeg.a"
+combined_sha="$(shasum -a 256 "$device_install_archive" | awk '{print $1}')"
+record="$(device_record "$case_root")"
+jq --arg sha "$combined_sha" '.archives["libFFmpeg.a"] = $sha' "$record" > "$record.new"
+mv "$record.new" "$record"
+"$case_root/Scripts/audit-ffmpeg.sh" \
+  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework" >/dev/null
+echo "Artifact audit accepted a reviewed optional system symbol"
+
+case_root="$(new_case overlapping-symbol-allowlists)"
+printf '_abort\n' >> "$case_root/Vendor/FFmpeg/optional-system-symbol-allowlist.txt"
+assert_rejected "$case_root" "system symbol allowlists overlap" "overlapping required and optional symbol allowlists"
 
 case_root="$(new_case stale-symbol)"
 printf '_vplayer_audit_stale_symbol\n' >> "$case_root/Vendor/FFmpeg/system-symbol-allowlist.txt"
