@@ -32,6 +32,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private static let capacity = 96
     private static let compressedStartupFallbackDuration = CMTime(value: 3, timescale: 4)
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
+    // Packet duration follows the codec clock while its PTS may be rounded to
+    // the container clock. A tiny tolerance joins that representation residue,
+    // but remains far below one AAC/AC-3 packet and cannot conceal a real gap.
+    private static let audioContinuityTolerance = CMTime(value: 1, timescale: 1_000)
     private static let maximumConsecutiveInvalidPackets = 8
 
     private struct PublicSnapshot {
@@ -843,8 +847,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             guard entry.sentCompressed,
                   entry.sample.presentationTimeStamp.isNumeric,
                   entry.sample.duration.isNumeric,
-                  CMTimeCompare(entry.sample.duration, .zero) > 0,
-                  CMTimeCompare(entry.sample.presentationTimeStamp, end) <= 0 else { break }
+                  CMTimeCompare(entry.sample.duration, .zero) > 0 else { break }
+            let toleratedEnd = CMTimeAdd(end, Self.audioContinuityTolerance)
+            guard toleratedEnd.isNumeric,
+                  CMTimeCompare(entry.sample.presentationTimeStamp, toleratedEnd) <= 0 else { break }
             let sampleEnd = CMTimeAdd(
                 entry.sample.presentationTimeStamp,
                 entry.sample.duration

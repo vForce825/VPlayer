@@ -193,6 +193,33 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
+    func testCompressedStartupTreatsTransportClockRoundingAsContinuous() throws {
+        let harness = try makeHarness(codec: .aac)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: false)
+        let packetDuration = CMTime(value: 1_024, timescale: 44_100)
+
+        for index in 0..<33 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTime(value: Int64(index * 2_090), timescale: 90_000),
+                    duration: packetDuration
+                ))
+            }
+        }
+
+        XCTAssertEqual(
+            harness.synchronizer.removalCount,
+            1,
+            "AAC timestamps rounded onto a 90 kHz transport clock must still trigger fallback"
+        )
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
     func testNotReadyInputStaysPendingAndReadyCallbackDrainsOnlyCapacity() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
