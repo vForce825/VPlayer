@@ -165,6 +165,16 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     // absorb a single late frame. A larger margin is actively harmful: playback
     // settles just underneath it, showing nothing and never recovering.
     static let videoResyncThreshold = CMTime(value: 1, timescale: 25)
+    // Audio packet duration is expressed in the codec sample clock while PTS
+    // can be rounded onto a container clock (90 kHz for MPEG-TS). Treat
+    // sub-millisecond rounding residue as continuous without masking a real
+    // missing audio packet.
+    private static let audioContinuityTolerance = CMTime(value: 1, timescale: 1_000)
+    // Compressed samples retained for startup/re-anchor. While readiness is
+    // closed this window must keep the earliest samples, matching the startup
+    // video window: HLS can deliver many seconds of AAC before VideoToolbox
+    // returns its first decoded frames. Sliding audio forward in that phase
+    // leaves the two windows permanently non-overlapping.
     private static let retainedAudioCapacity = 96
 
     private struct PendingPacketAdmission {
@@ -773,9 +783,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         retainedAudio.sort {
             CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp) < 0
         }
-        if retainedAudio.count > Self.retainedAudioCapacity {
-            retainedAudio.removeFirst(retainedAudio.count - Self.retainedAudioCapacity)
-        }
+        boundRetainedAudioIsolated()
         drainPendingVideoDecodeIsolated()
         boundRetainedVideoIsolated()
         updateReadinessIsolated()
@@ -1221,7 +1229,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             guard sample.presentationTimeStamp.isNumeric,
                   sample.duration.isNumeric,
                   CMTimeCompare(sample.duration, .zero) > 0 else { break }
-            let comparison = CMTimeCompare(sample.presentationTimeStamp, end)
+            let toleratedEnd = CMTimeAdd(end, Self.audioContinuityTolerance)
+            guard toleratedEnd.isNumeric else { break }
+            let comparison = CMTimeCompare(sample.presentationTimeStamp, toleratedEnd)
             guard comparison <= 0 else { break }
             let sampleEnd = CMTimeAdd(sample.presentationTimeStamp, sample.duration)
             guard sampleEnd.isNumeric else { break }
@@ -1283,6 +1293,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             }
             let removed = retainedVideo.removeFirst()
             estimatedBytes = max(0, estimatedBytes - removed.estimatedStorageBytes)
+        }
+    }
+
+    private func boundRetainedAudioIsolated() {
+        assertIsolated()
+        guard retainedAudio.count > Self.retainedAudioCapacity else { return }
+        let overflow = retainedAudio.count - Self.retainedAudioCapacity
+        if !paused, readiness?.isOpen != true {
+            retainedAudio.removeLast(overflow)
+        } else {
+            retainedAudio.removeFirst(overflow)
         }
     }
 

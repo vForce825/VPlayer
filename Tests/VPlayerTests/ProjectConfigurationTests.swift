@@ -29,7 +29,7 @@ final class ProjectConfigurationTests: XCTestCase {
 
         XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
         XCTAssertEqual(
-            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.0\"").count - 1,
+            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.1\"").count - 1,
             3,
             "the app and both embedded frameworks need a marketing version"
         )

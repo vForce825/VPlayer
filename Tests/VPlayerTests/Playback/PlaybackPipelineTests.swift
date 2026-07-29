@@ -1014,6 +1014,78 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(harness.display.snapshot().last, "resume")
     }
 
+    func testClosedReadinessPreservesEarlyAudioWhenIngestOutrunsVideoDecode() async throws {
+        let metrics = PlaybackMetrics(
+            channelID: "audio-leads-video-decode",
+            now: { 1 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = makeHarness(metrics: metrics)
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+
+        let audioDuration = CMTime(value: 1, timescale: 40)
+        for index in 0..<128 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTime(value: Int64(index), timescale: 40),
+                duration: audioDuration
+            )))
+        }
+        try await eventually {
+            metrics.snapshot(window: .seconds(60)).retainedAudioCount == 96
+        }
+
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+        XCTAssertEqual(harness.clock.snapshot().anchors.last?.0, .zero)
+        XCTAssertEqual(harness.display.snapshot().last, "resume")
+    }
+
+    func testAudioTimestampRoundingDoesNotBreakStartupContinuity() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+
+        // MPEG-TS timestamps use a 90 kHz clock while AAC duration is exact at
+        // 44.1 kHz. Rounding 1,024 samples to 2,090 transport ticks leaves a
+        // harmless ~2 microsecond gap between some adjacent packets.
+        let audioDuration = CMTime(value: 1_024, timescale: 44_100)
+        for index in 0..<12 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTime(value: Int64(index * 2_090), timescale: 90_000),
+                duration: audioDuration
+            )))
+        }
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+        XCTAssertEqual(harness.clock.snapshot().anchors.last?.0, .zero)
+        XCTAssertEqual(harness.display.snapshot().last, "resume")
+    }
+
     func testClosedReadinessKeepsDecoderPoolHeadroomAndDefersDisplaySubmission() async throws {
         let metrics = PlaybackMetrics(
             channelID: "decoder-pool-headroom",
