@@ -175,7 +175,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     // video window: HLS can deliver many seconds of AAC before VideoToolbox
     // returns its first decoded frames. Sliding audio forward in that phase
     // leaves the two windows permanently non-overlapping.
-    private static let retainedAudioCapacity = 96
+    // At 44.1 kHz, 96 AAC packets cover only ~2.23 seconds: less than the
+    // default two-second video horizon plus the readiness gate's 250 ms audio
+    // runway. Keep enough compressed audio to cover both with alignment slack.
+    static let retainedAudioCapacity = 128
 
     private struct PendingPacketAdmission {
         let packet: DemuxPacket
@@ -241,6 +244,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     // (which clears `readyPublished`) and a gate-internal close (which only bumps
     // the cycle) let the next open resume submission again.
     private var displayResumedCycle: UInt64?
+    private var hasOpenedReadinessForCurrentMedia = false
+    private var rebufferAudioAnchorTarget: CMTime?
     private var readinessCycle: UInt64 = 0
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
@@ -764,7 +769,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             )
             if pendingVideoDecode.count < capacity {
                 pendingVideoDecode.append(accessUnit)
-            } else if accessUnit.isRandomAccess {
+            } else if accessUnit.isRandomAccess, readiness?.isOpen == true {
                 pendingVideoDecode.removeAll(keepingCapacity: true)
                 pendingVideoDecode.append(accessUnit)
             } else {
@@ -924,6 +929,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         audioFormat = nil
         audioCodec = nil
         trackEpochAlreadyAdvanced = false
+        hasOpenedReadinessForCurrentMedia = false
+        rebufferAudioAnchorTarget = nil
         pendingTrackVideo.removeAll(keepingCapacity: true)
         pendingTrackAudio.removeAll(keepingCapacity: true)
         pendingVideoDecode.removeAll(keepingCapacity: true)
@@ -983,6 +990,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         readiness?.close(.discontinuity)
         readiness?.configure(requiredVideoFrameCount: requiredVideoFrameCount)
         readyPublished = false
+        hasOpenedReadinessForCurrentMedia = false
+        rebufferAudioAnchorTarget = nil
         releasePendingAdmissionIsolated()
         preparedAnchor = nil
         anchorPreparationInProgress = false
@@ -1190,6 +1199,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func resumeDisplayForOpenReadinessGateIsolated() {
         assertIsolated()
+        hasOpenedReadinessForCurrentMedia = true
+        rebufferAudioAnchorTarget = nil
         if pendingDisplayTimingReset {
             pendingDisplayTimingReset = false
             renderer.resetPresentationTiming()
@@ -1299,11 +1310,50 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func boundRetainedAudioIsolated() {
         assertIsolated()
         guard retainedAudio.count > Self.retainedAudioCapacity else { return }
-        let overflow = retainedAudio.count - Self.retainedAudioCapacity
-        if !paused, readiness?.isOpen != true {
-            retainedAudio.removeLast(overflow)
-        } else {
-            retainedAudio.removeFirst(overflow)
+        if paused || readiness?.isOpen == true {
+            rebufferAudioAnchorTarget = nil
+            retainedAudio.removeFirst(retainedAudio.count - Self.retainedAudioCapacity)
+            return
+        }
+
+        guard hasOpenedReadinessForCurrentMedia else {
+            retainedAudio.removeLast(retainedAudio.count - Self.retainedAudioCapacity)
+            return
+        }
+
+        let pendingTarget = pendingVideoDecode.first.map {
+            CMSampleBufferGetPresentationTimeStamp($0.sampleBuffer)
+        }
+        if let candidate = pendingTarget
+                ?? retainedVideo.last?.presentationTimeStamp,
+           candidate.isNumeric,
+           rebufferAudioAnchorTarget.map({
+               !$0.isNumeric || CMTimeCompare(candidate, $0) > 0
+           }) ?? true {
+            rebufferAudioAnchorTarget = candidate
+        }
+
+        // Initial startup keeps the earliest audio because VideoToolbox may not
+        // have returned a frame yet. Rebuffering is different: the compressed
+        // video queue can already have skipped to a later random-access point.
+        // Advance the bounded audio window only until it overlaps the oldest
+        // deferred video unit. The target is monotonic but follows that queue's
+        // head: once a key frame is submitted, holding its old PTS can leave the
+        // next unit just beyond the audio window forever. Following the head
+        // lets the two windows advance together without chasing the live edge.
+        while retainedAudio.count > Self.retainedAudioCapacity {
+            guard let target = rebufferAudioAnchorTarget,
+                  target.isNumeric,
+                  let first = retainedAudio.first else {
+                retainedAudio.removeLast()
+                continue
+            }
+            let firstEnd = CMTimeAdd(first.presentationTimeStamp, first.duration)
+            if firstEnd.isNumeric, CMTimeCompare(firstEnd, target) <= 0 {
+                retainedAudio.removeFirst()
+            } else {
+                retainedAudio.removeLast()
+            }
         }
     }
 
