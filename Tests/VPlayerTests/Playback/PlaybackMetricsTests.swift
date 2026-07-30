@@ -221,6 +221,93 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.presentedVideoFrames, 2)
     }
 
+    func testUniquePresentationPTSRegressionIsCountedWithinOneGeneration() {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
+        let generation = MediaGeneration(rawValue: 1)
+
+        for pts in [10.0, 10.04, 9.0] {
+            let time = CMTime(seconds: pts, preferredTimescale: 1_000)
+            metrics.recordPresentationCompletion(
+                generation: generation,
+                activeGeneration: generation,
+                isUniquePresentation: true,
+                presentationTimeStamp: time,
+                targetMediaTime: time
+            )
+        }
+
+        XCTAssertEqual(
+            metrics.snapshot(window: .seconds(60)).presentationPTSRegressionCount,
+            1
+        )
+    }
+
+    func testUniquePresentationPTSRegressionSurvivesDecoderGenerationChange() {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
+        let firstGeneration = MediaGeneration(rawValue: 1)
+        let secondGeneration = MediaGeneration(rawValue: 2)
+
+        metrics.recordPresentationCompletion(
+            generation: firstGeneration,
+            activeGeneration: firstGeneration,
+            isUniquePresentation: true,
+            presentationTimeStamp: CMTime(seconds: 10, preferredTimescale: 1_000),
+            targetMediaTime: CMTime(seconds: 10, preferredTimescale: 1_000)
+        )
+        metrics.recordPresentationCompletion(
+            generation: firstGeneration,
+            activeGeneration: secondGeneration,
+            isUniquePresentation: true,
+            presentationTimeStamp: CMTime(seconds: 9, preferredTimescale: 1_000),
+            targetMediaTime: CMTime(seconds: 9, preferredTimescale: 1_000)
+        )
+        metrics.recordPresentationCompletion(
+            generation: secondGeneration,
+            activeGeneration: secondGeneration,
+            isUniquePresentation: true,
+            presentationTimeStamp: CMTime(seconds: 1, preferredTimescale: 1_000),
+            targetMediaTime: CMTime(seconds: 1, preferredTimescale: 1_000)
+        )
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.presentationPTSRegressionCount, 1)
+        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
+    }
+
+    func testExplicitTimelineResetAllowsAnEarlierPTSWithoutErasingEvidence() {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
+        let firstGeneration = MediaGeneration(rawValue: 1)
+        let secondGeneration = MediaGeneration(rawValue: 2)
+
+        metrics.recordPresentationCompletion(
+            generation: firstGeneration,
+            activeGeneration: firstGeneration,
+            isUniquePresentation: true,
+            presentationTimeStamp: CMTime(seconds: 10, preferredTimescale: 1_000),
+            targetMediaTime: CMTime(seconds: 10, preferredTimescale: 1_000)
+        )
+        metrics.recordPresentationCompletion(
+            generation: firstGeneration,
+            activeGeneration: firstGeneration,
+            isUniquePresentation: true,
+            presentationTimeStamp: CMTime(seconds: 9, preferredTimescale: 1_000),
+            targetMediaTime: CMTime(seconds: 9, preferredTimescale: 1_000)
+        )
+        metrics.resetPresentationTimeline()
+        metrics.recordPresentationCompletion(
+            generation: secondGeneration,
+            activeGeneration: secondGeneration,
+            isUniquePresentation: true,
+            presentationTimeStamp: CMTime(seconds: 1, preferredTimescale: 1_000),
+            targetMediaTime: CMTime(seconds: 1, preferredTimescale: 1_000)
+        )
+
+        XCTAssertEqual(
+            metrics.snapshot(window: .seconds(60)).presentationPTSRegressionCount,
+            1
+        )
+    }
+
     func testSnapshotNeverClaimsAWindowLongerThanItsRetainedHistory() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(

@@ -70,6 +70,52 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         XCTAssertTrue(harness.yadif.submissions.isEmpty)
     }
 
+    func testHandleReturnsTrueOnlyWhenAccessUnitReachesDecoder() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+
+        XCTAssertFalse(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: false
+        )))
+        XCTAssertFalse(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: MediaGeneration(rawValue: generation.rawValue - 1),
+            randomAccess: true
+        )))
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 3,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        harness.decoder.decodeFailures = [.badData(kVTVideoDecoderBadDataErr)]
+        XCTAssertFalse(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 4,
+            generation: generation,
+            randomAccess: false
+        )))
+    }
+
+    func testSubmissionCompletionDoesNotChangeCoordinatorState() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        let operations = harness.decoder.snapshot()
+        let hostOperations = harness.host.operations
+
+        harness.coordinator.handle(decoder: .submissionCompleted(
+            accessUnitID: 9,
+            generation: generation
+        ))
+
+        XCTAssertEqual(harness.decoder.snapshot(), operations)
+        XCTAssertEqual(harness.host.operations, hostOperations)
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
     func testSupplementalProbeDoesNotDoubleCountProgressiveFrame() throws {
         let harness = makeHarness(classifierConfiguration: ScanClassifierConfiguration(
             progressiveConfirmationFrames: 3,
@@ -822,7 +868,7 @@ private final class CoordinatorHost: @unchecked Sendable {
                 trace.append("host.advance:\(generation.rawValue)")
                 return generation
             },
-            resetPlayback: { [weak self] generation, requiredCount in
+            resetPlayback: { [weak self] generation, requiredCount, _ in
                 self?.operations.append("reset:\(generation.rawValue):\(requiredCount)")
                 self?.trace.append("host.reset:\(generation.rawValue):\(requiredCount)")
             },

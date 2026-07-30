@@ -608,15 +608,26 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let initialEnqueueCount = renderer.snapshot.enqueuedPTS.count
         XCTAssertEqual(initialEnqueueCount, 216)
 
-        synchronizer.setCurrentTime(CMTime(value: 2, timescale: 1))
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let unblockExecutor = DispatchSemaphore(value: 0)
+        executor.submit {
+            blockerEntered.signal()
+            _ = unblockExecutor.wait(timeout: .now() + 5)
+        }
+        XCTAssertEqual(blockerEntered.wait(timeout: .now() + 2), .success)
+
+        let capturedTime = CMTime(value: 2, timescale: 1)
+        let executionTime = CMTime(value: 3, timescale: 1)
+        synchronizer.setCurrentTime(capturedTime)
         renderer.emit(.automaticFlush(CMTime(value: 1, timescale: 1)))
+        executor.submit { synchronizer.setCurrentTime(executionTime) }
+        unblockExecutor.signal()
         drain(executor)
 
         let replayed = Array(renderer.snapshot.enqueuedPTS.dropFirst(initialEnqueueCount))
-        XCTAssertGreaterThanOrEqual(replayed.count, 125)
         let first = try XCTUnwrap(replayed.first)
-        XCTAssertGreaterThan(CMTimeGetSeconds(first), 1.95)
-        XCTAssertLessThanOrEqual(CMTimeGetSeconds(first), 2)
+        XCTAssertGreaterThan(CMTimeCompare(first, CMTimeSubtract(executionTime, packetDuration)), 0)
+        XCTAssertLessThanOrEqual(CMTimeCompare(first, executionTime), 0)
         XCTAssertTrue(synchronizer.rateSnapshot.isEmpty)
     }
 
@@ -653,7 +664,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.pipeline.isReadyForPlayback)
     }
 
-    func testExternallyClockedFallbackAndRecoveryReportReadinessWithoutChangingRateOrAnchor() throws {
+    func testExternallyClockedFallbackBridgesReadinessWithoutChangingRateOrAnchor() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-clock")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -694,17 +705,85 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         drain(executor)
         compressed.emit(.failed("force-fallback"))
         drain(executor)
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 10)
+            ))
+        }
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
         synchronizer.completeRemoval(didRemove: true)
         drain(executor)
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
         let pcm = try XCTUnwrap(renderers.snapshot.last)
         pcm.configureReadiness(ready: true, sufficient: true)
         pcm.fireReady()
         drain(executor)
 
         XCTAssertTrue(synchronizer.rateSnapshot.isEmpty)
-        XCTAssertTrue(readiness.snapshot.map(\.change).contains(.invalidated))
-        XCTAssertTrue(readiness.snapshot.map(\.change).contains(.available))
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
         XCTAssertTrue(failures.snapshot.isEmpty)
+    }
+
+    func testExternallyClockedFallbackGraceExpiresWhenReplacementCannotPreroll() async throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-timeout")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { _, _ in },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { sample in
+                [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+            },
+            routeMonitor: FakeAudioRouteMonitor(),
+            supportChecker: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in
+                readiness.append(change, generation: generation)
+            }
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        let compressed = try XCTUnwrap(renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: true)
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        compressed.fireReady()
+        drain(executor)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+
+        compressed.emit(.failed("force-fallback-timeout"))
+        drain(executor)
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 10)
+            ))
+        }
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+
+        try await eventually(timeout: .seconds(2)) {
+            readiness.snapshot.map(\.change) == [.available, .invalidated]
+        }
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        try await Task.sleep(for: .milliseconds(100))
+        drain(executor)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .invalidated])
+
+        synchronizer.completeRemoval(didRemove: true)
+        drain(executor)
+        synchronizer.releaseRemoval()
     }
 
     func testOverlappingRecoveryEventsMergeIntoOneFlushAndReevaluation() throws {

@@ -54,6 +54,10 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let elapsedSeconds: Double
     public let windowDurationSeconds: Double
     public let presentedVideoFrames: UInt64
+    // Unique frames must be selected in media-time order within one media
+    // timeline. A non-zero value is direct evidence that recovery replayed
+    // already-presented video after a same-timeline stall.
+    public let presentationPTSRegressionCount: UInt64
     public let maximumAbsoluteAVDriftMilliseconds: Double
     public let crossGenerationPresentationCount: UInt64
     public let audioRoute: String
@@ -218,6 +222,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         var maximumYADIFInFlightCount = 0
         var maximumYADIFInputDepth = 0
         var presentedVideoFrames: UInt64 = 0
+        var presentationPTSRegressionCount: UInt64 = 0
+        var lastUniquePresentationPTS: CMTime?
         var maximumAbsoluteAVDriftMilliseconds = 0.0
         var crossGenerationPresentationCount: UInt64 = 0
         var audioRoute = "systemCompressed"
@@ -484,6 +490,13 @@ final class PlaybackMetrics: @unchecked Sendable {
                 return
             }
             guard isUniquePresentation else { return }
+            if presentationTimeStamp.isNumeric {
+                if let previousPTS = state.lastUniquePresentationPTS,
+                   CMTimeCompare(presentationTimeStamp, previousPTS) < 0 {
+                    state.presentationPTSRegressionCount &+= 1
+                }
+                state.lastUniquePresentationPTS = presentationTimeStamp
+            }
             state.presentationTimes.append(timestamp)
             state.presentedVideoFrames &+= 1
             guard timestamp >= state.avDriftGraceUntil,
@@ -497,6 +510,14 @@ final class PlaybackMetrics: @unchecked Sendable {
                 drift
             )
         }
+    }
+
+    // Decoder replacement can advance MediaGeneration while remaining on the
+    // same media timeline, so generation changes must not erase regression
+    // history. Only callers that know a genuine timeline reset occurred may
+    // clear the comparison baseline; the cumulative evidence remains intact.
+    func resetPresentationTimeline() {
+        lock.withLock { state.lastUniquePresentationPTS = nil }
     }
 
     func recordYADIFKernelDispatch(inFlightCount: Int, inputDepth: Int) {
@@ -631,6 +652,7 @@ final class PlaybackMetrics: @unchecked Sendable {
             elapsedSeconds: elapsed,
             windowDurationSeconds: windowSeconds,
             presentedVideoFrames: captured.presentedVideoFrames,
+            presentationPTSRegressionCount: captured.presentationPTSRegressionCount,
             maximumAbsoluteAVDriftMilliseconds: captured.maximumAbsoluteAVDriftMilliseconds,
             crossGenerationPresentationCount: captured.crossGenerationPresentationCount,
             audioRoute: captured.audioRoute,

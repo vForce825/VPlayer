@@ -90,7 +90,7 @@ final class FFmpegDemuxerTests: XCTestCase {
             XCTAssertEqual(recorder.waitForTerminal().last, .endOfStream)
             XCTAssertEqual(bridge.createCount, 1)
             XCTAssertEqual(bridge.urlBytes, Data(url.absoluteString.utf8))
-            XCTAssertEqual(bridge.timeoutUS, 10_000_000)
+            XCTAssertEqual(bridge.timeoutUS, 30_000_000)
         }
     }
 

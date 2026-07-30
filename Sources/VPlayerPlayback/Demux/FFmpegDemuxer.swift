@@ -43,7 +43,10 @@ final class FFmpegDemuxer: MediaDemuxing, @unchecked Sendable {
         executor: PlaybackSerialExecutor = PlaybackSerialExecutor(),
         capacity: Int = 256,
         maximumQueuedBytes: Int = 64 * 1_024 * 1_024,
-        timeoutUS: Int64 = 10_000_000,
+        // A live HLS read can legitimately span a playlist target duration plus
+        // a retry. Keep the interrupt deadline long enough for several 5-second
+        // segments so transient playlist latency does not terminate playback.
+        timeoutUS: Int64 = 30_000_000,
         ioQueue: DispatchQueue? = nil
     ) {
         self.bridge = bridge

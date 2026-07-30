@@ -150,6 +150,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
                      let .fatalFailure(failure, _),
                      let .submissionFailure(failure, _):
                     decoded.record(failure)
+                case .submissionCompleted:
+                    break
                 }
             }
             let format = try XCTUnwrap(assembled.videoFormats.last)

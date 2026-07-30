@@ -36,9 +36,17 @@ extension YADIFProcessor: YADIFFrameProcessing {
 /// playback serial executor. `schedule` is the sole exception: it moves asynchronous
 /// probe completion work back onto that executor before coordinator state is touched.
 struct VideoPipelineCoordinatorHooks: Sendable {
+    enum PlaybackResetScope: Sendable, Equatable {
+        /// A real media discontinuity or format epoch may legitimately restart
+        /// timestamps from an earlier value.
+        case timeline
+        /// Rebuilding only the decoder keeps the current live media timeline.
+        case decoderSession
+    }
+
     let closeAdmission: @Sendable () -> Void
     let advanceGeneration: @Sendable () -> MediaGeneration
-    let resetPlayback: @Sendable (MediaGeneration, Int) -> Void
+    let resetPlayback: @Sendable (MediaGeneration, Int, PlaybackResetScope) -> Void
     let reopenAdmission: @Sendable () -> Void
     let routeDidChange: @Sendable (Int) -> Void
     let deliver: @Sendable ([VideoPresentationFrame], MediaGeneration) -> Void
@@ -165,21 +173,22 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         videoFormat = format
         decoderConfigured = false
         waitingForRandomAccess = true
-        hooks.resetPlayback(generation, requiredVideoFrameCount)
+        hooks.resetPlayback(generation, requiredVideoFrameCount, .timeline)
         decoder.invalidate()
         if reopenAdmission {
             hooks.reopenAdmission()
         }
     }
 
-    func handle(accessUnit: CompressedVideoAccessUnit) {
-        guard !stopped else { return }
+    @discardableResult
+    func handle(accessUnit: CompressedVideoAccessUnit) -> Bool {
+        guard !stopped else { return false }
         guard accessUnit.generation == generation else {
             metrics?.recordStaleGenerationDrop()
-            return
+            return false
         }
         if waitingForRandomAccess {
-            guard accessUnit.isRandomAccess, let videoFormat else { return }
+            guard accessUnit.isRandomAccess, let videoFormat else { return false }
             do {
                 try decoder.configure(format: videoFormat, generation: generation)
                 decoderConfigured = true
@@ -187,19 +196,22 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             } catch let failure as VideoDecoderFailure {
                 recordDecodeFailureDiagnostic(failure)
                 hooks.fail(PlaybackPipeline.coreError(for: failure), generation)
-                return
+                return false
             } catch {
                 hooks.fail(.videoDecode(-1), generation)
-                return
+                return false
             }
         }
 
         do {
             try decoder.decode(accessUnit, flags: ._EnableAsynchronousDecompression)
+            return true
         } catch let failure as VideoDecoderFailure {
             handleSubmissionFailure(failure, generation: generation)
+            return false
         } catch {
             hooks.fail(.videoDecode(-1), generation)
+            return false
         }
     }
 
@@ -250,6 +262,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 return
             }
             handleSubmissionFailure(failure, generation: eventGeneration)
+        case .submissionCompleted:
+            // Admission accounting belongs to PlaybackPipeline. A completion
+            // carries no decoded media and must not affect routing or recovery.
+            break
         case let .recoverableFailure(failure, eventGeneration):
             guard eventGeneration == generation else {
                 metrics?.recordStaleGenerationDrop()
@@ -298,7 +314,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             activeProbeSubmissionID = nil
             decoderConfigured = false
             waitingForRandomAccess = true
-            hooks.resetPlayback(generation, requiredVideoFrameCount)
+            hooks.resetPlayback(generation, requiredVideoFrameCount, .timeline)
             decoder.invalidate()
             return
         }
@@ -473,7 +489,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         activeProbeSubmissionID = nil
         decoderConfigured = false
         waitingForRandomAccess = true
-        hooks.resetPlayback(generation, requiredVideoFrameCount)
+        hooks.resetPlayback(generation, requiredVideoFrameCount, .decoderSession)
         decoder.invalidate()
         hooks.reopenAdmission()
     }

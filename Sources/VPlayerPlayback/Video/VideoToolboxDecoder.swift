@@ -137,7 +137,7 @@ private final class SessionIdentityBox: @unchecked Sendable {
 /// this whole change exists to keep free. Cancelling is also the more faithful
 /// outcome: those units belong to the generation being abandoned, so their
 /// output would be discarded on arrival anyway.
-private final class SubmissionEpoch: @unchecked Sendable {
+final class SubmissionEpoch: @unchecked Sendable {
     private let lock = NSLock()
     private var current: UInt64 = 0
 
@@ -164,6 +164,83 @@ private final class DecodeSubmissionLease: @unchecked Sendable {
             return true
         }
         if shouldRelease { releaseAction() }
+    }
+}
+
+/// Emits the admission-release event exactly once, including paths where
+/// VideoToolbox never produces an image callback.
+private final class DecodeCompletionLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    private let accessUnitID: UInt64
+    private let generation: MediaGeneration
+    private let executor: PlaybackSerialExecutor
+    private let eventSink: @Sendable (VideoDecoderEvent) -> Void
+
+    init(
+        accessUnitID: UInt64,
+        generation: MediaGeneration,
+        executor: PlaybackSerialExecutor,
+        eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
+    ) {
+        self.accessUnitID = accessUnitID
+        self.generation = generation
+        self.executor = executor
+        self.eventSink = eventSink
+    }
+
+    func schedule() {
+        guard let event = takeEvent() else { return }
+        let eventSink = eventSink
+        executor.submit { eventSink(event) }
+    }
+
+    /// Used when output handling is already on the playback executor, so the
+    /// completion cannot overtake the frame or failure produced by that output.
+    func deliverIsolated() {
+        guard let event = takeEvent() else { return }
+        eventSink(event)
+    }
+
+    private func takeEvent() -> VideoDecoderEvent? {
+        lock.withLock {
+            guard !completed else { return nil }
+            completed = true
+            return .submissionCompleted(
+                accessUnitID: accessUnitID,
+                generation: generation
+            )
+        }
+    }
+}
+
+/// Keeps callback-owned completions reachable from teardown. VideoToolbox may
+/// discard pending callbacks when a session is invalidated, so relying on the
+/// callback alone would leak admission credit for those access units.
+private final class DecodeCompletionRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var leases: [VTSessionID: [ObjectIdentifier: DecodeCompletionLease]] = [:]
+
+    func insert(_ lease: DecodeCompletionLease, sessionID: VTSessionID) {
+        lock.withLock {
+            leases[sessionID, default: [:]][ObjectIdentifier(lease)] = lease
+        }
+    }
+
+    func remove(_ lease: DecodeCompletionLease, sessionID: VTSessionID) {
+        lock.withLock {
+            leases[sessionID]?.removeValue(forKey: ObjectIdentifier(lease))
+            if leases[sessionID]?.isEmpty == true {
+                leases.removeValue(forKey: sessionID)
+            }
+        }
+    }
+
+    func completeAll(sessionID: VTSessionID) {
+        let pending = lock.withLock {
+            leases.removeValue(forKey: sessionID).map { Array($0.values) } ?? []
+        }
+        for lease in pending { lease.schedule() }
     }
 }
 
@@ -229,8 +306,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private var active: ActiveSession?
     private var submissionsSinceDepthSample = 0
 
-    private let submissionEpoch = SubmissionEpoch()
+    private let submissionEpoch: SubmissionEpoch
     private let sessionIdentity = SessionIdentityBox()
+    private let completionRegistry = DecodeCompletionRegistry()
     private let backlog: DecodeSubmissionBacklog
     private let tuningBox = TuningBox()
 
@@ -277,6 +355,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             label: "org.vplayer.playback.decode.submit",
             qos: .userInitiated
         ),
+        submissionEpoch: SubmissionEpoch = SubmissionEpoch(),
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil
     ) {
@@ -290,6 +369,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             waitInterval: inFlightWaitInterval
         )
         backlog = DecodeSubmissionBacklog(depth: tuning.decodeSubmissionQueueDepth)
+        self.submissionEpoch = submissionEpoch
         tuningBox.value = tuning
         self.metrics = metrics
         self.signposts = signposts
@@ -412,6 +492,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         )
         sessionIdentity.set(id: candidate.id, generation: generation)
         if let previous {
+            completionRegistry.completeAll(sessionID: previous.id)
             submissionWindow.reset(sessionID: previous.id)
             api.invalidate(previous.session)
         }
@@ -523,33 +604,50 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         _ accessUnit: CompressedVideoAccessUnit,
         flags: VTDecodeFrameFlags
     ) throws {
+        let completion = DecodeCompletionLease(
+            accessUnitID: accessUnit.id,
+            generation: accessUnit.generation,
+            executor: executor,
+            eventSink: eventSink
+        )
         guard backlog.admit(isRandomAccess: accessUnit.isRandomAccess) == .submit else {
             metrics?.recordVideoDrop(source: .decodeSubmissionBacklog)
+            completion.schedule()
             return
         }
         let epoch = submissionEpoch.value
+        let backlog = backlog
+        let metrics = metrics
         submissionQueue.async { [weak self] in
-            guard let self else { return }
             defer {
                 backlog.complete()
                 metrics?.recordDecodeSubmissionDepth(backlog.maximumDepth)
+            }
+            guard let self else {
+                completion.schedule()
+                return
             }
             // The session this unit was meant for has already been torn down;
             // submitting to its replacement would decode a frame whose
             // references were never sent.
             guard submissionEpoch.value == epoch else {
                 metrics?.recordStaleGenerationDrop()
+                completion.schedule()
                 return
             }
-            submitIsolated(accessUnit, flags: flags)
+            submitIsolated(accessUnit, flags: flags, completion: completion)
         }
     }
 
     private func submitIsolated(
         _ accessUnit: CompressedVideoAccessUnit,
-        flags: VTDecodeFrameFlags
+        flags: VTDecodeFrameFlags,
+        completion: DecodeCompletionLease
     ) {
-        guard let active, accessUnit.generation == active.generation else { return }
+        guard let active, accessUnit.generation == active.generation else {
+            completion.schedule()
+            return
+        }
         let token = DecodeToken(
             accessUnitID: accessUnit.id,
             generation: accessUnit.generation,
@@ -559,11 +657,13 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         sampleFramesBeingDecoded(active)
         guard submissionWindow.claim(sessionID: sessionID) else {
             report(.backpressureTimeout, generation: accessUnit.generation)
+            completion.schedule()
             return
         }
         let submissionLease = DecodeSubmissionLease { [submissionWindow] in
             submissionWindow.release(sessionID: sessionID)
         }
+        completionRegistry.insert(completion, sessionID: sessionID)
         let executor = executor
         var decodeFlags = flags
         decodeFlags.insert(._EnableAsynchronousDecompression)
@@ -581,8 +681,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             sampleBuffer: accessUnit.sampleBuffer,
             flags: decodeFlags,
             frameOptions: nil
-        ) { [weak self, outstandingOutputs] output in
+        ) { [weak self, outstandingOutputs, completionRegistry] output in
             submissionLease.releaseOnce()
+            completionRegistry.remove(completion, sessionID: sessionID)
             // Against the submission's own duration this says what the
             // submission was waiting for. Equal means the decode ran to
             // completion inside the call and the wall time is compute; much
@@ -600,6 +701,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             executor.submit { [weak self] in
                 outstandingOutputs.leave()
                 self?.handle(output: output, token: token, sessionID: sessionID)
+                completion.deliverIsolated()
             }
         }
         metrics?.recordVideoDecodeSubmission(
@@ -610,6 +712,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         )
         guard status == noErr else {
             submissionLease.releaseOnce()
+            completionRegistry.remove(completion, sessionID: sessionID)
             signpostLifetime.finish()
             let classified = Self.classify(status)
             if !classified.isRecoverable {
@@ -618,6 +721,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 )
             }
             report(classified.failure, generation: accessUnit.generation)
+            completion.schedule()
             return
         }
     }
@@ -681,6 +785,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         submissionQueue.sync {
             guard let current = active else { return }
             active = nil
+            completionRegistry.completeAll(sessionID: current.id)
             submissionWindow.reset(sessionID: current.id)
             api.invalidate(current.session)
         }
