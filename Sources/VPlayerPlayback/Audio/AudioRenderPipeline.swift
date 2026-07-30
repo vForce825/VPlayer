@@ -29,7 +29,14 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     static let removalFailedError = "audio.renderer.remove"
     static let unsupportedPCMError = "audio.pcm.unsupported"
     static let isolationError = "audio.executor.isolation"
-    private static let capacity = 96
+    // Compressed replay is recovery history. It must span a conventional live
+    // HLS segment; bounding it to 96 AAC packets retained barely two seconds and
+    // made an automatic renderer flush unrecoverable in the middle of a five-
+    // second segment. PCM remains separately bounded because it owns decoded
+    // sample memory rather than tiny compressed access units.
+    private static let replayCapacity = 512
+    private static let replayHardCapacity = 1_024
+    private static let pendingPCMCapacity = 96
     private static let compressedStartupFallbackDuration = CMTime(value: 3, timescale: 4)
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
     // Packet duration follows the codec clock while its PTS may be rounded to
@@ -112,6 +119,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var pendingRemoval: PendingRemoval?
     private var stopCompletions: [StopCompletion] = []
     private var currentOutput = AudioOutputCategory.other
+    private var lastEvaluatedOutput: AudioOutputCategory?
 
     convenience init(
         synchronizer: AVSampleBufferRenderSynchronizer,
@@ -207,9 +215,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             throw PlaybackCoreError.audioRendererFailed("audio.codec.mismatch")
         }
         try pruneExpired(at: synchronizer.currentTime())
-        if replay.count >= Self.capacity {
-            replay.removeFirst(replay.count - Self.capacity + 1)
-        }
         replay.append(ReplayEntry(sample: sample, sentCompressed: false, decoded: false))
         do {
             if !replacing, rendererAttached, let renderer {
@@ -221,6 +226,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 try decodeAvailable()
                 try drainPCM()
             }
+            try trimReplayHistory()
         } catch {
             classifyAndEmitDecode(error)
         }
@@ -389,6 +395,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         recoveryScheduled = false
         pendingRecovery = nil
         currentOutput = .other
+        lastEvaluatedOutput = nil
         updateSnapshot(route: .systemCompressed, ready: false)
     }
 
@@ -529,9 +536,15 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 pendingReevaluation = true
                 return
             }
-            let recoveryTime = copiedTime?.isNumeric == true
-                ? copiedTime ?? synchronizer.currentTime()
-                : synchronizer.currentTime()
+            // AVSampleBufferRenderSynchronizer's timebase keeps advancing after
+            // an automatic renderer flush. In the externally-managed mode only
+            // the owner can move that timebase, so replay must start at its
+            // current media time. FlushTimeKey is usable only when this object
+            // also pauses and re-anchors the standalone synchronizer.
+            let currentTime = synchronizer.currentTime()
+            let recoveryTime = clockMode == .externallyManaged
+                ? currentTime
+                : (copiedTime?.isNumeric == true ? copiedTime ?? currentTime : currentTime)
             scheduleRecovery(
                 at: recoveryTime,
                 requiresSupportCheck: false,
@@ -553,6 +566,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     ) {
         guard self.epoch == epoch, self.generation == generation,
               configured, !stopped, !terminal else { return }
+        guard lastEvaluatedOutput != output else { return }
+        lastEvaluatedOutput = output
         currentOutput = output
         scheduleRecovery(
             at: synchronizer.currentTime(),
@@ -865,7 +880,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func decodeAvailable() throws {
         guard route == .ffmpegPCM, let decoder, !terminal, !replacing else { return }
         for index in replay.indices where !replay[index].decoded {
-            guard pendingPCM.count < Self.capacity else { break }
+            guard pendingPCM.count < Self.pendingPCMCapacity else { break }
             let outputs: [CMSampleBuffer]
             do {
                 outputs = try decoder.push(replay[index].sample)
@@ -881,7 +896,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 decoder.flush()
                 continue
             }
-            guard outputs.count <= Self.capacity - pendingPCM.count else {
+            guard outputs.count <= Self.pendingPCMCapacity - pendingPCM.count else {
                 throw PlaybackCoreError.audioFallbackDecode(
                     FFmpegPCMAudioDecoder.tokenCapacityErrorCode
                 )
@@ -932,6 +947,28 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             guard duration.isNumeric, duration >= .zero else { return false }
             let end = CMTimeAdd(entry.sample.presentationTimeStamp, duration)
             return end.isNumeric && CMTimeCompare(end, time) <= 0
+        }
+    }
+
+    private func trimReplayHistory() throws {
+        while replay.count > Self.replayCapacity {
+            // An entry that has not reached the active renderer/decoder is work,
+            // not history, and may never be silently overwritten. Prefer the
+            // farthest-future completed entry so the bounded recovery window
+            // continues to cover the current clock during a segment burst.
+            let removable = replay.indices.reversed().first { index in
+                switch route {
+                case .systemCompressed:
+                    replay[index].sentCompressed
+                case .ffmpegPCM:
+                    replay[index].decoded
+                }
+            }
+            guard let removable else { break }
+            replay.remove(at: removable)
+        }
+        guard replay.count <= Self.replayHardCapacity else {
+            throw PlaybackCoreError.audioRendererFailed("audio.replay.backpressure")
         }
     }
 

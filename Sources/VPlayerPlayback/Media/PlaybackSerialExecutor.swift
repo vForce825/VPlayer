@@ -18,11 +18,24 @@ public final class PlaybackSerialExecutor: @unchecked Sendable {
 
     public func submit(_ operation: @escaping @Sendable () -> Void) {
         queue.async { [self] in
-            let start = DispatchTime.now().uptimeNanoseconds
-            operation()
-            let elapsed = DispatchTime.now().uptimeNanoseconds &- start
-            busyLock.withLock { busyNanosecondsTotal &+= elapsed }
+            measure(operation)
         }
+    }
+
+    func submit(
+        after delay: DispatchTimeInterval,
+        _ operation: @escaping @Sendable () -> Void
+    ) {
+        queue.asyncAfter(deadline: .now() + delay) { [self] in
+            measure(operation)
+        }
+    }
+
+    private func measure(_ operation: () -> Void) {
+        let start = DispatchTime.now().uptimeNanoseconds
+        operation()
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+        busyLock.withLock { busyNanosecondsTotal &+= elapsed }
     }
 
     /// Wall time spent running work items. Against elapsed time this says whether

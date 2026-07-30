@@ -261,7 +261,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
-    func testReplayCapacityKeepsNewest96WithoutFailingWhenClockCannotAdvance() throws {
+    func testReplayPreservesUnexpiredSamplesInsteadOfOverwritingThemAtNinetySixPackets() throws {
         let harness = try makeHarness()
         for id in 0..<96 {
             try perform(on: harness.executor) {
@@ -288,12 +288,16 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         drain(harness.executor)
         harness.synchronizer.completeRemoval(didRemove: true)
         drain(harness.executor)
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcm.configureReadiness(ready: true, sufficient: true)
+        pcm.fireReady()
+        drain(harness.executor)
         let pushed = try XCTUnwrap(harness.decoderFactory.snapshot.first).pushedIDSnapshot
-        XCTAssertEqual(pushed.count, 96)
-        XCTAssertEqual(pushed.first, 3)
+        XCTAssertEqual(pushed.count, 97)
+        XCTAssertEqual(pushed.first, 2)
         XCTAssertEqual(pushed.suffix(2), [97, 98])
         XCTAssertFalse(pushed.contains(1))
-        XCTAssertFalse(pushed.contains(2))
+        XCTAssertTrue(pushed.contains(2))
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
@@ -564,6 +568,56 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
 
         XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+    }
+
+    func testExternallyManagedAutomaticFlushReplaysFiveSecondBurstFromCurrentClock() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-flush-time")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { _, _ in },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { sample in
+                [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+            },
+            routeMonitor: FakeAudioRouteMonitor(),
+            supportChecker: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        let packetDuration = CMTime(value: 1_024, timescale: 44_100)
+        for index in 0..<216 {
+            try perform(on: executor) {
+                try pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTimeMultiply(packetDuration, multiplier: Int32(index)),
+                    duration: packetDuration
+                ))
+            }
+        }
+        let initialEnqueueCount = renderer.snapshot.enqueuedPTS.count
+        XCTAssertEqual(initialEnqueueCount, 216)
+
+        synchronizer.setCurrentTime(CMTime(value: 2, timescale: 1))
+        renderer.emit(.automaticFlush(CMTime(value: 1, timescale: 1)))
+        drain(executor)
+
+        let replayed = Array(renderer.snapshot.enqueuedPTS.dropFirst(initialEnqueueCount))
+        XCTAssertGreaterThanOrEqual(replayed.count, 125)
+        let first = try XCTUnwrap(replayed.first)
+        XCTAssertGreaterThan(CMTimeGetSeconds(first), 1.95)
+        XCTAssertLessThanOrEqual(CMTimeGetSeconds(first), 2)
+        XCTAssertTrue(synchronizer.rateSnapshot.isEmpty)
     }
 
     func testFlushInvalidatesReadinessAndRequiresFreshPreroll() throws {
