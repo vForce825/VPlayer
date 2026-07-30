@@ -566,7 +566,7 @@ final class PlaybackPipelineTests: XCTestCase {
 
             harness.demux.emit(.packet(
                 videoFirst
-                    ? PlaybackFakeMedia.videoPacket(marker: 1)
+                    ? PlaybackFakeMedia.videoPacket(marker: 1, pts: 0)
                     : PlaybackFakeMedia.audioPacket(id: 1)
             ))
             try await eventually { builder.formatFingerprintsSnapshot.count == 1 }
@@ -581,7 +581,7 @@ final class PlaybackPipelineTests: XCTestCase {
             harness.demux.emit(.packet(
                 videoFirst
                     ? PlaybackFakeMedia.audioPacket(id: 2)
-                    : PlaybackFakeMedia.videoPacket(marker: 1)
+                    : PlaybackFakeMedia.videoPacket(marker: 1, pts: 0)
             ))
             try await eventually { (await harness.pipeline.debugSnapshot()).generation.rawValue == 1 }
             let fingerprints = builder.formatFingerprintsSnapshot
@@ -734,7 +734,8 @@ final class PlaybackPipelineTests: XCTestCase {
             harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
                 id: 31,
                 generation: awaitingGeneration,
-                randomAccess: true
+                randomAccess: true,
+                pts: .zero
             )))
             harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
                 id: 31,
@@ -771,7 +772,8 @@ final class PlaybackPipelineTests: XCTestCase {
             harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
                 id: 32,
                 generation: expectedGeneration,
-                randomAccess: false
+                randomAccess: false,
+                pts: CMTime(value: 1, timescale: 10)
             )))
             harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
                 id: 32,
@@ -782,7 +784,8 @@ final class PlaybackPipelineTests: XCTestCase {
             harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
                 id: 33,
                 generation: expectedGeneration,
-                randomAccess: true
+                randomAccess: true,
+                pts: CMTime(value: 1, timescale: 5)
             )))
             try await eventually {
                 harness.audio.snapshot().samples.contains { $0.id == 32 }
@@ -1025,7 +1028,7 @@ final class PlaybackPipelineTests: XCTestCase {
         harness.audio.setReady(true)
 
         let audioDuration = CMTime(value: 1, timescale: 40)
-        for index in 0..<128 {
+        for index in 0..<PlaybackPipeline.retainedAudioCapacity {
             harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
                 id: UInt64(index + 1),
                 generation: generation,
@@ -1052,6 +1055,216 @@ final class PlaybackPipelineTests: XCTestCase {
         }
         XCTAssertEqual(harness.clock.snapshot().anchors.last?.0, .zero)
         XCTAssertEqual(harness.display.snapshot().last, "resume")
+    }
+
+    func testFiveSecondAudioSegmentBurstPreservesRecoveryWindowAtPlaybackClock() async throws {
+        let metrics = PlaybackMetrics(
+            channelID: "five-second-audio-burst",
+            now: { 1 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = makeHarness(metrics: metrics)
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        let packetDuration = CMTime(value: 1_024, timescale: 44_100)
+
+        for index in 0..<12 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTimeMultiply(packetDuration, multiplier: Int32(index)),
+                duration: packetDuration
+            )))
+        }
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+        harness.clock.setTime(CMTime(value: 1, timescale: 1))
+
+        // HLS delivers this whole five-second segment in a short burst. The
+        // recovery history must not slide to the final ~3 seconds while video
+        // callbacks are still close to the playback clock.
+        for index in 12..<216 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTimeMultiply(packetDuration, multiplier: Int32(index)),
+                duration: packetDuration
+            )))
+        }
+
+        try await eventually {
+            metrics.snapshot(window: .seconds(60)).retainedAudioCount > 128
+        }
+        let snapshot = try XCTUnwrap(metrics.snapshot(window: .seconds(60)))
+        XCTAssertLessThanOrEqual(snapshot.audioFirstPTSSeconds ?? .infinity, 1)
+        XCTAssertTrue(snapshot.readinessOpen)
+    }
+
+    func testFiveSecondVideoSegmentStaysCompressedAndDrainsAsClockAdvances() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        let audioDuration = CMTime(value: 1_024, timescale: 44_100)
+        for index in 0..<216 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTimeMultiply(audioDuration, multiplier: Int32(index)),
+                duration: audioDuration
+            )))
+        }
+        for index in 1...150 {
+            harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+                id: UInt64(index),
+                generation: generation,
+                randomAccess: index == 1,
+                pts: CMTime(value: Int64(index - 1), timescale: 30)
+            )))
+        }
+
+        try await eventually {
+            (await harness.pipeline.debugSnapshot()).pendingVideoDecodeCount > 120
+        }
+        let startupSubmissions = harness.decoder.snapshot().filter {
+            if case .decode = $0 { return true }
+            return false
+        }.count
+        XCTAssertLessThan(startupSubmissions, 16)
+
+        harness.audio.setReady(true)
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+
+        harness.clock.setTime(CMTime(value: 1, timescale: 1))
+        try await eventually {
+            harness.decoder.snapshot().contains {
+                if case let .decode(id, decodedGeneration, _) = $0 {
+                    return id == 30 && decodedGeneration == generation
+                }
+                return false
+            }
+        }
+        let drainedSnapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertLessThan(drainedSnapshot.pendingVideoDecodeCount, 140)
+        await harness.pipeline.stop()
+    }
+
+    func testTransientVideoLagDoesNotReanchorUntilItBecomesARealStall() async throws {
+        let metrics = PlaybackMetrics(
+            channelID: "video-resync-threshold",
+            now: { 1 },
+            residentMemoryProvider: { 1 }
+        )
+        let harness = makeHarness(metrics: metrics)
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 2, timescale: 1)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+        let opened = try XCTUnwrap(metrics.snapshot(window: .seconds(60)))
+
+        // A few missed 25 fps frames are handled by normal late-frame dropping.
+        harness.clock.setTime(CMTime(value: 8, timescale: 25))
+        harness.pipeline.refreshReadiness()
+        _ = await harness.pipeline.debugSnapshot()
+        var snapshot = try XCTUnwrap(metrics.snapshot(window: .seconds(60)))
+        XCTAssertEqual(snapshot.videoResyncCount, 0)
+        XCTAssertEqual(snapshot.readinessCycleID, opened.readinessCycleID)
+        XCTAssertEqual(
+            snapshot.readinessCloseReasonCounts[Int(PlaybackReadinessCloseReason.buffering.rawValue)],
+            opened.readinessCloseReasonCounts[Int(PlaybackReadinessCloseReason.buffering.rawValue)]
+        )
+        XCTAssertTrue(snapshot.readinessOpen)
+
+        // Once no decoded picture has covered the clock for more than a full
+        // second, the bounded re-anchor path is warranted.
+        harness.clock.setTime(CMTime(value: 6, timescale: 5))
+        harness.pipeline.refreshReadiness()
+        _ = await harness.pipeline.debugSnapshot()
+        snapshot = try XCTUnwrap(metrics.snapshot(window: .seconds(60)))
+        XCTAssertEqual(snapshot.videoResyncCount, 1)
+        XCTAssertEqual(snapshot.readinessCycleID, opened.readinessCycleID + 1)
+        XCTAssertEqual(
+            snapshot.readinessCloseReasonCounts[Int(PlaybackReadinessCloseReason.buffering.rawValue)],
+            opened.readinessCloseReasonCounts[Int(PlaybackReadinessCloseReason.buffering.rawValue)] + 1
+        )
+    }
+
+    func testOpenPlaybackPacesVideoFromClockNotAudioRecoveryHistory() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+
+        // The compressed audio renderer can already own later samples even
+        // when the bounded recovery history ends here. Running video follows
+        // the shared clock; using this stale history as a second ceiling would
+        // strand every access unit after 0.75 seconds.
+        harness.clock.setTime(CMTime(value: 10, timescale: 1))
+        harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+            id: 100,
+            generation: generation,
+            randomAccess: false,
+            pts: CMTime(value: 101, timescale: 10)
+        )))
+
+        try await eventually {
+            harness.decoder.snapshot().contains {
+                if case let .decode(id, decodedGeneration, _) = $0 {
+                    return id == 100 && decodedGeneration == generation
+                }
+                return false
+            }
+        }
+        let snapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(snapshot.pendingVideoDecodeCount, 0)
     }
 
     func testAudioTimestampRoundingDoesNotBreakStartupContinuity() async throws {
@@ -1114,7 +1327,6 @@ final class PlaybackPipelineTests: XCTestCase {
         }
 
         let recoveryPTS = CMTime(value: 3, timescale: 1)
-        let advancedRecoveryPTS = CMTime(value: 25, timescale: 4)
         harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
             id: 100,
             generation: generation,
@@ -1125,7 +1337,7 @@ final class PlaybackPipelineTests: XCTestCase {
             id: 200,
             generation: generation,
             randomAccess: false,
-            pts: advancedRecoveryPTS
+            pts: CMTime(value: 25, timescale: 4)
         )))
         harness.audio.setReady(false)
         harness.pipeline.receive(audioReadiness: .invalidated, generation: generation)
@@ -1141,7 +1353,7 @@ final class PlaybackPipelineTests: XCTestCase {
         try await eventually {
             harness.decoder.snapshot().contains {
                 if case let .decode(id, decodedGeneration, _) = $0 {
-                    return id == 200 && decodedGeneration == generation
+                    return id == 100 && decodedGeneration == generation
                 }
                 return false
             }
@@ -1151,9 +1363,9 @@ final class PlaybackPipelineTests: XCTestCase {
         harness.pipeline.receive(audioReadiness: .available, generation: generation)
         try receiveAndReleaseNormalizedFrames([
             PlaybackFakeMedia.decodedFrame(
-                id: 200,
+                id: 100,
                 generation: generation,
-                pts: advancedRecoveryPTS,
+                pts: recoveryPTS,
                 interlaced: false
             ),
         ], in: harness)
@@ -1161,6 +1373,75 @@ final class PlaybackPipelineTests: XCTestCase {
             harness.events.snapshot().filter { $0 == .ready(readinessCycle: 0) }.count == 2
         }
         XCTAssertEqual(harness.display.snapshot().last, "resume")
+    }
+
+    func testRebufferingSkipsDeferredNonRandomAccessHeadToReachRecoveryPoint() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        let audioDuration = CMTime(value: 1, timescale: 40)
+
+        for index in 0..<20 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTime(value: Int64(index), timescale: 40),
+                duration: audioDuration
+            )))
+        }
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+
+        harness.audio.setReady(false)
+        harness.pipeline.receive(audioReadiness: .invalidated, generation: generation)
+        harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+            id: 100,
+            generation: generation,
+            randomAccess: false,
+            pts: CMTime(value: 3, timescale: 1)
+        )))
+        harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+            id: 200,
+            generation: generation,
+            randomAccess: true,
+            pts: CMTime(value: 7, timescale: 2)
+        )))
+
+        // The paused clock cannot admit the non-random-access head. Once audio
+        // reaches the next independently decodable picture, recovery must skip
+        // that unusable prefix instead of leaving it at the head forever.
+        for index in 20..<150 {
+            harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+                id: UInt64(index + 1),
+                generation: generation,
+                pts: CMTime(value: Int64(index), timescale: 40),
+                duration: audioDuration
+            )))
+        }
+
+        try await eventually {
+            harness.decoder.snapshot().contains {
+                if case let .decode(id, decodedGeneration, _) = $0 {
+                    return id == 200 && decodedGeneration == generation
+                }
+                return false
+            }
+        }
+        XCTAssertFalse(harness.decoder.snapshot().contains {
+            if case let .decode(id, _, _) = $0 { return id == 100 }
+            return false
+        })
+        let snapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(snapshot.pendingVideoDecodeCount, 0)
     }
 
     func testClosedReadinessPreservesDeferredHeadWhenBacklogIsFull() async throws {
@@ -1316,7 +1597,7 @@ final class PlaybackPipelineTests: XCTestCase {
             if case let .decode(id, _, _) = $0 { return id == futureID }
             return false
         })
-        harness.clock.setTime(CMTime(value: 7, timescale: 10))
+        harness.clock.setTime(CMTime(value: 4, timescale: 5))
         harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
             id: 3,
             generation: generation,

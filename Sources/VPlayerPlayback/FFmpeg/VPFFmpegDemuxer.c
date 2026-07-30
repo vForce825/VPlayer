@@ -2526,7 +2526,10 @@ static int vpff_video_bootstrap_replay_live(
     );
 }
 
-static int vpff_set_open_options(AVDictionary **options, int64_t timeout_us) {
+static int vpff_set_open_options(
+    AVDictionary **options,
+    int64_t timeout_us
+) {
     int result = av_dict_set_int(options, "rw_timeout", timeout_us, 0);
     if (result >= 0) {
         result = av_dict_set_int(options, "timeout", timeout_us, 0);
@@ -2538,6 +2541,14 @@ static int vpff_set_open_options(AVDictionary **options, int64_t timeout_us) {
             VPFF_PROTOCOL_WHITELIST,
             0
         );
+    }
+    if (result >= 0) {
+        // FFmpeg's HLS default begins three complete segments behind the live
+        // edge. That startup burst can exceed both compressed recovery windows
+        // before the clock has moved, forcing video to skip a GOP while audio
+        // retains an incompatible earlier range. HLS consumes this private
+        // option; other demuxers leave it for the exact cleanup below.
+        result = av_dict_set_int(options, "live_start_index", -1, 0);
     }
     return result;
 }
@@ -2697,6 +2708,30 @@ int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer) {
     if (vpff_is_cancelled(demuxer)) {
         failure.code = AVERROR_EXIT;
         goto finish_failure;
+    }
+    // `live_start_index` is deliberately offered to every input so FFmpeg, not
+    // a URL suffix heuristic, decides whether the source is HLS. HLS must
+    // consume it; every other demuxer must leave our private option untouched
+    // so it can be removed without weakening the remaining-option audit.
+    AVDictionaryEntry *live_start_option = av_dict_get(
+        options,
+        "live_start_index",
+        NULL,
+        0
+    );
+    bool is_hls = format->iformat != NULL &&
+                  strcmp(format->iformat->name, "hls") == 0;
+    if (is_hls == (live_start_option != NULL)) {
+        result = AVERROR_OPTION_NOT_FOUND;
+        failure.code = result;
+        goto finish_failure;
+    }
+    if (!is_hls) {
+        result = av_dict_set(&options, "live_start_index", NULL, 0);
+        if (result < 0) {
+            failure.code = result;
+            goto finish_failure;
+        }
     }
     if (av_dict_count(options) != 0) {
         result = AVERROR_OPTION_NOT_FOUND;
