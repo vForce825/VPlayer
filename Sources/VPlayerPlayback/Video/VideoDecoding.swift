@@ -126,6 +126,13 @@ public enum VideoDecoderEvent: @unchecked Sendable {
     /// come back as a `throw` from `decode`. It carries the same failures the
     /// synchronous path used to raise and is classified identically.
     case submissionFailure(VideoDecoderFailure, generation: MediaGeneration)
+    /// The decoder has finished with one submitted access unit, whether it
+    /// produced a frame, dropped it, or rejected it asynchronously.
+    ///
+    /// This is deliberately separate from `frame`: reordered decoders can
+    /// produce zero or multiple frames for a submission, while admission needs
+    /// exactly one release signal for every accepted access unit.
+    case submissionCompleted(accessUnitID: UInt64, generation: MediaGeneration)
 }
 
 public protocol VideoDecoding: AnyObject {
@@ -133,7 +140,9 @@ public protocol VideoDecoding: AnyObject {
     /// Hands an access unit to the decoder. Submission is asynchronous, so a
     /// failure to submit arrives as `VideoDecoderEvent.submissionFailure`
     /// rather than as a `throw`; the signature stays throwing for decoders that
-    /// can reject a unit outright.
+    /// can reject a unit outright. Every call that returns normally must later
+    /// emit exactly one matching `submissionCompleted`; a call that throws was
+    /// rejected synchronously and emits no completion.
     func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws
     func finishDelayedFrames() throws
     func waitForAsynchronousFrames() throws

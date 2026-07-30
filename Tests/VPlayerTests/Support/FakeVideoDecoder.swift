@@ -18,6 +18,7 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
 
     private let lock = NSLock()
     private(set) var operations: [Operation] = []
+    private var submissionCompletionSink: (@Sendable (UInt64, MediaGeneration) -> Void)?
     var configureError: VideoDecoderFailure?
     var decodeError: VideoDecoderFailure?
     var finishError: VideoDecoderFailure?
@@ -33,7 +34,17 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
 
     func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws {
         if let decodeError { throw decodeError }
-        lock.withLock { operations.append(.decode(accessUnit.id, accessUnit.generation, flags)) }
+        let completion = lock.withLock {
+            operations.append(.decode(accessUnit.id, accessUnit.generation, flags))
+            return submissionCompletionSink
+        }
+        completion?(accessUnit.id, accessUnit.generation)
+    }
+
+    func setSubmissionCompletionSink(
+        _ sink: (@Sendable (UInt64, MediaGeneration) -> Void)?
+    ) {
+        lock.withLock { submissionCompletionSink = sink }
     }
 
     func finishDelayedFrames() throws {

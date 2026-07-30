@@ -1421,7 +1421,7 @@ private final class TraceCoordinatorHost: @unchecked Sendable {
                 generation = MediaGeneration(rawValue: generation.rawValue + 1)
                 return generation
             },
-            resetPlayback: { _, _ in },
+            resetPlayback: { _, _, _ in },
             reopenAdmission: {},
             routeDidChange: { _ in },
             deliver: { [weak self] frames, generation in

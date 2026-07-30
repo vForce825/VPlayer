@@ -277,6 +277,30 @@ final class PlaybackClockTests: XCTestCase {
         }
     }
 
+    func testSameTimelineRecoveryNeverAnchorsBeforeTheClockAtClose() {
+        let harness = makeGate(requiredVideoCount: 1)
+        makeReady(harness.gate, audioPTS: .zero, videoPTS: .zero)
+        harness.clock.currentTime = time(5)
+
+        harness.gate.close(.audioReplacement)
+        makeReady(harness.gate, audioPTS: .zero, videoPTS: .zero)
+
+        XCTAssertTrue(harness.gate.isOpen)
+        XCTAssertEqual(harness.clock.anchors.map(\.mediaTime), [.zero, time(5)])
+    }
+
+    func testTimelineResetAllowsAnEarlierAnchorForTheNewEpoch() {
+        let harness = makeGate(requiredVideoCount: 1)
+        makeReady(harness.gate, audioPTS: time(10), videoPTS: time(10))
+        harness.clock.currentTime = time(12)
+
+        harness.gate.closeForTimelineReset(.discontinuity)
+        makeReady(harness.gate, audioPTS: .zero, videoPTS: .zero)
+
+        XCTAssertTrue(harness.gate.isOpen)
+        XCTAssertEqual(harness.clock.anchors.map(\.mediaTime), [time(10), .zero])
+    }
+
     func testDisplayModeClosePreservesSnapshotAndReopensWithOneFreshAnchor() {
         let harness = makeGate(requiredVideoCount: 3)
         makeReady(harness.gate, audioPTS: time(2), videoPTS: time(3), videoCount: 3)

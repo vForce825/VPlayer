@@ -45,6 +45,10 @@ public final class PlaybackReadinessGate {
 
     public private(set) var isOpen = false
     public private(set) var cycleID: UInt64
+    // A renderer replacement or presentation interruption is still the same
+    // media timeline. Its next anchor may advance, but must never rewind the
+    // shared A/V clock and replay retained history.
+    private(set) var minimumRecoveryAnchorPTS: CMTime?
     // Diagnostics only: indexed by `PlaybackReadinessCloseReason.rawValue`, so a
     // flapping gate can be attributed to the caller that keeps closing it.
     public private(set) var closeReasonCounts = [UInt64](repeating: 0, count: 6)
@@ -160,6 +164,35 @@ public final class PlaybackReadinessGate {
     }
 
     public func close(_ reason: PlaybackReadinessCloseReason) {
+        close(reason, preservingTimeline: true)
+    }
+
+    /// Closes readiness and clears the monotonic recovery floor because the
+    /// caller is starting a genuinely new media timeline.
+    public func closeForTimelineReset(_ reason: PlaybackReadinessCloseReason) {
+        close(reason, preservingTimeline: false)
+    }
+
+    private func close(
+        _ reason: PlaybackReadinessCloseReason,
+        preservingTimeline: Bool
+    ) {
+        if preservingTimeline {
+            if isOpen {
+                let currentTime = clock.currentTime
+                if currentTime.isNumeric {
+                    if let floor = minimumRecoveryAnchorPTS {
+                        if CMTimeCompare(currentTime, floor) > 0 {
+                            minimumRecoveryAnchorPTS = currentTime
+                        }
+                    } else {
+                        minimumRecoveryAnchorPTS = currentTime
+                    }
+                }
+            }
+        } else {
+            minimumRecoveryAnchorPTS = nil
+        }
         let slot = Int(reason.rawValue)
         if closeReasonCounts.indices.contains(slot) {
             closeReasonCounts[slot] &+= 1
@@ -204,6 +237,7 @@ public final class PlaybackReadinessGate {
         )
         guard anchorHostTime.isNumeric else { return false }
         clock.anchor(mediaTime: commonPTS, atHostTime: anchorHostTime, rate: 1)
+        minimumRecoveryAnchorPTS = nil
         isOpen = true
         return true
     }
@@ -265,6 +299,10 @@ public final class PlaybackReadinessGate {
                     ? latestUsefulAnchor
                     : runwayLimit
             }
+        }
+        if let minimumRecoveryAnchorPTS,
+           CMTimeCompare(minimumRecoveryAnchorPTS, commonPTS) > 0 {
+            commonPTS = minimumRecoveryAnchorPTS
         }
         guard commonPTS.isNumeric,
               CMTimeCompare(commonPTS, audioEnd) < 0,

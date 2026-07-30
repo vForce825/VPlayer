@@ -359,7 +359,14 @@ final class VideoToolboxDecoderTests: XCTestCase {
         harness.api.deliver(index: 3, output: output(status: noErr, imageBuffer: try makePixelBuffer()))
         drain(harness.executor)
 
-        XCTAssertTrue(harness.events.events.isEmpty)
+        XCTAssertTrue(harness.events.frames.isEmpty)
+        XCTAssertTrue(harness.events.failures.isEmpty)
+        XCTAssertEqual(Set(harness.events.completions), Set([
+            CompletionRecord(accessUnitID: 1, generation: MediaGeneration(rawValue: 3)),
+            CompletionRecord(accessUnitID: 10, generation: MediaGeneration(rawValue: 3)),
+            CompletionRecord(accessUnitID: 2, generation: MediaGeneration(rawValue: 4)),
+            CompletionRecord(accessUnitID: 3, generation: MediaGeneration(rawValue: 4)),
+        ]))
     }
 
     func testCallbackCanArriveFromAnotherQueueAndSinkRunsOnMediaExecutor() throws {
@@ -379,7 +386,11 @@ final class VideoToolboxDecoderTests: XCTestCase {
         drain(harness.executor)
 
         XCTAssertEqual(harness.events.frames.map(\.accessUnitID), [42])
-        XCTAssertEqual(harness.events.isolationChecks, [true])
+        XCTAssertEqual(harness.events.completions, [CompletionRecord(
+            accessUnitID: 42,
+            generation: MediaGeneration(rawValue: 1)
+        )])
+        XCTAssertEqual(harness.events.isolationChecks, [true, true])
     }
 
     // Handing a unit to VideoToolbox happens off the caller's thread, so the
@@ -413,6 +424,10 @@ final class VideoToolboxDecoderTests: XCTestCase {
                 generation: MediaGeneration(rawValue: 1),
                 disposition: .submission
             )])
+            XCTAssertEqual(harness.events.completions, [CompletionRecord(
+                accessUnitID: 1,
+                generation: MediaGeneration(rawValue: 1)
+            )])
             XCTAssertEqual(harness.api.snapshot.pendingDecodeCount, 0)
         }
     }
@@ -433,6 +448,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
             generation: MediaGeneration(rawValue: 1),
             disposition: .submission
         )])
+        XCTAssertEqual(harness.events.completions.map(\.accessUnitID), [3])
         XCTAssertEqual(harness.api.snapshot.decodes.count, 2)
         XCTAssertEqual(harness.api.snapshot.pendingDecodeCount, 2)
 
@@ -477,7 +493,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         }
     }
 
-    func testDroppedAndInterruptedNilImagesEmitNothingButUnflaggedNilIsRecoverable() throws {
+    func testDroppedAndInterruptedNilImagesStillCompleteExactlyOnce() throws {
         let harness = makeHarness()
         try configure(harness, generation: 2)
         try decode(harness, id: 1, generation: 2)
@@ -489,7 +505,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         harness.api.deliver(index: 2, output: output())
         drain(harness.executor)
 
-        XCTAssertEqual(harness.events.events.count, 1)
+        XCTAssertEqual(harness.events.completions.map(\.accessUnitID), [1, 2, 3])
         XCTAssertEqual(harness.events.failures.first?.disposition, .recoverable)
         XCTAssertEqual(
             harness.events.failures.first?.failure,
@@ -530,11 +546,21 @@ final class VideoToolboxDecoderTests: XCTestCase {
             harness.decoder.invalidate()
             harness.decoder.invalidate()
         }
-        harness.api.deliver(index: 0, output: output(status: -123))
         drain(harness.executor)
 
         XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
-        XCTAssertTrue(harness.events.events.isEmpty)
+        XCTAssertTrue(harness.events.frames.isEmpty)
+        XCTAssertTrue(harness.events.failures.isEmpty)
+        XCTAssertEqual(harness.events.completions.map(\.accessUnitID), [1])
+
+        // A callback racing teardown may still arrive, but the completion lease
+        // has already been consumed by invalidation and cannot release twice.
+        harness.api.deliver(index: 0, output: output(status: -123))
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.events.frames.isEmpty)
+        XCTAssertTrue(harness.events.failures.isEmpty)
+        XCTAssertEqual(harness.events.completions.map(\.accessUnitID), [1])
     }
 
     // A decoder that has fallen behind must cost frames, not the read path: the
@@ -589,8 +615,39 @@ final class VideoToolboxDecoderTests: XCTestCase {
         }
         release.signal()
         harness.drainSubmissions()
+        drain(harness.executor)
 
         XCTAssertEqual(harness.api.snapshot.decodes.count, depth)
+        XCTAssertEqual(
+            harness.events.completions.map(\.accessUnitID),
+            Array(UInt64(depth)..<UInt64(depth + 4))
+        )
+    }
+
+    func testQueuedAccessUnitFromAnOldSubmissionEpochCompletesWithoutDecoding() throws {
+        let epoch = SubmissionEpoch()
+        let harness = makeHarness(submissionEpoch: epoch)
+        try configure(harness, generation: 1)
+
+        let release = DispatchSemaphore(value: 0)
+        harness.submissionQueue.async { release.wait() }
+        let accessUnit = try makeAccessUnit(id: 88, generation: 1, isRandomAccess: true)
+        try perform(on: harness.executor) {
+            try harness.decoder.decode(
+                accessUnit,
+                flags: ._EnableAsynchronousDecompression
+            )
+        }
+        epoch.bump()
+        release.signal()
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.api.snapshot.decodes.isEmpty)
+        XCTAssertEqual(harness.events.completions, [CompletionRecord(
+            accessUnitID: 88,
+            generation: MediaGeneration(rawValue: 1)
+        )])
     }
 
     func testValid420v420fAndP010BuffersProduceExactRangesAndBitDepths() throws {
@@ -791,7 +848,8 @@ final class VideoToolboxDecoderTests: XCTestCase {
         compatibilityCheck: @escaping PixelBufferCompatibilityCheck = VideoFormatMetadataReader.systemCompatibilityCheck,
         maximumInFlightDecodeCount: Int = 8,
         inFlightWaitInterval: TimeInterval = 0.25,
-        tuning: PlaybackTuning = .default
+        tuning: PlaybackTuning = .default,
+        submissionEpoch: SubmissionEpoch = SubmissionEpoch()
     ) -> DecoderHarness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.decoder")
         let api = FakeVideoToolboxAPI()
@@ -805,7 +863,8 @@ final class VideoToolboxDecoderTests: XCTestCase {
             maximumInFlightDecodeCount: maximumInFlightDecodeCount,
             inFlightWaitInterval: inFlightWaitInterval,
             tuning: tuning,
-            submissionQueue: submissionQueue
+            submissionQueue: submissionQueue,
+            submissionEpoch: submissionEpoch
         )
         return DecoderHarness(
             executor: executor,
@@ -1070,6 +1129,11 @@ private struct FailureRecord: Sendable, Equatable {
     let disposition: ExpectedDisposition
 }
 
+private struct CompletionRecord: Sendable, Hashable {
+    let accessUnitID: UInt64
+    let generation: MediaGeneration
+}
+
 private final class DecoderEventRecorder: @unchecked Sendable {
     private let executor: PlaybackSerialExecutor
     private let lock = NSLock()
@@ -1109,7 +1173,7 @@ private final class DecoderEventRecorder: @unchecked Sendable {
     var failures: [FailureRecord] {
         events.compactMap { event in
             switch event {
-            case .frame:
+            case .frame, .submissionCompleted:
                 return nil
             case let .recoverableFailure(failure, generation):
                 return FailureRecord(
@@ -1130,6 +1194,15 @@ private final class DecoderEventRecorder: @unchecked Sendable {
                     disposition: .submission
                 )
             }
+        }
+    }
+
+    var completions: [CompletionRecord] {
+        events.compactMap { event in
+            guard case let .submissionCompleted(accessUnitID, generation) = event else {
+                return nil
+            }
+            return CompletionRecord(accessUnitID: accessUnitID, generation: generation)
         }
     }
 }

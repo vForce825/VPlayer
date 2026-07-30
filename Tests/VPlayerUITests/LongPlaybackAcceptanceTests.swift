@@ -177,6 +177,21 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         ))
     }
 
+    func testRuntimeValidationSeparatesSimulatorFunctionalityFromDevicePerformance() {
+        let configuration = AcceptanceConfiguration(
+            encodedEnvironment: [:],
+            channel: "中天新闻",
+            duration: 180
+        )
+        #if targetEnvironment(simulator)
+        XCTAssertFalse(configuration.validatesSteadyStatePerformance)
+        XCTAssertEqual(configuration.maximumPresentationQueueDepth, 120)
+        #else
+        XCTAssertTrue(configuration.validatesSteadyStatePerformance)
+        XCTAssertEqual(configuration.maximumPresentationQueueDepth, 16)
+        #endif
+    }
+
     func testTabFocusNavigatorAcquiresNormalizesAndSelectsExactlyOnce() {
         var moves: [AcceptanceTabFocusMove] = []
         var selectCount = 0
@@ -560,6 +575,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         let runBaseline = try await activeHeartbeat(
             after: -Double.infinity,
             metricsElement: metricsElement,
+            stateElement: stateElement,
             in: app
         )
 
@@ -570,22 +586,28 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         var nextMinute = startedAt.advanced(by: .seconds(60))
         var lastObservedElapsed = runBaseline.elapsedSeconds
         var previousSteadySnapshot = runBaseline
+        var previousFunctionalSnapshot = runBaseline
         var snapshots: [AcceptanceMetricsSnapshot] = []
 
         while clock.now < end {
             let heartbeat = try await activeHeartbeat(
                 after: lastObservedElapsed,
                 metricsElement: metricsElement,
+                stateElement: stateElement,
+                progressingAfter: previousFunctionalSnapshot,
                 in: app
             )
             lastObservedElapsed = heartbeat.elapsedSeconds
+            try assertFunctionalProgress(
+                from: previousFunctionalSnapshot,
+                to: heartbeat
+            )
+            previousFunctionalSnapshot = heartbeat
             if clock.now >= nextMinute {
                 if let prior = snapshots.last {
                     XCTAssertGreaterThan(heartbeat.elapsedSeconds, prior.elapsedSeconds)
                 }
-                if AcceptanceValidationPolicy.requiresSteadyStatePerformance(
-                    duration: configuration.duration
-                ) {
+                if configuration.validatesSteadyStatePerformance {
                     assertSteadyStateCounterDelta(
                         from: previousSteadySnapshot,
                         to: heartbeat,
@@ -607,23 +629,22 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             // as the assertions; otherwise the observer itself manufactures the
             // missed callbacks and presentation drops it is trying to measure.
             let heartbeatInterval: Duration =
-                AcceptanceValidationPolicy.requiresSteadyStatePerformance(
-                    duration: configuration.duration
-                ) ? .seconds(60) : .seconds(10)
+                configuration.validatesSteadyStatePerformance ? .seconds(60) : .seconds(10)
             try await clock.sleep(for: heartbeatInterval)
         }
 
         let final = try await activeHeartbeat(
             after: lastObservedElapsed,
             metricsElement: metricsElement,
+            stateElement: stateElement,
+            progressingAfter: previousFunctionalSnapshot,
             in: app
         )
+        try assertFunctionalProgress(from: previousFunctionalSnapshot, to: final)
         if let prior = snapshots.last {
             XCTAssertGreaterThan(final.elapsedSeconds, prior.elapsedSeconds)
         }
-        if AcceptanceValidationPolicy.requiresSteadyStatePerformance(
-            duration: configuration.duration
-        ) {
+        if configuration.validatesSteadyStatePerformance {
             assertSteadyStateCounterDelta(
                 from: previousSteadySnapshot,
                 to: final,
@@ -866,22 +887,74 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     private func activeHeartbeat(
         after previousElapsed: Double,
         metricsElement: XCUIElement,
+        stateElement: XCUIElement,
+        progressingAfter previousSnapshot: AcceptanceMetricsSnapshot? = nil,
         in app: XCUIApplication
     ) async throws -> AcceptanceMetricsSnapshot {
         try assertActiveControls(in: app)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(6))
         while clock.now < deadline {
+            let state = try playbackState(from: stateElement)
+            try AcceptanceStableRouteFailureClassifier.validate(state: state)
+            guard state == .playing else {
+                throw AcceptanceFailure.playbackNotPlaying
+            }
             if let candidate = try? snapshot(from: metricsElement),
                candidate.elapsedSeconds > previousElapsed,
                candidate.decoderCallbacksPerSecond > 0,
                candidate.presentationsPerSecond > 0,
-               candidate.residentMemoryBytes > 0 {
+               candidate.residentMemoryBytes > 0,
+               previousSnapshot.map({ previous in
+                   candidate.videoAccessUnitCount > previous.videoAccessUnitCount
+                       && candidate.videoDecodeSubmissionCount
+                           > previous.videoDecodeSubmissionCount
+                       && candidate.presentedVideoFrames > previous.presentedVideoFrames
+               }) ?? true {
+                guard candidate.presentationPTSRegressionCount == 0 else {
+                    throw AcceptanceFailure.presentationPTSRegressed
+                }
                 return candidate
             }
             try await clock.sleep(for: .milliseconds(500))
         }
         throw AcceptanceFailure.metricsDidNotAdvance
+    }
+
+    private func assertFunctionalProgress(
+        from previous: AcceptanceMetricsSnapshot,
+        to current: AcceptanceMetricsSnapshot
+    ) throws {
+        XCTAssertGreaterThan(current.videoAccessUnitCount, previous.videoAccessUnitCount)
+        XCTAssertGreaterThan(
+            current.videoDecodeSubmissionCount,
+            previous.videoDecodeSubmissionCount
+        )
+        XCTAssertGreaterThan(current.presentedVideoFrames, previous.presentedVideoFrames)
+        XCTAssertEqual(current.presentationPTSRegressionCount, 0)
+        XCTAssertEqual(current.videoResyncCount, previous.videoResyncCount)
+
+        let bufferingIndex = 1
+        let previousBufferingCloses = previous.readinessCloseReasonCounts.indices.contains(
+            bufferingIndex
+        ) ? previous.readinessCloseReasonCounts[bufferingIndex] : 0
+        let currentBufferingCloses = current.readinessCloseReasonCounts.indices.contains(
+            bufferingIndex
+        ) ? current.readinessCloseReasonCounts[bufferingIndex] : 0
+        XCTAssertEqual(currentBufferingCloses, previousBufferingCloses)
+
+        let discontinuityIndex = 3
+        let previousDiscontinuities = previous.readinessCloseReasonCounts.indices.contains(
+            discontinuityIndex
+        ) ? previous.readinessCloseReasonCounts[discontinuityIndex] : 0
+        let currentDiscontinuities = current.readinessCloseReasonCounts.indices.contains(
+            discontinuityIndex
+        ) ? current.readinessCloseReasonCounts[discontinuityIndex] : 0
+        if currentDiscontinuities == previousDiscontinuities {
+            let previousClock = try XCTUnwrap(previous.clockTimeSeconds)
+            let currentClock = try XCTUnwrap(current.clockTimeSeconds)
+            XCTAssertGreaterThanOrEqual(currentClock, previousClock)
+        }
     }
 
     @MainActor
@@ -1011,16 +1084,14 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.decoderCallbacksPerSecond, 0)
         XCTAssertGreaterThan(snapshot.presentationsPerSecond, 0)
         XCTAssertGreaterThan(snapshot.residentMemoryBytes, 0)
-        let maximumPresentationQueueDepth = configuration.channel == "东方卫视 4K"
-            ? 21
-            : 12
         XCTAssertLessThanOrEqual(
             snapshot.maximumPresentationQueueDepth,
-            maximumPresentationQueueDepth
+            configuration.maximumPresentationQueueDepth
         )
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
+        XCTAssertEqual(snapshot.presentationPTSRegressionCount, 0)
         XCTAssertGreaterThan(snapshot.presentedVideoFrames, 0)
         if snapshot.elapsedSeconds >= 60 {
             XCTAssertGreaterThanOrEqual(snapshot.windowDurationSeconds, 55)
@@ -1028,10 +1099,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         }
 
         XCTAssertGreaterThan(snapshot.presentedVideoFrames + snapshot.droppedVideoFrames, 0)
-        let validatesSteadyStatePerformance =
-            AcceptanceValidationPolicy.requiresSteadyStatePerformance(
-                duration: configuration.duration
-            )
+        let validatesSteadyStatePerformance = configuration.validatesSteadyStatePerformance
         if validatesSteadyStatePerformance {
             XCTAssertLessThanOrEqual(snapshot.avDriftP95Milliseconds, 40)
             XCTAssertLessThanOrEqual(snapshot.maximumAbsoluteAVDriftMilliseconds, 100)
@@ -1044,6 +1112,15 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             if validatesSteadyStatePerformance {
                 XCTAssertTrue((48...52).contains(snapshot.decoderCallbacksPerSecond))
                 XCTAssertTrue((48...52).contains(snapshot.presentationsPerSecond))
+            }
+            return
+        }
+        if configuration.channel == "中天新闻" {
+            XCTAssertEqual(snapshot.scanType, "progressive")
+            XCTAssertEqual(snapshot.activeRoute, "bypass")
+            if validatesSteadyStatePerformance {
+                XCTAssertTrue((28...32).contains(snapshot.decoderCallbacksPerSecond))
+                XCTAssertTrue((28...32).contains(snapshot.presentationsPerSecond))
             }
             return
         }
@@ -1067,10 +1144,12 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         to current: AcceptanceMetricsSnapshot,
         configuration: AcceptanceConfiguration
     ) {
-        let excludesCadenceSupersededDrops = configuration.channel == "东方卫视 4K"
+        let excludesCadenceSupersededDrops = ["东方卫视 4K", "中天新闻"].contains(
+            configuration.channel
+        )
         // PlaybackVideoDropSource.presentationSuperseded. The explicit 48–52fps
-        // assertion above owns cadence quality; the 1% ratio remains focused on
-        // decoder, backlog, expiry, and memory-overflow losses.
+        // or 28–32fps assertion above owns cadence quality; the 1% ratio remains
+        // focused on decoder, backlog, expiry, and memory-overflow losses.
         let supersededSourceIndex = 6
         let previousSuperseded = excludesCadenceSupersededDrops
             && previous.videoDropCountsBySource.indices.contains(supersededSourceIndex)
@@ -1168,6 +1247,8 @@ private enum AcceptanceFailure: Error, Equatable, CustomStringConvertible {
     case stableRouteTimedOut
     case preparationTimedOut
     case playbackStateUnavailable
+    case playbackNotPlaying
+    case presentationPTSRegressed
     case playbackFailed(code: String)
 
     var description: String {
@@ -1182,6 +1263,10 @@ private enum AcceptanceFailure: Error, Equatable, CustomStringConvertible {
             "acceptance playback preparation timed out"
         case .playbackStateUnavailable:
             "acceptance playback state unavailable"
+        case .playbackNotPlaying:
+            "acceptance playback is not playing"
+        case .presentationPTSRegressed:
+            "acceptance presentation timestamp regressed"
         case let .playbackFailed(code):
             "acceptance playback failed code=\(code)"
         }
@@ -1514,6 +1599,29 @@ private struct AcceptanceConfiguration {
     let channel: String
     let duration: TimeInterval
 
+    var validatesSteadyStatePerformance: Bool {
+        #if targetEnvironment(simulator)
+        false
+        #else
+        AcceptanceValidationPolicy.requiresSteadyStatePerformance(duration: duration)
+        #endif
+    }
+
+    var maximumPresentationQueueDepth: Int {
+        #if targetEnvironment(simulator)
+        // The simulator can throttle CAMetalDisplayLink independently of the
+        // decoder. Keep the queue bounded by the two-second 60 fps buffer
+        // without pretending its presentation cadence represents Apple TV.
+        120
+        #else
+        switch channel {
+        case "东方卫视 4K": 21
+        case "中天新闻": 16
+        default: 12
+        }
+        #endif
+    }
+
     var channelOffsetFromFirst: Int? {
         switch channel {
         case "东方卫视 HD": 0
@@ -1545,6 +1653,7 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let elapsedSeconds: Double
     let windowDurationSeconds: Double
     let presentedVideoFrames: UInt64
+    let presentationPTSRegressionCount: UInt64
     let maximumAbsoluteAVDriftMilliseconds: Double
     let crossGenerationPresentationCount: UInt64
     let audioRoute: String

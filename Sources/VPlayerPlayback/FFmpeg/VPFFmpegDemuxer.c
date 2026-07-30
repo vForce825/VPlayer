@@ -2543,12 +2543,16 @@ static int vpff_set_open_options(
         );
     }
     if (result >= 0) {
-        // FFmpeg's HLS default begins three complete segments behind the live
-        // edge. That startup burst can exceed both compressed recovery windows
-        // before the clock has moved, forcing video to skip a GOP while audio
-        // retains an incompatible earlier range. HLS consumes this private
-        // option; other demuxers leave it for the exact cleanup below.
-        result = av_dict_set_int(options, "live_start_index", -1, 0);
+        // Keep one complete segment between playback and the live edge. Starting
+        // at -1 gives FFmpeg exactly one target-duration segment to consume while
+        // its HLS demuxer waits that same target duration before the next playlist
+        // reload; any network or scheduling overhead therefore creates a gap at
+        // every segment boundary. The pipeline now retains multi-segment audio
+        // and compressed-video reservoirs, so -2 adds the needed safety margin
+        // without paying FFmpeg's default three-segment live latency.
+        // HLS consumes this private option; other demuxers leave it for the exact
+        // cleanup below.
+        result = av_dict_set_int(options, "live_start_index", -2, 0);
     }
     return result;
 }
