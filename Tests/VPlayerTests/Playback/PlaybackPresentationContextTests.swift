@@ -102,6 +102,12 @@ final class PlaybackPresentationContextTests: XCTestCase {
 
         XCTAssertEqual(managerFactory.makeCount, 1)
         XCTAssertEqual(managerFactory.manager.nonNilAssignmentCount, 1)
+        window.addSubview(view)
+        let screenMaximum = Float(window.screen.maximumFramesPerSecond)
+        let expectedPreferred = min(Float(50), screenMaximum)
+        XCTAssertEqual(view.displayLink.preferredFrameRateRange.minimum, expectedPreferred)
+        XCTAssertEqual(view.displayLink.preferredFrameRateRange.maximum, screenMaximum)
+        XCTAssertEqual(view.displayLink.preferredFrameRateRange.preferred, expectedPreferred)
         context.detach()
         XCTAssertTrue(view.displayLink.isPaused)
         context.attach(to: window)

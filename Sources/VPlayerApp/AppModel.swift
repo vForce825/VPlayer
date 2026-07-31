@@ -21,6 +21,12 @@ final class AppModel {
         let reloadApplied: Bool
     }
 
+    private struct EPGMatchingSnapshot: Sendable {
+        let matches: [String: EPGMatchResult]
+        let scopedManualMappings: [String: String]
+        let matchedXMLTVChannelIDs: Set<String>
+    }
+
     enum ActiveMutationLaneEvent: Equatable, Sendable {
         enum Operation: Equatable, Sendable {
             case activate(UUID)
@@ -66,6 +72,9 @@ final class AppModel {
     private var terminalRefreshOverlays: [RefreshKey: TerminalRefreshOverlay] = [:]
     private var manualRefreshAttempts: [RefreshKey: ManualRefreshAttempt] = [:]
     @ObservationIgnored private var activeReloadIDs: Set<UUID> = []
+    /// Distinguishes a successfully loaded, legitimately empty library from the
+    /// default empty presentation state left behind by a failed first read.
+    @ObservationIgnored private var hasAppliedLibrarySnapshot = false
     @ObservationIgnored private var reloadCompletionWaiters: [
         UUID: [CheckedContinuation<Void, Never>]
     ] = [:]
@@ -137,11 +146,13 @@ final class AppModel {
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
         let terminalRefreshOverlayIDsAtStart = terminalRefreshOverlays.mapValues(\.id)
-        let presentedPlaybackRequestAtStart = presentedPlaybackRequest
         activeTransition = nil
         reloadID = currentReloadID
-        isLoading = true
-        clearActiveBoundState(preservingPlayback: true)
+        // A background M3U/EPG refresh can hold the repository actor while it
+        // installs a large snapshot. Keep a previously loaded channel library
+        // visible and selectable until the replacement is complete; only the
+        // first load needs to mask the empty UI with a spinner.
+        isLoading = activeProfile == nil || channels.isEmpty
 
         do {
             let loadedProfiles = try await repository.profiles()
@@ -161,7 +172,6 @@ final class AppModel {
                     matches: [:],
                     manualMappings: [:],
                     programmes: [:],
-                    presentedPlaybackRequestAtStart: presentedPlaybackRequestAtStart,
                     terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
                 )
             }
@@ -195,43 +205,28 @@ final class AppModel {
             )
             try Task.checkCancellation()
 
-            // Scope to the loaded playlist so stale overrides for channels that
-            // are no longer present stay out of the presented state.
-            var scopedManualMappings: [String: String] = [:]
-            var matches: [String: EPGMatchResult] = [:]
-            var matchedXMLTVChannelIDs: Set<String> = []
-            for channel in loadedChannels {
-                if let xmltvChannelID = manualMappings[channel.id] {
-                    scopedManualMappings[channel.id] = xmltvChannelID
-                }
-                let manualMapping = manualMappings[channel.id].map {
-                    ManualEPGMapping(
-                        sourceProfileID: loadedActiveProfile.id,
-                        channelID: channel.id,
-                        xmltvChannelID: $0
-                    )
-                }
-                let match = EPGMatcher.match(
-                    channel: channel,
-                    epgChannels: loadedEPGChannels,
-                    manualMapping: manualMapping
-                )
-                matches[channel.id] = match
-                if let xmltvChannelID = match.xmltvChannelID {
-                    matchedXMLTVChannelIDs.insert(xmltvChannelID)
-                }
-            }
+            // Unicode normalization and fuzzy matching are CPU work, not UI
+            // work. Build one reusable EPG index and match the whole playlist
+            // away from MainActor so focus and remote input stay responsive.
+            let matching = try await Self.makeEPGMatchingSnapshot(
+                channels: loadedChannels,
+                epgChannels: loadedEPGChannels,
+                manualMappings: manualMappings
+            )
+            try Task.checkCancellation()
 
             let programmesByXMLTVChannelID = try await repository.programmes(
                 profileID: loadedActiveProfile.id,
-                xmltvChannelIDs: matchedXMLTVChannelIDs,
+                xmltvChannelIDs: matching.matchedXMLTVChannelIDs,
                 overlapping: windowStart..<windowEnd
             )
             try Task.checkCancellation()
 
             var programmes: [String: [Programme]] = [:]
             for channel in loadedChannels {
-                guard let xmltvChannelID = matches[channel.id]?.xmltvChannelID else { continue }
+                guard let xmltvChannelID = matching.matches[channel.id]?.xmltvChannelID else {
+                    continue
+                }
                 programmes[channel.id] = programmesByXMLTVChannelID[xmltvChannelID] ?? []
             }
 
@@ -243,10 +238,9 @@ final class AppModel {
                 epgChannels: loadedEPGChannels,
                 epgProgrammeCount: loadedEPGProgrammeCount,
                 epgCoverageEnd: loadedEPGCoverageEnd,
-                matches: matches,
-                manualMappings: scopedManualMappings,
+                matches: matching.matches,
+                manualMappings: matching.scopedManualMappings,
                 programmes: programmes,
-                presentedPlaybackRequestAtStart: presentedPlaybackRequestAtStart,
                 terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
             )
         } catch is CancellationError {
@@ -258,6 +252,43 @@ final class AppModel {
             presentOperationMessage("无法读取数据，请稍后重试。")
             finishLoading(reloadID: currentReloadID)
             return .failedWhileCurrent
+        }
+    }
+
+    private nonisolated static func makeEPGMatchingSnapshot(
+        channels: [Channel],
+        epgChannels: [EPGChannel],
+        manualMappings: [String: String]
+    ) async throws -> EPGMatchingSnapshot {
+        let worker = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let matches = try EPGMatcher.matches(
+                channels: channels,
+                epgChannels: epgChannels,
+                manualMappingsByChannelID: manualMappings,
+                cancellationCheck: { try Task.checkCancellation() }
+            )
+            try Task.checkCancellation()
+
+            // Scope to the loaded playlist so stale overrides for channels that
+            // are no longer present stay out of the presented state.
+            var scopedManualMappings: [String: String] = [:]
+            scopedManualMappings.reserveCapacity(min(channels.count, manualMappings.count))
+            for channel in channels {
+                if let xmltvChannelID = manualMappings[channel.id] {
+                    scopedManualMappings[channel.id] = xmltvChannelID
+                }
+            }
+            return EPGMatchingSnapshot(
+                matches: matches,
+                scopedManualMappings: scopedManualMappings,
+                matchedXMLTVChannelIDs: Set(matches.values.compactMap(\.xmltvChannelID))
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
         }
     }
 
@@ -580,20 +611,20 @@ final class AppModel {
         guard !isLoading,
               let activeProfile,
               channel.sourceProfileID == activeProfile.id,
-              channels.contains(where: {
+              let currentChannel = channels.first(where: {
                   $0.id == channel.id && $0.sourceProfileID == activeProfile.id
               }) else {
             presentedPlaybackRequest = nil
             return
         }
-        switch StreamProtocolPolicy.evaluate(channel.streamURL) {
+        switch StreamProtocolPolicy.evaluate(currentChannel.streamURL) {
         case .allowed:
             alertMessage = nil
             presentedPlaybackRequest = PlaybackRequest(
-                sourceProfileID: channel.sourceProfileID,
-                channelID: channel.id,
-                streamURL: channel.streamURL,
-                title: channel.displayName
+                sourceProfileID: currentChannel.sourceProfileID,
+                channelID: currentChannel.id,
+                streamURL: currentChannel.streamURL,
+                title: currentChannel.displayName
             )
         case let .rejected(rejection):
             presentedPlaybackRequest = nil
@@ -618,6 +649,15 @@ final class AppModel {
         presentedPlaybackRequest = nil
     }
 
+    /// Waits for the reload that currently owns presentation state, including
+    /// a newer reload that superseded the caller's request. Startup uses this
+    /// before allowing foreground refreshes to begin.
+    @discardableResult
+    func waitForLibraryReloadsToSettle() async -> Bool {
+        await waitForWinningReloadCompletion()
+        return hasAppliedLibrarySnapshot
+    }
+
     private func apply(
         reloadID currentReloadID: UUID,
         profiles: [SourceProfile],
@@ -629,7 +669,6 @@ final class AppModel {
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
         programmes: [String: [Programme]],
-        presentedPlaybackRequestAtStart: PlaybackRequest?,
         terminalRefreshOverlayIDsAtStart: [RefreshKey: UUID]
     ) -> ReloadOutcome {
         guard reloadID == currentReloadID else { return .superseded }
@@ -658,8 +697,9 @@ final class AppModel {
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
-        let loadedPlaybackStillMatches = presentedPlaybackRequestAtStart.map { request in
-            activeProfile?.id == request.sourceProfileID
+        hasAppliedLibrarySnapshot = true
+        let loadedPlaybackStillMatches = presentedPlaybackRequest.map { request in
+            self.activeProfile?.id == request.sourceProfileID
                 && channels.contains(where: {
                     $0.id == request.channelID
                         && $0.sourceProfileID == request.sourceProfileID
@@ -667,8 +707,7 @@ final class AppModel {
                         && $0.displayName == request.title
                 })
         } ?? false
-        if presentedPlaybackRequest == presentedPlaybackRequestAtStart,
-           !loadedPlaybackStillMatches {
+        if !loadedPlaybackStillMatches {
             presentedPlaybackRequest = nil
         }
         if let pendingCreation,

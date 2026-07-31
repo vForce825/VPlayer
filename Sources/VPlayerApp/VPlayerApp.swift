@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import OSLog
 import SwiftUI
 import VPlayerPlayback
 
@@ -165,10 +166,70 @@ struct AcceptanceSourcePrefill: Equatable {
 }
 #endif
 
+private struct LiveDependenciesRootView: View {
+    private enum LoadState {
+        case loading
+        case failed
+        case ready
+    }
+
+    let bootstrap: LiveAppBootstrap
+    @State private var dependencies: VPlayerDependencies?
+    @State private var loadState = LoadState.loading
+    @State private var loadAttempt = 0
+
+    var body: some View {
+        Group {
+            switch loadState {
+            case .loading:
+                ProgressView("正在打开本地资料库…")
+                    .accessibilityIdentifier("library.runtime.loading")
+            case .failed:
+                VStack(spacing: 28) {
+                    ContentUnavailableView(
+                        "无法打开本地资料库",
+                        systemImage: "externaldrive.badge.xmark",
+                        description: Text("本地资料暂时无法打开，请重试。")
+                    )
+                    Button("重试") {
+                        loadAttempt += 1
+                    }
+                    .accessibilityIdentifier("library.runtime.retry")
+                }
+            case .ready:
+                if let dependencies {
+                    RootView(dependencies: dependencies)
+                }
+            }
+        }
+        .task(id: loadAttempt) {
+            guard dependencies == nil else { return }
+            loadState = .loading
+            do {
+                let loadedDependencies = try await bootstrap.dependencies()
+                guard !Task.isCancelled else { return }
+                dependencies = loadedDependencies
+                loadState = .ready
+            } catch is CancellationError {
+                return
+            } catch {
+                launchLogger.error(
+                    "Live library bootstrap failed (\(String(describing: type(of: error)), privacy: .public))."
+                )
+                guard !Task.isCancelled else { return }
+                loadState = .failed
+            }
+        }
+    }
+}
+
 @main
 struct VPlayerApp: App {
     @Environment(\.scenePhase) private var scenePhase
-    private let dependencies: VPlayerDependencies
+    private let dependencies: VPlayerDependencies?
+    private let liveBootstrap: LiveAppBootstrap?
+    private let foregroundRefreshDriver: ForegroundRefreshDriver
+    private let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
 
     init() {
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)
@@ -183,31 +244,48 @@ struct VPlayerApp: App {
         }
         switch configuration.mode {
         case .live:
-            self.init(dependencies: .live())
+            self.init(liveBootstrap: .production())
         case .seededFixture:
             #if DEBUG
             self.init(dependencies: .uiTesting(playbackFixture: configuration.playbackFixture))
             #else
-            self.init(dependencies: .live())
+            self.init(liveBootstrap: .production())
             #endif
         case .acceptance:
             #if DEBUG
             self.init(dependencies: .acceptance())
             #else
-            self.init(dependencies: .live())
+            self.init(liveBootstrap: .production())
             #endif
         }
     }
 
     init(dependencies: VPlayerDependencies) {
         self.dependencies = dependencies
-        dependencies.backgroundRefreshRegistrar.register()
-        dependencies.launch()
+        liveBootstrap = nil
+        foregroundRefreshDriver = dependencies.foregroundRefreshDriver
+        backgroundRefreshRegistrar = dependencies.backgroundRefreshRegistrar
+        backgroundRefreshRegistrar.register()
+    }
+
+    init(liveBootstrap: LiveAppBootstrap) {
+        dependencies = nil
+        self.liveBootstrap = liveBootstrap
+        foregroundRefreshDriver = liveBootstrap.foregroundRefreshDriver
+        backgroundRefreshRegistrar = liveBootstrap.backgroundRefreshRegistrar
+        // BGTaskScheduler requires every launch handler to be registered before
+        // application launch completes. The lightweight registrar can do that
+        // synchronously while its closures await the shared detached runtime.
+        backgroundRefreshRegistrar.register()
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView(dependencies: dependencies)
+            if let dependencies {
+                RootView(dependencies: dependencies)
+            } else if let liveBootstrap {
+                LiveDependenciesRootView(bootstrap: liveBootstrap)
+            }
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             handleScenePhase(phase)
@@ -217,13 +295,15 @@ struct VPlayerApp: App {
     func handleScenePhase(_ phase: ScenePhase) {
         switch phase {
         case .active:
-            dependencies.foregroundRefreshDriver.activate()
+            foregroundRefreshDriver.activate()
         case .inactive, .background:
-            dependencies.foregroundRefreshDriver.deactivate()
-            dependencies.backgroundRefreshRegistrar.scheduleNext()
+            foregroundRefreshDriver.deactivate()
+            backgroundRefreshRegistrar.scheduleNext()
         @unknown default:
-            dependencies.foregroundRefreshDriver.deactivate()
-            dependencies.backgroundRefreshRegistrar.scheduleNext()
+            foregroundRefreshDriver.deactivate()
+            backgroundRefreshRegistrar.scheduleNext()
         }
     }
 }
+
+private let launchLogger = Logger(subsystem: "com.vforce.vplayer", category: "Launch")

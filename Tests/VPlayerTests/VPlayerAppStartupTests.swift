@@ -4,7 +4,12 @@
 
 import XCTest
 @testable import VPlayer
+@testable import VPlayerCore
 import VPlayerPlayback
+
+private enum LiveRuntimeLoadTaskContext {
+    @TaskLocal static var inheritedMarker = false
+}
 
 @MainActor
 final class VPlayerAppStartupTests: XCTestCase {
@@ -332,17 +337,267 @@ final class VPlayerAppStartupTests: XCTestCase {
     }
     #endif
 
-    func testProductionAppStartupPurgesLibrarySnapshotsOnceAfterRepeatedStartRequests() async {
+    func testAppInitializationDefersMaintenanceUntilLibraryLaunchAndThenRunsItOnce() async {
         let probe = StartupMaintenanceProbe()
         let dependencies = makeDependencies(maintenance: probe)
 
         _ = VPlayerApp(dependencies: dependencies)
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let countBeforeLibraryLaunch = await probe.attemptCount
+        XCTAssertEqual(countBeforeLibraryLaunch, 0)
+
+        dependencies.launch()
         await probe.waitUntilAttempted()
         let repeatedOutcome = await dependencies.start()
         let attemptCount = await probe.attemptCount
 
         XCTAssertEqual(repeatedOutcome, .alreadyCompleted)
         XCTAssertEqual(attemptCount, 1)
+    }
+
+    func testLiveAppRegistersBackgroundBeforeDetachedRuntimeStarts() async {
+        let repository = RepositorySpy(profiles: [])
+        let factory = LiveRuntimeFactoryProbe(repository: repository, blocksFirstAttempt: true)
+        let loader = LiveLibraryRuntimeLoader {
+            try await factory.makeRuntime(
+                inheritedTaskLocal: LiveRuntimeLoadTaskContext.inheritedMarker
+            )
+        }
+        let scheduler = StartupBackgroundSchedulerSpy()
+        let bootstrap = LiveAppBootstrap(
+            runtimeLoader: loader,
+            libraryChanges: LibraryChangeSignal(),
+            backgroundScheduler: scheduler
+        )
+
+        _ = VPlayerApp(liveBootstrap: bootstrap)
+
+        XCTAssertEqual(scheduler.registrationCount, 1)
+        let attemptCount = await factory.attemptCount
+        XCTAssertEqual(attemptCount, 0)
+    }
+
+    func testLiveRuntimeLoadIsDetachedCoalescedAndCached() async throws {
+        let repository = RepositorySpy(profiles: [])
+        let factory = LiveRuntimeFactoryProbe(repository: repository, blocksFirstAttempt: true)
+        let loader = LiveLibraryRuntimeLoader {
+            try await factory.makeRuntime(
+                inheritedTaskLocal: LiveRuntimeLoadTaskContext.inheritedMarker
+            )
+        }
+
+        let first = Task {
+            try await LiveRuntimeLoadTaskContext.$inheritedMarker.withValue(true) {
+                try await loader.load()
+            }
+        }
+        await factory.waitUntilAttemptCount(1)
+        let second = Task { try await loader.load() }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+
+        let countWhileBlocked = await factory.attemptCount
+        XCTAssertEqual(countWhileBlocked, 1)
+        await factory.releaseFirstAttempt()
+        _ = try await first.value
+        _ = try await second.value
+        _ = try await loader.load()
+
+        let finalCount = await factory.attemptCount
+        let inheritedTaskLocal = await factory.inheritedTaskLocal
+        XCTAssertEqual(finalCount, 1)
+        XCTAssertEqual(inheritedTaskLocal, false)
+    }
+
+    func testLiveRuntimeFailureCanRetryAndBootstrapSharesTheSuccessfulRuntime() async throws {
+        let repository = RepositorySpy(profiles: [])
+        let factory = LiveRuntimeFactoryProbe(repository: repository, failsFirstAttempt: true)
+        let loader = LiveLibraryRuntimeLoader {
+            try await factory.makeRuntime(
+                inheritedTaskLocal: LiveRuntimeLoadTaskContext.inheritedMarker
+            )
+        }
+        let bootstrap = LiveAppBootstrap(
+            runtimeLoader: loader,
+            libraryChanges: LibraryChangeSignal(),
+            backgroundScheduler: StartupBackgroundSchedulerSpy()
+        )
+
+        do {
+            _ = try await bootstrap.dependencies()
+            XCTFail("Expected the first runtime construction to fail")
+        } catch is StartupProbeError {
+            // Expected: a failed shared task must be discarded for retry.
+        }
+
+        let dependencies = try await bootstrap.dependencies()
+        let profiles = try await dependencies.repository.profiles()
+        let attemptCount = await factory.attemptCount
+
+        XCTAssertTrue(profiles.isEmpty)
+        XCTAssertEqual(attemptCount, 2)
+    }
+
+    func testInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = SourceProfile(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            name: "Source",
+            m3uURL: URL(string: "https://example.test/list.m3u")!,
+            epgURL: URL(string: "https://example.test/epg.xml")!,
+            m3uRefreshInterval: .sixHours,
+            epgRefreshInterval: .daily,
+            m3uStatus: ResourceRefreshStatus(),
+            epgStatus: ResourceRefreshStatus(),
+            createdAt: now,
+            updatedAt: now
+        )
+        let channel = Channel(
+            sourceProfileID: profile.id,
+            displayName: "Cached Channel",
+            streamURL: URL(string: "https://example.test/live")!,
+            tvgID: nil,
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 0
+        )
+        let repository = RepositorySpy(profiles: [profile])
+        let maintenance = BlockingStartupMaintenanceProbe()
+        let completion = StartupOpeningCompletionProbe()
+        let dependencies = VPlayerDependencies(
+            libraryStartup: LibraryStartup {
+                try await maintenance.purgeUnreferencedSnapshots()
+            },
+            foregroundRefreshDriver: ForegroundRefreshDriver(
+                loadProfiles: { [] },
+                refresh: { _, _, _ in [] },
+                reportStatus: { _ in }
+            ),
+            backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                scheduler: StartupBackgroundSchedulerSpy(),
+                loadProfiles: { [] },
+                refresh: { _, _, _ in [] },
+                reportStatus: { _ in }
+            ),
+            repository: repository,
+            prepare: {
+                await repository.replaceChannels(
+                    profileID: profile.id,
+                    channels: [channel]
+                )
+            }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            now: { now }
+        )
+
+        let opening = Task {
+            await dependencies.openInitialLibrary(using: model)
+            await completion.recordCompletion()
+        }
+        await maintenance.waitUntilAttempted()
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let completedBeforeCleanupRelease = await completion.isComplete
+
+        XCTAssertEqual(model.channels, [channel])
+        await maintenance.release()
+        await opening.value
+        XCTAssertTrue(completedBeforeCleanupRelease)
+    }
+
+    func testInitialLibraryPreparationFailureKeepsLibraryClosedUntilRetrySucceeds() async {
+        let repository = RepositorySpy(profiles: [])
+        let prepare = RetryingLibraryPrepareProbe()
+        let foreground = ForegroundRefreshDriver(
+            loadProfiles: { try await repository.profiles() },
+            refresh: { _, _, _ in [] },
+            reportStatus: { _ in }
+        )
+        defer { foreground.deactivate() }
+        foreground.activate()
+        let dependencies = VPlayerDependencies(
+            libraryStartup: LibraryStartup {},
+            foregroundRefreshDriver: foreground,
+            backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                scheduler: StartupBackgroundSchedulerSpy(),
+                loadProfiles: { try await repository.profiles() },
+                refresh: { _, _, _ in [] },
+                reportStatus: { _ in }
+            ),
+            repository: repository,
+            prepare: {
+                try await prepare.run()
+            }
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] }
+        )
+
+        let firstOpen = await dependencies.openInitialLibrary(using: model)
+        let firstSnapshot = await repository.snapshot()
+
+        XCTAssertFalse(firstOpen)
+        XCTAssertFalse(foreground.isInitialLibraryLoadComplete)
+        XCTAssertEqual(firstSnapshot.profileLookupCount, 0)
+
+        let retryOpen = await dependencies.openInitialLibrary(using: model)
+        let prepareAttemptCount = await prepare.attemptCount
+
+        XCTAssertTrue(retryOpen)
+        XCTAssertTrue(foreground.isInitialLibraryLoadComplete)
+        XCTAssertEqual(prepareAttemptCount, 2)
+        foreground.deactivate()
+    }
+
+    func testInitialLibraryReadFailureKeepsLibraryClosedUntilRetryAppliesSnapshot() async {
+        let repository = RepositorySpy(profiles: [])
+        await repository.setReadFailure(true)
+        let foreground = ForegroundRefreshDriver(
+            loadProfiles: { try await repository.profiles() },
+            refresh: { _, _, _ in [] },
+            reportStatus: { _ in }
+        )
+        defer { foreground.deactivate() }
+        foreground.activate()
+        let dependencies = VPlayerDependencies(
+            libraryStartup: LibraryStartup {},
+            foregroundRefreshDriver: foreground,
+            backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                scheduler: StartupBackgroundSchedulerSpy(),
+                loadProfiles: { try await repository.profiles() },
+                refresh: { _, _, _ in [] },
+                reportStatus: { _ in }
+            ),
+            repository: repository
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] }
+        )
+
+        let firstOpen = await dependencies.openInitialLibrary(using: model)
+
+        XCTAssertFalse(firstOpen)
+        XCTAssertFalse(foreground.isInitialLibraryLoadComplete)
+
+        await repository.setReadFailure(false)
+        let retryOpen = await dependencies.openInitialLibrary(using: model)
+
+        XCTAssertTrue(retryOpen)
+        XCTAssertTrue(foreground.isInitialLibraryLoadComplete)
+        XCTAssertTrue(model.profiles.isEmpty)
+        XCTAssertFalse(model.isLoading)
+        foreground.deactivate()
     }
 
     func testFailedLibraryStartupCanRetryAndCompletesOnlyOnceAfterSuccess() async {
@@ -393,6 +648,12 @@ final class VPlayerAppStartupTests: XCTestCase {
         let app = VPlayerApp(dependencies: dependencies)
 
         app.handleScenePhase(.active)
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let sleepCountBeforeInitialLoad = await loopProbe.sleepCountValue()
+        XCTAssertEqual(sleepCountBeforeInitialLoad, 0)
+        dependencies.foregroundRefreshDriver.initialLibraryLoadDidComplete()
         await loopProbe.waitUntilSleeping()
         app.handleScenePhase(.background)
         await loopProbe.waitUntilCancelled()
@@ -432,6 +693,71 @@ final class VPlayerAppStartupTests: XCTestCase {
     }
 }
 
+private actor LiveRuntimeFactoryProbe {
+    private let repository: RepositorySpy
+    private let blocksFirstAttempt: Bool
+    private let failsFirstAttempt: Bool
+    private var attemptWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstAttemptRelease: CheckedContinuation<Void, Never>?
+    private var isFirstAttemptReleased = false
+    private(set) var attemptCount = 0
+    private(set) var inheritedTaskLocal: Bool?
+
+    init(
+        repository: RepositorySpy,
+        blocksFirstAttempt: Bool = false,
+        failsFirstAttempt: Bool = false
+    ) {
+        self.repository = repository
+        self.blocksFirstAttempt = blocksFirstAttempt
+        self.failsFirstAttempt = failsFirstAttempt
+    }
+
+    func makeRuntime(inheritedTaskLocal: Bool) async throws -> LiveLibraryRuntime {
+        attemptCount += 1
+        let attempt = attemptCount
+        self.inheritedTaskLocal = inheritedTaskLocal
+        for waiter in attemptWaiters {
+            waiter.resume()
+        }
+        attemptWaiters = []
+
+        if blocksFirstAttempt, attempt == 1, !isFirstAttemptReleased {
+            await withCheckedContinuation { continuation in
+                firstAttemptRelease = continuation
+            }
+        }
+        if failsFirstAttempt, attempt == 1 {
+            throw StartupProbeError.expected
+        }
+
+        let repository = repository
+        return LiveLibraryRuntime(
+            repository: repository,
+            refresh: { _, resources, _ in
+                resources.map {
+                    RefreshOutcome(resource: $0, succeeded: true, message: nil)
+                }
+            },
+            prepare: {},
+            maintenance: {}
+        )
+    }
+
+    func waitUntilAttemptCount(_ expectedCount: Int) async {
+        guard attemptCount < expectedCount else { return }
+        await withCheckedContinuation { continuation in
+            attemptWaiters.append(continuation)
+        }
+    }
+
+    func releaseFirstAttempt() {
+        isFirstAttemptReleased = true
+        firstAttemptRelease?.resume()
+        firstAttemptRelease = nil
+    }
+}
+
 private actor StartupMaintenanceProbe: LibrarySnapshotMaintenance {
     private(set) var attemptCount = 0
     private let failFirstAttempt: Bool
@@ -458,8 +784,56 @@ private actor StartupMaintenanceProbe: LibrarySnapshotMaintenance {
     }
 }
 
+private actor BlockingStartupMaintenanceProbe: LibrarySnapshotMaintenance {
+    private var attemptedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var hasAttempted = false
+
+    func purgeUnreferencedSnapshots() async throws {
+        hasAttempted = true
+        for waiter in attemptedWaiters {
+            waiter.resume()
+        }
+        attemptedWaiters = []
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilAttempted() async {
+        guard !hasAttempted else { return }
+        await withCheckedContinuation { continuation in
+            attemptedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor StartupOpeningCompletionProbe {
+    private(set) var isComplete = false
+
+    func recordCompletion() {
+        isComplete = true
+    }
+}
+
 private enum StartupProbeError: Error {
     case expected
+}
+
+private actor RetryingLibraryPrepareProbe {
+    private(set) var attemptCount = 0
+
+    func run() throws {
+        attemptCount += 1
+        if attemptCount == 1 {
+            throw StartupProbeError.expected
+        }
+    }
 }
 
 private actor StartupLoopProbe {
@@ -490,6 +864,10 @@ private actor StartupLoopProbe {
 
     func cancellationCountValue() -> Int {
         cancellationCount
+    }
+
+    func sleepCountValue() -> Int {
+        sleepCount
     }
 }
 

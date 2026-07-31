@@ -146,20 +146,31 @@ public final class MetalDisplayLinkDriver: NSObject {
         (renderer as? VideoPresentationTimingResetting)?.resetPresentationTiming()
     }
 
-    /// Left to itself CAMetalDisplayLink picks a rate from how the layer has
-    /// been presenting, and for field-rate video that settles well under the
-    /// panel: every callback it withholds is a field that has to be discarded,
-    /// because two of them then come due on the following one. Pinning the range
-    /// to the panel is the app stating the cadence it actually needs.
-    public func setPreferredFrameRate(framesPerSecond: Int) {
-        guard !isStopped, framesPerSecond > 0 else { return }
-        let rate = Float(framesPerSecond)
+    /// The decoded presentation cadence is the system scheduling preference;
+    /// the screen capability is only the upper bound. This lets a 50p stream
+    /// align with a 50 Hz display mode while still allowing 60 callbacks when
+    /// the current display cannot switch. Both values come from live media and
+    /// UIKit rather than a channel-specific threshold.
+    public func setPreferredFrameRate(
+        contentFramesPerSecond: Float?,
+        maximumFramesPerSecond: Int
+    ) {
+        guard !isStopped, maximumFramesPerSecond > 0 else { return }
+        let maximum = Float(maximumFramesPerSecond)
+        let preferred: Float
+        if let contentFramesPerSecond,
+           contentFramesPerSecond.isFinite,
+           contentFramesPerSecond > 0 {
+            preferred = min(contentFramesPerSecond, maximum)
+        } else {
+            preferred = maximum
+        }
         displayLink.preferredFrameRateRange = CAFrameRateRange(
-            minimum: rate,
-            maximum: rate,
-            preferred: rate
+            minimum: preferred,
+            maximum: maximum,
+            preferred: preferred
         )
-        renderer.recordDisplayRefreshRate(framesPerSecond: Double(framesPerSecond))
+        renderer.recordDisplayRefreshRate(framesPerSecond: Double(preferred))
     }
 
     func render(

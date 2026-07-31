@@ -293,10 +293,216 @@ actor LibraryStartup {
     }
 }
 
+struct LiveLibraryRuntime: Sendable {
+    typealias Refresh = @Sendable (
+        UUID,
+        Set<RefreshResource>,
+        RefreshTrigger
+    ) async -> [RefreshOutcome]
+    typealias Operation = @Sendable () async throws -> Void
+
+    let repository: any LibraryRepository & RefreshSnapshotCommitting
+    let refresh: Refresh
+    let prepare: Operation
+    let maintenance: Operation
+}
+
+/// Owns the one production-library construction task shared by the initial
+/// scene, foreground scheduling, and a background launch. The factory runs in
+/// a detached user-initiated task so opening or recovering the SwiftData store
+/// can never hold MainActor before the first SwiftUI frame. Failed attempts are
+/// deliberately not cached, allowing the launch retry UI to try again.
+actor LiveLibraryRuntimeLoader {
+    typealias Factory = @Sendable () async throws -> LiveLibraryRuntime
+
+    private struct RunningLoad {
+        let id: UUID
+        let task: Task<LiveLibraryRuntime, Error>
+    }
+
+    private let factory: Factory
+    private var loadedRuntime: LiveLibraryRuntime?
+    private var runningLoad: RunningLoad?
+
+    init(factory: @escaping Factory) {
+        self.factory = factory
+    }
+
+    func load() async throws -> LiveLibraryRuntime {
+        if let loadedRuntime {
+            return loadedRuntime
+        }
+        if let runningLoad {
+            return try await resolve(runningLoad)
+        }
+
+        let factory = factory
+        let runningLoad = RunningLoad(
+            id: UUID(),
+            task: Task.detached(priority: .userInitiated) {
+                try await factory()
+            }
+        )
+        self.runningLoad = runningLoad
+        return try await resolve(runningLoad)
+    }
+
+    private func resolve(_ load: RunningLoad) async throws -> LiveLibraryRuntime {
+        do {
+            let runtime = try await load.task.value
+            if runningLoad?.id == load.id {
+                loadedRuntime = runtime
+                runningLoad = nil
+            }
+            return runtime
+        } catch {
+            if runningLoad?.id == load.id {
+                runningLoad = nil
+            }
+            throw error
+        }
+    }
+}
+
+private func makeProductionLibraryRuntime(
+    onPersistedOutcome: @escaping RefreshCoordinator.PersistedOutcomeHandler
+) throws -> LiveLibraryRuntime {
+    let container = try VPlayerModelContainer.make()
+    let repository = SwiftDataLibraryStore(
+        modelContainer: container,
+        profileMirror: SourceProfileMirror(defaults: .standard)
+    )
+    let coordinator = RefreshCoordinator(
+        repository: repository,
+        downloader: URLSessionBoundedDownloader(),
+        onPersistedOutcome: onPersistedOutcome
+    )
+    let refresh: LiveLibraryRuntime.Refresh = { profileID, resources, trigger in
+        await coordinator.refresh(
+            profileID: profileID,
+            resources: resources,
+            trigger: trigger
+        )
+    }
+    return LiveLibraryRuntime(
+        repository: repository,
+        refresh: refresh,
+        prepare: {
+            // tvOS can delete the Caches-resident store between launches.
+            // Restore the non-refetchable source profiles before the first
+            // library read.
+            if try await repository.synchronizeProfileMirror() > 0 {
+                logger.notice("Restored source profiles after a purged persistent store.")
+            }
+        },
+        maintenance: {
+            try await repository.purgeUnreferencedSnapshots()
+        }
+    )
+}
+
+@MainActor
+final class LiveAppBootstrap {
+    let foregroundRefreshDriver: ForegroundRefreshDriver
+    let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
+
+    private let runtimeLoader: LiveLibraryRuntimeLoader
+    private let libraryChanges: LibraryChangeSignal
+    private var loadedDependencies: AppDependencies?
+
+    static func production() -> LiveAppBootstrap {
+        let libraryChanges = LibraryChangeSignal()
+        let onPersistedOutcome: RefreshCoordinator.PersistedOutcomeHandler = {
+            [weak libraryChanges] _, _ in
+            await MainActor.run {
+                libraryChanges?.notify()
+            }
+        }
+        let runtimeLoader = LiveLibraryRuntimeLoader {
+            try makeProductionLibraryRuntime(
+                onPersistedOutcome: onPersistedOutcome
+            )
+        }
+        return LiveAppBootstrap(
+            runtimeLoader: runtimeLoader,
+            libraryChanges: libraryChanges
+        )
+    }
+
+    init(
+        runtimeLoader: LiveLibraryRuntimeLoader,
+        libraryChanges: LibraryChangeSignal,
+        backgroundScheduler: (any BackgroundRefreshScheduling)? = nil
+    ) {
+        self.runtimeLoader = runtimeLoader
+        self.libraryChanges = libraryChanges
+
+        let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
+            let runtime = try await runtimeLoader.load()
+            return try await runtime.repository.profiles()
+        }
+        let refresh: ForegroundRefreshDriver.Refresh = {
+            profileID,
+            resources,
+            trigger in
+            do {
+                let runtime = try await runtimeLoader.load()
+                return await runtime.refresh(profileID, resources, trigger)
+            } catch {
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: nil)
+                }
+            }
+        }
+        foregroundRefreshDriver = ForegroundRefreshDriver(
+            loadProfiles: loadProfiles,
+            refresh: refresh,
+            reportStatus: { _ in }
+        )
+        if let backgroundScheduler {
+            backgroundRefreshRegistrar = BackgroundRefreshRegistrar(
+                scheduler: backgroundScheduler,
+                loadProfiles: loadProfiles,
+                refresh: refresh,
+                reportStatus: { _ in }
+            )
+        } else {
+            backgroundRefreshRegistrar = BackgroundRefreshRegistrar(
+                loadProfiles: loadProfiles,
+                refresh: refresh,
+                reportStatus: { _ in }
+            )
+        }
+    }
+
+    func dependencies() async throws -> AppDependencies {
+        if let loadedDependencies {
+            return loadedDependencies
+        }
+        let runtime = try await runtimeLoader.load()
+        try Task.checkCancellation()
+        if let loadedDependencies {
+            return loadedDependencies
+        }
+
+        let dependencies = AppDependencies(
+            libraryStartup: LibraryStartup(maintenance: runtime.maintenance),
+            foregroundRefreshDriver: foregroundRefreshDriver,
+            backgroundRefreshRegistrar: backgroundRefreshRegistrar,
+            repository: runtime.repository,
+            refresh: runtime.refresh,
+            prepare: runtime.prepare,
+            libraryChanges: libraryChanges
+        )
+        loadedDependencies = dependencies
+        return dependencies
+    }
+}
+
 @MainActor
 struct AppDependencies {
     typealias Refresh = AppModel.Refresh
-    typealias Prepare = @Sendable () async -> Void
+    typealias Prepare = @Sendable () async throws -> Void
     typealias PlaybackPresentationProvider = @Sendable () async -> PlaybackPresentationContext?
     typealias PlaybackMetricsProvider = @Sendable (Duration) async -> PlaybackMetricsSnapshot?
 
@@ -378,50 +584,29 @@ struct AppDependencies {
 
     static func live() -> Self {
         do {
-            let container = try VPlayerModelContainer.make()
-            let repository = SwiftDataLibraryStore(
-                modelContainer: container,
-                profileMirror: SourceProfileMirror(defaults: .standard)
-            )
             let libraryChanges = LibraryChangeSignal()
-            let coordinator = RefreshCoordinator(
-                repository: repository,
-                downloader: URLSessionBoundedDownloader(),
+            let runtime = try makeProductionLibraryRuntime(
                 onPersistedOutcome: { [weak libraryChanges] _, _ in
                     await MainActor.run {
                         libraryChanges?.notify()
                     }
                 }
             )
-            let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in
-                await coordinator.refresh(
-                    profileID: profileID,
-                    resources: resources,
-                    trigger: trigger
-                )
-            }
 
             return make(
-                repository: repository,
-                refresh: refresh,
+                repository: runtime.repository,
+                refresh: runtime.refresh,
                 libraryChanges: libraryChanges,
-                libraryStartup: LibraryStartup { [weak libraryChanges] in
-                    // tvOS can delete the Caches-resident store between
-                    // launches. Everything else in it is refetchable, so this
-                    // is the one thing that has to be put back, and anything
-                    // that already read the empty library needs telling.
-                    if try await repository.synchronizeProfileMirror() > 0 {
-                        logger.notice("Restored source profiles after a purged persistent store.")
-                        await MainActor.run { libraryChanges?.notify() }
-                    }
-                    try await repository.purgeUnreferencedSnapshots()
-                }
+                libraryStartup: LibraryStartup(maintenance: runtime.maintenance),
+                prepare: runtime.prepare
             )
         } catch {
             // The UI can only say "storage is unavailable"; without this the
             // real reason never leaves the process and the failure is
             // undiagnosable on a device.
-            logger.error("Persistent library store unavailable: \(error, privacy: .public)")
+            logger.error(
+                "Persistent library store unavailable (\(String(describing: type(of: error)), privacy: .public))."
+            )
             let repository = UnavailableLibraryRepository()
             let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
                 throw ProductionDependencyError.libraryUnavailable
@@ -560,8 +745,32 @@ struct AppDependencies {
         await libraryStartup.start()
     }
 
+    @discardableResult
+    func openInitialLibrary(using model: AppModel) async -> Bool {
+        do {
+            try await prepare()
+        } catch {
+            logger.error(
+                "Initial library preparation failed (\(String(describing: type(of: error)), privacy: .public))."
+            )
+            return false
+        }
+        guard !Task.isCancelled else { return false }
+
+        _ = await model.reload()
+        let didApplyLibrarySnapshot = await model.waitForLibraryReloadsToSettle()
+        guard !Task.isCancelled, didApplyLibrarySnapshot else { return false }
+
+        foregroundRefreshDriver.initialLibraryLoadDidComplete()
+        // Orphan cleanup is maintenance, not a prerequisite for rendering a
+        // cached library. Start it only after the first stable snapshot is
+        // visible and foreground refresh can recover network-backed data.
+        launch()
+        return true
+    }
+
     func launch() {
-        Task {
+        Task(priority: .utility) {
             _ = await start()
         }
     }
@@ -571,6 +780,7 @@ struct AppDependencies {
         refresh: @escaping Refresh,
         libraryChanges: LibraryChangeSignal,
         libraryStartup: LibraryStartup,
+        prepare: @escaping Prepare = {},
         exposesAcceptanceMetrics: Bool = false,
         exposesAcceptanceState: Bool = false
     ) -> Self {
@@ -591,6 +801,7 @@ struct AppDependencies {
             ),
             repository: repository,
             refresh: refresh,
+            prepare: prepare,
             exposesAcceptanceMetrics: exposesAcceptanceMetrics,
             exposesAcceptanceState: exposesAcceptanceState,
             libraryChanges: libraryChanges

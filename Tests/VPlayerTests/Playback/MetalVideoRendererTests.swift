@@ -141,7 +141,7 @@ final class MetalVideoRendererTests: XCTestCase {
         XCTAssertNil(weakProbe)
     }
 
-    func testInFlightCapacityIsExactlyThreeAndFourthSkipsWithoutQueueAdvance() throws {
+    func testEveryDrawableCreditSubmitsWithoutASecondCapacityThreshold() throws {
         let harness = try makeHarness()
         for id in 1...4 {
             harness.renderer.enqueue(frame(
@@ -154,7 +154,7 @@ final class MetalVideoRendererTests: XCTestCase {
                 ))
             ))
         }
-        for id in 1...3 {
+        for id in 1...4 {
             let decision = harness.renderer.draw(
                 targetMediaTime: CMTime(value: Int64(id), timescale: 25),
                 drawable: harness.drawable
@@ -162,24 +162,10 @@ final class MetalVideoRendererTests: XCTestCase {
             XCTAssertEqual(decision.action, .presented)
             XCTAssertEqual(decision.sourceAccessUnitID, UInt64(id))
         }
-
-        let skipped = harness.renderer.draw(
-            targetMediaTime: CMTime(value: 4, timescale: 25),
-            drawable: harness.drawable
-        )
-        XCTAssertEqual(skipped.action, .skippedInFlight)
-        XCTAssertEqual(harness.submitter.submitCount, 3)
-
-        harness.submitter.completeFirst(.succeeded)
-        let fourth = harness.renderer.draw(
-            targetMediaTime: CMTime(value: 4, timescale: 25),
-            drawable: harness.drawable
-        )
-        XCTAssertEqual(fourth.action, .presented)
-        XCTAssertEqual(fourth.sourceAccessUnitID, 4)
+        XCTAssertEqual(harness.submitter.submitCount, 4)
     }
 
-    func testSkippedInFlightTickStillKeepsConsecutiveTargetCadence() throws {
+    func testConsecutiveTargetCadenceWhileSubmissionsRemainInFlight() throws {
         let harness = try makeHarness()
         for id in 1...4 {
             harness.renderer.enqueue(frame(
@@ -192,28 +178,13 @@ final class MetalVideoRendererTests: XCTestCase {
                 ))
             ))
         }
-        for tick in 0...2 {
-            _ = harness.renderer.draw(
+        for tick in 0...3 {
+            XCTAssertEqual(harness.renderer.draw(
                 targetMediaTime: CMTime(value: Int64(tick) * 20, timescale: 1_000),
                 drawable: harness.drawable
-            )
+            ).action, .presented)
         }
-        XCTAssertEqual(
-            harness.renderer.draw(
-                targetMediaTime: CMTime(value: 60, timescale: 1_000),
-                drawable: harness.drawable
-            ).action,
-            .skippedInFlight
-        )
-
-        harness.submitter.completeFirst(.succeeded)
-        XCTAssertEqual(
-            harness.renderer.draw(
-                targetMediaTime: CMTime(value: 80, timescale: 1_000),
-                drawable: harness.drawable
-            ).action,
-            .presented
-        )
+        XCTAssertEqual(harness.submitter.submitCount, 4)
         XCTAssertEqual(
             try XCTUnwrap(harness.submitter.jobs.last?.displayInterval.seconds),
             0.02,

@@ -26,6 +26,7 @@ final class RefreshLifecycleTests: XCTestCase {
             reportStatus: { _ in }
         )
 
+        driver.initialLibraryLoadDidComplete()
         driver.activate()
         await probe.waitForSleepCount(1)
         driver.activate()
@@ -54,6 +55,7 @@ final class RefreshLifecycleTests: XCTestCase {
             }
         )
 
+        driver.initialLibraryLoadDidComplete()
         driver.activate()
         await loadGate.waitForLoadCount(1)
         driver.activate()
@@ -66,6 +68,58 @@ final class RefreshLifecycleTests: XCTestCase {
         driver.deactivate()
 
         XCTAssertEqual(reportedStatuses, [])
+    }
+
+    func testForegroundActivationWaitsForInitialLibraryLoadBeforeStartingLoop() async {
+        let probe = ForegroundLoopProbe()
+        let driver = ForegroundRefreshDriver(
+            loadProfiles: { [] },
+            refresh: { _, _, _ in [] },
+            sleep: {
+                await probe.recordSleepStarted()
+                try await Task.sleep(for: .seconds(3_600))
+            },
+            reportStatus: { _ in }
+        )
+
+        driver.activate()
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let sleepCountBeforeInitialLoad = await probe.sleepCountValue()
+        XCTAssertEqual(sleepCountBeforeInitialLoad, 0)
+
+        driver.initialLibraryLoadDidComplete()
+        await probe.waitForSleepCount(1)
+        let sleepCountAfterInitialLoad = await probe.sleepCountValue()
+        XCTAssertEqual(sleepCountAfterInitialLoad, 1)
+        driver.deactivate()
+    }
+
+    func testInitialLibraryLoadCompletionWhileInactiveWaitsForActivation() async {
+        let probe = ForegroundLoopProbe()
+        let driver = ForegroundRefreshDriver(
+            loadProfiles: { [] },
+            refresh: { _, _, _ in [] },
+            sleep: {
+                await probe.recordSleepStarted()
+                try await Task.sleep(for: .seconds(3_600))
+            },
+            reportStatus: { _ in }
+        )
+
+        driver.initialLibraryLoadDidComplete()
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let sleepCountWhileInactive = await probe.sleepCountValue()
+        XCTAssertEqual(sleepCountWhileInactive, 0)
+
+        driver.activate()
+        await probe.waitForSleepCount(1)
+        let sleepCountAfterActivation = await probe.sleepCountValue()
+        XCTAssertEqual(sleepCountAfterActivation, 1)
+        driver.deactivate()
     }
 
     func testBackgroundRegistrationIsIdempotentAndSchedulesBeforeRefreshing() async throws {
@@ -332,6 +386,10 @@ private actor ForegroundLoopProbe {
             if sleepCount >= expected { return }
             await Task.yield()
         }
+    }
+
+    func sleepCountValue() -> Int {
+        sleepCount
     }
 }
 

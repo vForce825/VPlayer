@@ -2241,6 +2241,61 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(weakModel)
     }
 
+    func testInitialLoadSettleWaitsForWinningReloadAfterCallerIsSuperseded() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [channel]]
+        )
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            now: { now }
+        )
+        let initialReloadApplied = await model.reload()
+        XCTAssertTrue(initialReloadApplied)
+
+        await repository.gateNextChannelRead()
+        let supersededReload = Task { await model.reload() }
+        await repository.waitUntilChannelReadIsBlocked()
+
+        await repository.gateNextProfileRead()
+        let winningReload = Task { await model.reload() }
+        await repository.waitUntilProfileReadIsBlocked()
+        await repository.releaseChannelRead()
+        let supersededReloadApplied = await supersededReload.value
+        XCTAssertFalse(supersededReloadApplied)
+
+        let settleProbe = LibraryReloadSettleProbe()
+        let settle = Task {
+            await model.waitForLibraryReloadsToSettle()
+            await settleProbe.recordCompletion()
+        }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let settledBeforeWinningReload = await settleProbe.isComplete
+        XCTAssertFalse(settledBeforeWinningReload)
+
+        await repository.releaseProfileRead()
+        let winningReloadApplied = await winningReload.value
+        XCTAssertTrue(winningReloadApplied)
+        await settle.value
+        let settledAfterWinningReload = await settleProbe.isComplete
+        XCTAssertTrue(settledAfterWinningReload)
+    }
+
     func testLibraryChangeNotificationsDuringReloadCoalesceToOneLatestFollowUp() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
@@ -3366,9 +3421,7 @@ final class AppModelTests: XCTestCase {
         await fixture.repository.gateNextChannelRead()
         let reload = Task { await fixture.model.reload() }
         await fixture.repository.waitUntilChannelReadIsBlocked()
-        XCTAssertTrue(fixture.model.isLoading)
-        XCTAssertNil(fixture.model.activeProfile)
-        XCTAssertTrue(fixture.model.channels.isEmpty)
+        assertCompleteActiveBoundState(fixture)
 
         await fixture.repository.failNextActivation()
         await fixture.repository.gateNextActivation()
@@ -3417,6 +3470,111 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(reloadApplied)
         XCTAssertEqual(fixture.model.presentedPlaybackRequest, requestAtStart)
         XCTAssertEqual(fixture.model.presentedPlaybackRequest?.id, requestAtStart.id)
+    }
+
+    func testOrdinaryReloadKeepsLoadedChannelsAndProgrammesUsableWhileReadIsGated() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            now: now
+        )
+
+        await fixture.repository.gateNextChannelRead()
+        let reload = Task { await fixture.model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+
+        XCTAssertFalse(fixture.model.isLoading)
+        XCTAssertEqual(fixture.model.activeProfile, fixture.activeProfile)
+        XCTAssertEqual(fixture.model.channels, fixture.channels)
+        XCTAssertEqual(fixture.model.epgChannels, fixture.epgChannels)
+        XCTAssertEqual(
+            fixture.model.programmesByChannelID,
+            fixture.programmesByChannelID
+        )
+        fixture.model.dismissPlayback()
+        fixture.model.select(channel: fixture.automaticChannel)
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.channelID,
+            fixture.automaticChannel.id
+        )
+
+        await fixture.repository.releaseChannelRead()
+        let reloadApplied = await reload.value
+        XCTAssertTrue(reloadApplied)
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.channelID,
+            fixture.automaticChannel.id
+        )
+    }
+
+    func testOrdinaryReloadClearsChannelSelectedDuringReadWhenNewSnapshotRemovedIt() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            now: now
+        )
+        await fixture.repository.replaceChannels(
+            profileID: fixture.activeProfile.id,
+            channels: [fixture.manualChannel]
+        )
+        await fixture.repository.gateNextChannelRead()
+
+        let reload = Task { await fixture.model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+        fixture.model.dismissPlayback()
+        fixture.model.select(channel: fixture.automaticChannel)
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.channelID,
+            fixture.automaticChannel.id
+        )
+
+        await fixture.repository.releaseChannelRead()
+        let reloadApplied = await reload.value
+
+        XCTAssertTrue(reloadApplied)
+        XCTAssertEqual(fixture.model.channels, [fixture.manualChannel])
+        XCTAssertNil(fixture.model.presentedPlaybackRequest)
+    }
+
+    func testSelectionFromStaleCardUsesCurrentChannelSnapshot() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            now: now
+        )
+        let renamedChannel = Channel(
+            sourceProfileID: fixture.activeProfile.id,
+            displayName: "Renamed Channel",
+            streamURL: fixture.automaticChannel.streamURL,
+            tvgID: fixture.automaticChannel.tvgID,
+            tvgName: fixture.automaticChannel.tvgName,
+            logoURL: fixture.automaticChannel.logoURL,
+            groupTitle: fixture.automaticChannel.groupTitle,
+            attributes: fixture.automaticChannel.attributes,
+            order: fixture.automaticChannel.order
+        )
+        await fixture.repository.replaceChannels(
+            profileID: fixture.activeProfile.id,
+            channels: [renamedChannel, fixture.manualChannel]
+        )
+        let reloadApplied = await fixture.model.reload()
+        XCTAssertTrue(reloadApplied)
+
+        fixture.model.dismissPlayback()
+        fixture.model.select(channel: fixture.automaticChannel)
+
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.channelID,
+            renamedChannel.id
+        )
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.streamURL,
+            renamedChannel.streamURL
+        )
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.title,
+            renamedChannel.displayName
+        )
     }
 
     func testOrdinaryReloadDoesNotRestorePlaybackDismissedWhileReadIsGated() async throws {
@@ -4190,6 +4348,14 @@ private actor AppModelPersistedOutcomeGate {
     func release() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private actor LibraryReloadSettleProbe {
+    private(set) var isComplete = false
+
+    func recordCompletion() {
+        isComplete = true
     }
 }
 

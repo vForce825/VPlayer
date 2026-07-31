@@ -151,6 +151,26 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 0)
     }
 
+    func testCadenceChangeAndSubmissionResumeStartFreshMeasurementEpochs() {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
+        metrics.recordDisplayRefreshRate(framesPerSecond: 60)
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 100)
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 100 + 1.0 / 60)
+
+        metrics.recordDisplayRefreshRate(framesPerSecond: 50)
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 101)
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 101 + 1.0 / 50)
+        metrics.recordDisplaySubmissionResume()
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 102)
+        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 102 + 1.0 / 50)
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.displayRefreshHz, 50)
+        XCTAssertEqual(snapshot.nativeDisplayIntervalMilliseconds, 20, accuracy: 0.001)
+        XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 0)
+        XCTAssertEqual(snapshot.displayResumeCount, 1)
+    }
+
     func testWindowedRatesAndPercentilesExcludeOldSamplesWithoutResettingSessionTotals() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(
