@@ -25,41 +25,177 @@ public enum EPGMatchResult: Equatable, Sendable {
 }
 
 public enum EPGMatcher {
+    /// Matches a whole playlist against one reusable XMLTV index. Building the
+    /// index once avoids re-normalizing and linearly scanning the same EPG
+    /// channel corpus for every channel during an app reload.
+    public static func matches(
+        channels: [Channel],
+        epgChannels: [EPGChannel],
+        manualMappingsByChannelID: [String: String]
+    ) -> [String: EPGMatchResult] {
+        matches(
+            channels: channels,
+            epgChannels: epgChannels,
+            manualMappingsByChannelID: manualMappingsByChannelID,
+            cancellationCheck: {}
+        )
+    }
+
+    /// Cancellation-aware variant for reload workers. The check is injected
+    /// so VPlayerCore does not need to own a task or choose its cancellation
+    /// policy.
+    public static func matches(
+        channels: [Channel],
+        epgChannels: [EPGChannel],
+        manualMappingsByChannelID: [String: String],
+        cancellationCheck: () throws -> Void
+    ) rethrows -> [String: EPGMatchResult] {
+        let index = try EPGMatchIndex(
+            epgChannels: epgChannels,
+            cancellationCheck: cancellationCheck
+        )
+        try cancellationCheck()
+        var matches: [String: EPGMatchResult] = [:]
+        matches.reserveCapacity(channels.count)
+        for channel in channels {
+            try cancellationCheck()
+            let manualMapping = manualMappingsByChannelID[channel.id].map {
+                ManualEPGMapping(
+                    sourceProfileID: channel.sourceProfileID,
+                    channelID: channel.id,
+                    xmltvChannelID: $0
+                )
+            }
+            matches[channel.id] = index.match(
+                channel: channel,
+                manualMapping: manualMapping
+            )
+        }
+        return matches
+    }
+
     public static func match(
         channel: Channel,
         epgChannels: [EPGChannel],
         manualMapping: ManualEPGMapping?
     ) -> EPGMatchResult {
+        EPGMatchIndex(epgChannels: epgChannels, cancellationCheck: {}).match(
+            channel: channel,
+            manualMapping: manualMapping
+        )
+    }
+}
+
+/// Immutable lookup tables shared by every playlist-channel match in one
+/// library reload.
+private struct EPGMatchIndex: Sendable {
+    private struct SubstitutionSignature: Hashable, Sendable {
+        let originalLength: Int
+        let removedIndex: Int
+        let remainder: String
+    }
+
+    private let channelIDs: Set<String>
+    private let candidateIDsByNormalizedName: [String: Set<String>]
+    private let candidateIDsByOneDeletion: [String: Set<String>]
+    private let candidateIDsBySubstitutionSignature: [SubstitutionSignature: Set<String>]
+
+    init(
+        epgChannels: [EPGChannel],
+        cancellationCheck: () throws -> Void
+    ) rethrows {
+        var channelIDs: Set<String> = []
+        var candidateIDsByNormalizedName: [String: Set<String>] = [:]
+        var candidateIDsByOneDeletion: [String: Set<String>] = [:]
+        var candidateIDsBySubstitutionSignature: [SubstitutionSignature: Set<String>] = [:]
+        channelIDs.reserveCapacity(epgChannels.count)
+
+        try cancellationCheck()
+        for epgChannel in epgChannels {
+            try cancellationCheck()
+            channelIDs.insert(epgChannel.id)
+            let normalizedNames = Set(epgChannel.displayNames.compactMap { displayName in
+                let normalized = EPGNameNormalizer.normalize(displayName)
+                return normalized.isEmpty ? nil : normalized
+            })
+            for normalizedName in normalizedNames {
+                candidateIDsByNormalizedName[normalizedName, default: []]
+                    .insert(epgChannel.id)
+                guard normalizedName.count >= 5 else { continue }
+                for deletion in Self.oneCharacterDeletions(of: normalizedName) {
+                    candidateIDsByOneDeletion[deletion.remainder, default: []]
+                        .insert(epgChannel.id)
+                    candidateIDsBySubstitutionSignature[
+                        SubstitutionSignature(
+                            originalLength: normalizedName.count,
+                            removedIndex: deletion.index,
+                            remainder: deletion.remainder
+                        ),
+                        default: []
+                    ].insert(epgChannel.id)
+                }
+            }
+        }
+
+        self.channelIDs = channelIDs
+        self.candidateIDsByNormalizedName = candidateIDsByNormalizedName
+        self.candidateIDsByOneDeletion = candidateIDsByOneDeletion
+        self.candidateIDsBySubstitutionSignature = candidateIDsBySubstitutionSignature
+    }
+
+    func match(
+        channel: Channel,
+        manualMapping: ManualEPGMapping?
+    ) -> EPGMatchResult {
         if let manualMapping,
            manualMapping.sourceProfileID == channel.sourceProfileID,
            manualMapping.channelID == channel.id,
-           epgChannels.contains(where: { $0.id == manualMapping.xmltvChannelID }) {
+           channelIDs.contains(manualMapping.xmltvChannelID) {
             return .matched(xmltvChannelID: manualMapping.xmltvChannelID, method: .manual)
         }
 
         if let tvgID = channel.tvgID,
-           let result = result(for: Set(epgChannels.filter { $0.id == tvgID }.map(\.id)), method: .exactID) {
+           channelIDs.contains(tvgID) {
+            return .matched(xmltvChannelID: tvgID, method: .exactID)
+        }
+
+        let channelNames = Self.normalizedNames(for: channel)
+        var exactCandidateIDs: Set<String> = []
+        for channelName in channelNames {
+            exactCandidateIDs.formUnion(candidateIDsByNormalizedName[channelName] ?? [])
+        }
+        if let result = Self.result(for: exactCandidateIDs, method: .exactName) {
             return result
         }
 
-        let channelNames = normalizedNames(for: channel)
-        if let result = result(
-            for: candidateIDs(in: epgChannels) { epgChannel in
-                epgChannel.displayNames.contains { channelNames.contains(EPGNameNormalizer.normalize($0)) }
-            },
-            method: .exactName
-        ) {
-            return result
-        }
+        var fuzzyCandidateIDs: Set<String> = []
+        for channelName in channelNames {
+            guard channelName.count >= 5 else { continue }
 
-        if let result = result(
-            for: candidateIDs(in: epgChannels) { epgChannel in
-                epgChannel.displayNames.contains { displayName in
-                    channelNames.contains { EPGNameNormalizer.isConservativeFuzzyMatch($0, displayName) }
+            // XMLTV name is one character longer than the playlist name.
+            fuzzyCandidateIDs.formUnion(candidateIDsByOneDeletion[channelName] ?? [])
+
+            for deletion in Self.oneCharacterDeletions(of: channelName) {
+                // XMLTV name is one character shorter than the playlist name.
+                if deletion.remainder.count >= 5 {
+                    fuzzyCandidateIDs.formUnion(
+                        candidateIDsByNormalizedName[deletion.remainder] ?? []
+                    )
                 }
-            },
-            method: .fuzzy
-        ) {
+
+                // Equal-length names with one substitution share the same
+                // remainder when the differing position is removed.
+                let signature = SubstitutionSignature(
+                    originalLength: channelName.count,
+                    removedIndex: deletion.index,
+                    remainder: deletion.remainder
+                )
+                fuzzyCandidateIDs.formUnion(
+                    candidateIDsBySubstitutionSignature[signature] ?? []
+                )
+            }
+        }
+        if let result = Self.result(for: fuzzyCandidateIDs, method: .fuzzy) {
             return result
         }
 
@@ -74,11 +210,15 @@ public enum EPGMatcher {
         })
     }
 
-    private static func candidateIDs(
-        in epgChannels: [EPGChannel],
-        where predicate: (EPGChannel) -> Bool
-    ) -> Set<String> {
-        Set(epgChannels.lazy.filter(predicate).map(\.id))
+    private static func oneCharacterDeletions(
+        of value: String
+    ) -> [(index: Int, remainder: String)] {
+        let characters = Array(value)
+        return characters.indices.map { removedIndex in
+            var remainder = characters
+            remainder.remove(at: removedIndex)
+            return (removedIndex, String(remainder))
+        }
     }
 
     private static func result(for candidateIDs: Set<String>, method: EPGMatchMethod) -> EPGMatchResult? {

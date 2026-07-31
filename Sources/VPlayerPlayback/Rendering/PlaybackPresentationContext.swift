@@ -122,6 +122,9 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
             renderer: renderer,
             device: device
         )
+        if let pendingCriteria {
+            view.setPreferredContentFrameRate(pendingCriteria.outputFrameRate)
+        }
         view.windowDidChange = { [weak self] window in
             guard let self else { return }
             if let window {
@@ -218,6 +221,7 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
             return
         }
         pendingCriteria = request
+        cachedView?.setPreferredContentFrameRate(outputFrameRate)
         criteriaController?.enterFullScreen(
             formatDescription: formatDescription,
             outputFrameRate: outputFrameRate

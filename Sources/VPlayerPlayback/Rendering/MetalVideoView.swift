@@ -15,6 +15,7 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
     public override class var layerClass: AnyClass { CAMetalLayer.self }
 
     private var driver: MetalDisplayLinkDriver!
+    private var preferredContentFrameRate: Float?
     var windowDidChange: ((UIWindow?) -> Void)?
 
     public var displayLink: CAMetalDisplayLink { driver.displayLink }
@@ -92,9 +93,7 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
         super.didMoveToWindow()
         if let window {
             contentScaleFactor = window.screen.nativeScale
-            driver.setPreferredFrameRate(
-                framesPerSecond: window.screen.maximumFramesPerSecond
-            )
+            applyPreferredFrameRate(for: window.screen)
         }
         updateDrawableSize()
         windowDidChange?(window)
@@ -133,6 +132,14 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
         driver.resetPresentationTiming()
     }
 
+    func setPreferredContentFrameRate(_ framesPerSecond: Float) {
+        guard framesPerSecond.isFinite, framesPerSecond > 0 else { return }
+        preferredContentFrameRate = framesPerSecond
+        if let window {
+            applyPreferredFrameRate(for: window.screen)
+        }
+    }
+
     func render(
         targetPresentationTimestamp: CFTimeInterval,
         drawable: any CAMetalDrawable
@@ -156,5 +163,12 @@ public final class MetalVideoView: UIView, DisplayLinkControlling {
               size.height > 0,
               metalLayer.drawableSize != size else { return }
         metalLayer.drawableSize = size
+    }
+
+    private func applyPreferredFrameRate(for screen: UIScreen) {
+        driver.setPreferredFrameRate(
+            contentFramesPerSecond: preferredContentFrameRate,
+            maximumFramesPerSecond: screen.maximumFramesPerSecond
+        )
     }
 }

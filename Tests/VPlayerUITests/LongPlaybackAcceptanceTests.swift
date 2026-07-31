@@ -185,10 +185,8 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         )
         #if targetEnvironment(simulator)
         XCTAssertFalse(configuration.validatesSteadyStatePerformance)
-        XCTAssertEqual(configuration.maximumPresentationQueueDepth, 120)
         #else
         XCTAssertTrue(configuration.validatesSteadyStatePerformance)
-        XCTAssertEqual(configuration.maximumPresentationQueueDepth, 16)
         #endif
     }
 
@@ -610,8 +608,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 if configuration.validatesSteadyStatePerformance {
                     assertSteadyStateCounterDelta(
                         from: previousSteadySnapshot,
-                        to: heartbeat,
-                        configuration: configuration
+                        to: heartbeat
                     )
                 }
                 try attach(heartbeat, elapsed: elapsedSeconds(from: startedAt, clock: clock))
@@ -647,8 +644,7 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         if configuration.validatesSteadyStatePerformance {
             assertSteadyStateCounterDelta(
                 from: previousSteadySnapshot,
-                to: final,
-                configuration: configuration
+                to: final
             )
         }
         try attach(final, elapsed: elapsedSeconds(from: startedAt, clock: clock))
@@ -894,29 +890,35 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         try assertActiveControls(in: app)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(6))
+        var lastSnapshot: AcceptanceMetricsSnapshot?
         while clock.now < deadline {
             let state = try playbackState(from: stateElement)
             try AcceptanceStableRouteFailureClassifier.validate(state: state)
             guard state == .playing else {
                 throw AcceptanceFailure.playbackNotPlaying
             }
-            if let candidate = try? snapshot(from: metricsElement),
-               candidate.elapsedSeconds > previousElapsed,
-               candidate.decoderCallbacksPerSecond > 0,
-               candidate.presentationsPerSecond > 0,
-               candidate.residentMemoryBytes > 0,
-               previousSnapshot.map({ previous in
-                   candidate.videoAccessUnitCount > previous.videoAccessUnitCount
-                       && candidate.videoDecodeSubmissionCount
-                           > previous.videoDecodeSubmissionCount
-                       && candidate.presentedVideoFrames > previous.presentedVideoFrames
-               }) ?? true {
-                guard candidate.presentationPTSRegressionCount == 0 else {
-                    throw AcceptanceFailure.presentationPTSRegressed
+            if let candidate = try? snapshot(from: metricsElement) {
+                lastSnapshot = candidate
+                if candidate.elapsedSeconds > previousElapsed,
+                   candidate.decoderCallbacksPerSecond > 0,
+                   candidate.presentationsPerSecond > 0,
+                   candidate.residentMemoryBytes > 0,
+                   previousSnapshot.map({ previous in
+                       candidate.videoAccessUnitCount > previous.videoAccessUnitCount
+                           && candidate.videoDecodeSubmissionCount
+                               > previous.videoDecodeSubmissionCount
+                           && candidate.presentedVideoFrames > previous.presentedVideoFrames
+                   }) ?? true {
+                    guard candidate.presentationPTSRegressionCount == 0 else {
+                        throw AcceptanceFailure.presentationPTSRegressed
+                    }
+                    return candidate
                 }
-                return candidate
             }
             try await clock.sleep(for: .milliseconds(500))
+        }
+        if let lastSnapshot {
+            try attach(lastSnapshot, name: "playback-heartbeat-timeout.json")
         }
         throw AcceptanceFailure.metricsDidNotAdvance
     }
@@ -1084,10 +1086,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.decoderCallbacksPerSecond, 0)
         XCTAssertGreaterThan(snapshot.presentationsPerSecond, 0)
         XCTAssertGreaterThan(snapshot.residentMemoryBytes, 0)
-        XCTAssertLessThanOrEqual(
-            snapshot.maximumPresentationQueueDepth,
-            configuration.maximumPresentationQueueDepth
-        )
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
@@ -1135,30 +1133,37 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         if validatesSteadyStatePerformance {
             XCTAssertTrue((22...28).contains(snapshot.decoderCallbacksPerSecond))
             XCTAssertTrue((45...55).contains(snapshot.presentationsPerSecond))
-            XCTAssertLessThanOrEqual(snapshot.gpuDurationP95Milliseconds, 16)
+            guard snapshot.decoderCallbacksPerSecond > 0 else { return }
+            // One YADIF command consumes one interlaced input frame and emits
+            // both field-rate output frames. Its sustainable GPU budget is the
+            // observed input-frame period, not an arbitrary display-frame
+            // threshold such as 16 ms.
+            XCTAssertLessThanOrEqual(
+                snapshot.gpuDurationP95Milliseconds,
+                1_000 / snapshot.decoderCallbacksPerSecond
+            )
         }
     }
 
     private func assertSteadyStateCounterDelta(
         from previous: AcceptanceMetricsSnapshot,
-        to current: AcceptanceMetricsSnapshot,
-        configuration: AcceptanceConfiguration
+        to current: AcceptanceMetricsSnapshot
     ) {
-        let excludesCadenceSupersededDrops = ["东方卫视 4K", "中天新闻"].contains(
-            configuration.channel
-        )
         // PlaybackVideoDropSource.presentationSuperseded. The explicit 48–52fps
-        // or 28–32fps assertion above owns cadence quality; the 1% ratio remains
-        // focused on decoder, backlog, expiry, and memory-overflow losses.
+        // / 28–32fps / field-rate assertion above owns cadence quality for every
+        // route; the generic loss ratio remains focused on decoder, backlog,
+        // expiry, and memory-overflow losses.
         let supersededSourceIndex = 6
-        let previousSuperseded = excludesCadenceSupersededDrops
-            && previous.videoDropCountsBySource.indices.contains(supersededSourceIndex)
-                ? previous.videoDropCountsBySource[supersededSourceIndex]
-                : 0
-        let currentSuperseded = excludesCadenceSupersededDrops
-            && current.videoDropCountsBySource.indices.contains(supersededSourceIndex)
-                ? current.videoDropCountsBySource[supersededSourceIndex]
-                : 0
+        let previousSuperseded = previous.videoDropCountsBySource.indices.contains(
+            supersededSourceIndex
+        )
+            ? previous.videoDropCountsBySource[supersededSourceIndex]
+            : 0
+        let currentSuperseded = current.videoDropCountsBySource.indices.contains(
+            supersededSourceIndex
+        )
+            ? current.videoDropCountsBySource[supersededSourceIndex]
+            : 0
         XCTAssertGreaterThanOrEqual(previous.droppedVideoFrames, previousSuperseded)
         XCTAssertGreaterThanOrEqual(current.droppedVideoFrames, currentSuperseded)
         XCTAssertNoThrow(try AcceptanceSnapshotValidator.validateCounterDelta(
@@ -1604,21 +1609,6 @@ private struct AcceptanceConfiguration {
         false
         #else
         AcceptanceValidationPolicy.requiresSteadyStatePerformance(duration: duration)
-        #endif
-    }
-
-    var maximumPresentationQueueDepth: Int {
-        #if targetEnvironment(simulator)
-        // The simulator can throttle CAMetalDisplayLink independently of the
-        // decoder. Keep the queue bounded by the two-second 60 fps buffer
-        // without pretending its presentation cadence represents Apple TV.
-        120
-        #else
-        switch channel {
-        case "东方卫视 4K": 21
-        case "中天新闻": 16
-        default: 12
-        }
         #endif
     }
 

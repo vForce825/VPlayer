@@ -23,6 +23,8 @@ final class ForegroundRefreshDriver {
     private let sleep: Sleep
     private let reportStatus: ReportStatus
     private var loopTask: Task<Void, Never>?
+    private var isActive = false
+    private(set) var isInitialLibraryLoadComplete = false
 
     init(
         loadProfiles: @escaping LoadProfiles,
@@ -43,6 +45,22 @@ final class ForegroundRefreshDriver {
     }
 
     func activate() {
+        isActive = true
+        startLoopIfReady()
+    }
+
+    /// Foreground refresh must not race the first library read. In particular,
+    /// an overdue EPG can import thousands of rows and make the empty launch UI
+    /// wait behind that write. RootView opens the cached snapshot first, then
+    /// releases this one-way gate.
+    func initialLibraryLoadDidComplete() {
+        guard !isInitialLibraryLoadComplete else { return }
+        isInitialLibraryLoadComplete = true
+        startLoopIfReady()
+    }
+
+    private func startLoopIfReady() {
+        guard isActive, isInitialLibraryLoadComplete else { return }
         loopTask?.cancel()
 
         let loadProfiles = loadProfiles
@@ -79,6 +97,7 @@ final class ForegroundRefreshDriver {
     }
 
     func deactivate() {
+        isActive = false
         loopTask?.cancel()
         loopTask = nil
     }

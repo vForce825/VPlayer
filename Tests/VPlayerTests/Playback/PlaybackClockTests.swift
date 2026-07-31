@@ -23,7 +23,7 @@ final class PlaybackClockTests: XCTestCase {
             contiguousDuration: CMTime(value: 1, timescale: 4),
             isContiguous: true
         )
-        gate.updateVideo(firstPTS: .zero, readyFrameCount: 1)
+        gate.updateVideo(frames: frames(firstPTS: .zero, count: 1))
 
         XCTAssertEqual(prepared, [.zero])
         XCTAssertTrue(gate.isOpen)
@@ -66,12 +66,12 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(anchors.first?.2, 1)
     }
 
-    func testReadinessBoundaryIsClosedAt249Point999MillisecondsAndOpensAt250Milliseconds() {
+    func testReadinessOpensWhenAnActualVideoFrameIsFullyCoveredByReadyAudio() {
         let harness = makeGate(requiredVideoCount: 1)
-        harness.gate.updateVideo(firstPTS: time(3), readyFrameCount: 1)
+        harness.gate.updateVideo(frames: frames(firstPTS: time(3), count: 1))
         harness.gate.updateAudio(
             firstPTS: time(3),
-            contiguousDuration: CMTime(value: 249_999, timescale: 1_000_000),
+            contiguousDuration: CMTime(value: 39_999, timescale: 1_000_000),
             isContiguous: true
         )
         XCTAssertFalse(harness.gate.isOpen)
@@ -79,11 +79,53 @@ final class PlaybackClockTests: XCTestCase {
 
         harness.gate.updateAudio(
             firstPTS: time(3),
-            contiguousDuration: CMTime(value: 250, timescale: 1_000),
+            contiguousDuration: CMTime(value: 1, timescale: 25),
             isContiguous: true
         )
         XCTAssertTrue(harness.gate.isOpen)
         XCTAssertEqual(harness.clock.anchors.count, 1)
+    }
+
+    func testReadinessOpensWhenAudioStartsInsideAFrameAndCoversItsEnd() {
+        let harness = makeGate(requiredVideoCount: 1)
+        harness.gate.updateVideo(frames: frames(firstPTS: .zero, count: 1))
+        harness.gate.updateAudio(
+            firstPTS: CMTime(value: 1, timescale: 100),
+            contiguousDuration: CMTime(value: 3, timescale: 100),
+            isContiguous: true
+        )
+
+        XCTAssertTrue(harness.gate.isOpen)
+        XCTAssertEqual(
+            harness.clock.anchors.first?.mediaTime,
+            CMTime(value: 1, timescale: 100)
+        )
+    }
+
+    func testVideoSummaryCannotOpenWithoutActualFrameIntervals() {
+        let harness = makeGate(requiredVideoCount: 1)
+        harness.gate.updateAudio(
+            firstPTS: time(3),
+            contiguousDuration: time(10),
+            isContiguous: true
+        )
+        harness.gate.updateVideo(firstPTS: time(3), readyFrameCount: 100)
+
+        XCTAssertFalse(harness.gate.isOpen)
+        XCTAssertTrue(harness.clock.anchors.isEmpty)
+    }
+
+    func testReadinessDoesNotCapObservedAVTimestampSeparation() {
+        let harness = makeGate(requiredVideoCount: 1)
+        harness.gate.updateAudio(
+            firstPTS: .zero,
+            contiguousDuration: CMTime(value: 126, timescale: 25),
+            isContiguous: true
+        )
+        harness.gate.updateVideo(frames: frames(firstPTS: time(5), count: 1))
+
+        XCTAssertTrue(harness.gate.isOpen)
+        XCTAssertEqual(harness.clock.anchors.map(\.mediaTime), [time(5)])
     }
 
     func testRequiredVideoCountOneAndThreeUseExactBoundaries() {
@@ -94,9 +136,9 @@ final class PlaybackClockTests: XCTestCase {
                 contiguousDuration: CMTime(value: 1, timescale: 4),
                 isContiguous: true
             )
-            harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: required - 1)
+            harness.gate.updateVideo(frames: frames(firstPTS: time(1), count: required - 1))
             XCTAssertFalse(harness.gate.isOpen)
-            harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: required)
+            harness.gate.updateVideo(frames: frames(firstPTS: time(1), count: required))
             XCTAssertTrue(harness.gate.isOpen)
         }
     }
@@ -105,13 +147,13 @@ final class PlaybackClockTests: XCTestCase {
         let invalidDurations = [CMTime.invalid, .indefinite, CMTime(value: -1, timescale: 1)]
         for duration in invalidDurations {
             let harness = makeGate(requiredVideoCount: 1)
-            harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 1)
+            harness.gate.updateVideo(frames: frames(firstPTS: time(1), count: 1))
             harness.gate.updateAudio(firstPTS: time(1), contiguousDuration: duration, isContiguous: true)
             XCTAssertFalse(harness.gate.isOpen)
         }
 
         let gapped = makeGate(requiredVideoCount: 1)
-        gapped.gate.updateVideo(firstPTS: time(1), readyFrameCount: 1)
+        gapped.gate.updateVideo(frames: frames(firstPTS: time(1), count: 1))
         gapped.gate.updateAudio(
             firstPTS: time(1),
             contiguousDuration: CMTime(value: 1, timescale: 1),
@@ -146,7 +188,7 @@ final class PlaybackClockTests: XCTestCase {
                 isContiguous: true
             )
             XCTAssertFalse(harness.gate.isOpen)
-            harness.gate.updateVideo(firstPTS: time(3), readyFrameCount: 1)
+            harness.gate.updateVideo(frames: frames(firstPTS: time(3), count: 1))
             XCTAssertTrue(harness.gate.isOpen)
         }
     }
@@ -169,7 +211,10 @@ final class PlaybackClockTests: XCTestCase {
             contiguousDuration: CMTime(value: 251, timescale: 1_000),
             isContiguous: true
         )
-        gate.updateVideo(firstPTS: CMTime(value: 10_001, timescale: 1_000), readyFrameCount: 1)
+        gate.updateVideo(frames: frames(
+            firstPTS: CMTime(value: 10_001, timescale: 1_000),
+            count: 1
+        ))
 
         XCTAssertEqual(order.suffix(2), ["prepare", "anchor"])
         XCTAssertEqual(clock.anchors.first?.mediaTime, CMTime(value: 10_001, timescale: 1_000))
@@ -201,7 +246,7 @@ final class PlaybackClockTests: XCTestCase {
         )
         clippedAudio.gate.updateVideo(frames: [
             PlaybackReadinessVideoFrame(
-                presentationTimeStamp: CMTime(value: 6, timescale: 5),
+                presentationTimeStamp: CMTime(value: 31, timescale: 25),
                 duration: CMTime(value: 1, timescale: 25)
             ),
         ])
@@ -283,7 +328,7 @@ final class PlaybackClockTests: XCTestCase {
         harness.clock.currentTime = time(5)
 
         harness.gate.close(.audioReplacement)
-        makeReady(harness.gate, audioPTS: .zero, videoPTS: .zero)
+        makeReady(harness.gate, audioPTS: .zero, videoPTS: time(5))
 
         XCTAssertTrue(harness.gate.isOpen)
         XCTAssertEqual(harness.clock.anchors.map(\.mediaTime), [.zero, time(5)])
@@ -342,23 +387,22 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(gate.cycleID, UInt64.max)
     }
 
-    func testRunningGateSurvivesRetainedWindowsShorterThanTheStartupRunway() {
+    func testRunningGateSurvivesSnapshotsWithoutTheirOriginalCommonInterval() {
         let harness = makeGate(requiredVideoCount: 2)
         harness.gate.updateAudio(
             firstPTS: time(1),
             contiguousDuration: CMTime(value: 1, timescale: 2),
             isContiguous: true
         )
-        harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 2)
+        harness.gate.updateVideo(frames: frames(firstPTS: time(1), count: 2))
         XCTAssertTrue(harness.gate.isOpen)
         let openCycle = harness.gate.cycleID
         let pausesWhenOpened = harness.clock.pauseCount
 
         // Live steady state: anchoring trims the pipeline's retained windows back
-        // to the anchor, and video output leads the audio ingest edge, so the
-        // runway measured here sits well under the 250 ms startup threshold. It
-        // must not close the gate — every close pauses the clock and the reopen
-        // flushes the renderer, which is what reduced playback to a slideshow.
+        // to the anchor, and video output legitimately leads the audio ingest
+        // edge. It must not close the gate merely because the newest snapshot no
+        // longer contains the complete interval that established readiness.
         for step in 0..<40 {
             let base = CMTimeAdd(time(1), CMTime(value: Int64(step) * 24, timescale: 1_000))
             harness.gate.updateAudio(
@@ -384,11 +428,11 @@ final class PlaybackClockTests: XCTestCase {
             contiguousDuration: CMTime(value: 1, timescale: 2),
             isContiguous: true
         )
-        harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 2)
+        harness.gate.updateVideo(frames: frames(firstPTS: time(1), count: 2))
         XCTAssertTrue(harness.gate.isOpen)
         let openCycle = harness.gate.cycleID
 
-        harness.gate.updateVideo(firstPTS: time(1), readyFrameCount: 1)
+        harness.gate.updateVideo(frames: frames(firstPTS: time(1), count: 1))
 
         XCTAssertFalse(harness.gate.isOpen)
         XCTAssertEqual(harness.gate.cycleID, openCycle + 1)
@@ -416,7 +460,19 @@ final class PlaybackClockTests: XCTestCase {
             contiguousDuration: CMTime(value: 10, timescale: 1),
             isContiguous: true
         )
-        gate.updateVideo(firstPTS: videoPTS, readyFrameCount: videoCount)
+        gate.updateVideo(frames: frames(firstPTS: videoPTS, count: videoCount))
+    }
+
+    private func frames(firstPTS: CMTime, count: Int) -> [PlaybackReadinessVideoFrame] {
+        (0..<count).map { index in
+            PlaybackReadinessVideoFrame(
+                presentationTimeStamp: CMTimeAdd(
+                    firstPTS,
+                    CMTime(value: Int64(index), timescale: 25)
+                ),
+                duration: CMTime(value: 1, timescale: 25)
+            )
+        }
     }
 
     private func time(_ seconds: Int64) -> CMTime {

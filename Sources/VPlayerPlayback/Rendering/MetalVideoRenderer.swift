@@ -261,7 +261,6 @@ final class SystemMetalCommandSubmitter: MetalCommandSubmitting, @unchecked Send
 
 public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingResetting, @unchecked Sendable {
     public static let maximumCommandErrorLength = 256
-    private static let maximumInFlightCount = 3
     private static let initialDisplayInterval = CMTime(value: 1, timescale: 60)
 
     private final class CompletionLifetime: @unchecked Sendable {
@@ -385,11 +384,11 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
     ) -> VideoRenderDecision {
         presentationLock.lock()
         defer { presentationLock.unlock() }
-        guard reserveInFlightSlot() else {
-            metrics?.recordRenderTick(skippedInFlight: true)
-            _ = nextDisplayInterval(for: targetMediaTime)
-            return decision(action: .skippedInFlight, frame: nil, dropped: 0)
-        }
+        // CAMetalDisplayLink only calls us with a drawable that Core Animation's
+        // bounded drawable pool has made available. Treat that drawable as the
+        // real admission credit. A second fixed in-flight cap can reject valid
+        // credits, skip a present, and make the following tick supersede frames.
+        beginInFlightSubmission()
         metrics?.recordRenderTick(skippedInFlight: false)
 
         let displayInterval = nextDisplayInterval(for: targetMediaTime)
@@ -593,11 +592,9 @@ public final class MetalVideoRenderer: VideoRendering, VideoPresentationTimingRe
         }
     }
 
-    private func reserveInFlightSlot() -> Bool {
+    private func beginInFlightSubmission() {
         stateLock.withLock {
-            guard inFlightCount < Self.maximumInFlightCount else { return false }
             inFlightCount += 1
-            return true
         }
     }
 

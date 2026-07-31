@@ -358,13 +358,21 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func recordDisplayRefreshRate(framesPerSecond: Double) {
         guard framesPerSecond.isFinite, framesPerSecond > 0 else { return }
-        lock.withLock { state.displayRefreshHz = framesPerSecond }
+        lock.withLock {
+            if state.displayRefreshHz != framesPerSecond {
+                // A content/display cadence change starts a new measurement
+                // epoch. The transition gap is intentional, not missed vsyncs.
+                state.previousDisplayLinkTimestamp = nil
+                state.nativeDisplayIntervalSeconds = 0
+            }
+            state.displayRefreshHz = framesPerSecond
+        }
     }
 
-    /// Gaps are measured against the panel's own period when the screen has
-    /// reported one. The shortest gap ever seen is a poor stand-in: the display
-    /// link's target timestamps are not strictly quantized to vsync boundaries,
-    /// so a single short outlier would rescale every later gap into a miss.
+    /// Gaps are measured against the requested presentation cadence when one is
+    /// known. The shortest gap ever seen is a poor stand-in: display-link target
+    /// timestamps are not strictly quantized, so one short outlier would rescale
+    /// every later gap into a miss.
     func recordDisplayLinkCallback(targetPresentationTimestamp: CFTimeInterval) {
         guard targetPresentationTimestamp.isFinite else { return }
         lock.withLock {
@@ -390,7 +398,14 @@ final class PlaybackMetrics: @unchecked Sendable {
     }
 
     func recordDisplaySubmissionResume() {
-        lock.withLock { state.displayResumeCount &+= 1 }
+        lock.withLock {
+            state.displayResumeCount &+= 1
+            // Readiness recovery and display-mode switches intentionally pause
+            // callbacks. The first callback after resume begins a fresh cadence
+            // epoch instead of charging the paused interval as missed frames.
+            state.previousDisplayLinkTimestamp = nil
+            state.nativeDisplayIntervalSeconds = 0
+        }
     }
 
     func recordProcessedVideo(latestPTS: CMTime?) {

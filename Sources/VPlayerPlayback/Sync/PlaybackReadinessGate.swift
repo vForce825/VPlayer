@@ -30,7 +30,6 @@ public final class PlaybackReadinessGate {
     }
 
     private struct VideoSnapshot {
-        let firstPTS: CMTime
         let readyFrameCount: Int
         let frames: [PlaybackReadinessVideoFrame]?
     }
@@ -110,6 +109,9 @@ public final class PlaybackReadinessGate {
         contiguousDuration: CMTime,
         isContiguous: Bool
     ) {
+        // The pipeline publishes a valid snapshot only after its audio renderer
+        // reports that it can start. An invalid/non-contiguous update therefore
+        // clears both renderer readiness and the usable audio timeline here.
         guard isContiguous,
               firstPTS.isNumeric,
               contiguousDuration.isNumeric,
@@ -125,6 +127,9 @@ public final class PlaybackReadinessGate {
         reevaluate()
     }
 
+    /// Updates count-only video availability. This can keep an already-open
+    /// gate healthy, but cannot establish initial readiness because it carries
+    /// no frame durations with which to prove audio interval coverage.
     public func updateVideo(firstPTS: CMTime, readyFrameCount: Int) {
         guard firstPTS.isNumeric, readyFrameCount >= 0 else {
             if isOpen {
@@ -134,7 +139,7 @@ public final class PlaybackReadinessGate {
             }
             return
         }
-        video = VideoSnapshot(firstPTS: firstPTS, readyFrameCount: readyFrameCount, frames: nil)
+        video = VideoSnapshot(readyFrameCount: readyFrameCount, frames: nil)
         reevaluate()
     }
 
@@ -147,7 +152,7 @@ public final class PlaybackReadinessGate {
         }.sorted {
             CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp) < 0
         }
-        guard valid.count == frames.count, let first = valid.first else {
+        guard valid.count == frames.count, !valid.isEmpty else {
             if isOpen {
                 close(.buffering)
             } else {
@@ -156,7 +161,6 @@ public final class PlaybackReadinessGate {
             return
         }
         video = VideoSnapshot(
-            firstPTS: first.presentationTimeStamp,
             readyFrameCount: valid.count,
             frames: valid
         )
@@ -242,9 +246,6 @@ public final class PlaybackReadinessGate {
         return true
     }
 
-    // Opening waits for this much buffered audio past the anchor so the first
-    // anchor does not start out starved.
-    private static let startupAudioRunway = CMTime(value: 1, timescale: 4)
     // The renderer buffers only a bounded span of decoded video. Anchoring
     // further behind the newest frame than that makes every arriving frame
     // overflow the presentation queue before the clock ever reaches it, which
@@ -265,16 +266,14 @@ public final class PlaybackReadinessGate {
         _ = attemptOpen()
     }
 
-    // Staying open deliberately drops the startup runway requirement. Anchoring
-    // trims the pipeline's retained windows back to the anchor point, and video
-    // output legitimately leads the audio ingest edge on a live stream, so a
-    // healthy running pipeline sits *below* the startup threshold nearly all the
-    // time. Re-applying it on every audio packet closed the gate ~10x/second;
-    // each close paused the clock and the following reopen flushed the renderer
-    // and re-anchored, which is what cut live playback to a few frames/second.
-    // A genuine stall still closes the gate: non-contiguous audio and an empty
-    // video window are handled by `updateAudio`/`updateVideo` directly, and the
-    // frame-count floor below catches video starvation.
+    // Staying open deliberately does not re-apply startup interval coverage.
+    // Anchoring trims the pipeline's retained windows back to the anchor point,
+    // and video output legitimately leads the audio ingest edge on a live
+    // stream. Requiring every subsequent snapshot to retain the original common
+    // interval would flap the gate while playback is healthy. A genuine stall
+    // still closes it: non-contiguous audio and an empty video window are handled
+    // by `updateAudio`/`updateVideo`, and the frame-count floor below catches
+    // video starvation.
     private func canRemainOpen() -> Bool {
         guard let audio, let video,
               video.readyFrameCount >= requiredVideoFrameCount else { return false }
@@ -283,21 +282,27 @@ public final class PlaybackReadinessGate {
 
     private func commonReadyPTS() -> CMTime? {
         guard let audio, let video,
-              video.readyFrameCount >= requiredVideoFrameCount else { return nil }
+              video.readyFrameCount >= requiredVideoFrameCount,
+              let frames = video.frames else { return nil }
         let audioEnd = CMTimeAdd(audio.firstPTS, audio.contiguousDuration)
         guard audioEnd.isNumeric else { return nil }
-        var commonPTS = CMTimeCompare(audio.firstPTS, video.firstPTS) >= 0
-            ? audio.firstPTS
-            : video.firstPTS
-        if let newest = video.frames?.last?.presentationTimeStamp {
+        let coveredFrames = frames.filter { frame in
+            let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+            return CMTimeCompare(end, audio.firstPTS) > 0
+                && CMTimeCompare(end, audioEnd) <= 0
+        }
+        guard coveredFrames.count >= requiredVideoFrameCount,
+              let oldestCoveredFrame = coveredFrames.first else { return nil }
+
+        var commonPTS = CMTimeCompare(
+            audio.firstPTS,
+            oldestCoveredFrame.presentationTimeStamp
+        ) >= 0 ? audio.firstPTS : oldestCoveredFrame.presentationTimeStamp
+        if let newest = coveredFrames.last?.presentationTimeStamp {
             let latestUsefulAnchor = CMTimeSubtract(newest, maximumAnchorLag)
-            let runwayLimit = CMTimeSubtract(audioEnd, Self.startupAudioRunway)
             if latestUsefulAnchor.isNumeric,
-               runwayLimit.isNumeric,
                CMTimeCompare(latestUsefulAnchor, commonPTS) > 0 {
-                commonPTS = CMTimeCompare(latestUsefulAnchor, runwayLimit) <= 0
-                    ? latestUsefulAnchor
-                    : runwayLimit
+                commonPTS = latestUsefulAnchor
             }
         }
         if let minimumRecoveryAnchorPTS,
@@ -305,21 +310,14 @@ public final class PlaybackReadinessGate {
             commonPTS = minimumRecoveryAnchorPTS
         }
         guard commonPTS.isNumeric,
-              CMTimeCompare(commonPTS, audioEnd) < 0,
-              CMTimeCompare(
-                  CMTimeSubtract(audioEnd, commonPTS),
-                  Self.startupAudioRunway
-              ) >= 0 else { return nil }
-        if let frames = video.frames {
-            let overlappingCount = frames.filter { frame in
-                let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
-                return CMTimeCompare(end, commonPTS) > 0
-                    && CMTimeCompare(frame.presentationTimeStamp, audioEnd) < 0
-            }.count
-            guard overlappingCount >= requiredVideoFrameCount else { return nil }
-        } else {
-            guard CMTimeCompare(video.firstPTS, audioEnd) < 0 else { return nil }
-        }
+              CMTimeCompare(commonPTS, audioEnd) < 0 else { return nil }
+        let readyFrameCount = coveredFrames.lazy.filter { frame in
+            CMTimeCompare(
+                CMTimeAdd(frame.presentationTimeStamp, frame.duration),
+                commonPTS
+            ) > 0
+        }.count
+        guard readyFrameCount >= requiredVideoFrameCount else { return nil }
         return commonPTS
     }
 }

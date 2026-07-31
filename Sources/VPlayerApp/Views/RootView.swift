@@ -5,10 +5,18 @@
 import SwiftUI
 
 struct RootView: View {
+    private enum InitialLibraryState {
+        case loading
+        case ready
+        case failed
+    }
+
     private let dependencies: AppDependencies
     private let focusPolicy: AcceptanceFocusPolicy
     @State private var model: AppModel
     @State private var selectedTab: AcceptanceFocusPolicy.RootTab
+    @State private var initialLibraryState = InitialLibraryState.loading
+    @State private var initialLibraryAttempt = 0
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
@@ -40,35 +48,37 @@ struct RootView: View {
     private var libraryContent: some View {
         @Bindable var model = model
 
-        return TabView(selection: $selectedTab) {
-            ChannelBrowserView(
-                model: model,
-                browsingSettings: dependencies.channelBrowsingSettings
-            )
-                .tabItem {
-                    Label("频道", systemImage: "play.rectangle")
+        return Group {
+            switch initialLibraryState {
+            case .loading:
+                ProgressView("正在载入资料库…")
+                    .accessibilityIdentifier("library.loading")
+            case .ready:
+                libraryTabs
+            case .failed:
+                VStack(spacing: 28) {
+                    ContentUnavailableView(
+                        "无法载入资料库",
+                        systemImage: "arrow.clockwise.circle",
+                        description: Text("本地资料暂时无法读取，请重试。")
+                    )
+                    Button("重试") {
+                        initialLibraryAttempt += 1
+                    }
+                    .accessibilityIdentifier("library.retry")
                 }
-                .tag(AcceptanceFocusPolicy.RootTab.channels)
-
-            SourceProfilesView(model: model)
-                .tabItem {
-                    Label("播放列表", systemImage: "play.square.stack")
-                }
-                .tag(AcceptanceFocusPolicy.RootTab.sources)
-
-            SettingsView(
-                playback: dependencies.playbackSettings,
-                channelBrowsing: dependencies.channelBrowsingSettings
-            )
-                .tabItem {
-                    Label("设置", systemImage: "gearshape")
-                }
-                .tag(AcceptanceFocusPolicy.RootTab.settings)
+            }
         }
-        .task {
-            await dependencies.prepare()
+        .task(id: initialLibraryAttempt) {
+            initialLibraryState = .loading
+            let opened = await dependencies.openInitialLibrary(using: model)
             guard !Task.isCancelled else { return }
-            await model.reload()
+            // A failed repository read also raises the model's generic alert.
+            // Bootstrap owns this persistent retry screen, so avoid presenting
+            // two competing failure affordances; successful retry also clears
+            // any stale alert from the preceding attempt.
+            model.dismissAlert()
+            initialLibraryState = opened ? .ready : .failed
         }
         .alert(model.alertTitle, isPresented: Binding(
             get: { model.alertMessage != nil },
@@ -96,6 +106,36 @@ struct RootView: View {
             ) {
                 model.dismissPlayback()
             }
+        }
+    }
+
+    private var libraryTabs: some View {
+        @Bindable var model = model
+
+        return TabView(selection: $selectedTab) {
+            ChannelBrowserView(
+                model: model,
+                browsingSettings: dependencies.channelBrowsingSettings
+            )
+                .tabItem {
+                    Label("频道", systemImage: "play.rectangle")
+                }
+                .tag(AcceptanceFocusPolicy.RootTab.channels)
+
+            SourceProfilesView(model: model)
+                .tabItem {
+                    Label("播放列表", systemImage: "play.square.stack")
+                }
+                .tag(AcceptanceFocusPolicy.RootTab.sources)
+
+            SettingsView(
+                playback: dependencies.playbackSettings,
+                channelBrowsing: dependencies.channelBrowsingSettings
+            )
+                .tabItem {
+                    Label("设置", systemImage: "gearshape")
+                }
+                .tag(AcceptanceFocusPolicy.RootTab.settings)
         }
     }
 }
