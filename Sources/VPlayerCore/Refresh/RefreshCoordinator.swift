@@ -31,6 +31,7 @@ public struct RefreshOutcome: Equatable, Sendable {
 
 public actor RefreshCoordinator {
     public typealias PersistedOutcomeHandler = @Sendable (UUID, RefreshOutcome) async -> Void
+    public typealias RefreshStartedHandler = @Sendable (UUID, RefreshResource) async -> Void
 
     struct WaiterRegistration: Equatable, Sendable {
         let profileID: UUID
@@ -67,6 +68,7 @@ public actor RefreshCoordinator {
     private let downloader: any RemoteResourceDownloading
     private let now: @Sendable () -> Date
     private let onPersistedOutcome: PersistedOutcomeHandler?
+    private let onRefreshStarted: RefreshStartedHandler?
     private let waiterRegistrationObserver: WaiterRegistrationObserver?
     private var inFlight: [RefreshKey: InFlight] = [:]
 
@@ -74,12 +76,14 @@ public actor RefreshCoordinator {
         repository: any LibraryRepository & RefreshSnapshotCommitting,
         downloader: any RemoteResourceDownloading,
         now: @escaping @Sendable () -> Date = Date.init,
-        onPersistedOutcome: PersistedOutcomeHandler? = nil
+        onPersistedOutcome: PersistedOutcomeHandler? = nil,
+        onRefreshStarted: RefreshStartedHandler? = nil
     ) {
         self.repository = repository
         self.downloader = downloader
         self.now = now
         self.onPersistedOutcome = onPersistedOutcome
+        self.onRefreshStarted = onRefreshStarted
         waiterRegistrationObserver = nil
     }
 
@@ -88,12 +92,14 @@ public actor RefreshCoordinator {
         downloader: any RemoteResourceDownloading,
         now: @escaping @Sendable () -> Date = Date.init,
         onPersistedOutcome: PersistedOutcomeHandler? = nil,
+        onRefreshStarted: RefreshStartedHandler? = nil,
         waiterRegistrationObserver: @escaping WaiterRegistrationObserver
     ) {
         self.repository = repository
         self.downloader = downloader
         self.now = now
         self.onPersistedOutcome = onPersistedOutcome
+        self.onRefreshStarted = onRefreshStarted
         self.waiterRegistrationObserver = waiterRegistrationObserver
     }
 
@@ -102,11 +108,14 @@ public actor RefreshCoordinator {
         resources: Set<RefreshResource>,
         trigger: RefreshTrigger
     ) async -> [RefreshOutcome] {
-        _ = trigger
         return await withTaskGroup(of: RefreshOutcome.self) { group in
             for resource in resources {
                 group.addTask {
-                    await self.refreshOne(profileID: profileID, resource: resource)
+                    await self.refreshOne(
+                        profileID: profileID,
+                        resource: resource,
+                        trigger: trigger
+                    )
                 }
             }
             var outcomes: [RefreshOutcome] = []
@@ -119,7 +128,8 @@ public actor RefreshCoordinator {
 
     private func refreshOne(
         profileID: UUID,
-        resource: RefreshResource
+        resource: RefreshResource,
+        trigger: RefreshTrigger
     ) async -> RefreshOutcome {
         if Task.isCancelled {
             return Self.cancellationOutcome(resource: resource)
@@ -131,7 +141,11 @@ public actor RefreshCoordinator {
             guard shouldRetry else {
                 return Self.cancellationOutcome(resource: resource, attemptID: existing.id)
             }
-            return await refreshOne(profileID: profileID, resource: resource)
+            return await refreshOne(
+                profileID: profileID,
+                resource: resource,
+                trigger: trigger
+            )
         }
 
         let flightID: UUID
@@ -141,6 +155,7 @@ public actor RefreshCoordinator {
             let repository = repository
             let downloader = downloader
             let onPersistedOutcome = onPersistedOutcome
+            let onRefreshStarted = onRefreshStarted
             let timestamp = now()
             let id = UUID()
             let task = Task {
@@ -150,7 +165,9 @@ public actor RefreshCoordinator {
                     profileID: profileID,
                     resource: resource,
                     timestamp: timestamp,
-                    attemptID: id
+                    attemptID: id,
+                    trigger: trigger,
+                    onRefreshStarted: onRefreshStarted
                 )
                 if performed.didPersistTerminalStatus, let onPersistedOutcome {
                     await onPersistedOutcome(profileID, performed.outcome)
@@ -295,7 +312,9 @@ public actor RefreshCoordinator {
         profileID: UUID,
         resource: RefreshResource,
         timestamp: Date,
-        attemptID: UUID
+        attemptID: UUID,
+        trigger: RefreshTrigger,
+        onRefreshStarted: RefreshStartedHandler?
     ) async -> PerformedRefresh {
         var resourceURL: URL?
         do {
@@ -311,6 +330,11 @@ public actor RefreshCoordinator {
                 at: timestamp,
                 attemptID: attemptID
             )
+            if case .manual = trigger {
+                // Manual refreshes already update AppModel synchronously.
+            } else if let onRefreshStarted {
+                await onRefreshStarted(profileID, resource)
+            }
             try Task.checkCancellation()
             guard isRemoteHTTPURL(url) else { throw CoordinatorError.unsupportedRemoteURL }
 

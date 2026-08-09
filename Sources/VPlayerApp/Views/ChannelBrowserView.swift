@@ -176,12 +176,28 @@ struct ChannelBrowserView: View {
     /// programme in it already ended. Never focusable — it is a note, not a
     /// control standing between the remote and the channels.
     private func staleEPGBanner(coverageEnd: Date) -> some View {
-        Label(
-            EPGCoverageNotice.text(staleCoverageEnd: coverageEnd),
-            systemImage: "calendar.badge.exclamationmark"
-        )
-        .font(.caption)
-        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Label(
+                EPGCoverageNotice.text(staleCoverageEnd: coverageEnd),
+                systemImage: "calendar.badge.exclamationmark"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if model.activeProfile?.m3uStatus.state == .refreshing {
+                Label("正在刷新频道列表…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("channel.playlist.refreshing")
+            }
+
+            if model.activeProfile?.epgStatus.state == .refreshing {
+                Label("正在刷新节目单…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("channel.epg.refreshing")
+            }
+        }
         .padding(.vertical, 16)
         .padding(.horizontal, 20)
         .frame(maxWidth: .infinity, alignment: .leading)

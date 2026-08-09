@@ -541,6 +541,45 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(records.first { $0.outcome.resource == .epg }?.observedStatus, .failed)
     }
 
+    func testAutomaticRefreshStartHookRunsAfterRefreshingStatusIsPersisted() async {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(
+            data: [.playlist: validPlaylist(name: "Replacement")],
+            isSuspended: true
+        )
+        let probe = PersistedRefreshStartProbe()
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { fixedNow },
+            onRefreshStarted: { profileID, resource in
+                let snapshot = await repository.snapshot()
+                let status = resource == .playlist
+                    ? snapshot.profiles.first?.m3uStatus.state
+                    : snapshot.profiles.first?.epgStatus.state
+                await probe.save(profileID: profileID, resource: resource, status: status)
+            }
+        )
+
+        let refresh = Task {
+            await coordinator.refresh(
+                profileID: profileID,
+                resources: [.playlist],
+                trigger: .foreground
+            )
+        }
+        await probe.waitUntilRecorded()
+
+        let record = await probe.value
+        XCTAssertEqual(record?.profileID, profileID)
+        XCTAssertEqual(record?.resource, .playlist)
+        XCTAssertEqual(record?.status, .refreshing)
+
+        await downloader.resume(.playlist)
+        _ = await refresh.value
+    }
+
     func testPersistedOutcomeHookDoesNotRunWhenFailureStatusCannotBePersisted() async {
         let repository = RepositorySpy(
             profiles: [makeProfile()],
@@ -774,6 +813,26 @@ private actor PersistedOutcomeProbe {
 
     func record(outcome: RefreshOutcome, observedStatus: RefreshState?) {
         records.append(Record(outcome: outcome, observedStatus: observedStatus))
+    }
+}
+
+private actor PersistedRefreshStartProbe {
+    struct Record: Sendable {
+        let profileID: UUID
+        let resource: RefreshResource
+        let status: RefreshState?
+    }
+
+    private(set) var value: Record?
+
+    func save(profileID: UUID, resource: RefreshResource, status: RefreshState?) {
+        value = Record(profileID: profileID, resource: resource, status: status)
+    }
+
+    func waitUntilRecorded() async {
+        while value == nil {
+            await Task.yield()
+        }
     }
 }
 

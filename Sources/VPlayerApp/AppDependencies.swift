@@ -365,7 +365,8 @@ actor LiveLibraryRuntimeLoader {
 }
 
 private func makeProductionLibraryRuntime(
-    onPersistedOutcome: @escaping RefreshCoordinator.PersistedOutcomeHandler
+    onPersistedOutcome: @escaping RefreshCoordinator.PersistedOutcomeHandler,
+    onRefreshStarted: @escaping RefreshCoordinator.RefreshStartedHandler
 ) throws -> LiveLibraryRuntime {
     let container = try VPlayerModelContainer.make()
     let repository = SwiftDataLibraryStore(
@@ -375,7 +376,8 @@ private func makeProductionLibraryRuntime(
     let coordinator = RefreshCoordinator(
         repository: repository,
         downloader: URLSessionBoundedDownloader(),
-        onPersistedOutcome: onPersistedOutcome
+        onPersistedOutcome: onPersistedOutcome,
+        onRefreshStarted: onRefreshStarted
     )
     let refresh: LiveLibraryRuntime.Refresh = { profileID, resources, trigger in
         await coordinator.refresh(
@@ -418,9 +420,16 @@ final class LiveAppBootstrap {
                 libraryChanges?.notify()
             }
         }
+        let onRefreshStarted: RefreshCoordinator.RefreshStartedHandler = {
+            [weak libraryChanges] _, _ in
+            await MainActor.run {
+                libraryChanges?.notify()
+            }
+        }
         let runtimeLoader = LiveLibraryRuntimeLoader {
             try makeProductionLibraryRuntime(
-                onPersistedOutcome: onPersistedOutcome
+                onPersistedOutcome: onPersistedOutcome,
+                onRefreshStarted: onRefreshStarted
             )
         }
         return LiveAppBootstrap(
@@ -590,6 +599,11 @@ struct AppDependencies {
                     await MainActor.run {
                         libraryChanges?.notify()
                     }
+                },
+                onRefreshStarted: { [weak libraryChanges] _, _ in
+                    await MainActor.run {
+                        libraryChanges?.notify()
+                    }
                 }
             )
 
@@ -647,6 +661,9 @@ struct AppDependencies {
                 repository: repository,
                 downloader: URLSessionBoundedDownloader(),
                 onPersistedOutcome: { [weak libraryChanges] _, _ in
+                    await MainActor.run { libraryChanges?.notify() }
+                },
+                onRefreshStarted: { [weak libraryChanges] _, _ in
                     await MainActor.run { libraryChanges?.notify() }
                 }
             )
