@@ -421,9 +421,12 @@ final class LiveAppBootstrap {
             }
         }
         let onRefreshStarted: RefreshCoordinator.RefreshStartedHandler = {
-            [weak libraryChanges] _, _ in
+            [weak libraryChanges] profileID, resource in
             await MainActor.run {
-                libraryChanges?.notify()
+                libraryChanges?.notifyRefreshStarted(
+                    profileID: profileID,
+                    resource: resource
+                )
             }
         }
         let runtimeLoader = LiveLibraryRuntimeLoader {
@@ -600,9 +603,12 @@ struct AppDependencies {
                         libraryChanges?.notify()
                     }
                 },
-                onRefreshStarted: { [weak libraryChanges] _, _ in
+                onRefreshStarted: { [weak libraryChanges] profileID, resource in
                     await MainActor.run {
-                        libraryChanges?.notify()
+                        libraryChanges?.notifyRefreshStarted(
+                            profileID: profileID,
+                            resource: resource
+                        )
                     }
                 }
             )
@@ -663,8 +669,13 @@ struct AppDependencies {
                 onPersistedOutcome: { [weak libraryChanges] _, _ in
                     await MainActor.run { libraryChanges?.notify() }
                 },
-                onRefreshStarted: { [weak libraryChanges] _, _ in
-                    await MainActor.run { libraryChanges?.notify() }
+                onRefreshStarted: { [weak libraryChanges] profileID, resource in
+                    await MainActor.run {
+                        libraryChanges?.notifyRefreshStarted(
+                            profileID: profileID,
+                            resource: resource
+                        )
+                    }
                 }
             )
             let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in

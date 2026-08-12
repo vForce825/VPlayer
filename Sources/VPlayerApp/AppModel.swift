@@ -106,6 +106,16 @@ final class AppModel {
         self.mutationLaneEvent = mutationLaneEvent
         self.now = now
         if let libraryChanges {
+            libraryChanges.observeRefreshStarts {
+                [weak self] profileID, resource in
+                guard let self else { return false }
+                self.markRefreshing(
+                    profileID: profileID,
+                    resource: resource,
+                    startedAt: self.now()
+                )
+                return true
+            }
             let observedGeneration = libraryChanges.generation
             libraryChangeTask = Task { @MainActor [weak self, weak libraryChanges] in
                 guard let libraryChanges else { return }
