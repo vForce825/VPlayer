@@ -2018,6 +2018,51 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(ResourceRefreshStatusPresentation.text(for: failed).contains(successText))
     }
 
+    func testAutomaticRefreshStartSignalUpdatesStatusWithoutReloadingLibrary() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(-600),
+            lastSuccessAt: now.addingTimeInterval(-3_600),
+            state: .failed,
+            errorSummary: "playlist failure"
+        )
+        profile.epgStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(-600),
+            lastSuccessAt: now.addingTimeInterval(-3_600),
+            state: .succeeded
+        )
+        let repository = RepositorySpy(profiles: [profile])
+        let changes = LibraryChangeSignal()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            libraryChanges: changes,
+            now: { now }
+        )
+
+        await model.reload()
+        let profileReadsBeforeStart = await repository.snapshot().profileLookupCount
+
+        changes.notifyRefreshStarted(profileID: profile.id, resource: .epg)
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(model.profiles.first?.m3uStatus, profile.m3uStatus)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .refreshing)
+        XCTAssertEqual(model.profiles.first?.epgStatus.lastAttemptAt, now)
+        XCTAssertNil(model.profiles.first?.epgStatus.errorSummary)
+        XCTAssertEqual(model.activeProfile?.epgStatus.state, .refreshing)
+        XCTAssertEqual(changes.generation, 0)
+        let profileReadsAfterStart = await repository.snapshot().profileLookupCount
+        XCTAssertEqual(profileReadsAfterStart, profileReadsBeforeStart)
+    }
+
     func testPersistenceTerminalSignalReloadsVisibleChannelsWithoutManualUIAction() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
