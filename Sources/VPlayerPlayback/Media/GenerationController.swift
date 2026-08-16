@@ -32,6 +32,10 @@ public struct MediaFormatFingerprint: Hashable, Sendable {
             data.append(video.codec.rawValue)
             data.append(video.width)
             data.append(video.height)
+            data.appendOptional(video.frameRate) { nestedData, frameRate in
+                nestedData.append(frameRate.num)
+                nestedData.append(frameRate.den)
+            }
             try data.appendLengthPrefixed(video.extradata)
         }
 

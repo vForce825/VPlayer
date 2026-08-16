@@ -64,6 +64,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(harness.coordinator.route, .rawWhileClassifying)
+        XCTAssertFalse(harness.coordinator.isClassificationResolved)
         XCTAssertEqual(harness.coordinator.requiredVideoFrameCount, 1)
         XCTAssertEqual(harness.probe.pendingCount, 1)
         XCTAssertEqual(harness.host.deliveredFrames.count, 1)
@@ -154,6 +155,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             parser: progressiveParser(sourcePTS90k: 43_200)
         )))
         XCTAssertEqual(harness.coordinator.route, .bypass)
+        XCTAssertTrue(harness.coordinator.isClassificationResolved)
     }
 
     func testPsFProbeEvidenceBypassesBothDeinterlacers() throws {

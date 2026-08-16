@@ -10,17 +10,21 @@ import VPlayerPlayback
 @Observable
 final class FullScreenPlayerViewModel {
     typealias PresentationProvider = @Sendable () async -> PlaybackPresentationContext?
+    typealias MediaInformationProvider = @Sendable () async -> AsyncStream<PlaybackMediaInformation?>
     typealias Sleep = @Sendable (Duration) async throws -> Void
 
     let request: PlaybackRequest
     private let engine: any PlaybackEngine
     private let presentationProvider: PresentationProvider
+    private let mediaInformationProvider: MediaInformationProvider
     private let settings: PlaybackSettingsStore
     private let sleep: Sleep
     private var stateTask: Task<Void, Never>?
     private var noticeTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
+    private var mediaInformationProviderTask: Task<Void, Never>?
+    private var mediaInformationTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
     private var noticeDismissalTask: Task<Void, Never>?
@@ -32,17 +36,24 @@ final class FullScreenPlayerViewModel {
     private(set) var state: PlaybackState = .idle
     private(set) var visibleNotice: PlaybackNotice?
     private(set) var presentationContext: PlaybackPresentationContext?
+    private(set) var mediaInformation: PlaybackMediaInformation?
 
     init(
         request: PlaybackRequest,
         engine: any PlaybackEngine,
         presentationProvider: @escaping PresentationProvider,
+        mediaInformationProvider: @escaping MediaInformationProvider = {
+            AsyncStream<PlaybackMediaInformation?> { continuation in
+                continuation.finish()
+            }
+        },
         settings: PlaybackSettingsStore,
         sleep: @escaping Sleep = { try await Task.sleep(for: $0) }
     ) {
         self.request = request
         self.engine = engine
         self.presentationProvider = presentationProvider
+        self.mediaInformationProvider = mediaInformationProvider
         self.settings = settings
         self.sleep = sleep
     }
@@ -54,6 +65,7 @@ final class FullScreenPlayerViewModel {
 
     func start() {
         guard !started, !stopped else { return }
+        resetMediaInformation()
         started = true
         playbackGeneration &+= 1
         let lifecycle = lifecycleGeneration
@@ -70,6 +82,9 @@ final class FullScreenPlayerViewModel {
                           !Task.isCancelled,
                           isCurrent(lifecycle: lifecycle) else { return }
                     self.state = state
+                    if case .failed = state {
+                        self.resetMediaInformation()
+                    }
                 }
             }
             noticeTask = Task { [weak self] in
@@ -80,9 +95,12 @@ final class FullScreenPlayerViewModel {
                     self.present(notice)
                 }
             }
-            guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             await engine.play(request)
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+            beginMediaInformationSubscription(
+                lifecycle: lifecycle,
+                playback: playback
+            )
             beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
     }
@@ -110,6 +128,7 @@ final class FullScreenPlayerViewModel {
 
     func retry() {
         guard !stopped else { return }
+        resetMediaInformation()
         playbackGeneration &+= 1
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
@@ -121,6 +140,10 @@ final class FullScreenPlayerViewModel {
                   isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             await engine.play(request)
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+            beginMediaInformationSubscription(
+                lifecycle: lifecycle,
+                playback: playback
+            )
             beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
     }
@@ -140,19 +163,27 @@ final class FullScreenPlayerViewModel {
         let pause = pauseTask
         let states = stateTask
         let notices = noticeTask
+        let mediaInformationProvider = mediaInformationProviderTask
+        let mediaInformation = mediaInformationTask
         playback?.cancel()
         presentation?.cancel()
+        mediaInformationProvider?.cancel()
+        mediaInformation?.cancel()
         pause?.cancel()
         states?.cancel()
         notices?.cancel()
         noticeDismissalTask?.cancel()
         playbackTask = nil
         presentationTask = nil
+        mediaInformationProviderTask = nil
+        mediaInformationTask = nil
         pauseTask = nil
         stateTask = nil
         noticeTask = nil
         noticeDismissalTask = nil
         visibleNotice = nil
+        self.mediaInformation = nil
+        state = .stopped
         presentationContext?.detach()
         presentationContext = nil
 
@@ -162,6 +193,7 @@ final class FullScreenPlayerViewModel {
             await pause?.value
             await states?.value
             await notices?.value
+            await mediaInformation?.value
             await engine.stop()
         }
         stopTask = task
@@ -181,11 +213,39 @@ final class FullScreenPlayerViewModel {
         }
     }
 
+    private func beginMediaInformationSubscription(
+        lifecycle: UInt64,
+        playback: UInt64
+    ) {
+        let provider = mediaInformationProvider
+        mediaInformationProviderTask = Task { [weak self] in
+            let mediaStream = await provider()
+            guard let self,
+                  isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+            mediaInformationTask = Task { [weak self] in
+                for await information in mediaStream {
+                    guard let self,
+                          !Task.isCancelled,
+                          isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+                    self.mediaInformation = information
+                }
+            }
+        }
+    }
+
     private func isCurrent(lifecycle: UInt64, playback: UInt64? = nil) -> Bool {
         guard !Task.isCancelled,
               !stopped,
               lifecycleGeneration == lifecycle else { return false }
         return playback.map { playbackGeneration == $0 } ?? true
+    }
+
+    private func resetMediaInformation() {
+        mediaInformationProviderTask?.cancel()
+        mediaInformationProviderTask = nil
+        mediaInformationTask?.cancel()
+        mediaInformationTask = nil
+        mediaInformation = nil
     }
 
     private func present(_ notice: PlaybackNotice) {

@@ -20,6 +20,39 @@ final class FullScreenPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testPlayingFixtureAutoHidesAndRemoteCommandsWakeBothOverlays() {
+        let app = launchFixture()
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "playing")
+
+        let card = app.otherElements["player-channel-info"]
+        let playPause = app.buttons["player-play-pause"]
+        let visibility = app.otherElements["player-controls-visibility"]
+        XCTAssertTrue(visibility.waitForExistence(timeout: 1))
+        XCTAssertEqual(visibility.value as? String, "visible")
+        XCTAssertTrue(card.exists)
+        XCTAssertTrue(playPause.exists)
+
+        XCTAssertTrue(waitForValue(visibility, equals: "hidden", timeout: 5))
+        XCTAssertFalse(playPause.isHittable)
+
+        XCUIRemote.shared.press(.right)
+        XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
+        XCTAssertTrue(playPause.wait(for: \.isHittable, toEqual: true, timeout: 2))
+
+        XCTAssertTrue(waitForValue(visibility, equals: "hidden", timeout: 5))
+        XCUIRemote.shared.press(.playPause)
+        XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
+        XCTAssertTrue(playPause.wait(for: \.isHittable, toEqual: true, timeout: 2))
+    }
+
+    @MainActor
     func testFailureOverlayDefaultsFocusToRetry() {
         let app = launchFixture(playback: "failed")
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
@@ -74,5 +107,18 @@ final class FullScreenPlayerUITests: XCTestCase {
         for _ in 0..<4 where !tab.hasFocus { XCUIRemote.shared.press(.right) }
         XCTAssertTrue(tab.hasFocus)
         XCUIRemote.shared.press(.select)
+    }
+
+    @MainActor
+    private func waitForValue(
+        _ element: XCUIElement,
+        equals expected: String,
+        timeout: TimeInterval
+    ) -> Bool {
+        let predicate = NSPredicate { object, _ in
+            (object as? XCUIElement)?.value as? String == expected
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 }

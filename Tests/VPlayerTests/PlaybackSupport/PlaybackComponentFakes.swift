@@ -299,6 +299,11 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     var stopAutomaticallyCompletes = true
     var enqueueError: PlaybackCoreError?
     private var flushHandler: (@Sendable (MediaGeneration) -> Void)?
+    private var synchronousReadinessHandler: (@Sendable (MediaGeneration) -> Void)?
+    private var synchronousReadinessOnFlush = false
+    private var synchronousReadinessOnEnqueue = false
+    private var synchronousReadinessMaximumCallbackCount = 0
+    private var synchronousReadinessCallbackCount = 0
     private var stopContinuations: [CheckedContinuation<Void, Never>] = []
 
     var isReadyForPlayback: Bool { lock.withLock { ready } }
@@ -314,16 +319,36 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
 
     func enqueue(_ sample: CompressedAudioSample) throws {
         if let enqueueError { throw enqueueError }
-        lock.withLock { samples.append(sample) }
+        let readinessHandler = lock.withLock { () -> (@Sendable (MediaGeneration) -> Void)? in
+            samples.append(sample)
+            guard synchronousReadinessOnEnqueue,
+                  synchronousReadinessCallbackCount
+                      < synchronousReadinessMaximumCallbackCount,
+                  let synchronousReadinessHandler else { return nil }
+            synchronousReadinessCallbackCount += 1
+            return synchronousReadinessHandler
+        }
+        readinessHandler?(sample.generation)
     }
 
     func flush(to generation: MediaGeneration) {
-        let handler = lock.withLock { () -> (@Sendable (MediaGeneration) -> Void)? in
+        let handlers = lock.withLock {
             flushes.append(generation)
             samples.removeAll(keepingCapacity: true)
-            return flushHandler
+            let readinessHandler: (@Sendable (MediaGeneration) -> Void)?
+            if synchronousReadinessOnFlush,
+               synchronousReadinessCallbackCount
+                   < synchronousReadinessMaximumCallbackCount,
+               let synchronousReadinessHandler {
+                synchronousReadinessCallbackCount += 1
+                readinessHandler = synchronousReadinessHandler
+            } else {
+                readinessHandler = nil
+            }
+            return (flushHandler, readinessHandler)
         }
-        handler?(generation)
+        handlers.0?(generation)
+        handlers.1?(generation)
     }
 
     func stop() {
@@ -354,6 +379,25 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
 
     func setFlushHandler(_ handler: (@Sendable (MediaGeneration) -> Void)?) {
         lock.withLock { flushHandler = handler }
+    }
+
+    func setSynchronousReadinessCallback(
+        onFlush: Bool = false,
+        onEnqueue: Bool = false,
+        maxCallbacks: Int = 1,
+        _ handler: (@Sendable (MediaGeneration) -> Void)?
+    ) {
+        lock.withLock {
+            synchronousReadinessOnFlush = onFlush
+            synchronousReadinessOnEnqueue = onEnqueue
+            synchronousReadinessMaximumCallbackCount = max(0, maxCallbacks)
+            synchronousReadinessHandler = handler
+            synchronousReadinessCallbackCount = 0
+        }
+    }
+
+    var synchronousReadinessCallbackCountSnapshot: Int {
+        lock.withLock { synchronousReadinessCallbackCount }
     }
 
     func snapshot() -> (
@@ -547,7 +591,11 @@ final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecke
 }
 
 enum PlaybackFakeMedia {
-    static func tracks(videoExtradata: Data = Data(), audioExtradata: Data = Data([0x12, 0x10])) -> DemuxTrackSet {
+    static func tracks(
+        videoExtradata: Data = Data(),
+        audioExtradata: Data = Data([0x12, 0x10]),
+        videoFrameRate: MediaRational? = nil
+    ) -> DemuxTrackSet {
         DemuxTrackSet(
             selectedProgramID: 1,
             video: VideoTrackDescriptor(
@@ -557,8 +605,26 @@ enum PlaybackFakeMedia {
                 width: 1_920,
                 height: 1_080,
                 videoDelay: 0,
-                extradata: videoExtradata
+                extradata: videoExtradata,
+                frameRate: videoFrameRate
             ),
+            audio: AudioTrackDescriptor(
+                streamIndex: 101,
+                codec: .aac,
+                timeBase: MediaRational(num: 1, den: 48_000)!,
+                sampleRate: 48_000,
+                channelLayout: AudioChannelLayout(channelCount: 2, nativeMask: 3),
+                extradata: audioExtradata
+            )
+        )
+    }
+
+    static func audioOnlyTracks(
+        audioExtradata: Data = Data([0x12, 0x10])
+    ) -> DemuxTrackSet {
+        DemuxTrackSet(
+            selectedProgramID: 1,
+            video: nil,
             audio: AudioTrackDescriptor(
                 streamIndex: 101,
                 codec: .aac,
@@ -705,6 +771,7 @@ enum PlaybackFakeMedia {
         pts: CMTime,
         interlaced: Bool,
         duration: CMTime = CMTime(value: 1, timescale: 25),
+        pictureStructure: PictureStructure = .frame,
         dimensions: CMVideoDimensions = CMVideoDimensions(width: 16, height: 16),
         bitDepth: Int = 8
     ) throws -> DecodedVideoFrame {
@@ -734,7 +801,7 @@ enum PlaybackFakeMedia {
             generation: generation,
             parserMetadata: VideoParserMetadata(
                 fieldOrder: interlaced ? .tb : .progressive,
-                pictureStructure: .frame,
+                pictureStructure: pictureStructure,
                 isInterlaced: interlaced,
                 repeatFirstField: false,
                 topFieldFirst: interlaced,

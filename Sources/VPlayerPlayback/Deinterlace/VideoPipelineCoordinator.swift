@@ -90,6 +90,13 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
 
     private(set) var route = DeinterlaceRoute.rawWhileClassifying
 
+    /// Startup classification is unresolved until the coordinator has selected
+    /// either the passthrough or YADIF presentation path. Playback readiness
+    /// uses this semantic state instead of duplicating route comparisons.
+    var isClassificationResolved: Bool {
+        route != .rawWhileClassifying
+    }
+
     var requiredVideoFrameCount: Int {
         // One completed YADIF job yields the two field-rate presentation frames
         // needed to open readiness. The processor's three-frame reference window

@@ -7,7 +7,7 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class MediaGenerationTests: XCTestCase {
-    private let goldenDigest = "e035dc76f01128638a315a33717065ee778c3f14212c61d50e571d43417a83e2"
+    private let goldenDigest = "aa072b85a84b6bf1a5856da25e7838ab9630789444302a0bec21dc2b954b91fe"
 
     func testGenerationChangesOnlyForChangedFingerprintAndRejectsStaleWork() {
         var subject = GenerationController()
@@ -62,6 +62,17 @@ final class MediaGenerationTests: XCTestCase {
         for variant in variants {
             XCTAssertNotEqual(variant, base)
         }
+    }
+
+    func testVideoFrameRateChangesFingerprint() throws {
+        let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
+        let twentyFive = try XCTUnwrap(MediaRational(num: 25, den: 1))
+        let fifty = try XCTUnwrap(MediaRational(num: 50, den: 1))
+
+        let base = try makeFingerprint(video: makeVideo(frameRate: twentyFive, timeBase: timeBase))
+        let changed = try makeFingerprint(video: makeVideo(frameRate: fifty, timeBase: timeBase))
+
+        XCTAssertNotEqual(base, changed)
     }
 
     func testEveryIncludedAudioFieldAndOptionalChangesFingerprint() throws {
@@ -186,6 +197,7 @@ final class MediaGenerationTests: XCTestCase {
         height: Int32 = 1_080,
         videoDelay: Int32 = 1,
         extradata: Data = Data([1, 2, 3]),
+        frameRate: MediaRational? = nil,
         timeBase: MediaRational
     ) -> VideoTrackDescriptor {
         VideoTrackDescriptor(
@@ -195,7 +207,8 @@ final class MediaGenerationTests: XCTestCase {
             width: width,
             height: height,
             videoDelay: videoDelay,
-            extradata: extradata
+            extradata: extradata,
+            frameRate: frameRate
         )
     }
 

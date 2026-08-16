@@ -41,6 +41,7 @@ public final class PlaybackReadinessGate {
     private var audio: AudioSnapshot?
     private var video: VideoSnapshot?
     private var waitingForDisplayModeEnd = false
+    private var audioOnlyOpen = false
 
     public private(set) var isOpen = false
     public private(set) var cycleID: UInt64
@@ -127,6 +128,42 @@ public final class PlaybackReadinessGate {
         reevaluate()
     }
 
+    /// Opens the shared clock for a session that has no video timeline. Audio
+    /// readiness still needs the same rate-one anchor as the A/V path; the
+    /// absence of video only removes the frame-coverage veto.
+    @discardableResult
+    func openAudioOnly(firstPTS: CMTime) -> Bool {
+        guard !isOpen,
+              !waitingForDisplayModeEnd,
+              firstPTS.isNumeric else { return isOpen }
+        let anchorPTS: CMTime
+        if let floor = minimumRecoveryAnchorPTS {
+            guard let audio else { return false }
+            let audioEnd = CMTimeAdd(audio.firstPTS, audio.contiguousDuration)
+            guard audioEnd.isNumeric,
+                  CMTimeCompare(audio.firstPTS, floor) <= 0,
+                  CMTimeCompare(floor, audioEnd) < 0 else { return false }
+            anchorPTS = CMTimeCompare(firstPTS, floor) >= 0 ? firstPTS : floor
+        } else {
+            anchorPTS = firstPTS
+        }
+        let openingCycle = cycleID
+        guard prepareAnchorVeto?(anchorPTS) != false,
+              cycleID == openingCycle,
+              !isOpen,
+              !waitingForDisplayModeEnd else { return false }
+        let anchorHostTime = CMTimeAdd(
+            hostTimeProvider(),
+            CMTime(value: 100, timescale: 1_000)
+        )
+        guard anchorHostTime.isNumeric else { return false }
+        clock.anchor(mediaTime: anchorPTS, atHostTime: anchorHostTime, rate: 1)
+        minimumRecoveryAnchorPTS = nil
+        audioOnlyOpen = true
+        isOpen = true
+        return true
+    }
+
     /// Updates count-only video availability. This can keep an already-open
     /// gate healthy, but cannot establish initial readiness because it carries
     /// no frame durations with which to prove audio interval coverage.
@@ -203,6 +240,7 @@ public final class PlaybackReadinessGate {
         }
         clock.pause()
         isOpen = false
+        audioOnlyOpen = false
         if cycleID < UInt64.max {
             cycleID += 1
         }
@@ -242,6 +280,7 @@ public final class PlaybackReadinessGate {
         guard anchorHostTime.isNumeric else { return false }
         clock.anchor(mediaTime: commonPTS, atHostTime: anchorHostTime, rate: 1)
         minimumRecoveryAnchorPTS = nil
+        audioOnlyOpen = false
         isOpen = true
         return true
     }
@@ -275,6 +314,10 @@ public final class PlaybackReadinessGate {
     // by `updateAudio`/`updateVideo`, and the frame-count floor below catches
     // video starvation.
     private func canRemainOpen() -> Bool {
+        if audioOnlyOpen {
+            guard let audio else { return false }
+            return CMTimeAdd(audio.firstPTS, audio.contiguousDuration).isNumeric
+        }
         guard let audio, let video,
               video.readyFrameCount >= requiredVideoFrameCount else { return false }
         return CMTimeAdd(audio.firstPTS, audio.contiguousDuration).isNumeric

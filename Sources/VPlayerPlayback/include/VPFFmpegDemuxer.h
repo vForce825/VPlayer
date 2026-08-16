@@ -67,6 +67,8 @@ typedef struct {
     VPFFCodec codec;
     int32_t time_base_num;
     int32_t time_base_den;
+    int32_t frame_rate_num;
+    int32_t frame_rate_den;
     int32_t width;
     int32_t height;
     int32_t video_delay;

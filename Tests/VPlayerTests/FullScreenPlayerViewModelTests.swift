@@ -11,19 +11,160 @@ import XCTest
 
 @MainActor
 final class FullScreenPlayerViewModelTests: XCTestCase {
+    func testPlayerOverlayUsesOneThreeSecondSteadyPlaybackTimeout() {
+        let request = makeRequest()
+
+        XCTAssertEqual(PlayerControlsVisibilityPolicy.idleTimeout, .seconds(3))
+        XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .playing(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .preparing(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .paused(request)))
+    }
+
     func testTransportControlsAutoHideOnlyDuringSteadyPlayback() {
         let request = makeRequest()
         let failure = PlaybackFailure(code: "demux.open", userMessage: "failed")
 
-        // Only steady playback may fade the overlay away; every state where the
-        // viewer still needs the controls keeps them pinned on screen.
+        // Steady playback is timed; preparing and paused are pinned. Terminal
+        // states must remove the transport and channel overlays entirely.
         XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .playing(request)))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .idle))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .preparing(request)))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .paused(request)))
-        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .stopped))
-        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .failed(failure)))
+        XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .stopped))
+        XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .failed(failure)))
         XCTAssertGreaterThan(PlayerControlsVisibilityPolicy.idleTimeout, .zero)
+    }
+
+    func testOverlayVisibilityModeSeparatesHiddenPinnedAndTimedStates() {
+        let request = makeRequest()
+        let failure = PlaybackFailure(code: "demux.open", userMessage: "failed")
+
+        XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .failed(failure)),
+            .hidden
+        )
+        XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .stopped),
+            .hidden
+        )
+        XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .preparing(request)),
+            .pinned
+        )
+        XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .paused(request)),
+            .pinned
+        )
+        XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .playing(request)),
+            .timed
+        )
+        XCTAssertFalse(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .failed(failure))
+        )
+        XCTAssertFalse(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .stopped)
+        )
+        XCTAssertTrue(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .preparing(request))
+        )
+        XCTAssertTrue(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .paused(request))
+        )
+        XCTAssertTrue(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .playing(request))
+        )
+    }
+
+    func testAutoHideStateChangesKeyForTerminalStateWakeAndMediaEvents() {
+        var state = PlayerControlsVisibilityState(mode: .timed, wakeRevision: 7)
+        let playingKey = state.key
+
+        XCTAssertTrue(state.isVisible)
+        XCTAssertTrue(PlayerControlsAutoHidePolicy.shouldSleep(for: playingKey))
+        XCTAssertTrue(
+            PlayerControlsAutoHidePolicy.shouldHide(after: playingKey, current: playingKey)
+        )
+
+        state.apply(.stateChanged(.pinned))
+        let pausedKey = state.key
+        XCTAssertNotEqual(pausedKey, playingKey)
+        XCTAssertTrue(state.isVisible)
+        XCTAssertFalse(PlayerControlsAutoHidePolicy.shouldSleep(for: pausedKey))
+        XCTAssertFalse(
+            PlayerControlsAutoHidePolicy.shouldHide(after: playingKey, current: pausedKey)
+        )
+        state.apply(.stateChanged(.pinned))
+        XCTAssertEqual(state.key, pausedKey)
+        state.apply(.mediaInformationBecameAvailable)
+        XCTAssertEqual(state.key, pausedKey)
+
+        state.apply(.stateChanged(.hidden))
+        let stoppedKey = state.key
+        XCTAssertNotEqual(stoppedKey, pausedKey)
+        XCTAssertFalse(state.isVisible)
+        XCTAssertFalse(PlayerControlsAutoHidePolicy.shouldSleep(for: stoppedKey))
+
+        state.apply(.stateChanged(.timed))
+        let resumedKey = state.key
+        XCTAssertTrue(state.isVisible)
+        state.apply(.mediaInformationBecameAvailable)
+        let mediaReadyKey = state.key
+        XCTAssertNotEqual(mediaReadyKey, resumedKey)
+        state.apply(.userInteraction)
+        XCTAssertNotEqual(state.key, mediaReadyKey)
+        XCTAssertTrue(state.isVisible)
+    }
+
+    func testVisibilityReducerKeepsPinnedInteractionVisibleWithoutStartingATimer() {
+        var state = PlayerControlsVisibilityState(mode: .pinned, wakeRevision: 11)
+        let pinnedKey = state.key
+
+        state.apply(.userInteraction)
+
+        XCTAssertEqual(state.key, pinnedKey)
+        XCTAssertTrue(state.isVisible)
+        XCTAssertFalse(PlayerControlsAutoHidePolicy.shouldSleep(for: state.key))
+    }
+
+    func testTimeoutCompletionOnlyHidesTheCurrentTimedKey() {
+        var state = PlayerControlsVisibilityState(mode: .timed, wakeRevision: 3)
+        let originalKey = state.key
+
+        state.apply(.userInteraction)
+        let currentKey = state.key
+        XCTAssertNotEqual(currentKey, originalKey)
+
+        state.apply(.timeoutCompleted(originalKey))
+        XCTAssertTrue(state.isVisible)
+
+        state.apply(.timeoutCompleted(currentKey))
+        XCTAssertFalse(state.isVisible)
+
+        state.apply(.stateChanged(.pinned))
+        state.apply(.timeoutCompleted(currentKey))
+        XCTAssertTrue(state.isVisible)
+
+        state.apply(.stateChanged(.hidden))
+        state.apply(.timeoutCompleted(currentKey))
+        XCTAssertFalse(state.isVisible)
+    }
+
+    func testPlayPauseCommandWakesBeforeTogglingPlayback() {
+        var wakeRevision = 0
+        var events: [String] = []
+
+        PlayerControlsCommandPolicy.handlePlayPause(
+            wake: {
+                wakeRevision += 1
+                events.append("wake:\(wakeRevision)")
+            },
+            toggle: {
+                events.append("toggle:\(wakeRevision)")
+            }
+        )
+
+        XCTAssertEqual(events, ["wake:1", "toggle:1"])
     }
 
     func testIdleTimerIsDisabledOnlyWhilePreparingOrPlaying() {
@@ -71,6 +212,121 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertEqual(Array(log.values.prefix(4)), [
             "events", "notices", "play", "presentation",
         ])
+    }
+
+    func testMediaInformationSubscriptionClearsOnRetryAndStop() async throws {
+        let media = ViewModelMediaInformationFeed()
+        let model = FullScreenPlayerViewModel(
+            request: makeRequest(),
+            engine: ViewModelPlaybackEngine(log: .init()),
+            presentationProvider: { nil },
+            mediaInformationProvider: { await media.stream() },
+            settings: makeSettings()
+        )
+        model.start()
+        await media.emit(PlaybackMediaInformation(
+            width: 1_920,
+            height: 1_080,
+            scanMode: .interlaced,
+            sourceFrameRate: MediaRational(num: 25, den: 1),
+            outputFrameRate: 50,
+            isSmoothMotionEnhanced: true
+        ))
+        try await eventually { model.mediaInformation?.width == 1_920 }
+
+        model.retry()
+        try await eventually { model.mediaInformation == nil }
+
+        await model.stop()
+        XCTAssertNil(model.mediaInformation)
+    }
+
+    func testMediaInformationWaitsForCurrentPlayClearBoundaryBeforeAcceptingSnapshot() async throws {
+        let media = ViewModelMediaGenerationFeed(previous: mediaInformation(width: 1_280))
+        let playGate = ViewModelAsyncGate()
+        let retryGate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(
+            suspendedPlayCall: 1,
+            playGate: playGate,
+            playGates: [2: retryGate],
+            playCompletion: { await media.markPlayCompleted() }
+        )
+        let model = FullScreenPlayerViewModel(
+            request: makeRequest(),
+            engine: engine,
+            presentationProvider: { nil },
+            mediaInformationProvider: { await media.stream() },
+            settings: makeSettings()
+        )
+
+        model.start()
+        try await eventually { await playGate.hasWaiter }
+
+        XCTAssertNil(model.mediaInformation)
+
+        await playGate.open()
+        try await eventually { await media.hasSubscriber }
+        await media.emit(mediaInformation(width: 1_920))
+        try await eventually { model.mediaInformation?.width == 1_920 }
+
+        await media.prepareNextPlay()
+        model.retry()
+        try await eventually { await retryGate.hasWaiter }
+        XCTAssertNil(model.mediaInformation)
+
+        await retryGate.open()
+        try await eventually { await media.hasSubscriber }
+        await media.emit(mediaInformation(width: 3_840))
+        try await eventually { model.mediaInformation?.width == 3_840 }
+    }
+
+    func testStopMarksViewModelStoppedAndHidesMediaImmediately() async throws {
+        let media = ViewModelMediaInformationFeed()
+        let engine = ViewModelPlaybackEngine(log: .init())
+        let model = FullScreenPlayerViewModel(
+            request: makeRequest(),
+            engine: engine,
+            presentationProvider: { nil },
+            mediaInformationProvider: { await media.stream() },
+            settings: makeSettings()
+        )
+
+        model.start()
+        try await eventually { await engine.playCount == 1 }
+        await media.emit(mediaInformation(width: 1_920))
+        try await eventually { model.mediaInformation != nil }
+
+        await model.stop()
+
+        XCTAssertEqual(model.state, .stopped)
+        XCTAssertNil(model.mediaInformation)
+    }
+
+    func testStopDoesNotWaitForNonCooperativeMediaInformationProvider() async throws {
+        let provider = ViewModelNonCooperativeMediaInformationProvider()
+        let engine = ViewModelPlaybackEngine(log: .init())
+        let model = FullScreenPlayerViewModel(
+            request: makeRequest(),
+            engine: engine,
+            presentationProvider: { nil },
+            mediaInformationProvider: { await provider.stream() },
+            settings: makeSettings()
+        )
+        let stopFinished = ViewModelFlag()
+
+        model.start()
+        try await eventually { await provider.hasWaiter }
+        let stop = Task {
+            await model.stop()
+            stopFinished.set()
+        }
+
+        let finishedWithoutProvider = await waitUntil { stopFinished.value }
+        XCTAssertTrue(finishedWithoutProvider)
+
+        await provider.release()
+        await stop.value
+        XCTAssertNil(model.mediaInformation)
     }
 
     func testPauseRetryAndStopExactlyOnce() async throws {
@@ -353,12 +609,33 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         )
     }
 
+    private func mediaInformation(width: Int32) -> PlaybackMediaInformation {
+        PlaybackMediaInformation(
+            width: width,
+            height: 1_080,
+            scanMode: .progressive,
+            sourceFrameRate: MediaRational(num: 25, den: 1),
+            outputFrameRate: 25,
+            isSmoothMotionEnhanced: false
+        )
+    }
+
     private func eventually(_ predicate: @escaping () async -> Bool) async throws {
         for _ in 0..<200 {
             if await predicate() { return }
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("condition not reached")
+    }
+
+    private func waitUntil(
+        _ predicate: @escaping () async -> Bool
+    ) async -> Bool {
+        for _ in 0..<100 {
+            if await predicate() { return true }
+            await Task.yield()
+        }
+        return false
     }
 }
 
@@ -457,6 +734,8 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     private let stopGate: ViewModelAsyncGate?
     private let suspendedPlayCall: Int?
     private let playGate: ViewModelAsyncGate?
+    private let playGates: [Int: ViewModelAsyncGate]
+    private let playCompletion: (@Sendable () async -> Void)?
     private let suspendedTuningCall: Int?
     private let tuningGate: ViewModelAsyncGate?
     private let pauseGate: ViewModelAsyncGate?
@@ -475,6 +754,8 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         stopGate: ViewModelAsyncGate? = nil,
         suspendedPlayCall: Int? = nil,
         playGate: ViewModelAsyncGate? = nil,
+        playGates: [Int: ViewModelAsyncGate] = [:],
+        playCompletion: (@Sendable () async -> Void)? = nil,
         suspendedTuningCall: Int? = nil,
         tuningGate: ViewModelAsyncGate? = nil,
         pauseGate: ViewModelAsyncGate? = nil
@@ -483,6 +764,8 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         self.stopGate = stopGate
         self.suspendedPlayCall = suspendedPlayCall
         self.playGate = playGate
+        self.playGates = playGates
+        self.playCompletion = playCompletion
         self.suspendedTuningCall = suspendedTuningCall
         self.tuningGate = tuningGate
         self.pauseGate = pauseGate
@@ -514,7 +797,9 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         playCount += 1
         let call = playCount
         operations.append("play:\(call):start")
-        if suspendedPlayCall == call, let playGate { await playGate.wait() }
+        let gate = playGates[call] ?? (suspendedPlayCall == call ? playGate : nil)
+        if let gate { await gate.wait() }
+        if let playCompletion { await playCompletion() }
         operations.append("play:\(call):end")
     }
 
@@ -576,6 +861,74 @@ private final class ViewModelOperationLog: @unchecked Sendable {
     private var storedValues: [String] = []
     var values: [String] { lock.withLock { storedValues } }
     func append(_ value: String) { lock.withLock { storedValues.append(value) } }
+}
+
+private actor ViewModelMediaInformationFeed {
+    private let pair = AsyncStream.makeStream(of: PlaybackMediaInformation?.self)
+
+    func stream() -> AsyncStream<PlaybackMediaInformation?> {
+        pair.stream
+    }
+
+    func emit(_ information: PlaybackMediaInformation?) {
+        pair.continuation.yield(information)
+    }
+}
+
+private actor ViewModelMediaGenerationFeed {
+    private let previous: PlaybackMediaInformation
+    private var pair: (stream: AsyncStream<PlaybackMediaInformation?>,
+                       continuation: AsyncStream<PlaybackMediaInformation?>.Continuation)?
+    private var playCompleted = false
+
+    init(previous: PlaybackMediaInformation) {
+        self.previous = previous
+    }
+
+    var hasSubscriber: Bool { pair != nil }
+
+    func stream() -> AsyncStream<PlaybackMediaInformation?> {
+        let next = AsyncStream.makeStream(of: PlaybackMediaInformation?.self)
+        pair = next
+        if playCompleted {
+            next.continuation.yield(nil)
+        } else {
+            next.continuation.yield(previous)
+        }
+        return next.stream
+    }
+
+    func markPlayCompleted() {
+        playCompleted = true
+        pair?.continuation.yield(nil)
+    }
+
+    func prepareNextPlay() {
+        playCompleted = false
+        pair = nil
+    }
+
+    func emit(_ information: PlaybackMediaInformation?) {
+        pair?.continuation.yield(information)
+    }
+}
+
+private actor ViewModelNonCooperativeMediaInformationProvider {
+    private var continuation: CheckedContinuation<AsyncStream<PlaybackMediaInformation?>, Never>?
+
+    var hasWaiter: Bool { continuation != nil }
+
+    func stream() async -> AsyncStream<PlaybackMediaInformation?> {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        let pair = AsyncStream.makeStream(of: PlaybackMediaInformation?.self)
+        continuation?.resume(returning: pair.stream)
+        continuation = nil
+    }
 }
 
 private actor ViewModelPlaybackEngine: PlaybackEngine {

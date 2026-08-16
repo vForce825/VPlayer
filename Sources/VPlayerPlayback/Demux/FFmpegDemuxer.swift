@@ -475,7 +475,11 @@ private enum RawDemuxEventCopier {
                     width: raw.width,
                     height: raw.height,
                     videoDelay: raw.video_delay,
-                    extradata: extradata
+                    extradata: extradata,
+                    frameRate: MediaRational(
+                        num: raw.frame_rate_num,
+                        den: raw.frame_rate_den
+                    )
                 ),
                 audio: nil,
                 byteCount: extradata.count

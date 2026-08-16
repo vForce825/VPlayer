@@ -12,21 +12,108 @@ enum FullScreenPlayerLifecyclePolicy {
     }
 }
 
-/// Decides when the transport controls may fade away over live video.
-///
-/// Controls stay pinned whenever the viewer still needs them on screen — while
-/// preparing, paused, or stopped — and only auto-hide during steady playback so
-/// a static overlay never sits on the panel indefinitely.
+/// Decides when the transport controls and channel information card are mounted
+/// and whether they are pinned or owned by the single playback auto-hide task.
 enum PlayerControlsVisibilityPolicy {
-    static let idleTimeout = Duration.seconds(5)
+    enum Mode: Equatable, Sendable {
+        case hidden
+        case pinned
+        case timed
+    }
+
+    static let idleTimeout = Duration.seconds(3)
+
+    static func mode(for state: PlaybackState) -> Mode {
+        switch state {
+        case .idle, .preparing, .paused:
+            .pinned
+        case .playing:
+            .timed
+        case .stopped, .failed:
+            .hidden
+        }
+    }
+
+    static func mountsOverlays(for state: PlaybackState) -> Bool {
+        mountsOverlays(for: mode(for: state))
+    }
+
+    static func mountsOverlays(for mode: Mode) -> Bool {
+        mode != .hidden
+    }
 
     static func staysVisible(for state: PlaybackState) -> Bool {
-        switch state {
-        case .playing:
-            false
-        case .idle, .preparing, .paused, .stopped, .failed:
-            true
+        mode(for: state) == .pinned
+    }
+}
+
+enum PlayerControlsVisibilityEvent: Equatable, Sendable {
+    case stateChanged(PlayerControlsVisibilityPolicy.Mode)
+    case userInteraction
+    case mediaInformationBecameAvailable
+    case timeoutCompleted(PlayerControlsAutoHideKey)
+}
+
+struct PlayerControlsAutoHideKey: Equatable, Sendable {
+    let mode: PlayerControlsVisibilityPolicy.Mode
+    let wakeRevision: UInt64
+}
+
+struct PlayerControlsVisibilityState: Equatable, Sendable {
+    private(set) var mode: PlayerControlsVisibilityPolicy.Mode
+    private(set) var wakeRevision: UInt64
+    private(set) var isVisible: Bool
+
+    init(
+        mode: PlayerControlsVisibilityPolicy.Mode,
+        wakeRevision: UInt64 = 0
+    ) {
+        self.mode = mode
+        self.wakeRevision = wakeRevision
+        isVisible = mode != .hidden
+    }
+
+    var key: PlayerControlsAutoHideKey {
+        PlayerControlsAutoHideKey(mode: mode, wakeRevision: wakeRevision)
+    }
+
+    mutating func apply(_ event: PlayerControlsVisibilityEvent) {
+        switch event {
+        case let .stateChanged(nextMode):
+            guard mode != nextMode else { return }
+            mode = nextMode
+            isVisible = nextMode != .hidden
+        case .userInteraction, .mediaInformationBecameAvailable:
+            guard mode == .timed else { return }
+            isVisible = true
+            wakeRevision &+= 1
+        case let .timeoutCompleted(completedKey):
+            guard mode == .timed, key == completedKey else { return }
+            isVisible = false
         }
+    }
+}
+
+enum PlayerControlsAutoHidePolicy {
+    static func shouldSleep(for key: PlayerControlsAutoHideKey) -> Bool {
+        key.mode == .timed
+    }
+
+    static func shouldHide(
+        after key: PlayerControlsAutoHideKey,
+        current: PlayerControlsAutoHideKey
+    ) -> Bool {
+        key.mode == .timed && key == current
+    }
+}
+
+enum PlayerControlsCommandPolicy {
+    static func handlePlayPause(
+        wake: () -> Void,
+        toggle: () -> Void
+    ) {
+        wake()
+        toggle()
     }
 }
 
@@ -51,20 +138,15 @@ struct FullScreenPlayerView: View {
         case settings
     }
 
-    private struct ControlsAutoHideKey: Equatable {
-        let wake: Int
-        let pinned: Bool
-    }
-
     @State private var model: FullScreenPlayerViewModel
     @State private var showsSettings = false
     @State private var isClosing = false
-    @State private var controlsIdleHidden = false
-    @State private var controlsWakeCount = 0
+    @State private var controlsVisibility = PlayerControlsVisibilityState(mode: .pinned)
     #if DEBUG
     @State private var acceptanceMetricsJSON = "unavailable"
     #endif
     @FocusState private var failureFocus: FailureControl?
+    private let channelPresentation: PlayerChannelPresentation
     private let settings: PlaybackSettingsStore
     private let metricsProvider: AppDependencies.PlaybackMetricsProvider
     private let acceptanceMetricsEnabled: Bool
@@ -72,19 +154,22 @@ struct FullScreenPlayerView: View {
     private let onDismiss: () -> Void
 
     init(
-        request: PlaybackRequest,
+        channelPresentation: PlayerChannelPresentation,
         engine: any PlaybackEngine,
         presentationProvider: @escaping FullScreenPlayerViewModel.PresentationProvider,
+        mediaInformationProvider: @escaping FullScreenPlayerViewModel.MediaInformationProvider,
         metricsProvider: @escaping AppDependencies.PlaybackMetricsProvider,
         acceptanceMetricsEnabled: Bool,
         acceptanceStateEnabled: Bool,
         settings: PlaybackSettingsStore,
         onDismiss: @escaping () -> Void
     ) {
+        self.channelPresentation = channelPresentation
         _model = State(initialValue: FullScreenPlayerViewModel(
-            request: request,
+            request: channelPresentation.request,
             engine: engine,
             presentationProvider: presentationProvider,
+            mediaInformationProvider: mediaInformationProvider,
             settings: settings
         ))
         self.settings = settings
@@ -95,7 +180,7 @@ struct FullScreenPlayerView: View {
     }
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .topTrailing) {
             // fullScreenCover is transparent on tvOS. Keep an opaque backing
             // below Metal even after its context exists, because the drawable
             // has no video content until the first frame is presented.
@@ -109,6 +194,13 @@ struct FullScreenPlayerView: View {
             Color.clear
                 .accessibilityElement(children: .ignore)
                 .accessibilityIdentifier("player-full-screen")
+                .allowsHitTesting(false)
+                .focusable(false)
+
+            Color.clear
+                .accessibilityElement(children: .ignore)
+                .accessibilityIdentifier("player-controls-visibility")
+                .accessibilityValue(controlsVisibility.isVisible ? "visible" : "hidden")
                 .allowsHitTesting(false)
                 .focusable(false)
 
@@ -134,6 +226,17 @@ struct FullScreenPlayerView: View {
             }
             #endif
 
+            if shouldMountTransportOverlays {
+                PlayerChannelInfoOverlay(
+                    presentation: channelPresentation,
+                    mediaInformation: model.mediaInformation
+                )
+                .padding(.top, 36)
+                .padding(.trailing, 56)
+                .opacity(controlsAreVisible ? 1 : 0)
+                .animation(.easeInOut(duration: 0.3), value: controlsAreVisible)
+            }
+
             statusOverlay
 
             if let notice = model.visibleNotice {
@@ -141,33 +244,37 @@ struct FullScreenPlayerView: View {
                     .transition(.opacity)
             }
 
-            if !hasFailure {
+            if shouldMountTransportOverlays {
                 PlayerControlsOverlay(
-                    title: model.request.title,
                     isPaused: model.isPaused,
                     onBack: close,
                     onPlayPause: model.togglePause,
-                    onSettings: { showsSettings = true }
+                    onSettings: { showsSettings = true },
+                    onInteraction: wakeControls
                 )
-                // Faded rather than removed so the focus engine keeps a target
-                // and the controls stay reachable to the remote at any moment.
                 .opacity(controlsAreVisible ? 1 : 0)
                 .animation(.easeInOut(duration: 0.3), value: controlsAreVisible)
             }
         }
         .onMoveCommand { _ in
-            controlsWakeCount &+= 1
+            wakeControls()
         }
-        .task(id: ControlsAutoHideKey(
-            wake: controlsWakeCount,
-            pinned: controlsArePinned
-        )) {
-            await runControlsAutoHide()
+        .task(id: controlsAutoHideKey) {
+            await runControlsAutoHide(for: controlsAutoHideKey)
         }
         .task { model.start() }
         .onChange(of: model.state, initial: true) { _, state in
+            controlsVisibility.apply(
+                .stateChanged(PlayerControlsVisibilityPolicy.mode(for: state))
+            )
             UIApplication.shared.isIdleTimerDisabled =
                 PlaybackIdleTimerPolicy.isDisabled(for: state)
+        }
+        .onChange(of: model.mediaInformation) { oldValue, newValue in
+            guard oldValue == nil, newValue != nil, controlsVisibilityMode == .timed else {
+                return
+            }
+            wakeControls()
         }
         #if DEBUG
         .task { await publishAcceptanceMetrics() }
@@ -179,7 +286,12 @@ struct FullScreenPlayerView: View {
             UIApplication.shared.isIdleTimerDisabled = false
             Task { await model.stop() }
         }
-        .onPlayPauseCommand(perform: model.togglePause)
+        .onPlayPauseCommand {
+            PlayerControlsCommandPolicy.handlePlayPause(
+                wake: wakeControls,
+                toggle: model.togglePause
+            )
+        }
         .onExitCommand(perform: close)
         .sheet(isPresented: $showsSettings) {
             PlaybackSettingsView(settings: settings)
@@ -215,32 +327,38 @@ struct FullScreenPlayerView: View {
         }
     }
 
-    private var hasFailure: Bool {
-        if case .failed = model.state { return true }
-        return false
+    private var controlsVisibilityMode: PlayerControlsVisibilityPolicy.Mode {
+        controlsVisibility.mode
     }
 
-    private var controlsArePinned: Bool {
-        PlayerControlsVisibilityPolicy.staysVisible(for: model.state)
+    private var shouldMountTransportOverlays: Bool {
+        PlayerControlsVisibilityPolicy.mountsOverlays(for: controlsVisibilityMode)
+    }
+
+    private var controlsAutoHideKey: PlayerControlsAutoHideKey {
+        controlsVisibility.key
     }
 
     private var controlsAreVisible: Bool {
-        controlsArePinned || !controlsIdleHidden
+        controlsVisibility.isVisible
+    }
+
+    private func wakeControls() {
+        controlsVisibility.apply(.userInteraction)
     }
 
     /// Re-shows the controls, then fades them out again after an idle period of
     /// uninterrupted playback. Restarted whenever the viewer moves on the remote
     /// or playback leaves the steady playing state.
-    private func runControlsAutoHide() async {
-        controlsIdleHidden = false
-        guard !controlsArePinned else { return }
+    private func runControlsAutoHide(for key: PlayerControlsAutoHideKey) async {
+        guard PlayerControlsAutoHidePolicy.shouldSleep(for: key) else { return }
         do {
             try await Task.sleep(for: PlayerControlsVisibilityPolicy.idleTimeout)
         } catch {
             return
         }
         guard !Task.isCancelled else { return }
-        controlsIdleHidden = true
+        controlsVisibility.apply(.timeoutCompleted(key))
     }
 
     private func close() {

@@ -11,6 +11,10 @@ import VideoToolbox
 
 enum PlaybackPipelineEvent: Sendable, Equatable {
     case ready(readinessCycle: UInt64)
+    // The generation defaults to nil for lightweight test/integration fakes;
+    // real pipelines always provide it so a late format result can never
+    // replace a newer media snapshot in the controller.
+    case mediaInformation(PlaybackMediaInformation?, generation: MediaGeneration? = nil)
     case stopped
     case failed(PlaybackCoreError)
 }
@@ -256,6 +260,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private var audioFormat: CMAudioFormatDescription?
     private var audioCodec: AudioCodec?
     private var videoAdmissionOpen = false
+    private var mediaInformation: PlaybackMediaInformation?
+    private var mediaInformationGeneration: MediaGeneration?
+    private var outputCadenceDurations: [CMTime] = []
     private var paused = false
     private var started = false
     private var terminal = false
@@ -303,6 +310,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         processor: any VideoFrameProcessing,
         yadifProcessor: any YADIFFrameProcessing,
         scanProbe: (any LumaScanProbing)? = nil,
+        classifierConfiguration: ScanClassifierConfiguration = .init(),
         tuning: PlaybackTuning = .default,
         videoDecodeStallTimeout: DispatchTimeInterval = .seconds(1),
         rawReadinessRequirementOverride: Int? = nil,
@@ -334,6 +342,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             yadif: yadifProcessor,
             probe: scanProbe,
             initialGeneration: generationController.current,
+            classifierConfiguration: classifierConfiguration,
             rawReadinessRequirementOverride: rawReadinessRequirementOverride,
             metrics: metrics,
             signposts: signposts,
@@ -529,7 +538,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         guard !started, !terminal else { return }
         started = true
         readiness = PlaybackReadinessGate(clock: clock, prepareAnchorVeto: { [weak self] commonPTS in
-            self?.prepareAnchorIsolated(commonPTS: commonPTS) == true
+            guard let self else { return false }
+            return prepareAnchorIsolated(commonPTS: commonPTS)
         })
         readiness?.setMaximumAnchorLag(tuning.maximumAnchorLag)
         readiness?.configure(requiredVideoFrameCount: videoCoordinator.requiredVideoFrameCount)
@@ -626,7 +636,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         discontinuity: Bool
     ) throws {
         assertIsolated()
-        guard newTracks.video != nil else { throw PlaybackCoreError.unsupportedVideoCodec }
         guard newTracks.audio != nil else { throw PlaybackCoreError.unsupportedAudioCodec }
         if let tracks, tracks == newTracks, !discontinuity { return }
 
@@ -634,16 +643,20 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             beginTrackEpochIsolated()
             let sharedState = AssemblyFormatState(trackSet: newTracks)
             formatState = sharedState
-            videoAssembler = try assemblerBuilder.makeVideo(
-                trackSet: newTracks,
-                generationProvider: { [weak self] in
-                    guard let self else { return MediaGeneration(rawValue: 0) }
-                    self.assertIsolated()
-                    return self.generationController.current
-                },
-                eventSink: { [weak self] event in self?.receive(video: event) },
-                formatState: sharedState
-            )
+            if newTracks.video != nil {
+                videoAssembler = try assemblerBuilder.makeVideo(
+                    trackSet: newTracks,
+                    generationProvider: { [weak self] in
+                        guard let self else { return MediaGeneration(rawValue: 0) }
+                        self.assertIsolated()
+                        return self.generationController.current
+                    },
+                    eventSink: { [weak self] event in self?.receive(video: event) },
+                    formatState: sharedState
+                )
+            } else {
+                videoAssembler = nil
+            }
             audioAssembler = try assemblerBuilder.makeAudio(
                 trackSet: newTracks,
                 generationProvider: { [weak self] in
@@ -1221,6 +1234,15 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             for frame in frames where generationController.accepts(frame.generation) {
                 videoDecodeBufferHorizon = effectiveVideoBufferHorizon(for: frame)
                 updateMaximumAnchorLagIsolated(for: frame)
+                if frame.duration.isNumeric,
+                   CMTimeCompare(frame.duration, .zero) > 0 {
+                    outputCadenceDurations.append(frame.duration)
+                    if outputCadenceDurations.count > 7 {
+                        outputCadenceDurations.removeFirst(
+                            outputCadenceDurations.count - 7
+                        )
+                    }
+                }
                 if readiness?.isOpen == true {
                     renderer.enqueue(frame)
                 }
@@ -1251,6 +1273,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             }
             metrics?.recordProcessedVideo(latestPTS: retainedVideo.last?.presentationTimeStamp)
             boundRetainedVideoIsolated()
+            publishMediaInformationIfReadyIsolated()
             updateReadinessIsolated()
         case let .failure(failure):
             failIsolated(.metalCommand(failure.code))
@@ -1261,12 +1284,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         latestEventFingerprint fingerprint: MediaFormatFingerprint
     ) throws {
         assertIsolated()
+        let hasVideo = tracks?.video != nil
         if awaitingFreshTrackEpoch {
-            guard freshVideoFormatArrived,
-                  freshAudioFormatArrived,
-                  videoFormat != nil,
+            guard freshAudioFormatArrived,
                   audioFormat != nil,
                   audioCodec != nil else { return }
+            if hasVideo {
+                guard freshVideoFormatArrived, videoFormat != nil else { return }
+            }
             consumedFingerprint = fingerprint
             if trackEpochAlreadyAdvanced {
                 try configureCurrentGenerationIsolated()
@@ -1299,6 +1324,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         audioCodec = nil
         trackEpochAlreadyAdvanced = false
         hasOpenedReadinessForCurrentMedia = false
+        clearMediaInformationIsolated(publish: true)
+        outputCadenceDurations.removeAll(keepingCapacity: true)
         cancelPendingVideoDrainIsolated()
         pendingTrackVideo.removeAll(keepingCapacity: true)
         pendingTrackAudio.removeAll(keepingCapacity: true)
@@ -1312,17 +1339,23 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func configureCurrentGenerationIsolated() throws {
         assertIsolated()
-        guard let videoFormat, let audioFormat, let audioCodec else { return }
+        guard let audioFormat, let audioCodec else { return }
         let generation = generationController.current
-        videoCoordinator.installFormatForCurrentGeneration(videoFormat)
+        if let videoFormat {
+            videoCoordinator.installFormatForCurrentGeneration(videoFormat)
+        }
         try audio.configure(format: audioFormat, codec: audioCodec, generation: generation)
         mediaAdmissionOpen = true
-        videoAdmissionOpen = true
+        videoAdmissionOpen = videoFormat != nil
     }
 
     private func forceAdvanceGenerationIsolated() throws {
         assertIsolated()
-        videoCoordinator.beginDiscontinuity()
+        if tracks?.video != nil {
+            videoCoordinator.beginDiscontinuity()
+        } else {
+            _ = generationController.forceAdvance()
+        }
         guard !terminal else { return }
         mediaAdmissionOpen = false
         videoAdmissionOpen = false
@@ -1330,14 +1363,28 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func rebuildForCurrentFormatsIsolated() throws {
         assertIsolated()
-        guard let videoFormat, let audioFormat, let audioCodec else { return }
-        videoCoordinator.replaceFormat(videoFormat)
-        guard !terminal else { return }
+        guard let audioFormat, let audioCodec else { return }
+        clearMediaInformationIsolated(publish: true)
+        outputCadenceDurations.removeAll(keepingCapacity: true)
+        if let videoFormat {
+            videoCoordinator.replaceFormat(videoFormat)
+            guard !terminal else { return }
+        } else {
+            _ = generationController.forceAdvance()
+            readiness?.closeForTimelineReset(.discontinuity)
+            hasOpenedReadinessForCurrentMedia = false
+            mediaInformation = nil
+            mediaInformationGeneration = nil
+            outputCadenceDurations.removeAll(keepingCapacity: true)
+            retainedAudio.removeAll(keepingCapacity: true)
+            retainedVideo.removeAll(keepingCapacity: true)
+            readyPublished = false
+        }
         let generation = generationController.current
         try audio.configure(format: audioFormat, codec: audioCodec, generation: generation)
         guard !terminal else { return }
         mediaAdmissionOpen = true
-        videoAdmissionOpen = true
+        videoAdmissionOpen = videoFormat != nil
     }
 
     private func closeCoordinatorAdmissionIsolated() {
@@ -1358,6 +1405,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     ) {
         assertIsolated()
         clock.pause()
+        clearMediaInformationIsolated(publish: true)
+        outputCadenceDurations.removeAll(keepingCapacity: true)
         switch resetScope {
         case .timeline:
             readiness?.closeForTimelineReset(.discontinuity)
@@ -1397,6 +1446,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         readiness?.close(.buffering)
         readiness?.configure(requiredVideoFrameCount: requiredVideoFrameCount)
         readyPublished = false
+        clearMediaInformationIsolated(publish: true)
+        outputCadenceDurations.removeAll(keepingCapacity: true)
         preparedAnchor = nil
         retainedVideo.removeAll(keepingCapacity: true)
         renderer.flush(to: generationController.current)
@@ -1458,6 +1509,20 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func updateReadinessIsolated() {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
+        if tracks?.video == nil {
+            updateAudioOnlyReadinessIsolated()
+            updateReadinessDiagnosticsIsolated(readiness)
+            return
+        }
+        guard videoCoordinator.isClassificationResolved,
+              mediaInformation != nil,
+              mediaInformationGeneration == generationController.current else {
+            // Classification and media metadata are admission prerequisites for
+            // video readiness, but diagnostics still need to expose the
+            // retained startup window while that gate is closed.
+            updateReadinessDiagnosticsIsolated(readiness)
+            return
+        }
         resyncIfVideoTrailsClockIsolated()
         pruneRetainedAudioBeforeRecoveryFloorIsolated()
         pruneRetainedVideoBeforeRecoveryFloorIsolated()
@@ -1496,6 +1561,16 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             displayResumedCycle = readiness.cycleID
             resumeDisplayForOpenReadinessGateIsolated()
         }
+        updateReadinessDiagnosticsIsolated(readiness, audioInterval: audioInterval)
+    }
+
+    private func updateReadinessDiagnosticsIsolated(
+        _ readiness: PlaybackReadinessGate,
+        audioInterval: (first: CMTime, duration: CMTime)? = nil
+    ) {
+        assertIsolated()
+        let audioInterval = audioInterval
+            ?? (readiness.isOpen ? contiguousAudioInterval() : preferredReadinessAudioIntervalIsolated())
         metrics?.updateReadinessDiagnostics(
             audioRoute: audio.route,
             audioReady: audio.isReadyForPlayback,
@@ -1572,7 +1647,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         finishModeSwitchSignpostIsolated()
         guard !terminal, !paused, let readiness else { return }
         _ = readiness.reopenAfterDisplayModeSwitch()
-        if readiness.isOpen {
+        if readiness.isOpen,
+           tracks?.video == nil
+                || (videoCoordinator.isClassificationResolved
+                    && mediaInformation != nil
+                    && mediaInformationGeneration == generationController.current) {
             displayResumedCycle = readiness.cycleID
             resumeDisplayForOpenReadinessGateIsolated()
         } else {
@@ -1582,6 +1661,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
     private func resumeDisplayForOpenReadinessGateIsolated() {
         assertIsolated()
+        guard tracks?.video == nil
+                || (videoCoordinator.isClassificationResolved
+                    && mediaInformation != nil
+                    && mediaInformationGeneration == generationController.current) else { return }
         hasOpenedReadinessForCurrentMedia = true
         pendingVideoRecoveryAnchor = nil
         drainPendingVideoDecodeIsolated()
@@ -1606,6 +1689,105 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         case .metalYADIF2x:
             .metalYADIF2x
         }
+    }
+
+    private func updateAudioOnlyReadinessIsolated() {
+        assertIsolated()
+        guard let readiness,
+              audio.isReadyForPlayback,
+              let audioInterval = contiguousAudioInterval() else { return }
+        readiness.updateAudio(
+            firstPTS: audioInterval.first,
+            contiguousDuration: audioInterval.duration,
+            isContiguous: true
+        )
+        guard readiness.openAudioOnly(firstPTS: audioInterval.first) else { return }
+        guard !readyPublished, !paused, !terminal else { return }
+        readyPublished = true
+        eventSink(.ready(readinessCycle: readinessCycle))
+    }
+
+    private func clearMediaInformationIsolated(publish: Bool) {
+        assertIsolated()
+        let hadInformation = mediaInformation != nil
+        mediaInformation = nil
+        mediaInformationGeneration = nil
+        guard publish, hadInformation else { return }
+        eventSink(.mediaInformation(nil, generation: generationController.current))
+    }
+
+    private func publishMediaInformationIfReadyIsolated() {
+        assertIsolated()
+        guard !terminal,
+              tracks?.video != nil,
+              videoFormat != nil,
+              videoCoordinator.isClassificationResolved else { return }
+        let generation = generationController.current
+        let information = makeMediaInformationIsolated()
+        mediaInformation = information
+        mediaInformationGeneration = generation
+        eventSink(.mediaInformation(information, generation: generation))
+    }
+
+    private func makeMediaInformationIsolated() -> PlaybackMediaInformation {
+        let dimensions = videoFormat.map(CMVideoFormatDescriptionGetDimensions)
+            ?? CMVideoDimensions(
+                width: tracks?.video?.width ?? 0,
+                height: tracks?.video?.height ?? 0
+            )
+        let source = validatedFrameRate(tracks?.video?.frameRate)
+        let route = videoCoordinator.route
+        let output: Double?
+        switch route {
+        case .bypass:
+            output = sourceRate(source)
+        case .metalYADIF2x:
+            let expected = sourceRate(source).map { $0 * 2 }
+            let measured = measuredOutputFrameRateIsolated()
+            if let expected, expected.isFinite, expected > 0, expected <= 120 {
+                let tolerance = max(0.5, expected * 0.02)
+                output = measured.map { abs($0 - expected) <= tolerance ? $0 : expected }
+                    ?? expected
+            } else {
+                output = measured
+            }
+        case .rawWhileClassifying:
+            output = nil
+        }
+        return PlaybackMediaInformation(
+            width: dimensions.width,
+            height: dimensions.height,
+            scanMode: route == .metalYADIF2x ? .interlaced : .progressive,
+            sourceFrameRate: source,
+            outputFrameRate: output,
+            isSmoothMotionEnhanced: route == .metalYADIF2x
+        )
+    }
+
+    private func validatedFrameRate(_ rate: MediaRational?) -> MediaRational? {
+        guard let rate else { return nil }
+        let value = Double(rate.num) / Double(rate.den)
+        guard value.isFinite, value > 0, value <= 120 else { return nil }
+        return rate
+    }
+
+    private func sourceRate(_ rate: MediaRational?) -> Double? {
+        rate.map { Double($0.num) / Double($0.den) }
+    }
+
+    private func measuredOutputFrameRateIsolated() -> Double? {
+        let durations = outputCadenceDurations.compactMap { duration -> Double? in
+            guard duration.isNumeric, duration.value > 0, duration.timescale > 0 else {
+                return nil
+            }
+            let seconds = Double(duration.value) / Double(duration.timescale)
+            guard seconds.isFinite, seconds > 0 else { return nil }
+            let rate = 1 / seconds
+            guard rate.isFinite, rate > 0, rate <= 120 else { return nil }
+            return rate
+        }.sorted()
+        guard !durations.isEmpty else { return nil }
+        return durations[durations.count / 2]
     }
 
     private func contiguousAudioInterval(
@@ -1975,12 +2157,19 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func prepareAnchorIsolated(commonPTS: CMTime) -> Bool {
         assertIsolated()
         let expectedGeneration = generationController.current
-        guard !terminal, !paused, let readiness else { return false }
+        // Audio renderers can synchronously report `.available` while flush or
+        // re-enqueue is still preparing an anchor. Do not recursively prepare
+        // the same readiness cycle from that callback.
+        guard !terminal,
+              !paused,
+              !anchorPreparationInProgress,
+              let readiness else { return false }
         if let floor = readiness.minimumRecoveryAnchorPTS,
            CMTimeCompare(commonPTS, floor) < 0 {
             return false
         }
         let expectedCycle = readiness.cycleID
+        let requiresVideo = tracks?.video != nil
         let candidateAudio = retainedAudio.filter {
             let end = CMTimeAdd($0.presentationTimeStamp, $0.duration)
             return !end.isNumeric || CMTimeCompare(end, commonPTS) > 0
@@ -1997,7 +2186,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         guard hasSufficientMediaForAnchor(
             commonPTS: commonPTS,
             audioSamples: candidateAudio,
-            videoFrames: candidateVideo
+            videoFrames: candidateVideo,
+            requireVideo: requiresVideo
         ) else { return false }
         retainedAudio = candidateAudio
         retainedVideo = candidateVideo
@@ -2035,7 +2225,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
               !paused,
               generationController.current == expectedGeneration,
               readiness.cycleID == expectedCycle,
-              hasSufficientMediaForAnchor(commonPTS: commonPTS) else { return false }
+              hasSufficientMediaForAnchor(
+                  commonPTS: commonPTS,
+                  requireVideo: requiresVideo
+              ) else { return false }
         renderer.resetPresentationTiming()
         return true
     }
@@ -2043,7 +2236,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private func hasSufficientMediaForAnchor(
         commonPTS: CMTime,
         audioSamples: [CompressedAudioSample]? = nil,
-        videoFrames: [VideoPresentationFrame]? = nil
+        videoFrames: [VideoPresentationFrame]? = nil,
+        requireVideo: Bool = true
     ) -> Bool {
         assertIsolated()
         let audioSamples = audioSamples ?? retainedAudio
@@ -2057,6 +2251,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         guard audioEnd.isNumeric,
               CMTimeCompare(interval.first, commonPTS) <= 0,
               CMTimeCompare(commonPTS, audioEnd) < 0 else { return false }
+        guard requireVideo else { return true }
         let coveredVideoCount = videoFrames.filter { frame in
             let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
             return end.isNumeric

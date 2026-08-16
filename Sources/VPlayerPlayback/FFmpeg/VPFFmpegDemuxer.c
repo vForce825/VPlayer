@@ -863,6 +863,22 @@ static bool vpff_time_base_is_valid(AVRational time_base) {
     return time_base.num > 0 && time_base.den > 0;
 }
 
+static AVRational vpff_guess_frame_rate(
+    AVFormatContext *format,
+    AVStream *stream
+) {
+    if (format == NULL || stream == NULL) {
+        return (AVRational){0, 0};
+    }
+    AVRational frame_rate = av_guess_frame_rate(format, stream, NULL);
+    if (frame_rate.num <= 0 || frame_rate.den <= 0 ||
+        (int64_t)frame_rate.num > INT32_MAX ||
+        (int64_t)frame_rate.den > INT32_MAX) {
+        return (AVRational){0, 0};
+    }
+    return frame_rate;
+}
+
 static bool vpff_extradata_is_valid(const uint8_t *data, int size) {
     return size >= 0 && (size_t)size <= VPFF_MAX_EXTRADATA_BYTES &&
            (size == 0 || data != NULL);
@@ -1792,7 +1808,8 @@ static int vpff_make_video_track(
     VPFFOwnedTrack *track,
     int stream_index,
     const AVCodecParameters *parameters,
-    AVRational time_base
+    AVRational time_base,
+    AVRational frame_rate
 ) {
     if (!vpff_is_supported_video(parameters) || !vpff_time_base_is_valid(time_base) ||
         stream_index < 0 || parameters->width <= 0 || parameters->height <= 0 ||
@@ -1806,6 +1823,12 @@ static int vpff_make_video_track(
     built.value.codec = vpff_codec(parameters->codec_id);
     built.value.time_base_num = time_base.num;
     built.value.time_base_den = time_base.den;
+    if (frame_rate.num > 0 && frame_rate.den > 0 &&
+        (int64_t)frame_rate.num <= INT32_MAX &&
+        (int64_t)frame_rate.den <= INT32_MAX) {
+        built.value.frame_rate_num = frame_rate.num;
+        built.value.frame_rate_den = frame_rate.den;
+    }
     built.value.width = parameters->width;
     built.value.height = parameters->height;
     built.value.video_delay = parameters->video_delay;
@@ -1857,6 +1880,7 @@ static int vpff_make_audio_track(
 
 static int vpff_make_track_set(
     VPFFOwnedTrackSet *tracks,
+    AVFormatContext *format,
     const VPFFSelection *selection,
     const VPFFVideoFilter *video_filter,
     const AVCodecParameters *audio_parameters,
@@ -1871,11 +1895,16 @@ static int vpff_make_track_set(
         if (video_filter == NULL || video_filter->context == NULL) {
             result = AVERROR_INVALIDDATA;
         } else {
+            AVStream *video_stream = format == NULL ||
+                (unsigned int)selection->video_stream_index >= format->nb_streams
+                ? NULL
+                : format->streams[selection->video_stream_index];
             result = vpff_make_video_track(
                 &built.video,
                 selection->video_stream_index,
                 video_filter->context->par_out,
-                video_filter->context->time_base_out
+                video_filter->context->time_base_out,
+                vpff_guess_frame_rate(format, video_stream)
             );
         }
     }
@@ -1906,6 +1935,8 @@ static bool vpff_public_tracks_equal(
            a->codec == b->codec &&
            a->time_base_num == b->time_base_num &&
            a->time_base_den == b->time_base_den &&
+           a->frame_rate_num == b->frame_rate_num &&
+           a->frame_rate_den == b->frame_rate_den &&
            a->width == b->width &&
            a->height == b->height &&
            a->video_delay == b->video_delay &&
@@ -2220,6 +2251,7 @@ static int vpff_update_selected_tracks(
     VPFFOwnedTrackSet replacement = {0};
     result = vpff_make_track_set(
         &replacement,
+        format,
         selection,
         video_filter,
         *audio_key,
@@ -2859,6 +2891,7 @@ int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer) {
 
     result = vpff_make_track_set(
         &current_tracks,
+        format,
         &selection,
         &video_filter,
         audio_key,
