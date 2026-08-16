@@ -1,6 +1,7 @@
 # Local-only design and planning documents
 /docs/
 /.superpowers/
+/.worktrees/
 
 # macOS and Xcode user state
 .DS_Store
