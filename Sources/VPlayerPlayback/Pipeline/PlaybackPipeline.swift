@@ -940,6 +940,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     ) -> Bool {
         assertIsolated()
         guard !retainedVideo.isEmpty else { return false }
+        // A provisional raw frame cannot satisfy video readiness while scan
+        // classification is unresolved. Keep feeding the bounded decoder/probe
+        // path until the coordinator selects the actual presentation route.
+        guard videoCoordinator.isClassificationResolved else { return false }
         let requiredFrameCount = videoCoordinator.requiredVideoFrameCount
         guard let audioInterval = preferredReadinessAudioIntervalIsolated() else {
             return retainedVideo.count >= requiredFrameCount

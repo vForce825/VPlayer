@@ -6,6 +6,42 @@ import XCTest
 
 final class FullScreenPlayerUITests: XCTestCase {
     @MainActor
+    func testPreparingFixtureKeepsStatusAndControlsCenteredWithChannelCardTopTrailing() {
+        let app = launchFixture(playback: "preparing")
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        let screen = app.otherElements["player-full-screen"]
+        let preparing = app.descendants(matching: .any)["player-preparing"]
+        let back = app.buttons["player-back"]
+        let playPause = app.buttons["player-play-pause"]
+        let settings = app.buttons["player-settings"]
+        let card = app.otherElements
+            .matching(identifier: "player-channel-info")
+            .firstMatch
+
+        XCTAssertTrue(screen.waitForExistence(timeout: 3))
+        XCTAssertTrue(preparing.waitForExistence(timeout: 3))
+        XCTAssertTrue(back.waitForExistence(timeout: 3))
+        XCTAssertTrue(playPause.waitForExistence(timeout: 3))
+        XCTAssertTrue(settings.waitForExistence(timeout: 3))
+        XCTAssertTrue(card.waitForExistence(timeout: 3))
+
+        let screenFrame = screen.frame
+        XCTAssertEqual(preparing.frame.midX, screenFrame.midX, accuracy: 20)
+        XCTAssertEqual(preparing.frame.midY, screenFrame.midY, accuracy: 20)
+
+        let controlsFrame = back.frame.union(playPause.frame).union(settings.frame)
+        XCTAssertEqual(controlsFrame.midX, screenFrame.midX, accuracy: 20)
+        XCTAssertGreaterThan(controlsFrame.midY, screenFrame.midY)
+
+        XCTAssertGreaterThan(card.frame.midX, screenFrame.midX)
+        XCTAssertLessThan(card.frame.midY, screenFrame.midY)
+    }
+
+    @MainActor
     func testPlayingFixtureExposesSanitizedAcceptanceState() {
         let app = launchFixture()
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))

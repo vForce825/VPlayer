@@ -48,6 +48,9 @@ actor UITestPlaybackEngine: PlaybackEngine {
         self.request = request
         publish(.preparing(request))
         await Task.yield()
+        if fixture == "preparing" {
+            return
+        }
         if fixture == "failed" || fixture == "failed-diagnostic" {
             publish(.failed(PlaybackFailure(
                 code: "ui.fixture",
