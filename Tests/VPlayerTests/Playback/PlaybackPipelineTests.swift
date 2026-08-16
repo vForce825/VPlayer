@@ -118,6 +118,61 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(events.filter { $0 == .ready(readinessCycle: 0) }.count, 1)
     }
 
+    func testStartupKeepsDecodingUntilFieldScanClassificationCanOpenReadiness() async throws {
+        let harness = makeHarness(scanProbe: InconclusivePipelineScanProbe())
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 2, timescale: 1)
+        )))
+
+        harness.pipeline.receive(decoder: .frame(try PlaybackFakeMedia.decodedFrame(
+            id: 0,
+            generation: generation,
+            pts: .zero,
+            interlaced: true
+        )))
+        _ = await harness.pipeline.debugSnapshot()
+
+        for id in 1...6 {
+            harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
+                id: UInt64(id),
+                generation: generation,
+                randomAccess: false,
+                pts: CMTime(value: Int64(id), timescale: 25)
+            )))
+            try await eventually {
+                harness.decoder.snapshot().contains(.decode(
+                    UInt64(id),
+                    generation,
+                    ._EnableAsynchronousDecompression
+                ))
+            }
+            harness.pipeline.receive(decoder: .frame(try PlaybackFakeMedia.decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                pts: CMTime(value: Int64(id), timescale: 25),
+                interlaced: true
+            )))
+            _ = await harness.pipeline.debugSnapshot()
+        }
+
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+        let information = try XCTUnwrap(harness.events.snapshot().compactMap {
+            event -> PlaybackMediaInformation? in
+            guard case let .mediaInformation(information, eventGeneration) = event,
+                  eventGeneration == generation else { return nil }
+            return information
+        }.last)
+        XCTAssertEqual(information.scanMode, .interlaced)
+        XCTAssertTrue(information.isSmoothMotionEnhanced)
+    }
+
     func testAudioOnlyReadinessDoesNotWaitForVideoInformation() async throws {
         let harness = makeHarness()
         harness.pipeline.start(url: makeRequest().streamURL)
@@ -4073,6 +4128,7 @@ final class PlaybackPipelineTests: XCTestCase {
             psfConfirmationFrames: 1,
             exitInterlacedConfirmationFrames: 1
         ),
+        scanProbe: (any LumaScanProbing)? = nil,
         playbackAssemblerBuilder: (any PlaybackAssemblerBuilding)? = nil,
         metrics: PlaybackMetrics? = nil,
         automaticallyCompleteDecoderSubmissions: Bool = true,
@@ -4096,6 +4152,7 @@ final class PlaybackPipelineTests: XCTestCase {
             decoder: decoder,
             processor: processor,
             yadifProcessor: yadifProcessor,
+            scanProbe: scanProbe,
             classifierConfiguration: classifierConfiguration,
             videoDecodeStallTimeout: videoDecodeStallTimeout,
             rawReadinessRequirementOverride: requiredVideoFrames,
@@ -4192,4 +4249,23 @@ private struct SeededGenerator: RandomNumberGenerator {
         state = state &* 6_364_136_223_846_793_005 &+ 1
         return state
     }
+}
+
+private final class InconclusivePipelineScanProbe: LumaScanProbing, @unchecked Sendable {
+    func submit(
+        current _: CVPixelBuffer,
+        previous _: CVPixelBuffer,
+        generation _: MediaGeneration,
+        completion: @escaping @Sendable (
+            Result<ContentProbeSample, LumaScanProbeFailure>
+        ) -> Void
+    ) {
+        completion(.success(ContentProbeSample(
+            combRatio: 0.04,
+            motionRatio: 0,
+            sampleCount: 2_304
+        )))
+    }
+
+    func stop(generation _: MediaGeneration) {}
 }

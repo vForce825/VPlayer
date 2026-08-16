@@ -180,7 +180,7 @@ struct FullScreenPlayerView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             // fullScreenCover is transparent on tvOS. Keep an opaque backing
             // below Metal even after its context exists, because the drawable
             // has no video content until the first frame is presented.
@@ -231,6 +231,7 @@ struct FullScreenPlayerView: View {
                     presentation: channelPresentation,
                     mediaInformation: model.mediaInformation
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 .padding(.top, 36)
                 .padding(.trailing, 56)
                 .opacity(controlsAreVisible ? 1 : 0)
@@ -303,6 +304,8 @@ struct FullScreenPlayerView: View {
         switch model.state {
         case .idle, .preparing:
             ProgressView("正在准备播放…")
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("player-preparing")
                 .padding(24)
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
         case let .failed(failure):
