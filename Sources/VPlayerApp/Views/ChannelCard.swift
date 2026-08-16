@@ -4,42 +4,7 @@
 
 import Foundation
 import SwiftUI
-import UIKit
 import VPlayerCore
-
-private struct CachedChannelLogo: View {
-    let url: URL
-    @State private var image: UIImage?
-
-    var body: some View {
-        Group {
-            if let image = image ?? ChannelLogoCache.shared.memoryCachedImage(for: url) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .padding(20)
-            } else {
-                ChannelLogoPlaceholder()
-            }
-        }
-        .task(id: url) {
-            image = nil
-            let loadedImage = await ChannelLogoCache.shared.image(for: url)
-            guard !Task.isCancelled else { return }
-            image = loadedImage
-        }
-    }
-}
-
-private struct ChannelLogoPlaceholder: View {
-    var body: some View {
-        Image(systemName: "tv")
-            .resizable()
-            .scaledToFit()
-            .padding(.vertical, 34)
-            .foregroundStyle(.secondary)
-    }
-}
 
 /// Grid tile for one channel. The logo is the tile: it spans the full card
 /// width in 16:9, with the name as a compact caption underneath and the live
@@ -51,7 +16,10 @@ struct ChannelCard: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
-            let current = currentProgramme(at: context.date)
+            let presentation = ChannelProgrammePresentation.resolve(
+                programmes: programmes,
+                at: context.date
+            )
             VStack(alignment: .leading, spacing: 12) {
                 logo
 
@@ -60,24 +28,24 @@ struct ChannelCard: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
 
-                epgFooter(current: current, at: context.date)
+                epgFooter(presentation: presentation)
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
-    private func epgFooter(current: Programme?, at date: Date) -> some View {
+    private func epgFooter(presentation: ChannelProgrammePresentation) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(current?.title ?? "暂无当前节目")
+            Text(presentation.current?.title ?? "暂无当前节目")
                 .font(.caption2)
                 .lineLimit(1)
 
-            ProgressView(value: current.map { progress(for: $0, at: date) } ?? 0)
+            ProgressView(value: presentation.progress ?? 0)
                 .accessibilityLabel("当前节目进度")
-                .opacity(current == nil ? 0 : 1)
+                .opacity(presentation.current == nil ? 0 : 1)
 
-            Text(nextProgrammeLine(at: date) ?? " ")
+            Text(nextProgrammeLine(for: presentation.next) ?? " ")
                 .font(.caption2)
                 .lineLimit(1)
         }
@@ -91,33 +59,15 @@ struct ChannelCard: View {
             .fill(.thinMaterial)
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
             .overlay {
-                if let logoURL = channel.logoURL {
-                    CachedChannelLogo(url: logoURL)
-                } else {
-                    logoPlaceholder
-                }
+                ChannelLogoView(url: channel.logoURL)
             }
             .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
-    private var logoPlaceholder: some View {
-        ChannelLogoPlaceholder()
-    }
-
-    private func currentProgramme(at date: Date) -> Programme? {
-        programmes.first { $0.start <= date && date < $0.stop }
-    }
-
-    private func nextProgrammeLine(at date: Date) -> String? {
-        guard let next = programmes.first(where: { $0.start >= date }) else {
+    private func nextProgrammeLine(for next: Programme?) -> String? {
+        guard let next else {
             return nil
         }
         return "接下来 \(next.start.formatted(date: .omitted, time: .shortened))  \(next.title)"
-    }
-
-    private func progress(for programme: Programme, at date: Date) -> Double {
-        let duration = programme.stop.timeIntervalSince(programme.start)
-        guard duration > 0 else { return 0 }
-        return min(max(date.timeIntervalSince(programme.start) / duration, 0), 1)
     }
 }

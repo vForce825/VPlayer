@@ -516,6 +516,7 @@ struct AppDependencies {
     typealias Refresh = AppModel.Refresh
     typealias Prepare = @Sendable () async throws -> Void
     typealias PlaybackPresentationProvider = @Sendable () async -> PlaybackPresentationContext?
+    typealias PlaybackMediaInformationProvider = @Sendable () async -> AsyncStream<PlaybackMediaInformation?>
     typealias PlaybackMetricsProvider = @Sendable (Duration) async -> PlaybackMetricsSnapshot?
 
     let repository: any LibraryRepository
@@ -525,6 +526,7 @@ struct AppDependencies {
     let channelBrowsingSettings: ChannelBrowsingSettingsStore
     let playbackEngine: any PlaybackEngine
     let playbackPresentationProvider: PlaybackPresentationProvider
+    let playbackMediaInformationProvider: PlaybackMediaInformationProvider
     let playbackMetricsProvider: PlaybackMetricsProvider
     let exposesAcceptanceMetrics: Bool
     let exposesAcceptanceState: Bool
@@ -550,6 +552,7 @@ struct AppDependencies {
         channelBrowsingSettings: ChannelBrowsingSettingsStore = ChannelBrowsingSettingsStore(),
         playbackEngine: (any PlaybackEngine)? = nil,
         playbackPresentationProvider: PlaybackPresentationProvider? = nil,
+        playbackMediaInformationProvider: PlaybackMediaInformationProvider? = nil,
         playbackMetricsProvider: PlaybackMetricsProvider? = nil,
         exposesAcceptanceMetrics: Bool = false,
         exposesAcceptanceState: Bool = false,
@@ -566,12 +569,20 @@ struct AppDependencies {
         if let playbackEngine {
             resolvedPlaybackEngine = playbackEngine
             self.playbackPresentationProvider = playbackPresentationProvider ?? { nil }
+            self.playbackMediaInformationProvider = playbackMediaInformationProvider ?? {
+                AsyncStream<PlaybackMediaInformation?> { continuation in
+                    continuation.finish()
+                }
+            }
             self.playbackMetricsProvider = playbackMetricsProvider ?? { _ in nil }
         } else {
             let controller = PlaybackController()
             resolvedPlaybackEngine = controller
             self.playbackPresentationProvider = {
                 await controller.presentationContext()
+            }
+            self.playbackMediaInformationProvider = {
+                await controller.playbackMediaInformation()
             }
             self.playbackMetricsProvider = { window in
                 await controller.playbackMetricsSnapshot(window: window)

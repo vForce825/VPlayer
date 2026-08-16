@@ -4,17 +4,22 @@
 
 import Foundation
 
-public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
+public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
+    PlaybackMediaInformationProviding {
     private let factory: any PlaybackPipelineFactory
     private var state = PlaybackState.idle
     private var pipeline: (any PlaybackPipelineProtocol)?
     private var request: PlaybackRequest?
     private var userPaused = false
     private var sessionID: UInt64 = 0
+    private var mediaGeneration: MediaGeneration?
+    private var currentMediaInformation: PlaybackMediaInformation?
     private var readinessCycle: UInt64 = 0
     private var pendingTeardown: Task<Void, Never>?
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
+    private var mediaInformationContinuations:
+        [UUID: AsyncStream<PlaybackMediaInformation?>.Continuation] = [:]
     private var tuning = PlaybackTuning.default
 
     public init() {
@@ -52,11 +57,26 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
         return stream
     }
 
+    public func playbackMediaInformation() -> AsyncStream<PlaybackMediaInformation?> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: PlaybackMediaInformation?.self,
+            bufferingPolicy: .bufferingNewest(8)
+        )
+        mediaInformationContinuations[id] = continuation
+        _ = continuation.yield(currentMediaInformation)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeMediaInformationContinuation(id) }
+        }
+        return stream
+    }
+
     public func play(_ request: PlaybackRequest) async {
         invalidateSession()
         let id = sessionID
         let previous = pipeline
         pipeline = nil
+        clearMediaInformation()
         self.request = request
         userPaused = false
         readinessCycle = 0
@@ -110,6 +130,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
         let id = sessionID
         let current = pipeline
         pipeline = nil
+        clearMediaInformation()
         request = nil
         userPaused = false
         readinessCycle = 0
@@ -205,6 +226,20 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
     private func receive(_ event: PlaybackPipelineEvent, sessionID: UInt64) {
         guard sessionID == self.sessionID, pipeline != nil else { return }
         switch event {
+        case let .mediaInformation(information, generation: eventGeneration?):
+            guard mediaGeneration.map({ eventGeneration >= $0 }) ?? true else { return }
+            if mediaGeneration != eventGeneration {
+                mediaGeneration = eventGeneration
+                // A generation transition invalidates the previous snapshot.
+                // The event itself may already be the transition's nil marker,
+                // so avoid publishing that marker twice.
+                if currentMediaInformation != nil, information != nil {
+                    publishMediaInformation(nil)
+                }
+            }
+            publishMediaInformation(information)
+        case let .mediaInformation(information, generation: nil):
+            publishMediaInformation(information)
         case let .ready(eventCycle):
             guard let request,
                   !userPaused,
@@ -214,11 +249,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
             pipeline = nil
             request = nil
             userPaused = false
+            clearMediaInformation()
             publish(.stopped)
         case let .failed(error):
             pipeline = nil
             request = nil
             userPaused = false
+            clearMediaInformation()
             publish(.failed(Self.failure(for: error)))
         }
     }
@@ -239,11 +276,28 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding {
         }
     }
 
+    private func publishMediaInformation(_ information: PlaybackMediaInformation?) {
+        currentMediaInformation = information
+        for continuation in mediaInformationContinuations.values {
+            _ = continuation.yield(information)
+        }
+    }
+
+    private func clearMediaInformation() {
+        guard currentMediaInformation != nil || mediaGeneration != nil else { return }
+        mediaGeneration = nil
+        publishMediaInformation(nil)
+    }
+
     private func removeEventContinuation(_ id: UUID) {
         eventContinuations[id] = nil
     }
 
     private func removeNoticeContinuation(_ id: UUID) {
         noticeContinuations[id] = nil
+    }
+
+    private func removeMediaInformationContinuation(_ id: UUID) {
+        mediaInformationContinuations[id] = nil
     }
 }

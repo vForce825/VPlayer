@@ -383,6 +383,77 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertFalse(deinterlace.contains("CVPixelBufferLockBaseAddress"))
     }
 
+    func testPlayerChannelInfoOverlayIsNonInteractiveAndReplacesOldTitleOverlay() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let overlay = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Player/PlayerChannelInfoOverlay.swift"
+            ),
+            encoding: .utf8
+        )
+        let player = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Player/FullScreenPlayerView.swift"
+            ),
+            encoding: .utf8
+        )
+        let controls = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Player/PlayerControlsOverlay.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(overlay.contains(".allowsHitTesting(false)"))
+        XCTAssertTrue(overlay.contains(".focusable(false)"))
+        XCTAssertTrue(player.contains("@State private var controlsVisibility = PlayerControlsVisibilityState"))
+        XCTAssertTrue(player.contains("shouldMountTransportOverlays"))
+        XCTAssertTrue(player.contains("mountsOverlays(for: controlsVisibilityMode)"))
+        XCTAssertTrue(player.contains("controlsVisibility.isVisible"))
+        XCTAssertTrue(player.contains("controlsVisibility.apply"))
+        XCTAssertFalse(player.contains("Text(title)"))
+        XCTAssertFalse(controls.contains("Text(title)"))
+    }
+
+    func testPlayerChannelInfoOverlayDoesNotShowMissingNextPlaceholderWhenCurrentExists() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let overlay = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Player/PlayerChannelInfoOverlay.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(
+            overlay.contains("} else if programmePresentation.current == nil {"),
+            "只有没有当前节目时才允许显示后续节目缺失占位文案"
+        )
+    }
+
+    func testPlayerControlsOverlayLeavesVisibilityLifecycleToParent() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let controls = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerApp/Player/PlayerControlsOverlay.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(controls.contains("hideTask"))
+        XCTAssertFalse(controls.contains("autoHideDelay"))
+        XCTAssertFalse(controls.contains("Task.sleep"))
+        XCTAssertFalse(controls.contains("Text(title)"))
+    }
+
     func testAcceptanceFocusWiringCoversEveryRealFlowBoundary() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

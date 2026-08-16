@@ -35,6 +35,7 @@ public struct VideoTrackDescriptor: Sendable, Hashable {
     public let streamIndex: Int32
     public let codec: VideoCodec
     public let timeBase: MediaRational
+    public let frameRate: MediaRational?
     public let width: Int32
     public let height: Int32
     public let videoDelay: Int32
@@ -47,11 +48,13 @@ public struct VideoTrackDescriptor: Sendable, Hashable {
         width: Int32,
         height: Int32,
         videoDelay: Int32,
-        extradata: Data
+        extradata: Data,
+        frameRate: MediaRational? = nil
     ) {
         self.streamIndex = streamIndex
         self.codec = codec
         self.timeBase = timeBase
+        self.frameRate = frameRate
         self.width = width
         self.height = height
         self.videoDelay = videoDelay

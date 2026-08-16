@@ -59,6 +59,8 @@ struct RawTrackSpec: Sendable {
     var width: Int32 = 0
     var height: Int32 = 0
     var videoDelay: Int32 = 0
+    var frameRateNum: Int32 = 0
+    var frameRateDen: Int32 = 0
     var sampleRate: Int32 = 0
     var channelCount: Int32 = 0
     var channelOrder = VPFF_CHANNEL_ORDER_UNSPECIFIED
@@ -352,6 +354,8 @@ final class FakeFFmpegDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
         track.width = spec.width
         track.height = spec.height
         track.video_delay = spec.videoDelay
+        track.frame_rate_num = spec.frameRateNum
+        track.frame_rate_den = spec.frameRateDen
         track.sample_rate = spec.sampleRate
         track.channel_count = spec.channelCount
         track.channel_order = spec.channelOrder

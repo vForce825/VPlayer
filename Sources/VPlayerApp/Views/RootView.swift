@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import SwiftUI
+import VPlayerPlayback
 
 struct RootView: View {
     private enum InitialLibraryState {
@@ -96,9 +97,10 @@ struct RootView: View {
         }
         .fullScreenCover(item: $model.presentedPlaybackRequest) { request in
             FullScreenPlayerView(
-                request: request,
+                channelPresentation: playerChannelPresentation(for: request),
                 engine: dependencies.playbackEngine,
                 presentationProvider: dependencies.playbackPresentationProvider,
+                mediaInformationProvider: dependencies.playbackMediaInformationProvider,
                 metricsProvider: dependencies.playbackMetricsProvider,
                 acceptanceMetricsEnabled: dependencies.exposesAcceptanceMetrics,
                 acceptanceStateEnabled: dependencies.exposesAcceptanceState,
@@ -107,6 +109,17 @@ struct RootView: View {
                 model.dismissPlayback()
             }
         }
+    }
+
+    private func playerChannelPresentation(
+        for request: PlaybackRequest
+    ) -> PlayerChannelPresentation {
+        let channel = model.channels.first { $0.id == request.channelID }
+        return PlayerChannelPresentation(
+            request: request,
+            logoURL: channel?.logoURL,
+            programmes: model.programmesByChannelID[request.channelID, default: []]
+        )
     }
 
     private var libraryTabs: some View {

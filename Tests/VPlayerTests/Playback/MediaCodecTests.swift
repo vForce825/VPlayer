@@ -60,6 +60,35 @@ final class MediaCodecTests: XCTestCase {
         XCTAssertEqual(Set([custom, custom, knownZero]).count, 2)
     }
 
+    func testVideoFrameRateParticipatesInTrackEqualityAndHashing() throws {
+        let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
+        let twentyFive = try XCTUnwrap(MediaRational(num: 25, den: 1))
+        let fifty = try XCTUnwrap(MediaRational(num: 50, den: 1))
+        let base = VideoTrackDescriptor(
+            streamIndex: 2,
+            codec: .h264,
+            timeBase: timeBase,
+            width: 1_920,
+            height: 1_080,
+            videoDelay: 1,
+            extradata: Data([0x01, 0x64]),
+            frameRate: twentyFive
+        )
+        let changed = VideoTrackDescriptor(
+            streamIndex: 2,
+            codec: .h264,
+            timeBase: timeBase,
+            width: 1_920,
+            height: 1_080,
+            videoDelay: 1,
+            extradata: Data([0x01, 0x64]),
+            frameRate: fifty
+        )
+
+        XCTAssertNotEqual(base, changed)
+        XCTAssertEqual(Set([base, changed]).count, 2)
+    }
+
     func testCodecAndTrackValuesAreHashableAndSendable() {
         func requireSendable<T: Sendable>(_: T.Type) {}
 

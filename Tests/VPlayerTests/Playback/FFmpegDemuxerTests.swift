@@ -164,6 +164,31 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertEqual(events.last, .endOfStream)
     }
 
+    func testCopiesValidVideoFrameRateAndTreatsInvalidRateAsUnknown() throws {
+        let valid = FakeFFmpegDemuxBridge { handle in
+            handle.emitTracks(video: .h264(frameRateNum: 25, frameRateDen: 1))
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+        guard case let .tracks(tracks) = try run(bridge: valid).first else {
+            return XCTFail("missing tracks")
+        }
+        XCTAssertEqual(tracks.video?.frameRate, MediaRational(num: 25, den: 1))
+
+        for (numerator, denominator) in [(Int32(0), Int32(1)), (25, 0), (-1, 1), (1, -1)] {
+            let invalid = FakeFFmpegDemuxBridge { handle in
+                handle.emitTracks(video: .h264(frameRateNum: numerator, frameRateDen: denominator))
+                handle.emitTerminal(VPFF_EVENT_END)
+                return 0
+            }
+            guard case let .tracks(invalidTracks) = try run(bridge: invalid).first else {
+                return XCTFail("missing tracks for invalid frame rate \(numerator)/\(denominator)")
+            }
+            XCTAssertNil(invalidTracks.video?.frameRate, "invalid frame rate \(numerator)/\(denominator) must remain unknown")
+            XCTAssertEqual(invalidTracks.video?.width, 1_920)
+        }
+    }
+
     func testCopiesProgramPresenceAndUnspecifiedAndNativeChannelLayouts() throws {
         let unspecified = FakeFFmpegDemuxBridge { handle in
             handle.emitTracks(audio: .aac(
@@ -1086,6 +1111,8 @@ private extension RawTrackSpec {
     static func h264(
         width: Int32 = 1_920,
         videoDelay: Int32 = 1,
+        frameRateNum: Int32 = 0,
+        frameRateDen: Int32 = 0,
         extradata: Data = Data([1, 2, 3])
     ) -> Self {
         .init(
@@ -1094,6 +1121,8 @@ private extension RawTrackSpec {
             width: width,
             height: 1_080,
             videoDelay: videoDelay,
+            frameRateNum: frameRateNum,
+            frameRateDen: frameRateDen,
             extradata: extradata
         )
     }
