@@ -713,6 +713,25 @@ struct AppDependencies {
         }
     }
 
+    private static func uiTestMediaInformationProvider(
+        for playbackFixture: String?
+    ) -> PlaybackMediaInformationProvider? {
+        guard playbackFixture == "media-information" else { return nil }
+        return {
+            AsyncStream { continuation in
+                continuation.yield(.some(PlaybackMediaInformation(
+                    width: 1_920,
+                    height: 1_080,
+                    scanMode: .interlaced,
+                    sourceFrameRate: MediaRational(num: 25, den: 1),
+                    outputFrameRate: 50,
+                    isSmoothMotionEnhanced: true
+                )))
+                continuation.finish()
+            }
+        }
+    }
+
     static func uiTesting(playbackFixture: String? = nil) -> Self {
         do {
             let container = try VPlayerModelContainer.make(inMemory: true)
@@ -748,6 +767,9 @@ struct AppDependencies {
                 },
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
                 playbackPresentationProvider: { nil },
+                playbackMediaInformationProvider: uiTestMediaInformationProvider(
+                    for: playbackFixture
+                ),
                 exposesAcceptanceState: true,
                 libraryChanges: libraryChanges
             )
@@ -773,6 +795,9 @@ struct AppDependencies {
                 refresh: refresh,
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
                 playbackPresentationProvider: { nil },
+                playbackMediaInformationProvider: uiTestMediaInformationProvider(
+                    for: playbackFixture
+                ),
                 exposesAcceptanceState: true
             )
         }

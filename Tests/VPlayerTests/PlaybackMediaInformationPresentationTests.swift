@@ -9,7 +9,7 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackMediaInformationPresentationTests: XCTestCase {
-    func testFormatsInterlacedDoubleRateWithUnitsArrowAndBenefit() {
+    func testFormatsInterlacedDoubleRateWithCompactVisualHighlight() {
         let subject = PlaybackMediaInformationPresentation(
             information: PlaybackMediaInformation(
                 width: 1_920,
@@ -21,8 +21,10 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1920×1080i · 25 fps → 50 fps")
-        XCTAssertTrue(subject.showsSmoothMotionBadge)
+        XCTAssertEqual(subject.visualResolutionText, "1920×1080i")
+        XCTAssertEqual(subject.visualFrameRateText, "25 → 50 fps")
+        XCTAssertEqual(subject.visualText, "1920×1080i · 25 → 50 fps")
+        XCTAssertTrue(subject.showsEnhancedFrameRateHighlight)
         XCTAssertEqual(
             subject.accessibilityText,
             "1920 乘 1080 隔行扫描，从每秒 25 帧增强到每秒 50 帧"
@@ -44,7 +46,9 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
         )
 
         XCTAssertEqual(subject.visualText, "1920×1080p · 50 fps")
-        XCTAssertFalse(subject.showsSmoothMotionBadge)
+        XCTAssertEqual(subject.visualResolutionText, "1920×1080p")
+        XCTAssertEqual(subject.visualFrameRateText, "50 fps")
+        XCTAssertFalse(subject.showsEnhancedFrameRateHighlight)
         XCTAssertEqual(
             subject.accessibilityText,
             "1920 乘 1080 逐行扫描，每秒 50 帧"
@@ -66,7 +70,6 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
 
         XCTAssertEqual(subject.visualText, "1920×1080p · 50 fps")
         XCTAssertEqual(subject.accessibilityText, "1920 乘 1080 逐行扫描，每秒 50 帧")
-        XCTAssertFalse(subject.showsSmoothMotionBadge)
         XCTAssertFalse(subject.visualText.contains("→"))
     }
 
@@ -108,7 +111,7 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1280×720i · 29.97 fps → 59.94 fps")
+        XCTAssertEqual(subject.visualText, "1280×720i · 29.97 → 59.94 fps")
         XCTAssertEqual(
             subject.accessibilityText,
             "1280 乘 720 隔行扫描，从每秒 29.97 帧增强到每秒 59.94 帧"
@@ -127,12 +130,11 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1920×1080i · 25 fps → 50 fps")
+        XCTAssertEqual(subject.visualText, "1920×1080i · 25 → 50 fps")
         XCTAssertEqual(
             subject.accessibilityText,
             "1920 乘 1080 隔行扫描，从每秒 25 帧增强到每秒 50 帧"
         )
-        XCTAssertTrue(subject.showsSmoothMotionBadge)
     }
 
     func testEnhancedNtscOutputWithinTwoPercentOfDoubleSourceRateUsesStableDoubleRate() {
@@ -147,7 +149,7 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1280×720i · 29.97 fps → 59.94 fps")
+        XCTAssertEqual(subject.visualText, "1280×720i · 29.97 → 59.94 fps")
         XCTAssertEqual(
             subject.accessibilityText,
             "1280 乘 720 隔行扫描，从每秒 29.97 帧增强到每秒 59.94 帧"
@@ -166,12 +168,11 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1920×1080i · 25 fps → 52 fps")
+        XCTAssertEqual(subject.visualText, "1920×1080i · 25 → 52 fps")
         XCTAssertEqual(
             subject.accessibilityText,
             "1920 乘 1080 隔行扫描，从每秒 25 帧增强到每秒 52 帧"
         )
-        XCTAssertTrue(subject.showsSmoothMotionBadge)
     }
 
     func testEnhancedOutputAtLowerTwoPercentBoundaryUsesStableDoubleRate() {
@@ -186,7 +187,7 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1920×1080i · 30 fps → 60 fps")
+        XCTAssertEqual(subject.visualText, "1920×1080i · 30 → 60 fps")
         XCTAssertEqual(
             subject.accessibilityText,
             "1920 乘 1080 隔行扫描，从每秒 30 帧增强到每秒 60 帧"
@@ -205,7 +206,7 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(subject.visualText, "1920×1080i · 30 fps → 60 fps")
+        XCTAssertEqual(subject.visualText, "1920×1080i · 30 → 60 fps")
         XCTAssertEqual(
             subject.accessibilityText,
             "1920 乘 1080 隔行扫描，从每秒 30 帧增强到每秒 60 帧"
@@ -234,8 +235,8 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(lower.visualText, "1920×1080i · 30 fps → 58.79 fps")
-        XCTAssertEqual(upper.visualText, "1920×1080i · 30 fps → 61.21 fps")
+        XCTAssertEqual(lower.visualText, "1920×1080i · 30 → 58.79 fps")
+        XCTAssertEqual(upper.visualText, "1920×1080i · 30 → 61.21 fps")
     }
 
     func testFormatsFilmRateWithAtMostThreeDecimalPlaces() {
@@ -268,7 +269,6 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
 
         XCTAssertEqual(subject.visualText, "1920×1080p · 50 fps")
         XCTAssertEqual(subject.accessibilityText, "1920 乘 1080 逐行扫描，每秒 50 帧")
-        XCTAssertFalse(subject.showsSmoothMotionBadge)
     }
 
     func testOmitsArrowWhenEnhancedInterlacedRateIsIncomplete() {
@@ -284,8 +284,9 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
         )
 
         XCTAssertEqual(subject.visualText, "1920×1080i · 25 fps")
+        XCTAssertEqual(subject.visualFrameRateText, "25 fps")
         XCTAssertEqual(subject.accessibilityText, "1920 乘 1080 隔行扫描，每秒 25 帧")
-        XCTAssertTrue(subject.showsSmoothMotionBadge)
+        XCTAssertFalse(subject.showsEnhancedFrameRateHighlight)
         XCTAssertFalse(subject.visualText.contains("→"))
     }
 
@@ -343,10 +344,9 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
 
         XCTAssertEqual(subject.visualText, "正在检测画面规格…")
         XCTAssertEqual(subject.accessibilityText, "正在检测画面规格…")
-        XCTAssertFalse(subject.showsSmoothMotionBadge)
     }
 
-    func testPlayerChannelInfoAccessibilityUsesChineseSemanticsWithoutBadgeDuplication() {
+    func testPlayerChannelInfoAccessibilityUsesChineseSemantics() {
         let current = programme(title: "新闻", start: 0, stop: 1_800)
         let next = programme(title: "天气", start: 1_800, stop: 3_600)
         let enhanced = PlaybackMediaInformation(
@@ -370,29 +370,28 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
         )
         XCTAssertEqual(subject.currentProgrammeText, "当前节目：新闻")
         XCTAssertEqual(subject.nextProgrammeText, "下一节目：天气")
-        XCTAssertNil(subject.badgeText)
-
-        let incomplete = PlaybackMediaInformation(
-            width: 1_920,
-            height: 1_080,
-            scanMode: .interlaced,
-            sourceFrameRate: MediaRational(num: 25, den: 1),
-            outputFrameRate: nil,
-            isSmoothMotionEnhanced: true
-        )
-        XCTAssertEqual(
-            PlayerChannelInfoAccessibilityPresentation(
-                information: incomplete,
-                current: nil,
-                next: nil
-            ).badgeText,
-            "流畅增强"
-        )
     }
 
-    func testNextProgrammeAccessibilityUsesOnlyItsStartTime() {
-        let current = programme(title: "新闻", start: 0, stop: 1_800)
-        let next = programme(title: "天气", start: 1_800, stop: 3_600)
+    func testNextProgrammeAccessibilityUsesCompactTimeRange() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let currentStart = calendar.date(
+            from: DateComponents(year: 2026, month: 8, day: 18, hour: 23, minute: 0)
+        )!
+        let nextStart = calendar.date(
+            from: DateComponents(year: 2026, month: 8, day: 19, hour: 0, minute: 29)
+        )!
+        let current = programme(
+            title: "新闻",
+            start: currentStart.timeIntervalSince1970,
+            stop: nextStart.timeIntervalSince1970
+        )
+        let nextStop = calendar.date(byAdding: .minute, value: 30, to: nextStart)!
+        let next = programme(
+            title: "天气",
+            start: nextStart.timeIntervalSince1970,
+            stop: nextStop.timeIntervalSince1970
+        )
 
         let subject = PlayerChannelInfoAccessibilityPresentation(
             information: nil,
@@ -400,13 +399,32 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             next: next
         )
 
-        let startTime = next.start.formatted(date: .omitted, time: .shortened)
-        let stopTime = next.stop.formatted(date: .omitted, time: .shortened)
         XCTAssertEqual(
             subject.nextProgrammeAccessibilityText,
-            "下一节目：天气，时间 \(startTime)"
+            "下一节目：天气，时间 0:29 – 0:59"
         )
-        XCTAssertFalse(subject.nextProgrammeAccessibilityText?.contains(stopTime) ?? false)
+    }
+
+    func testCurrentProgrammeTimeUsesCompactTwentyFourHourRangeAcrossLocalMidnight() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let start = calendar.date(
+            from: DateComponents(year: 2026, month: 8, day: 18, hour: 23, minute: 59)
+        )!
+        let stop = calendar.date(byAdding: .minute, value: 30, to: start)!
+        let current = programme(
+            title: "跨日节目",
+            start: start.timeIntervalSince1970,
+            stop: stop.timeIntervalSince1970
+        )
+
+        XCTAssertEqual(
+            PlayerChannelInfoAccessibilityPresentation.programmeTimeText(
+                label: "当前节目",
+                programme: current
+            ),
+            "23:59 – 0:29"
+        )
     }
 
     private func programme(title: String, start: TimeInterval, stop: TimeInterval) -> Programme {

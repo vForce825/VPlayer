@@ -7,18 +7,26 @@ import UIKit
 
 struct ChannelLogoView: View {
     let url: URL?
+    var imagePadding: CGFloat = 20
+    var placeholderVerticalPadding: CGFloat = 34
 
     var body: some View {
         if let url {
-            CachedChannelLogo(url: url)
+            CachedChannelLogo(
+                url: url,
+                imagePadding: imagePadding,
+                placeholderVerticalPadding: placeholderVerticalPadding
+            )
         } else {
-            ChannelLogoPlaceholder()
+            ChannelLogoPlaceholder(verticalPadding: placeholderVerticalPadding)
         }
     }
 }
 
 private struct CachedChannelLogo: View {
     let url: URL
+    let imagePadding: CGFloat
+    let placeholderVerticalPadding: CGFloat
     @State private var image: UIImage?
 
     var body: some View {
@@ -27,9 +35,9 @@ private struct CachedChannelLogo: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    .padding(20)
+                    .padding(imagePadding)
             } else {
-                ChannelLogoPlaceholder()
+                ChannelLogoPlaceholder(verticalPadding: placeholderVerticalPadding)
             }
         }
         .task(id: url) {
@@ -42,11 +50,13 @@ private struct CachedChannelLogo: View {
 }
 
 private struct ChannelLogoPlaceholder: View {
+    let verticalPadding: CGFloat
+
     var body: some View {
         Image(systemName: "tv")
             .resizable()
             .scaledToFit()
-            .padding(.vertical, 34)
+            .padding(.vertical, verticalPadding)
             .foregroundStyle(.secondary)
     }
 }
