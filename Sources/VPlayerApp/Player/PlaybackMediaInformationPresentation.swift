@@ -6,6 +6,12 @@ import Foundation
 import VPlayerPlayback
 
 struct PlaybackMediaInformationPresentation: Sendable {
+    private struct VisualParts: Sendable {
+        let resolution: String?
+        let frameRate: String?
+        let highlightsFrameRate: Bool
+    }
+
     private static let detectingText = "正在检测画面规格…"
     private static let maximumFrameRate = 120.0
 
@@ -15,28 +21,22 @@ struct PlaybackMediaInformationPresentation: Sendable {
         self.information = information
     }
 
+    var visualResolutionText: String? {
+        visualParts.resolution
+    }
+
+    var visualFrameRateText: String? {
+        visualParts.frameRate
+    }
+
+    var showsEnhancedFrameRateHighlight: Bool {
+        visualParts.highlightsFrameRate
+    }
+
     var visualText: String {
-        guard let information else { return Self.detectingText }
+        guard information != nil else { return Self.detectingText }
 
-        let resolution = Self.visualResolutionText(for: information)
-        let smoothMotionEnhancementIsActive = Self.smoothMotionEnhancementIsActive(for: information)
-        let rates = Self.frameRateValues(
-            for: information,
-            smoothMotionEnhancementIsActive: smoothMotionEnhancementIsActive
-        )
-        let rateText: String?
-
-        if smoothMotionEnhancementIsActive,
-           let source = rates.source,
-           let output = rates.output {
-            rateText = "\(Self.formatFrameRate(source)) fps → \(Self.formatFrameRate(output)) fps"
-        } else if let rate = rates.output ?? rates.source {
-            rateText = "\(Self.formatFrameRate(rate)) fps"
-        } else {
-            rateText = nil
-        }
-
-        return [resolution, rateText]
+        return [visualResolutionText, visualFrameRateText]
             .compactMap { $0 }
             .joined(separator: " · ")
     }
@@ -67,9 +67,38 @@ struct PlaybackMediaInformationPresentation: Sendable {
             .joined(separator: "，")
     }
 
-    var showsSmoothMotionBadge: Bool {
-        guard let information else { return false }
-        return Self.smoothMotionEnhancementIsActive(for: information)
+    private var visualParts: VisualParts {
+        guard let information else {
+            return VisualParts(
+                resolution: nil,
+                frameRate: nil,
+                highlightsFrameRate: false
+            )
+        }
+
+        let resolution = Self.visualResolutionText(for: information)
+        let smoothMotionEnhancementIsActive = Self.smoothMotionEnhancementIsActive(for: information)
+        let rates = Self.frameRateValues(
+            for: information,
+            smoothMotionEnhancementIsActive: smoothMotionEnhancementIsActive
+        )
+
+        if smoothMotionEnhancementIsActive,
+           let source = rates.source,
+           let output = rates.output {
+            return VisualParts(
+                resolution: resolution,
+                frameRate: "\(Self.formatFrameRate(source)) → \(Self.formatFrameRate(output)) fps",
+                highlightsFrameRate: true
+            )
+        }
+
+        let frameRate = rates.output ?? rates.source
+        return VisualParts(
+            resolution: resolution,
+            frameRate: frameRate.map { "\(Self.formatFrameRate($0)) fps" },
+            highlightsFrameRate: false
+        )
     }
 
     private static func visualResolutionText(

@@ -89,6 +89,59 @@ final class FullScreenPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testMediaInformationFixtureUsesWideCompactChannelCard() {
+        let app = launchFixture(playback: "media-information")
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(
+            for: \.hasFocus,
+            toEqual: true,
+            timeout: 2
+        ))
+        XCUIRemote.shared.press(.select)
+
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "playing")
+
+        let card = app.otherElements["player-channel-info"]
+        let current = app.otherElements.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "当前节目：")
+        ).firstMatch
+        let next = app.otherElements.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "下一节目：")
+        ).firstMatch
+        let progress = app.progressIndicators["player-channel-progress"]
+        let technical = app.descendants(matching: .any)[
+            "1920 乘 1080 隔行扫描，从每秒 25 帧增强到每秒 50 帧"
+        ]
+
+        XCTAssertTrue(card.waitForExistence(timeout: 3))
+        XCTAssertTrue(current.waitForExistence(timeout: 3))
+        XCTAssertTrue(next.waitForExistence(timeout: 3))
+        XCTAssertTrue(technical.waitForExistence(timeout: 3))
+        XCTAssertTrue(progress.waitForExistence(timeout: 3))
+        XCTAssertGreaterThanOrEqual(card.frame.width, 470)
+        XCTAssertLessThan(card.frame.width, 540)
+        XCTAssertGreaterThanOrEqual(progress.frame.width, 240)
+        XCTAssertLessThan(progress.frame.width, 320)
+        XCTAssertLessThan(card.frame.height, 250)
+        XCTAssertLessThan(current.frame.height, 30)
+        XCTAssertLessThan(next.frame.height, 30)
+
+        let visibility = app.otherElements["player-controls-visibility"]
+        XCTAssertTrue(visibility.waitForExistence(timeout: 1))
+        XCUIRemote.shared.press(.right)
+        XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
+        XCTAssertTrue(card.waitForExistence(timeout: 1))
+
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = "channel-info-density"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    @MainActor
     func testFailureOverlayDefaultsFocusToRetry() {
         let app = launchFixture(playback: "failed")
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
