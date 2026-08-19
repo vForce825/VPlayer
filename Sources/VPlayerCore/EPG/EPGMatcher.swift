@@ -121,7 +121,9 @@ private struct EPGMatchIndex: Sendable {
             for normalizedName in normalizedNames {
                 candidateIDsByNormalizedName[normalizedName, default: []]
                     .insert(epgChannel.id)
-                guard normalizedName.count >= 5 else { continue }
+                guard EPGNameNormalizer.isFuzzyMatchEligible(normalizedName) else {
+                    continue
+                }
                 for deletion in Self.oneCharacterDeletions(of: normalizedName) {
                     candidateIDsByOneDeletion[deletion.remainder, default: []]
                         .insert(epgChannel.id)
@@ -170,14 +172,16 @@ private struct EPGMatchIndex: Sendable {
 
         var fuzzyCandidateIDs: Set<String> = []
         for channelName in channelNames {
-            guard channelName.count >= 5 else { continue }
+            guard EPGNameNormalizer.isFuzzyMatchEligible(channelName) else {
+                continue
+            }
 
             // XMLTV name is one character longer than the playlist name.
             fuzzyCandidateIDs.formUnion(candidateIDsByOneDeletion[channelName] ?? [])
 
             for deletion in Self.oneCharacterDeletions(of: channelName) {
                 // XMLTV name is one character shorter than the playlist name.
-                if deletion.remainder.count >= 5 {
+                if EPGNameNormalizer.isFuzzyMatchEligible(deletion.remainder) {
                     fuzzyCandidateIDs.formUnion(
                         candidateIDsByNormalizedName[deletion.remainder] ?? []
                     )
@@ -214,7 +218,12 @@ private struct EPGMatchIndex: Sendable {
         of value: String
     ) -> [(index: Int, remainder: String)] {
         let characters = Array(value)
-        return characters.indices.map { removedIndex in
+        return characters.indices.compactMap { removedIndex in
+            guard !EPGNameNormalizer.isProtectedSemanticCharacter(
+                characters[removedIndex]
+            ) else {
+                return nil
+            }
             var remainder = characters
             remainder.remove(at: removedIndex)
             return (removedIndex, String(remainder))
