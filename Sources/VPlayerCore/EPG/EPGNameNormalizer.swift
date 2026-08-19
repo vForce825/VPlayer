@@ -9,15 +9,32 @@ public enum EPGNameNormalizer {
         let compatible = name.precomposedStringWithCompatibilityMapping
         let lowercase = compatible.lowercased(with: Locale(identifier: "en_US_POSIX"))
         let scalars = lowercase.unicodeScalars.filter {
-            $0.properties.isAlphabetic || $0.properties.numericType != nil
+            $0.properties.isAlphabetic
+                || $0.properties.numericType != nil
+                || $0.value == 0x2B
         }
         return String(String.UnicodeScalarView(scalars))
+    }
+
+    static func isProtectedSemanticCharacter(_ character: Character) -> Bool {
+        character == "+"
+    }
+
+    static func isFuzzyMatchEligible(_ normalizedName: String) -> Bool {
+        normalizedName.lazy.filter {
+            !isProtectedSemanticCharacter($0)
+        }.prefix(5).count == 5
     }
 
     public static func isConservativeFuzzyMatch(_ lhs: String, _ rhs: String) -> Bool {
         let normalizedLeft = normalize(lhs)
         let normalizedRight = normalize(rhs)
-        guard normalizedLeft.count >= 5, normalizedRight.count >= 5 else {
+        guard isFuzzyMatchEligible(normalizedLeft),
+              isFuzzyMatchEligible(normalizedRight) else {
+            return false
+        }
+        guard protectedSemanticCharacters(in: normalizedLeft)
+            == protectedSemanticCharacters(in: normalizedRight) else {
             return false
         }
 
@@ -31,6 +48,10 @@ public enum EPGNameNormalizer {
         }
 
         return levenshteinDistanceExactlyOne(normalizedLeft, normalizedRight)
+    }
+
+    private static func protectedSemanticCharacters(in value: String) -> [Character] {
+        value.filter(isProtectedSemanticCharacter)
     }
 
     private static func levenshteinDistanceExactlyOne(_ lhs: String, _ rhs: String) -> Bool {

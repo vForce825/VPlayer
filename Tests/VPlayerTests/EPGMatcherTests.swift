@@ -21,6 +21,40 @@ final class EPGMatcherTests: XCTestCase {
         )
     }
 
+    func testMatchesCCTV5AndCCTV5PlusAsDistinctNormalizedNames() {
+        let epgChannels = [
+            ("cctv5", ["CCTV5"]),
+            ("cctv5-plus", ["CCTV5+"]),
+        ]
+
+        XCTAssertEqual(
+            match(tvgID: nil, tvgName: "CCTV5", names: epgChannels),
+            .matched(xmltvChannelID: "cctv5", method: .exactName)
+        )
+        XCTAssertEqual(
+            match(tvgID: nil, tvgName: "CCTV5+", names: epgChannels),
+            .matched(xmltvChannelID: "cctv5-plus", method: .exactName)
+        )
+    }
+
+    func testDoesNotFuzzyMatchAcrossSemanticPlusBoundary() {
+        XCTAssertEqual(
+            match(tvgID: nil, tvgName: "CCTV5+", names: [("cctv5", ["CCTV5"])]),
+            .unmatched
+        )
+        XCTAssertEqual(
+            match(tvgID: nil, tvgName: "CCTV5", names: [("cctv5-plus", ["CCTV5+"])]),
+            .unmatched
+        )
+    }
+
+    func testExactXMLTVIDWinsDespitePlusDifferenceInName() {
+        XCTAssertEqual(
+            match(tvgID: "cctv5", tvgName: "CCTV5+", names: [("cctv5", ["CCTV5"])]),
+            .matched(xmltvChannelID: "cctv5", method: .exactID)
+        )
+    }
+
     func testManualOverrideWinsWhenItsTargetExists() {
         let channel = makeChannel(tvgID: "1287", tvgName: nil)
         let manualOverrideResult = EPGMatcher.match(
@@ -249,12 +283,19 @@ final class EPGMatcherTests: XCTestCase {
         XCTAssertEqual(cancellationCheckCount, 3)
     }
 
-    func testNormalizerPrecomposesAndRemovesNonAlphanumericCharacters() {
+    func testNormalizerPrecomposesAndRemovesFormattingCharacters() {
         XCTAssertEqual(EPGNameNormalizer.normalize("五星 体育-HD"), "五星体育hd")
+    }
+
+    func testNormalizerPreservesSemanticPlusAndCanonicalizesFullWidthPlus() {
+        XCTAssertEqual(EPGNameNormalizer.normalize("CCTV5+"), "cctv5+")
+        XCTAssertEqual(EPGNameNormalizer.normalize("CCTV5＋"), "cctv5+")
+        XCTAssertFalse(EPGNameNormalizer.isConservativeFuzzyMatch("CCTV5", "CCTV5+"))
     }
 
     func testFuzzyMatchingRequiresAtLeastFiveNormalizedCharacters() {
         XCTAssertFalse(EPGNameNormalizer.isConservativeFuzzyMatch("ABCD", "ABC"))
+        XCTAssertFalse(EPGNameNormalizer.isConservativeFuzzyMatch("ABCD+", "ABCE+"))
     }
 
     private func match(
