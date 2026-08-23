@@ -415,9 +415,12 @@ final class LiveAppBootstrap {
     static func production() -> LiveAppBootstrap {
         let libraryChanges = LibraryChangeSignal()
         let onPersistedOutcome: RefreshCoordinator.PersistedOutcomeHandler = {
-            [weak libraryChanges] _, _ in
+            [weak libraryChanges] profileID, outcome in
             await MainActor.run {
-                libraryChanges?.notify()
+                libraryChanges?.notify(
+                    profileID: profileID,
+                    resource: outcome.resource
+                )
             }
         }
         let onRefreshStarted: RefreshCoordinator.RefreshStartedHandler = {
@@ -609,9 +612,12 @@ struct AppDependencies {
         do {
             let libraryChanges = LibraryChangeSignal()
             let runtime = try makeProductionLibraryRuntime(
-                onPersistedOutcome: { [weak libraryChanges] _, _ in
+                onPersistedOutcome: { [weak libraryChanges] profileID, outcome in
                     await MainActor.run {
-                        libraryChanges?.notify()
+                        libraryChanges?.notify(
+                            profileID: profileID,
+                            resource: outcome.resource
+                        )
                     }
                 },
                 onRefreshStarted: { [weak libraryChanges] profileID, resource in
@@ -677,8 +683,13 @@ struct AppDependencies {
             let coordinator = RefreshCoordinator(
                 repository: repository,
                 downloader: URLSessionBoundedDownloader(),
-                onPersistedOutcome: { [weak libraryChanges] _, _ in
-                    await MainActor.run { libraryChanges?.notify() }
+                onPersistedOutcome: { [weak libraryChanges] profileID, outcome in
+                    await MainActor.run {
+                        libraryChanges?.notify(
+                            profileID: profileID,
+                            resource: outcome.resource
+                        )
+                    }
                 },
                 onRefreshStarted: { [weak libraryChanges] profileID, resource in
                     await MainActor.run {
@@ -919,7 +930,10 @@ struct AppDependencies {
                 }
                 outcomes.append(outcome)
                 await MainActor.run {
-                    libraryChanges.notify()
+                    libraryChanges.notify(
+                        profileID: profileID,
+                        resource: resource
+                    )
                 }
             }
             return outcomes

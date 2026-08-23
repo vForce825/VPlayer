@@ -48,6 +48,83 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    func testLargeLibraryPresentationPreparationYieldsMainActorAndBuildsSnapshot() async throws {
+        let now = Date(timeIntervalSince1970: 1_787_486_400)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        let channelCount = 10_000
+        let channels = (0..<channelCount).reversed().map { index in
+            makeChannel(
+                profileID: profile.id,
+                url: "https://example.test/live/\(index)",
+                tvgID: "epg-\(index)",
+                order: index
+            )
+        }
+        let matches = Dictionary(uniqueKeysWithValues: channels.map { channel in
+            (
+                channel.id,
+                EPGMatchResult.matched(
+                    xmltvChannelID: channel.tvgID!,
+                    method: .exactID
+                )
+            )
+        })
+        let programmesByXMLTVChannelID = Dictionary(uniqueKeysWithValues: (0..<channelCount).map {
+            index in
+            let programme = Programme(
+                id: "programme-\(index)",
+                xmltvChannelID: "epg-\(index)",
+                start: now.addingTimeInterval(-600),
+                stop: now.addingTimeInterval(600),
+                title: "Programme \(index)",
+                subtitle: nil,
+                summary: nil,
+                categories: []
+            )
+            return (programme.xmltvChannelID, [programme])
+        })
+        let playingChannel = channels[channelCount / 2]
+        let playbackRequest = PlaybackRequest(
+            sourceProfileID: profile.id,
+            channelID: playingChannel.id,
+            streamURL: playingChannel.streamURL,
+            title: playingChannel.displayName
+        )
+        var mainActorHeartbeatRan = false
+        Task { @MainActor in
+            mainActorHeartbeatRan = true
+        }
+
+        let snapshot = try await AppModel.makeLibraryPresentationSnapshot(
+            channels: channels,
+            matches: matches,
+            programmesByXMLTVChannelID: programmesByXMLTVChannelID,
+            sortsChannels: true,
+            indexesPlaybackChannels: true
+        )
+
+        XCTAssertTrue(mainActorHeartbeatRan)
+        XCTAssertEqual(snapshot.channels.first?.order, 0)
+        XCTAssertEqual(snapshot.channels.last?.order, channelCount - 1)
+        XCTAssertEqual(snapshot.programmesByChannelID.count, channelCount)
+        XCTAssertEqual(
+            snapshot.programmesByChannelID[playingChannel.id]?.first?.title,
+            "Programme \(playingChannel.order)"
+        )
+        XCTAssertEqual(
+            snapshot.playbackChannelIdentities[playingChannel.id],
+            AppModel.PlaybackChannelIdentity(
+                sourceProfileID: playbackRequest.sourceProfileID,
+                streamURL: playbackRequest.streamURL,
+                title: playbackRequest.title
+            )
+        )
+    }
+
     func testReloadReportsEPGWhoseProgrammesAllEndedAndClearsItOnceCoverageReachesNow() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
@@ -2102,6 +2179,174 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.channels.map(\.streamURL), [refreshedChannel.streamURL])
     }
 
+    func testEPGPersistenceTerminalSignalUpdatesProgrammesWithoutRereadingChannels() async {
+        let now = Date(timeIntervalSince1970: 1_787_486_400)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: "epg",
+            order: 0
+        )
+        let oldProgramme = Programme(
+            id: "old",
+            xmltvChannelID: "epg",
+            start: now.addingTimeInterval(-600),
+            stop: now.addingTimeInterval(600),
+            title: "Old EPG",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [channel]],
+            epgChannels: [
+                profile.id: [
+                    EPGChannel(id: "epg", displayNames: ["Channel"], iconURL: nil)
+                ]
+            ],
+            programmes: [profile.id: [oldProgramme]]
+        )
+        let changes = LibraryChangeSignal()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            libraryChanges: changes,
+            now: { now }
+        )
+        let downloader = AppModelRefreshDownloader(
+            payload: Data("""
+            <?xml version="1.0" encoding="UTF-8"?>
+            <tv>
+              <channel id="epg"><display-name>Channel</display-name></channel>
+              <programme channel="epg" start="20260823110000 +0000" stop="20260823130000 +0000">
+                <title>Refreshed EPG</title>
+              </programme>
+            </tv>
+            """.utf8)
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { now },
+            onPersistedOutcome: { profileID, outcome in
+                await MainActor.run {
+                    changes.notify(profileID: profileID, resource: outcome.resource)
+                }
+            }
+        )
+
+        await model.reload()
+        let channelReadsBeforeRefresh = await repository.snapshot().channelLookupCount
+
+        let outcomes = await coordinator.refresh(
+            profileID: profile.id,
+            resources: [.epg],
+            trigger: .foreground
+        )
+        await eventually {
+            model.programmesByChannelID[channel.id]?.first?.title == "Refreshed EPG"
+        }
+
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertEqual(outcomes.first?.resource, .epg)
+        XCTAssertEqual(outcomes.first?.succeeded, true)
+        XCTAssertNil(outcomes.first?.message)
+        XCTAssertNotNil(outcomes.first?.attemptID)
+        XCTAssertEqual(snapshot.channelLookupCount, channelReadsBeforeRefresh)
+        XCTAssertEqual(model.channels, [channel])
+        XCTAssertEqual(model.programmesByChannelID[channel.id]?.map(\.title), ["Refreshed EPG"])
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .succeeded)
+    }
+
+    func testLargePersistedPlaylistRefreshPublishesTenThousandChannelsWithOneChannelRead() async {
+        let now = Date(timeIntervalSince1970: 1_787_486_400)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        let oldChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/old",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            channels: [profile.id: [oldChannel]]
+        )
+        let changes = LibraryChangeSignal()
+        let (processedChanges, processedChangeContinuation) = AsyncStream.makeStream(
+            of: AppModel.ProcessedLibraryChange.self,
+            bufferingPolicy: .unbounded
+        )
+        defer { processedChangeContinuation.finish() }
+        var processedChangeIterator = processedChanges.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, _, _ in [] },
+            libraryChanges: changes,
+            libraryChangeProcessed: { processing in
+                processedChangeContinuation.yield(processing)
+            },
+            now: { now }
+        )
+
+        let channelCount = 10_000
+        var playlistLines = ["#EXTM3U"]
+        playlistLines.reserveCapacity(channelCount * 2 + 1)
+        for index in 0..<channelCount {
+            playlistLines.append(
+                "#EXTINF:-1 tvg-id=\"epg-\(index)\" group-title=\"Group \(index % 100)\",Channel \(index)"
+            )
+            playlistLines.append("https://example.test/live/\(index)")
+        }
+        let downloader = AppModelRefreshDownloader(
+            payload: Data(playlistLines.joined(separator: "\n").utf8)
+        )
+        let coordinator = RefreshCoordinator(
+            repository: repository,
+            downloader: downloader,
+            now: { now },
+            onPersistedOutcome: { profileID, outcome in
+                await MainActor.run {
+                    changes.notify(profileID: profileID, resource: outcome.resource)
+                }
+            }
+        )
+
+        await model.reload()
+        let channelReadsBeforeRefresh = await repository.snapshot().channelLookupCount
+
+        let outcomes = await coordinator.refresh(
+            profileID: profile.id,
+            resources: [.playlist],
+            trigger: .foreground
+        )
+        let processing = await processedChangeIterator.next()
+
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertEqual(outcomes.first?.resource, .playlist)
+        XCTAssertEqual(outcomes.first?.succeeded, true)
+        XCTAssertEqual(processing?.generation, changes.generation)
+        XCTAssertEqual(processing?.reloadApplied, true)
+        XCTAssertEqual(snapshot.playlistInstallCount, 1)
+        XCTAssertEqual(snapshot.channelLookupCount, channelReadsBeforeRefresh + 1)
+        XCTAssertEqual(model.channels.count, channelCount)
+        XCTAssertEqual(model.channels.first?.displayName, "Channel 0")
+        XCTAssertEqual(model.channels.first?.order, 0)
+        XCTAssertEqual(model.channels.last?.displayName, "Channel 9999")
+        XCTAssertEqual(model.channels.last?.order, channelCount - 1)
+    }
+
     func testPersistenceTerminalSignalReloadsVisibleFailureStatus() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
@@ -2412,6 +2657,61 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(newestGeneration, 1_001)
     }
 
+    func testBufferedRefreshSignalsPreserveEveryResourceSinceLastProcessedGeneration() async {
+        let profileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let changes = LibraryChangeSignal()
+        let stream = changes.changes(after: 0)
+        var iterator = stream.makeAsyncIterator()
+
+        changes.notify(profileID: profileID, resource: .epg)
+        changes.notify(profileID: profileID, resource: .playlist)
+
+        let newestGeneration = await iterator.next()
+        XCTAssertEqual(newestGeneration, 2)
+        XCTAssertEqual(
+            changes.reloadScope(after: 0),
+            .refreshes([profileID: [.playlist, .epg]])
+        )
+        XCTAssertEqual(
+            changes.reloadScope(after: 1),
+            .refreshes([profileID: [.playlist]])
+        )
+    }
+
+    func testPersistedRefreshClaimCoalescesPendingResourcesOrDiscardsThemAfterLocalReload() {
+        let profileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let changes = LibraryChangeSignal()
+        let publishedClaim = changes.claimPersistedRefreshes(
+            profileID: profileID,
+            resources: [.playlist, .epg]
+        )
+
+        changes.notify(profileID: profileID, resource: .epg)
+        changes.notify(profileID: profileID, resource: .playlist)
+        XCTAssertEqual(changes.generation, 0)
+
+        changes.releasePersistedRefreshes(
+            publishedClaim,
+            publishesPendingChanges: true
+        )
+        XCTAssertEqual(changes.generation, 1)
+        XCTAssertEqual(
+            changes.reloadScope(after: 0),
+            .refreshes([profileID: [.playlist, .epg]])
+        )
+
+        let discardedClaim = changes.claimPersistedRefreshes(
+            profileID: profileID,
+            resources: [.epg]
+        )
+        changes.notify(profileID: profileID, resource: .epg)
+        changes.releasePersistedRefreshes(
+            discardedClaim,
+            publishesPendingChanges: false
+        )
+        XCTAssertEqual(changes.generation, 1)
+    }
+
     func testCreateRetryIdentityUpdatesCommittedProfileWhenInputChanges() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let repository = RepositorySpy(profiles: [])
@@ -2477,10 +2777,214 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(created)
         let createdID = try XCTUnwrap(model.profiles.first?.id)
 
-        await probe.waitForCalls(count: 2)
+        await probe.waitForCalls(count: 1)
         let calls = await probe.calls
-        XCTAssertEqual(Set(calls.flatMap(\.resources)), [.playlist, .epg])
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.resources, [.playlist, .epg])
         XCTAssertTrue(calls.allSatisfy { $0.profileID == createdID })
+    }
+
+    func testCreatedProfileAutomaticBatchConsumesPersistedSignalsAndReloadsChannelsOnce() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let changes = LibraryChangeSignal()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                if resources.contains(.playlist) {
+                    await repository.replaceChannels(
+                        profileID: profileID,
+                        channels: [
+                            Channel(
+                                sourceProfileID: profileID,
+                                displayName: "Refreshed",
+                                streamURL: URL(string: "https://example.test/refreshed")!,
+                                tvgID: nil,
+                                tvgName: nil,
+                                logoURL: nil,
+                                groupTitle: nil,
+                                attributes: [:],
+                                order: 0
+                            )
+                        ]
+                    )
+                }
+                var outcomes: [RefreshOutcome] = []
+                for resource in resources {
+                    let attemptID = UUID()
+                    try? await repository.recordSuccess(
+                        profileID: profileID,
+                        resource: resource,
+                        at: now,
+                        attemptID: attemptID
+                    )
+                    let outcome = RefreshOutcome(
+                        resource: resource,
+                        succeeded: true,
+                        message: nil,
+                        attemptID: attemptID
+                    )
+                    outcomes.append(outcome)
+                    await MainActor.run {
+                        changes.notify(profileID: profileID, resource: resource)
+                    }
+                }
+                return outcomes
+            },
+            libraryChanges: changes,
+            now: { now }
+        )
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+
+        let created = await model.create(input: input, attemptID: UUID())
+        XCTAssertTrue(created)
+        await eventually {
+            model.channels.map(\.displayName) == ["Refreshed"]
+        }
+        await model.waitForLibraryReloadsToSettle()
+
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(changes.generation, 0)
+        XCTAssertEqual(snapshot.channelLookupCount, 2)
+        XCTAssertEqual(model.channels.map(\.displayName), ["Refreshed"])
+        XCTAssertEqual(model.profiles.first?.m3uStatus.state, .succeeded)
+        XCTAssertEqual(model.profiles.first?.epgStatus.state, .succeeded)
+    }
+
+    func testForegroundCompletionDuringAutomaticBatchReloadIsNotConsumedByFinishedClaim() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let changes = LibraryChangeSignal()
+        let automaticRefreshGate = AppModelAsyncGate()
+        await automaticRefreshGate.arm()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                await repository.replaceChannels(
+                    profileID: profileID,
+                    channels: [
+                        Channel(
+                            sourceProfileID: profileID,
+                            displayName: "Automatic batch",
+                            streamURL: URL(string: "https://example.test/automatic-batch")!,
+                            tvgID: nil,
+                            tvgName: nil,
+                            logoURL: nil,
+                            groupTitle: nil,
+                            attributes: [:],
+                            order: 0
+                        )
+                    ]
+                )
+                var outcomes: [RefreshOutcome] = []
+                for resource in resources {
+                    let outcome = RefreshOutcome(
+                        resource: resource,
+                        succeeded: true,
+                        message: nil,
+                        attemptID: UUID()
+                    )
+                    outcomes.append(outcome)
+                    await MainActor.run {
+                        changes.notify(profileID: profileID, resource: resource)
+                    }
+                }
+                await automaticRefreshGate.suspendIfArmed()
+                return outcomes
+            },
+            libraryChanges: changes,
+            now: { now }
+        )
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+
+        let created = await model.create(input: input, attemptID: UUID())
+        XCTAssertTrue(created)
+        let profileID = try XCTUnwrap(model.profiles.first?.id)
+        await automaticRefreshGate.waitUntilSuspended()
+        await repository.gateNextChannelRead()
+        await automaticRefreshGate.release()
+        await repository.waitUntilChannelReadIsBlocked()
+
+        let foregroundChannel = Channel(
+            sourceProfileID: profileID,
+            displayName: "Foreground completion",
+            streamURL: URL(string: "https://example.test/foreground-completion")!,
+            tvgID: nil,
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 0
+        )
+        await repository.replaceChannels(
+            profileID: profileID,
+            channels: [foregroundChannel]
+        )
+        changes.notify(profileID: profileID, resource: .playlist)
+        XCTAssertEqual(changes.generation, 1)
+
+        await repository.releaseChannelRead()
+        await eventually {
+            model.channels == [foregroundChannel]
+        }
+        await model.waitForLibraryReloadsToSettle()
+
+        XCTAssertEqual(model.channels, [foregroundChannel])
+        let snapshot = await repository.snapshot()
+        XCTAssertGreaterThanOrEqual(snapshot.channelLookupCount, 3)
+    }
+
+    func testAutomaticBatchDoesNotRetainModelAndReleasesClaimWhenRefreshIgnoresCancellation() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let changes = LibraryChangeSignal()
+        let refreshGate = AppModelAsyncGate()
+        await refreshGate.arm()
+        var model: AppModel? = AppModel(
+            repository: repository,
+            refresh: { _, resources, _ in
+                await refreshGate.suspendIfArmed()
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: true, message: nil)
+                }
+            },
+            libraryChanges: changes,
+            now: { now }
+        )
+        let input = SourceProfileInput(
+            name: "Created",
+            m3uURLString: "https://example.test/playlist.m3u",
+            epgURLString: "https://example.test/epg.xml",
+            m3uRefreshInterval: .manual,
+            epgRefreshInterval: .manual
+        )
+
+        let created = await model?.create(input: input, attemptID: UUID())
+        XCTAssertEqual(created, true)
+        let profileID = try XCTUnwrap(model?.profiles.first?.id)
+        await refreshGate.waitUntilSuspended()
+        weak let weakModel = model
+        model = nil
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+
+        XCTAssertNil(weakModel)
+        changes.notify(profileID: profileID, resource: .playlist)
+        XCTAssertEqual(changes.generation, 1)
+        await refreshGate.release()
     }
 
     func testEditedProfileRefetchesOnlyTheResourceWhoseAddressChanged() async {
@@ -3552,6 +4056,43 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    func testReloadKeepsPlaybackSelectedAfterPresentationPreparationWhenSnapshotContainsIt() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let presentationGate = AppModelAsyncGate()
+        let fixture = try await makeLoadedActiveBoundFixture(
+            additionalProfiles: [],
+            beforeLibraryPresentationApply: {
+                await presentationGate.suspendIfArmed()
+            },
+            now: now
+        )
+        fixture.model.dismissPlayback()
+        fixture.model.select(channel: fixture.automaticChannel)
+        await fixture.repository.replaceChannels(
+            profileID: fixture.activeProfile.id,
+            channels: [fixture.manualChannel]
+        )
+        await presentationGate.arm()
+
+        let reload = Task { await fixture.model.reload() }
+        await presentationGate.waitUntilSuspended()
+        fixture.model.dismissPlayback()
+        fixture.model.select(channel: fixture.manualChannel)
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.channelID,
+            fixture.manualChannel.id
+        )
+        await presentationGate.release()
+
+        let reloadApplied = await reload.value
+        XCTAssertTrue(reloadApplied)
+        XCTAssertEqual(fixture.model.channels, [fixture.manualChannel])
+        XCTAssertEqual(
+            fixture.model.presentedPlaybackRequest?.channelID,
+            fixture.manualChannel.id
+        )
+    }
+
     func testOrdinaryReloadClearsChannelSelectedDuringReadWhenNewSnapshotRemovedIt() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let fixture = try await makeLoadedActiveBoundFixture(
@@ -3993,6 +4534,7 @@ final class AppModelTests: XCTestCase {
         additionalProfiles: [SourceProfile],
         additionalChannels: [UUID: [Channel]] = [:],
         mutationLaneEvent: (@MainActor @Sendable (AppModel.ActiveMutationLaneEvent) -> Void)? = nil,
+        beforeLibraryPresentationApply: @escaping @Sendable () async -> Void = {},
         now: Date
     ) async throws -> LoadedActiveBoundFixture {
         let active = makeProfile(
@@ -4052,6 +4594,7 @@ final class AppModelTests: XCTestCase {
             repository: repository,
             refresh: { _, _, _ in [] },
             mutationLaneEvent: mutationLaneEvent,
+            beforeLibraryPresentationApply: beforeLibraryPresentationApply,
             now: { now }
         )
 
@@ -4186,6 +4729,43 @@ private actor RefreshCallProbe {
         await withCheckedContinuation { continuation in
             waiters.append((count: count, continuation: continuation))
         }
+    }
+}
+
+private actor AppModelAsyncGate {
+    private var isArmed = false
+    private var isSuspended = false
+    private var suspensionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func arm() {
+        isArmed = true
+    }
+
+    func suspendIfArmed() async {
+        guard isArmed else { return }
+        isArmed = false
+        isSuspended = true
+        for waiter in suspensionWaiters {
+            waiter.resume()
+        }
+        suspensionWaiters = []
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { continuation in
+            suspensionWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+        isSuspended = false
     }
 }
 

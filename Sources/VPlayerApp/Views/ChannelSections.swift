@@ -14,6 +14,39 @@ struct ChannelSection: Identifiable, Equatable {
     var channels: [Channel]
 }
 
+/// The derived channel-browser values for one SwiftUI body evaluation. Keeping
+/// the filtered playlist and its sections together lets every branch of the
+/// browser consume the same grouping work.
+struct ChannelBrowserPresentation: Equatable {
+    let filteredChannels: [Channel]
+    let sections: [ChannelSection]
+    let defaultFocusChannelID: String?
+    let showsGroupRail: Bool
+
+    init(
+        channels: [Channel],
+        searchText: String,
+        grouping: ChannelGrouping
+    ) {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            filteredChannels = channels
+        } else {
+            filteredChannels = channels.filter { channel in
+                channel.displayName.localizedCaseInsensitiveContains(query)
+                    || channel.groupTitle?.localizedCaseInsensitiveContains(query) == true
+                    || channel.tvgName?.localizedCaseInsensitiveContains(query) == true
+            }
+        }
+        sections = ChannelSectionBuilder.sections(
+            channels: filteredChannels,
+            grouping: grouping
+        )
+        defaultFocusChannelID = sections.first?.channels.first?.id
+        showsGroupRail = grouping == .playlistGroups && sections.count > 1
+    }
+}
+
 enum ChannelSectionBuilder {
     /// Where channels land when the playlist gives them no `group-title`. M3U
     /// files routinely omit it on a handful of entries, and those channels must
