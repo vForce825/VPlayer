@@ -52,6 +52,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         let programmeBatchRequests: [ProgrammeBatchRequest]
         let events: [Event]
         let profileLookupCount: Int
+        let channelLookupCount: Int
         let playlistInstallCount: Int
         let epgInstallCount: Int
         let profileCreateCount: Int
@@ -70,6 +71,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var programmeBatchRequests: [Snapshot.ProgrammeBatchRequest] = []
     private var recordedEvents: [Event] = []
     private var profileLookupCount = 0
+    private var channelLookupCount = 0
     private var playlistInstallCount = 0
     private var epgInstallCount = 0
     private var profileCreateCount = 0
@@ -135,6 +137,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             programmeBatchRequests: programmeBatchRequests,
             events: recordedEvents,
             profileLookupCount: profileLookupCount,
+            channelLookupCount: channelLookupCount,
             playlistInstallCount: playlistInstallCount,
             epgInstallCount: epgInstallCount,
             profileCreateCount: profileCreateCount,
@@ -388,6 +391,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     func channels(profileID: UUID) async throws -> [Channel] {
         if failsReads { throw InjectedError.read }
         _ = try profileIndex(profileID)
+        channelLookupCount += 1
         let result = storedChannels[profileID, default: []]
         if shouldGateNextChannelRead {
             shouldGateNextChannelRead = false

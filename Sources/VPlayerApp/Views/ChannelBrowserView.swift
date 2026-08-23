@@ -44,7 +44,19 @@ struct ChannelBrowserView: View {
                 // the loading and empty states above stay chrome-free. Default
                 // focus is pinned to the first channel so entering the tab
                 // lands on content rather than the search keyboard.
-                channelGrid
+                let presentation = ChannelBrowserPresentation(
+                    channels: model.channels,
+                    searchText: searchText,
+                    grouping: browsingSettings.grouping
+                )
+                let defaultFocusElement = defaultFocusElement(
+                    for: presentation.sections,
+                    defaultFocusChannelID: presentation.defaultFocusChannelID
+                )
+                channelGrid(
+                    sections: presentation.sections,
+                    showsGroupRail: presentation.showsGroupRail
+                )
                     .searchable(text: $searchText, prompt: "搜索频道")
                     .defaultFocus($focusedElement, defaultFocusElement)
             }
@@ -54,11 +66,18 @@ struct ChannelBrowserView: View {
         }
     }
 
-    private var defaultFocusElement: ChannelBrowserFocus? {
+    private func defaultFocusElement(
+        for sections: [ChannelSection],
+        defaultFocusChannelID: String?
+    ) -> ChannelBrowserFocus? {
         guard !focusPolicy.isEnabled || focusPolicy.focusesFirstChannel else {
             return nil
         }
-        return filteredChannels.first.map { .channel($0.id) }
+        guard let firstChannelID = sections.first?.channels.first?.id,
+              firstChannelID == defaultFocusChannelID else {
+            return nil
+        }
+        return .channel(firstChannelID)
     }
 
     private var contentState: ChannelBrowserContentState {
@@ -70,15 +89,21 @@ struct ChannelBrowserView: View {
     }
 
     @ViewBuilder
-    private var channelGrid: some View {
+    private func channelGrid(
+        sections: [ChannelSection],
+        showsGroupRail: Bool
+    ) -> some View {
         if sections.isEmpty {
             ContentUnavailableView.search(text: searchText)
         } else {
-            sectionedChannelGrid
+            sectionedChannelGrid(sections: sections, showsGroupRail: showsGroupRail)
         }
     }
 
-    private var sectionedChannelGrid: some View {
+    private func sectionedChannelGrid(
+        sections: [ChannelSection],
+        showsGroupRail: Bool
+    ) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -86,7 +111,7 @@ struct ChannelBrowserView: View {
                     // at the top of the browser and leaves the screen with the
                     // channel rows instead of occupying a permanent viewport.
                     if showsGroupRail {
-                        groupRail(proxy: proxy)
+                        groupRail(proxy: proxy, sections: sections)
                     }
                     if let staleCoverageEnd = model.staleEPGCoverageEnd {
                         staleEPGBanner(coverageEnd: staleCoverageEnd)
@@ -114,7 +139,10 @@ struct ChannelBrowserView: View {
     /// group both scrolls its header to the top — which also realizes the lazy
     /// rows — and hands focus to its first channel, so the remote ends up in
     /// the group rather than merely pointing at it.
-    private func groupRail(proxy: ScrollViewProxy) -> some View {
+    private func groupRail(
+        proxy: ScrollViewProxy,
+        sections: [ChannelSection]
+    ) -> some View {
         ScrollView(.horizontal) {
             HStack(spacing: 16) {
                 ForEach(sections) { section in
@@ -146,10 +174,6 @@ struct ChannelBrowserView: View {
         // One focus section keeps the rail a single up/down stop rather than a
         // row the remote has to traverse chip by chip on its way to the grid.
         .focusSection()
-    }
-
-    private var showsGroupRail: Bool {
-        browsingSettings.grouping == .playlistGroups && sections.count > 1
     }
 
     private func channelCard(for channel: Channel) -> some View {
@@ -227,25 +251,6 @@ struct ChannelBrowserView: View {
 
     private func sectionScrollID(for section: ChannelSection) -> String {
         "channel.section.\(section.id)"
-    }
-
-    private var sections: [ChannelSection] {
-        ChannelSectionBuilder.sections(
-            channels: filteredChannels,
-            grouping: browsingSettings.grouping
-        )
-    }
-
-    /// Channels narrowed by the search field. Large IPTV playlists are not
-    /// navigable by scrolling alone, so name, group, and tvg-name all match.
-    private var filteredChannels: [Channel] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return model.channels }
-        return model.channels.filter { channel in
-            channel.displayName.localizedCaseInsensitiveContains(query)
-                || channel.groupTitle?.localizedCaseInsensitiveContains(query) == true
-                || channel.tvgName?.localizedCaseInsensitiveContains(query) == true
-        }
     }
 
     private func channelIdentifier(_ channel: Channel) -> String {
