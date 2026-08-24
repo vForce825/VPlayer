@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #define VPFF_VIDEO_DECODER_ABI_VERSION ((uint32_t)1)
+#define VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT INT32_C(1)
 
 typedef struct VPFFVideoDecoder VPFFVideoDecoder;
 
@@ -58,12 +59,16 @@ int32_t vp_ffmpeg_video_decoder_create(
 );
 
 /* Access-unit bytes are borrowed only for this call and are NULL iff size is
-   zero. Frames complete through the callback before this returns. */
+   zero. Frames complete through the callback before this returns. Both output
+   pointers are required and report the token for an unsupported output, if the
+   decoder produced one with a positive PTS. */
 int32_t vp_ffmpeg_video_decoder_push(
     VPFFVideoDecoder *decoder,
     const uint8_t *bytes,
     size_t size,
-    int64_t pts
+    int64_t pts,
+    int64_t *out_failure_token,
+    uint8_t *out_has_failure_token
 );
 
 /* Writes one decoded picture into a bi-planar destination: the luma plane row

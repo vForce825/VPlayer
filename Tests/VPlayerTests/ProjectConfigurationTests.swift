@@ -21,6 +21,12 @@ final class ProjectConfigurationTests: XCTestCase {
             contentsOf: repositoryRoot.appendingPathComponent("project.yml"),
             encoding: .utf8
         )
+        let generatedProject = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "VPlayer.xcodeproj/project.pbxproj"
+            ),
+            encoding: .utf8
+        )
         let infoPlist = try propertyList(
             at: repositoryRoot.appendingPathComponent(
                 "Sources/VPlayerApp/Resources/Info.plist"
@@ -29,10 +35,17 @@ final class ProjectConfigurationTests: XCTestCase {
 
         XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
         XCTAssertEqual(
-            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.3\"").count - 1,
+            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.4\"").count - 1,
             3,
             "the app and both embedded frameworks need a marketing version"
         )
+        XCTAssertFalse(projectYAML.contains("MARKETING_VERSION: \"1.3\""))
+        XCTAssertEqual(
+            generatedProject.components(separatedBy: "MARKETING_VERSION = 1.4;").count - 1,
+            6,
+            "Debug and Release for the app and both embedded frameworks need version 1.4"
+        )
+        XCTAssertFalse(generatedProject.contains("MARKETING_VERSION = 1.3;"))
         XCTAssertEqual(
             projectYAML.components(separatedBy: "CURRENT_PROJECT_VERSION: \"1\"").count - 1,
             3,

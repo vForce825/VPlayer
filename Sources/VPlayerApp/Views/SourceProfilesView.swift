@@ -29,6 +29,16 @@ enum ResourceRefreshStatusPresentation {
     }
 }
 
+enum SourceProfileURLPresentation {
+    static func m3uURL(
+        profile: SourceProfile,
+        protectsAcceptanceValue: Bool
+    ) -> String {
+        if protectsAcceptanceValue { return "Protected URL configured" }
+        return RedactedURL.string(profile.m3uURL)
+    }
+}
+
 struct SourceProfilesView: View {
     /// One shared column grid keeps the playlist header and its indented
     /// resource rows aligned, so the hierarchy survives being read from across
@@ -228,6 +238,11 @@ struct SourceProfilesView: View {
 
     private func profileHeader(_ profile: SourceProfile) -> some View {
         let isActive = model.activeProfile?.id == profile.id
+        #if DEBUG
+        let protectsAcceptanceValue = AcceptanceSourcePrefill.isActive()
+        #else
+        let protectsAcceptanceValue = false
+        #endif
         return HStack(alignment: .center, spacing: Metrics.columnSpacing) {
             Image(systemName: isActive ? "play.square.stack.fill" : "play.square.stack")
                 .font(.title2)
@@ -241,7 +256,10 @@ struct SourceProfilesView: View {
                         activeBadge(profile)
                     }
                 }
-                Text(displayedM3UURL(for: profile))
+                Text(SourceProfileURLPresentation.m3uURL(
+                    profile: profile,
+                    protectsAcceptanceValue: protectsAcceptanceValue
+                ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -287,15 +305,6 @@ struct SourceProfilesView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(Capsule().fill(.green.opacity(0.18)))
-    }
-
-    private func displayedM3UURL(for profile: SourceProfile) -> String {
-        #if DEBUG
-        if AcceptanceSourcePrefill.isActive() {
-            return "Protected URL configured"
-        }
-        #endif
-        return profile.m3uURL.absoluteString
     }
 
     private func resourceStatus(

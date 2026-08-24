@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CryptoKit
 import XCTest
+import UIKit
 @testable import VPlayer
 @testable import VPlayerCore
 import VPlayerPlayback
@@ -44,22 +46,30 @@ final class VPlayerAppStartupTests: XCTestCase {
 
     func testChannelLogoCachePersistsDownloadedImageAndAvoidsSecondRequest() async throws {
         let cacheDirectory = temporaryLogoCacheDirectory()
+        let downloadsDirectory = temporaryLogoDownloadsDirectory()
         defer { try? FileManager.default.removeItem(at: cacheDirectory) }
-        let session = logoTestSession()
+        defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
+        let dataLoader = logoDataLoader(downloadsDirectory: downloadsDirectory)
         let logoURL = try XCTUnwrap(URL(string: "https://images.example/oriental-4k.png"))
         StubURLProtocol.enqueue(.init(
             response: .http(statusCode: 200, headers: ["Content-Type": "image/png"]),
             chunks: [Self.onePixelPNG]
         ))
 
-        let firstCache = ChannelLogoCache(session: session, cacheDirectory: cacheDirectory)
+        let firstCache = ChannelLogoCache(
+            dataLoader: dataLoader,
+            cacheDirectory: cacheDirectory
+        )
         let downloadedImage = await firstCache.image(for: logoURL)
         let memoryCachedImage = await firstCache.image(for: logoURL)
         XCTAssertNotNil(downloadedImage)
         XCTAssertNotNil(memoryCachedImage)
         XCTAssertEqual(StubURLProtocol.requests.count, 1)
 
-        let relaunchedCache = ChannelLogoCache(session: session, cacheDirectory: cacheDirectory)
+        let relaunchedCache = ChannelLogoCache(
+            dataLoader: dataLoader,
+            cacheDirectory: cacheDirectory
+        )
         let diskCachedImage = await relaunchedCache.image(for: logoURL)
         XCTAssertNotNil(diskCachedImage)
         XCTAssertEqual(StubURLProtocol.requests.count, 1)
@@ -71,7 +81,9 @@ final class VPlayerAppStartupTests: XCTestCase {
 
     func testChannelLogoCacheCoalescesConcurrentRequestsForSameURL() async throws {
         let cacheDirectory = temporaryLogoCacheDirectory()
+        let downloadsDirectory = temporaryLogoDownloadsDirectory()
         defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
         let logoURL = try XCTUnwrap(URL(string: "https://images.example/shared.png"))
         StubURLProtocol.enqueue(.init(
             response: .http(statusCode: 200),
@@ -79,7 +91,7 @@ final class VPlayerAppStartupTests: XCTestCase {
             callbackDelay: 0.02
         ))
         let cache = ChannelLogoCache(
-            session: logoTestSession(),
+            dataLoader: logoDataLoader(downloadsDirectory: downloadsDirectory),
             cacheDirectory: cacheDirectory
         )
 
@@ -90,6 +102,144 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertNotNil(firstImage)
         XCTAssertNotNil(secondImage)
         XCTAssertEqual(StubURLProtocol.requests.count, 1)
+    }
+
+    func testChannelLogoCacheRejectsDeclaredLengthAndCancelsBeforeRemainingBody() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        let downloadsDirectory = temporaryLogoDownloadsDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/declared-too-large.png"))
+        let limit = 8 * 1_024 * 1_024
+        let plannedChunkCount = 3
+        StubURLProtocol.enqueue(.init(
+            response: .http(
+                statusCode: 200,
+                headers: ["Content-Length": "\(limit + 1)"]
+            ),
+            chunks: Array(
+                repeating: Data(repeating: 0x41, count: limit / 2),
+                count: plannedChunkCount
+            ),
+            callbackDelay: 0.02
+        ))
+        let cache = ChannelLogoCache(
+            dataLoader: logoDataLoader(downloadsDirectory: downloadsDirectory),
+            cacheDirectory: cacheDirectory
+        )
+
+        let image = await cache.image(for: logoURL)
+        await waitForLogoProtocolCancellation()
+
+        XCTAssertNil(image)
+        XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 1)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+    }
+
+    func testChannelLogoCacheCancelsChunkedTransferAtFirstOverflowChunk() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        let downloadsDirectory = temporaryLogoDownloadsDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/chunked-too-large.png"))
+        let limit = 8 * 1_024 * 1_024
+        StubURLProtocol.enqueue(.init(
+            chunks: [
+                Data(repeating: 0x41, count: limit),
+                Data([0x42]),
+                Data("must-not-be-delivered".utf8),
+            ],
+            callbackDelay: 0.02
+        ))
+        let cache = ChannelLogoCache(
+            dataLoader: logoDataLoader(downloadsDirectory: downloadsDirectory),
+            cacheDirectory: cacheDirectory
+        )
+
+        let image = await cache.image(for: logoURL)
+        await waitForLogoProtocolCancellation()
+
+        XCTAssertNil(image)
+        XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 2)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+    }
+
+    func testChannelLogoCacheDecodesAwayFromMainThreadWhenCalledOnMainActor() async throws {
+        XCTAssertTrue(Thread.isMainThread)
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/thread-probe.png"))
+        let probe = ChannelLogoDecoderThreadProbe()
+        let cache = ChannelLogoCache(
+            dataLoader: FixedChannelLogoDataLoader(data: Self.onePixelPNG),
+            imageDecoder: ThreadRecordingChannelLogoDecoder(probe: probe),
+            cacheDirectory: cacheDirectory
+        )
+
+        let image = await cache.image(for: logoURL)
+
+        XCTAssertNotNil(image)
+        XCTAssertEqual(probe.threadValues, [false])
+    }
+
+    func testChannelLogoCacheDoesNotPersistMalformedDownloadedBytes() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/malformed.png"))
+        let malformed = Data("not-an-image".utf8)
+        let cache = ChannelLogoCache(
+            dataLoader: FixedChannelLogoDataLoader(data: malformed),
+            cacheDirectory: cacheDirectory
+        )
+
+        let image = await cache.image(for: logoURL)
+
+        XCTAssertNil(image)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path),
+            []
+        )
+
+        let relaunchedCache = ChannelLogoCache(
+            dataLoader: NilChannelLogoDataLoader(),
+            cacheDirectory: cacheDirectory
+        )
+        let relaunchedImage = await relaunchedCache.image(for: logoURL)
+
+        XCTAssertNil(relaunchedImage)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path),
+            []
+        )
+    }
+
+    func testChannelLogoCacheEvictsMalformedDiskEntryBeforeFallbackCompletes() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        try FileManager.default.createDirectory(
+            at: cacheDirectory,
+            withIntermediateDirectories: true
+        )
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/corrupt-disk.png"))
+        let diskKey = SHA256.hash(data: Data(logoURL.absoluteString.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let corruptEntryURL = cacheDirectory.appendingPathComponent(diskKey)
+        try Data("not-an-image".utf8).write(to: corruptEntryURL)
+        let cache = ChannelLogoCache(
+            dataLoader: NilChannelLogoDataLoader(),
+            cacheDirectory: cacheDirectory
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corruptEntryURL.path))
+
+        let image = await cache.image(for: logoURL)
+
+        XCTAssertNil(image)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: corruptEntryURL.path))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path),
+            []
+        )
     }
 
     func testLaunchArgumentsSelectOnlyTheExactSeededFixturePair() {
@@ -140,10 +290,28 @@ final class VPlayerAppStartupTests: XCTestCase {
             .appendingPathComponent("VPlayerLogoCacheTests-\(UUID().uuidString)", isDirectory: true)
     }
 
-    private func logoTestSession() -> URLSession {
+    private func temporaryLogoDownloadsDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("VPlayerLogoDownloads-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    private func logoDataLoader(downloadsDirectory: URL) -> LiveChannelLogoDataLoader {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
-        return URLSession(configuration: configuration)
+        return LiveChannelLogoDataLoader(
+            downloader: URLSessionBoundedDownloader(
+                configuration: configuration,
+                downloadsDirectory: downloadsDirectory
+            ),
+            fileManager: .default
+        )
+    }
+
+    private func waitForLogoProtocolCancellation() async {
+        let deadline = Date().addingTimeInterval(2)
+        while StubURLProtocol.stopLoadingCount == 0, Date() < deadline {
+            await Task.yield()
+        }
     }
 
     func testAcceptanceLaunchIsExactDebugOnlyAndNeverSelectsTheFixtureEngine() {
@@ -690,6 +858,45 @@ final class VPlayerAppStartupTests: XCTestCase {
             foregroundRefreshDriver: foreground,
             backgroundRefreshRegistrar: background
         )
+    }
+}
+
+private struct FixedChannelLogoDataLoader: ChannelLogoDataLoading {
+    let data: Data
+
+    func data(for url: URL, maximumByteCount: Int) async -> Data? {
+        _ = url
+        return data.count <= maximumByteCount ? data : nil
+    }
+}
+
+private struct NilChannelLogoDataLoader: ChannelLogoDataLoading {
+    func data(for url: URL, maximumByteCount: Int) async -> Data? {
+        _ = url
+        _ = maximumByteCount
+        return nil
+    }
+}
+
+private struct ThreadRecordingChannelLogoDecoder: ChannelLogoImageDecoding {
+    let probe: ChannelLogoDecoderThreadProbe
+
+    func decodeThumbnail(from data: Data) -> DecodedChannelLogo? {
+        probe.record(Thread.isMainThread)
+        return ChannelLogoImageDecoder().decodeThumbnail(from: data)
+    }
+}
+
+private final class ChannelLogoDecoderThreadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Bool] = []
+
+    var threadValues: [Bool] {
+        lock.withLock { values }
+    }
+
+    func record(_ isMainThread: Bool) {
+        lock.withLock { values.append(isMainThread) }
     }
 }
 

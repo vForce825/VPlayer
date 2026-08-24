@@ -6,6 +6,42 @@ import XCTest
 @testable import VPlayerCore
 
 final class DomainTests: XCTestCase {
+    func testSourceURLIdentityPreservesAbsoluteStringBytes() {
+        let url = URL(
+            string: "https://User:Pass@EXAMPLE.test:443/a%2Fb?sig=A%2BB#x"
+        )!
+        let differentlySpelledURL = URL(
+            string: "https://User:Pass@example.test/a%2Fb?sig=A%2BB#x"
+        )!
+
+        XCTAssertEqual(SourceURLIdentity(url: url).rawValue, url.absoluteString)
+        XCTAssertNotEqual(
+            SourceURLIdentity(url: url),
+            SourceURLIdentity(url: differentlySpelledURL)
+        )
+    }
+
+    func testSourceProfileReturnsURLForRequestedResource() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let playlistURL = URL(string: "https://playlist.example/source.m3u")!
+        let epgURL = URL(string: "https://epg.example/source.xml")!
+        let profile = SourceProfile(
+            id: UUID(),
+            name: "Source",
+            m3uURL: playlistURL,
+            epgURL: epgURL,
+            m3uRefreshInterval: .sixHours,
+            epgRefreshInterval: .daily,
+            m3uStatus: ResourceRefreshStatus(),
+            epgStatus: ResourceRefreshStatus(),
+            createdAt: now,
+            updatedAt: now
+        )
+
+        XCTAssertEqual(profile.sourceURL(for: .playlist), playlistURL)
+        XCTAssertEqual(profile.sourceURL(for: .epg), epgURL)
+    }
+
     func testSourceInputRequiresRemoteHTTPURLs() throws {
         let valid = try SourceProfileInput(
             name: "  上海 IPTV  ",

@@ -5,6 +5,7 @@
 import Foundation
 
 public final class URLSessionBoundedDownloader: NSObject,
+    BoundedHTTPDownloading,
     RemoteResourceDownloading,
     URLSessionDataDelegate,
     @unchecked Sendable {
@@ -59,13 +60,10 @@ public final class URLSessionBoundedDownloader: NSObject,
         }
     }
 
-    typealias ByteLimit = @Sendable (RemoteResourceRequest) -> Int64
-
     private let lock = NSLock()
     private let configuration: URLSessionConfiguration
     private let fileManager: FileManager
     private let downloadsDirectory: URL
-    private let byteLimit: ByteLimit
     private var session: URLSession?
     private var transfers: [Int: Transfer] = [:]
 
@@ -80,15 +78,13 @@ public final class URLSessionBoundedDownloader: NSObject,
         fileManager = .default
         downloadsDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VPlayerDownloads", isDirectory: true)
-        byteLimit = { $0.byteLimit }
         super.init()
     }
 
     init(
         configuration: URLSessionConfiguration,
         fileManager: FileManager = .default,
-        downloadsDirectory: URL,
-        byteLimit: @escaping ByteLimit = { $0.byteLimit }
+        downloadsDirectory: URL
     ) {
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 15
@@ -98,12 +94,15 @@ public final class URLSessionBoundedDownloader: NSObject,
         self.configuration = configuration
         self.fileManager = fileManager
         self.downloadsDirectory = downloadsDirectory
-        self.byteLimit = byteLimit
         super.init()
     }
 
     public func download(_ request: RemoteResourceRequest) async throws -> DownloadedResource {
-        guard Self.isRemoteHTTPURL(request.url) else {
+        try await download(url: request.url, byteLimit: request.byteLimit)
+    }
+
+    public func download(url: URL, byteLimit: Int64) async throws -> DownloadedResource {
+        guard byteLimit > 0, Self.isRemoteHTTPURL(url) else {
             throw RemoteDownloadError.invalidResponse
         }
 
@@ -118,9 +117,9 @@ public final class URLSessionBoundedDownloader: NSObject,
                     continuation: continuation,
                     fileURL: fileURL,
                     fileHandle: fileHandle,
-                    byteLimit: byteLimit(request)
+                    byteLimit: byteLimit
                 )
-                let task = register(transfer: transfer, request: request)
+                let task = register(transfer: transfer, url: url)
                 let wasCancelled = cancellation.register(taskID: task.taskIdentifier)
                 task.resume()
                 if wasCancelled {
@@ -272,7 +271,7 @@ public final class URLSessionBoundedDownloader: NSObject,
 
     private func register(
         transfer: Transfer,
-        request: RemoteResourceRequest
+        url: URL
     ) -> URLSessionDataTask {
         lock.withLock {
             let activeSession: URLSession
@@ -287,7 +286,7 @@ public final class URLSessionBoundedDownloader: NSObject,
                 session = created
                 activeSession = created
             }
-            var urlRequest = URLRequest(url: request.url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+            var urlRequest = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
             urlRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
             let task = activeSession.dataTask(with: urlRequest)
             transfer.task = task

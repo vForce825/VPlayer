@@ -23,7 +23,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core
-        MARKETING_VERSION: "1.3"
+        MARKETING_VERSION: "1.4"
         CURRENT_PROJECT_VERSION: "1"
         DEFINES_MODULE: true
         GENERATE_INFOPLIST_FILE: true
@@ -55,7 +55,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback
-        MARKETING_VERSION: "1.3"
+        MARKETING_VERSION: "1.4"
         CURRENT_PROJECT_VERSION: "1"
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: true
@@ -79,7 +79,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer
         PRODUCT_NAME: VPlayer
-        MARKETING_VERSION: "1.3"
+        MARKETING_VERSION: "1.4"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Sources/VPlayerApp/Resources/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
@@ -97,6 +97,9 @@ targets:
         type: folder
         buildPhase: resources
       - path: Tests/Fixtures/Video
+        type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/Images
         type: folder
         buildPhase: resources
     dependencies:
