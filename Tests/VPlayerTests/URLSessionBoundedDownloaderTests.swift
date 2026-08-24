@@ -27,24 +27,33 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         }
     }
 
-    func testRemoteResourceRequestsUseExactResourceCaps() {
+    func testRefreshRequestAdapterUsesExactResourceCaps() async {
         let url = URL(string: "https://example.test/resource")!
+        let (downloader, _) = makeDownloader()
 
-        XCTAssertEqual(
-            RemoteResourceRequest(url: url, resource: .playlist).byteLimit,
-            10 * 1_024 * 1_024
-        )
-        XCTAssertEqual(
-            RemoteResourceRequest(url: url, resource: .epg).byteLimit,
-            200 * 1_024 * 1_024
-        )
+        for (resource, limit) in [
+            (RefreshResource.playlist, Int64(10 * 1_024 * 1_024)),
+            (.epg, Int64(200 * 1_024 * 1_024))
+        ] {
+            StubURLProtocol.enqueue(.init(
+                response: .http(statusCode: 200, headers: ["Content-Length": "\(limit + 1)"])
+            ))
+
+            let error = await captureError {
+                try await downloader.download(RemoteResourceRequest(url: url, resource: resource))
+            }
+
+            XCTAssertEqual(error as? RemoteDownloadError, .responseTooLarge(limit: limit))
+        }
+        await assertDownloadsDirectoryBecomesEmpty()
     }
 
     func testExactLimitSucceedsAcrossChunksAndTransfersFileOwnership() async throws {
         StubURLProtocol.enqueue(.init(chunks: [Data("1234".utf8), Data("567890".utf8)]))
-        let (downloader, configuration) = makeDownloader(limit: 10)
+        let (downloader, configuration) = makeDownloader()
+        let boundedDownloader: any BoundedHTTPDownloading = downloader
 
-        let result = try await downloader.download(request())
+        let result = try await boundedDownloader.download(url: request().url, byteLimit: 10)
 
         XCTAssertEqual(result.byteCount, 10)
         XCTAssertEqual(try Data(contentsOf: result.temporaryFileURL), Data("1234567890".utf8))
@@ -58,9 +67,11 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
 
     func testUnknownLengthOverflowFailsAtElevenBytesAndRemovesPartialFile() async {
         StubURLProtocol.enqueue(.init(chunks: [Data("123456".utf8), Data("78901".utf8)]))
-        let (downloader, _) = makeDownloader(limit: 10)
+        let (downloader, _) = makeDownloader()
 
-        let error = await captureError { try await downloader.download(self.request()) }
+        let error = await captureError {
+            try await downloader.download(url: self.request().url, byteLimit: 10)
+        }
 
         XCTAssertEqual(error as? RemoteDownloadError, .responseTooLarge(limit: 10))
         await assertDownloadsDirectoryBecomesEmpty()
@@ -71,9 +82,11 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
             response: .http(statusCode: 200, headers: ["Content-Length": "11"]),
             chunks: [Data("12345678901".utf8)]
         ))
-        let (downloader, _) = makeDownloader(limit: 10)
+        let (downloader, _) = makeDownloader()
 
-        let error = await captureError { try await downloader.download(self.request()) }
+        let error = await captureError {
+            try await downloader.download(url: self.request().url, byteLimit: 10)
+        }
 
         XCTAssertEqual(error as? RemoteDownloadError, .responseTooLarge(limit: 10))
         await assertDownloadsDirectoryBecomesEmpty()
@@ -82,10 +95,14 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
     func testHTTPErrorAndNonHTTPResponseAreRejectedAndCleaned() async {
         StubURLProtocol.enqueue(.init(response: .http(statusCode: 500), chunks: [Data("secret".utf8)]))
         StubURLProtocol.enqueue(.init(response: .nonHTTP, chunks: [Data("body".utf8)]))
-        let (downloader, _) = makeDownloader(limit: 10)
+        let (downloader, _) = makeDownloader()
 
-        let httpError = await captureError { try await downloader.download(self.request()) }
-        let invalidError = await captureError { try await downloader.download(self.request()) }
+        let httpError = await captureError {
+            try await downloader.download(url: self.request().url, byteLimit: 10)
+        }
+        let invalidError = await captureError {
+            try await downloader.download(url: self.request().url, byteLimit: 10)
+        }
 
         XCTAssertEqual(httpError as? RemoteDownloadError, .httpStatus(500))
         XCTAssertEqual(invalidError as? RemoteDownloadError, .invalidResponse)
@@ -98,8 +115,8 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
             completes: false,
             callbackDelay: 0.05
         ))
-        let (downloader, _) = makeDownloader(limit: 100)
-        let operation = Task { try await downloader.download(request()) }
+        let (downloader, _) = makeDownloader()
+        let operation = Task { try await downloader.download(url: self.request().url, byteLimit: 100) }
         await waitUntil { StubURLProtocol.deliveredChunkCount == 1 }
 
         operation.cancel()
@@ -113,13 +130,12 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
     }
 
     func testNonRemoteSchemeIsRejectedWithoutStartingURLSession() async {
-        let (downloader, _) = makeDownloader(limit: 10)
-        let fileRequest = RemoteResourceRequest(
-            url: URL(fileURLWithPath: "/tmp/list.m3u"),
-            resource: .playlist
-        )
+        let (downloader, _) = makeDownloader()
+        let fileURL = URL(fileURLWithPath: "/tmp/list.m3u")
 
-        let error = await captureError { try await downloader.download(fileRequest) }
+        let error = await captureError {
+            try await downloader.download(url: fileURL, byteLimit: 10)
+        }
 
         XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse)
         XCTAssertTrue(StubURLProtocol.requests.isEmpty)
@@ -130,9 +146,9 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         let redirectedURL = URL(string: "https://cdn.example.test/list.m3u")!
         StubURLProtocol.enqueue(.init(response: .redirect(location: redirectedURL)))
         StubURLProtocol.enqueue(.init(chunks: [Data("redirected".utf8)]))
-        let (downloader, _) = makeDownloader(limit: 10)
+        let (downloader, _) = makeDownloader()
 
-        let result = try await downloader.download(request())
+        let result = try await downloader.download(url: request().url, byteLimit: 10)
 
         XCTAssertEqual(try Data(contentsOf: result.temporaryFileURL), Data("redirected".utf8))
         XCTAssertEqual(StubURLProtocol.requests.compactMap(\.url), [request().url, redirectedURL])
@@ -148,9 +164,11 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
 
         for target in invalidTargets {
             StubURLProtocol.enqueue(.init(response: .redirect(location: target)))
-            let (downloader, _) = makeDownloader(limit: 10)
+            let (downloader, _) = makeDownloader()
 
-            let error = await captureError { try await downloader.download(self.request()) }
+            let error = await captureError {
+                try await downloader.download(url: self.request().url, byteLimit: 10)
+            }
 
             XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse, target.absoluteString)
             await assertDownloadsDirectoryBecomesEmpty()
@@ -166,11 +184,28 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
             ),
             chunks: [Data("must-not-be-written".utf8)]
         ))
-        let (downloader, _) = makeDownloader(limit: 100)
+        let (downloader, _) = makeDownloader()
 
-        let error = await captureError { try await downloader.download(self.request()) }
+        let error = await captureError {
+            try await downloader.download(url: self.request().url, byteLimit: 100)
+        }
 
         XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse)
+        await assertDownloadsDirectoryBecomesEmpty()
+    }
+
+    func testNonpositiveByteLimitIsRejectedWithoutStartingURLSession() async {
+        let (downloader, _) = makeDownloader()
+
+        for limit: Int64 in [0, -1] {
+            let error = await captureError {
+                try await downloader.download(url: self.request().url, byteLimit: limit)
+            }
+
+            XCTAssertEqual(error as? RemoteDownloadError, .invalidResponse)
+        }
+
+        XCTAssertTrue(StubURLProtocol.requests.isEmpty)
         await assertDownloadsDirectoryBecomesEmpty()
     }
 
@@ -180,6 +215,20 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
                 URL(string: "https://user:pass@example.test/list?token=secret#x")!
             ),
             "https://example.test/list"
+        )
+    }
+
+    func testRedactedURLRemovesUserWithoutPassword() {
+        XCTAssertEqual(
+            RedactedURL.string(URL(string: "https://user@example.test/list")!),
+            "https://example.test/list"
+        )
+    }
+
+    func testRedactedURLLeavesNormalURLUnchanged() {
+        XCTAssertEqual(
+            RedactedURL.string(URL(string: "https://example.test/list.m3u")!),
+            "https://example.test/list.m3u"
         )
     }
 
@@ -261,16 +310,13 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         }
     }
 
-    private func makeDownloader(
-        limit: Int64
-    ) -> (URLSessionBoundedDownloader, URLSessionConfiguration) {
+    private func makeDownloader() -> (URLSessionBoundedDownloader, URLSessionConfiguration) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
         return (
             URLSessionBoundedDownloader(
                 configuration: configuration,
-                downloadsDirectory: downloadsDirectory,
-                byteLimit: { _ in limit }
+                downloadsDirectory: downloadsDirectory
             ),
             configuration
         )

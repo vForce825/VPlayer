@@ -355,6 +355,263 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertEqual(stopCount, 1)
     }
 
+    func testRapidPauseTogglesRetireExactCommandsAndReconcileAcknowledgements() async throws {
+        let firstPauseGate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [1: firstPauseGate])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationProvider: { nil },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.subscriberCount == 2 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        model.togglePause()
+        model.togglePause()
+
+        try await eventually { await firstPauseGate.hasWaiter }
+        await firstPauseGate.open()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 4
+        }
+
+        let pauseOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+        XCTAssertEqual(pauseOperations, [
+            "pause:true:start",
+            "pause:true:end",
+            "pause:false:start",
+            "pause:false:end",
+        ])
+
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 6
+        }
+        var completedPauseOperations = await engine.operations.filter {
+            $0.hasPrefix("pause:")
+        }
+        XCTAssertEqual(Array(completedPauseOperations.suffix(2)), [
+            "pause:true:start",
+            "pause:true:end",
+        ])
+
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 8
+        }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 10
+        }
+        completedPauseOperations = await engine.operations.filter {
+            $0.hasPrefix("pause:")
+        }
+        XCTAssertEqual(Array(completedPauseOperations.suffix(2)), [
+            "pause:false:start",
+            "pause:false:end",
+        ])
+    }
+
+    func testDuplicatePlayingDoesNotOverwriteExpectedPauseIntent() async throws {
+        let engine = ControlledViewModelPlaybackEngine()
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationProvider: { nil },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.subscriberCount == 2 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        model.togglePause()
+        try await eventually {
+            await engine.operations.contains("pause:true:end")
+        }
+        await engine.emit(state: .playing(request))
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 4
+        }
+
+        let pauseOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+        XCTAssertEqual(pauseOperations, [
+            "pause:true:start",
+            "pause:true:end",
+            "pause:false:start",
+            "pause:false:end",
+        ])
+    }
+
+    func testPausedEventWhileResumePendingDoesNotOverwriteFinalResumeIntent() async throws {
+        let resumeGate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [2: resumeGate])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationProvider: { nil },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.subscriberCount == 2 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        model.togglePause()
+        try await eventually {
+            await engine.operations.contains("pause:true:end")
+        }
+        model.togglePause()
+        try await eventually { await resumeGate.hasWaiter }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+
+        await resumeGate.open()
+        try await eventually {
+            await engine.operations.contains("pause:false:end")
+        }
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 6
+        }
+
+        let pauseOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+        XCTAssertEqual(pauseOperations, [
+            "pause:true:start",
+            "pause:true:end",
+            "pause:false:start",
+            "pause:false:end",
+            "pause:true:start",
+            "pause:true:end",
+        ])
+    }
+
+    func testRetryResetsPauseIntentAndNewPreparingEnablesStateSynchronization() async throws {
+        let engine = ControlledViewModelPlaybackEngine()
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationProvider: { nil },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.subscriberCount == 2 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        model.togglePause()
+        try await eventually {
+            await engine.operations.contains("pause:true:end")
+        }
+
+        model.retry()
+        try await eventually { await engine.playCount == 2 }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 4
+        }
+
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        model.togglePause()
+        try await eventually {
+            await engine.operations.filter { $0.hasPrefix("pause:") }.count == 6
+        }
+
+        let pauseOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+        XCTAssertEqual(pauseOperations, [
+            "pause:true:start",
+            "pause:true:end",
+            "pause:true:start",
+            "pause:true:end",
+            "pause:true:start",
+            "pause:true:end",
+        ])
+    }
+
+    func testRetryPreventsCancelledQueuedPauseFromCrossingPlaybackGeneration() async throws {
+        let firstPauseGate = ViewModelAsyncGate()
+        let stalePauseGate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [
+            1: firstPauseGate,
+            2: stalePauseGate,
+        ])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationProvider: { nil },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.subscriberCount == 2 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        model.togglePause()
+        model.togglePause()
+        try await eventually { await firstPauseGate.hasWaiter }
+
+        model.retry()
+        try await eventually { await engine.playCount == 2 }
+        await firstPauseGate.open()
+        try await eventually {
+            await engine.operations.contains("pause:true:end")
+        }
+
+        var stalePauseStarted = false
+        for _ in 0..<200 {
+            if await stalePauseGate.hasWaiter {
+                stalePauseStarted = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertFalse(stalePauseStarted)
+
+        await stalePauseGate.open()
+        if stalePauseStarted {
+            try await eventually {
+                await engine.operations.contains("pause:false:end")
+            }
+        }
+        await model.stop()
+    }
+
     func testRepeatedVisibleNoticeDoesNotRestartOrExtendThreeSecondTimer() async throws {
         let sleep = ViewModelSleepProbe()
         let engine = ViewModelPlaybackEngine(log: ViewModelOperationLog())
@@ -569,6 +826,63 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertLessThan(pauseEnd, stopStart)
     }
 
+    func testFailureReleasesSuspendedPauseOwnershipBeforeStop() async throws {
+        let pauseGate = ViewModelAsyncGate()
+        let stopGate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(
+            stopGate: stopGate,
+            pauseGates: [1: pauseGate]
+        )
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationProvider: { nil },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.subscriberCount == 2 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        model.togglePause()
+        try await eventually { await pauseGate.hasWaiter }
+        let failure = PlaybackFailure(
+            code: "playback.failed",
+            userMessage: "Playback failed"
+        )
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
+
+        let stop = Task { await model.stop() }
+        var stopReachedEngineWhilePauseWasSuspended = false
+        for _ in 0..<200 {
+            if await stopGate.hasWaiter {
+                stopReachedEngineWhilePauseWasSuspended = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(stopReachedEngineWhilePauseWasSuspended)
+
+        await pauseGate.open()
+        if !stopReachedEngineWhilePauseWasSuspended {
+            try await eventually { await stopGate.hasWaiter }
+        }
+        await stopGate.open()
+        await stop.value
+        try await eventually {
+            await engine.operations.contains("pause:true:end")
+        }
+
+        let operations = await engine.operations
+        let stopStart = try XCTUnwrap(operations.firstIndex(of: "stop:start"))
+        let pauseEnd = try XCTUnwrap(operations.firstIndex(of: "pause:true:end"))
+        XCTAssertLessThan(stopStart, pauseEnd)
+    }
+
     func testSettingsTuningSelectionControllerSerializesRapidChanges() async throws {
         let firstTuningGate = ViewModelAsyncGate()
         let engine = ControlledViewModelPlaybackEngine(
@@ -714,15 +1028,18 @@ private final class ViewModelBlockingGate: @unchecked Sendable {
 
 private actor ViewModelAsyncGate {
     private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
     private(set) var waiterCount = 0
     var hasWaiter: Bool { waiterCount > 0 }
 
     func wait() async {
         waiterCount += 1
+        guard !isOpen else { return }
         await withCheckedContinuation { continuations.append($0) }
     }
 
     func open() {
+        isOpen = true
         let pending = continuations
         continuations.removeAll()
         for continuation in pending { continuation.resume() }
@@ -739,6 +1056,7 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     private let suspendedTuningCall: Int?
     private let tuningGate: ViewModelAsyncGate?
     private let pauseGate: ViewModelAsyncGate?
+    private let pauseGates: [Int: ViewModelAsyncGate]
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
     private(set) var playCount = 0
@@ -746,6 +1064,7 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     private(set) var completedTunings: [PlaybackTuning] = []
     private(set) var operations: [String] = []
     private var tuningCallCount = 0
+    private var pauseCallCount = 0
 
     var subscriberCount: Int { eventContinuations.count + noticeContinuations.count }
 
@@ -758,7 +1077,8 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         playCompletion: (@Sendable () async -> Void)? = nil,
         suspendedTuningCall: Int? = nil,
         tuningGate: ViewModelAsyncGate? = nil,
-        pauseGate: ViewModelAsyncGate? = nil
+        pauseGate: ViewModelAsyncGate? = nil,
+        pauseGates: [Int: ViewModelAsyncGate] = [:]
     ) {
         self.eventsGate = eventsGate
         self.stopGate = stopGate
@@ -769,6 +1089,7 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         self.suspendedTuningCall = suspendedTuningCall
         self.tuningGate = tuningGate
         self.pauseGate = pauseGate
+        self.pauseGates = pauseGates
     }
 
     func events() -> AsyncStream<PlaybackState> {
@@ -804,8 +1125,10 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     }
 
     func setPaused(_ paused: Bool) async {
+        pauseCallCount += 1
+        let call = pauseCallCount
         operations.append("pause:\(paused):start")
-        if let pauseGate { await pauseGate.wait() }
+        if let gate = pauseGates[call] ?? pauseGate { await gate.wait() }
         operations.append("pause:\(paused):end")
     }
 

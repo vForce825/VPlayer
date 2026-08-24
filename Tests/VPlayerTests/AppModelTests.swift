@@ -3030,6 +3030,440 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(calls.first?.profileID, profile.id)
     }
 
+    func testPlaylistURLEditReloadsWithoutOldChannelsBeforeAutomaticRefreshCompletes() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let repository = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await repository.createProfile(
+            try SourceProfileInput(
+                name: "Source",
+                m3uURLString: "https://playlist.example/original.m3u",
+                epgURLString: "https://epg.example/original.xml",
+                m3uRefreshInterval: .manual,
+                epgRefreshInterval: .manual
+            ).validated(),
+            now: now
+        )
+        let oldChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://stream.example/old",
+            tvgID: nil,
+            order: 0
+        )
+        try await repository.installPlaylist(
+            profileID: profile.id,
+            channels: [oldChannel],
+            fetchedAt: now
+        )
+        let automaticRefreshGate = AppModelAsyncGate()
+        await automaticRefreshGate.arm()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, resources, _ in
+                await automaticRefreshGate.suspendIfArmed()
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: true, message: nil)
+                }
+            },
+            now: { now }
+        )
+
+        let initialReloaded = await model.reload()
+        XCTAssertTrue(initialReloaded)
+        XCTAssertEqual(model.channels, [oldChannel])
+
+        let updated = await model.update(
+            profileID: profile.id,
+            input: SourceProfileInput(
+                name: "Source",
+                m3uURLString: "https://playlist.example/replacement.m3u",
+                epgURLString: profile.epgURL.absoluteString,
+                m3uRefreshInterval: .manual,
+                epgRefreshInterval: .manual
+            )
+        )
+        XCTAssertTrue(updated)
+        await automaticRefreshGate.waitUntilSuspended()
+
+        XCTAssertEqual(model.channels, [])
+        let storedChannels = try await repository.channels(profileID: profile.id)
+        XCTAssertEqual(storedChannels, [])
+
+        await automaticRefreshGate.release()
+        _ = await model.waitForLibraryReloadsToSettle()
+    }
+
+    func testCommittedPlaylistRetargetReadFailureInvalidatesOnlyPlaylistAndStartsAutomaticRefresh() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(-300),
+            lastSuccessAt: now.addingTimeInterval(-240),
+            state: .succeeded,
+            attemptID: UUID()
+        )
+        profile.epgStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(-180),
+            lastSuccessAt: now.addingTimeInterval(-120),
+            state: .failed,
+            errorSummary: "old EPG failure",
+            attemptID: UUID()
+        )
+        let automaticChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/automatic",
+            tvgID: "automatic",
+            order: 0
+        )
+        let manualChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/manual",
+            tvgID: "unmatched",
+            order: 1
+        )
+        let epgChannels = [
+            EPGChannel(id: "automatic", displayNames: ["Automatic"], iconURL: nil),
+            EPGChannel(id: "manual", displayNames: ["Manual"], iconURL: nil),
+        ]
+        let programme = Programme(
+            id: "stale-programme",
+            xmltvChannelID: "manual",
+            start: now.addingTimeInterval(-600),
+            stop: now.addingTimeInterval(-60),
+            title: "Stale programme",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [automaticChannel, manualChannel]],
+            epgChannels: [profile.id: epgChannels],
+            programmes: [profile.id: [programme]],
+            manualMappings: [profile.id: [manualChannel.id: "manual"]]
+        )
+        let refreshProbe = RefreshCallProbe()
+        let refreshGate = AppModelAsyncGate()
+        await refreshGate.arm()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await refreshProbe.record(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+                await refreshGate.suspendIfArmed()
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "test cleanup")
+                }
+            },
+            now: { now }
+        )
+
+        let initiallyReloaded = await model.reload()
+        XCTAssertTrue(initiallyReloaded)
+        model.select(channel: manualChannel)
+        XCTAssertEqual(model.staleEPGCoverageEnd, programme.stop)
+        XCTAssertEqual(model.manualEPGChannelID(for: manualChannel), "manual")
+        await repository.setReadFailure(true)
+
+        let replacementURL = URL(string: "https://example.test/replacement.m3u")!
+        let updated = await model.update(
+            profileID: profile.id,
+            input: SourceProfileInput(
+                name: "Renamed",
+                m3uURLString: replacementURL.absoluteString,
+                epgURLString: profile.epgURL.absoluteString,
+                m3uRefreshInterval: .manual,
+                epgRefreshInterval: .manual
+            )
+        )
+
+        XCTAssertFalse(updated)
+        let stored = await repository.snapshot()
+        XCTAssertEqual(stored.profiles.first?.m3uURL, replacementURL)
+        XCTAssertEqual(model.activeProfile?.m3uURL, replacementURL)
+        XCTAssertEqual(model.channels, [])
+        XCTAssertNil(model.matchedEPGChannelID(for: automaticChannel))
+        XCTAssertNil(model.manualEPGChannelID(for: manualChannel))
+        XCTAssertEqual(model.programmesByChannelID, [:])
+        XCTAssertNil(model.presentedPlaybackRequest)
+        XCTAssertEqual(model.epgChannels, epgChannels)
+        XCTAssertEqual(model.epgProgrammeCount, 1)
+        XCTAssertEqual(model.staleEPGCoverageEnd, programme.stop)
+        XCTAssertEqual(model.activeProfile?.epgStatus, profile.epgStatus)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .refreshing)
+        XCTAssertEqual(model.activeProfile?.m3uStatus.lastAttemptAt, now)
+        XCTAssertNil(model.activeProfile?.m3uStatus.lastSuccessAt)
+        XCTAssertNil(model.activeProfile?.m3uStatus.errorSummary)
+        XCTAssertNil(model.activeProfile?.m3uStatus.attemptID)
+
+        let refreshStarted = await boundedEventually {
+            await refreshProbe.calls.count == 1
+        }
+        XCTAssertTrue(refreshStarted)
+        let refreshSuspended = await boundedEventually {
+            await refreshGate.snapshotIsSuspended()
+        }
+        XCTAssertTrue(refreshSuspended)
+        let calls = await refreshProbe.calls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.profileID, profile.id)
+        XCTAssertEqual(calls.first?.resources, [.playlist])
+        XCTAssertEqual(calls.first?.trigger, .manual)
+        await refreshGate.cancel()
+    }
+
+    func testCommittedEPGRetargetReloadCancellationInvalidatesOnlyEPGAndStartsAutomaticRefresh() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        profile.m3uStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(-300),
+            lastSuccessAt: now.addingTimeInterval(-240),
+            state: .failed,
+            errorSummary: "old playlist failure",
+            attemptID: UUID()
+        )
+        profile.epgStatus = ResourceRefreshStatus(
+            lastAttemptAt: now.addingTimeInterval(-180),
+            lastSuccessAt: now.addingTimeInterval(-120),
+            state: .succeeded,
+            attemptID: UUID()
+        )
+        let automaticChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/automatic",
+            tvgID: "automatic",
+            order: 0
+        )
+        let manualChannel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/manual",
+            tvgID: "unmatched",
+            order: 1
+        )
+        let epgChannels = [
+            EPGChannel(id: "automatic", displayNames: ["Automatic"], iconURL: nil),
+            EPGChannel(id: "manual", displayNames: ["Manual"], iconURL: nil),
+        ]
+        let programme = Programme(
+            id: "stale-programme",
+            xmltvChannelID: "manual",
+            start: now.addingTimeInterval(-600),
+            stop: now.addingTimeInterval(-60),
+            title: "Stale programme",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [automaticChannel, manualChannel]],
+            epgChannels: [profile.id: epgChannels],
+            programmes: [profile.id: [programme]],
+            manualMappings: [profile.id: [manualChannel.id: "manual"]]
+        )
+        let refreshProbe = RefreshCallProbe()
+        let refreshGate = AppModelAsyncGate()
+        await refreshGate.arm()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await refreshProbe.record(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+                await refreshGate.suspendIfArmed()
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "test cleanup")
+                }
+            },
+            now: { now }
+        )
+
+        let initiallyReloaded = await model.reload()
+        XCTAssertTrue(initiallyReloaded)
+        model.select(channel: manualChannel)
+        let playbackRequest = try XCTUnwrap(model.presentedPlaybackRequest)
+        XCTAssertEqual(model.staleEPGCoverageEnd, programme.stop)
+        await repository.gateNextProfileRead()
+        let replacementURL = URL(string: "https://example.test/replacement.xml")!
+
+        let update = Task {
+            await model.update(
+                profileID: profile.id,
+                input: SourceProfileInput(
+                    name: "Renamed",
+                    m3uURLString: profile.m3uURL.absoluteString,
+                    epgURLString: replacementURL.absoluteString,
+                    m3uRefreshInterval: .manual,
+                    epgRefreshInterval: .manual
+                )
+            )
+        }
+        await repository.waitUntilProfileReadIsBlocked()
+
+        let storedWhileBlocked = await repository.snapshot()
+        XCTAssertEqual(storedWhileBlocked.profiles.first?.epgURL, replacementURL)
+        XCTAssertEqual(model.activeProfile?.epgURL, replacementURL)
+        XCTAssertEqual(model.activeProfile?.epgStatus, ResourceRefreshStatus())
+        XCTAssertEqual(model.activeProfile?.m3uStatus, profile.m3uStatus)
+        XCTAssertEqual(model.channels, [automaticChannel, manualChannel])
+        XCTAssertEqual(model.presentedPlaybackRequest, playbackRequest)
+        XCTAssertEqual(model.manualEPGChannelID(for: manualChannel), "manual")
+        XCTAssertNil(model.matchedEPGChannelID(for: automaticChannel))
+        XCTAssertNil(model.matchedEPGChannelID(for: manualChannel))
+        XCTAssertEqual(model.epgChannels, [])
+        XCTAssertEqual(model.epgProgrammeCount, 0)
+        XCTAssertNil(model.staleEPGCoverageEnd)
+        XCTAssertEqual(model.programmesByChannelID, [:])
+
+        update.cancel()
+        await repository.releaseProfileRead()
+        let updateSucceeded = await update.value
+        XCTAssertFalse(updateSucceeded)
+        let refreshStarted = await boundedEventually {
+            await refreshProbe.calls.count == 1
+        }
+        XCTAssertTrue(refreshStarted)
+        let refreshSuspended = await boundedEventually {
+            await refreshGate.snapshotIsSuspended()
+        }
+        XCTAssertTrue(refreshSuspended)
+        let calls = await refreshProbe.calls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.profileID, profile.id)
+        XCTAssertEqual(calls.first?.resources, [.epg])
+        XCTAssertEqual(calls.first?.trigger, .manual)
+        XCTAssertEqual(model.activeProfile?.epgStatus.state, .refreshing)
+        XCTAssertNil(model.activeProfile?.epgStatus.lastSuccessAt)
+        XCTAssertEqual(model.activeProfile?.m3uStatus, profile.m3uStatus)
+        XCTAssertEqual(model.channels, [automaticChannel, manualChannel])
+        XCTAssertEqual(model.presentedPlaybackRequest, playbackRequest)
+        XCTAssertEqual(model.manualEPGChannelID(for: manualChannel), "manual")
+        await refreshGate.cancel()
+    }
+
+    func testSupersededUpdateCannotRestoreOlderProfileMetadata() async throws {
+        let originalTime = Date(timeIntervalSince1970: 2_000_000_000)
+        let olderTime = originalTime.addingTimeInterval(60)
+        let newestTime = originalTime.addingTimeInterval(120)
+        let clock = AppModelTestClock(olderTime)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Original",
+            now: originalTime
+        )
+        let repository = RepositorySpy(profiles: [profile], activeProfileID: profile.id)
+        let refreshBarrier = AppModelRefreshBarrier()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, trigger in
+                await refreshBarrier.block(
+                    profileID: profileID,
+                    resources: resources,
+                    trigger: trigger
+                )
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "test cleanup")
+                }
+            },
+            now: { clock.value }
+        )
+        func input(
+            name: String,
+            playlistURL: String,
+            playlistInterval: RefreshInterval,
+            epgInterval: RefreshInterval
+        ) -> SourceProfileInput {
+            SourceProfileInput(
+                name: name,
+                m3uURLString: playlistURL,
+                epgURLString: profile.epgURL.absoluteString,
+                m3uRefreshInterval: playlistInterval,
+                epgRefreshInterval: epgInterval
+            )
+        }
+
+        let initiallyReloaded = await model.reload()
+        XCTAssertTrue(initiallyReloaded)
+        await repository.gateNextProfileRead()
+        let olderURL = URL(string: "https://example.test/older.m3u")!
+        let olderUpdate = Task {
+            await model.update(
+                profileID: profile.id,
+                input: input(
+                    name: "Older",
+                    playlistURL: olderURL.absoluteString,
+                    playlistInterval: .hourly,
+                    epgInterval: .hourly
+                )
+            )
+        }
+        await repository.waitUntilProfileReadIsBlocked()
+
+        clock.value = newestTime
+        let newestURL = URL(string: "https://example.test/newest.m3u")!
+        let newestUpdated = await model.update(
+            profileID: profile.id,
+            input: input(
+                name: "Newest",
+                playlistURL: newestURL.absoluteString,
+                playlistInterval: .daily,
+                epgInterval: .sixHours
+            )
+        )
+        XCTAssertTrue(newestUpdated)
+        let newestRefreshBlocked = await boundedEventually {
+            await refreshBarrier.calls.count == 1
+        }
+        XCTAssertTrue(newestRefreshBlocked)
+
+        await repository.releaseProfileRead()
+        let olderUpdated = await olderUpdate.value
+        XCTAssertFalse(olderUpdated)
+        let olderRefreshBlocked = await boundedEventually {
+            await refreshBarrier.calls.count == 2
+        }
+        XCTAssertTrue(olderRefreshBlocked)
+
+        let storedSnapshot = await repository.snapshot()
+        let storedProfile = try XCTUnwrap(storedSnapshot.profiles.first)
+        XCTAssertEqual(storedProfile.name, "Newest")
+        XCTAssertEqual(storedProfile.m3uURL, newestURL)
+        XCTAssertEqual(storedProfile.m3uRefreshInterval, .daily)
+        XCTAssertEqual(storedProfile.epgRefreshInterval, .sixHours)
+        XCTAssertEqual(storedProfile.updatedAt, newestTime)
+        XCTAssertEqual(model.profiles.first?.name, "Newest")
+        XCTAssertEqual(model.profiles.first?.m3uURL, newestURL)
+        XCTAssertEqual(model.profiles.first?.m3uRefreshInterval, .daily)
+        XCTAssertEqual(model.profiles.first?.epgRefreshInterval, .sixHours)
+        XCTAssertEqual(model.profiles.first?.updatedAt, newestTime)
+        XCTAssertEqual(model.activeProfile?.name, "Newest")
+        XCTAssertEqual(model.activeProfile?.m3uURL, newestURL)
+        XCTAssertEqual(model.activeProfile?.m3uRefreshInterval, .daily)
+        XCTAssertEqual(model.activeProfile?.epgRefreshInterval, .sixHours)
+        XCTAssertEqual(model.activeProfile?.updatedAt, newestTime)
+        let refreshCalls = await refreshBarrier.calls
+        XCTAssertEqual(refreshCalls.count, 2)
+        XCTAssertTrue(refreshCalls.allSatisfy { $0.profileID == profile.id })
+        XCTAssertTrue(refreshCalls.allSatisfy { $0.resources == [.playlist] })
+        XCTAssertTrue(refreshCalls.allSatisfy { $0.trigger == .manual })
+        await refreshBarrier.releaseAll()
+    }
+
     func testCancellingCreateAttemptAllowsIntentionalIdenticalCreationFromNewSheet() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let repository = RepositorySpy(profiles: [])
@@ -4517,6 +4951,16 @@ final class AppModelTests: XCTestCase {
         XCTFail("Condition did not become true", file: file, line: line)
     }
 
+    private func boundedEventually(
+        _ condition: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        for _ in 0..<1_000 {
+            if await condition() { return true }
+            await Task.yield()
+        }
+        return false
+    }
+
     private struct LoadedActiveBoundFixture {
         let repository: RepositorySpy
         let model: AppModel
@@ -4732,6 +5176,38 @@ private actor RefreshCallProbe {
     }
 }
 
+private actor AppModelRefreshBarrier {
+    struct Call: Sendable {
+        let profileID: UUID
+        let resources: Set<RefreshResource>
+        let trigger: RefreshTrigger
+    }
+
+    private(set) var calls: [Call] = []
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+
+    func block(
+        profileID: UUID,
+        resources: Set<RefreshResource>,
+        trigger: RefreshTrigger
+    ) async {
+        calls.append(Call(profileID: profileID, resources: resources, trigger: trigger))
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func releaseAll() {
+        isReleased = true
+        for continuation in continuations {
+            continuation.resume()
+        }
+        continuations = []
+    }
+}
+
 private actor AppModelAsyncGate {
     private var isArmed = false
     private var isSuspended = false
@@ -4763,6 +5239,17 @@ private actor AppModelAsyncGate {
     }
 
     func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+        isSuspended = false
+    }
+
+    func snapshotIsSuspended() -> Bool {
+        isSuspended
+    }
+
+    func cancel() {
+        isArmed = false
         releaseContinuation?.resume()
         releaseContinuation = nil
         isSuspended = false

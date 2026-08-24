@@ -3,68 +3,75 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
-import SwiftData
 
 enum EPGPersistenceSinkError: Error, Equatable, Sendable {
     case duplicateChannelID
     case duplicateProgrammeID
 }
 
+struct EPGPersistenceBatch: Sendable {
+    let channels: [EPGChannel]
+    let programmes: [Programme]
+}
+
 final class EPGPersistenceSink: XMLTVEventSink {
     private static let saveBatchSize = 500
 
-    private let modelContext: ModelContext
-    private let snapshotID: UUID
-    private let saveBatch: () throws -> Void
-    private var pendingEventCount = 0
+    private let cancellationCheck: @Sendable () throws -> Void
+    private let persistBatch: (EPGPersistenceBatch) throws -> Void
+    private let batchDidPassPostPersistCancellationCheck: (() -> Void)?
     private var channelIDs: Set<String> = []
     private var programmeIDs: Set<String> = []
+    private var channels: [EPGChannel] = []
+    private var programmes: [Programme] = []
 
     init(
-        modelContext: ModelContext,
-        snapshotID: UUID,
-        saveBatch: @escaping () throws -> Void
+        cancellationCheck: @escaping @Sendable () throws -> Void,
+        persistBatch: @escaping (EPGPersistenceBatch) throws -> Void,
+        batchDidPassPostPersistCancellationCheck: (() -> Void)? = nil
     ) {
-        self.modelContext = modelContext
-        self.snapshotID = snapshotID
-        self.saveBatch = saveBatch
+        self.cancellationCheck = cancellationCheck
+        self.persistBatch = persistBatch
+        self.batchDidPassPostPersistCancellationCheck = batchDidPassPostPersistCancellationCheck
     }
 
     func accept(channel: EPGChannel) throws {
+        try cancellationCheck()
         guard channelIDs.insert(channel.id).inserted else {
             throw EPGPersistenceSinkError.duplicateChannelID
         }
-        modelContext.insert(EPGChannelRecord(
-            snapshotID: snapshotID,
-            xmltvID: channel.id,
-            displayNames: channel.displayNames,
-            iconURLString: channel.iconURL?.absoluteString
-        ))
-        try saveBatchIfNeeded()
+        channels.append(channel)
+        try flushIfNeeded()
     }
 
     func accept(programme: Programme) throws {
+        try cancellationCheck()
         guard programmeIDs.insert(programme.id).inserted else {
             throw EPGPersistenceSinkError.duplicateProgrammeID
         }
-        modelContext.insert(ProgrammeRecord(
-            snapshotID: snapshotID,
-            stableID: programme.id,
-            xmltvChannelID: programme.xmltvChannelID,
-            start: programme.start,
-            stop: programme.stop,
-            title: programme.title,
-            subtitle: programme.subtitle,
-            programmeDescription: programme.summary,
-            categories: programme.categories
-        ))
-        try saveBatchIfNeeded()
+        programmes.append(programme)
+        try flushIfNeeded()
     }
 
-    private func saveBatchIfNeeded() throws {
-        pendingEventCount += 1
-        guard pendingEventCount == Self.saveBatchSize else { return }
-        try saveBatch()
-        pendingEventCount = 0
+    func finish() throws {
+        try flush()
+    }
+
+    private func flushIfNeeded() throws {
+        guard channels.count + programmes.count == Self.saveBatchSize else { return }
+        try flush()
+    }
+
+    private func flush() throws {
+        try cancellationCheck()
+        guard !channels.isEmpty || !programmes.isEmpty else { return }
+        try persistBatch(EPGPersistenceBatch(
+            channels: channels,
+            programmes: programmes
+        ))
+        try cancellationCheck()
+        batchDidPassPostPersistCancellationCheck?()
+        channels.removeAll(keepingCapacity: true)
+        programmes.removeAll(keepingCapacity: true)
     }
 }

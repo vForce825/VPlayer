@@ -9,6 +9,11 @@ import VPlayerPlayback
 @MainActor
 @Observable
 final class FullScreenPlayerViewModel {
+    private struct PendingPauseCommand: Equatable {
+        let id: UUID
+        let target: Bool
+    }
+
     typealias PresentationProvider = @Sendable () async -> PlaybackPresentationContext?
     typealias MediaInformationProvider = @Sendable () async -> AsyncStream<PlaybackMediaInformation?>
     typealias Sleep = @Sendable (Duration) async throws -> Void
@@ -30,6 +35,10 @@ final class FullScreenPlayerViewModel {
     private var noticeDismissalTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
+    private var desiredPaused = false
+    private var pendingPauseCommands: [PendingPauseCommand] = []
+    private var awaitingAuthoritativePause: Bool?
+    private var acceptsAuthoritativePauseState = false
     private var started = false
     private var stopped = false
 
@@ -66,6 +75,7 @@ final class FullScreenPlayerViewModel {
     func start() {
         guard !started, !stopped else { return }
         resetMediaInformation()
+        resetPauseIntent()
         started = true
         playbackGeneration &+= 1
         let lifecycle = lifecycleGeneration
@@ -81,10 +91,7 @@ final class FullScreenPlayerViewModel {
                     guard let self,
                           !Task.isCancelled,
                           isCurrent(lifecycle: lifecycle) else { return }
-                    self.state = state
-                    if case .failed = state {
-                        self.resetMediaInformation()
-                    }
+                    self.apply(state)
                 }
             }
             noticeTask = Task { [weak self] in
@@ -106,22 +113,30 @@ final class FullScreenPlayerViewModel {
     }
 
     func togglePause() {
-        let target: Bool
         switch state {
-        case .playing:
-            target = true
-        case .paused:
-            target = false
+        case .playing, .paused:
+            break
         case .idle, .preparing, .stopped, .failed:
             return
         }
+        desiredPaused.toggle()
+        let command = PendingPauseCommand(id: UUID(), target: desiredPaused)
+        pendingPauseCommands.append(command)
+        awaitingAuthoritativePause = nil
         let predecessor = pauseTask
         let lifecycle = lifecycleGeneration
+        let playback = playbackGeneration
         let engine = engine
         let task = Task { [weak self] in
             await predecessor?.value
-            guard let self, isCurrent(lifecycle: lifecycle) else { return }
-            await engine.setPaused(target)
+            guard let self,
+                  isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+            await engine.setPaused(command.target)
+            retirePauseCommand(
+                command,
+                lifecycle: lifecycle,
+                playback: playback
+            )
         }
         pauseTask = task
     }
@@ -130,6 +145,7 @@ final class FullScreenPlayerViewModel {
         guard !stopped else { return }
         resetMediaInformation()
         playbackGeneration &+= 1
+        resetPauseIntent()
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
         let predecessor = playbackTask
@@ -177,7 +193,7 @@ final class FullScreenPlayerViewModel {
         presentationTask = nil
         mediaInformationProviderTask = nil
         mediaInformationTask = nil
-        pauseTask = nil
+        resetPauseIntent()
         stateTask = nil
         noticeTask = nil
         noticeDismissalTask = nil
@@ -238,6 +254,59 @@ final class FullScreenPlayerViewModel {
               !stopped,
               lifecycleGeneration == lifecycle else { return false }
         return playback.map { playbackGeneration == $0 } ?? true
+    }
+
+    private func apply(_ newState: PlaybackState) {
+        state = newState
+        switch newState {
+        case .preparing:
+            acceptsAuthoritativePauseState = true
+        case .playing:
+            applyAuthoritativePauseState(false)
+        case .paused:
+            applyAuthoritativePauseState(true)
+        case .stopped, .failed:
+            resetPauseIntent()
+            if case .failed = newState {
+                resetMediaInformation()
+            }
+        case .idle:
+            break
+        }
+    }
+
+    private func applyAuthoritativePauseState(_ paused: Bool) {
+        guard acceptsAuthoritativePauseState,
+              pendingPauseCommands.isEmpty else { return }
+        if let awaitingAuthoritativePause {
+            guard awaitingAuthoritativePause == paused else { return }
+            self.awaitingAuthoritativePause = nil
+        }
+        desiredPaused = paused
+    }
+
+    private func retirePauseCommand(
+        _ command: PendingPauseCommand,
+        lifecycle: UInt64,
+        playback: UInt64
+    ) {
+        guard isCurrent(lifecycle: lifecycle, playback: playback),
+              let commandIndex = pendingPauseCommands.firstIndex(where: {
+                  $0.id == command.id
+              }) else { return }
+        pendingPauseCommands.remove(at: commandIndex)
+        if pendingPauseCommands.isEmpty {
+            awaitingAuthoritativePause = command.target
+        }
+    }
+
+    private func resetPauseIntent() {
+        pauseTask?.cancel()
+        pauseTask = nil
+        desiredPaused = false
+        pendingPauseCommands.removeAll()
+        awaitingAuthoritativePause = nil
+        acceptsAuthoritativePauseState = false
     }
 
     private func resetMediaInformation() {

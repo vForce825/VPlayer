@@ -2,12 +2,41 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
-import CryptoKit
 import Foundation
 
 public protocol XMLTVEventSink: AnyObject {
     func accept(channel: EPGChannel) throws
     func accept(programme: Programme) throws
+}
+
+public struct XMLTVParseLimits: Equatable, Sendable {
+    public let maximumChannels: Int
+    public let maximumProgrammes: Int
+    public let maximumEvents: Int
+    public let maximumDepth: Int
+    public let maximumTextBytes: Int
+
+    public init(
+        maximumChannels: Int,
+        maximumProgrammes: Int,
+        maximumEvents: Int,
+        maximumDepth: Int,
+        maximumTextBytes: Int
+    ) {
+        self.maximumChannels = maximumChannels
+        self.maximumProgrammes = maximumProgrammes
+        self.maximumEvents = maximumEvents
+        self.maximumDepth = maximumDepth
+        self.maximumTextBytes = maximumTextBytes
+    }
+
+    public static let production = Self(
+        maximumChannels: 50_000,
+        maximumProgrammes: 500_000,
+        maximumEvents: 550_000,
+        maximumDepth: 32,
+        maximumTextBytes: 1_048_576
+    )
 }
 
 public struct XMLTVParseSummary: Equatable, Sendable {
@@ -20,17 +49,29 @@ public enum XMLTVParserError: Error, Equatable, Sendable {
     case entityDeclarationForbidden
     case excessiveDepth
     case excessiveText
+    case excessiveChannels
+    case excessiveProgrammes
+    case excessiveEvents
     case invalidProgramme
 }
 
 public final class XMLTVParser {
     public init() {}
 
-    public func parse(fileURL: URL, into sink: XMLTVEventSink) throws -> XMLTVParseSummary {
+    public func parse(
+        fileURL: URL,
+        into sink: XMLTVEventSink,
+        limits: XMLTVParseLimits = .production,
+        cancellationCheck: @escaping @Sendable () throws -> Void = {}
+    ) throws -> XMLTVParseSummary {
         guard let parser = Foundation.XMLParser(contentsOf: fileURL) else {
             throw XMLTVParserError.malformed
         }
-        let delegate = XMLTVDelegate(sink: sink)
+        let delegate = XMLTVDelegate(
+            sink: sink,
+            limits: limits,
+            cancellationCheck: cancellationCheck
+        )
         parser.delegate = delegate
         parser.shouldResolveExternalEntities = false
         parser.externalEntityResolvingPolicy = .never
@@ -50,9 +91,6 @@ public final class XMLTVParser {
 }
 
 private final class XMLTVDelegate: NSObject, XMLParserDelegate {
-    private static let maximumDepth = 32
-    private static let maximumTextBytes = 1_048_576
-
     private struct ChannelState {
         let id: String
         var displayNames: [String] = []
@@ -71,8 +109,13 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
     }
 
     private let sink: XMLTVEventSink
+    private let limits: XMLTVParseLimits
+    private let cancellationCheck: @Sendable () throws -> Void
     private let timeParser = XMLTVTimeParser()
     private var depth = 0
+    private var rawChannelCount = 0
+    private var rawProgrammeCount = 0
+    private var rawEventCount = 0
     private var channel: ChannelState?
     private var programme: ProgrammeState?
     private var textElement: (name: String, depth: Int)?
@@ -83,8 +126,14 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
     private(set) var programmeCount = 0
     private(set) var firstError: Error?
 
-    init(sink: XMLTVEventSink) {
+    init(
+        sink: XMLTVEventSink,
+        limits: XMLTVParseLimits,
+        cancellationCheck: @escaping @Sendable () throws -> Void
+    ) {
         self.sink = sink
+        self.limits = limits
+        self.cancellationCheck = cancellationCheck
     }
 
     func parser(
@@ -95,18 +144,39 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
         attributes attributeDict: [String: String] = [:]
     ) {
         guard firstError == nil else { return }
+        guard checkCancellation(parser: parser) else { return }
         depth += 1
-        guard depth <= Self.maximumDepth else {
+        guard depth <= limits.maximumDepth else {
             fail(XMLTVParserError.excessiveDepth, parser: parser)
             return
         }
 
         switch elementName {
         case "channel":
+            rawChannelCount += 1
+            rawEventCount += 1
+            guard rawChannelCount <= limits.maximumChannels else {
+                fail(XMLTVParserError.excessiveChannels, parser: parser)
+                return
+            }
+            guard rawEventCount <= limits.maximumEvents else {
+                fail(XMLTVParserError.excessiveEvents, parser: parser)
+                return
+            }
             channel = ChannelState(
                 id: attributeDict["id"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             )
         case "programme":
+            rawProgrammeCount += 1
+            rawEventCount += 1
+            guard rawProgrammeCount <= limits.maximumProgrammes else {
+                fail(XMLTVParserError.excessiveProgrammes, parser: parser)
+                return
+            }
+            guard rawEventCount <= limits.maximumEvents else {
+                fail(XMLTVParserError.excessiveEvents, parser: parser)
+                return
+            }
             programme = ProgrammeState(
                 channelID: attributeDict["channel"],
                 rawStart: attributeDict["start"],
@@ -159,10 +229,12 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
     }
 
     func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard checkCancellation(parser: parser) else { return }
         appendText(string, parser: parser)
     }
 
     func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+        guard checkCancellation(parser: parser) else { return }
         guard let string = String(data: CDATABlock, encoding: .utf8) else {
             fail(XMLTVParserError.malformed, parser: parser)
             return
@@ -213,7 +285,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
     private func appendText(_ addition: String, parser: XMLParser) {
         guard firstError == nil, textElement != nil else { return }
         let addedBytes = addition.utf8.count
-        guard addedBytes <= Self.maximumTextBytes - textByteCount else {
+        guard addedBytes <= limits.maximumTextBytes - textByteCount else {
             fail(XMLTVParserError.excessiveText, parser: parser)
             return
         }
@@ -252,6 +324,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
             fail(XMLTVParserError.malformed, parser: parser)
             return
         }
+        guard checkCancellation(parser: parser) else { return }
         do {
             try sink.accept(channel: EPGChannel(
                 id: channel.id,
@@ -283,9 +356,12 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
             guard stop > start else {
                 throw XMLTVParserError.invalidProgramme
             }
-            let identity = "\(channelID)|\(Int64(start.timeIntervalSince1970))|\(Int64(stop.timeIntervalSince1970))|\(title)"
-            let digest = SHA256.hash(data: Data(identity.utf8))
-            let id = digest.map { String(format: "%02x", $0) }.joined()
+            let id = ProgrammeStableID.make(
+                channelID: channelID,
+                startEpochSeconds: Int64(start.timeIntervalSince1970),
+                stopEpochSeconds: Int64(stop.timeIntervalSince1970),
+                title: title
+            )
             _ = programme.iconURL
             emittedProgramme = Programme(
                 id: id,
@@ -304,6 +380,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
             return
         }
 
+        guard checkCancellation(parser: parser) else { return }
         do {
             try sink.accept(programme: emittedProgramme)
             programmeCount += 1
@@ -317,6 +394,17 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
             return nil
         }
         return value
+    }
+
+    private func checkCancellation(parser: XMLParser) -> Bool {
+        guard firstError == nil else { return false }
+        do {
+            try cancellationCheck()
+            return true
+        } catch {
+            fail(error, parser: parser)
+            return false
+        }
     }
 
     private func fail(_ error: Error, parser: XMLParser) {

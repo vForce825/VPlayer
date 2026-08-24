@@ -616,12 +616,16 @@ final class AppModel {
             try await repository.updateProfile(id: profileID, input: validatedInput, now: updatedAt)
             clearPendingCreation(profileID: profileID)
             reconcileUpdatedProfile(id: profileID, input: validatedInput, updatedAt: updatedAt)
-            guard await reload() else {
-                reconcileUpdatedProfile(id: profileID, input: validatedInput, updatedAt: updatedAt)
+            invalidateCommittedRetarget(
+                profileID: profileID,
+                resources: retargetedResources
+            )
+            let reloadApplied = await reload()
+            startAutomaticRefresh(profileID: profileID, resources: retargetedResources)
+            guard reloadApplied else {
                 presentOperationMessage("更改已保存，但界面未能重新读取。请稍后重试。")
                 return false
             }
-            startAutomaticRefresh(profileID: profileID, resources: retargetedResources)
             return true
         } catch {
             presentOperationError(error)
@@ -944,13 +948,54 @@ final class AppModel {
     ) -> Set<RefreshResource> {
         guard let profile else { return [] }
         var resources: Set<RefreshResource> = []
-        if profile.m3uURL != input.m3uURL {
+        if SourceURLIdentity(url: profile.m3uURL) != SourceURLIdentity(url: input.m3uURL) {
             resources.insert(.playlist)
         }
-        if profile.epgURL != input.epgURL {
+        if SourceURLIdentity(url: profile.epgURL) != SourceURLIdentity(url: input.epgURL) {
             resources.insert(.epg)
         }
         return resources
+    }
+
+    private func invalidateCommittedRetarget(
+        profileID: UUID,
+        resources: Set<RefreshResource>
+    ) {
+        guard !resources.isEmpty else { return }
+        for resource in resources {
+            let key = RefreshKey(profileID: profileID, resource: resource)
+            manualRefreshAttempts[key] = nil
+            terminalRefreshOverlays[key] = nil
+            cancelRefreshReconciliation(for: key)
+        }
+
+        guard let profileIndex = profiles.firstIndex(where: { $0.id == profileID }) else {
+            return
+        }
+        let isActiveProfile = activeProfile?.id == profileID
+        for resource in resources {
+            switch resource {
+            case .playlist:
+                profiles[profileIndex].m3uStatus = ResourceRefreshStatus()
+                guard isActiveProfile else { continue }
+                channels = []
+                matchByChannelID = [:]
+                manualMappingByChannelID = [:]
+                programmesByChannelID = [:]
+                presentedPlaybackRequest = nil
+            case .epg:
+                profiles[profileIndex].epgStatus = ResourceRefreshStatus()
+                guard isActiveProfile else { continue }
+                epgChannels = []
+                epgProgrammeCount = 0
+                staleEPGCoverageEnd = nil
+                matchByChannelID = [:]
+                programmesByChannelID = [:]
+            }
+        }
+        if isActiveProfile {
+            activeProfile = profiles[profileIndex]
+        }
     }
 
     @discardableResult

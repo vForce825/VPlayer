@@ -4,6 +4,18 @@
 
 import Foundation
 
+public struct SourceURLIdentity: RawRepresentable, Hashable, Sendable {
+    public let rawValue: String
+
+    public init(url: URL) {
+        rawValue = url.absoluteString
+    }
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+}
+
 public enum SourceProfileURLField: Equatable, Sendable { case m3u, epg }
 
 public enum SourceProfileValidationError: Error, Equatable, Sendable {
@@ -83,4 +95,10 @@ public struct SourceProfile: Identifiable, Equatable, Sendable {
     public var epgStatus: ResourceRefreshStatus
     public var createdAt: Date
     public var updatedAt: Date
+}
+
+public extension SourceProfile {
+    func sourceURL(for resource: RefreshResource) -> URL {
+        resource == .playlist ? m3uURL : epgURL
+    }
 }

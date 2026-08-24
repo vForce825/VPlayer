@@ -4,6 +4,16 @@
 
 import Foundation
 
+public struct RefreshSourceContext: Hashable, Sendable {
+    public let source: SourceURLIdentity
+    public let attemptID: UUID
+
+    public init(source: SourceURLIdentity, attemptID: UUID) {
+        self.source = source
+        self.attemptID = attemptID
+    }
+}
+
 public protocol LibraryRepository: Sendable {
     func profiles() async throws -> [SourceProfile]
     func activeProfile() async throws -> SourceProfile?
@@ -73,19 +83,36 @@ public protocol LibraryRepository: Sendable {
     func purgeUnreferencedSnapshots() async throws
 }
 
+public protocol ConditionalRefreshStatusWriting: Sendable {
+    func beginRefresh(
+        profileID: UUID,
+        resource: RefreshResource,
+        context: RefreshSourceContext,
+        at: Date
+    ) async throws -> Bool
+
+    func recordRefreshFailure(
+        profileID: UUID,
+        resource: RefreshResource,
+        context: RefreshSourceContext,
+        summary: String,
+        at: Date
+    ) async throws -> Bool
+}
+
 /// Commits a refresh snapshot and its successful resource status as one repository transaction.
 public protocol RefreshSnapshotCommitting: Sendable {
     func commitPlaylistRefresh(
         profileID: UUID,
         channels: [Channel],
         fetchedAt: Date,
-        attemptID: UUID?
+        context: RefreshSourceContext
     ) async throws
     func commitEPGRefresh(
         profileID: UUID,
         fileURL: URL,
         fetchedAt: Date,
-        attemptID: UUID?
+        context: RefreshSourceContext
     ) async throws -> XMLTVParseSummary
 }
 
@@ -132,38 +159,11 @@ public extension LibraryRepository {
     }
 }
 
-public extension RefreshSnapshotCommitting {
-    func commitPlaylistRefresh(
-        profileID: UUID,
-        channels: [Channel],
-        fetchedAt: Date
-    ) async throws {
-        try await commitPlaylistRefresh(
-            profileID: profileID,
-            channels: channels,
-            fetchedAt: fetchedAt,
-            attemptID: nil
-        )
-    }
-
-    func commitEPGRefresh(
-        profileID: UUID,
-        fileURL: URL,
-        fetchedAt: Date
-    ) async throws -> XMLTVParseSummary {
-        try await commitEPGRefresh(
-            profileID: profileID,
-            fileURL: fileURL,
-            fetchedAt: fetchedAt,
-            attemptID: nil
-        )
-    }
-}
-
 public enum LibraryRepositoryError: Error, Equatable, Sendable {
     case profileNotFound
     case invalidChannelProfile
     case duplicatePlaylistChannel
     case epgHasNoChannels
     case corruptPersistedValue
+    case sourceConfigurationChanged
 }

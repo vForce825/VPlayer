@@ -5,7 +5,8 @@
 import Foundation
 @testable import VPlayerCore
 
-actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
+actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting,
+    ConditionalRefreshStatusWriting {
     enum InjectedError: Error, Sendable {
         case setActiveProfile
         case deleteProfile
@@ -27,6 +28,15 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         case channelReadReleased
         case activationStarted(UUID)
         case deletionStarted(UUID)
+    }
+
+    enum ConditionalRefreshEvent: Equatable, Sendable {
+        case beginAccepted(UUID, RefreshResource, RefreshSourceContext)
+        case beginRejected(UUID, RefreshResource, RefreshSourceContext)
+        case failureAccepted(UUID, RefreshResource, RefreshSourceContext)
+        case failureRejected(UUID, RefreshResource, RefreshSourceContext)
+        case commitAccepted(UUID, RefreshResource, RefreshSourceContext)
+        case commitRejected(UUID, RefreshResource, RefreshSourceContext)
     }
 
     struct Snapshot: Sendable {
@@ -59,6 +69,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         let profileUpdateCount: Int
         let profileReadPlaylistStates: [RefreshState]
         let operationEvents: [OperationEvent]
+        let conditionalRefreshEvents: [ConditionalRefreshEvent]
     }
 
     private var storedProfiles: [SourceProfile]
@@ -78,6 +89,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var profileUpdateCount = 0
     private var profileReadPlaylistStates: [RefreshState] = []
     private var operationEvents: [OperationEvent] = []
+    private var conditionalRefreshEvents: [ConditionalRefreshEvent] = []
     private var failsReads = false
     private var shouldGateNextChannelRead = false
     private var blockedChannelReadContinuation: CheckedContinuation<Void, Never>?
@@ -99,6 +111,9 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     private var shouldGateNextMappingWrite = false
     private var blockedMappingWriteContinuation: CheckedContinuation<Void, Never>?
     private var mappingWriteReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var shouldGateNextBeginRefresh = false
+    private var blockedBeginRefreshContinuation: CheckedContinuation<Void, Never>?
+    private var beginRefreshReleaseContinuation: CheckedContinuation<Void, Never>?
     private let failedRefreshCommits: Set<RefreshResource>
     private var failsRecordAttempt: Bool
     private var failsRecordFailure: Bool
@@ -143,7 +158,8 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             profileCreateCount: profileCreateCount,
             profileUpdateCount: profileUpdateCount,
             profileReadPlaylistStates: profileReadPlaylistStates,
-            operationEvents: operationEvents
+            operationEvents: operationEvents,
+            conditionalRefreshEvents: conditionalRefreshEvents
         )
     }
 
@@ -170,6 +186,23 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
     func replaceProfiles(_ profiles: [SourceProfile], activeProfileID: UUID?) {
         storedProfiles = profiles
         storedActiveProfileID = activeProfileID
+    }
+
+    func gateNextBeginRefresh() {
+        shouldGateNextBeginRefresh = true
+    }
+
+    func waitUntilBeginRefreshIsBlocked() async {
+        if beginRefreshReleaseContinuation != nil { return }
+        guard shouldGateNextBeginRefresh else { return }
+        await withCheckedContinuation { continuation in
+            blockedBeginRefreshContinuation = continuation
+        }
+    }
+
+    func releaseBeginRefresh() {
+        beginRefreshReleaseContinuation?.resume()
+        beginRefreshReleaseContinuation = nil
     }
 
     func gateNextChannelRead() {
@@ -539,8 +572,18 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         profileID: UUID,
         channels: [Channel],
         fetchedAt: Date,
-        attemptID: UUID?
+        context: RefreshSourceContext
     ) throws {
+        let index = try profileIndex(profileID)
+        guard refreshContextMatches(
+            context,
+            profile: storedProfiles[index],
+            resource: .playlist,
+            requiresStoredAttempt: true
+        ) else {
+            conditionalRefreshEvents.append(.commitRejected(profileID, .playlist, context))
+            throw LibraryRepositoryError.sourceConfigurationChanged
+        }
         guard !failedRefreshCommits.contains(.playlist) else {
             throw InjectedError.refreshCommit
         }
@@ -549,16 +592,27 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             profileID: profileID,
             resource: .playlist,
             at: fetchedAt,
-            attemptID: attemptID
+            attemptID: context.attemptID
         )
+        conditionalRefreshEvents.append(.commitAccepted(profileID, .playlist, context))
     }
 
     func commitEPGRefresh(
         profileID: UUID,
         fileURL: URL,
         fetchedAt: Date,
-        attemptID: UUID?
+        context: RefreshSourceContext
     ) throws -> XMLTVParseSummary {
+        let index = try profileIndex(profileID)
+        guard refreshContextMatches(
+            context,
+            profile: storedProfiles[index],
+            resource: .epg,
+            requiresStoredAttempt: true
+        ) else {
+            conditionalRefreshEvents.append(.commitRejected(profileID, .epg, context))
+            throw LibraryRepositoryError.sourceConfigurationChanged
+        }
         guard !failedRefreshCommits.contains(.epg) else {
             throw InjectedError.refreshCommit
         }
@@ -571,9 +625,77 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
             profileID: profileID,
             resource: .epg,
             at: fetchedAt,
-            attemptID: attemptID
+            attemptID: context.attemptID
         )
+        conditionalRefreshEvents.append(.commitAccepted(profileID, .epg, context))
         return summary
+    }
+
+    func beginRefresh(
+        profileID: UUID,
+        resource: RefreshResource,
+        context: RefreshSourceContext,
+        at: Date
+    ) async throws -> Bool {
+        if shouldGateNextBeginRefresh {
+            shouldGateNextBeginRefresh = false
+            blockedBeginRefreshContinuation?.resume()
+            blockedBeginRefreshContinuation = nil
+            await withCheckedContinuation { continuation in
+                beginRefreshReleaseContinuation = continuation
+            }
+        }
+        guard !failsRecordAttempt else { throw InjectedError.recordAttempt }
+        let index = try profileIndex(profileID)
+        guard refreshContextMatches(
+            context,
+            profile: storedProfiles[index],
+            resource: resource,
+            requiresStoredAttempt: false
+        ) else {
+            conditionalRefreshEvents.append(.beginRejected(profileID, resource, context))
+            return false
+        }
+        updateStatus(index: index, resource: resource) { status in
+            status.lastAttemptAt = at
+            status.state = .refreshing
+            status.errorSummary = nil
+            status.attemptID = context.attemptID
+        }
+        storedProfiles[index].updatedAt = at
+        recordedEvents.append(.attempt(profileID, resource))
+        conditionalRefreshEvents.append(.beginAccepted(profileID, resource, context))
+        return true
+    }
+
+    func recordRefreshFailure(
+        profileID: UUID,
+        resource: RefreshResource,
+        context: RefreshSourceContext,
+        summary: String,
+        at: Date
+    ) throws -> Bool {
+        guard !failsRecordFailure else { throw InjectedError.recordFailure }
+        let index = try profileIndex(profileID)
+        guard refreshContextMatches(
+            context,
+            profile: storedProfiles[index],
+            resource: resource,
+            requiresStoredAttempt: true
+        ) else {
+            conditionalRefreshEvents.append(.failureRejected(profileID, resource, context))
+            return false
+        }
+        let sanitized = String(summary.prefix(240))
+        updateStatus(index: index, resource: resource) { status in
+            status.state = .failed
+            status.errorSummary = sanitized
+            status.attemptID = context.attemptID
+        }
+        storedProfiles[index].updatedAt = at
+        recordedEvents.append(.failure(profileID, resource, sanitized))
+        conditionalRefreshEvents.append(.failureAccepted(profileID, resource, context))
+        return true
     }
 
     func recordAttempt(
@@ -660,6 +782,17 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting {
         case .epg:
             update(&storedProfiles[index].epgStatus)
         }
+    }
+
+    private func refreshContextMatches(
+        _ context: RefreshSourceContext,
+        profile: SourceProfile,
+        resource: RefreshResource,
+        requiresStoredAttempt: Bool
+    ) -> Bool {
+        let status = resource == .playlist ? profile.m3uStatus : profile.epgStatus
+        return SourceURLIdentity(url: profile.sourceURL(for: resource)) == context.source
+            && (!requiresStoredAttempt || status.attemptID == context.attemptID)
     }
 }
 

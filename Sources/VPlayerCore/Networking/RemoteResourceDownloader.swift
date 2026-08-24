@@ -35,6 +35,10 @@ public enum RemoteDownloadError: Error, Equatable, Sendable {
     case cancelled
 }
 
+public protocol BoundedHTTPDownloading: Sendable {
+    func download(url: URL, byteLimit: Int64) async throws -> DownloadedResource
+}
+
 public protocol RemoteResourceDownloading: Sendable {
     func download(_ request: RemoteResourceRequest) async throws -> DownloadedResource
 }

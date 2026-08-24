@@ -7,6 +7,10 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+// INT32_C is not imported by Swift's Clang importer, so expose the bridge
+// contract's positive status to the Swift adapter and its integration tests.
+let VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT: Int32 = 1
+
 /// A decoded frame borrowed for the duration of one synchronous callback.
 struct BorrowedFFmpegVideoFrame: @unchecked Sendable {
     let luma: UnsafePointer<UInt8>?
@@ -25,8 +29,26 @@ struct BorrowedFFmpegVideoFrame: @unchecked Sendable {
     let structSize: UInt32
 }
 
+struct FFmpegVideoPushResult: Equatable, Sendable {
+    let status: Int32
+    let failureToken: Int64?
+
+    static let success = Self(status: 0, failureToken: nil)
+
+    static func liveBridge(
+        status: Int32,
+        failureToken: Int64,
+        hasFailureToken: UInt8
+    ) -> Self {
+        let eligible = hasFailureToken == 1
+            && failureToken > 0
+            && failureToken != Int64.min
+        return Self(status: status, failureToken: eligible ? failureToken : nil)
+    }
+}
+
 protocol FFmpegVideoDecoderHandle: AnyObject, Sendable {
-    func push(_ bytes: UnsafeRawBufferPointer, token: Int64) -> Int32
+    func push(_ bytes: UnsafeRawBufferPointer, token: Int64) -> FFmpegVideoPushResult
     func flush()
     func destroy()
 }
@@ -89,14 +111,23 @@ private final class LiveFFmpegVideoDecoderHandle: FFmpegVideoDecoderHandle, @unc
         retainedBox = retained
     }
 
-    func push(_ bytes: UnsafeRawBufferPointer, token: Int64) -> Int32 {
+    func push(_ bytes: UnsafeRawBufferPointer, token: Int64) -> FFmpegVideoPushResult {
         lock.withLock {
-            guard let decoder else { return 0 }
-            return vp_ffmpeg_video_decoder_push(
+            guard let decoder else { return .success }
+            var failureToken: Int64 = 0
+            var hasFailureToken: UInt8 = 0
+            let status = vp_ffmpeg_video_decoder_push(
                 decoder,
                 bytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
                 bytes.count,
-                token
+                token,
+                &failureToken,
+                &hasFailureToken
+            )
+            return FFmpegVideoPushResult.liveBridge(
+                status: status,
+                failureToken: failureToken,
+                hasFailureToken: hasFailureToken
             )
         }
     }
@@ -200,6 +231,8 @@ private final class FFmpegDecodeCompletionLease: @unchecked Sendable {
 /// recovering) follows from that shortfall. FFmpeg's decoder handles the same
 /// stream at 7.2x realtime on a single thread, and threads across frames.
 final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
+    private static let maximumPendingUnitCount = 64
+
     private struct ActiveSession {
         let handle: any FFmpegVideoDecoderHandle
         let generation: MediaGeneration
@@ -211,6 +244,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     /// the bytes are immutable for the unit's lifetime.
     private struct SubmittedUnit: @unchecked Sendable {
         let blockBuffer: CMBlockBuffer
+        let accessUnitID: UInt64
         let generation: MediaGeneration
         let epoch: UInt64
         let token: Int64
@@ -229,6 +263,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     private let api: any FFmpegVideoDecoderAPI
     private let surfacePool: ProgressiveSurfacePool
     private let submissionQueue: DispatchQueue
+    private let submissionStartSink: (@Sendable (UInt64) -> Void)?
     private let metrics: PlaybackMetrics?
     private let sessionTransitionSink: (@Sendable (UInt64) -> Void)?
 
@@ -239,6 +274,10 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     private var pending: [Int64: PendingUnit] = [:]
     private var nextToken: Int64 = 1
     private var sessionEpoch: UInt64 = 0
+    /// A frame claimed before a native error may already be queued on the
+    /// executor when that error retires its session. Keep one bounded permit
+    /// for that retired epoch; ordinary session boundaries clear it.
+    private var nativeFailureDeliveryEpoch: UInt64?
 
     init(
         executor: PlaybackSerialExecutor,
@@ -249,6 +288,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             label: "org.vplayer.playback.decode.ffmpeg",
             qos: .userInitiated
         ),
+        submissionStartSink: (@Sendable (UInt64) -> Void)? = nil,
         metrics: PlaybackMetrics? = nil,
         sessionTransitionSink: (@Sendable (UInt64) -> Void)? = nil
     ) {
@@ -257,6 +297,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         self.api = api
         self.surfacePool = surfacePool
         self.submissionQueue = submissionQueue
+        self.submissionStartSink = submissionStartSink
         self.metrics = metrics
         self.sessionTransitionSink = sessionTransitionSink
     }
@@ -276,6 +317,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             let previous = active
             active = nil
             pending.removeAll(keepingCapacity: true)
+            nativeFailureDeliveryEpoch = nil
             return (sessionEpoch, previous)
         }
         sessionTransitionSink?(replacementEpoch)
@@ -323,9 +365,20 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         guard let blockBuffer = CMSampleBufferGetDataBuffer(accessUnit.sampleBuffer) else {
             throw VideoDecoderFailure.badData(kVTParameterErr)
         }
-        let submitted = stateLock.withLock { () -> SubmittedUnit? in
+        let admission = stateLock.withLock {
+            () -> (
+                submitted: SubmittedUnit?,
+                retired: (handle: any FFmpegVideoDecoderHandle, epoch: UInt64)?
+            ) in
             guard let session = active,
-                  session.generation == accessUnit.generation else { return nil }
+                  session.generation == accessUnit.generation else { return (nil, nil) }
+            guard pending.count < Self.maximumPendingUnitCount else {
+                return (nil, retireSessionLocked(
+                    epoch: session.epoch,
+                    // Capacity retirement never licenses a claimed callback.
+                    nativeFailure: nil
+                ))
+            }
             let issued = nextToken
             nextToken &+= 1
             pending[issued] = PendingUnit(
@@ -337,13 +390,25 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 parserMetadata: accessUnit.parserMetadata,
                 epoch: session.epoch
             )
-            return SubmittedUnit(
-                blockBuffer: blockBuffer,
-                generation: accessUnit.generation,
-                epoch: session.epoch,
-                token: issued
+            return (
+                SubmittedUnit(
+                    blockBuffer: blockBuffer,
+                    accessUnitID: accessUnit.id,
+                    generation: accessUnit.generation,
+                    epoch: session.epoch,
+                    token: issued
+                ),
+                nil
             )
         }
+        if let retired = admission.retired {
+            sessionTransitionSink?(retired.epoch)
+            submissionQueue.async { retired.handle.destroy() }
+            report(.backpressureTimeout, generation: accessUnit.generation)
+            completion.schedule()
+            return
+        }
+        let submitted = admission.submitted
         guard let submitted else {
             completion.schedule()
             return
@@ -354,7 +419,9 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         // Both generation and session epoch are re-checked on the queue. A
         // same-generation rebuild is still a different reference chain, so an
         // old queued unit must release its credit without entering the new one.
+        let submissionStartSink = submissionStartSink
         submissionQueue.async { [weak self] in
+            submissionStartSink?(submitted.accessUnitID)
             defer { completion.schedule() }
             guard let self else { return }
             let generation = submitted.generation
@@ -390,12 +457,53 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             metrics?.recordVideoDecodeSubmission(
                 milliseconds: max(0, (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000)
             )
-            guard result == 0 else {
-                stateLock.withLock { _ = pending.removeValue(forKey: token) }
-                report(.badData(OSStatus(result)), generation: generation)
+            guard result.status == 0 else {
+                guard let retired = retireSession(
+                    epoch: submitted.epoch,
+                    nativeFailure: result
+                ) else { return }
+                sessionTransitionSink?(retired.epoch)
+                retired.handle.destroy()
+                report(Self.failure(forNativeStatus: result.status), generation: generation)
                 return
             }
         }
+    }
+
+    private func retireSession(
+        epoch: UInt64,
+        nativeFailure: FFmpegVideoPushResult
+    ) -> (handle: any FFmpegVideoDecoderHandle, epoch: UInt64)? {
+        stateLock.withLock {
+            retireSessionLocked(
+                epoch: epoch,
+                nativeFailure: nativeFailure
+            )
+        }
+    }
+
+    /// Must be called while `stateLock` is held so capacity admission and
+    /// retirement remain one atomic state transition.
+    private func retireSessionLocked(
+        epoch: UInt64,
+        nativeFailure: FFmpegVideoPushResult?
+    ) -> (handle: any FFmpegVideoDecoderHandle, epoch: UInt64)? {
+        guard let active, active.epoch == epoch else { return nil }
+        let failureTokenBelongsToEpoch = nativeFailure?.failureToken.flatMap {
+            pending[$0]
+        }?.epoch == epoch
+        sessionEpoch &+= 1
+        self.active = nil
+        pending.removeAll(keepingCapacity: true)
+        nativeFailureDeliveryEpoch = failureTokenBelongsToEpoch ? epoch : nil
+        return (active.handle, sessionEpoch)
+    }
+
+    private static func failure(forNativeStatus status: Int32) -> VideoDecoderFailure {
+        if status == VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT {
+            return .badData(kVTVideoDecoderUnsupportedDataFormatErr)
+        }
+        return .badData(OSStatus(status))
     }
 
     private func report(_ failure: VideoDecoderFailure, generation: MediaGeneration) {
@@ -408,7 +516,21 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         // the drain the VideoToolbox route performs.
         submissionQueue.sync {
             guard let session = stateLock.withLock({ active }) else { return }
-            _ = session.handle.push(UnsafeRawBufferPointer(start: nil, count: 0), token: 0)
+            let result = session.handle.push(
+                UnsafeRawBufferPointer(start: nil, count: 0),
+                token: 0
+            )
+            guard result.status != 0,
+                  let retired = retireSession(
+                      epoch: session.epoch,
+                      nativeFailure: result
+                  ) else { return }
+            sessionTransitionSink?(retired.epoch)
+            retired.handle.destroy()
+            report(
+                Self.failure(forNativeStatus: result.status),
+                generation: session.generation
+            )
         }
     }
 
@@ -421,6 +543,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             let previous = active
             active = nil
             pending.removeAll(keepingCapacity: true)
+            nativeFailureDeliveryEpoch = nil
             return (sessionEpoch, previous)
         }
         sessionTransitionSink?(invalidatedEpoch)
@@ -475,7 +598,10 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         let eventSink = eventSink
         executor.submit { [weak self] in
             guard let self,
-                  stateLock.withLock({ active?.epoch == expectedEpoch }) else {
+                  stateLock.withLock({
+                      active?.epoch == expectedEpoch
+                          || nativeFailureDeliveryEpoch == expectedEpoch
+                  }) else {
                 self?.metrics?.recordStaleGenerationDrop()
                 return
             }

@@ -29,15 +29,22 @@ struct VPFFVideoDecoder {
     void *context;
 };
 
-static void deliver(VPFFVideoDecoder *decoder) {
-    const AVFrame *frame = decoder->frame;
+static int32_t deliver_frame(VPFFVideoDecoder *decoder, const AVFrame *frame) {
     // Only the one planar layout this pipeline can turn into NV12. A decoder
     // that produced anything else would otherwise be read as 4:2:0 and torn.
     if (frame->format != AV_PIX_FMT_YUV420P) {
-        return;
+        return VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT;
     }
-    if (frame->width <= 0 || frame->height <= 0) {
-        return;
+    if (frame->data[0] == NULL || frame->data[1] == NULL || frame->data[2] == NULL ||
+        frame->width <= 0 || frame->height <= 0 ||
+        (frame->width & 1) != 0 || (frame->height & 1) != 0) {
+        return VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT;
+    }
+    const int32_t chroma_width = frame->width / 2;
+    if (frame->linesize[0] <= 0 || frame->linesize[1] <= 0 || frame->linesize[2] <= 0 ||
+        frame->linesize[0] < frame->width ||
+        frame->linesize[1] < chroma_width || frame->linesize[2] < chroma_width) {
+        return VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT;
     }
 
     VPFFVideoRange range = VPFF_VIDEO_RANGE_UNKNOWN;
@@ -68,9 +75,65 @@ static void deliver(VPFFVideoDecoder *decoder) {
         .color_matrix = (int32_t)frame->colorspace,
     };
     decoder->callback(decoder->context, &delivered);
+    return 0;
 }
 
-static int32_t drain(VPFFVideoDecoder *decoder) {
+static int32_t deliver(VPFFVideoDecoder *decoder) {
+    return deliver_frame(decoder, decoder->frame);
+}
+
+#if DEBUG
+int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
+    int32_t format,
+    const uint8_t *luma,
+    int32_t luma_stride,
+    const uint8_t *chroma_b,
+    int32_t chroma_b_stride,
+    const uint8_t *chroma_r,
+    int32_t chroma_r_stride,
+    int32_t width,
+    int32_t height,
+    VPFFVideoFrameCallback callback,
+    void *context
+);
+
+int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
+    int32_t format,
+    const uint8_t *luma,
+    int32_t luma_stride,
+    const uint8_t *chroma_b,
+    int32_t chroma_b_stride,
+    const uint8_t *chroma_r,
+    int32_t chroma_r_stride,
+    int32_t width,
+    int32_t height,
+    VPFFVideoFrameCallback callback,
+    void *context
+) {
+    AVFrame frame = {0};
+    frame.format = format;
+    frame.data[0] = (uint8_t *)luma;
+    frame.data[1] = (uint8_t *)chroma_b;
+    frame.data[2] = (uint8_t *)chroma_r;
+    frame.linesize[0] = luma_stride;
+    frame.linesize[1] = chroma_b_stride;
+    frame.linesize[2] = chroma_r_stride;
+    frame.width = width;
+    frame.height = height;
+
+    VPFFVideoDecoder decoder = {
+        .callback = callback,
+        .context = context,
+    };
+    return deliver_frame(&decoder, &frame);
+}
+#endif
+
+static int32_t drain(
+    VPFFVideoDecoder *decoder,
+    int64_t *out_failure_token,
+    uint8_t *out_has_failure_token
+) {
     for (;;) {
         int result = avcodec_receive_frame(decoder->codec_context, decoder->frame);
         if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
@@ -79,8 +142,16 @@ static int32_t drain(VPFFVideoDecoder *decoder) {
         if (result < 0) {
             return (int32_t)result;
         }
-        deliver(decoder);
+        const int64_t frame_pts = decoder->frame->pts;
+        int32_t delivery_result = deliver(decoder);
         av_frame_unref(decoder->frame);
+        if (delivery_result != 0) {
+            if (frame_pts > 0 && frame_pts != AV_NOPTS_VALUE) {
+                *out_failure_token = frame_pts;
+                *out_has_failure_token = 1;
+            }
+            return delivery_result;
+        }
     }
 }
 
@@ -153,8 +224,19 @@ int32_t vp_ffmpeg_video_decoder_push(
     VPFFVideoDecoder *decoder,
     const uint8_t *bytes,
     size_t size,
-    int64_t pts
+    int64_t pts,
+    int64_t *out_failure_token,
+    uint8_t *out_has_failure_token
 ) {
+    if (out_failure_token != NULL) {
+        *out_failure_token = 0;
+    }
+    if (out_has_failure_token != NULL) {
+        *out_has_failure_token = 0;
+    }
+    if (out_failure_token == NULL || out_has_failure_token == NULL) {
+        return AVERROR(EINVAL);
+    }
     if (decoder == NULL) {
         return AVERROR(EINVAL);
     }
@@ -186,7 +268,7 @@ int32_t vp_ffmpeg_video_decoder_push(
     if (result < 0 && result != AVERROR(EAGAIN) && result != AVERROR_INVALIDDATA) {
         return (int32_t)result;
     }
-    return drain(decoder);
+    return drain(decoder, out_failure_token, out_has_failure_token);
 }
 
 void vp_ffmpeg_video_write_biplanar(

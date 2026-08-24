@@ -13,26 +13,27 @@ import VPlayerPlayback
 final class ChannelLogoCache {
     static let shared = ChannelLogoCache()
 
-    private struct LoadedLogo {
-        let image: UIImage
-        let cost: Int
-    }
-
     private let memoryCache = NSCache<NSURL, UIImage>()
-    private let session: URLSession
+    private let dataLoader: any ChannelLogoDataLoading
+    private let imageDecoder: any ChannelLogoImageDecoding
     private let diskCache: ChannelLogoDiskCache?
     private let maximumResponseBytes: Int
-    private var inFlight: [URL: Task<LoadedLogo?, Never>] = [:]
+    private var inFlight: [URL: Task<DecodedChannelLogo?, Never>] = [:]
 
     init(
-        session: URLSession = .shared,
+        dataLoader: any ChannelLogoDataLoading = LiveChannelLogoDataLoader(
+            downloader: URLSessionBoundedDownloader(),
+            fileManager: .default
+        ),
+        imageDecoder: any ChannelLogoImageDecoding = ChannelLogoImageDecoder(),
         fileManager: FileManager = .default,
         cacheDirectory: URL? = nil,
         memoryCostLimit: Int = 64 * 1_024 * 1_024,
         diskCapacity: Int = 128 * 1_024 * 1_024,
         maximumResponseBytes: Int = 8 * 1_024 * 1_024
     ) {
-        self.session = session
+        self.dataLoader = dataLoader
+        self.imageDecoder = imageDecoder
         self.maximumResponseBytes = maximumResponseBytes
         memoryCache.totalCostLimit = memoryCostLimit
         memoryCache.countLimit = 256
@@ -60,7 +61,7 @@ final class ChannelLogoCache {
             return await task.value?.image
         }
 
-        let task = Task { [weak self] () -> LoadedLogo? in
+        let task = Task { [weak self] () -> DecodedChannelLogo? in
             guard let self else { return nil }
             return await self.loadLogo(for: url)
         }
@@ -91,154 +92,47 @@ final class ChannelLogoCache {
             .appendingPathComponent("ChannelLogos", isDirectory: true)
     }
 
-    private func loadLogo(for url: URL) async -> LoadedLogo? {
+    private func loadLogo(for url: URL) async -> DecodedChannelLogo? {
         let diskKey = Self.diskKey(for: url)
         if let diskCache,
-           let data = await diskCache.data(forKey: diskKey) {
-            if let image = await preparedImage(from: data) {
-                return LoadedLogo(image: image, cost: Self.memoryCost(for: image, data: data))
+           let data = await diskCache.data(
+            forKey: diskKey,
+            maximumByteCount: maximumResponseBytes
+        ) {
+            if let decoded = await decode(data) {
+                return decoded
             }
             await diskCache.removeData(forKey: diskKey)
         }
 
-        guard let data = await downloadLogo(from: url),
-              let image = await preparedImage(from: data) else {
+        guard let data = await dataLoader.data(
+            for: url,
+            maximumByteCount: maximumResponseBytes
+        ),
+              let decoded = await decode(data) else {
             return nil
         }
         if let diskCache {
-            await diskCache.store(data, forKey: diskKey)
+            await diskCache.store(
+                data,
+                forKey: diskKey,
+                maximumByteCount: maximumResponseBytes
+            )
         }
-        return LoadedLogo(image: image, cost: Self.memoryCost(for: image, data: data))
+        return decoded
     }
 
-    private func preparedImage(from data: Data) async -> UIImage? {
-        guard let image = UIImage(data: data, scale: 1) else { return nil }
-        return await image.byPreparingForDisplay() ?? image
-    }
-
-    private func downloadLogo(from url: URL) async -> Data? {
-        if url.isFileURL {
-            return await Task.detached(priority: .utility) { [maximumResponseBytes] in
-                guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-                      let fileSize = values.fileSize,
-                      fileSize <= maximumResponseBytes else {
-                    return nil
-                }
-                return try? Data(contentsOf: url, options: .mappedIfSafe)
-            }.value
-        }
-
-        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
-            return nil
-        }
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 15
-            let (data, response) = try await session.data(for: request)
-            guard let response = response as? HTTPURLResponse,
-                  (200..<300).contains(response.statusCode),
-                  data.count <= maximumResponseBytes else {
-                return nil
-            }
-            return data
-        } catch {
-            return nil
-        }
+    private func decode(_ data: Data) async -> DecodedChannelLogo? {
+        let imageDecoder = imageDecoder
+        return await Task.detached(priority: .utility) {
+            imageDecoder.decodeThumbnail(from: data)
+        }.value
     }
 
     private static func diskKey(for url: URL) -> String {
         SHA256.hash(data: Data(url.absoluteString.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-    }
-
-    private static func memoryCost(for image: UIImage, data: Data) -> Int {
-        guard let cgImage = image.cgImage else { return data.count }
-        return cgImage.bytesPerRow * cgImage.height
-    }
-}
-
-private actor ChannelLogoDiskCache {
-    private struct Entry {
-        let url: URL
-        let size: Int
-        let modificationDate: Date
-    }
-
-    private let directory: URL
-    private let capacity: Int
-    private let fileManager: FileManager
-
-    init(directory: URL, capacity: Int) throws {
-        self.directory = directory
-        self.capacity = capacity
-        fileManager = .default
-        try fileManager.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
-    }
-
-    func data(forKey key: String) -> Data? {
-        let fileURL = fileURL(forKey: key)
-        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
-            return nil
-        }
-        try? fileManager.setAttributes(
-            [.modificationDate: Date()],
-            ofItemAtPath: fileURL.path
-        )
-        return data
-    }
-
-    func store(_ data: Data, forKey key: String) {
-        guard data.count <= capacity else { return }
-        do {
-            try data.write(to: fileURL(forKey: key), options: .atomic)
-            try pruneIfNeeded()
-        } catch {
-            // Disk caching is best-effort; the memory cache already owns the image.
-        }
-    }
-
-    func removeData(forKey key: String) {
-        try? fileManager.removeItem(at: fileURL(forKey: key))
-    }
-
-    private func fileURL(forKey key: String) -> URL {
-        directory.appendingPathComponent(key, isDirectory: false)
-    }
-
-    private func pruneIfNeeded() throws {
-        let resourceKeys: Set<URLResourceKey> = [
-            .contentModificationDateKey,
-            .fileSizeKey,
-            .isRegularFileKey,
-        ]
-        let fileURLs = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: Array(resourceKeys),
-            options: [.skipsHiddenFiles]
-        )
-        var entries: [Entry] = []
-        var totalSize = 0
-        for fileURL in fileURLs {
-            let values = try fileURL.resourceValues(forKeys: resourceKeys)
-            guard values.isRegularFile == true else { continue }
-            let size = values.fileSize ?? 0
-            totalSize += size
-            entries.append(Entry(
-                url: fileURL,
-                size: size,
-                modificationDate: values.contentModificationDate ?? .distantPast
-            ))
-        }
-        guard totalSize > capacity else { return }
-        for entry in entries.sorted(by: { $0.modificationDate < $1.modificationDate }) {
-            try? fileManager.removeItem(at: entry.url)
-            totalSize -= entry.size
-            if totalSize <= capacity { break }
-        }
     }
 }
 
@@ -302,6 +196,7 @@ struct LiveLibraryRuntime: Sendable {
     typealias Operation = @Sendable () async throws -> Void
 
     let repository: any LibraryRepository & RefreshSnapshotCommitting
+        & ConditionalRefreshStatusWriting
     let refresh: Refresh
     let prepare: Operation
     let maintenance: Operation
@@ -851,7 +746,8 @@ struct AppDependencies {
     }
 
     private static func make(
-        repository: any LibraryRepository & RefreshSnapshotCommitting,
+        repository: any LibraryRepository & RefreshSnapshotCommitting
+            & ConditionalRefreshStatusWriting,
         refresh: @escaping Refresh,
         libraryChanges: LibraryChangeSignal,
         libraryStartup: LibraryStartup,
@@ -1098,7 +994,8 @@ private actor SeededLibrarySeeder {
 }
 #endif
 
-private actor UnavailableLibraryRepository: LibraryRepository {
+private actor UnavailableLibraryRepository: LibraryRepository,
+    ConditionalRefreshStatusWriting {
     func profiles() throws -> [SourceProfile] { throw ProductionDependencyError.libraryUnavailable }
     func activeProfile() throws -> SourceProfile? { throw ProductionDependencyError.libraryUnavailable }
     func createProfile(_ input: ValidatedSourceProfileInput, now: Date) throws -> SourceProfile {
@@ -1199,6 +1096,18 @@ private actor UnavailableLibraryRepository: LibraryRepository {
         _ = attemptID
         throw ProductionDependencyError.libraryUnavailable
     }
+    func beginRefresh(
+        profileID: UUID,
+        resource: RefreshResource,
+        context: RefreshSourceContext,
+        at: Date
+    ) throws -> Bool {
+        _ = profileID
+        _ = resource
+        _ = context
+        _ = at
+        throw ProductionDependencyError.libraryUnavailable
+    }
     func recordSuccess(
         profileID: UUID,
         resource: RefreshResource,
@@ -1223,6 +1132,20 @@ private actor UnavailableLibraryRepository: LibraryRepository {
         _ = summary
         _ = at
         _ = attemptID
+        throw ProductionDependencyError.libraryUnavailable
+    }
+    func recordRefreshFailure(
+        profileID: UUID,
+        resource: RefreshResource,
+        context: RefreshSourceContext,
+        summary: String,
+        at: Date
+    ) throws -> Bool {
+        _ = profileID
+        _ = resource
+        _ = context
+        _ = summary
+        _ = at
         throw ProductionDependencyError.libraryUnavailable
     }
     func purgeUnreferencedSnapshots() throws { throw ProductionDependencyError.libraryUnavailable }
