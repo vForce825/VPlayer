@@ -6,7 +6,6 @@ import Foundation
 
 enum EPGPersistenceSinkError: Error, Equatable, Sendable {
     case duplicateChannelID
-    case duplicateProgrammeID
 }
 
 struct EPGPersistenceBatch: Sendable {
@@ -24,6 +23,13 @@ final class EPGPersistenceSink: XMLTVEventSink {
     private var programmeIDs: Set<String> = []
     private var channels: [EPGChannel] = []
     private var programmes: [Programme] = []
+
+    var acceptedSummary: XMLTVParseSummary {
+        XMLTVParseSummary(
+            channelCount: channelIDs.count,
+            programmeCount: programmeIDs.count
+        )
+    }
 
     init(
         cancellationCheck: @escaping @Sendable () throws -> Void,
@@ -46,9 +52,7 @@ final class EPGPersistenceSink: XMLTVEventSink {
 
     func accept(programme: Programme) throws {
         try cancellationCheck()
-        guard programmeIDs.insert(programme.id).inserted else {
-            throw EPGPersistenceSinkError.duplicateProgrammeID
-        }
+        guard programmeIDs.insert(programme.id).inserted else { return }
         programmes.append(programme)
         try flushIfNeeded()
     }
