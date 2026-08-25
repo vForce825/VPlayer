@@ -587,7 +587,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                     self.epgStagingCheckpoint?(.afterBatchCancellationCheck)
                 }
             )
-            summary = try XMLTVParser().parse(
+            _ = try XMLTVParser().parse(
                 fileURL: fileURL,
                 into: sink,
                 cancellationCheck: cancellationCheck
@@ -595,6 +595,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             epgStagingCheckpoint?(.beforeFinalFlush)
             try sink.finish()
             try cancellationCheck()
+            summary = sink.acceptedSummary
             guard summary.channelCount > 0 else {
                 throw LibraryRepositoryError.epgHasNoChannels
             }

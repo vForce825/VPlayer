@@ -378,7 +378,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(inventory.programmes, [])
     }
 
-    func testDuplicateXMLTVProgrammeStableIDsRejectReplacementAndCleanStaging() async throws {
+    func testDuplicateXMLTVProgrammeStableIDsImportOnceAndKeepFirstMetadata() async throws {
         let (container, store) = try makeStore()
         let profile = try await store.createProfile(input(name: "Home"), now: date(10))
         let originalURL = try temporaryXML(
@@ -397,9 +397,11 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
               <channel id="replacement"><display-name>Replacement</display-name></channel>
               <programme channel="replacement" start="20260718150000 Z" stop="20260718160000 Z">
                 <title>Duplicated Show</title>
+                <sub-title>First metadata</sub-title>
               </programme>
               <programme channel="replacement" start="20260718150000 Z" stop="20260718160000 Z">
                 <title>Duplicated Show</title>
+                <sub-title>Second metadata</sub-title>
               </programme>
             </tv>
             """
@@ -415,26 +417,26 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
         try await store.recordSuccess(profileID: profile.id, resource: .epg, at: date(25))
 
-        _ = await XCTAssertThrowsErrorAsync {
-            _ = try await store.installEPG(
-                profileID: profile.id,
-                fileURL: duplicateURL,
-                fetchedAt: self.date(30)
-            )
-        }
+        let summary = try await store.installEPG(
+            profileID: profile.id,
+            fileURL: duplicateURL,
+            fetchedAt: date(30)
+        )
 
         let activeChannels = try await store.epgChannels(profileID: profile.id)
         let activeProgrammes = try await store.programmes(
             profileID: profile.id,
-            xmltvChannelID: "original",
+            xmltvChannelID: "replacement",
             overlapping: date(0)..<date(2_000_000_000)
         )
         let profiles = try await store.profiles()
         let currentProfile = try XCTUnwrap(profiles.first)
         let snapshotHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
         let inventory = try snapshotInventory(container)
-        XCTAssertEqual(activeChannels.map(\.id), ["original"])
-        XCTAssertEqual(activeProgrammes.map(\.title), ["Original Show"])
+        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 1))
+        XCTAssertEqual(activeChannels.map(\.id), ["replacement"])
+        XCTAssertEqual(activeProgrammes.map(\.title), ["Duplicated Show"])
+        XCTAssertEqual(activeProgrammes.map(\.subtitle), ["First metadata"])
         XCTAssertEqual(currentProfile.epgStatus.state, .succeeded)
         XCTAssertEqual(currentProfile.epgStatus.lastSuccessAt, date(25))
         XCTAssertEqual(snapshotHeaders.count, 1)
@@ -442,7 +444,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(inventory.playlistHeaderIDs, [])
         XCTAssertEqual(inventory.channels, [])
         XCTAssertEqual(inventory.epgHeaderIDs, snapshotHeaders.map(\.id))
-        XCTAssertEqual(inventory.epgChannels.map(\.valueID), ["original"])
+        XCTAssertEqual(inventory.epgChannels.map(\.valueID), ["replacement"])
         XCTAssertEqual(inventory.programmes.map(\.valueID), [activeProgrammes[0].id])
     }
 
@@ -841,6 +843,16 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
                 categories: []
             ))
         }
+        try sink.accept(programme: Programme(
+            id: "programme-0",
+            xmltvChannelID: "guide",
+            start: date(10_000),
+            stop: date(10_001),
+            title: "Conflicting duplicate metadata",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        ))
 
         try sink.finish()
 
@@ -855,6 +867,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(Set(channelIDs).count, 1)
         XCTAssertEqual(programmeIDs, expectedProgrammeIDs)
         XCTAssertEqual(Set(programmeIDs).count, 1_001)
+        XCTAssertEqual(recorded.flatMap(\.programmes).first?.title, "Programme 0")
     }
 
     func testEPGImportPersistsHeaderThreeBoundedBatchesAndFinalCounts() async throws {
