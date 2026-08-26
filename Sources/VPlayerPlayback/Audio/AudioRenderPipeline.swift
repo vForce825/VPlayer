@@ -405,7 +405,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         pendingRecovery = nil
         fallbackReadinessGraceActive = false
         currentOutput = .other
-        lastEvaluatedOutput = nil
+        lastEvaluatedOutput = .other
         updateSnapshot(route: .systemCompressed, ready: false)
     }
 
