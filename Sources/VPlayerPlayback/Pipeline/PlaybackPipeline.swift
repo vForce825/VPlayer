@@ -2432,7 +2432,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let executor = PlaybackSerialExecutor()
         let demuxExecutor = PlaybackSerialExecutor(label: "org.vplayer.playback.demux.delivery")
         let synchronizer = AVSampleBufferRenderSynchronizer()
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
         let clock = RenderSynchronizerClock(synchronizer: synchronizer)
         let relay = PlaybackPipelineRelay()
         let decoder = RoutingVideoDecoder(
