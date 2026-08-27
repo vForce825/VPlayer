@@ -292,7 +292,11 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private let lock = NSLock()
     var ready = false
     var selectedRoute = VPlayerPlayback.AudioRoute.systemCompressed
-    private(set) var configured: [(VPlayerPlayback.AudioCodec, MediaGeneration)] = []
+    private(set) var configured: [(
+        VPlayerPlayback.AudioCodec,
+        MediaGeneration,
+        MediaFormatFingerprint
+    )] = []
     private(set) var samples: [CompressedAudioSample] = []
     private(set) var flushes: [MediaGeneration] = []
     private(set) var stopCount = 0
@@ -312,9 +316,10 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     func configure(
         format _: CMAudioFormatDescription,
         codec: VPlayerPlayback.AudioCodec,
-        generation: MediaGeneration
+        generation: MediaGeneration,
+        fingerprint: MediaFormatFingerprint
     ) throws {
-        lock.withLock { configured.append((codec, generation)) }
+        lock.withLock { configured.append((codec, generation, fingerprint)) }
     }
 
     func enqueue(_ sample: CompressedAudioSample) throws {
@@ -401,7 +406,11 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     }
 
     func snapshot() -> (
-        configured: [(VPlayerPlayback.AudioCodec, MediaGeneration)],
+        configured: [(
+            VPlayerPlayback.AudioCodec,
+            MediaGeneration,
+            MediaFormatFingerprint
+        )],
         samples: [CompressedAudioSample],
         flushes: [MediaGeneration],
         stops: Int,

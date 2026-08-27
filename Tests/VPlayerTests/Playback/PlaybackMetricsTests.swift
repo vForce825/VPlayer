@@ -8,6 +8,74 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackMetricsTests: XCTestCase {
+    func testAudioDiagnosticsRoundTripThroughMetricsJSON() throws {
+        let metrics = PlaybackMetrics(channelID: "channel", now: { 1 })
+        let fingerprint = try XCTUnwrap(AudioFormatFingerprintDiagnostic(
+            value: String(repeating: "a", count: 64)
+        ))
+        let failure = try XCTUnwrap(AudioRendererFailureDiagnostic(
+            domain: "AVFoundationErrorDomain",
+            code: -11819
+        ))
+        let diagnostics = AudioRenderDiagnostics(
+            automaticFlushTriggerCount: 11,
+            outputConfigurationTriggerCount: 12,
+            routeChangeTriggerCount: 13,
+            recoveryTransactionCount: 14,
+            suppressedCorrelatedTriggerCount: 15,
+            compressedRendererRetryCount: 16,
+            pcmFallbackCount: 17,
+            lastFallbackReason: .repeatedCompressedRendererFailure,
+            startupWaitingSeconds: 18.5,
+            rendererReady: true,
+            rendererSufficient: false,
+            activeCodec: .eac3,
+            formatFingerprint: fingerprint,
+            outputCategory: .airPlay,
+            routeRevision: 20,
+            mediaGeneration: MediaGeneration(rawValue: 21),
+            lastCompressedRendererFailure: failure,
+            acceptedCompressedMediaDurationSeconds: 22.5
+        )
+        metrics.updateReadinessDiagnostics(
+            audioRoute: .ffmpegPCM,
+            audioReady: true,
+            readinessOpen: true,
+            retainedAudioCount: 1,
+            retainedVideoCount: 1,
+            audioFirstPTS: .zero,
+            audioDuration: .zero,
+            videoFirstPTS: .zero,
+            audioRecoveryCount: 19,
+            audioDiagnostics: diagnostics
+        )
+
+        let original = metrics.snapshot(window: .seconds(60))
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(PlaybackMetricsSnapshot.self, from: data)
+
+        XCTAssertEqual(decoded, original)
+        XCTAssertEqual(decoded.audioAutomaticFlushTriggerCount, 11)
+        XCTAssertEqual(decoded.audioOutputConfigurationTriggerCount, 12)
+        XCTAssertEqual(decoded.audioRouteChangeTriggerCount, 13)
+        XCTAssertEqual(decoded.audioRecoveryTransactionCount, 14)
+        XCTAssertEqual(decoded.audioSuppressedCorrelatedTriggerCount, 15)
+        XCTAssertEqual(decoded.audioCompressedRendererRetryCount, 16)
+        XCTAssertEqual(decoded.audioPCMFallbackCount, 17)
+        XCTAssertEqual(decoded.audioLastFallbackReason, .repeatedCompressedRendererFailure)
+        XCTAssertEqual(decoded.audioStartupWaitingSeconds, 18.5)
+        XCTAssertTrue(decoded.audioRendererReady)
+        XCTAssertFalse(decoded.audioRendererSufficient)
+        XCTAssertEqual(decoded.audioRecoveryCount, 19)
+        XCTAssertEqual(decoded.audioActiveCodec, .eac3)
+        XCTAssertEqual(decoded.audioFormatFingerprint, fingerprint)
+        XCTAssertEqual(decoded.audioOutputCategory, .airPlay)
+        XCTAssertEqual(decoded.audioRouteRevision, 20)
+        XCTAssertEqual(decoded.audioMediaGeneration, MediaGeneration(rawValue: 21))
+        XCTAssertEqual(decoded.audioLastCompressedRendererFailure, failure)
+        XCTAssertEqual(decoded.audioAcceptedCompressedMediaDurationSeconds, 22.5)
+    }
+
     func testMetricsSnapshotTracksBoundedQueuesRatesAndRequiredCounters() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(

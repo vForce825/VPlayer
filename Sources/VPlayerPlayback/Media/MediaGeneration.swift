@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
-public struct MediaGeneration: RawRepresentable, Hashable, Comparable, Sendable {
+public struct MediaGeneration: RawRepresentable, Hashable, Comparable, Codable, Sendable {
     public let rawValue: UInt64
 
     public init(rawValue: UInt64) {

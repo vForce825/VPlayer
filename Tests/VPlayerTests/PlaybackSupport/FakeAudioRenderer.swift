@@ -141,6 +141,10 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         withLock { eventHandler }?(event)
     }
 
+    func captureEventHandler() -> (@Sendable (AudioRendererEvent) -> Void)? {
+        withLock { eventHandler }
+    }
+
     var snapshot: Snapshot {
         withLock {
             Snapshot(
@@ -168,14 +172,20 @@ final class FakeAudioRendererFactory: AudioRendererFactory, @unchecked Sendable 
     private let lock = NSLock()
     private var nextIdentity: UInt64 = 1
     private var renderers: [FakeAudioRenderer] = []
+    private var createError: PlaybackCoreError?
 
     func makeRenderer(mediaKind: AudioRendererMediaKind) throws -> any AudioRenderer {
         lock.lock()
         defer { lock.unlock() }
+        if let createError { throw createError }
         let renderer = FakeAudioRenderer(identity: nextIdentity, mediaKind: mediaKind)
         nextIdentity += 1
         renderers.append(renderer)
         return renderer
+    }
+
+    func configureCreateError(_ error: PlaybackCoreError?) {
+        lock.withLock { createError = error }
     }
 
     var snapshot: [FakeAudioRenderer] {
@@ -199,6 +209,7 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
     private var operations: [String] = []
     private var rateChanges: [(Float, CMTime)] = []
     private var removals: [Removal] = []
+    private var attachError: PlaybackCoreError?
 
     func currentTime() -> CMTime { withLock { clockTime } }
     var rate: Float { withLock { currentRate } }
@@ -207,12 +218,17 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
         withLock { clockTime = value }
     }
 
-    func attach(_ renderer: any AudioRenderer) {
-        withLock {
+    func attach(_ renderer: any AudioRenderer) throws {
+        try withLock {
+            if let attachError { throw attachError }
             operations.append("attach:\(renderer.identity.rawValue)")
             attached.append(renderer.identity)
         }
         (renderer as? FakeAudioRenderer)?.markAttached()
+    }
+
+    func configureAttachError(_ error: PlaybackCoreError?) {
+        withLock { attachError = error }
     }
 
     func remove(
@@ -250,10 +266,10 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
     var removalCount: Int { withLock { removals.count } }
 
     @discardableResult
-    private func withLock<Result>(_ body: () -> Result) -> Result {
+    private func withLock<Result>(_ body: () throws -> Result) rethrows -> Result {
         lock.lock()
         defer { lock.unlock() }
-        return body()
+        return try body()
     }
 }
 
@@ -473,15 +489,25 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
 
 final class FakeAudioRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
     private let lock = NSLock()
-    private var handler: (@Sendable (AudioOutputCategory) -> Void)?
+    private var handler: (@Sendable (AudioOutputRouteSnapshot) -> Void)?
     private var startCount = 0
     private var stopCount = 0
+    private let initialCategory: AudioOutputRouteCategory
 
-    func start(_ handler: @escaping @Sendable (AudioOutputCategory) -> Void) {
+    init(initialCategory: AudioOutputRouteCategory = .other) {
+        self.initialCategory = initialCategory
+    }
+
+    func start(_ handler: @escaping @Sendable (AudioOutputRouteSnapshot) -> Void) {
         lock.lock()
         self.handler = handler
         startCount += 1
         lock.unlock()
+        handler(AudioOutputRouteSnapshot(
+            category: initialCategory,
+            reason: .initial,
+            revision: 0
+        ))
     }
 
     func stop() {
@@ -491,11 +517,11 @@ final class FakeAudioRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         lock.unlock()
     }
 
-    func emit(_ category: AudioOutputCategory) {
+    func emit(_ snapshot: AudioOutputRouteSnapshot) {
         lock.lock()
         let copied = handler
         lock.unlock()
-        copied?(category)
+        copied?(snapshot)
     }
 }
 
