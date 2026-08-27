@@ -137,9 +137,11 @@
 		82D68BAE0313D068BD09B54B /* progressive-h264-aac.ts in Resources */ = {isa = PBXBuildFile; fileRef = 63B3AEF14DD2421D4A3AA3DE /* progressive-h264-aac.ts */; };
 		842D24A63B94FC45353B3249 /* ScanTypeClassifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21F204F78607BC92CFBE8536 /* ScanTypeClassifier.swift */; };
 		849637FE454BDD01737C072F /* VPlayerUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F83B421173E1978DA035BF40 /* VPlayerUITests.swift */; };
+		851D1B4FEA3D4A1D9E8F40D7 /* AudioRecoveryCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18D85F5C34347058F699FB78 /* AudioRecoveryCoordinator.swift */; };
 		8623A982060816A0386DA685 /* MediaTimestamp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D6AAD4FCE5CC250AEAF8DD4 /* MediaTimestamp.swift */; };
 		86F079E90934D8EB19E328D4 /* PlaybackSettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA047A5D68B3C061A0B0BAA7 /* PlaybackSettingsStoreTests.swift */; };
 		87DDC0B9D93FE9982D653E52 /* YADIFReferenceWindowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0685EAE8345F1D0B5628961C /* YADIFReferenceWindowTests.swift */; };
+		8848E86BF4DAF34497B66CDB /* AudioRecoveryCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682969FAE2E170CD7B6C625E /* AudioRecoveryCoordinatorTests.swift */; };
 		88C697BA97F9B45FAF088E3C /* FFmpegVideoDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5083966DCE983FC265462736 /* FFmpegVideoDecoder.swift */; };
 		88EE4D6EB5C53CBF06806476 /* NetworkFailureMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BC07E59D5A77AEDA7743492 /* NetworkFailureMapper.swift */; };
 		891C5AAB506FE4CA07A334BA /* XMLTVParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = C99D8B80186539B2A8231C30 /* XMLTVParser.swift */; };
@@ -360,6 +362,7 @@
 		17C14E42AA6106141D92DD14 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		17FC24D02BC7CDA6FF415D93 /* PlaybackSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsView.swift; sourceTree = "<group>"; };
 		18AF1E7F70C884EFB8FD7910 /* StubURLProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StubURLProtocol.swift; sourceTree = "<group>"; };
+		18D85F5C34347058F699FB78 /* AudioRecoveryCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecoveryCoordinator.swift; sourceTree = "<group>"; };
 		1A91D91D87BE831A47E471E2 /* interlaced-h264-mp2.ts */ = {isa = PBXFileReference; path = "interlaced-h264-mp2.ts"; sourceTree = "<group>"; };
 		1DF63818CE82E7723BE40552 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
 		1E9F526E75D1691C1C4F2931 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
@@ -446,6 +449,7 @@
 		64C377C392800022FACE5ABD /* RepositorySpy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RepositorySpy.swift; sourceTree = "<group>"; };
 		66AD65AF4E3E185685F2B892 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		6719AAD38D9FF62B8CB14806 /* ChannelLogoImageDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelLogoImageDecoderTests.swift; sourceTree = "<group>"; };
+		682969FAE2E170CD7B6C625E /* AudioRecoveryCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecoveryCoordinatorTests.swift; sourceTree = "<group>"; };
 		68D68FDF610F8391D9C7BA8A /* ProjectConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectConfigurationTests.swift; sourceTree = "<group>"; };
 		69AF47B948C7AF73F4F6ADE7 /* MetalPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPlayerView.swift; sourceTree = "<group>"; };
 		6B01331098EF436F008D2BEC /* FullScreenPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullScreenPlayerView.swift; sourceTree = "<group>"; };
@@ -1045,6 +1049,7 @@
 				262815F870519A83B1F36F83 /* Support */,
 				706D698E11356DB7E985F6AC /* Timing */,
 				6D0DCDB6239235F5B85CC530 /* AppModelTests.swift */,
+				682969FAE2E170CD7B6C625E /* AudioRecoveryCoordinatorTests.swift */,
 				229B3FA39D5D782A3BDFC9DA /* ChannelLogoDiskCacheTests.swift */,
 				6719AAD38D9FF62B8CB14806 /* ChannelLogoImageDecoderTests.swift */,
 				332FCAA43D6756AA7E3F5EBB /* ChannelProgrammePresentationTests.swift */,
@@ -1157,6 +1162,7 @@
 			children = (
 				85DEACF95219050358906274 /* AudioFormatDescriptionBuilder.swift */,
 				63569EB441C130BF20B76FA0 /* AudioOutputRouteMonitor.swift */,
+				18D85F5C34347058F699FB78 /* AudioRecoveryCoordinator.swift */,
 				236F58780D6F85721D75E758 /* AudioRendering.swift */,
 				8576D8DDC02E6C1D6374132C /* AudioRenderPipeline.swift */,
 				B63B6EB36ACBAF4A8908E166 /* AudioTypes.swift */,
@@ -1523,6 +1529,7 @@
 			files = (
 				7C1000AB5ABBB846332FEF10 /* AppModelTests.swift in Sources */,
 				37B71D4AEC2AFA2ADF506167 /* AssemblerTestSupport.swift in Sources */,
+				8848E86BF4DAF34497B66CDB /* AudioRecoveryCoordinatorTests.swift in Sources */,
 				61B2D45BC7D28B03036B82C7 /* AudioRenderPipelineTests.swift in Sources */,
 				50FF1E365B87A2BD253AF2F9 /* BoundedMediaQueueTests.swift in Sources */,
 				A933CB765C69AD5C257D5750 /* ChannelLogoDiskCacheTests.swift in Sources */,
@@ -1611,6 +1618,7 @@
 				400180A260F29AC14CE026F8 /* AnnexBScanner.swift in Sources */,
 				6E237B9538044FA0511ED2D3 /* AudioFormatDescriptionBuilder.swift in Sources */,
 				143309936A6254113FFD4CAC /* AudioOutputRouteMonitor.swift in Sources */,
+				851D1B4FEA3D4A1D9E8F40D7 /* AudioRecoveryCoordinator.swift in Sources */,
 				DC105589DE1F39C1E0B37AC8 /* AudioRenderPipeline.swift in Sources */,
 				71E952E1EEE2470D8B119C15 /* AudioRendering.swift in Sources */,
 				AC28C9946D7ACC2748025F72 /* AudioTypes.swift in Sources */,

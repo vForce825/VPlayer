@@ -9,7 +9,7 @@ public enum VideoCodec: UInt8, Sendable, Hashable {
     case hevc = 2
 }
 
-public enum AudioCodec: UInt8, Sendable, Hashable {
+public enum AudioCodec: UInt8, Codable, Sendable, Hashable {
     case aac = 1
     case ac3 = 2
     case eac3 = 3

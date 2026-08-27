@@ -91,6 +91,24 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // Audio renderer recoveries (flush + full replay re-enqueue). Each one is
     // expensive on the playback executor, so a high rate starves ingest.
     public let audioRecoveryCount: UInt64
+    public let audioAutomaticFlushTriggerCount: UInt64
+    public let audioOutputConfigurationTriggerCount: UInt64
+    public let audioRouteChangeTriggerCount: UInt64
+    public let audioRecoveryTransactionCount: UInt64
+    public let audioSuppressedCorrelatedTriggerCount: UInt64
+    public let audioCompressedRendererRetryCount: UInt64
+    public let audioPCMFallbackCount: UInt64
+    public let audioLastFallbackReason: AudioFallbackReason?
+    public let audioStartupWaitingSeconds: Double
+    public let audioRendererReady: Bool
+    public let audioRendererSufficient: Bool
+    public let audioActiveCodec: AudioCodec?
+    public let audioFormatFingerprint: AudioFormatFingerprintDiagnostic?
+    public let audioOutputCategory: AudioDiagnosticOutputCategory
+    public let audioRouteRevision: UInt64
+    public let audioMediaGeneration: MediaGeneration?
+    public let audioLastCompressedRendererFailure: AudioRendererFailureDiagnostic?
+    public let audioAcceptedCompressedMediaDurationSeconds: Double
     // Display-link callbacks that reached the renderer. Divided by elapsed time
     // this is the *actual* tick rate, which is what separates "the display link
     // is missing ticks" from "the renderer refused ticks it was offered".
@@ -242,6 +260,7 @@ final class PlaybackMetrics: @unchecked Sendable {
         var clockTimeSeconds: Double?
         var videoResyncCount: UInt64 = 0
         var audioRecoveryCount: UInt64 = 0
+        var audioDiagnostics = AudioRenderDiagnostics.zero
         var renderTickCount: UInt64 = 0
         var renderSkippedInFlightCount: UInt64 = 0
         var displayLinkCallbackCount: UInt64 = 0
@@ -311,7 +330,8 @@ final class PlaybackMetrics: @unchecked Sendable {
         readinessCycleID: UInt64 = 0,
         readinessCloseReasonCounts: [UInt64] = [],
         clockTime: CMTime? = nil,
-        audioRecoveryCount: UInt64 = 0
+        audioRecoveryCount: UInt64 = 0,
+        audioDiagnostics: AudioRenderDiagnostics = .zero
     ) {
         lock.withLock {
             state.audioRoute = audioRoute == .systemCompressed
@@ -330,6 +350,7 @@ final class PlaybackMetrics: @unchecked Sendable {
             }
             state.clockTimeSeconds = Self.numericSeconds(clockTime)
             state.audioRecoveryCount = audioRecoveryCount
+            state.audioDiagnostics = audioDiagnostics
         }
     }
 
@@ -347,6 +368,10 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.demuxAdmitWaitNanoseconds = demuxAdmitWaitNanoseconds
             state.playbackExecutorBusyNanoseconds = playbackExecutorBusyNanoseconds
         }
+    }
+
+    func update(audioDiagnostics: AudioRenderDiagnostics) {
+        lock.withLock { state.audioDiagnostics = audioDiagnostics }
     }
 
     func recordRenderTick(skippedInFlight: Bool) {
@@ -686,6 +711,31 @@ final class PlaybackMetrics: @unchecked Sendable {
             clockTimeSeconds: captured.clockTimeSeconds,
             videoResyncCount: captured.videoResyncCount,
             audioRecoveryCount: captured.audioRecoveryCount,
+            audioAutomaticFlushTriggerCount:
+                captured.audioDiagnostics.automaticFlushTriggerCount,
+            audioOutputConfigurationTriggerCount:
+                captured.audioDiagnostics.outputConfigurationTriggerCount,
+            audioRouteChangeTriggerCount: captured.audioDiagnostics.routeChangeTriggerCount,
+            audioRecoveryTransactionCount:
+                captured.audioDiagnostics.recoveryTransactionCount,
+            audioSuppressedCorrelatedTriggerCount:
+                captured.audioDiagnostics.suppressedCorrelatedTriggerCount,
+            audioCompressedRendererRetryCount:
+                captured.audioDiagnostics.compressedRendererRetryCount,
+            audioPCMFallbackCount: captured.audioDiagnostics.pcmFallbackCount,
+            audioLastFallbackReason: captured.audioDiagnostics.lastFallbackReason,
+            audioStartupWaitingSeconds: captured.audioDiagnostics.startupWaitingSeconds,
+            audioRendererReady: captured.audioDiagnostics.rendererReady,
+            audioRendererSufficient: captured.audioDiagnostics.rendererSufficient,
+            audioActiveCodec: captured.audioDiagnostics.activeCodec,
+            audioFormatFingerprint: captured.audioDiagnostics.formatFingerprint,
+            audioOutputCategory: captured.audioDiagnostics.outputCategory,
+            audioRouteRevision: captured.audioDiagnostics.routeRevision,
+            audioMediaGeneration: captured.audioDiagnostics.mediaGeneration,
+            audioLastCompressedRendererFailure:
+                captured.audioDiagnostics.lastCompressedRendererFailure,
+            audioAcceptedCompressedMediaDurationSeconds:
+                captured.audioDiagnostics.acceptedCompressedMediaDurationSeconds,
             renderTickCount: captured.renderTickCount,
             renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
             displayLinkCallbackCount: captured.displayLinkCallbackCount,
