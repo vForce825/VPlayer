@@ -19,9 +19,14 @@ public final class ProgressiveSurfacePool: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let recommendedAttributes: CVPixelBufferAttributes
     private var pools: [PoolKey: CVPixelBufferPool] = [:]
 
-    public init() {}
+    public init(
+        recommendedAttributes: CVPixelBufferAttributes = .init(rawAttributes: [:])
+    ) {
+        self.recommendedAttributes = recommendedAttributes
+    }
 
     public func allocatePair(
         matching source: CVPixelBuffer
@@ -70,13 +75,23 @@ public final class ProgressiveSurfacePool: @unchecked Sendable {
         let poolAttributes: [CFString: Any] = [
             kCVPixelBufferPoolMinimumBufferCountKey: 2,
         ]
-        let pixelAttributes: [CFString: Any] = [
-            kCVPixelBufferWidthKey: key.width,
-            kCVPixelBufferHeightKey: key.height,
-            kCVPixelBufferPixelFormatTypeKey: key.pixelFormat,
-            kCVPixelBufferMetalCompatibilityKey: true,
-            kCVPixelBufferIOSurfacePropertiesKey: [:],
-        ]
+        var mandatory = CVPixelBufferAttributes(
+            pixelFormatTypes: [CVPixelFormatType(rawValue: key.pixelFormat)],
+            size: CVImageSize(width: key.width, height: key.height),
+            compatibility: [.metalTexture]
+        )
+        mandatory.backing = .ioSurfaceWithProperties([:])
+        guard let resolved = CVPixelBufferAttributes(merging: [
+            recommendedAttributes,
+            mandatory,
+        ]) else {
+            throw YADIFFailure.incompatibleRendererAttributes
+        }
+        let pixelAttributes = resolved.rawAttributes.reduce(
+            into: [CFString: Any]()
+        ) { result, item in
+            result[item.key as CFString] = item.value
+        }
         var created: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(
             nil,
@@ -112,6 +127,7 @@ public final class ProgressiveSurfacePool: @unchecked Sendable {
         try YADIFSurfaceValidator.validate(actual)
         guard actual == expected else { throw .invalidPlaneLayout }
 
+        CVBufferRemoveAllAttachments(output)
         CVBufferPropagateAttachments(source, output)
         CVBufferRemoveAttachment(output, kCVImageBufferFieldCountKey)
         CVBufferRemoveAttachment(output, kCVImageBufferFieldDetailKey)

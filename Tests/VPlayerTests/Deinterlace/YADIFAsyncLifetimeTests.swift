@@ -161,61 +161,22 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertEqual(harness.processor.metricsSnapshot.inFlightCount, 0)
     }
 
-    func testMappedCommandOutputsBecomeMetalPresentationFrames() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw XCTSkip("Metal device unavailable")
-        }
-        let lumaDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r8Unorm,
-            width: 4,
-            height: 4,
-            mipmapped: false
-        )
-        let chromaDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rg8Unorm,
-            width: 2,
-            height: 2,
-            mipmapped: false
-        )
-        let firstLuma = try XCTUnwrap(device.makeTexture(descriptor: lumaDescriptor))
-        let firstChroma = try XCTUnwrap(device.makeTexture(descriptor: chromaDescriptor))
-        let secondLuma = try XCTUnwrap(device.makeTexture(descriptor: lumaDescriptor))
-        let secondChroma = try XCTUnwrap(device.makeTexture(descriptor: chromaDescriptor))
-        let outputPlanes = YADIFOutputPlaneSets(
-            first: MetalPlaneSet(
-                luma: firstLuma,
-                chroma: firstChroma,
-                retainedObjects: []
-            ),
-            second: MetalPlaneSet(
-                luma: secondLuma,
-                chroma: secondChroma,
-                retainedObjects: []
-            )
-        )
+    func testCommandOutputsBecomeTheExactPixelBufferPresentationFrames() throws {
         let harness = try makeHarness(maximumInFlight: 1)
         submit(try normalized(id: 1), to: harness)
         submit(try normalized(id: 2), to: harness)
         let identifier = try XCTUnwrap(harness.queue.submissionIdentifiers.first)
+        let submission = try XCTUnwrap(harness.queue.submission(identifier: identifier))
 
         harness.queue.complete(
             identifier: identifier,
-            completion: YADIFCommandCompletion(
-                result: .completed,
-                outputPlanes: outputPlanes
-            )
+            completion: YADIFCommandCompletion(result: .completed)
         )
 
         let frames = try success(harness.results.singleResult(for: 1))
         XCTAssertEqual(frames.count, 2)
-        guard case let .metalPlanes(first) = frames[0].storage,
-              case let .metalPlanes(second) = frames[1].storage else {
-            return XCTFail("mapped YADIF outputs must bypass renderer remapping")
-        }
-        XCTAssertTrue((first.luma as AnyObject) === (firstLuma as AnyObject))
-        XCTAssertTrue((first.chroma as AnyObject) === (firstChroma as AnyObject))
-        XCTAssertTrue((second.luma as AnyObject) === (secondLuma as AnyObject))
-        XCTAssertTrue((second.chroma as AnyObject) === (secondChroma as AnyObject))
+        XCTAssertTrue(try pixelBuffer(from: frames[0]) === submission.outputs.first)
+        XCTAssertTrue(try pixelBuffer(from: frames[1]) === submission.outputs.second)
     }
 
     func testMaximumThreeInflightJobsAndArbitraryCompletionResumeFIFOReadyWorkWithoutWait() throws {
@@ -931,7 +892,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         guard case let .completedWithGPUInterval(interval) = completion.result else {
             return XCTFail("expected completed Metal GPU interval")
         }
-        XCTAssertNotNil(completion.outputPlanes)
+        XCTAssertNotNil(CVPixelBufferGetIOSurface(outputs.first))
+        XCTAssertNotNil(CVPixelBufferGetIOSurface(outputs.second))
         XCTAssertGreaterThanOrEqual(interval.gpuStartTime, 0)
         XCTAssertGreaterThanOrEqual(interval.gpuEndTime, interval.gpuStartTime)
     }
@@ -1099,13 +1061,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
     }
 
     private func pixelBuffer(from frame: VideoPresentationFrame) throws -> CVPixelBuffer {
-        guard case let .pixelBuffer(pixelBuffer) = frame.storage else {
-            throw PlaybackFailure(
-                code: "unexpected-storage",
-                userMessage: "Expected a pixel-buffer YADIF output"
-            )
-        }
-        return pixelBuffer
+        frame.pixelBuffer
     }
 
     private func assertSendable<T: Sendable>(_: T.Type) {}
@@ -1124,7 +1080,6 @@ private final class TestYADIFClock: PlaybackClock, @unchecked Sendable {
     private var storedTime = CMTime.zero
 
     var currentTime: CMTime { lock.withLock { storedTime } }
-    func mediaTime(forHostTime hostTime: CMTime) -> CMTime { hostTime }
     func pause() {}
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         set(mediaTime)
@@ -1188,7 +1143,7 @@ private final class ImmediateYADIFCommandSubmitter: YADIFCommandSubmitting, @unc
         completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure) {
         lock.withLock { storedSubmitCount += 1 }
-        completion(YADIFCommandCompletion(result: .completed, outputPlanes: nil))
+        completion(YADIFCommandCompletion(result: .completed))
     }
 }
 
@@ -1222,7 +1177,7 @@ private final class BlockingYADIFCommandSubmitter: YADIFCommandSubmitting, @unch
         let completion = lock.withLock {
             pending.isEmpty ? nil : pending.removeFirst().completion
         }
-        completion?(YADIFCommandCompletion(result: result, outputPlanes: nil))
+        completion?(YADIFCommandCompletion(result: result))
     }
 }
 

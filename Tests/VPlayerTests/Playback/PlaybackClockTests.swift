@@ -29,28 +29,19 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertTrue(gate.isOpen)
     }
 
-    func testRenderSynchronizerClockOwnsCallerSynchronizerAndUsesInjectedExactTimeConversion() {
+    func testRenderSynchronizerClockOwnsCallerSynchronizerAndUsesInjectedActions() {
         let synchronizer = AVSampleBufferRenderSynchronizer()
-        var convertedHostTimes: [CMTime] = []
         var pauses = 0
         var anchors: [(CMTime, CMTime, Float)] = []
         let subject = RenderSynchronizerClock(
             synchronizer: synchronizer,
             currentTime: { CMTime(value: 11, timescale: 2) },
-            convertHostTime: {
-                convertedHostTimes.append($0)
-                return CMTime(value: 7, timescale: 1)
-            },
             pause: { pauses += 1 },
             anchor: { anchors.append(($0, $1, $2)) }
         )
 
         XCTAssertTrue(subject.synchronizer === synchronizer)
         XCTAssertEqual(subject.currentTime, CMTime(value: 11, timescale: 2))
-        XCTAssertEqual(
-            subject.mediaTime(forHostTime: CMTime(value: 100, timescale: 1)),
-            CMTime(value: 7, timescale: 1)
-        )
         subject.pause()
         subject.anchor(
             mediaTime: CMTime(value: 9, timescale: 1),
@@ -58,7 +49,6 @@ final class PlaybackClockTests: XCTestCase {
             rate: 1
         )
 
-        XCTAssertEqual(convertedHostTimes, [CMTime(value: 100, timescale: 1)])
         XCTAssertEqual(pauses, 1)
         XCTAssertEqual(anchors.count, 1)
         XCTAssertEqual(anchors.first?.0, CMTime(value: 9, timescale: 1))
@@ -548,33 +538,6 @@ final class PlaybackClockTests: XCTestCase {
         )
     }
 
-    func testRenderSynchronizerClockCompensatesAudioOutputLatencyInMediaTime() {
-        let synchronizer = AVSampleBufferRenderSynchronizer()
-        var convertedHostTime: CMTime?
-        let clock = RenderSynchronizerClock(
-            synchronizer: synchronizer,
-            currentTime: { .zero },
-            convertHostTime: { hostTime in
-                convertedHostTime = hostTime
-                return hostTime
-            },
-            pause: {},
-            anchor: { _, _, _ in }
-        )
-
-        let hostTime1 = CMTime(value: 10_000, timescale: 1_000)
-        _ = clock.mediaTime(forHostTime: hostTime1)
-        XCTAssertEqual(convertedHostTime, hostTime1)
-
-        clock.setAudioOutputLatency(CMTime(value: 200, timescale: 1_000))
-        _ = clock.mediaTime(forHostTime: hostTime1)
-        XCTAssertEqual(convertedHostTime, CMTime(value: 9_800, timescale: 1_000))
-
-        clock.setAudioOutputLatency(.zero)
-        _ = clock.mediaTime(forHostTime: hostTime1)
-        XCTAssertEqual(convertedHostTime, hostTime1)
-    }
-
     private func time(_ seconds: Int64) -> CMTime {
         CMTime(value: seconds, timescale: 1)
     }
@@ -600,8 +563,6 @@ private final class FakePlaybackClock: PlaybackClock {
     init(order: ((String) -> Void)? = nil) {
         self.order = order
     }
-
-    func mediaTime(forHostTime hostTime: CMTime) -> CMTime { hostTime }
 
     func pause() {
         pauseCount += 1

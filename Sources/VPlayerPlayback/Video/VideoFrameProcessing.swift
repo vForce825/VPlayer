@@ -35,7 +35,7 @@ public final class PassthroughVideoProcessor: VideoFrameProcessing, @unchecked S
         }
         sequence &+= 1
         completion(.success([VideoPresentationFrame(
-            storage: .pixelBuffer(frame.pixelBuffer),
+            pixelBuffer: frame.pixelBuffer,
             presentationTimeStamp: frame.presentationTimeStamp,
             duration: frame.duration,
             generation: frame.generation,

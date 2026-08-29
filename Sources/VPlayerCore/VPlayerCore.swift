@@ -3,5 +3,5 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 public enum VPlayerCore {
-    public static let deploymentTarget = "tvOS 18.0"
+    public static let deploymentTarget = "tvOS 26.0"
 }

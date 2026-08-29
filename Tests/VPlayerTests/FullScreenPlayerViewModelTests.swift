@@ -4,7 +4,6 @@
 
 import CoreMedia
 import Foundation
-import Metal
 import XCTest
 @testable import VPlayer
 @testable import VPlayerPlayback
@@ -689,12 +688,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
     func testStopDoesNotWaitForNonCooperativeProviderOrWriteBackItsLateContext() async throws {
         let providerGate = ViewModelAsyncGate()
         let engine = ControlledViewModelPlaybackEngine()
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let lateContext = PlaybackPresentationContext(
-            renderer: ViewModelPresentationRenderer(),
-            clock: ViewModelPresentationClock(),
-            device: device
-        )
+        let lateContext = PlaybackPresentationContext()
         let model = FullScreenPlayerViewModel(
             request: makeRequest(),
             engine: engine,
@@ -728,12 +722,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
 
     func testStaleProviderCompletionCannotTeardownCurrentRetryContext() async throws {
         let engine = ControlledViewModelPlaybackEngine()
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let sharedContext = PlaybackPresentationContext(
-            renderer: ViewModelPresentationRenderer(),
-            clock: ViewModelPresentationClock(),
-            device: device
-        )
+        let sharedContext = PlaybackPresentationContext()
         let provider = ViewModelPresentationProviderSequence(context: sharedContext)
         let model = FullScreenPlayerViewModel(
             request: makeRequest(),
@@ -748,14 +737,14 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         try await eventually {
             provider.callCount == 2 && model.presentationContext === sharedContext
         }
-        let displayLink = sharedContext.makeMetalVideoView().displayLink
-        XCTAssertNotNil(displayLink.delegate)
+        let videoView = sharedContext.makeVideoView()
+        XCTAssertNotNil(videoView.windowDidChange)
 
         provider.releaseFirstCall()
         await Task { @MainActor in }.value
 
         XCTAssertTrue(model.presentationContext === sharedContext)
-        XCTAssertNotNil(displayLink.delegate)
+        XCTAssertNotNil(videoView.windowDidChange)
         sharedContext.teardown()
     }
 
@@ -1156,26 +1145,6 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
 
     private func removeNoticeContinuation(_ id: UUID) {
         noticeContinuations[id] = nil
-    }
-}
-
-private final class ViewModelPresentationClock: PlaybackClock {
-    var currentTime: CMTime = .zero
-    func mediaTime(forHostTime hostTime: CMTime) -> CMTime { hostTime }
-    func pause() {}
-    func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {}
-}
-
-private final class ViewModelPresentationRenderer: VideoRendering {
-    func enqueue(_ frame: VideoPresentationFrame) {}
-    func flush(to generation: MediaGeneration) {}
-    func draw(targetMediaTime: CMTime, drawable: any CAMetalDrawable) -> VideoRenderDecision {
-        VideoRenderDecision(
-            action: .noFrame,
-            sourceAccessUnitID: nil,
-            sequenceNumber: nil,
-            droppedFrameCount: 0
-        )
     }
 }
 

@@ -33,7 +33,7 @@ protocol PlaybackPipelineFactory: Sendable {
         tuning: PlaybackTuning,
         channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
-    ) throws -> any PlaybackPipelineProtocol
+    ) async throws -> any PlaybackPipelineProtocol
 }
 
 protocol VideoAccessUnitAssembling: AnyObject {
@@ -108,10 +108,28 @@ extension PlaybackTunable {
     func apply(_ tuning: PlaybackTuning) {}
 }
 
-protocol PlaybackVideoRendering: VideoRendering, VideoPresentationTimingResetting, PlaybackTunable {}
-extension MetalVideoRenderer: PlaybackVideoRendering {
-    func apply(_ tuning: PlaybackTuning) { setTuning(tuning) }
+protocol PlaybackVideoRendering: AnyObject, Sendable, PlaybackTunable {
+    func enqueue(_ frame: VideoPresentationFrame)
+    func flush(to generation: MediaGeneration)
+    func reset(_ request: VideoRendererResetRequest, completion: @escaping SystemVideoOutput.Acceptance)
+    func resetPresentationTiming()
+    func stopAwaitingRendererRemoval() async
 }
+
+extension PlaybackVideoRendering {
+    func reset(_ request: VideoRendererResetRequest, completion: @escaping SystemVideoOutput.Acceptance) {
+        flush(to: request.generation)
+        for frame in request.seedFrames { enqueue(frame) }
+        completion(.success(VideoEnqueueReceipt(
+            generation: request.generation,
+            sequenceNumbers: Set(request.seedFrames.map(\.sequenceNumber))
+        )))
+    }
+
+    func stopAwaitingRendererRemoval() async {}
+}
+
+extension SystemVideoOutput: PlaybackVideoRendering, PlaybackTunable {}
 
 protocol PlaybackDisplayControlling: Sendable {
     func pauseSubmission()
@@ -265,6 +283,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private let demuxer: any MediaDemuxing
     private let assemblerBuilder: any PlaybackAssemblerBuilding
     private let renderer: any PlaybackVideoRendering
+    private let videoSurfaceLedger: VideoSurfaceBudgetLedger?
     private let audio: any AudioRenderPipelineProtocol
     private let clock: any PlaybackClock
     private let display: any PlaybackDisplayControlling
@@ -360,6 +379,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         audioContinuityRetentionLimits: CompressedAudioRetentionLimits =
             CompressedAudioRetentionPolicy.continuity,
         renderer: any PlaybackVideoRendering,
+        videoSurfaceLedger: VideoSurfaceBudgetLedger? = nil,
         audio: any AudioRenderPipelineProtocol,
         clock: any PlaybackClock,
         display: any PlaybackDisplayControlling,
@@ -381,6 +401,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         self.demuxer = demuxer
         self.assemblerBuilder = assemblerBuilder
         self.renderer = renderer
+        self.videoSurfaceLedger = videoSurfaceLedger
         self.audio = audio
         self.clock = clock
         self.display = display
@@ -494,6 +515,24 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
     }
 
+    func receive(videoRendererRecovery generation: MediaGeneration) {
+        submitOrRun { [weak self] in
+            guard let self,
+                  !terminal,
+                  generationController.accepts(generation),
+                  let readiness else { return }
+            preparedAnchor = nil
+            anchorPreparationTransaction = nil
+            readyPublished = false
+            if !pendingDisplayTimingReset {
+                readiness.close(.buffering)
+            }
+            setSharedTimelineOpenedIsolated(false)
+            display.pauseSubmission()
+            updateReadinessIsolated()
+        }
+    }
+
     func receive(
         audioReadiness change: AudioRenderReadinessChange,
         generation: MediaGeneration
@@ -601,7 +640,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         readiness?.setMaximumAnchorLag(tuning.maximumAnchorLag)
         readiness?.configure(requiredVideoFrameCount: videoCoordinator.requiredVideoFrameCount)
         readiness?.setAnchorLeadTime(audio.anchorLeadTime)
-        clock.setAudioOutputLatency(audio.outputLatency)
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
             failIsolated(.unsupportedProtocol(scheme))
@@ -1091,7 +1129,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         if !requiresVideo {
             phase = .preparingAnchor
         } else if outstandingVideoDecodeSubmissions.isEmpty {
-            retainedVideo.removeAll(keepingCapacity: true)
+            clearRetainedVideoIsolated(keepingCapacity: true)
             renderer.flush(to: admitted.frame.generation)
             phase = .waitingForRandomAccess
         } else {
@@ -1305,7 +1343,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
 
         if transaction.phase == .waitingForOutstandingVideo {
             guard outstandingVideoDecodeSubmissions.isEmpty else { return true }
-            retainedVideo.removeAll(keepingCapacity: true)
+            clearRetainedVideoIsolated(keepingCapacity: true)
             renderer.flush(to: transaction.generation)
             transaction.phase = .waitingForRandomAccess
             audioGapReanchorTransaction = transaction
@@ -1594,10 +1632,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                         )
                     }
                 }
-                if readiness?.isOpen == true {
+                if readiness?.isOpen == true || anchorPreparationTransaction != nil {
+                    // Frames decoded while the renderer's physical reset is in
+                    // flight must queue behind that barrier. Otherwise the seed
+                    // snapshot is accepted, readiness opens, and every frame
+                    // produced between those two moments is lost forever.
                     renderer.enqueue(frame)
                 }
-                retainedVideo.append(frame)
+                appendRetainedVideoIsolated(frame)
                 let route = videoCoordinator.route
                 if let videoFormat,
                    let rate = PlaybackPresentationCadencePolicy.outputFrameRate(
@@ -1733,7 +1775,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             mediaInformationGeneration = nil
             outputCadenceDurations.removeAll(keepingCapacity: true)
             audioContinuity.reset(to: generationController.current)
-            retainedVideo.removeAll(keepingCapacity: true)
+            clearRetainedVideoIsolated(keepingCapacity: true)
             readyPublished = false
         }
         let generation = generationController.current
@@ -1784,7 +1826,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         anchorPreparationTransaction = nil
         audioGapReanchorTransaction = nil
         audioContinuity.reset(to: generation)
-        retainedVideo.removeAll(keepingCapacity: true)
+        clearRetainedVideoIsolated(keepingCapacity: true)
         deferredPackets.removeAll(keepingCapacity: true)
         pendingVideoDecode.removeAll(keepingCapacity: true)
         videoDecodeBufferHorizon = nil
@@ -1808,7 +1850,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         clearMediaInformationIsolated(publish: true)
         outputCadenceDurations.removeAll(keepingCapacity: true)
         preparedAnchor = nil
-        retainedVideo.removeAll(keepingCapacity: true)
+        clearRetainedVideoIsolated(keepingCapacity: true)
         renderer.flush(to: generationController.current)
         display.pauseSubmission()
         metrics?.beginAVDriftGracePeriod(seconds: 5)
@@ -1829,12 +1871,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
 
         let pausedAudioTime = clock.currentTime
-        retainedVideo.removeAll {
+        removeRetainedVideoIsolated {
             let end = CMTimeAdd($0.presentationTimeStamp, $0.duration)
             return end.isNumeric && CMTimeCompare(end, pausedAudioTime) <= 0
         }
-        renderer.flush(to: generationController.current)
-        for frame in retainedVideo { renderer.enqueue(frame) }
         readiness?.close(.buffering)
 
         let queued = deferredPackets
@@ -1894,7 +1934,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         readiness.setAnchorLeadTime(audio.anchorLeadTime)
-        clock.setAudioOutputLatency(audio.outputLatency)
         if tracks?.video == nil {
             updateAudioOnlyReadinessIsolated()
             updateReadinessDiagnosticsIsolated(readiness)
@@ -2228,7 +2267,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 // stream absorbs a segment burst.
             } else {
                 let before = retainedVideo.count
-                retainedVideo.removeAll { frame in
+                removeRetainedVideoIsolated { frame in
                     let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
                     return end.isNumeric && CMTimeCompare(end, audioFirstPTS) <= 0
                 }
@@ -2246,9 +2285,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         // video and drags the clock backwards. Drop the oldest instead.
         if !paused, readiness?.isOpen != true {
             guard retainedVideo.count > Self.startupRetainedVideoCapacity else { return }
-            retainedVideo.removeLast(
-                retainedVideo.count - Self.startupRetainedVideoCapacity
-            )
+            trimRetainedVideoToPrefixIsolated(Self.startupRetainedVideoCapacity)
             return
         }
 
@@ -2275,15 +2312,50 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 return
             }
             let removed = retainedVideo.removeFirst()
+            videoSurfaceLedger?.release(removed)
             estimatedBytes = max(0, estimatedBytes - removed.estimatedStorageBytes)
         }
+    }
+
+    private func appendRetainedVideoIsolated(_ frame: VideoPresentationFrame) {
+        guard videoSurfaceLedger?.retain(frame) ?? true else { return }
+        retainedVideo.append(frame)
+    }
+
+    private func clearRetainedVideoIsolated(keepingCapacity: Bool) {
+        for frame in retainedVideo { videoSurfaceLedger?.release(frame) }
+        retainedVideo.removeAll(keepingCapacity: keepingCapacity)
+    }
+
+    private func removeRetainedVideoIsolated(
+        where shouldRemove: (VideoPresentationFrame) -> Bool
+    ) {
+        var kept: [VideoPresentationFrame] = []
+        kept.reserveCapacity(retainedVideo.count)
+        for frame in retainedVideo {
+            if shouldRemove(frame) {
+                videoSurfaceLedger?.release(frame)
+            } else {
+                kept.append(frame)
+            }
+        }
+        retainedVideo = kept
+    }
+
+    private func trimRetainedVideoToPrefixIsolated(_ count: Int) {
+        let retainedCount = max(0, min(count, retainedVideo.count))
+        guard retainedCount < retainedVideo.count else { return }
+        for frame in retainedVideo[retainedCount...] {
+            videoSurfaceLedger?.release(frame)
+        }
+        retainedVideo.removeLast(retainedVideo.count - retainedCount)
     }
 
     private func pruneRetainedVideoBeforeRecoveryFloorIsolated() {
         assertIsolated()
         guard let floor = readiness?.minimumRecoveryAnchorPTS,
               floor.isNumeric else { return }
-        retainedVideo.removeAll { frame in
+        removeRetainedVideoIsolated { frame in
             frame.presentationTimeStamp.isNumeric
                 && CMTimeCompare(frame.presentationTimeStamp, floor) < 0
         }
@@ -2359,51 +2431,28 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 failIsolated(.audioRendererFailed("audio.anchor"))
                 return false
             }
-            renderer.flush(to: expectedGeneration)
-            for frame in candidateVideo { renderer.enqueue(frame) }
-
-            guard !terminal,
-                  !paused,
-                  generationController.current == preparation.generation,
-                  readiness.cycleID == preparation.cycleID,
-                  anchorPreparationTransaction.map({ transaction in
-                    transaction.cycleID == preparation.cycleID
-                        && transaction.generation == preparation.generation
-                        && transaction.islandID == preparation.islandID
-                        && CMTimeCompare(transaction.commonPTS, preparation.commonPTS) == 0
-                  }) == true,
-                  audioContinuity.anchorCandidate(at: commonPTS)?.id == audioCandidate.id,
-                  hasSufficientMediaForAnchor(
-                    commonPTS: commonPTS,
-                    audioIsland: audioCandidate,
-                    videoFrames: candidateVideo,
-                    requireVideo: requiresVideo
-                  ) else {
-                anchorPreparationTransaction = nil
-                return false
+            let resetReason: VideoRendererResetRequest.Reason =
+                audioGapReanchorTransaction == nil ? .timelineDiscontinuity : .audioGap
+            renderer.reset(VideoRendererResetRequest(
+                generation: expectedGeneration,
+                reason: resetReason,
+                removeDisplayedImage: true,
+                seedFrames: candidateVideo
+            )) { [weak self] result in
+                guard let self else { return }
+                executor.submit { [self] in
+                    completeAnchorPreparationIsolated(
+                        preparation,
+                        audioCandidate: audioCandidate,
+                        candidateVideo: candidateVideo,
+                        requiresVideo: requiresVideo,
+                        result: result
+                    )
+                }
             }
-            retainedVideo = candidateVideo
-            do {
-                try audioContinuity.commitAnchor(at: commonPTS, in: audioCandidate.id)
-            } catch let error as PlaybackCoreError {
-                anchorPreparationTransaction = nil
-                failIsolated(error)
-                return false
-            } catch {
-                anchorPreparationTransaction = nil
-                failIsolated(.audioRendererFailed(
-                    CompressedAudioRetentionPolicy.accountingError
-                ))
-                return false
-            }
-            preparedAnchor = PreparedAnchor(cycleID: expectedCycle, commonPTS: commonPTS)
-            renderer.resetPresentationTiming()
-            anchorPreparationTransaction = nil
-            if let gapTransaction = audioGapReanchorTransaction,
-               gapTransaction.islandID == audioCandidate.id,
-               gapTransaction.generation == expectedGeneration {
-                audioGapReanchorTransaction = nil
-            }
+            // Readiness must stay closed until the physical renderer flush has
+            // completed and every seed sample has crossed the backend boundary.
+            return false
         }
         guard !terminal,
               !paused,
@@ -2415,6 +2464,90 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                   requireVideo: requiresVideo
               ) else { return false }
         return true
+    }
+
+    private func completeAnchorPreparationIsolated(
+        _ preparation: AnchorPreparationTransaction,
+        audioCandidate: AudioContinuityAnchorCandidate,
+        candidateVideo: [VideoPresentationFrame],
+        requiresVideo: Bool,
+        result: Result<VideoEnqueueReceipt, PlaybackCoreError>
+    ) {
+        assertIsolated()
+        let isInstalledTransaction = anchorPreparationTransaction.map { transaction in
+            transaction.cycleID == preparation.cycleID
+                && transaction.generation == preparation.generation
+                && transaction.islandID == preparation.islandID
+                && CMTimeCompare(transaction.commonPTS, preparation.commonPTS) == 0
+        } == true
+        guard isInstalledTransaction else { return }
+        guard !terminal,
+              !paused,
+              generationController.current == preparation.generation,
+              readiness?.cycleID == preparation.cycleID else {
+            // Pause and display-mode changes can invalidate the readiness cycle
+            // while AVFoundation is still completing its asynchronous flush.
+            // Retaining this transaction would veto every future re-anchor.
+            anchorPreparationTransaction = nil
+            updateReadinessIsolated()
+            return
+        }
+        switch result {
+        case let .failure(error):
+            anchorPreparationTransaction = nil
+            failIsolated(error)
+            return
+        case let .success(receipt):
+            let expectedSequences = Set(candidateVideo.map(\.sequenceNumber))
+            guard receipt.generation == preparation.generation,
+                  receipt.sequenceNumbers == expectedSequences,
+                  audioContinuity.anchorCandidate(at: preparation.commonPTS)?.id
+                    == audioCandidate.id,
+                  hasSufficientMediaForAnchor(
+                    commonPTS: preparation.commonPTS,
+                    audioIsland: audioCandidate,
+                    videoFrames: candidateVideo,
+                    requireVideo: requiresVideo
+                  ) else {
+                anchorPreparationTransaction = nil
+                return
+            }
+        }
+        // Keep frames that arrived while the physical reset was in flight. The
+        // reset seeds already cover `candidateVideo`; later frames were queued
+        // behind the same output barrier and must remain available for recovery.
+        removeRetainedVideoIsolated { frame in
+            let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+            return end.isNumeric && CMTimeCompare(end, preparation.commonPTS) <= 0
+        }
+        do {
+            try audioContinuity.commitAnchor(
+                at: preparation.commonPTS,
+                in: audioCandidate.id
+            )
+        } catch let error as PlaybackCoreError {
+            anchorPreparationTransaction = nil
+            failIsolated(error)
+            return
+        } catch {
+            anchorPreparationTransaction = nil
+            failIsolated(.audioRendererFailed(
+                CompressedAudioRetentionPolicy.accountingError
+            ))
+            return
+        }
+        preparedAnchor = PreparedAnchor(
+            cycleID: preparation.cycleID,
+            commonPTS: preparation.commonPTS
+        )
+        renderer.resetPresentationTiming()
+        anchorPreparationTransaction = nil
+        if let gapTransaction = audioGapReanchorTransaction,
+           gapTransaction.islandID == audioCandidate.id,
+           gapTransaction.generation == preparation.generation {
+            audioGapReanchorTransaction = nil
+        }
+        updateReadinessIsolated()
     }
 
     private func hasSufficientMediaForAnchor(
@@ -2483,7 +2616,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         renderer.flush(to: generation)
         audio.flush(to: generation)
         readiness?.closeForTimelineReset(.flush)
-        retainedVideo.removeAll(keepingCapacity: false)
+        clearRetainedVideoIsolated(keepingCapacity: false)
         deferredPackets.removeAll(keepingCapacity: false)
         pendingTrackVideo.removeAll(keepingCapacity: false)
         clearPendingTrackAudioIsolated(keepingCapacity: false)
@@ -2491,7 +2624,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         videoDecodeBufferHorizon = nil
         display.pauseSubmission()
         Task { [self] in
-            await audio.stopAwaitingRendererRemoval()
+            async let videoStop: Void = renderer.stopAwaitingRendererRemoval()
+            async let audioStop: Void = audio.stopAwaitingRendererRemoval()
+            _ = await (videoStop, audioStop)
             executor.submit { [self] in completeNormalStopIsolated() }
         }
     }
@@ -2536,10 +2671,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         pendingVideoDecode.removeAll(keepingCapacity: false)
         videoDecodeBufferHorizon = nil
         videoCoordinator.stop(emergency: true)
-        audio.stop()
         display.pauseSubmission()
         displayClearInProgress = true
         Task { [self] in
+            async let videoStop: Void = renderer.stopAwaitingRendererRemoval()
+            async let audioStop: Void = audio.stopAwaitingRendererRemoval()
+            _ = await (videoStop, audioStop)
             await display.clearDisplayCriteria()
             executor.submit { [self] in
                 displayClearInProgress = false
@@ -2587,6 +2724,10 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
         lock.withLock { target }?.receive(failure: error, generation: generation)
     }
 
+    func videoRendererRecovery(_ generation: MediaGeneration) {
+        lock.withLock { target }?.receive(videoRendererRecovery: generation)
+    }
+
     func audioReadiness(
         _ change: AudioRenderReadinessChange,
         generation: MediaGeneration
@@ -2603,6 +2744,14 @@ private final class PlaybackPipelineRelay: @unchecked Sendable {
     }
 }
 
+private final class VisibleVideoRendererReference: @unchecked Sendable {
+    let renderer: AVSampleBufferVideoRenderer
+
+    init(_ renderer: AVSampleBufferVideoRenderer) {
+        self.renderer = renderer
+    }
+}
+
 struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
     static func makeSynchronizer() -> AVSampleBufferRenderSynchronizer {
         let synchronizer = AVSampleBufferRenderSynchronizer()
@@ -2614,7 +2763,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         tuning: PlaybackTuning,
         channelID: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
-    ) throws -> any PlaybackPipelineProtocol {
+    ) async throws -> any PlaybackPipelineProtocol {
         let metrics = PlaybackMetrics(
             channelID: channelID
         )
@@ -2653,6 +2802,20 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         guard cacheStatus == kCVReturnSuccess, let textureCache else {
             throw PlaybackCoreError.metalCommand("texture-cache.\(cacheStatus)")
         }
+        let presentationContext = PlaybackPresentationContext(
+            switchStarted: { relay.displayModeSwitchStarted() },
+            switchEnded: { relay.displayModeSwitchEnded() }
+        )
+        let videoRendererReference = await MainActor.run {
+            VisibleVideoRendererReference(presentationContext.videoRenderer)
+        }
+        let videoRenderer = videoRendererReference.renderer
+        // This exact object belongs to the visible AVSampleBufferDisplayLayer.
+        // Attach it before the output adapter exists, so no video sample can be
+        // enqueued outside the audio renderer's shared system timebase.
+        synchronizer.addRenderer(videoRenderer)
+        let recommendedPixelBufferAttributes = videoRenderer
+            .recommendedPixelBufferAttributes
         let yadif: YADIFProcessor
         do {
             yadif = try YADIFProcessor(
@@ -2661,6 +2824,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
                 textureCache: textureCache,
                 clock: clock,
                 diagnostics: (metrics: metrics, signposts: signposts),
+                recommendedPixelBufferAttributes: recommendedPixelBufferAttributes,
                 maximumPendingFrames: tuning.deinterlaceBufferFrames
             )
         } catch {
@@ -2672,20 +2836,13 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         } catch {
             throw PlaybackCoreError.metalCommand("scan-probe.setup")
         }
-        let renderer = try MetalVideoRenderer(
-            device: device,
-            generation: MediaGeneration(rawValue: 0),
-            tuning: tuning,
-            metrics: metrics,
-            signposts: signposts,
+        let surfaceLedger = VideoSurfaceBudgetLedger()
+        let renderer = SystemVideoOutput(
+            renderer: videoRenderer,
+            synchronizer: synchronizer,
+            ledger: surfaceLedger,
+            recoverySink: { relay.videoRendererRecovery($0) },
             failureSink: { relay.failure($0, generation: $1) }
-        )
-        let presentationContext = PlaybackPresentationContext(
-            renderer: renderer,
-            clock: clock,
-            device: device,
-            switchStarted: { relay.displayModeSwitchStarted() },
-            switchEnded: { relay.displayModeSwitchEnded() }
         )
         let display = PlaybackPresentationDisplayBridge(context: presentationContext)
         let audio = AudioRenderPipeline(
@@ -2705,6 +2862,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             scanProbe: probe,
             tuning: tuning,
             renderer: renderer,
+            videoSurfaceLedger: surfaceLedger,
             audio: audio,
             clock: clock,
             display: display,

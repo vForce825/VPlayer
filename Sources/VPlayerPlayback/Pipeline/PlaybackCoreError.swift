@@ -14,6 +14,8 @@ enum PlaybackCoreError: Error, Sendable, Equatable {
     case videoFormatDescription(OSStatus)
     case hardwareDecoderUnavailable
     case videoDecode(OSStatus)
+    case videoSampleBuffer(String)
+    case videoRendererFailed(String)
     case audioFormatDescription(OSStatus)
     case audioFallbackDecode(Int32)
     case audioRendererFailed(String)
