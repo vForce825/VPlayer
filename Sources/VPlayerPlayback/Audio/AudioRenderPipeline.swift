@@ -339,6 +339,20 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         withSnapshot { $0.route }
     }
 
+    var currentRouteSnapshot: AudioOutputRouteSnapshot? {
+        withSnapshot { _ in lastRouteSnapshot }
+    }
+
+    var anchorLeadTime: CMTime {
+        if let snapshot = currentRouteSnapshot {
+            return PlaybackAnchorLeadTimePolicy.compute(
+                outputLatency: snapshot.outputLatency,
+                ioBufferDuration: snapshot.ioBufferDuration
+            )
+        }
+        return PlaybackAnchorLeadTimePolicy.minimumLeadTime
+    }
+
     func configure(
         _ configuration: CompressedAudioRenderConfiguration,
         generation: MediaGeneration
@@ -1888,12 +1902,24 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         updateReadiness()
     }
 
+    private var requiredPCMStartupPrerollDuration: CMTime {
+        guard let lastRouteSnapshot else { return Self.pcmStartupPrerollDuration }
+        let latency = max(0, lastRouteSnapshot.outputLatency) + max(0, lastRouteSnapshot.ioBufferDuration)
+        if latency > 0.05 {
+            let dynamicPreroll = CMTime(seconds: latency + 0.25, preferredTimescale: 1_000)
+            return CMTimeCompare(dynamicPreroll, Self.pcmStartupPrerollDuration) > 0
+                ? dynamicPreroll
+                : Self.pcmStartupPrerollDuration
+        }
+        return Self.pcmStartupPrerollDuration
+    }
+
     private var hasMinimumPCMPreroll: Bool {
         guard let start = pcmPrerollStart,
               let end = pcmPrerollEnd else { return false }
         let duration = CMTimeSubtract(end, start)
         return duration.isNumeric &&
-            CMTimeCompare(duration, Self.pcmStartupPrerollDuration) >= 0
+            CMTimeCompare(duration, requiredPCMStartupPrerollDuration) >= 0
     }
 
     private func recordPCMPreroll(_ sampleBuffer: CMSampleBuffer) {
@@ -2009,6 +2035,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         switch snapshot.category {
         case .hdmi: category = .hdmi
         case .airPlay: category = .airPlay
+        case .bluetooth: category = .bluetooth
         case .other: category = .other
         case .none: category = .none
         }

@@ -7,6 +7,7 @@ import Foundation
 
 final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
     typealias SnapshotProvider = @Sendable () -> [AVAudioSession.Port]
+    typealias LatencyProvider = @Sendable () -> (outputLatency: TimeInterval, ioBufferDuration: TimeInterval)
 
     private enum PendingDelivery: Sendable {
         case initial
@@ -16,6 +17,7 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
     private let executor: PlaybackSerialExecutor
     private let notificationCenter: NotificationCenter
     private let snapshotProvider: SnapshotProvider
+    private let latencyProvider: LatencyProvider
     private let initialDrainBoundaryHook: @Sendable () -> Void
     private let lock = NSLock()
     private var observer: NSObjectProtocol?
@@ -34,11 +36,18 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         snapshotProvider: @escaping SnapshotProvider = {
             AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType)
         },
+        latencyProvider: @escaping LatencyProvider = {
+            (
+                outputLatency: AVAudioSession.sharedInstance().outputLatency,
+                ioBufferDuration: AVAudioSession.sharedInstance().ioBufferDuration
+            )
+        },
         initialDrainBoundaryHook: @escaping @Sendable () -> Void = {}
     ) {
         self.executor = executor
         self.notificationCenter = notificationCenter
         self.snapshotProvider = snapshotProvider
+        self.latencyProvider = latencyProvider
         self.initialDrainBoundaryHook = initialDrainBoundaryHook
     }
 
@@ -92,6 +101,9 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         if ports.isEmpty { return .none }
         if ports.contains(AVAudioSession.Port.HDMI) { return .hdmi }
         if ports.contains(.airPlay) { return .airPlay }
+        if ports.contains(.bluetoothA2DP) || ports.contains(.bluetoothLE) || ports.contains(.bluetoothHFP) {
+            return .bluetooth
+        }
         return .other
     }
 
@@ -184,13 +196,16 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
 
     private func deliverInitialRoute(for lifecycle: UInt64) {
         let category = Self.category(from: snapshotProvider())
+        let latency = latencyProvider()
         let copiedHandler = withLock {
             activeLifecycle == lifecycle ? eventHandler : nil
         }
         copiedHandler?(AudioOutputRouteSnapshot(
             category: category,
             reason: .initial,
-            revision: 0
+            revision: 0,
+            outputLatency: latency.outputLatency,
+            ioBufferDuration: latency.ioBufferDuration
         ))
     }
 
@@ -199,6 +214,7 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         for lifecycle: UInt64
     ) {
         let category = Self.category(from: snapshotProvider())
+        let latency = latencyProvider()
         let delivery = withLock { () -> (
             @Sendable (AudioOutputRouteSnapshot) -> Void,
             UInt64
@@ -213,7 +229,9 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         handler(AudioOutputRouteSnapshot(
             category: category,
             reason: reason,
-            revision: revision
+            revision: revision,
+            outputLatency: latency.outputLatency,
+            ioBufferDuration: latency.ioBufferDuration
         ))
     }
 

@@ -20,6 +20,7 @@ public enum AudioFallbackReason: String, Codable, Sendable, Equatable {
 public enum AudioDiagnosticOutputCategory: String, Codable, Sendable, Equatable {
     case hdmi
     case airPlay
+    case bluetooth
     case other
     case none
 }
@@ -111,45 +112,64 @@ public struct AudioRendererFailureDiagnostic: Codable, Sendable, Equatable {
     }
 }
 
+public enum PlaybackAnchorLeadTimePolicy {
+    public static let minimumLeadTime = CMTime(value: 100, timescale: 1_000) // 100ms
+    public static let defaultSafetyMargin = CMTime(value: 100, timescale: 1_000) // 100ms
+
+    public static func compute(
+        outputLatency: TimeInterval,
+        ioBufferDuration: TimeInterval,
+        safetyMargin: CMTime = defaultSafetyMargin
+    ) -> CMTime {
+        let totalLatencySeconds = max(0, outputLatency) + max(0, ioBufferDuration)
+        let latencyCMTime = CMTime(seconds: totalLatencySeconds, preferredTimescale: 1_000)
+        let combined = CMTimeAdd(latencyCMTime, safetyMargin)
+        guard combined.isNumeric else { return minimumLeadTime }
+        return CMTimeCompare(combined, minimumLeadTime) > 0 ? combined : minimumLeadTime
+    }
+}
+
 public struct AudioRenderDiagnostics: Sendable, Equatable {
-    public let automaticFlushTriggerCount: UInt64
-    public let outputConfigurationTriggerCount: UInt64
-    public let routeChangeTriggerCount: UInt64
-    public let recoveryTransactionCount: UInt64
-    public let suppressedCorrelatedTriggerCount: UInt64
-    public let compressedRendererRetryCount: UInt64
-    public let pcmFallbackCount: UInt64
-    public let lastFallbackReason: AudioFallbackReason?
-    public let startupWaitingSeconds: Double
-    public let rendererReady: Bool
-    public let rendererSufficient: Bool
-    public let activeCodec: AudioCodec?
-    public let formatFingerprint: AudioFormatFingerprintDiagnostic?
-    public let outputCategory: AudioDiagnosticOutputCategory
-    public let routeRevision: UInt64
-    public let mediaGeneration: MediaGeneration?
-    public let lastCompressedRendererFailure: AudioRendererFailureDiagnostic?
-    public let acceptedCompressedMediaDurationSeconds: Double
-    public let pendingSampleCount: Int
-    public let rendererRequestArmed: Bool
-    public let rendererBackpressureCount: UInt64
-    public let rendererRequestRearmCount: UInt64
-    public let automaticFlushNoProgressCount: UInt64
-    public let lastAcceptedPTSSeconds: Double?
-    public let lastRendererProgressAgeSeconds: Double?
+    public static let zero = AudioRenderDiagnostics()
+
+    public internal(set) var automaticFlushTriggerCount: UInt64 = 0
+    public internal(set) var outputConfigurationTriggerCount: UInt64 = 0
+    public internal(set) var routeChangeTriggerCount: UInt64 = 0
+    public internal(set) var recoveryTransactionCount: UInt64 = 0
+    public internal(set) var suppressedCorrelatedTriggerCount: UInt64 = 0
+    public internal(set) var compressedRendererRetryCount: UInt64 = 0
+    public internal(set) var pcmFallbackCount: UInt64 = 0
+    public internal(set) var lastFallbackReason: AudioFallbackReason?
+    public internal(set) var startupWaitingSeconds: Double = 0
+    public internal(set) var rendererReady: Bool = false
+    public internal(set) var rendererSufficient: Bool = false
+    public internal(set) var activeCodec: AudioCodec?
+    public internal(set) var formatFingerprint: AudioFormatFingerprintDiagnostic?
+    public internal(set) var outputCategory: AudioDiagnosticOutputCategory = .other
+    public internal(set) var routeRevision: UInt64 = 0
+    public internal(set) var mediaGeneration: MediaGeneration?
+    public internal(set) var lastCompressedRendererFailure: AudioRendererFailureDiagnostic?
+    public internal(set) var acceptedCompressedMediaDurationSeconds: Double = 0
+    public internal(set) var pendingSampleCount: Int = 0
+    public internal(set) var rendererRequestArmed: Bool = false
+    public internal(set) var rendererBackpressureCount: UInt64 = 0
+    public internal(set) var rendererRequestRearmCount: UInt64 = 0
+    public internal(set) var automaticFlushNoProgressCount: UInt64 = 0
+    public internal(set) var lastAcceptedPTSSeconds: Double?
+    public internal(set) var lastRendererProgressAgeSeconds: Double?
 
     public init(
-        automaticFlushTriggerCount: UInt64,
-        outputConfigurationTriggerCount: UInt64,
-        routeChangeTriggerCount: UInt64,
-        recoveryTransactionCount: UInt64,
-        suppressedCorrelatedTriggerCount: UInt64,
-        compressedRendererRetryCount: UInt64,
-        pcmFallbackCount: UInt64,
-        lastFallbackReason: AudioFallbackReason?,
-        startupWaitingSeconds: Double,
-        rendererReady: Bool,
-        rendererSufficient: Bool,
+        automaticFlushTriggerCount: UInt64 = 0,
+        outputConfigurationTriggerCount: UInt64 = 0,
+        routeChangeTriggerCount: UInt64 = 0,
+        recoveryTransactionCount: UInt64 = 0,
+        suppressedCorrelatedTriggerCount: UInt64 = 0,
+        compressedRendererRetryCount: UInt64 = 0,
+        pcmFallbackCount: UInt64 = 0,
+        lastFallbackReason: AudioFallbackReason? = nil,
+        startupWaitingSeconds: Double = 0,
+        rendererReady: Bool = false,
+        rendererSufficient: Bool = false,
         activeCodec: AudioCodec? = nil,
         formatFingerprint: AudioFormatFingerprintDiagnostic? = nil,
         outputCategory: AudioDiagnosticOutputCategory = .other,
@@ -195,20 +215,6 @@ public struct AudioRenderDiagnostics: Sendable, Equatable {
             age.isFinite && age >= 0 ? age : nil
         }
     }
-
-    public static let zero = AudioRenderDiagnostics(
-        automaticFlushTriggerCount: 0,
-        outputConfigurationTriggerCount: 0,
-        routeChangeTriggerCount: 0,
-        recoveryTransactionCount: 0,
-        suppressedCorrelatedTriggerCount: 0,
-        compressedRendererRetryCount: 0,
-        pcmFallbackCount: 0,
-        lastFallbackReason: nil,
-        startupWaitingSeconds: 0,
-        rendererReady: false,
-        rendererSufficient: false
-    )
 }
 
 enum AudioClockMode: Sendable, Equatable {
@@ -216,7 +222,7 @@ enum AudioClockMode: Sendable, Equatable {
     case externallyManaged
 }
 
-enum AudioRenderReadinessChange: Sendable, Equatable {
+public enum AudioRenderReadinessChange: Sendable, Equatable {
     case invalidated
     case available
 }
@@ -224,6 +230,8 @@ enum AudioRenderReadinessChange: Sendable, Equatable {
 public protocol AudioRenderPipelineProtocol: AnyObject {
     var isReadyForPlayback: Bool { get }
     var route: AudioRoute { get }
+    var currentRouteSnapshot: AudioOutputRouteSnapshot? { get }
+    var anchorLeadTime: CMTime { get }
     // Diagnostics: how many times the renderer has been flushed and refilled from
     // the replay buffer. Each recovery is expensive, so a high rate shows up as
     // reduced ingest throughput rather than as an error.
@@ -256,6 +264,16 @@ public extension AudioRenderPipelineProtocol {
 
     var recoveryCount: UInt64 { 0 }
     var diagnostics: AudioRenderDiagnostics { .zero }
+    var currentRouteSnapshot: AudioOutputRouteSnapshot? { nil }
+    var anchorLeadTime: CMTime {
+        if let snapshot = currentRouteSnapshot {
+            return PlaybackAnchorLeadTimePolicy.compute(
+                outputLatency: snapshot.outputLatency,
+                ioBufferDuration: snapshot.ioBufferDuration
+            )
+        }
+        return PlaybackAnchorLeadTimePolicy.minimumLeadTime
+    }
     func setSharedTimelineOpened(_: Bool) {}
 }
 
@@ -324,16 +342,17 @@ protocol PCMAudioDecoderFactory: Sendable {
     ) throws -> any PCMAudioDecoding
 }
 
-enum AudioOutputRouteCategory: Sendable, Equatable {
+public enum AudioOutputRouteCategory: Sendable, Equatable {
     case hdmi
     case airPlay
+    case bluetooth
     case other
     case none
 }
 
-typealias AudioOutputCategory = AudioOutputRouteCategory
+public typealias AudioOutputCategory = AudioOutputRouteCategory
 
-enum AudioRouteChangeReason: Sendable, Equatable {
+public enum AudioRouteChangeReason: Sendable, Equatable {
     case initial
     case newDeviceAvailable
     case oldDeviceUnavailable
@@ -345,13 +364,35 @@ enum AudioRouteChangeReason: Sendable, Equatable {
     case unknown
 }
 
-struct AudioOutputRouteSnapshot: Sendable, Equatable {
-    let category: AudioOutputRouteCategory
-    let reason: AudioRouteChangeReason
-    let revision: UInt64
+public struct AudioOutputRouteSnapshot: Sendable, Equatable {
+    public let category: AudioOutputRouteCategory
+    public let reason: AudioRouteChangeReason
+    public let revision: UInt64
+    public let outputLatency: TimeInterval
+    public let ioBufferDuration: TimeInterval
+
+    public init(
+        category: AudioOutputRouteCategory,
+        reason: AudioRouteChangeReason,
+        revision: UInt64,
+        outputLatency: TimeInterval = 0,
+        ioBufferDuration: TimeInterval = 0
+    ) {
+        self.category = category
+        self.reason = reason
+        self.revision = revision
+        self.outputLatency = outputLatency
+        self.ioBufferDuration = ioBufferDuration
+    }
+
+    public static func == (lhs: AudioOutputRouteSnapshot, rhs: AudioOutputRouteSnapshot) -> Bool {
+        lhs.category == rhs.category
+            && lhs.reason == rhs.reason
+            && lhs.revision == rhs.revision
+    }
 }
 
-protocol AudioRouteMonitoring: AnyObject, Sendable {
+public protocol AudioRouteMonitoring: AnyObject, Sendable {
     func start(_ handler: @escaping @Sendable (AudioOutputRouteSnapshot) -> Void)
     func stop()
 }

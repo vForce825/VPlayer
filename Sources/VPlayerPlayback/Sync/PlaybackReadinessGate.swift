@@ -39,6 +39,7 @@ public final class PlaybackReadinessGate {
     private let hostTimeProvider: () -> CMTime
     private let prepareAnchorVeto: ((CMTime) -> Bool)?
     private var requiredVideoFrameCount = 1
+    private var anchorLeadTime = PlaybackAnchorLeadTimePolicy.minimumLeadTime
     private var audio: AudioSnapshot?
     private var video: VideoSnapshot?
     private var waitingForDisplayModeEnd = false
@@ -104,6 +105,11 @@ public final class PlaybackReadinessGate {
         _ = attemptOpen()
     }
 
+    public func setAnchorLeadTime(_ leadTime: CMTime) {
+        guard leadTime.isNumeric, CMTimeCompare(leadTime, .zero) > 0 else { return }
+        anchorLeadTime = leadTime
+    }
+
     public func setMaximumAnchorLag(_ lag: CMTime) {
         guard lag.isNumeric, CMTimeCompare(lag, .zero) > 0 else { return }
         maximumAnchorLag = lag
@@ -157,7 +163,7 @@ public final class PlaybackReadinessGate {
               !waitingForDisplayModeEnd else { return false }
         let anchorHostTime = CMTimeAdd(
             hostTimeProvider(),
-            CMTime(value: 100, timescale: 1_000)
+            anchorLeadTime
         )
         guard anchorHostTime.isNumeric else { return false }
         clock.anchor(mediaTime: anchorPTS, atHostTime: anchorHostTime, rate: 1)
@@ -278,7 +284,7 @@ public final class PlaybackReadinessGate {
               commonReadyPTS() == commonPTS else { return false }
         let anchorHostTime = CMTimeAdd(
             hostTimeProvider(),
-            CMTime(value: 100, timescale: 1_000)
+            anchorLeadTime
         )
         guard anchorHostTime.isNumeric else { return false }
         clock.anchor(mediaTime: commonPTS, atHostTime: anchorHostTime, rate: 1)

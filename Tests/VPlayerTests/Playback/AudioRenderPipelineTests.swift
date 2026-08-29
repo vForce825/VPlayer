@@ -4980,6 +4980,25 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTFail("condition was not satisfied before timeout")
     }
 
+    func testBluetoothRouteUpdatesDiagnosticOutputCategoryAndAnchorLeadTime() throws {
+        let harness = try makeHarness(initialRouteCategory: .hdmi)
+        XCTAssertEqual(harness.pipeline.diagnostics.outputCategory, .hdmi)
+        XCTAssertEqual(harness.pipeline.anchorLeadTime.seconds, 0.100, accuracy: 0.001)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .bluetooth,
+            reason: .newDeviceAvailable,
+            revision: 1,
+            outputLatency: 0.200,
+            ioBufferDuration: 0.020
+        ))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.diagnostics.outputCategory, .bluetooth)
+        XCTAssertEqual(harness.pipeline.diagnostics.routeRevision, 1)
+        XCTAssertEqual(harness.pipeline.anchorLeadTime.seconds, 0.320, accuracy: 0.001)
+    }
+
     private func assertCoreError(
         _ expected: PlaybackCoreError,
         file: StaticString = #filePath,
