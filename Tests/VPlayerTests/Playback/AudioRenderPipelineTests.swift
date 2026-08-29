@@ -5006,7 +5006,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
 
         XCTAssertFalse(harness.pipeline.isReadyForPlayback)
 
-        for id in 1...10 {
+        for id in 1...15 {
             try perform(on: harness.executor) {
                 try harness.pipeline.enqueue(try self.makeSample(
                     id: UInt64(id),

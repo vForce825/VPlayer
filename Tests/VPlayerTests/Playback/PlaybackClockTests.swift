@@ -548,6 +548,33 @@ final class PlaybackClockTests: XCTestCase {
         )
     }
 
+    func testRenderSynchronizerClockCompensatesAudioOutputLatencyInMediaTime() {
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        var convertedHostTime: CMTime?
+        let clock = RenderSynchronizerClock(
+            synchronizer: synchronizer,
+            currentTime: { .zero },
+            convertHostTime: { hostTime in
+                convertedHostTime = hostTime
+                return hostTime
+            },
+            pause: {},
+            anchor: { _, _, _ in }
+        )
+
+        let hostTime1 = CMTime(value: 10_000, timescale: 1_000)
+        _ = clock.mediaTime(forHostTime: hostTime1)
+        XCTAssertEqual(convertedHostTime, hostTime1)
+
+        clock.setAudioOutputLatency(CMTime(value: 200, timescale: 1_000))
+        _ = clock.mediaTime(forHostTime: hostTime1)
+        XCTAssertEqual(convertedHostTime, CMTime(value: 9_800, timescale: 1_000))
+
+        clock.setAudioOutputLatency(.zero)
+        _ = clock.mediaTime(forHostTime: hostTime1)
+        XCTAssertEqual(convertedHostTime, hostTime1)
+    }
+
     private func time(_ seconds: Int64) -> CMTime {
         CMTime(value: seconds, timescale: 1)
     }

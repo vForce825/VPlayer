@@ -232,6 +232,7 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
     var route: AudioRoute { get }
     var currentRouteSnapshot: AudioOutputRouteSnapshot? { get }
     var anchorLeadTime: CMTime { get }
+    var outputLatency: CMTime { get }
     // Diagnostics: how many times the renderer has been flushed and refilled from
     // the replay buffer. Each recovery is expensive, so a high rate shows up as
     // reduced ingest throughput rather than as an error.
@@ -273,6 +274,13 @@ public extension AudioRenderPipelineProtocol {
             )
         }
         return PlaybackAnchorLeadTimePolicy.minimumLeadTime
+    }
+    var outputLatency: CMTime {
+        if let snapshot = currentRouteSnapshot {
+            let total = max(0, snapshot.outputLatency) + max(0, snapshot.ioBufferDuration)
+            return CMTime(seconds: total, preferredTimescale: 1_000)
+        }
+        return .zero
     }
     func setSharedTimelineOpened(_: Bool) {}
 }
