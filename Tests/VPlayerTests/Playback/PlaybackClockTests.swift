@@ -492,6 +492,62 @@ final class PlaybackClockTests: XCTestCase {
         }
     }
 
+    func testAnchorLeadTimePolicyComputesAccurateLatencyForHDMIAndBluetooth() {
+        let hdmiLeadTime = PlaybackAnchorLeadTimePolicy.compute(
+            outputLatency: 0.015,
+            ioBufferDuration: 0.010
+        )
+        // 25ms + 100ms margin = 125ms
+        XCTAssertEqual(hdmiLeadTime.seconds, 0.125, accuracy: 0.001)
+
+        let bluetoothLeadTime = PlaybackAnchorLeadTimePolicy.compute(
+            outputLatency: 0.200,
+            ioBufferDuration: 0.020
+        )
+        // 220ms + 100ms margin = 320ms
+        XCTAssertEqual(bluetoothLeadTime.seconds, 0.320, accuracy: 0.001)
+
+        let airPlayLeadTime = PlaybackAnchorLeadTimePolicy.compute(
+            outputLatency: 0.500,
+            ioBufferDuration: 0.050
+        )
+        // 550ms + 100ms margin = 650ms
+        XCTAssertEqual(airPlayLeadTime.seconds, 0.650, accuracy: 0.001)
+
+        let zeroLeadTime = PlaybackAnchorLeadTimePolicy.compute(
+            outputLatency: 0,
+            ioBufferDuration: 0
+        )
+        XCTAssertEqual(zeroLeadTime.seconds, 0.100, accuracy: 0.001)
+    }
+
+    func testPlaybackReadinessGateUsesConfiguredAnchorLeadTime() {
+        let clock = FakePlaybackClock()
+        let currentHostTime = CMTime(value: 1_000, timescale: 1_000)
+        let gate = PlaybackReadinessGate(
+            clock: clock,
+            hostTime: { currentHostTime },
+            prepareAnchorVeto: nil
+        )
+        gate.configure(requiredVideoFrameCount: 1)
+        let customLeadTime = CMTime(value: 350, timescale: 1_000)
+        gate.setAnchorLeadTime(customLeadTime)
+
+        gate.updateVideo(frames: frames(firstPTS: .zero, count: 1))
+        gate.updateAudio(
+            firstPTS: .zero,
+            contiguousDuration: CMTime(value: 1, timescale: 25),
+            isContiguous: true
+        )
+
+        XCTAssertTrue(gate.isOpen)
+        XCTAssertEqual(clock.anchors.count, 1)
+        XCTAssertEqual(
+            clock.anchors.first?.hostTime,
+            CMTime(value: 1_350, timescale: 1_000)
+        )
+    }
+
     private func time(_ seconds: Int64) -> CMTime {
         CMTime(value: seconds, timescale: 1)
     }
