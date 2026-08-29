@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AudioToolbox
 import CoreMedia
 import Foundation
 import XCTest
@@ -527,7 +528,10 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         let initialExpected = try MediaFormatFingerprint(
             trackSet: initialTracks,
             videoParameterSets: initialParameterSets,
-            audioCookie: initialCookie
+            audioSystemFormat: audioSystemFingerprintComponent(
+                descriptor: initialAudio,
+                magicCookie: initialCookie
+            )
         )
         XCTAssertEqual(videoEvents.compactMap(\.formatFingerprint).last, initialExpected)
         XCTAssertEqual(audioEvents.compactMap(\.formatFingerprint).last, initialExpected)
@@ -565,7 +569,10 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         let resetExpected = try MediaFormatFingerprint(
             trackSet: resetTracks,
             videoParameterSets: resetParameterSets,
-            audioCookie: resetCookie
+            audioSystemFormat: audioSystemFingerprintComponent(
+                descriptor: resetAudio,
+                magicCookie: resetCookie
+            )
         )
         XCTAssertEqual(videoEvents.compactMap(\.formatFingerprint).last, resetExpected)
         XCTAssertEqual(audioEvents.compactMap(\.formatFingerprint).last, resetExpected)
@@ -586,6 +593,27 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         let first = try XCTUnwrap(attachments.firstObject as? NSDictionary)
         return (first[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false
     }
+
+    private func audioSystemFingerprintComponent(
+        descriptor: AudioTrackDescriptor,
+        magicCookie: Data
+    ) -> AudioSystemFormatFingerprintComponent {
+        let layout: CoreAudioLayoutSpec
+        if let nativeMask = descriptor.channelLayout.nativeMask {
+            layout = .bitmap(AudioChannelBitmap(rawValue: UInt32(nativeMask)))
+        } else {
+            layout = .discrete(UInt32(descriptor.channelLayout.channelCount))
+        }
+        return AudioSystemFormatFingerprintComponent(
+            profileID: .aacLC,
+            formatID: kAudioFormatMPEG4AAC,
+            sampleRate: descriptor.sampleRate,
+            channelCount: descriptor.channelLayout.channelCount,
+            framesPerPacket: 1_024,
+            layout: layout,
+            magicCookie: magicCookie
+        )
+    }
 }
 
 private extension VideoAssemblerEvent {
@@ -602,7 +630,7 @@ private extension VideoAssemblerEvent {
 
 private extension AudioAssemblerEvent {
     var formatFingerprint: MediaFormatFingerprint? {
-        guard case let .format(_, _, value) = self else { return nil }
-        return value
+        guard case let .format(configuration) = self else { return nil }
+        return configuration.fingerprint
     }
 }

@@ -102,6 +102,56 @@ enum AssemblerTestFixtures {
     ])
     static let hevcPPS = Data([0x44, 0x01, 0xC0, 0xF1, 0x83, 0x24])
 
+    static func syntheticAC3Frame(
+        fscod: UInt8 = 0,
+        frmsizecod: UInt8 = 20,
+        bsid: UInt8 = 8,
+        bsmod: UInt8 = 0,
+        acmod: UInt8 = 2,
+        lfeon: Bool = false
+    ) -> Data {
+        precondition(fscod < 3)
+        precondition(frmsizecod < 38)
+        precondition(bsid < 32)
+        precondition(bsmod < 8)
+        precondition(acmod < 8)
+
+        let frameSizeWords: [[Int]] = [
+            [64, 69, 96], [64, 70, 96], [80, 87, 120], [80, 88, 120],
+            [96, 104, 144], [96, 105, 144], [112, 121, 168], [112, 122, 168],
+            [128, 139, 192], [128, 140, 192], [160, 174, 240], [160, 175, 240],
+            [192, 208, 288], [192, 209, 288], [224, 243, 336], [224, 244, 336],
+            [256, 278, 384], [256, 279, 384], [320, 348, 480], [320, 349, 480],
+            [384, 417, 576], [384, 418, 576], [448, 487, 672], [448, 488, 672],
+            [512, 557, 768], [512, 558, 768], [640, 696, 960], [640, 697, 960],
+            [768, 835, 1_152], [768, 836, 1_152], [896, 975, 1_344],
+            [896, 976, 1_344], [1_024, 1_114, 1_536], [1_024, 1_115, 1_536],
+            [1_152, 1_253, 1_728], [1_152, 1_254, 1_728], [1_280, 1_393, 1_920],
+            [1_280, 1_394, 1_920],
+        ]
+        var writer = SyntheticAC3BitWriter(
+            byteCount: frameSizeWords[Int(frmsizecod)][Int(fscod)] * 2
+        )
+        writer.write(0x0B77, bitCount: 16)
+        writer.write(0, bitCount: 16) // CRC field; the full-frame patch is written below.
+        writer.write(UInt32(fscod), bitCount: 2)
+        writer.write(UInt32(frmsizecod), bitCount: 6)
+        writer.write(UInt32(bsid), bitCount: 5)
+        writer.write(UInt32(bsmod), bitCount: 3)
+        writer.write(UInt32(acmod), bitCount: 3)
+        if acmod & 1 != 0, acmod != 1 {
+            writer.write(0b10, bitCount: 2) // cmixlev
+        }
+        if acmod & 4 != 0 {
+            writer.write(0b01, bitCount: 2) // surmixlev
+        }
+        if acmod == 2 {
+            writer.write(0b10, bitCount: 2) // dsurmod
+        }
+        writer.write(lfeon ? 1 : 0, bitCount: 1)
+        return writer.dataPatchingANSI16Remainder()
+    }
+
     static func h264AccessUnit(
         sps: Data? = h264SPS,
         pps: Data? = h264PPS,
@@ -229,7 +279,8 @@ enum AssemblerTestFixtures {
         streamIndex: Int32 = 1,
         codec: AudioCodec,
         pts: CMTime = CMTime(value: 90_000, timescale: 90_000),
-        duration: CMTime = .invalid
+        duration: CMTime = .invalid,
+        isCorrupt: Bool = false
     ) -> DemuxPacket {
         DemuxPacket(
             streamIndex: streamIndex,
@@ -239,8 +290,37 @@ enum AssemblerTestFixtures {
             decodeTimeStamp: .invalid,
             duration: duration,
             isKey: false,
-            isCorrupt: false
+            isCorrupt: isCorrupt
         )
+    }
+
+    static func syntheticMPEGFrame(codec: AudioCodec) -> Data {
+        let facts: (version: UInt32, layer: UInt32, bitrateIndex: UInt32,
+                    sampleRateIndex: UInt32, frameLength: Int)
+        switch codec {
+        case .mp1:
+            facts = (3, 3, 9, 1, 288)
+        case .mp2:
+            facts = (3, 2, 9, 1, 480)
+        case .mp3:
+            facts = (3, 1, 9, 1, 384)
+        default:
+            preconditionFailure("synthetic MPEG fixture requires MP1, MP2, or MP3")
+        }
+        let header = UInt32(0x7FF) << 21
+            | facts.version << 19
+            | facts.layer << 17
+            | 1 << 16
+            | facts.bitrateIndex << 12
+            | facts.sampleRateIndex << 10
+        var result = Data([
+            UInt8((header >> 24) & 0xFF),
+            UInt8((header >> 16) & 0xFF),
+            UInt8((header >> 8) & 0xFF),
+            UInt8(header & 0xFF),
+        ])
+        result.append(Data(repeating: 0xA5, count: facts.frameLength - 4))
+        return result
     }
 
     static func parsedVideoFrame(
@@ -297,6 +377,54 @@ enum AssemblerTestFixtures {
             frameSamples: frameSamples,
             channelLayout: AudioChannelLayout(channelCount: channels, nativeMask: nativeMask)
         )
+    }
+}
+
+private struct SyntheticAC3BitWriter {
+    private(set) var data: Data
+    private var bitOffset = 0
+
+    init(byteCount: Int) {
+        data = Data(repeating: 0, count: byteCount)
+    }
+
+    mutating func write(_ value: UInt32, bitCount: Int) {
+        precondition((0...32).contains(bitCount))
+        for shift in stride(from: bitCount - 1, through: 0, by: -1) {
+            let bit = UInt8((value >> UInt32(shift)) & 1)
+            let byteIndex = bitOffset / 8
+            let bitIndex = 7 - bitOffset % 8
+            data[byteIndex] |= bit << UInt8(bitIndex)
+            bitOffset += 1
+        }
+    }
+
+    func dataPatchingANSI16Remainder() -> Data {
+        precondition(data.count >= 4)
+        var result = data
+        let patchIndex = result.count - 2
+        let prefixCRC = result[2..<patchIndex].reduce(UInt16(0)) {
+            Self.updateANSI16($0, byte: $1)
+        }
+        for patch in UInt32(0)...UInt32(UInt16.max) {
+            let high = UInt8((patch >> 8) & 0xFF)
+            let low = UInt8(patch & 0xFF)
+            let afterHigh = Self.updateANSI16(prefixCRC, byte: high)
+            if Self.updateANSI16(afterHigh, byte: low) == 0 {
+                result[patchIndex] = high
+                result[patchIndex + 1] = low
+                return result
+            }
+        }
+        preconditionFailure("ANSI-16 patch was not found")
+    }
+
+    private static func updateANSI16(_ crc: UInt16, byte: UInt8) -> UInt16 {
+        var result = crc ^ (UInt16(byte) << 8)
+        for _ in 0..<8 {
+            result = result & 0x8000 != 0 ? (result << 1) ^ 0x8005 : result << 1
+        }
+        return result
     }
 }
 

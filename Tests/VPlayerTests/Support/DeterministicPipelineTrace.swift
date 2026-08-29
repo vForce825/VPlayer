@@ -466,13 +466,16 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         let initialFingerprint = try MediaFormatFingerprint(
             trackSet: initialTracks,
             videoParameterSets: [initialSPS, pps],
-            audioCookie: initialCookie
+            audioSystemFormat: PlaybackFakeMedia.audioSystemFingerprintComponent(
+                magicCookie: initialCookie
+            )
         )
         demuxer.emit(.tracks(initialTracks))
         pipeline.receive(audio: .format(
-            try PlaybackFakeMedia.audioFormat(),
-            .aac,
-            initialFingerprint
+            try PlaybackFakeMedia.audioConfiguration(
+                fingerprint: initialFingerprint,
+                decoderExtradata: initialCookie
+            )
         ))
         pipeline.receive(video: .format(trace.formatDescription, initialFingerprint))
         try await waitUntil {
@@ -499,7 +502,9 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         let changedSPSFingerprint = try MediaFormatFingerprint(
             trackSet: initialTracks,
             videoParameterSets: [changedSPS, pps],
-            audioCookie: initialCookie
+            audioSystemFormat: PlaybackFakeMedia.audioSystemFingerprintComponent(
+                magicCookie: initialCookie
+            )
         )
         let spsBoundaryEventOffset = yadif.eventCount
         pipeline.receive(video: .format(trace.formatDescription, changedSPSFingerprint))
@@ -525,14 +530,17 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         let changedPMTFingerprint = try MediaFormatFingerprint(
             trackSet: changedTracks,
             videoParameterSets: [changedSPS, pps],
-            audioCookie: changedCookie
+            audioSystemFormat: PlaybackFakeMedia.audioSystemFingerprintComponent(
+                magicCookie: changedCookie
+            )
         )
         let pmtBoundaryEventOffset = yadif.eventCount
         demuxer.emit(.tracks(changedTracks))
         pipeline.receive(audio: .format(
-            try PlaybackFakeMedia.audioFormat(),
-            .aac,
-            changedPMTFingerprint
+            try PlaybackFakeMedia.audioConfiguration(
+                fingerprint: changedPMTFingerprint,
+                decoderExtradata: changedCookie
+            )
         ))
         pipeline.receive(video: .format(trace.formatDescription, changedPMTFingerprint))
         try await waitUntil {
@@ -550,16 +558,17 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         )
 
         let discontinuityBoundaryEventOffset = yadif.eventCount
-        demuxer.emit(.discontinuity(changedTracks))
+        demuxer.emit(.discontinuity(changedTracks, reason: .timelineReset))
         try await waitUntil {
             await pipeline.debugSnapshot().generation.rawValue
                 == pmtGeneration.rawValue + 1
         }
         let discontinuityGeneration = await pipeline.debugSnapshot().generation
         pipeline.receive(audio: .format(
-            try PlaybackFakeMedia.audioFormat(),
-            .aac,
-            changedPMTFingerprint
+            try PlaybackFakeMedia.audioConfiguration(
+                fingerprint: changedPMTFingerprint,
+                decoderExtradata: changedCookie
+            )
         ))
         pipeline.receive(video: .format(trace.formatDescription, changedPMTFingerprint))
         _ = await pipeline.debugSnapshot()
@@ -663,7 +672,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         let audioPTS = trace.frames.first?.parserMetadata.sourcePTS90k.map {
             CMTime(value: Int64($0), timescale: 90_000)
         } ?? .zero
-        pipeline.receive(audio: .sample(try PlaybackFakeMedia.audioSample(
+        pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
             id: accessUnitIDOffset + 1,
             generation: generation,
             pts: audioPTS,

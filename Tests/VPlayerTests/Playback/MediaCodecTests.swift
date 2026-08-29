@@ -14,6 +14,8 @@ final class MediaCodecTests: XCTestCase {
         XCTAssertEqual(AudioCodec.ac3.rawValue, 2)
         XCTAssertEqual(AudioCodec.eac3.rawValue, 3)
         XCTAssertEqual(AudioCodec.mp2.rawValue, 4)
+        XCTAssertEqual(AudioCodec.mp1.rawValue, 5)
+        XCTAssertEqual(AudioCodec.mp3.rawValue, 6)
 
         XCTAssertEqual(MediaCodec.video(.h264), .video(.h264))
         XCTAssertEqual(MediaCodec.audio(.eac3), .audio(.eac3))

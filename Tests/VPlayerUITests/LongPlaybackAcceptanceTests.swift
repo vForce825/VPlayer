@@ -935,6 +935,32 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         XCTAssertGreaterThan(current.presentedVideoFrames, previous.presentedVideoFrames)
         XCTAssertEqual(current.presentationPTSRegressionCount, 0)
         XCTAssertEqual(current.videoResyncCount, previous.videoResyncCount)
+        XCTAssertEqual(current.audioContinuityDropCountsByReason.count, 5)
+        XCTAssertEqual(previous.audioContinuityDropCountsByReason.count, 5)
+        for index in 0..<5 {
+            XCTAssertGreaterThanOrEqual(
+                current.audioContinuityDropCountsByReason[index],
+                previous.audioContinuityDropCountsByReason[index]
+            )
+        }
+        XCTAssertGreaterThanOrEqual(current.audioShortGapCount, previous.audioShortGapCount)
+        XCTAssertGreaterThanOrEqual(current.audioLargeGapCount, previous.audioLargeGapCount)
+        XCTAssertGreaterThanOrEqual(
+            current.audioContinuityIslandSwitchCount,
+            previous.audioContinuityIslandSwitchCount
+        )
+        XCTAssertGreaterThanOrEqual(
+            current.audioRendererBackpressureCount,
+            previous.audioRendererBackpressureCount
+        )
+        XCTAssertGreaterThanOrEqual(
+            current.audioRendererRequestRearmCount,
+            previous.audioRendererRequestRearmCount
+        )
+        XCTAssertGreaterThanOrEqual(
+            current.audioAutomaticFlushNoProgressCount,
+            previous.audioAutomaticFlushNoProgressCount
+        )
 
         let bufferingIndex = 1
         let previousBufferingCloses = previous.readinessCloseReasonCounts.indices.contains(
@@ -1091,6 +1117,16 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
         XCTAssertEqual(snapshot.presentationPTSRegressionCount, 0)
         XCTAssertGreaterThan(snapshot.presentedVideoFrames, 0)
+        XCTAssertEqual(snapshot.audioContinuityDropCountsByReason.count, 5)
+        XCTAssertGreaterThanOrEqual(snapshot.audioPendingSampleCount, 0)
+        XCTAssertLessThanOrEqual(snapshot.audioPendingSampleCount, 1_120)
+        if let lastAcceptedPTSSeconds = snapshot.audioLastAcceptedPTSSeconds {
+            XCTAssertTrue(lastAcceptedPTSSeconds.isFinite)
+        }
+        if let progressAgeSeconds = snapshot.audioLastRendererProgressAgeSeconds {
+            XCTAssertTrue(progressAgeSeconds.isFinite)
+            XCTAssertGreaterThanOrEqual(progressAgeSeconds, 0)
+        }
         if snapshot.elapsedSeconds >= 60 {
             XCTAssertGreaterThanOrEqual(snapshot.windowDurationSeconds, 55)
             XCTAssertLessThanOrEqual(snapshot.windowDurationSeconds, 60.5)
@@ -1662,6 +1698,17 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let clockTimeSeconds: Double?
     let videoResyncCount: UInt64
     let audioRecoveryCount: UInt64
+    let audioPendingSampleCount: Int
+    let audioRendererRequestArmed: Bool
+    let audioRendererBackpressureCount: UInt64
+    let audioRendererRequestRearmCount: UInt64
+    let audioAutomaticFlushNoProgressCount: UInt64
+    let audioLastAcceptedPTSSeconds: Double?
+    let audioLastRendererProgressAgeSeconds: Double?
+    let audioContinuityDropCountsByReason: [UInt64]
+    let audioShortGapCount: UInt64
+    let audioLargeGapCount: UInt64
+    let audioContinuityIslandSwitchCount: UInt64
     let renderTickCount: UInt64
     let renderSkippedInFlightCount: UInt64
     let displayLinkCallbackCount: UInt64

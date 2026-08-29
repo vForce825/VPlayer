@@ -9,6 +9,24 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class FFmpegDemuxerTests: XCTestCase {
+    func testDemuxDiscontinuityRequiresExplicitTypedReasonWithoutDefault() throws {
+        let source = try repositorySource("Sources/VPlayerPlayback/Demux/DemuxTypes.swift")
+        XCTAssertNotNil(
+            source.range(
+                of: #"case\s+discontinuity\s*\(\s*DemuxTrackSet\s*,\s*reason\s*:\s*DemuxDiscontinuityReason\s*\)"#,
+                options: .regularExpression
+            ),
+            "the discontinuity case must retain its typed reason parameter"
+        )
+        XCTAssertNil(
+            source.range(
+                of: #"reason\s*:\s*DemuxDiscontinuityReason\s*="#,
+                options: .regularExpression
+            ),
+            "a default reason silently restores the untyped migration entrance"
+        )
+    }
+
 #if DEBUG
     func testBootstrapPacketLimitAccepts64AndRejects65WithoutLeaking() {
         let accepted = runBootstrapDebugScenario(VPFF_BOOTSTRAP_DEBUG_PACKET_LIMIT_EXACT)
@@ -92,6 +110,16 @@ final class FFmpegDemuxerTests: XCTestCase {
             XCTAssertEqual(bridge.urlBytes, Data(url.absoluteString.utf8))
             XCTAssertEqual(bridge.timeoutUS, 30_000_000)
         }
+    }
+
+    private func repositorySource(_ relativePath: String) throws -> String {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(relativePath)
+        return String(decoding: try Data(contentsOf: sourceURL), as: UTF8.self)
     }
 
     func testRejectsEveryNonHTTPTopLevelSchemeBeforeCreatingBridge() throws {
@@ -242,6 +270,8 @@ final class FFmpegDemuxerTests: XCTestCase {
     }
 
     func testMapsEverySupportedCodecAndPreservesNegativeAndInvalidTimes() throws {
+        XCTAssertEqual(VPFF_CODEC_MP1.rawValue, 7)
+        XCTAssertEqual(VPFF_CODEC_MP3.rawValue, 8)
         let specs: [(VPFFCodec, MediaCodec)] = [
             (VPFF_CODEC_H264, .video(.h264)),
             (VPFF_CODEC_HEVC, .video(.hevc)),
@@ -249,6 +279,8 @@ final class FFmpegDemuxerTests: XCTestCase {
             (VPFF_CODEC_AC3, .audio(.ac3)),
             (VPFF_CODEC_EAC3, .audio(.eac3)),
             (VPFF_CODEC_MP2, .audio(.mp2)),
+            (VPFF_CODEC_MP1, .audio(.mp1)),
+            (VPFF_CODEC_MP3, .audio(.mp3)),
         ]
         let bridge = FakeFFmpegDemuxBridge { handle in
             for (index, entry) in specs.enumerated() {
@@ -271,6 +303,12 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertTrue(packets.allSatisfy { $0.presentationTimeStamp == CMTime(value: -1_001, timescale: 30_000) })
         XCTAssertTrue(packets.allSatisfy { !$0.decodeTimeStamp.isValid })
         XCTAssertTrue(packets.allSatisfy { !$0.duration.isValid })
+
+        let unsupported = FakeFFmpegDemuxBridge { handle in
+            handle.emitTracks(audio: .unsupportedAudio)
+            return 0
+        }
+        XCTAssertEqual(try run(bridge: unsupported).last, .failure(.unsupportedAudioCodec))
     }
 
     func testUnsupportedCodecCustomAndAmbisonicLayoutsBecomePreciseTerminalFailures() throws {
@@ -532,13 +570,15 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertEqual(bridge.createCount, 0)
     }
 
-    func testChangedDiscontinuityPrecedesPacketAndIdenticalSignatureIsIgnored() throws {
+    func testIdenticalTimelineDiscontinuityIsDeliveredBeforePacket() throws {
         let first = RawTrackSpec.h264(width: 1_920, extradata: Data([1]))
-        let changed = RawTrackSpec.h264(width: 1_280, extradata: Data([2]))
         let bridge = FakeFFmpegDemuxBridge { handle in
             handle.emitTracks(video: first)
-            handle.emitTracks(video: first, kind: VPFF_EVENT_DISCONTINUITY)
-            handle.emitTracks(video: changed, kind: VPFF_EVENT_DISCONTINUITY)
+            handle.emitTracks(
+                video: first,
+                kind: VPFF_EVENT_DISCONTINUITY,
+                discontinuityReason: VPFF_DISCONTINUITY_TIMELINE_RESET
+            )
             handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([9])))
             handle.emitTerminal(VPFF_EVENT_END)
             return 0
@@ -546,10 +586,91 @@ final class FFmpegDemuxerTests: XCTestCase {
 
         let events = try run(bridge: bridge)
         XCTAssertEqual(events.count, 4)
-        guard case .tracks = events[0], case .discontinuity = events[1], case .packet = events[2] else {
-            return XCTFail("expected tracks, changed discontinuity, packet")
+        guard case .tracks = events[0],
+              case let .discontinuity(tracks, reason) = events[1],
+              case .packet = events[2] else {
+            return XCTFail("expected tracks, timeline discontinuity, packet")
         }
+        XCTAssertEqual(tracks.video?.width, 1_920)
+        XCTAssertEqual(reason, .timelineReset)
         XCTAssertEqual(events[3], .endOfStream)
+    }
+
+    func testFormatChangeDiscontinuityCarriesExplicitReason() throws {
+        let changed = RawTrackSpec.h264(width: 1_280, extradata: Data([2]))
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitTracks(video: RawTrackSpec.h264())
+            handle.emitTracks(
+                video: changed,
+                kind: VPFF_EVENT_DISCONTINUITY,
+                discontinuityReason: VPFF_DISCONTINUITY_FORMAT_CHANGE
+            )
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+
+        let events = try run(bridge: bridge)
+        guard case let .discontinuity(tracks, reason) = events.dropFirst().first else {
+            return XCTFail("expected a format-change discontinuity")
+        }
+        XCTAssertEqual(tracks.video?.width, 1_280)
+        XCTAssertEqual(reason, .formatChange)
+    }
+
+    func testMissingOrUnknownDiscontinuityReasonIsMalformed() throws {
+        for (label, reason) in [
+            ("missing", VPFF_DISCONTINUITY_NONE),
+            ("unknown", VPFFDemuxDiscontinuityReason(rawValue: 99)),
+        ] {
+            let bridge = FakeFFmpegDemuxBridge { handle in
+                handle.emitTracks(
+                    video: .h264(),
+                    kind: VPFF_EVENT_DISCONTINUITY,
+                    discontinuityReason: reason
+                )
+                return 0
+            }
+
+            XCTAssertEqual(
+                try run(bridge: bridge).last,
+                .failure(.demuxRead(FFmpegDemuxer.malformedEventErrorCode)),
+                label
+            )
+            XCTAssertEqual(waitForDestroy(bridge.handle), 1, label)
+            XCTAssertEqual(bridge.handle?.cancelCount, 1, label)
+        }
+    }
+
+    func testNonDiscontinuityEventIgnoresUnknownDiscontinuityReason() throws {
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitTracks(
+                video: .h264(),
+                discontinuityReason: VPFFDemuxDiscontinuityReason(rawValue: 99)
+            )
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+
+        let events = try run(bridge: bridge)
+        guard case .tracks = events.first else { return XCTFail("expected tracks") }
+        XCTAssertEqual(events.last, .endOfStream)
+    }
+
+    func testNativeDemuxABIValuesAndAppendOnlyEventLayoutAreStable() {
+        XCTAssertEqual(VPFF_DISCONTINUITY_NONE.rawValue, 0)
+        XCTAssertEqual(VPFF_DISCONTINUITY_FORMAT_CHANGE.rawValue, 1)
+        XCTAssertEqual(VPFF_DISCONTINUITY_TIMELINE_RESET.rawValue, 2)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.kind), 0)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.has_program_id), 4)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.selected_program_id), 8)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.video), 16)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.audio), 96)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.packet), 176)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.error_kind), 240)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.error_stage), 244)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.ffmpeg_error), 248)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.discontinuity_reason), 252)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.size, 256)
     }
 
     func testCapacityFourBlocksFifthProducerUntilOneEventIsConsumed() throws {

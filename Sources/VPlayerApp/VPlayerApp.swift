@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
-import AVFoundation
 import OSLog
 import SwiftUI
 import VPlayerPlayback
@@ -233,22 +232,8 @@ struct VPlayerApp: App {
     private let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
 
     init() {
-        do {
-            #if os(iOS)
-            try AVAudioSession.sharedInstance().setCategory(
-                .playback,
-                mode: .moviePlayback,
-                policy: .longFormVideo
-            )
-            #else
-            try AVAudioSession.sharedInstance().setCategory(
-                .playback,
-                mode: .moviePlayback
-            )
-            #endif
-        } catch {
-            launchLogger.error("Failed to configure AVAudioSession: \(error, privacy: .public)")
-        }
+        let audioSessionConfigurator = SystemAudioSessionConfigurator()
+        audioSessionConfigurator.configureOnce()
 
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)
         if configuration.resetsPlaybackSettings {

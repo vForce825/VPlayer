@@ -55,6 +55,12 @@ struct VideoPipelineCoordinatorHooks: Sendable {
 }
 
 final class VideoPipelineCoordinator: @unchecked Sendable {
+    private struct ProcessingAdmissionFloor: Sendable {
+        let generation: MediaGeneration
+        let minimumAccessUnitID: UInt64
+        let minimumOutputPTS: CMTime
+    }
+
     private static let maximumClassificationProbeAttempts = 3
     private static let maximumDecoderSessionRestarts = 4
     // A healthy stream produces at most a short burst of undecodable access
@@ -83,6 +89,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var decoderConfigured = false
     private var waitingForRandomAccess = true
     private var routeEpoch: UInt64 = 0
+    private var processingAdmissionFloor: ProcessingAdmissionFloor?
     // Decode failures since the last frame that actually decoded.
     private var consecutiveDecoderSessionFailures = 0
     private var consecutivePerFrameDecodeFailures = 0
@@ -153,6 +160,21 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         waitingForRandomAccess = true
     }
 
+    func installProcessingAdmissionFloor(
+        generation: MediaGeneration,
+        minimumAccessUnitID: UInt64,
+        minimumOutputPTS: CMTime
+    ) {
+        guard !stopped,
+              generation == self.generation,
+              minimumOutputPTS.isNumeric else { return }
+        processingAdmissionFloor = ProcessingAdmissionFloor(
+            generation: generation,
+            minimumAccessUnitID: minimumAccessUnitID,
+            minimumOutputPTS: minimumOutputPTS
+        )
+    }
+
     private func performTrueFormatChange(
         format: CMVideoFormatDescription?,
         reopenAdmission: Bool
@@ -165,6 +187,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
 
         let oldGeneration = generation
         generation = hooks.advanceGeneration()
+        processingAdmissionFloor = nil
         routeEpoch &+= 1
         route = .rawWhileClassifying
         metrics?.update(scanType: .unknown)
@@ -303,6 +326,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     func stop(emergency: Bool) {
         guard !stopped else { return }
         stopped = true
+        processingAdmissionFloor = nil
         hooks.closeAdmission()
         if emergency {
             let oldGeneration = generation
@@ -485,6 +509,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         hooks.closeAdmission()
         let oldGeneration = generation
         generation = hooks.advanceGeneration()
+        processingAdmissionFloor = nil
         routeEpoch &+= 1
         classifier.rebasePreservingClassification(generation: generation)
         normalizer.reset(generation: generation)
@@ -606,6 +631,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private func process(_ normalized: NormalizedDecodedFrame) {
         let submittedGeneration = generation
         let submittedEpoch = routeEpoch
+        let submittedAccessUnitID = normalized.frame.accessUnitID
         let completion: @Sendable (
             Result<[VideoPresentationFrame], PlaybackFailure>
         ) -> Void = { [weak self] result in
@@ -618,9 +644,29 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                     self?.metrics?.recordStaleGenerationDrop()
                     return
                 }
+                if let floor = processingAdmissionFloor {
+                    guard floor.generation == submittedGeneration,
+                          submittedAccessUnitID >= floor.minimumAccessUnitID else {
+                        return
+                    }
+                }
                 switch result {
                 case let .success(frames):
-                    hooks.deliver(frames, submittedGeneration)
+                    let admittedFrames: [VideoPresentationFrame]
+                    if let floor = processingAdmissionFloor {
+                        admittedFrames = frames.filter { frame in
+                            frame.generation == floor.generation
+                                && frame.sourceAccessUnitID >= floor.minimumAccessUnitID
+                                && frame.presentationTimeStamp.isNumeric
+                                && CMTimeCompare(
+                                    frame.presentationTimeStamp,
+                                    floor.minimumOutputPTS
+                                ) >= 0
+                        }
+                    } else {
+                        admittedFrames = frames
+                    }
+                    hooks.deliver(admittedFrames, submittedGeneration)
                 case .failure:
                     metrics?.recordVideoDrop(source: .deinterlaceFailure)
                     hooks.deliver([], submittedGeneration)

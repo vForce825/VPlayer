@@ -14,13 +14,14 @@ public struct PlaybackReadinessVideoFrame: Sendable, Equatable {
     }
 }
 
-public enum PlaybackReadinessCloseReason: UInt8, Sendable, Equatable {
+public enum PlaybackReadinessCloseReason: UInt8, Sendable, Equatable, CaseIterable {
     case flush
     case buffering
     case pause
     case discontinuity
     case audioReplacement
     case displayModeSwitch
+    case audioGap
 }
 
 public final class PlaybackReadinessGate {
@@ -51,7 +52,10 @@ public final class PlaybackReadinessGate {
     private(set) var minimumRecoveryAnchorPTS: CMTime?
     // Diagnostics only: indexed by `PlaybackReadinessCloseReason.rawValue`, so a
     // flapping gate can be attributed to the caller that keeps closing it.
-    public private(set) var closeReasonCounts = [UInt64](repeating: 0, count: 6)
+    public private(set) var closeReasonCounts = [UInt64](
+        repeating: 0,
+        count: PlaybackReadinessCloseReason.allCases.count
+    )
 
     public convenience init(
         clock: PlaybackClock,
@@ -141,7 +145,6 @@ public final class PlaybackReadinessGate {
             guard let audio else { return false }
             let audioEnd = CMTimeAdd(audio.firstPTS, audio.contiguousDuration)
             guard audioEnd.isNumeric,
-                  CMTimeCompare(audio.firstPTS, floor) <= 0,
                   CMTimeCompare(floor, audioEnd) < 0 else { return false }
             anchorPTS = CMTimeCompare(firstPTS, floor) >= 0 ? firstPTS : floor
         } else {

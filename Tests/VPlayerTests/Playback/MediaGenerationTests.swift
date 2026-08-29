@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AudioToolbox
 import Foundation
 import XCTest
 @testable import VPlayerPlayback
 
 final class MediaGenerationTests: XCTestCase {
-    private let goldenDigest = "aa072b85a84b6bf1a5856da25e7838ab9630789444302a0bec21dc2b954b91fe"
+    private let goldenDigest = "a0b86f7c76740f34d58690118aa3b1f9c4ae618bae65b1ad66af1cad25b1b7f5"
 
     func testGenerationChangesOnlyForChangedFingerprintAndRejectsStaleWork() {
         var subject = GenerationController()
@@ -87,13 +88,37 @@ final class MediaGenerationTests: XCTestCase {
             try makeFingerprint(audio: makeAudio(nativeMask: nil, timeBase: timeBase)),
             try makeFingerprint(audio: makeAudio(nativeMask: 4, timeBase: timeBase)),
             try makeFingerprint(audio: makeAudio(extradata: Data([0x12, 0x11]), timeBase: timeBase)),
-            try makeFingerprint(cookie: nil),
-            try makeFingerprint(cookie: Data([0])),
+            try makeFingerprint(systemFormat: .some(nil)),
         ]
 
         for variant in variants {
             XCTAssertNotEqual(variant, base)
         }
+    }
+
+    func testEverySystemAudioFormatFieldChangesFingerprint() throws {
+        let base = try makeFingerprint()
+        let variants = [
+            try makeFingerprint(systemFormat: makeSystemFormat(profileID: .heAACv1)),
+            try makeFingerprint(systemFormat: makeSystemFormat(formatID: kAudioFormatMPEG4AAC_HE)),
+            try makeFingerprint(systemFormat: makeSystemFormat(sampleRate: 44_100)),
+            try makeFingerprint(systemFormat: makeSystemFormat(channelCount: 1)),
+            try makeFingerprint(systemFormat: makeSystemFormat(framesPerPacket: 2_048)),
+            try makeFingerprint(systemFormat: makeSystemFormat(layout: .discrete(2))),
+            try makeFingerprint(systemFormat: makeSystemFormat(
+                layout: .tag(
+                    kAudioChannelLayoutTag_Stereo,
+                    equivalentBitmap: AudioChannelBitmap(rawValue: 3)
+                )
+            )),
+            try makeFingerprint(systemFormat: makeSystemFormat(
+                layout: .bitmap(AudioChannelBitmap(rawValue: 5))
+            )),
+            try makeFingerprint(systemFormat: makeSystemFormat(magicCookie: nil)),
+            try makeFingerprint(systemFormat: makeSystemFormat(magicCookie: Data([0]))),
+        ]
+
+        for variant in variants { XCTAssertNotEqual(variant, base) }
     }
 
     func testParameterSetOrderAndLengthPrefixesAreUnambiguous() throws {
@@ -107,7 +132,10 @@ final class MediaGenerationTests: XCTestCase {
     }
 
     func testNilAndEmptyOptionalsHaveDifferentFingerprints() throws {
-        XCTAssertNotEqual(try makeFingerprint(cookie: nil), try makeFingerprint(cookie: Data()))
+        XCTAssertNotEqual(
+            try makeFingerprint(systemFormat: makeSystemFormat(magicCookie: nil)),
+            try makeFingerprint(systemFormat: makeSystemFormat(magicCookie: Data()))
+        )
 
         let base = try makeFingerprint()
         let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
@@ -119,7 +147,7 @@ final class MediaGenerationTests: XCTestCase {
         XCTAssertNotEqual(base, try makeFingerprint(video: emptyVideo))
     }
 
-    func testV1IntentionallyIgnoresTimeBasesAndVideoDelay() throws {
+    func testV2IntentionallyIgnoresTimeBasesAndVideoDelay() throws {
         let base = try makeFingerprint()
         let otherTimeBase = try XCTUnwrap(MediaRational(num: 1_001, den: 30_000))
         let video = makeVideo(videoDelay: 99, timeBase: otherTimeBase)
@@ -174,7 +202,7 @@ final class MediaGenerationTests: XCTestCase {
         video: VideoTrackDescriptor?? = nil,
         parameterSets: [Data] = [Data([0x67, 0x64]), Data([0x68])],
         audio: AudioTrackDescriptor?? = nil,
-        cookie: Data?? = .some(Data())
+        systemFormat: AudioSystemFormatFingerprintComponent?? = nil
     ) throws -> MediaFormatFingerprint {
         let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
         let selectedVideo = video ?? .some(makeVideo(timeBase: timeBase))
@@ -186,7 +214,27 @@ final class MediaGenerationTests: XCTestCase {
                 audio: selectedAudio
             ),
             videoParameterSets: parameterSets,
-            audioCookie: cookie ?? nil
+            audioSystemFormat: systemFormat ?? .some(makeSystemFormat())
+        )
+    }
+
+    private func makeSystemFormat(
+        profileID: AudioCodecProfileID = .aacLC,
+        formatID: AudioFormatID = kAudioFormatMPEG4AAC,
+        sampleRate: Int32 = 48_000,
+        channelCount: Int32 = 2,
+        framesPerPacket: UInt32 = 1_024,
+        layout: CoreAudioLayoutSpec = .bitmap(AudioChannelBitmap(rawValue: 3)),
+        magicCookie: Data? = Data()
+    ) -> AudioSystemFormatFingerprintComponent {
+        AudioSystemFormatFingerprintComponent(
+            profileID: profileID,
+            formatID: formatID,
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            framesPerPacket: framesPerPacket,
+            layout: layout,
+            magicCookie: magicCookie
         )
     }
 
@@ -214,7 +262,7 @@ final class MediaGenerationTests: XCTestCase {
 
     private func makeAudio(
         streamIndex: Int32 = 9,
-        codec: AudioCodec = .aac,
+        codec: VPlayerPlayback.AudioCodec = .aac,
         sampleRate: Int32 = 48_000,
         channelCount: Int32 = 2,
         nativeMask: UInt64? = 3,

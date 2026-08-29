@@ -20,7 +20,9 @@ typedef enum {
     VPFF_CODEC_AAC = 3,
     VPFF_CODEC_AC3 = 4,
     VPFF_CODEC_EAC3 = 5,
-    VPFF_CODEC_MP2 = 6
+    VPFF_CODEC_MP2 = 6,
+    VPFF_CODEC_MP1 = 7,
+    VPFF_CODEC_MP3 = 8
 } VPFFCodec;
 
 typedef enum {
@@ -60,6 +62,12 @@ typedef enum {
     VPFF_DEMUX_STAGE_BSF_SEND = 7,
     VPFF_DEMUX_STAGE_BSF_RECEIVE = 8
 } VPFFDemuxErrorStage;
+
+typedef enum {
+    VPFF_DISCONTINUITY_NONE = 0,
+    VPFF_DISCONTINUITY_FORMAT_CHANGE = 1,
+    VPFF_DISCONTINUITY_TIMELINE_RESET = 2
+} VPFFDemuxDiscontinuityReason;
 
 typedef struct {
     uint8_t present;
@@ -107,7 +115,32 @@ typedef struct {
     VPFFDemuxErrorKind error_kind;
     VPFFDemuxErrorStage error_stage;
     int32_t ffmpeg_error;
+    VPFFDemuxDiscontinuityReason discontinuity_reason;
 } VPFFDemuxEvent;
+
+#if defined(__cplusplus)
+#define VPFF_DEMUX_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#else
+#define VPFF_DEMUX_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
+#endif
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, kind) == 0, "VPFFDemuxEvent.kind ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, has_program_id) == 4,
+                         "VPFFDemuxEvent.has_program_id ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, selected_program_id) == 8,
+                         "VPFFDemuxEvent.selected_program_id ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, video) == 16, "VPFFDemuxEvent.video ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, audio) == 96, "VPFFDemuxEvent.audio ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, packet) == 176, "VPFFDemuxEvent.packet ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, error_kind) == 240,
+                         "VPFFDemuxEvent.error_kind ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, error_stage) == 244,
+                         "VPFFDemuxEvent.error_stage ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, ffmpeg_error) == 248,
+                         "VPFFDemuxEvent.ffmpeg_error ABI");
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, discontinuity_reason) == 252,
+                         "VPFFDemuxEvent.discontinuity_reason ABI");
+VPFF_DEMUX_STATIC_ASSERT(sizeof(VPFFDemuxEvent) == 256, "VPFFDemuxEvent size ABI");
+#undef VPFF_DEMUX_STATIC_ASSERT
 
 /* The event and every borrowed pointer are valid only during this synchronous call. */
 typedef void (*VPFFDemuxCallback)(void *context, const VPFFDemuxEvent *event);

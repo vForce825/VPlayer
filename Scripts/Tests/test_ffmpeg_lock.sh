@@ -83,7 +83,7 @@ diff -u - "$flags" <<'FLAGS'
 --enable-demuxer=mpegts,hls,mov
 --enable-parser=h264,hevc,aac,aac_latm,ac3,mpegaudio
 --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb
---enable-decoder=aac,ac3,eac3,h264,mp2
+--enable-decoder=aac,ac3,eac3,h264,mp1,mp2,mp3
 FLAGS
 
 if grep -Eq -- '--enable-(gpl|nonfree|version3)|--enable-protocol=[^#]*(udp|rtp)' "$flags"; then

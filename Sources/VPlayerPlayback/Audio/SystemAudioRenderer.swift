@@ -51,17 +51,16 @@ final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
         renderer.hasSufficientMediaDataForReliablePlaybackStart
     }
 
-    func enqueue(_ sampleBuffer: CMSampleBuffer) throws {
-        guard isReadyForMoreMediaData else {
-            throw PlaybackCoreError.audioRendererFailed("renderer.not-ready")
-        }
+    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
         let formatID = CMSampleBufferGetFormatDescription(sampleBuffer)
             .map(CMFormatDescriptionGetMediaSubType) ?? 0
         let isPCM = formatID == kAudioFormatLinearPCM
         guard isPCM == (mediaKind == .linearPCM) else {
             throw PlaybackCoreError.audioRendererFailed("renderer.media-kind")
         }
+        guard isReadyForMoreMediaData else { return .backpressured }
         renderer.enqueue(sampleBuffer)
+        return .accepted
     }
 
     func flush() {
@@ -69,9 +68,7 @@ final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
     }
 
     func requestMediaDataWhenReady(_ handler: @escaping @Sendable () -> Void) {
-        if requesting {
-            renderer.stopRequestingMediaData()
-        }
+        guard !requesting else { return }
         requesting = true
         renderer.requestMediaDataWhenReady(on: callbackQueue, using: handler)
     }
@@ -160,8 +157,10 @@ final class SystemAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendab
     func currentTime() -> CMTime { synchronizer.currentTime() }
     var rate: Float { synchronizer.rate }
 
-    func attach(_ renderer: any AudioRenderer) {
-        guard let renderer = renderer as? SystemAudioRenderer else { return }
+    func attach(_ renderer: any AudioRenderer) throws {
+        guard let renderer = renderer as? SystemAudioRenderer else {
+            throw PlaybackCoreError.audioRendererFailed("audio.renderer.type-mismatch")
+        }
         synchronizer.addRenderer(renderer.renderer)
     }
 
@@ -183,48 +182,5 @@ final class SystemAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendab
 
     func setRate(_ rate: Float, time: CMTime) {
         synchronizer.setRate(rate, time: time)
-    }
-}
-
-struct SystemAudioFormatSupportChecker: AudioFormatSupportChecking {
-    func supports(
-        format: CMAudioFormatDescription,
-        route: AudioRoute,
-        output _: AudioOutputCategory
-    ) -> Bool {
-        guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else {
-            return false
-        }
-        if route == .ffmpegPCM {
-            return asbd.mFormatID == kAudioFormatLinearPCM &&
-                asbd.mSampleRate > 0 && asbd.mChannelsPerFrame > 0 &&
-                asbd.mBitsPerChannel == 32 &&
-                asbd.mBytesPerFrame == asbd.mChannelsPerFrame * 4 &&
-                asbd.mFramesPerPacket == 1
-        }
-
-        var byteCount: UInt32 = 0
-        guard AudioFormatGetPropertyInfo(
-            kAudioFormatProperty_DecodeFormatIDs,
-            0,
-            nil,
-            &byteCount
-        ) == noErr,
-        byteCount > 0,
-        byteCount % UInt32(MemoryLayout<AudioFormatID>.size) == 0 else {
-            return false
-        }
-        let count = Int(byteCount) / MemoryLayout<AudioFormatID>.size
-        var formats = [AudioFormatID](repeating: 0, count: count)
-        let status = formats.withUnsafeMutableBytes { buffer in
-            AudioFormatGetProperty(
-                kAudioFormatProperty_DecodeFormatIDs,
-                0,
-                nil,
-                &byteCount,
-                buffer.baseAddress
-            )
-        }
-        return status == noErr && formats.contains(asbd.mFormatID)
     }
 }

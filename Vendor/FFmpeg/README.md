@@ -46,7 +46,8 @@ The build contains only `libavcodec`, `libavformat`, `libavutil`, and
 `libswresample`. It enables HTTP/HTTPS over Secure Transport, the exact
 protocol/parser/bitstream-filter/audio-decoder inventory in
 `component-manifest.json`, and the HLS-required AAC, AC-3, and E-AC-3 child
-demuxers. No FFmpeg video decoder, encoder, muxer, filter, device, GPL,
+demuxers. MP1 and MP3 decoders exist only for final PCM fallback;
+system-compressed rendering remains primary. No FFmpeg video decoder, encoder, muxer, filter, device, GPL,
 nonfree, or version-3 component is enabled.
 
 The combined archives include FFmpeg's pinned IJG-derived files

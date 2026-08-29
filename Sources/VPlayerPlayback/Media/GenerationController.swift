@@ -5,6 +5,48 @@
 import CryptoKit
 import Foundation
 
+public struct AudioSystemFormatFingerprintComponent: Sendable, Hashable {
+    public let profileID: AudioCodecProfileID
+    public let formatID: UInt32
+    public let sampleRate: Int32
+    public let channelCount: Int32
+    public let framesPerPacket: UInt32
+    public let layout: CoreAudioLayoutSpec
+    public let magicCookie: Data?
+
+    public init(
+        profileID: AudioCodecProfileID,
+        formatID: UInt32,
+        sampleRate: Int32,
+        channelCount: Int32,
+        framesPerPacket: UInt32,
+        layout: CoreAudioLayoutSpec,
+        magicCookie: Data?
+    ) {
+        self.profileID = profileID
+        self.formatID = formatID
+        self.sampleRate = sampleRate
+        self.channelCount = channelCount
+        self.framesPerPacket = framesPerPacket
+        self.layout = layout
+        self.magicCookie = magicCookie
+    }
+}
+
+extension AudioSystemFormatFingerprintComponent {
+    init(_ format: SystemCompressedAudioFormat) {
+        self.init(
+            profileID: format.profileID,
+            formatID: format.formatID,
+            sampleRate: format.sampleRate,
+            channelCount: format.channelCount,
+            framesPerPacket: format.framesPerPacket,
+            layout: format.layout,
+            magicCookie: format.magicCookie
+        )
+    }
+}
+
 public enum MediaFormatFingerprintError: Error, Sendable, Equatable {
     case valueExceedsUInt32
 }
@@ -19,9 +61,9 @@ public struct MediaFormatFingerprint: Hashable, Sendable {
     public init(
         trackSet: DemuxTrackSet,
         videoParameterSets: [Data],
-        audioCookie: Data?
+        audioSystemFormat: AudioSystemFormatFingerprintComponent?
     ) throws {
-        var canonical = Data("VPlayer.MediaFormatFingerprint.v1".utf8)
+        var canonical = Data("VPlayer.MediaFormatFingerprint.v2".utf8)
         canonical.append(UInt8(0))
 
         canonical.appendOptional(trackSet.selectedProgramID) { data, programID in
@@ -54,8 +96,27 @@ public struct MediaFormatFingerprint: Hashable, Sendable {
             }
             try data.appendLengthPrefixed(audio.extradata)
         }
-        try canonical.appendOptional(audioCookie) { data, cookie in
-            try data.appendLengthPrefixed(cookie)
+        try canonical.appendOptional(audioSystemFormat) { data, format in
+            data.append(format.profileID.rawValue)
+            data.append(format.formatID)
+            data.append(format.sampleRate)
+            data.append(format.channelCount)
+            data.append(format.framesPerPacket)
+            switch format.layout {
+            case let .tag(tag, equivalentBitmap):
+                data.append(UInt8(0))
+                data.append(tag)
+                data.append(equivalentBitmap.rawValue)
+            case let .bitmap(bitmap):
+                data.append(UInt8(1))
+                data.append(bitmap.rawValue)
+            case let .discrete(count):
+                data.append(UInt8(2))
+                data.append(count)
+            }
+            try data.appendOptional(format.magicCookie) { nestedData, cookie in
+                try nestedData.appendLengthPrefixed(cookie)
+            }
         }
 
         bytes = Data(SHA256.hash(data: canonical))

@@ -15,7 +15,7 @@ final class FFmpegInventoryTests: XCTestCase {
         // h264 is here because interlaced H.264 has no hardware decode path on
         // Apple silicon and VideoToolbox's own software fallback manages only
         // about 20 frames a second on this hardware against a 25 fps source.
-        XCTAssertEqual(snapshot.decoders, ["aac", "ac3", "eac3", "h264", "mp2"])
+        XCTAssertEqual(snapshot.decoders, ["aac", "ac3", "eac3", "h264", "mp1", "mp2", "mp3"])
 
         XCTAssertFalse(snapshot.protocols.contains("udp"))
         XCTAssertFalse(snapshot.protocols.contains("rtp"))

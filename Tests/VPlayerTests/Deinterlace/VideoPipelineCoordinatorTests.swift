@@ -719,6 +719,176 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         )
     }
 
+    func testProcessingAdmissionFloorRejectsWholeOldSuccessAndFailureBeforeEffects()
+        throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        harness.passthrough.setAutomaticallyCompletes(false)
+        for id in 10...13 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        XCTAssertTrue(harness.passthrough.pendingAccessUnitIDs.contains(10))
+        XCTAssertTrue(harness.passthrough.pendingAccessUnitIDs.contains(11))
+
+        harness.coordinator.installProcessingAdmissionFloor(
+            generation: generation,
+            minimumAccessUnitID: 20,
+            minimumOutputPTS: CMTime(value: 20, timescale: 25)
+        )
+        let failureIndex = VideoDropSource.deinterlaceFailure.rawValue
+        let failuresBefore = harness.metrics.snapshot(window: .seconds(60))
+            .videoDropCountsBySource[failureIndex]
+        harness.passthrough.completePending(
+            accessUnitID: 10,
+            with: .failure(PlaybackFailure(
+                code: "synthetic.processing",
+                userMessage: "synthetic processing failure"
+            ))
+        )
+        harness.passthrough.completePending(accessUnitIDs: [11])
+
+        XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
+        XCTAssertEqual(
+            harness.metrics.snapshot(window: .seconds(60))
+                .videoDropCountsBySource[failureIndex],
+            failuresBefore
+        )
+    }
+
+    func testProcessingAdmissionFloorFiltersMixedLegalCompletionFrameByFrame() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        harness.passthrough.setAutomaticallyCompletes(false)
+        harness.coordinator.installProcessingAdmissionFloor(
+            generation: generation,
+            minimumAccessUnitID: 20,
+            minimumOutputPTS: CMTime(value: 20, timescale: 25)
+        )
+        for id in 20...22 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        XCTAssertTrue(harness.passthrough.pendingAccessUnitIDs.contains(20))
+        let source = try decodedFrame(
+            id: 20,
+            generation: generation,
+            parser: unknownParser(sourcePTS90k: 72_000)
+        )
+        let mixed = [
+            presentationFrame(
+                from: source,
+                sourceAccessUnitID: 19,
+                presentationTimeStamp: CMTime(value: 21, timescale: 25)
+            ),
+            presentationFrame(
+                from: source,
+                sourceAccessUnitID: 20,
+                presentationTimeStamp: CMTime(value: 20, timescale: 25)
+            ),
+            presentationFrame(
+                from: source,
+                sourceAccessUnitID: 21,
+                presentationTimeStamp: CMTime(value: 19, timescale: 25)
+            ),
+            presentationFrame(
+                from: source,
+                sourceAccessUnitID: 22,
+                presentationTimeStamp: CMTime(value: 22, timescale: 25),
+                generation: MediaGeneration(rawValue: generation.rawValue + 1)
+            ),
+        ]
+        harness.passthrough.completePending(accessUnitID: 20, with: .success(mixed))
+
+        XCTAssertEqual(harness.host.deliveredFrames.map(\.sourceAccessUnitID), [20])
+    }
+
+    func testProcessingAdmissionFloorSurvivesRouteChangeIsReplacedAndClearsOnGeneration()
+        throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        var generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        harness.passthrough.setAutomaticallyCompletes(false)
+        harness.coordinator.installProcessingAdmissionFloor(
+            generation: generation,
+            minimumAccessUnitID: 20,
+            minimumOutputPTS: .zero
+        )
+        for id in 10...12 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: progressiveParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        XCTAssertEqual(harness.coordinator.route, .bypass)
+        harness.passthrough.completePending(accessUnitIDs: [10])
+        XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
+
+        harness.coordinator.installProcessingAdmissionFloor(
+            generation: generation,
+            minimumAccessUnitID: 13,
+            minimumOutputPTS: .zero
+        )
+        for id in 13...15 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: progressiveParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        harness.passthrough.completePending(accessUnitIDs: [13])
+        XCTAssertEqual(harness.host.deliveredFrames.map(\.sourceAccessUnitID), [13])
+
+        let deliveredBeforeGenerationChange = harness.host.deliveredFrames.count
+        harness.coordinator.beginDiscontinuity()
+        generation = harness.host.generation
+        harness.coordinator.installFormatForCurrentGeneration(
+            try PlaybackFakeMedia.videoFormat()
+        )
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        for id in 5...7 {
+            harness.coordinator.handle(decoder: .frame(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        harness.passthrough.completePending(accessUnitIDs: [5])
+        XCTAssertEqual(
+            harness.host.deliveredFrames.dropFirst(deliveredBeforeGenerationChange)
+                .map(\.sourceAccessUnitID),
+            [5]
+        )
+    }
+
     private func makeHarness(
         classifierConfiguration: ScanClassifierConfiguration = ScanClassifierConfiguration(
             progressiveConfirmationFrames: 1,
@@ -778,6 +948,23 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             generation: base.generation,
             parserMetadata: parser,
             formatMetadata: base.formatMetadata
+        )
+    }
+
+    private func presentationFrame(
+        from source: DecodedVideoFrame,
+        sourceAccessUnitID: UInt64,
+        presentationTimeStamp: CMTime,
+        generation: MediaGeneration? = nil
+    ) -> VideoPresentationFrame {
+        VideoPresentationFrame(
+            storage: .pixelBuffer(source.pixelBuffer),
+            presentationTimeStamp: presentationTimeStamp,
+            duration: source.duration,
+            generation: generation ?? source.generation,
+            sequenceNumber: sourceAccessUnitID,
+            sourceAccessUnitID: sourceAccessUnitID,
+            formatMetadata: source.formatMetadata
         )
     }
 

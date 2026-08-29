@@ -13,6 +13,8 @@ public enum AudioRoute: Sendable, Equatable {
 
 public enum AudioFallbackReason: String, Codable, Sendable, Equatable {
     case repeatedCompressedRendererFailure
+    case systemDecoderUnavailable
+    case compressedRendererNoProgressAfterRebuild
 }
 
 public enum AudioDiagnosticOutputCategory: String, Codable, Sendable, Equatable {
@@ -128,6 +130,13 @@ public struct AudioRenderDiagnostics: Sendable, Equatable {
     public let mediaGeneration: MediaGeneration?
     public let lastCompressedRendererFailure: AudioRendererFailureDiagnostic?
     public let acceptedCompressedMediaDurationSeconds: Double
+    public let pendingSampleCount: Int
+    public let rendererRequestArmed: Bool
+    public let rendererBackpressureCount: UInt64
+    public let rendererRequestRearmCount: UInt64
+    public let automaticFlushNoProgressCount: UInt64
+    public let lastAcceptedPTSSeconds: Double?
+    public let lastRendererProgressAgeSeconds: Double?
 
     public init(
         automaticFlushTriggerCount: UInt64,
@@ -147,7 +156,14 @@ public struct AudioRenderDiagnostics: Sendable, Equatable {
         routeRevision: UInt64 = 0,
         mediaGeneration: MediaGeneration? = nil,
         lastCompressedRendererFailure: AudioRendererFailureDiagnostic? = nil,
-        acceptedCompressedMediaDurationSeconds: Double = 0
+        acceptedCompressedMediaDurationSeconds: Double = 0,
+        pendingSampleCount: Int = 0,
+        rendererRequestArmed: Bool = false,
+        rendererBackpressureCount: UInt64 = 0,
+        rendererRequestRearmCount: UInt64 = 0,
+        automaticFlushNoProgressCount: UInt64 = 0,
+        lastAcceptedPTSSeconds: Double? = nil,
+        lastRendererProgressAgeSeconds: Double? = nil
     ) {
         self.automaticFlushTriggerCount = automaticFlushTriggerCount
         self.outputConfigurationTriggerCount = outputConfigurationTriggerCount
@@ -167,6 +183,17 @@ public struct AudioRenderDiagnostics: Sendable, Equatable {
         self.mediaGeneration = mediaGeneration
         self.lastCompressedRendererFailure = lastCompressedRendererFailure
         self.acceptedCompressedMediaDurationSeconds = acceptedCompressedMediaDurationSeconds
+        self.pendingSampleCount = max(0, pendingSampleCount)
+        self.rendererRequestArmed = rendererRequestArmed
+        self.rendererBackpressureCount = rendererBackpressureCount
+        self.rendererRequestRearmCount = rendererRequestRearmCount
+        self.automaticFlushNoProgressCount = automaticFlushNoProgressCount
+        self.lastAcceptedPTSSeconds = lastAcceptedPTSSeconds?.isFinite == true
+            ? lastAcceptedPTSSeconds
+            : nil
+        self.lastRendererProgressAgeSeconds = lastRendererProgressAgeSeconds.flatMap { age in
+            age.isFinite && age >= 0 ? age : nil
+        }
     }
 
     public static let zero = AudioRenderDiagnostics(
@@ -203,12 +230,19 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
     var recoveryCount: UInt64 { get }
     var diagnostics: AudioRenderDiagnostics { get }
     func configure(
-        format: CMAudioFormatDescription,
-        codec: AudioCodec,
-        generation: MediaGeneration,
-        fingerprint: MediaFormatFingerprint
+        _ configuration: CompressedAudioRenderConfiguration,
+        generation: MediaGeneration
     ) throws
     func enqueue(_ sample: CompressedAudioSample) throws
+    func activateContinuityIsland(
+        _ islandID: AudioContinuityIslandID,
+        generation: MediaGeneration
+    )
+    func updateRecoveryFloor(_ floor: CMTime?)
+    func prepareAnchor(
+        at commonPTS: CMTime,
+        in islandID: AudioContinuityIslandID
+    ) throws
     func setSharedTimelineOpened(_ opened: Bool)
     func flush(to generation: MediaGeneration)
     func stop()
@@ -241,13 +275,20 @@ enum AudioRendererEvent: Sendable, Equatable {
     case outputConfigurationChanged
 }
 
+enum AudioRendererEnqueueResult: Sendable, Equatable {
+    case accepted
+    case backpressured
+}
+
 protocol AudioRenderer: AnyObject, Sendable {
     var identity: AudioRendererIdentity { get }
     var mediaKind: AudioRendererMediaKind { get }
     var isReadyForMoreMediaData: Bool { get }
     var hasSufficientMediaDataForReliablePlaybackStart: Bool { get }
-    func enqueue(_ sampleBuffer: CMSampleBuffer) throws
+    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult
     func flush()
+    // A demand opportunity only. The pipeline must correlate a post-reset
+    // acceptance and backpressure edge before treating this as queue consumption.
     func requestMediaDataWhenReady(_ handler: @escaping @Sendable () -> Void)
     func stopRequestingMediaData()
     func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void)
@@ -279,7 +320,7 @@ protocol PCMAudioDecoding: AnyObject, Sendable {
 protocol PCMAudioDecoderFactory: Sendable {
     func makeDecoder(
         codec: AudioCodec,
-        format: CMAudioFormatDescription
+        extradata: Data
     ) throws -> any PCMAudioDecoding
 }
 
@@ -313,12 +354,4 @@ struct AudioOutputRouteSnapshot: Sendable, Equatable {
 protocol AudioRouteMonitoring: AnyObject, Sendable {
     func start(_ handler: @escaping @Sendable (AudioOutputRouteSnapshot) -> Void)
     func stop()
-}
-
-protocol AudioFormatSupportChecking: Sendable {
-    func supports(
-        format: CMAudioFormatDescription,
-        route: AudioRoute,
-        output: AudioOutputCategory
-    ) -> Bool
 }

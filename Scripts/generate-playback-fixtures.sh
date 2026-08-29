@@ -21,7 +21,7 @@ expect_verify_failure() {
 write_test_manifest() {
   local root=$1 path
   : > "$root/SHA256SUMS"
-  for path in hls/master.m3u8 hls/segment0.ts interlaced-h264-mp2.ts progressive-h264-aac.ts; do
+  for path in ac3-48k-5point1.mov hls/master.m3u8 hls/segment0.ts interlaced-h264-mp2.ts progressive-h264-aac.ts; do
     (cd "$root" && shasum -a 256 "$path") >> "$root/SHA256SUMS"
   done
 }
@@ -37,6 +37,7 @@ run_self_tests() {
   printf segment > "$fixture_root/hls/segment0.ts"
   printf interlaced > "$fixture_root/interlaced-h264-mp2.ts"
   printf progressive > "$fixture_root/progressive-h264-aac.ts"
+  printf ac3 > "$fixture_root/ac3-48k-5point1.mov"
   write_test_manifest "$fixture_root"
   VPLAYER_FIXTURE_GENERATOR_SELF_TEST=1 "$script" --verify-root "$fixture_root"
 
@@ -93,6 +94,7 @@ import sys
 
 root = Path(sys.argv[1]).resolve(strict=True)
 expected = [
+    "ac3-48k-5point1.mov",
     "hls/master.m3u8",
     "hls/segment0.ts",
     "interlaced-h264-mp2.ts",
@@ -190,12 +192,12 @@ require_generation_tools() {
   [[ "$version" == *'--enable-libx264'* ]] || fail 'ffmpeg lacks libx264 support'
 
   encoders="$($ffmpeg_command -hide_banner -encoders 2>/dev/null)"
-  for encoder in libx264 aac mp2; do
+  for encoder in libx264 aac ac3_fixed mp2; do
     grep -Eq "^[[:space:]][A-Z.]{6}[[:space:]]+$encoder([[:space:]]|$)" <<< "$encoders" || \
       fail "ffmpeg lacks required encoder: $encoder"
   done
   filters="$($ffmpeg_command -hide_banner -filters 2>/dev/null)"
-  for filter in testsrc2 sine tinterlace setfield format; do
+  for filter in aevalsrc testsrc2 sine tinterlace setfield format; do
     grep -Eq "^[[:space:]][A-Z.|]{2,4}[[:space:]]+$filter([[:space:]]|$)" <<< "$filters" || \
       fail "ffmpeg lacks required filter: $filter"
   done
@@ -250,6 +252,20 @@ generate_interlaced() {
     -muxdelay 0 -muxpreload 0 -f mpegts "$output"
 }
 
+generate_ac3_mov() {
+  local output=$1
+  "$ffmpeg_command" -hide_banner -loglevel error -nostdin -y \
+    -filter_threads 1 -filter_complex_threads 1 \
+    -f lavfi -i 'aevalsrc=0|0|0.0625*sin(2*PI*440*t)|0|0|0:s=48000:d=2:c=5.1' \
+    -map 0:a:0 -t 2 -map_metadata -1 -map_chapters -1 \
+    -metadata creation_time='1970-01-01T00:00:00Z' \
+    -metadata:s:a:0 language=und \
+    -c:a ac3_fixed -b:a 448k -ar:a 48000 -ac:a 6 -channel_layout:a:0 5.1 \
+    -enc_time_base:a 1:48000 -threads:a 1 \
+    -fflags +bitexact -flags:a +bitexact \
+    -movflags +faststart+disable_chpl -f mov "$output"
+}
+
 write_hls_playlist() {
   local output=$1
   printf '%s\n' \
@@ -267,7 +283,7 @@ write_hls_playlist() {
 write_manifest() {
   local fixture_root=$1 path
   : > "$fixture_root/SHA256SUMS"
-  for path in hls/master.m3u8 hls/segment0.ts interlaced-h264-mp2.ts progressive-h264-aac.ts; do
+  for path in ac3-48k-5point1.mov hls/master.m3u8 hls/segment0.ts interlaced-h264-mp2.ts progressive-h264-aac.ts; do
     (cd "$fixture_root" && shasum -a 256 "$path") >> "$fixture_root/SHA256SUMS"
   done
 }
@@ -326,6 +342,39 @@ for relative, width, height, field_order, b_frames, audio_codec, video_count, au
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise SystemExit(f"{relative} failed media validation: {failed}; {document}")
+
+command = [
+    ffprobe,
+    "-v", "error",
+    "-count_packets",
+    "-show_streams",
+    "-show_format",
+    "-of", "json",
+    str(root / "ac3-48k-5point1.mov"),
+]
+document = json.loads(subprocess.check_output(command, text=True))
+audio_streams = [stream for stream in document["streams"] if stream["codec_type"] == "audio"]
+checks = {
+    "one audio stream": len(audio_streams) == 1,
+    "no video stream": not any(
+        stream["codec_type"] == "video" for stream in document["streams"]
+    ),
+}
+if len(audio_streams) == 1:
+    audio = audio_streams[0]
+    checks.update({
+        "audio codec": audio.get("codec_name") == "ac3",
+        "audio rate": audio.get("sample_rate") == "48000",
+        "audio channels": int(audio.get("channels", 0)) == 6,
+        "audio layout": audio.get("channel_layout") == "5.1(side)",
+        "audio packets": int(audio.get("nb_read_packets", 0)) >= 62,
+        "duration": 1.95 <= float(document["format"]["duration"]) <= 2.10,
+    })
+failed = [name for name, passed in checks.items() if not passed]
+if failed:
+    raise SystemExit(
+        f"ac3-48k-5point1.mov failed media validation: {failed}; {document}"
+    )
 PY
 }
 
@@ -338,6 +387,7 @@ regenerate() {
 
   generate_progressive "$generated/progressive-h264-aac.ts"
   generate_interlaced "$generated/interlaced-h264-mp2.ts"
+  generate_ac3_mov "$generated/ac3-48k-5point1.mov"
   cp "$generated/progressive-h264-aac.ts" "$generated/hls/segment0.ts"
   write_hls_playlist "$generated/hls/master.m3u8"
   write_manifest "$generated"
@@ -345,6 +395,7 @@ regenerate() {
   validate_generated_media "$generated"
 
   mkdir -p "$fixture_root/hls"
+  install -m 0644 "$generated/ac3-48k-5point1.mov" "$fixture_root/ac3-48k-5point1.mov"
   install -m 0644 "$generated/progressive-h264-aac.ts" "$fixture_root/progressive-h264-aac.ts"
   install -m 0644 "$generated/interlaced-h264-mp2.ts" "$fixture_root/interlaced-h264-mp2.ts"
   install -m 0644 "$generated/hls/master.m3u8" "$fixture_root/hls/master.m3u8"

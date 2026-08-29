@@ -461,10 +461,12 @@ static void vpff_emit_terminal(
 static void vpff_emit_tracks(
     VPDemuxer *demuxer,
     VPFFDemuxEventKind kind,
+    VPFFDemuxDiscontinuityReason discontinuity_reason,
     const VPFFOwnedTrackSet *tracks
 ) {
     VPFFDemuxEvent event = {0};
     event.kind = kind;
+    event.discontinuity_reason = discontinuity_reason;
     event.has_program_id = tracks->has_program_id;
     event.selected_program_id = tracks->selected_program_id;
     event.video = tracks->video.value;
@@ -486,6 +488,10 @@ static VPFFCodec vpff_codec(enum AVCodecID codec_id) {
         return VPFF_CODEC_EAC3;
     case AV_CODEC_ID_MP2:
         return VPFF_CODEC_MP2;
+    case AV_CODEC_ID_MP1:
+        return VPFF_CODEC_MP1;
+    case AV_CODEC_ID_MP3:
+        return VPFF_CODEC_MP3;
     default:
         return VPFF_CODEC_UNSUPPORTED;
     }
@@ -504,7 +510,9 @@ static bool vpff_is_supported_audio_codec(const AVCodecParameters *parameters) {
     return parameters->codec_id == AV_CODEC_ID_AAC ||
            parameters->codec_id == AV_CODEC_ID_AC3 ||
            parameters->codec_id == AV_CODEC_ID_EAC3 ||
-           parameters->codec_id == AV_CODEC_ID_MP2;
+           parameters->codec_id == AV_CODEC_ID_MP2 ||
+           parameters->codec_id == AV_CODEC_ID_MP1 ||
+           parameters->codec_id == AV_CODEC_ID_MP3;
 }
 
 static bool vpff_channel_layout_is_bounded(const AVChannelLayout *layout) {
@@ -2269,7 +2277,12 @@ static int vpff_update_selected_tracks(
             return AVERROR_EXIT;
         }
         vpff_replace_track_set(current_tracks, &replacement);
-        vpff_emit_tracks(demuxer, VPFF_EVENT_DISCONTINUITY, current_tracks);
+        vpff_emit_tracks(
+            demuxer,
+            VPFF_EVENT_DISCONTINUITY,
+            VPFF_DISCONTINUITY_FORMAT_CHANGE,
+            current_tracks
+        );
         if (vpff_is_cancelled(demuxer)) {
             return AVERROR_EXIT;
         }
@@ -2912,7 +2925,12 @@ int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer) {
         failure.code = result;
         goto finish_failure;
     }
-    vpff_emit_tracks(demuxer, VPFF_EVENT_TRACKS, &current_tracks);
+    vpff_emit_tracks(
+        demuxer,
+        VPFF_EVENT_TRACKS,
+        VPFF_DISCONTINUITY_NONE,
+        &current_tracks
+    );
     if (vpff_is_cancelled(demuxer)) {
         result = AVERROR_EXIT;
         failure.stage = VPFF_DEMUX_STAGE_READ;

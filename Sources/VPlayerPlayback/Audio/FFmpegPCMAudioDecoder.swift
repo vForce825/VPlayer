@@ -101,6 +101,8 @@ private final class LiveFFmpegAudioDecoderHandle: FFmpegAudioDecoderHandle, @unc
         case .ac3: rawCodec = VPFF_CODEC_AC3
         case .eac3: rawCodec = VPFF_CODEC_EAC3
         case .mp2: rawCodec = VPFF_CODEC_MP2
+        case .mp1: rawCodec = VPFF_CODEC_MP1
+        case .mp3: rawCodec = VPFF_CODEC_MP3
         }
         let result = extradata.withUnsafeBytes { bytes in
             let extradataPointer = bytes.isEmpty
@@ -288,20 +290,19 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
 
     convenience init(
         codec: VPlayerPlayback.AudioCodec,
-        format: CMAudioFormatDescription
+        extradata: Data
     ) throws {
-        try self.init(codec: codec, format: format, api: LiveFFmpegAudioDecoderAPI())
+        try self.init(codec: codec, extradata: extradata, api: LiveFFmpegAudioDecoderAPI())
     }
 
     init(
         codec: VPlayerPlayback.AudioCodec,
-        format: CMAudioFormatDescription,
+        extradata: Data,
         api: any FFmpegAudioDecoderAPI
     ) throws {
-        let cookie = try Self.magicCookie(format)
         let collector = FFmpegPCMCallbackCollector()
         self.collector = collector
-        handle = try api.create(codec: codec, extradata: cookie) { frame in
+        handle = try api.create(codec: codec, extradata: extradata) { frame in
             collector.receive(frame)
         }
     }
@@ -391,17 +392,6 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         _ = collector.take()
     }
 
-    private static func magicCookie(_ format: CMAudioFormatDescription) throws -> Data {
-        var size = 0
-        guard let pointer = CMAudioFormatDescriptionGetMagicCookie(format, sizeOut: &size) else {
-            return Data()
-        }
-        guard size >= 0, size <= maximumBytes else {
-            throw PlaybackCoreError.audioFallbackDecode(overflowErrorCode)
-        }
-        return Data(bytes: pointer, count: size)
-    }
-
     private static func compressedBytes(_ sample: CMSampleBuffer) throws -> Data {
         guard let block = CMSampleBufferGetDataBuffer(sample) else {
             throw PlaybackCoreError.audioFallbackDecode(invalidCallbackErrorCode)
@@ -432,9 +422,9 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
 struct LivePCMAudioDecoderFactory: PCMAudioDecoderFactory {
     func makeDecoder(
         codec: VPlayerPlayback.AudioCodec,
-        format: CMAudioFormatDescription
+        extradata: Data
     ) throws -> any PCMAudioDecoding {
-        try FFmpegPCMAudioDecoder(codec: codec, format: format)
+        try FFmpegPCMAudioDecoder(codec: codec, extradata: extradata)
     }
 }
 

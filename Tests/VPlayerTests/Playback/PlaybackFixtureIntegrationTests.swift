@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFoundation
 import CoreMedia
 import CryptoKit
 import Foundation
@@ -11,6 +12,7 @@ import XCTest
 
 final class PlaybackFixtureIntegrationTests: XCTestCase {
     private static let expectedFixturePaths: Set<String> = [
+        "ac3-48k-5point1.mov",
         "hls/master.m3u8",
         "hls/segment0.ts",
         "interlaced-h264-mp2.ts",
@@ -28,6 +30,32 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             let bytes = try FixtureHTTPClient.fetch(baseURL.appending(path: path))
             XCTAssertEqual(SHA256.hash(data: bytes).hexString, expected, path)
         }
+    }
+
+    func testSyntheticAC3MOVProvidesAVAssetReaderReferenceDescription() async throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: Self.self).url(forResource: "ac3-48k-5point1", withExtension: "mov")
+        )
+        let asset = AVURLAsset(url: fixtureURL)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        XCTAssertTrue(reader.canAdd(output))
+        reader.add(output)
+        XCTAssertTrue(reader.startReading())
+
+        let sample = try XCTUnwrap(output.copyNextSampleBuffer())
+        let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+        let stream = try XCTUnwrap(
+            CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee
+        )
+        XCTAssertEqual(stream.mFormatID, kAudioFormatAC3)
+        XCTAssertEqual(stream.mSampleRate, 48_000)
+        XCTAssertEqual(stream.mChannelsPerFrame, 6)
+        XCTAssertGreaterThanOrEqual(CMSampleBufferGetNumSamples(sample), 1)
+        XCTAssertEqual(CMSampleBufferGetSampleSize(sample, at: 0), 1_792)
+        XCTAssertFalse(try copiedSampleData(sample).isEmpty)
     }
 
     func testProgressiveTransportStreamTraversesRealDemuxAndAssemblers() throws {
@@ -68,13 +96,37 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
 
     func testMP2DecoderSurvivesRepeatedFlushesAtParsedFrameBoundaries() throws {
         let result = try assemble(path: "interlaced-h264-mp2.ts")
-        let format = try XCTUnwrap(result.audioFormats.last)
-        let decoder = try FFmpegPCMAudioDecoder(codec: .mp2, format: format)
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .mp2,
+            extradata: result.trackSet.audio?.extradata ?? Data()
+        )
         defer { decoder.destroy() }
 
         var decodedFrameCount = 0
-        for sample in result.audioSamples.prefix(20) {
+        var continuity = AudioContinuityBuffer()
+        let firstFrame = try XCTUnwrap(result.audioFrames.first)
+        continuity.reset(to: firstFrame.generation)
+        let format = try XCTUnwrap(result.audioFormats.last)
+        for frame in result.audioFrames.prefix(20) {
             decoder.flush()
+            guard case let .admitted(admitted) = try continuity.admit(frame) else {
+                return XCTFail("fixture audio frame must pass canonical continuity admission")
+            }
+            let sampleBuffer = try SampleBufferBuilder.makeAudio(
+                frame: admitted,
+                formatDescription: format,
+                forceResetDecoderBeforeDecoding: true
+            )
+            let sample = CompressedAudioSample(
+                id: frame.id,
+                sampleBuffer: sampleBuffer,
+                codec: frame.codec,
+                generation: frame.generation,
+                presentationTimeStamp: admitted.normalizedPresentationTimeStamp,
+                duration: admitted.duration,
+                continuityIslandID: admitted.continuityIslandID,
+                effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
+            )
             let outputs = try decoder.push(sample)
             decodedFrameCount += outputs.count
         }
@@ -300,7 +352,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         width: Int32,
         height: Int32,
         videoDelay: Int32,
-        audioCodec: AudioCodec
+        audioCodec: VPlayerPlayback.AudioCodec
     ) throws {
         let video = try XCTUnwrap(result.trackSet.video)
         let audio = try XCTUnwrap(result.trackSet.audio)
@@ -310,7 +362,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         XCTAssertEqual(video.videoDelay, videoDelay)
         XCTAssertEqual(audio.codec, audioCodec)
         XCTAssertGreaterThanOrEqual(result.videoAccessUnits.count, 25)
-        XCTAssertGreaterThanOrEqual(result.audioSamples.count, 40)
+        XCTAssertGreaterThanOrEqual(result.audioFrames.count, 40)
         XCTAssertFalse(result.videoFormats.isEmpty)
         XCTAssertFalse(result.audioFormats.isEmpty)
         XCTAssertEqual(PassthroughVideoProcessor().requiredInputFrameCount, 1)
@@ -319,7 +371,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             CMSampleBufferGetPresentationTimeStamp($0.sampleBuffer)
         }
         try assertBFramePresentationTimeline(videoPTS)
-        try assertStrictlyMonotonic(result.audioSamples.map(\.presentationTimeStamp))
+        try assertStrictlyMonotonic(result.audioFrames.map(\.presentationTimeStamp))
     }
 
     private func assertBFramePresentationTimeline(_ decodeOrder: [CMTime]) throws {
@@ -506,14 +558,14 @@ private struct AssembledFixture {
     let videoFormats: [CMVideoFormatDescription]
     let videoAccessUnits: [CompressedVideoAccessUnit]
     let audioFormats: [CMAudioFormatDescription]
-    let audioSamples: [CompressedAudioSample]
+    let audioFrames: [CompressedAudioFrame]
 }
 
 private final class AssemblerOutputRecorder {
     private var videoFormats: [CMVideoFormatDescription] = []
     private var videoAccessUnits: [CompressedVideoAccessUnit] = []
     private var audioFormats: [CMAudioFormatDescription] = []
-    private var audioSamples: [CompressedAudioSample] = []
+    private var audioFrames: [CompressedAudioFrame] = []
 
     func record(_ event: VideoAssemblerEvent) {
         switch event {
@@ -524,8 +576,12 @@ private final class AssemblerOutputRecorder {
 
     func record(_ event: AudioAssemblerEvent) {
         switch event {
-        case let .format(format, _, _): audioFormats.append(format)
-        case let .sample(sample): audioSamples.append(sample)
+        case let .format(configuration):
+            audioFormats.append(configuration.formatDescription)
+        case let .frame(frame):
+            audioFrames.append(frame)
+        case .decodeBreak:
+            break
         }
     }
 
@@ -539,7 +595,7 @@ private final class AssemblerOutputRecorder {
             videoFormats: videoFormats,
             videoAccessUnits: videoAccessUnits,
             audioFormats: audioFormats,
-            audioSamples: audioSamples
+            audioFrames: audioFrames
         )
     }
 }
