@@ -65,6 +65,12 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let readinessOpen: Bool
     public let retainedAudioCount: Int
     public let retainedVideoCount: Int
+    // Indexed by `AudioContinuityDropReason.slot` with an exact, bounded
+    // entry for every reason in the enum domain.
+    public internal(set) var audioContinuityDropCountsByReason: [UInt64]
+    public let audioShortGapCount: UInt64
+    public let audioLargeGapCount: UInt64
+    public let audioContinuityIslandSwitchCount: UInt64
     public let audioFirstPTSSeconds: Double?
     public let audioDurationSeconds: Double
     public let videoFirstPTSSeconds: Double?
@@ -76,7 +82,7 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // means readiness is flapping rather than staying shut once.
     public let readinessCycleID: UInt64
     // Indexed by `PlaybackReadinessCloseReason.rawValue`: flush, buffering,
-    // pause, discontinuity, audioReplacement, displayModeSwitch.
+    // pause, discontinuity, audioReplacement, displayModeSwitch, audioGap.
     public let readinessCloseReasonCounts: [UInt64]
     // How many times display submission has been resumed for an open gate. If
     // this stops advancing while frames keep arriving, the submission side is
@@ -109,6 +115,13 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let audioMediaGeneration: MediaGeneration?
     public let audioLastCompressedRendererFailure: AudioRendererFailureDiagnostic?
     public let audioAcceptedCompressedMediaDurationSeconds: Double
+    public let audioPendingSampleCount: Int
+    public let audioRendererRequestArmed: Bool
+    public let audioRendererBackpressureCount: UInt64
+    public let audioRendererRequestRearmCount: UInt64
+    public let audioAutomaticFlushNoProgressCount: UInt64
+    public let audioLastAcceptedPTSSeconds: Double?
+    public let audioLastRendererProgressAgeSeconds: Double?
     // Display-link callbacks that reached the renderer. Divided by elapsed time
     // this is the *actual* tick rate, which is what separates "the display link
     // is missing ticks" from "the renderer refused ticks it was offered".
@@ -175,6 +188,310 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let decodeCallbackLatencyP95Milliseconds: Double
     // Same distribution point as the latency above, so the two are comparable.
     public let videoDecodeSubmissionP95Milliseconds: Double
+}
+
+private struct PlaybackMetricsCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init(_ stringValue: String) {
+        self.stringValue = stringValue
+    }
+
+    init?(stringValue: String) {
+        self.init(stringValue)
+    }
+
+    init?(intValue: Int) {
+        return nil
+    }
+}
+
+enum PlaybackMetricsBoundedReasonCounts {
+    static func decode(
+        declaredCount: Int?,
+        expectedCount: Int,
+        next: () throws -> UInt64
+    ) throws -> [UInt64] {
+        let zeros = [UInt64](repeating: 0, count: max(0, expectedCount))
+        guard expectedCount >= 0, declaredCount == expectedCount else {
+            return zeros
+        }
+        var result: [UInt64] = []
+        result.reserveCapacity(expectedCount)
+        do {
+            for _ in 0..<expectedCount {
+                result.append(try next())
+            }
+        } catch {
+            return zeros
+        }
+        return result
+    }
+}
+
+enum PlaybackDiagnosticSaturatingCounter {
+    static func increment(_ value: inout UInt64) {
+        if value < UInt64.max {
+            value += 1
+        }
+    }
+}
+
+public extension PlaybackMetricsSnapshot {
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: PlaybackMetricsCodingKey.self)
+        scanType = try container.decode(String.self, forKey: .init("scanType"))
+        activeRoute = try container.decode(String.self, forKey: .init("activeRoute"))
+        decoderCallbacksPerSecond = try container.decode(Double.self, forKey: .init("decoderCallbacksPerSecond"))
+        presentationsPerSecond = try container.decode(Double.self, forKey: .init("presentationsPerSecond"))
+        yadifKernelDispatchCount = try container.decode(UInt64.self, forKey: .init("yadifKernelDispatchCount"))
+        staleGenerationDropCount = try container.decode(UInt64.self, forKey: .init("staleGenerationDropCount"))
+        droppedVideoFrames = try container.decode(UInt64.self, forKey: .init("droppedVideoFrames"))
+        videoDropCountsBySource = try container.decode([UInt64].self, forKey: .init("videoDropCountsBySource"))
+        lastVideoDecodeFailure = try container.decodeIfPresent(String.self, forKey: .init("lastVideoDecodeFailure"))
+        maximumPresentationQueueDepth = try container.decode(Int.self, forKey: .init("maximumPresentationQueueDepth"))
+        maximumYADIFInFlightCount = try container.decode(Int.self, forKey: .init("maximumYADIFInFlightCount"))
+        maximumYADIFInputDepth = try container.decode(Int.self, forKey: .init("maximumYADIFInputDepth"))
+        gpuDurationP95Milliseconds = try container.decode(Double.self, forKey: .init("gpuDurationP95Milliseconds"))
+        yadifCPUEncodeP95Milliseconds = try container.decode(Double.self, forKey: .init("yadifCPUEncodeP95Milliseconds"))
+        renderCPUPreparationP95Milliseconds = try container.decode(Double.self, forKey: .init("renderCPUPreparationP95Milliseconds"))
+        avDriftP95Milliseconds = try container.decode(Double.self, forKey: .init("avDriftP95Milliseconds"))
+        residentMemoryBytes = try container.decode(UInt64.self, forKey: .init("residentMemoryBytes"))
+        elapsedSeconds = try container.decode(Double.self, forKey: .init("elapsedSeconds"))
+        windowDurationSeconds = try container.decode(Double.self, forKey: .init("windowDurationSeconds"))
+        presentedVideoFrames = try container.decode(UInt64.self, forKey: .init("presentedVideoFrames"))
+        presentationPTSRegressionCount = try container.decode(UInt64.self, forKey: .init("presentationPTSRegressionCount"))
+        maximumAbsoluteAVDriftMilliseconds = try container.decode(Double.self, forKey: .init("maximumAbsoluteAVDriftMilliseconds"))
+        crossGenerationPresentationCount = try container.decode(UInt64.self, forKey: .init("crossGenerationPresentationCount"))
+        audioRoute = try container.decode(String.self, forKey: .init("audioRoute"))
+        audioReady = try container.decode(Bool.self, forKey: .init("audioReady"))
+        readinessOpen = try container.decode(Bool.self, forKey: .init("readinessOpen"))
+        retainedAudioCount = try container.decode(Int.self, forKey: .init("retainedAudioCount"))
+        retainedVideoCount = try container.decode(Int.self, forKey: .init("retainedVideoCount"))
+
+        let reasonCount = AudioContinuityDropReason.slotCount
+        let reasonKey = PlaybackMetricsCodingKey(
+            "audioContinuityDropCountsByReason"
+        )
+        if container.contains(reasonKey),
+           var nested = try? container.nestedUnkeyedContainer(forKey: reasonKey) {
+            audioContinuityDropCountsByReason = try PlaybackMetricsBoundedReasonCounts.decode(
+                declaredCount: nested.count,
+                expectedCount: reasonCount,
+                next: { try nested.decode(UInt64.self) }
+            )
+        } else {
+            audioContinuityDropCountsByReason = [UInt64](
+                repeating: 0,
+                count: reasonCount
+            )
+        }
+        audioShortGapCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("audioShortGapCount")
+        ) ?? 0
+        audioLargeGapCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("audioLargeGapCount")
+        ) ?? 0
+        audioContinuityIslandSwitchCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("audioContinuityIslandSwitchCount")
+        ) ?? 0
+
+        audioFirstPTSSeconds = try container.decodeIfPresent(Double.self, forKey: .init("audioFirstPTSSeconds"))
+        audioDurationSeconds = try container.decode(Double.self, forKey: .init("audioDurationSeconds"))
+        videoFirstPTSSeconds = try container.decodeIfPresent(Double.self, forKey: .init("videoFirstPTSSeconds"))
+        videoLatestPTSSeconds = try container.decodeIfPresent(Double.self, forKey: .init("videoLatestPTSSeconds"))
+        audioRelativeVideoPruneCount = try container.decode(UInt64.self, forKey: .init("audioRelativeVideoPruneCount"))
+        readinessCycleID = try container.decode(UInt64.self, forKey: .init("readinessCycleID"))
+        readinessCloseReasonCounts = try container.decode([UInt64].self, forKey: .init("readinessCloseReasonCounts"))
+        displayResumeCount = try container.decode(UInt64.self, forKey: .init("displayResumeCount"))
+        clockTimeSeconds = try container.decodeIfPresent(Double.self, forKey: .init("clockTimeSeconds"))
+        videoResyncCount = try container.decode(UInt64.self, forKey: .init("videoResyncCount"))
+        audioRecoveryCount = try container.decode(UInt64.self, forKey: .init("audioRecoveryCount"))
+        audioAutomaticFlushTriggerCount = try container.decode(UInt64.self, forKey: .init("audioAutomaticFlushTriggerCount"))
+        audioOutputConfigurationTriggerCount = try container.decode(UInt64.self, forKey: .init("audioOutputConfigurationTriggerCount"))
+        audioRouteChangeTriggerCount = try container.decode(UInt64.self, forKey: .init("audioRouteChangeTriggerCount"))
+        audioRecoveryTransactionCount = try container.decode(UInt64.self, forKey: .init("audioRecoveryTransactionCount"))
+        audioSuppressedCorrelatedTriggerCount = try container.decode(UInt64.self, forKey: .init("audioSuppressedCorrelatedTriggerCount"))
+        audioCompressedRendererRetryCount = try container.decode(UInt64.self, forKey: .init("audioCompressedRendererRetryCount"))
+        audioPCMFallbackCount = try container.decode(UInt64.self, forKey: .init("audioPCMFallbackCount"))
+        audioLastFallbackReason = try container.decodeIfPresent(AudioFallbackReason.self, forKey: .init("audioLastFallbackReason"))
+        audioStartupWaitingSeconds = try container.decode(Double.self, forKey: .init("audioStartupWaitingSeconds"))
+        audioRendererReady = try container.decode(Bool.self, forKey: .init("audioRendererReady"))
+        audioRendererSufficient = try container.decode(Bool.self, forKey: .init("audioRendererSufficient"))
+        audioActiveCodec = try container.decodeIfPresent(AudioCodec.self, forKey: .init("audioActiveCodec"))
+        audioFormatFingerprint = try container.decodeIfPresent(AudioFormatFingerprintDiagnostic.self, forKey: .init("audioFormatFingerprint"))
+        audioOutputCategory = try container.decode(AudioDiagnosticOutputCategory.self, forKey: .init("audioOutputCategory"))
+        audioRouteRevision = try container.decode(UInt64.self, forKey: .init("audioRouteRevision"))
+        audioMediaGeneration = try container.decodeIfPresent(MediaGeneration.self, forKey: .init("audioMediaGeneration"))
+        audioLastCompressedRendererFailure = try container.decodeIfPresent(AudioRendererFailureDiagnostic.self, forKey: .init("audioLastCompressedRendererFailure"))
+        audioAcceptedCompressedMediaDurationSeconds = try container.decode(Double.self, forKey: .init("audioAcceptedCompressedMediaDurationSeconds"))
+
+        audioPendingSampleCount = max(0, try container.decodeIfPresent(
+            Int.self,
+            forKey: .init("audioPendingSampleCount")
+        ) ?? 0)
+        audioRendererRequestArmed = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .init("audioRendererRequestArmed")
+        ) ?? false
+        audioRendererBackpressureCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("audioRendererBackpressureCount")
+        ) ?? 0
+        audioRendererRequestRearmCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("audioRendererRequestRearmCount")
+        ) ?? 0
+        audioAutomaticFlushNoProgressCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("audioAutomaticFlushNoProgressCount")
+        ) ?? 0
+        audioLastAcceptedPTSSeconds = try container.decodeIfPresent(
+            Double.self,
+            forKey: .init("audioLastAcceptedPTSSeconds")
+        )
+        audioLastRendererProgressAgeSeconds = try container.decodeIfPresent(
+            Double.self,
+            forKey: .init("audioLastRendererProgressAgeSeconds")
+        )
+
+        renderTickCount = try container.decode(UInt64.self, forKey: .init("renderTickCount"))
+        renderSkippedInFlightCount = try container.decode(UInt64.self, forKey: .init("renderSkippedInFlightCount"))
+        displayLinkCallbackCount = try container.decode(UInt64.self, forKey: .init("displayLinkCallbackCount"))
+        nativeDisplayIntervalMilliseconds = try container.decode(Double.self, forKey: .init("nativeDisplayIntervalMilliseconds"))
+        missedDisplayLinkVSyncCount = try container.decode(UInt64.self, forKey: .init("missedDisplayLinkVSyncCount"))
+        displayRefreshHz = try container.decode(Double.self, forKey: .init("displayRefreshHz"))
+        demuxQueueFullWaitSeconds = try container.decode(Double.self, forKey: .init("demuxQueueFullWaitSeconds"))
+        demuxAdmitWaitSeconds = try container.decode(Double.self, forKey: .init("demuxAdmitWaitSeconds"))
+        playbackExecutorBusySeconds = try container.decode(Double.self, forKey: .init("playbackExecutorBusySeconds"))
+        demuxPacketCount = try container.decode(UInt64.self, forKey: .init("demuxPacketCount"))
+        videoAccessUnitCount = try container.decode(UInt64.self, forKey: .init("videoAccessUnitCount"))
+        audioSampleCount = try container.decode(UInt64.self, forKey: .init("audioSampleCount"))
+        videoDecodeSubmissionCount = try container.decode(UInt64.self, forKey: .init("videoDecodeSubmissionCount"))
+        maximumVideoDecodeSubmissionMilliseconds = try container.decode(Double.self, forKey: .init("maximumVideoDecodeSubmissionMilliseconds"))
+        totalVideoDecodeSubmissionMilliseconds = try container.decode(Double.self, forKey: .init("totalVideoDecodeSubmissionMilliseconds"))
+        maximumOutstandingDecoderOutputs = try container.decode(Int.self, forKey: .init("maximumOutstandingDecoderOutputs"))
+        maximumDecodeSubmissionDepth = try container.decode(Int.self, forKey: .init("maximumDecodeSubmissionDepth"))
+        maximumFramesBeingDecoded = try container.decode(Int.self, forKey: .init("maximumFramesBeingDecoded"))
+        decoderSessionSummary = try container.decodeIfPresent(String.self, forKey: .init("decoderSessionSummary"))
+        decodeCallbackLatencyP95Milliseconds = try container.decode(Double.self, forKey: .init("decodeCallbackLatencyP95Milliseconds"))
+        videoDecodeSubmissionP95Milliseconds = try container.decode(Double.self, forKey: .init("videoDecodeSubmissionP95Milliseconds"))
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        let reasonCount = AudioContinuityDropReason.slotCount
+        guard audioContinuityDropCountsByReason.count == reasonCount else {
+            throw EncodingError.invalidValue(
+                audioContinuityDropCountsByReason,
+                EncodingError.Context(
+                    codingPath: encoder.codingPath,
+                    debugDescription: "invalid bounded audio continuity reason domain"
+                )
+            )
+        }
+        var container = encoder.container(keyedBy: PlaybackMetricsCodingKey.self)
+        try container.encode(scanType, forKey: .init("scanType"))
+        try container.encode(activeRoute, forKey: .init("activeRoute"))
+        try container.encode(decoderCallbacksPerSecond, forKey: .init("decoderCallbacksPerSecond"))
+        try container.encode(presentationsPerSecond, forKey: .init("presentationsPerSecond"))
+        try container.encode(yadifKernelDispatchCount, forKey: .init("yadifKernelDispatchCount"))
+        try container.encode(staleGenerationDropCount, forKey: .init("staleGenerationDropCount"))
+        try container.encode(droppedVideoFrames, forKey: .init("droppedVideoFrames"))
+        try container.encode(videoDropCountsBySource, forKey: .init("videoDropCountsBySource"))
+        try container.encodeIfPresent(lastVideoDecodeFailure, forKey: .init("lastVideoDecodeFailure"))
+        try container.encode(maximumPresentationQueueDepth, forKey: .init("maximumPresentationQueueDepth"))
+        try container.encode(maximumYADIFInFlightCount, forKey: .init("maximumYADIFInFlightCount"))
+        try container.encode(maximumYADIFInputDepth, forKey: .init("maximumYADIFInputDepth"))
+        try container.encode(gpuDurationP95Milliseconds, forKey: .init("gpuDurationP95Milliseconds"))
+        try container.encode(yadifCPUEncodeP95Milliseconds, forKey: .init("yadifCPUEncodeP95Milliseconds"))
+        try container.encode(renderCPUPreparationP95Milliseconds, forKey: .init("renderCPUPreparationP95Milliseconds"))
+        try container.encode(avDriftP95Milliseconds, forKey: .init("avDriftP95Milliseconds"))
+        try container.encode(residentMemoryBytes, forKey: .init("residentMemoryBytes"))
+        try container.encode(elapsedSeconds, forKey: .init("elapsedSeconds"))
+        try container.encode(windowDurationSeconds, forKey: .init("windowDurationSeconds"))
+        try container.encode(presentedVideoFrames, forKey: .init("presentedVideoFrames"))
+        try container.encode(presentationPTSRegressionCount, forKey: .init("presentationPTSRegressionCount"))
+        try container.encode(maximumAbsoluteAVDriftMilliseconds, forKey: .init("maximumAbsoluteAVDriftMilliseconds"))
+        try container.encode(crossGenerationPresentationCount, forKey: .init("crossGenerationPresentationCount"))
+        try container.encode(audioRoute, forKey: .init("audioRoute"))
+        try container.encode(audioReady, forKey: .init("audioReady"))
+        try container.encode(readinessOpen, forKey: .init("readinessOpen"))
+        try container.encode(retainedAudioCount, forKey: .init("retainedAudioCount"))
+        try container.encode(retainedVideoCount, forKey: .init("retainedVideoCount"))
+        try container.encode(audioContinuityDropCountsByReason, forKey: .init("audioContinuityDropCountsByReason"))
+        try container.encode(audioShortGapCount, forKey: .init("audioShortGapCount"))
+        try container.encode(audioLargeGapCount, forKey: .init("audioLargeGapCount"))
+        try container.encode(audioContinuityIslandSwitchCount, forKey: .init("audioContinuityIslandSwitchCount"))
+        try container.encodeIfPresent(audioFirstPTSSeconds, forKey: .init("audioFirstPTSSeconds"))
+        try container.encode(audioDurationSeconds, forKey: .init("audioDurationSeconds"))
+        try container.encodeIfPresent(videoFirstPTSSeconds, forKey: .init("videoFirstPTSSeconds"))
+        try container.encodeIfPresent(videoLatestPTSSeconds, forKey: .init("videoLatestPTSSeconds"))
+        try container.encode(audioRelativeVideoPruneCount, forKey: .init("audioRelativeVideoPruneCount"))
+        try container.encode(readinessCycleID, forKey: .init("readinessCycleID"))
+        try container.encode(readinessCloseReasonCounts, forKey: .init("readinessCloseReasonCounts"))
+        try container.encode(displayResumeCount, forKey: .init("displayResumeCount"))
+        try container.encodeIfPresent(clockTimeSeconds, forKey: .init("clockTimeSeconds"))
+        try container.encode(videoResyncCount, forKey: .init("videoResyncCount"))
+        try container.encode(audioRecoveryCount, forKey: .init("audioRecoveryCount"))
+        try container.encode(audioAutomaticFlushTriggerCount, forKey: .init("audioAutomaticFlushTriggerCount"))
+        try container.encode(audioOutputConfigurationTriggerCount, forKey: .init("audioOutputConfigurationTriggerCount"))
+        try container.encode(audioRouteChangeTriggerCount, forKey: .init("audioRouteChangeTriggerCount"))
+        try container.encode(audioRecoveryTransactionCount, forKey: .init("audioRecoveryTransactionCount"))
+        try container.encode(audioSuppressedCorrelatedTriggerCount, forKey: .init("audioSuppressedCorrelatedTriggerCount"))
+        try container.encode(audioCompressedRendererRetryCount, forKey: .init("audioCompressedRendererRetryCount"))
+        try container.encode(audioPCMFallbackCount, forKey: .init("audioPCMFallbackCount"))
+        try container.encodeIfPresent(audioLastFallbackReason, forKey: .init("audioLastFallbackReason"))
+        try container.encode(audioStartupWaitingSeconds, forKey: .init("audioStartupWaitingSeconds"))
+        try container.encode(audioRendererReady, forKey: .init("audioRendererReady"))
+        try container.encode(audioRendererSufficient, forKey: .init("audioRendererSufficient"))
+        try container.encodeIfPresent(audioActiveCodec, forKey: .init("audioActiveCodec"))
+        try container.encodeIfPresent(audioFormatFingerprint, forKey: .init("audioFormatFingerprint"))
+        try container.encode(audioOutputCategory, forKey: .init("audioOutputCategory"))
+        try container.encode(audioRouteRevision, forKey: .init("audioRouteRevision"))
+        try container.encodeIfPresent(audioMediaGeneration, forKey: .init("audioMediaGeneration"))
+        try container.encodeIfPresent(audioLastCompressedRendererFailure, forKey: .init("audioLastCompressedRendererFailure"))
+        try container.encode(audioAcceptedCompressedMediaDurationSeconds, forKey: .init("audioAcceptedCompressedMediaDurationSeconds"))
+        try container.encode(audioPendingSampleCount, forKey: .init("audioPendingSampleCount"))
+        try container.encode(audioRendererRequestArmed, forKey: .init("audioRendererRequestArmed"))
+        try container.encode(audioRendererBackpressureCount, forKey: .init("audioRendererBackpressureCount"))
+        try container.encode(audioRendererRequestRearmCount, forKey: .init("audioRendererRequestRearmCount"))
+        try container.encode(audioAutomaticFlushNoProgressCount, forKey: .init("audioAutomaticFlushNoProgressCount"))
+        try container.encodeIfPresent(audioLastAcceptedPTSSeconds, forKey: .init("audioLastAcceptedPTSSeconds"))
+        try container.encodeIfPresent(audioLastRendererProgressAgeSeconds, forKey: .init("audioLastRendererProgressAgeSeconds"))
+        try container.encode(renderTickCount, forKey: .init("renderTickCount"))
+        try container.encode(renderSkippedInFlightCount, forKey: .init("renderSkippedInFlightCount"))
+        try container.encode(displayLinkCallbackCount, forKey: .init("displayLinkCallbackCount"))
+        try container.encode(nativeDisplayIntervalMilliseconds, forKey: .init("nativeDisplayIntervalMilliseconds"))
+        try container.encode(missedDisplayLinkVSyncCount, forKey: .init("missedDisplayLinkVSyncCount"))
+        try container.encode(displayRefreshHz, forKey: .init("displayRefreshHz"))
+        try container.encode(demuxQueueFullWaitSeconds, forKey: .init("demuxQueueFullWaitSeconds"))
+        try container.encode(demuxAdmitWaitSeconds, forKey: .init("demuxAdmitWaitSeconds"))
+        try container.encode(playbackExecutorBusySeconds, forKey: .init("playbackExecutorBusySeconds"))
+        try container.encode(demuxPacketCount, forKey: .init("demuxPacketCount"))
+        try container.encode(videoAccessUnitCount, forKey: .init("videoAccessUnitCount"))
+        try container.encode(audioSampleCount, forKey: .init("audioSampleCount"))
+        try container.encode(videoDecodeSubmissionCount, forKey: .init("videoDecodeSubmissionCount"))
+        try container.encode(maximumVideoDecodeSubmissionMilliseconds, forKey: .init("maximumVideoDecodeSubmissionMilliseconds"))
+        try container.encode(totalVideoDecodeSubmissionMilliseconds, forKey: .init("totalVideoDecodeSubmissionMilliseconds"))
+        try container.encode(maximumOutstandingDecoderOutputs, forKey: .init("maximumOutstandingDecoderOutputs"))
+        try container.encode(maximumDecodeSubmissionDepth, forKey: .init("maximumDecodeSubmissionDepth"))
+        try container.encode(maximumFramesBeingDecoded, forKey: .init("maximumFramesBeingDecoded"))
+        try container.encodeIfPresent(decoderSessionSummary, forKey: .init("decoderSessionSummary"))
+        try container.encode(decodeCallbackLatencyP95Milliseconds, forKey: .init("decodeCallbackLatencyP95Milliseconds"))
+        try container.encode(videoDecodeSubmissionP95Milliseconds, forKey: .init("videoDecodeSubmissionP95Milliseconds"))
+    }
+
+    internal func uncheckedReplacingAudioContinuityDropCountsByReason(
+        _ counts: [UInt64]
+    ) -> Self {
+        var copy = self
+        copy.audioContinuityDropCountsByReason = counts
+        return copy
+    }
 }
 
 struct PlaybackDiagnosticsChannelID: Sendable, Equatable {
@@ -249,13 +566,23 @@ final class PlaybackMetrics: @unchecked Sendable {
         var readinessOpen = false
         var retainedAudioCount = 0
         var retainedVideoCount = 0
+        var audioContinuityDropCountsByReason = [UInt64](
+            repeating: 0,
+            count: AudioContinuityDropReason.slotCount
+        )
+        var audioShortGapCount: UInt64 = 0
+        var audioLargeGapCount: UInt64 = 0
+        var audioContinuityIslandSwitchCount: UInt64 = 0
         var audioFirstPTSSeconds: Double?
         var audioDurationSeconds = 0.0
         var videoFirstPTSSeconds: Double?
         var videoLatestPTSSeconds: Double?
         var audioRelativeVideoPruneCount: UInt64 = 0
         var readinessCycleID: UInt64 = 0
-        var readinessCloseReasonCounts = [UInt64](repeating: 0, count: 6)
+        var readinessCloseReasonCounts = [UInt64](
+            repeating: 0,
+            count: PlaybackReadinessCloseReason.allCases.count
+        )
         var displayResumeCount: UInt64 = 0
         var clockTimeSeconds: Double?
         var videoResyncCount: UInt64 = 0
@@ -331,7 +658,11 @@ final class PlaybackMetrics: @unchecked Sendable {
         readinessCloseReasonCounts: [UInt64] = [],
         clockTime: CMTime? = nil,
         audioRecoveryCount: UInt64 = 0,
-        audioDiagnostics: AudioRenderDiagnostics = .zero
+        audioDiagnostics: AudioRenderDiagnostics = .zero,
+        audioContinuityDropCountsByReason: [UInt64] = [],
+        audioShortGapCount: UInt64 = 0,
+        audioLargeGapCount: UInt64 = 0,
+        audioContinuityIslandSwitchCount: UInt64 = 0
     ) {
         lock.withLock {
             state.audioRoute = audioRoute == .systemCompressed
@@ -351,6 +682,43 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.clockTimeSeconds = Self.numericSeconds(clockTime)
             state.audioRecoveryCount = audioRecoveryCount
             state.audioDiagnostics = audioDiagnostics
+            let reasonCount = AudioContinuityDropReason.slotCount
+            if audioContinuityDropCountsByReason.isEmpty {
+                // Callers compiled before continuity diagnostics keep the
+                // collector's current bounded counters.
+            } else if audioContinuityDropCountsByReason.count == reasonCount {
+                state.audioContinuityDropCountsByReason =
+                    audioContinuityDropCountsByReason
+            } else {
+                state.audioContinuityDropCountsByReason = [UInt64](
+                    repeating: 0,
+                    count: reasonCount
+                )
+            }
+            state.audioShortGapCount = audioShortGapCount
+            state.audioLargeGapCount = audioLargeGapCount
+            state.audioContinuityIslandSwitchCount =
+                audioContinuityIslandSwitchCount
+        }
+    }
+
+    func updateAudioContinuityDiagnostics(
+        retainedAudioCount: Int,
+        dropCountsByReason: [UInt64],
+        shortGapCount: UInt64,
+        largeGapCount: UInt64,
+        islandSwitchCount: UInt64
+    ) {
+        lock.withLock {
+            let reasonCount = AudioContinuityDropReason.slotCount
+            state.audioContinuityDropCountsByReason =
+                dropCountsByReason.count == reasonCount
+                ? dropCountsByReason
+                : [UInt64](repeating: 0, count: reasonCount)
+            state.audioShortGapCount = shortGapCount
+            state.audioLargeGapCount = largeGapCount
+            state.audioContinuityIslandSwitchCount = islandSwitchCount
+            state.retainedAudioCount = max(0, retainedAudioCount)
         }
     }
 
@@ -700,6 +1068,12 @@ final class PlaybackMetrics: @unchecked Sendable {
             readinessOpen: captured.readinessOpen,
             retainedAudioCount: captured.retainedAudioCount,
             retainedVideoCount: captured.retainedVideoCount,
+            audioContinuityDropCountsByReason:
+                captured.audioContinuityDropCountsByReason,
+            audioShortGapCount: captured.audioShortGapCount,
+            audioLargeGapCount: captured.audioLargeGapCount,
+            audioContinuityIslandSwitchCount:
+                captured.audioContinuityIslandSwitchCount,
             audioFirstPTSSeconds: captured.audioFirstPTSSeconds,
             audioDurationSeconds: captured.audioDurationSeconds,
             videoFirstPTSSeconds: captured.videoFirstPTSSeconds,
@@ -736,6 +1110,18 @@ final class PlaybackMetrics: @unchecked Sendable {
                 captured.audioDiagnostics.lastCompressedRendererFailure,
             audioAcceptedCompressedMediaDurationSeconds:
                 captured.audioDiagnostics.acceptedCompressedMediaDurationSeconds,
+            audioPendingSampleCount: captured.audioDiagnostics.pendingSampleCount,
+            audioRendererRequestArmed: captured.audioDiagnostics.rendererRequestArmed,
+            audioRendererBackpressureCount:
+                captured.audioDiagnostics.rendererBackpressureCount,
+            audioRendererRequestRearmCount:
+                captured.audioDiagnostics.rendererRequestRearmCount,
+            audioAutomaticFlushNoProgressCount:
+                captured.audioDiagnostics.automaticFlushNoProgressCount,
+            audioLastAcceptedPTSSeconds:
+                captured.audioDiagnostics.lastAcceptedPTSSeconds,
+            audioLastRendererProgressAgeSeconds:
+                captured.audioDiagnostics.lastRendererProgressAgeSeconds,
             renderTickCount: captured.renderTickCount,
             renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
             displayLinkCallbackCount: captured.displayLinkCallbackCount,

@@ -16,10 +16,15 @@ struct DemuxPacket: Sendable, Equatable {
     let isCorrupt: Bool
 }
 
+enum DemuxDiscontinuityReason: Sendable, Equatable {
+    case formatChange
+    case timelineReset
+}
+
 enum DemuxEvent: Sendable, Equatable {
     case tracks(DemuxTrackSet)
     case packet(DemuxPacket)
-    case discontinuity(DemuxTrackSet)
+    case discontinuity(DemuxTrackSet, reason: DemuxDiscontinuityReason)
     case endOfStream
     case cancelled
     case failure(PlaybackCoreError)

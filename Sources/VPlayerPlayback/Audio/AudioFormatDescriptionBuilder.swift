@@ -14,45 +14,27 @@ struct BuiltAudioFormat {
 enum AudioFormatDescriptionBuilder {
     static let invalidLayoutErrorCode: Int32 = -1_448_208_898
 
-    static func make(
-        codec: AudioCodec,
-        sampleRate: Int32,
-        channelLayout: AudioChannelLayout,
-        cookie: Data?
-    ) throws -> BuiltAudioFormat {
-        guard sampleRate > 0, channelLayout.channelCount > 0 else {
+    static func make(_ format: SystemCompressedAudioFormat) throws -> BuiltAudioFormat {
+        guard format.sampleRate > 0, format.channelCount > 0 else {
             throw PlaybackCoreError.audioFallbackDecode(invalidLayoutErrorCode)
         }
-        let formatID: AudioFormatID
-        let framesPerPacket: UInt32
-        switch codec {
-        case .aac:
-            formatID = kAudioFormatMPEG4AAC
-            framesPerPacket = 1_024
-        case .ac3:
-            formatID = kAudioFormatAC3
-            framesPerPacket = 1_536
-        case .eac3:
-            formatID = kAudioFormatEnhancedAC3
-            framesPerPacket = 0
-        case .mp2:
-            formatID = kAudioFormatMPEGLayer2
-            framesPerPacket = 1_152
-        }
         var streamDescription = AudioStreamBasicDescription(
-            mSampleRate: Float64(sampleRate),
-            mFormatID: formatID,
+            mSampleRate: Float64(format.sampleRate),
+            mFormatID: format.formatID,
             mFormatFlags: 0,
             mBytesPerPacket: 0,
-            mFramesPerPacket: framesPerPacket,
+            mFramesPerPacket: format.framesPerPacket,
             mBytesPerFrame: 0,
-            mChannelsPerFrame: UInt32(channelLayout.channelCount),
+            mChannelsPerFrame: UInt32(format.channelCount),
             mBitsPerChannel: 0,
             mReserved: 0
         )
-        var coreAudioLayout = try makeCoreAudioLayout(channelLayout)
+        var coreAudioLayout = try makeCoreAudioLayout(
+            format.layout,
+            channelCount: format.channelCount
+        )
         var result: CMAudioFormatDescription?
-        let status = withCookie(cookie) { cookiePointer, cookieSize in
+        let status = withCookie(format.magicCookie) { cookiePointer, cookieSize in
             withUnsafePointer(to: &coreAudioLayout) { layoutPointer in
                 CMAudioFormatDescriptionCreate(
                     allocator: kCFAllocatorDefault,
@@ -73,32 +55,47 @@ enum AudioFormatDescriptionBuilder {
     }
 
     private static func makeCoreAudioLayout(
-        _ layout: AudioChannelLayout
+        _ layout: CoreAudioLayoutSpec,
+        channelCount: Int32
     ) throws -> AudioToolbox.AudioChannelLayout {
-        if let nativeMask = layout.nativeMask {
-            let supportedMask: UInt64 = (1 << 18) - 1
-            guard nativeMask != 0,
-                  nativeMask & ~supportedMask == 0,
-                  nativeMask.nonzeroBitCount == layout.channelCount,
-                  let bitmap = UInt32(exactly: nativeMask) else {
+        switch layout {
+        case let .tag(tag, equivalentBitmap):
+            guard tag != kAudioChannelLayoutTag_UseChannelBitmap,
+                  tag & 0xFFFF == UInt32(channelCount),
+                  equivalentBitmap.rawValue != 0,
+                  equivalentBitmap.rawValue.nonzeroBitCount == channelCount else {
+                throw PlaybackCoreError.audioFallbackDecode(invalidLayoutErrorCode)
+            }
+            return AudioToolbox.AudioChannelLayout(
+                mChannelLayoutTag: tag,
+                mChannelBitmap: AudioChannelBitmap(rawValue: 0),
+                mNumberChannelDescriptions: 0,
+                mChannelDescriptions: (AudioChannelDescription(),)
+            )
+        case let .bitmap(bitmap):
+            let supportedMask: UInt32 = (1 << 18) - 1
+            guard bitmap.rawValue != 0,
+                  bitmap.rawValue & ~supportedMask == 0,
+                  bitmap.rawValue.nonzeroBitCount == channelCount else {
                 throw PlaybackCoreError.audioFallbackDecode(invalidLayoutErrorCode)
             }
             return AudioToolbox.AudioChannelLayout(
                 mChannelLayoutTag: kAudioChannelLayoutTag_UseChannelBitmap,
-                mChannelBitmap: AudioChannelBitmap(rawValue: bitmap),
+                mChannelBitmap: bitmap,
+                mNumberChannelDescriptions: 0,
+                mChannelDescriptions: (AudioChannelDescription(),)
+            )
+        case let .discrete(count):
+            guard count > 0, count == UInt32(exactly: channelCount) else {
+                throw PlaybackCoreError.audioFallbackDecode(invalidLayoutErrorCode)
+            }
+            return AudioToolbox.AudioChannelLayout(
+                mChannelLayoutTag: kAudioChannelLayoutTag_DiscreteInOrder | count,
+                mChannelBitmap: AudioChannelBitmap(rawValue: 0),
                 mNumberChannelDescriptions: 0,
                 mChannelDescriptions: (AudioChannelDescription(),)
             )
         }
-        guard let count = UInt32(exactly: layout.channelCount) else {
-            throw PlaybackCoreError.audioFallbackDecode(invalidLayoutErrorCode)
-        }
-        return AudioToolbox.AudioChannelLayout(
-            mChannelLayoutTag: kAudioChannelLayoutTag_DiscreteInOrder | count,
-            mChannelBitmap: AudioChannelBitmap(rawValue: 0),
-            mNumberChannelDescriptions: 0,
-            mChannelDescriptions: (AudioChannelDescription(),)
-        )
     }
 
     private static func withCookie<Result>(

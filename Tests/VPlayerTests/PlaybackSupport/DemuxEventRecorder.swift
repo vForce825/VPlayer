@@ -201,6 +201,7 @@ final class FakeFFmpegDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
         video: RawTrackSpec? = nil,
         audio: RawTrackSpec? = nil,
         kind: VPFFDemuxEventKind = VPFF_EVENT_TRACKS,
+        discontinuityReason: VPFFDemuxDiscontinuityReason? = nil,
         mutateBorrowedBytesAfterCallback: Bool = false
     ) {
         emit(
@@ -210,6 +211,10 @@ final class FakeFFmpegDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
             audio: audio,
             packet: nil,
             errorKind: VPFF_DEMUX_ERROR_NONE,
+            discontinuityReason: discontinuityReason
+                ?? (kind == VPFF_EVENT_DISCONTINUITY
+                    ? VPFF_DISCONTINUITY_FORMAT_CHANGE
+                    : VPFF_DISCONTINUITY_NONE),
             ffmpegError: 0,
             mutateBorrowedBytesAfterCallback: mutateBorrowedBytesAfterCallback
         )
@@ -308,6 +313,7 @@ final class FakeFFmpegDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
         packet: RawPacketSpec?,
         errorKind: VPFFDemuxErrorKind,
         errorStage: VPFFDemuxErrorStage = VPFF_DEMUX_STAGE_NONE,
+        discontinuityReason: VPFFDemuxDiscontinuityReason = VPFF_DISCONTINUITY_NONE,
         ffmpegError: Int32,
         mutateBorrowedBytesAfterCallback: Bool
     ) {
@@ -328,6 +334,7 @@ final class FakeFFmpegDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
                     event.error_kind = errorKind
                     event.error_stage = errorStage
                     event.ffmpeg_error = ffmpegError
+                    event.discontinuity_reason = discontinuityReason
                     withUnsafePointer(to: &event, receiver)
                 }
             }

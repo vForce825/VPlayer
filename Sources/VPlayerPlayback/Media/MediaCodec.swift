@@ -14,6 +14,8 @@ public enum AudioCodec: UInt8, Codable, Sendable, Hashable {
     case ac3 = 2
     case eac3 = 3
     case mp2 = 4
+    case mp1 = 5
+    case mp3 = 6
 }
 
 public enum MediaCodec: Sendable, Hashable {

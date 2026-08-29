@@ -236,11 +236,7 @@ private final class DemuxSessionState: @unchecked Sendable {
 
         if case let .tracks(tracks) = copied.event {
             lastTracks = tracks
-        } else if case let .discontinuity(tracks) = copied.event {
-            if tracks == lastTracks {
-                condition.unlock()
-                return
-            }
+        } else if case let .discontinuity(tracks, _) = copied.event {
             lastTracks = tracks
         }
 
@@ -397,9 +393,21 @@ private enum RawDemuxEventCopier {
                 video: video.video,
                 audio: audio.audio
             )
-            let event: DemuxEvent = raw.kind == VPFF_EVENT_TRACKS
-                ? .tracks(tracks)
-                : .discontinuity(tracks)
+            let event: DemuxEvent
+            if raw.kind == VPFF_EVENT_TRACKS {
+                event = .tracks(tracks)
+            } else {
+                let reason: DemuxDiscontinuityReason
+                switch raw.discontinuity_reason {
+                case VPFF_DISCONTINUITY_FORMAT_CHANGE:
+                    reason = .formatChange
+                case VPFF_DISCONTINUITY_TIMELINE_RESET:
+                    reason = .timelineReset
+                default:
+                    throw RawDemuxCopyError.malformed
+                }
+                event = .discontinuity(tracks, reason: reason)
+            }
             return CopiedDemuxEvent(event: event, byteCount: video.byteCount + audio.byteCount)
         case VPFF_EVENT_PACKET:
             guard raw.error_stage == VPFF_DEMUX_STAGE_NONE,
@@ -604,6 +612,8 @@ private enum RawDemuxEventCopier {
         case VPFF_CODEC_AC3: .ac3
         case VPFF_CODEC_EAC3: .eac3
         case VPFF_CODEC_MP2: .mp2
+        case VPFF_CODEC_MP1: .mp1
+        case VPFF_CODEC_MP3: .mp3
         default: nil
         }
     }

@@ -304,7 +304,7 @@ final class PlaybackClockTests: XCTestCase {
 
     func testGateAnchorsOncePerCycleAndEveryCloseReasonPausesThenAllowsFreshCycle() {
         let reasons: [PlaybackReadinessCloseReason] = [
-            .flush, .buffering, .pause, .discontinuity, .audioReplacement,
+            .flush, .buffering, .pause, .discontinuity, .audioReplacement, .audioGap,
         ]
         for reason in reasons {
             let harness = makeGate(requiredVideoCount: 1)
@@ -332,6 +332,23 @@ final class PlaybackClockTests: XCTestCase {
 
         XCTAssertTrue(harness.gate.isOpen)
         XCTAssertEqual(harness.clock.anchors.map(\.mediaTime), [.zero, time(5)])
+    }
+
+    func testAudioGapClosePreservesSameTimelineRecoveryFloor() {
+        let harness = makeGate(requiredVideoCount: 1)
+        makeReady(harness.gate, audioPTS: .zero, videoPTS: .zero)
+        harness.clock.currentTime = time(5)
+
+        harness.gate.close(.audioGap)
+        makeReady(harness.gate, audioPTS: .zero, videoPTS: time(5))
+
+        XCTAssertTrue(harness.gate.isOpen)
+        XCTAssertEqual(harness.clock.anchors.map(\.mediaTime), [.zero, time(5)])
+        XCTAssertEqual(harness.gate.closeReasonCounts.count, 7)
+        XCTAssertEqual(
+            harness.gate.closeReasonCounts[Int(PlaybackReadinessCloseReason.audioGap.rawValue)],
+            1
+        )
     }
 
     func testTimelineResetAllowsAnEarlierAnchorForTheNewEpoch() {

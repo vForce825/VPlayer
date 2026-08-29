@@ -159,7 +159,13 @@ final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
 }
 
 final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendable {
-    private typealias PendingCompletion = @Sendable () -> Void
+    private struct PendingCompletion: @unchecked Sendable {
+        let accessUnitID: UInt64
+        let result: Result<[VideoPresentationFrame], PlaybackFailure>
+        let completion: @Sendable (
+            Result<[VideoPresentationFrame], PlaybackFailure>
+        ) -> Void
+    }
 
     private let lock = NSLock()
     let requiredInputFrameCount: Int
@@ -194,7 +200,11 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
         let shouldComplete = lock.withLock { () -> Bool in
             submittedMetadata.append(frame.parserMetadata)
             if !automaticallyCompletes {
-                pendingCompletions.append { completion(result) }
+                pendingCompletions.append(PendingCompletion(
+                    accessUnitID: frame.accessUnitID,
+                    result: result,
+                    completion: completion
+                ))
             }
             return automaticallyCompletes
         }
@@ -210,7 +220,41 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
             defer { pendingCompletions.removeAll(keepingCapacity: false) }
             return pendingCompletions
         }
-        for completion in completions { completion() }
+        for pending in completions { pending.completion(pending.result) }
+    }
+
+    func completePending(accessUnitIDs: Set<UInt64>) {
+        let completions = lock.withLock { () -> [PendingCompletion] in
+            var selected: [PendingCompletion] = []
+            var retained: [PendingCompletion] = []
+            for pending in pendingCompletions {
+                if accessUnitIDs.contains(pending.accessUnitID) {
+                    selected.append(pending)
+                } else {
+                    retained.append(pending)
+                }
+            }
+            pendingCompletions = retained
+            return selected
+        }
+        for pending in completions { pending.completion(pending.result) }
+    }
+
+    func completePending(
+        accessUnitID: UInt64,
+        with result: Result<[VideoPresentationFrame], PlaybackFailure>
+    ) {
+        let completion = lock.withLock { () -> PendingCompletion? in
+            guard let index = pendingCompletions.firstIndex(where: {
+                $0.accessUnitID == accessUnitID
+            }) else { return nil }
+            return pendingCompletions.remove(at: index)
+        }
+        completion?.completion(result)
+    }
+
+    var pendingAccessUnitIDs: [UInt64] {
+        lock.withLock { pendingCompletions.map(\.accessUnitID) }
     }
 
     func snapshot() -> (resets: [MediaGeneration], metadata: [VideoParserMetadata]) {
@@ -295,17 +339,23 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private(set) var configured: [(
         VPlayerPlayback.AudioCodec,
         MediaGeneration,
-        MediaFormatFingerprint
+        MediaFormatFingerprint,
+        Data
     )] = []
     private(set) var samples: [CompressedAudioSample] = []
     private(set) var flushes: [MediaGeneration] = []
+    private(set) var continuityIslandActivations: [(AudioContinuityIslandID, MediaGeneration)] = []
+    private(set) var recoveryFloors: [CMTime?] = []
+    private(set) var anchorPreparations: [(CMTime, AudioContinuityIslandID)] = []
     private(set) var stopCount = 0
     var stopAutomaticallyCompletes = true
     var enqueueError: PlaybackCoreError?
+    var prepareAnchorError: PlaybackCoreError?
     private var flushHandler: (@Sendable (MediaGeneration) -> Void)?
     private var synchronousReadinessHandler: (@Sendable (MediaGeneration) -> Void)?
     private var synchronousReadinessOnFlush = false
     private var synchronousReadinessOnEnqueue = false
+    private var synchronousReadinessOnPrepare = false
     private var synchronousReadinessMaximumCallbackCount = 0
     private var synchronousReadinessCallbackCount = 0
     private var stopContinuations: [CheckedContinuation<Void, Never>] = []
@@ -314,12 +364,17 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     var route: VPlayerPlayback.AudioRoute { lock.withLock { selectedRoute } }
 
     func configure(
-        format _: CMAudioFormatDescription,
-        codec: VPlayerPlayback.AudioCodec,
-        generation: MediaGeneration,
-        fingerprint: MediaFormatFingerprint
+        _ configuration: CompressedAudioRenderConfiguration,
+        generation: MediaGeneration
     ) throws {
-        lock.withLock { configured.append((codec, generation, fingerprint)) }
+        lock.withLock {
+            configured.append((
+                configuration.codec,
+                generation,
+                configuration.fingerprint,
+                configuration.decoderExtradata
+            ))
+        }
     }
 
     func enqueue(_ sample: CompressedAudioSample) throws {
@@ -334,6 +389,46 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
             return synchronousReadinessHandler
         }
         readinessHandler?(sample.generation)
+    }
+
+    func activateContinuityIsland(
+        _ islandID: AudioContinuityIslandID,
+        generation: MediaGeneration
+    ) {
+        lock.withLock {
+            continuityIslandActivations.append((islandID, generation))
+            samples.removeAll(keepingCapacity: true)
+        }
+    }
+
+    func updateRecoveryFloor(_ floor: CMTime?) {
+        lock.withLock { recoveryFloors.append(floor) }
+    }
+
+    func prepareAnchor(
+        at commonPTS: CMTime,
+        in islandID: AudioContinuityIslandID
+    ) throws {
+        let result = lock.withLock { () -> (
+            PlaybackCoreError?,
+            (@Sendable (MediaGeneration) -> Void)?,
+            MediaGeneration?
+        ) in
+            anchorPreparations.append((commonPTS, islandID))
+            let readinessHandler: (@Sendable (MediaGeneration) -> Void)?
+            if synchronousReadinessOnPrepare,
+               synchronousReadinessCallbackCount
+                    < synchronousReadinessMaximumCallbackCount,
+               let synchronousReadinessHandler {
+                synchronousReadinessCallbackCount += 1
+                readinessHandler = synchronousReadinessHandler
+            } else {
+                readinessHandler = nil
+            }
+            return (prepareAnchorError, readinessHandler, configured.last?.1)
+        }
+        if let generation = result.2 { result.1?(generation) }
+        if let error = result.0 { throw error }
     }
 
     func flush(to generation: MediaGeneration) {
@@ -389,12 +484,14 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     func setSynchronousReadinessCallback(
         onFlush: Bool = false,
         onEnqueue: Bool = false,
+        onPrepare: Bool = false,
         maxCallbacks: Int = 1,
         _ handler: (@Sendable (MediaGeneration) -> Void)?
     ) {
         lock.withLock {
             synchronousReadinessOnFlush = onFlush
             synchronousReadinessOnEnqueue = onEnqueue
+            synchronousReadinessOnPrepare = onPrepare
             synchronousReadinessMaximumCallbackCount = max(0, maxCallbacks)
             synchronousReadinessHandler = handler
             synchronousReadinessCallbackCount = 0
@@ -409,15 +506,28 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
         configured: [(
             VPlayerPlayback.AudioCodec,
             MediaGeneration,
-            MediaFormatFingerprint
+            MediaFormatFingerprint,
+            Data
         )],
         samples: [CompressedAudioSample],
         flushes: [MediaGeneration],
+        continuityIslandActivations: [(AudioContinuityIslandID, MediaGeneration)],
+        recoveryFloors: [CMTime?],
+        anchorPreparations: [(CMTime, AudioContinuityIslandID)],
         stops: Int,
         isStopWaiting: Bool
     ) {
         lock.withLock {
-            (configured, samples, flushes, stopCount, !stopContinuations.isEmpty)
+            (
+                configured,
+                samples,
+                flushes,
+                continuityIslandActivations,
+                recoveryFloors,
+                anchorPreparations,
+                stopCount,
+                !stopContinuations.isEmpty
+            )
         }
     }
 }
@@ -585,8 +695,10 @@ final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecke
             trackSet: trackSet,
             generationProvider: generationProvider,
             eventSink: { [weak self] event in
-                if case let .format(_, _, fingerprint) = event {
-                    self?.lock.withLock { self?.formatFingerprints.append(fingerprint) }
+                if case let .format(configuration) = event {
+                    self?.lock.withLock {
+                        self?.formatFingerprints.append(configuration.fingerprint)
+                    }
                 }
                 eventSink(event)
             },
@@ -686,26 +798,46 @@ enum PlaybackFakeMedia {
         return value
     }
 
-    static func audioSample(
+    static func audioConfiguration(
+        fingerprint: MediaFormatFingerprint,
+        decoderExtradata: Data = Data([0x12, 0x10])
+    ) throws -> CompressedAudioRenderConfiguration {
+        CompressedAudioRenderConfiguration(
+            formatDescription: try audioFormat(),
+            codec: .aac,
+            decoderExtradata: decoderExtradata,
+            fingerprint: fingerprint
+        )
+    }
+
+    static func audioSystemFingerprintComponent(
+        magicCookie: Data? = Data()
+    ) -> AudioSystemFormatFingerprintComponent {
+        AudioSystemFormatFingerprintComponent(
+            profileID: .aacLC,
+            formatID: kAudioFormatMPEG4AAC,
+            sampleRate: 48_000,
+            channelCount: 2,
+            framesPerPacket: 1_024,
+            layout: .bitmap(AudioChannelBitmap(rawValue: 3)),
+            magicCookie: magicCookie
+        )
+    }
+
+    static func audioFrame(
         id: UInt64,
         generation: MediaGeneration,
         pts: CMTime,
         duration: CMTime
-    ) throws -> CompressedAudioSample {
-        let format = try audioFormat()
-        let buffer = try SampleBufferBuilder.makeAudio(
-            data: Data([0x00]),
-            formatDescription: format,
-            presentationTimeStamp: pts,
-            variableFramesInPacket: UInt32(max(1, duration.seconds * 48_000))
-        )
-        return CompressedAudioSample(
+    ) -> CompressedAudioFrame {
+        return CompressedAudioFrame(
             id: id,
-            sampleBuffer: buffer,
+            payload: Data([UInt8(truncatingIfNeeded: id), 0xA5]),
             codec: .aac,
             generation: generation,
             presentationTimeStamp: pts,
-            duration: duration
+            duration: duration,
+            frameSampleCount: 1_024
         )
     }
 

@@ -27,6 +27,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var sufficient = false
     private var maximumEnqueuesPerReadyCallback = Int.max
     private var enqueuesSinceReadyCallback = 0
+    private var enqueueResults: [AudioRendererEnqueueResult] = []
     private var readyHandler: (@Sendable () -> Void)?
     private var eventHandler: (@Sendable (AudioRendererEvent) -> Void)?
     private var operations: [String] = []
@@ -68,24 +69,32 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         }
     }
 
-    func enqueue(_ sampleBuffer: CMSampleBuffer) throws {
+    func configureEnqueueResults(_ results: [AudioRendererEnqueueResult]) {
+        withLock { enqueueResults = results }
+    }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
         let formatID = CMSampleBufferGetFormatDescription(sampleBuffer)
             .map(CMFormatDescriptionGetMediaSubType) ?? 0
-        try withLock {
+        return try withLock {
             guard attached else {
                 throw PlaybackCoreError.audioRendererFailed("fake.not-attached")
-            }
-            guard ready, enqueuesSinceReadyCallback < maximumEnqueuesPerReadyCallback else {
-                throw PlaybackCoreError.audioRendererFailed("fake.unready")
             }
             let expectedPCM = mediaKind == .linearPCM
             guard (formatID == kAudioFormatLinearPCM) == expectedPCM else {
                 throw PlaybackCoreError.audioRendererFailed("fake.mixed-media")
             }
+            let scriptedResult = enqueueResults.isEmpty ? nil : enqueueResults.removeFirst()
+            guard scriptedResult != .backpressured,
+                  ready,
+                  enqueuesSinceReadyCallback < maximumEnqueuesPerReadyCallback else {
+                return .backpressured
+            }
             operations.append("enqueue")
             enqueuedFormatIDs.append(formatID)
             enqueuedPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             enqueuesSinceReadyCallback += 1
+            return .accepted
         }
     }
 
@@ -145,6 +154,10 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         withLock { eventHandler }
     }
 
+    func captureReadyHandler() -> (@Sendable () -> Void)? {
+        withLock { readyHandler }
+    }
+
     var snapshot: Snapshot {
         withLock {
             Snapshot(
@@ -173,10 +186,14 @@ final class FakeAudioRendererFactory: AudioRendererFactory, @unchecked Sendable 
     private var nextIdentity: UInt64 = 1
     private var renderers: [FakeAudioRenderer] = []
     private var createError: PlaybackCoreError?
+    private var nextCreateErrors: [(AudioRendererMediaKind, PlaybackCoreError)] = []
 
     func makeRenderer(mediaKind: AudioRendererMediaKind) throws -> any AudioRenderer {
         lock.lock()
         defer { lock.unlock() }
+        if let index = nextCreateErrors.firstIndex(where: { $0.0 == mediaKind }) {
+            throw nextCreateErrors.remove(at: index).1
+        }
         if let createError { throw createError }
         let renderer = FakeAudioRenderer(identity: nextIdentity, mediaKind: mediaKind)
         nextIdentity += 1
@@ -186,6 +203,13 @@ final class FakeAudioRendererFactory: AudioRendererFactory, @unchecked Sendable 
 
     func configureCreateError(_ error: PlaybackCoreError?) {
         lock.withLock { createError = error }
+    }
+
+    func configureNextCreateError(
+        _ error: PlaybackCoreError,
+        for mediaKind: AudioRendererMediaKind
+    ) {
+        lock.withLock { nextCreateErrors.append((mediaKind, error)) }
     }
 
     var snapshot: [FakeAudioRenderer] {
@@ -204,14 +228,21 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
 
     private let lock = NSLock()
     private var clockTime = CMTime.zero
+    private var currentTimeReads = 0
     private var currentRate: Float = 0
     private var attached: [AudioRendererIdentity] = []
     private var operations: [String] = []
     private var rateChanges: [(Float, CMTime)] = []
     private var removals: [Removal] = []
     private var attachError: PlaybackCoreError?
+    private var nextAttachError: PlaybackCoreError?
 
-    func currentTime() -> CMTime { withLock { clockTime } }
+    func currentTime() -> CMTime {
+        withLock {
+            currentTimeReads += 1
+            return clockTime
+        }
+    }
     var rate: Float { withLock { currentRate } }
 
     func setCurrentTime(_ value: CMTime) {
@@ -220,6 +251,10 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
 
     func attach(_ renderer: any AudioRenderer) throws {
         try withLock {
+            if let nextAttachError {
+                self.nextAttachError = nil
+                throw nextAttachError
+            }
             if let attachError { throw attachError }
             operations.append("attach:\(renderer.identity.rawValue)")
             attached.append(renderer.identity)
@@ -229,6 +264,10 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
 
     func configureAttachError(_ error: PlaybackCoreError?) {
         withLock { attachError = error }
+    }
+
+    func configureNextAttachError(_ error: PlaybackCoreError) {
+        withLock { nextAttachError = error }
     }
 
     func remove(
@@ -264,6 +303,7 @@ final class FakeAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendable
     var attachedSnapshot: [AudioRendererIdentity] { withLock { attached } }
     var rateSnapshot: [(Float, CMTime)] { withLock { rateChanges } }
     var removalCount: Int { withLock { removals.count } }
+    var currentTimeReadCount: Int { withLock { currentTimeReads } }
 
     @discardableResult
     private func withLock<Result>(_ body: () throws -> Result) rethrows -> Result {
@@ -316,10 +356,16 @@ final class FakePCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
 }
 
 final class FakePCMAudioDecoderFactory: PCMAudioDecoderFactory, @unchecked Sendable {
+    struct Creation: Sendable, Equatable {
+        let codec: VPlayerPlayback.AudioCodec
+        let extradata: Data
+    }
+
     private let lock = NSLock()
     var createError: PlaybackCoreError?
     var pushBody: FakePCMAudioDecoder.PushBody
     private var decoders: [FakePCMAudioDecoder] = []
+    private var creations: [Creation] = []
 
     init(pushBody: @escaping FakePCMAudioDecoder.PushBody) {
         self.pushBody = pushBody
@@ -327,15 +373,14 @@ final class FakePCMAudioDecoderFactory: PCMAudioDecoderFactory, @unchecked Senda
 
     func makeDecoder(
         codec: VPlayerPlayback.AudioCodec,
-        format: CMAudioFormatDescription
+        extradata: Data
     ) throws -> any PCMAudioDecoding {
-        _ = codec
-        _ = format
         if let createError { throw createError }
         let decoder = FakePCMAudioDecoder(pushBody: pushBody)
-        lock.lock()
-        decoders.append(decoder)
-        lock.unlock()
+        lock.withLock {
+            creations.append(Creation(codec: codec, extradata: extradata))
+            decoders.append(decoder)
+        }
         return decoder
     }
 
@@ -343,6 +388,10 @@ final class FakePCMAudioDecoderFactory: PCMAudioDecoderFactory, @unchecked Senda
         lock.lock()
         defer { lock.unlock() }
         return decoders
+    }
+
+    var creationSnapshot: [Creation] {
+        lock.withLock { creations }
     }
 }
 
@@ -525,7 +574,11 @@ final class FakeAudioRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
     }
 }
 
-final class FakeAudioFormatSupportChecker: AudioFormatSupportChecking, @unchecked Sendable {
+final class FakeAudioFormatSupportChecker:
+    SystemAudioDecodeCapabilityChecking,
+    PCMOutputFormatValidating,
+    @unchecked Sendable
+{
     private let lock = NSLock()
     var compressedSupported = true
     var pcmSupported = true
@@ -533,22 +586,20 @@ final class FakeAudioFormatSupportChecker: AudioFormatSupportChecking, @unchecke
     private var checks: [(AudioRoute, AudioOutputCategory)] = []
     private var formatIDs: [AudioFormatID] = []
 
-    func supports(
-        format: CMAudioFormatDescription,
-        route: AudioRoute,
-        output: AudioOutputCategory
-    ) -> Bool {
-        _ = format
+    func supportsDecoding(formatID: AudioFormatID) -> Bool {
+        lock.withLock { compressedSupported }
+    }
+
+    func isValidPCMOutput(_ format: CMAudioFormatDescription) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        checks.append((route, output))
+        checks.append((.ffmpegPCM, .none))
         let formatID = CMFormatDescriptionGetMediaSubType(format)
         formatIDs.append(formatID)
         if requireRouteMatchingFormat {
-            let isPCM = formatID == kAudioFormatLinearPCM
-            guard isPCM == (route == .ffmpegPCM) else { return false }
+            guard formatID == kAudioFormatLinearPCM else { return false }
         }
-        return route == .systemCompressed ? compressedSupported : pcmSupported
+        return pcmSupported
     }
 
     var checkSnapshot: [(AudioRoute, AudioOutputCategory)] {
@@ -561,5 +612,42 @@ final class FakeAudioFormatSupportChecker: AudioFormatSupportChecking, @unchecke
         lock.lock()
         defer { lock.unlock() }
         return formatIDs
+    }
+}
+
+final class FakeCoreAudioDecodeCapabilityChecker:
+    SystemAudioDecodeCapabilityChecking,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    var supported = true
+    private var formatIDs: [AudioFormatID] = []
+
+    func supportsDecoding(formatID: AudioFormatID) -> Bool {
+        lock.withLock {
+            formatIDs.append(formatID)
+            return supported
+        }
+    }
+
+    var formatIDSnapshot: [AudioFormatID] {
+        lock.withLock { formatIDs }
+    }
+}
+
+final class FakePCMOutputFormatValidator: PCMOutputFormatValidating, @unchecked Sendable {
+    private let lock = NSLock()
+    var supported = true
+    private var formatIDs: [AudioFormatID] = []
+
+    func isValidPCMOutput(_ format: CMAudioFormatDescription) -> Bool {
+        lock.withLock {
+            formatIDs.append(CMFormatDescriptionGetMediaSubType(format))
+            return supported
+        }
+    }
+
+    var formatIDSnapshot: [AudioFormatID] {
+        lock.withLock { formatIDs }
     }
 }

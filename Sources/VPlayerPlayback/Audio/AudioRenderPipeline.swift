@@ -7,6 +7,28 @@ import CoreMedia
 import CryptoKit
 import Foundation
 
+struct AudioAutomaticFlushProgressOriginTracker: Sendable {
+    private var currentTicket: AudioRendererProgressTicket?
+
+    var retainedTicketCount: Int {
+        currentTicket == nil ? 0 : 1
+    }
+
+    mutating func markCurrent(_ ticket: AudioRendererProgressTicket) {
+        currentTicket = ticket
+    }
+
+    mutating func consumeIfCurrent(_ ticket: AudioRendererProgressTicket) -> Bool {
+        guard currentTicket == ticket else { return false }
+        currentTicket = nil
+        return true
+    }
+
+    mutating func clear() {
+        currentTicket = nil
+    }
+}
+
 private final class AudioReadyCallbackGate: @unchecked Sendable {
     private let lock = NSLock()
     private var pending = false
@@ -35,13 +57,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     static let removalFailedError = "audio.renderer.remove"
     static let unsupportedPCMError = "audio.pcm.unsupported"
     static let isolationError = "audio.executor.isolation"
-    // Compressed replay is recovery history. It must span a conventional live
-    // HLS segment; bounding it to 96 AAC packets retained barely two seconds and
-    // made an automatic renderer flush unrecoverable in the middle of a five-
-    // second segment. PCM remains separately bounded because it owns decoded
-    // sample memory rather than tiny compressed access units.
-    private static let replayCapacity = 512
-    private static let replayHardCapacity = 1_024
+    static let progressTicketExhaustedError =
+        "audio.renderer.progress-ticket-exhausted"
+    // PCM owns decoded sample memory separately from the compressed replay
+    // reservoir, which is governed by CompressedAudioRetentionPolicy.
     private static let pendingPCMCapacity = 96
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
     // Switching from AVFoundation's compressed renderer to the FFmpeg PCM
@@ -50,6 +69,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     // a short preroll, but bound the grace period so a broken replacement can
     // still close readiness and surface the stall.
     private static let fallbackReadinessGrace: DispatchTimeInterval = .seconds(1)
+    private static let progressDeadlineDelay: DispatchTimeInterval = .seconds(1)
     private static let maximumConsecutiveInvalidPackets = 8
 
     private struct DiagnosticsState {
@@ -72,6 +92,15 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         var mediaGeneration: MediaGeneration?
         var lastCompressedRendererFailure: AudioRendererFailureDiagnostic?
         var acceptedCompressedMediaDurationSeconds: Double = 0
+        var pendingSampleCount = 0
+        var rendererRequestArmed = false
+        var rendererBackpressureCount: UInt64 = 0
+        var rendererRequestRearmCount: UInt64 = 0
+        var automaticFlushNoProgressCount: UInt64 = 0
+        var lastAcceptedPTSSeconds: Double?
+        // Private monotonic instant used only to derive an age for the public
+        // snapshot. The instant itself never leaves this state or Codable data.
+        var lastRendererProgressMonotonicInstant: TimeInterval?
 
         func snapshot(at timestamp: TimeInterval) -> AudioRenderDiagnostics {
             let waitingSeconds: Double
@@ -83,6 +112,17 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 waitingSeconds = max(0, timestamp - startupWaitStartedAt)
             } else {
                 waitingSeconds = 0
+            }
+            let progressAgeSeconds: Double?
+            if let lastRendererProgressMonotonicInstant,
+               lastRendererProgressMonotonicInstant.isFinite,
+               timestamp.isFinite {
+                progressAgeSeconds = max(
+                    0,
+                    timestamp - lastRendererProgressMonotonicInstant
+                )
+            } else {
+                progressAgeSeconds = nil
             }
             return AudioRenderDiagnostics(
                 automaticFlushTriggerCount: automaticFlushTriggerCount,
@@ -102,7 +142,14 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 routeRevision: routeRevision,
                 mediaGeneration: mediaGeneration,
                 lastCompressedRendererFailure: lastCompressedRendererFailure,
-                acceptedCompressedMediaDurationSeconds: acceptedCompressedMediaDurationSeconds
+                acceptedCompressedMediaDurationSeconds: acceptedCompressedMediaDurationSeconds,
+                pendingSampleCount: pendingSampleCount,
+                rendererRequestArmed: rendererRequestArmed,
+                rendererBackpressureCount: rendererBackpressureCount,
+                rendererRequestRearmCount: rendererRequestRearmCount,
+                automaticFlushNoProgressCount: automaticFlushNoProgressCount,
+                lastAcceptedPTSSeconds: lastAcceptedPTSSeconds,
+                lastRendererProgressAgeSeconds: progressAgeSeconds
             )
         }
     }
@@ -115,16 +162,18 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private struct ReplayEntry {
+        let retentionID: UInt64
         let sample: CompressedAudioSample
+        let ownedPayloadBytes: Int
+        let coverageStartPTS: CMTime
         var sentCompressed: Bool
         var decoded: Bool
         var acceptedCompressed: Bool
     }
 
-    private struct CompressedAttemptKey: Hashable, Sendable {
-        let generation: MediaGeneration
-        let fingerprint: MediaFormatFingerprint
-        let routeRevision: UInt64
+    private struct ReplayRetentionPlan {
+        let entries: [ReplayEntry]
+        let byteBudget: OwnedByteBudget
     }
 
     private enum RemovalContinuation: Sendable {
@@ -154,13 +203,15 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private let rendererFactory: any AudioRendererFactory
     private let decoderFactory: any PCMAudioDecoderFactory
     private let routeMonitor: any AudioRouteMonitoring
-    private let supportChecker: any AudioFormatSupportChecking
+    private let decodeCapabilityChecker: any SystemAudioDecodeCapabilityChecking
+    private let pcmOutputValidator: any PCMOutputFormatValidating
     private let recoveryScheduler: RecoveryScheduler
     private let diagnosticsNow: DiagnosticsNow
     private let clockMode: AudioClockMode
     private let readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)?
+    private let replayRetentionLimits: CompressedAudioRetentionLimits
+    private let replayHardCount: Int
     private let snapshotLock = NSLock()
-    private let readyCallbackGate = AudioReadyCallbackGate()
     private var publicSnapshot = PublicSnapshot()
 
     private var nextEpoch: UInt64? = 1
@@ -170,24 +221,33 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var fingerprint: MediaFormatFingerprint?
     private var pcmOutputFormat: CMAudioFormatDescription?
     private var codec: AudioCodec?
+    private var decoderExtradata = Data()
     private var renderer: (any AudioRenderer)?
     private var decoder: (any PCMAudioDecoding)?
     private var replay: [ReplayEntry] = []
+    private var replayByteBudget: OwnedByteBudget
+    private var recoveryFloor: CMTime?
+    private var nextReplayRetentionID: UInt64? = 1
     private var pendingPCM: [CMSampleBuffer] = []
+    private var activeContinuityIslandID: AudioContinuityIslandID?
+    private var needsDecoderResetBeforeNextCompressedEnqueue = false
     private var pcmPrerollStart: CMTime?
     private var pcmPrerollEnd: CMTime?
     private var acceptedCompressedRunStart: CMTime?
     private var acceptedCompressedRunEnd: CMTime?
     private var consecutiveInvalidPacketCount = 0
     private var rendererAttached = false
-    private var rendererRequesting = false
+    private var rendererPumpState = AudioRendererPumpState()
+    private var rendererDemandProgress = AudioRendererDemandProgressState()
     private var startupPrerollSatisfied = false
     private var replacing = false
     private var terminal = false
     private var configured = false
     private var stopped = true
     private var fallbackUsed = false
-    private var retriedCompressedAttemptKey: CompressedAttemptKey?
+    private var progressMonitor: AudioRendererRecoveryProgressMonitor
+    private var automaticFlushProgressOrigin =
+        AudioAutomaticFlushProgressOriginTracker()
     private var needsAnchor = false
     private var pendingReevaluation = false
     private var recoveryCoordinator = AudioRecoveryCoordinator()
@@ -213,7 +273,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             rendererFactory: SystemAudioRendererFactory(),
             decoderFactory: LivePCMAudioDecoderFactory(),
             routeMonitor: AudioOutputRouteMonitor(executor: executor),
-            supportChecker: SystemAudioFormatSupportChecker(),
+            decodeCapabilityChecker: CoreAudioDecodeCapabilityChecker(),
+            pcmOutputValidator: PCMOutputFormatValidator(),
             clockMode: clockMode,
             readinessSink: readinessSink
         )
@@ -226,11 +287,16 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         rendererFactory: any AudioRendererFactory,
         decoderFactory: any PCMAudioDecoderFactory,
         routeMonitor: any AudioRouteMonitoring,
-        supportChecker: any AudioFormatSupportChecking,
+        decodeCapabilityChecker: any SystemAudioDecodeCapabilityChecking,
+        pcmOutputValidator: any PCMOutputFormatValidating,
         recoveryScheduler: RecoveryScheduler? = nil,
         diagnosticsNow: @escaping DiagnosticsNow = { ProcessInfo.processInfo.systemUptime },
         clockMode: AudioClockMode = .standalone,
-        readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)? = nil
+        readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)? = nil,
+        replayRetentionLimits: CompressedAudioRetentionLimits =
+            CompressedAudioRetentionPolicy.replay,
+        replayHardCount: Int = CompressedAudioRetentionPolicy.replayHardCount,
+        testingProgressDeadlineTicketStart: UInt64? = nil
     ) {
         self.synchronizer = synchronizer
         self.executor = executor
@@ -238,13 +304,22 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         self.rendererFactory = rendererFactory
         self.decoderFactory = decoderFactory
         self.routeMonitor = routeMonitor
-        self.supportChecker = supportChecker
+        self.decodeCapabilityChecker = decodeCapabilityChecker
+        self.pcmOutputValidator = pcmOutputValidator
         self.recoveryScheduler = recoveryScheduler ?? { delay, operation in
             executor.submit(after: delay, operation)
         }
         self.diagnosticsNow = diagnosticsNow
         self.clockMode = clockMode
         self.readinessSink = readinessSink
+        self.replayRetentionLimits = replayRetentionLimits
+        self.replayHardCount = replayHardCount
+        progressMonitor = testingProgressDeadlineTicketStart.map {
+            AudioRendererRecoveryProgressMonitor(testingNextTicketRawValue: $0)
+        } ?? AudioRendererRecoveryProgressMonitor()
+        replayByteBudget = OwnedByteBudget(
+            limit: replayRetentionLimits.maximumOwnedBytes
+        )
     }
 
     var isReadyForPlayback: Bool {
@@ -265,20 +340,16 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     func configure(
-        format: CMAudioFormatDescription,
-        codec: AudioCodec,
-        generation: MediaGeneration,
-        fingerprint: MediaFormatFingerprint
+        _ configuration: CompressedAudioRenderConfiguration,
+        generation: MediaGeneration
     ) throws {
         guard executor.isIsolated else {
             throw PlaybackCoreError.audioRendererFailed(Self.isolationError)
         }
         let newEpoch = try takeEpoch()
         prepareConfiguration(
-            format: format,
-            codec: codec,
+            configuration: configuration,
             generation: generation,
-            fingerprint: fingerprint,
             epoch: newEpoch
         )
 
@@ -294,7 +365,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             beginRemoval(of: renderer, continuation: .configure)
             return
         }
-        try activateCompressedRenderer()
+        try activateConfiguredRenderer()
     }
 
     func enqueue(_ sample: CompressedAudioSample) throws {
@@ -303,32 +374,150 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
         guard configured, !stopped, !terminal else { return }
         guard sample.generation == generation else { return }
+        guard activeContinuityIslandID == sample.continuityIslandID else {
+            throw PlaybackCoreError.audioRendererFailed("audio.island.mismatch")
+        }
         guard sample.codec == codec else {
             throw PlaybackCoreError.audioRendererFailed("audio.codec.mismatch")
         }
-        try pruneExpired(at: synchronizer.currentTime())
-        replay.append(ReplayEntry(
-            sample: sample,
-            sentCompressed: false,
-            decoded: false,
-            acceptedCompressed: false
-        ))
         do {
-            if !replacing, rendererAttached, let renderer {
-                startRequests(on: renderer, epoch: epoch, generation: generation)
+            let coverageStartPTS = sample.effectiveCoverageStartPTS
+            guard coverageStartPTS.isNumeric,
+                  sample.presentationTimeStamp.isNumeric,
+                  CMTimeCompare(coverageStartPTS, sample.presentationTimeStamp) <= 0 else {
+                throw replayAccountingFailure()
             }
-            if route == .systemCompressed {
-                try drainCompressed()
-            } else {
-                try decodeAvailable()
-                try drainPCM()
+            try pruneExpired(at: synchronizer.currentTime())
+            let ownedPayloadBytes = try SampleBufferBuilder
+                .compressedAudioPayloadByteCount(sample.sampleBuffer)
+            guard let retentionID = nextReplayRetentionID else {
+                throw replayAccountingFailure()
             }
-            try trimReplayHistory()
+            let entry = ReplayEntry(
+                retentionID: retentionID,
+                sample: sample,
+                ownedPayloadBytes: ownedPayloadBytes,
+                coverageStartPTS: coverageStartPTS,
+                sentCompressed: false,
+                decoded: false,
+                acceptedCompressed: false
+            )
+            var candidates = replay
+            candidates.append(entry)
+            let plan = try makeReplayRetentionPlan(
+                candidates: candidates,
+                floor: recoveryFloor
+            )
+            commitReplayRetentionPlan(plan)
+            nextReplayRetentionID = retentionID == UInt64.max ? nil : retentionID + 1
         } catch {
-            classifyAndEmitDecode(error)
+            emitTerminal(replayRetentionFailure(from: error))
+            return
         }
-        refreshMediaRequestState()
-        updateReadiness()
+        driveRenderer()
+    }
+
+    func updateRecoveryFloor(_ floor: CMTime?) {
+        guard executor.isIsolated else {
+            executor.submit { [weak self] in self?.updateRecoveryFloor(floor) }
+            return
+        }
+        let normalizedFloor = floor?.isNumeric == true ? floor : nil
+        do {
+            try validateReplayAccounting()
+            let plan = try makeReplayRetentionPlan(
+                candidates: replay,
+                floor: normalizedFloor
+            )
+            recoveryFloor = normalizedFloor
+            commitReplayRetentionPlan(plan)
+        } catch {
+            emitTerminal(replayRetentionFailure(from: error))
+        }
+    }
+
+    var retainedReplayPayloadBytes: Int {
+        precondition(executor.isIsolated)
+        return replayByteBudget.used
+    }
+
+    var retainedReplaySampleIDs: [UInt64] {
+        precondition(executor.isIsolated)
+        return replay.map(\.sample.id)
+    }
+
+    func activateContinuityIsland(
+        _ islandID: AudioContinuityIslandID,
+        generation: MediaGeneration
+    ) {
+        guard executor.isIsolated else {
+            executor.submit { [weak self] in
+                self?.activateContinuityIsland(islandID, generation: generation)
+            }
+            return
+        }
+        guard configured, !stopped, !terminal,
+              generation == self.generation,
+              islandID != activeContinuityIslandID else { return }
+
+        guard activeContinuityIslandID != nil else {
+            activeContinuityIslandID = islandID
+            updateSnapshot(route: route, ready: false)
+            return
+        }
+
+        if let renderer { resetRendererQueue(renderer) }
+        clearReplay(keepingCapacity: false)
+        pendingPCM.removeAll(keepingCapacity: false)
+        decoder?.flush()
+        resetPCMPreroll()
+        resetAcceptedCompressedMedia()
+        consecutiveInvalidPacketCount = 0
+        recoveryCoordinator.invalidate()
+        invalidateProgressMonitor()
+        pendingReevaluation = false
+        needsAnchor = false
+        needsDecoderResetBeforeNextCompressedEnqueue = false
+        fallbackReadinessGraceActive = false
+        compressedRetryPreservesReadiness = false
+        resetStartupWait()
+        activeContinuityIslandID = islandID
+        resetRendererProgressObservation()
+        updateSnapshot(route: route, ready: false)
+    }
+
+    func prepareAnchor(
+        at commonPTS: CMTime,
+        in islandID: AudioContinuityIslandID
+    ) throws {
+        guard executor.isIsolated else {
+            throw PlaybackCoreError.audioRendererFailed(Self.isolationError)
+        }
+        guard configured, !stopped, !terminal else { return }
+        guard islandID == activeContinuityIslandID else {
+            throw PlaybackCoreError.audioRendererFailed("audio.island.mismatch")
+        }
+
+        try pruneExpired(at: commonPTS)
+        guard replay.contains(where: { entry in
+            entry.sample.continuityIslandID == islandID
+                && replayEntry(entry, covers: commonPTS)
+        }) else {
+            throw PlaybackCoreError.audioRendererFailed(
+                CompressedAudioRetentionPolicy.unretainedAnchorError
+            )
+        }
+        if let renderer { resetRendererQueue(renderer) }
+        pendingPCM.removeAll(keepingCapacity: false)
+        decoder?.flush()
+        resetPCMPreroll()
+        consecutiveInvalidPacketCount = 0
+        for index in replay.indices {
+            replay[index].sentCompressed = false
+            replay[index].decoded = false
+        }
+        needsDecoderResetBeforeNextCompressedEnqueue = true
+        driveRenderer()
     }
 
     func setSharedTimelineOpened(_ opened: Bool) {
@@ -345,22 +534,32 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             return
         }
         guard configured, !stopped else { return }
+        if let renderer {
+            resetRendererQueue(renderer)
+        } else {
+            invalidateRendererRequest(on: nil)
+        }
         guard let newEpoch = takeEpochWithoutThrow() else { return }
         epoch = newEpoch
         self.generation = generation
         terminal = false
         pendingReevaluation = false
         recoveryCoordinator.invalidate()
+        invalidateProgressMonitor()
         needsAnchor = false
         fallbackReadinessGraceActive = false
         compressedRetryPreservesReadiness = false
         resetStartupWait()
         updateSnapshot(route: route, ready: false)
         setSynchronizerRate(0, time: synchronizer.currentTime())
-        replay.removeAll(keepingCapacity: false)
+        clearReplay(keepingCapacity: false)
+        recoveryFloor = nil
         pendingPCM.removeAll(keepingCapacity: false)
+        activeContinuityIslandID = nil
+        needsDecoderResetBeforeNextCompressedEnqueue = false
         resetPCMPreroll()
         resetAcceptedCompressedMedia()
+        resetRendererProgressObservation()
         resetCompressedDiagnosticContextForTimeline(generation: generation)
         consecutiveInvalidPacketCount = 0
         decoder?.flush()
@@ -381,15 +580,13 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
 
         replacing = false
-        if let renderer { stopRequests(on: renderer) }
         renderer?.stopObserving()
-        renderer?.flush()
         if let renderer {
+            establishRendererDemandLifetime(for: renderer)
             installCallbacks(on: renderer, epoch: newEpoch, generation: generation)
-            startRequests(on: renderer, epoch: newEpoch, generation: generation)
         }
         startRouteMonitor(epoch: newEpoch, generation: generation)
-        updateReadiness()
+        driveRenderer()
     }
 
     func stop() {
@@ -428,6 +625,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         terminal = false
         pendingReevaluation = false
         recoveryCoordinator.invalidate()
+        invalidateProgressMonitor()
         fallbackReadinessGraceActive = false
         compressedRetryPreservesReadiness = false
         sharedTimelineOpened = false
@@ -448,11 +646,16 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
         decoder?.destroy()
         decoder = nil
+        decoderExtradata = Data()
         pcmOutputFormat = nil
-        replay.removeAll(keepingCapacity: false)
+        clearReplay(keepingCapacity: false)
+        recoveryFloor = nil
         pendingPCM.removeAll(keepingCapacity: false)
+        activeContinuityIslandID = nil
+        needsDecoderResetBeforeNextCompressedEnqueue = false
         resetPCMPreroll()
         resetAcceptedCompressedMedia()
+        resetRendererProgressObservation()
         consecutiveInvalidPacketCount = 0
         updateSnapshot(route: route, ready: false)
     }
@@ -480,10 +683,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func prepareConfiguration(
-        format: CMAudioFormatDescription,
-        codec: AudioCodec,
+        configuration: CompressedAudioRenderConfiguration,
         generation: MediaGeneration,
-        fingerprint: MediaFormatFingerprint,
         epoch: UInt64
     ) {
         routeMonitor.stop()
@@ -492,13 +693,18 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         pcmOutputFormat = nil
         self.epoch = epoch
         self.generation = generation
-        self.format = format
-        self.fingerprint = fingerprint
-        self.codec = codec
-        replay.removeAll(keepingCapacity: false)
+        format = configuration.formatDescription
+        fingerprint = configuration.fingerprint
+        codec = configuration.codec
+        decoderExtradata = configuration.decoderExtradata
+        clearReplay(keepingCapacity: false)
+        recoveryFloor = nil
         pendingPCM.removeAll(keepingCapacity: false)
+        activeContinuityIslandID = nil
+        needsDecoderResetBeforeNextCompressedEnqueue = false
         resetPCMPreroll()
         resetAcceptedCompressedMedia()
+        resetRendererProgressObservation()
         consecutiveInvalidPacketCount = 0
         configured = true
         stopped = false
@@ -508,6 +714,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         needsAnchor = false
         pendingReevaluation = false
         recoveryCoordinator.invalidate()
+        invalidateProgressMonitor()
         fallbackReadinessGraceActive = false
         compressedRetryPreservesReadiness = false
         sharedTimelineOpened = false
@@ -515,8 +722,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         lastRouteSnapshot = nil
         resetStartupWait()
         publishCompressedDiagnosticContext(
-            codec: codec,
-            fingerprint: fingerprint,
+            codec: configuration.codec,
+            fingerprint: configuration.fingerprint,
             generation: generation
         )
         updateSnapshot(route: .systemCompressed, ready: false)
@@ -524,15 +731,39 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func activateCompressedRenderer() throws {
         let candidate = try rendererFactory.makeRenderer(mediaKind: .compressed)
-        renderer = candidate
         rendererAttached = false
         installCallbacks(on: candidate, epoch: epoch, generation: generation)
-        try synchronizer.attach(candidate)
+        do {
+            try synchronizer.attach(candidate)
+        } catch {
+            candidate.stopObserving()
+            renderer = nil
+            rendererAttached = false
+            invalidateRendererDemandLifetime(on: candidate)
+            throw error
+        }
+        renderer = candidate
         rendererAttached = true
+        establishRendererDemandLifetime(for: candidate)
         replacing = false
-        startRequests(on: candidate, epoch: epoch, generation: generation)
         startRouteMonitor(epoch: epoch, generation: generation)
-        updateReadiness()
+        driveRenderer()
+    }
+
+    private func activateConfiguredRenderer() throws {
+        guard let format else {
+            throw PlaybackCoreError.audioRendererFailed("audio.format.missing")
+        }
+        let formatID = CMFormatDescriptionGetMediaSubType(format)
+        if decodeCapabilityChecker.supportsDecoding(formatID: formatID) {
+            try activateCompressedRenderer()
+            return
+        }
+
+        recordFallback(.systemDecoderUnavailable)
+        replacing = true
+        try activatePCMRenderer()
+        startRouteMonitor(epoch: epoch, generation: generation)
     }
 
     private func installCallbacks(
@@ -554,38 +785,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
-    private func startRequests(
-        on renderer: any AudioRenderer,
-        epoch: UInt64,
-        generation: MediaGeneration
-    ) {
-        guard !rendererRequesting else { return }
-        rendererRequesting = true
-        let rendererID = renderer.identity
-        let gate = readyCallbackGate
-        renderer.requestMediaDataWhenReady { [weak self, gate] in
-            guard gate.claim() else { return }
-            guard let self else {
-                gate.release()
-                return
-            }
-            executor.submit { [weak self, gate] in
-                defer { gate.release() }
-                self?.handleReady(
-                    epoch: epoch,
-                    rendererID: rendererID,
-                    generation: generation
-                )
-            }
-        }
-    }
-
-    private func stopRequests(on renderer: any AudioRenderer) {
-        guard rendererRequesting else { return }
-        rendererRequesting = false
-        renderer.stopRequestingMediaData()
-    }
-
     private func startRouteMonitor(epoch: UInt64, generation: MediaGeneration) {
         routeMonitor.stop()
         lastRouteSnapshot = nil
@@ -604,39 +803,72 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func handleReady(
         epoch: UInt64,
         rendererID: AudioRendererIdentity,
-        generation: MediaGeneration
+        generation: MediaGeneration,
+        queueEpisode: UInt64,
+        requestTicket: AudioRendererRequestTicket
     ) {
         guard isCurrent(epoch: epoch, rendererID: rendererID, generation: generation),
-              rendererRequesting, !terminal, !replacing else { return }
-        do {
-            if route == .systemCompressed {
-                try drainCompressed()
-            } else {
-                try decodeAvailable()
-                try drainPCM()
-            }
-            updateReadiness()
-        } catch {
-            classifyAndEmitDecode(error)
+              rendererPumpState.isCurrent(requestTicket),
+              renderer?.isReadyForMoreMediaData == true,
+              !terminal, !replacing else { return }
+        if rendererDemandProgress.readyAfterValidatedRequest(
+            rendererID: rendererID,
+            epoch: epoch,
+            queueEpisode: queueEpisode
+        ), let token = currentProgressToken,
+           progressMonitor.observeProgress(token) {
+            automaticFlushProgressOrigin.clear()
         }
-        refreshMediaRequestState()
+        driveRenderer()
     }
 
-    private func refreshMediaRequestState() {
-        guard configured, !stopped, !terminal, !replacing,
-              rendererAttached, let renderer else { return }
-        let hasPendingWork: Bool
-        switch route {
-        case .systemCompressed:
-            hasPendingWork = replay.contains { !$0.sentCompressed }
-        case .ffmpegPCM:
-            hasPendingWork = !pendingPCM.isEmpty || replay.contains { !$0.decoded }
+    private func reconcileRendererRequest(hasPendingWork: Bool) {
+        let mayRequest = configured && !stopped && !terminal && !replacing && rendererAttached
+        switch rendererPumpState.reconcile(
+            hasPendingWork: mayRequest && hasPendingWork,
+            keepArmedForProgress: mayRequest
+                && progressMonitor.hasActiveBaseline
+                && rendererDemandProgress.needsProgressRequest
+        ) {
+        case .none:
+            break
+        case let .arm(ticket, isRearm):
+            if isRearm {
+                incrementDiagnostic(\.rendererRequestRearmCount)
+            }
+            guard let renderer,
+                  rendererDemandProgress.rendererID == renderer.identity,
+                  rendererDemandProgress.epoch == epoch else {
+                invalidateRendererRequest(on: renderer)
+                publishRendererPumpObservation()
+                return
+            }
+            let rendererID = renderer.identity
+            let requestEpoch = epoch
+            let requestGeneration = generation
+            let requestQueueEpisode = rendererDemandProgress.queueEpisode
+            let gate = AudioReadyCallbackGate()
+            renderer.requestMediaDataWhenReady { [weak self, gate] in
+                guard gate.claim() else { return }
+                guard let self else {
+                    gate.release()
+                    return
+                }
+                executor.submit { [weak self, gate] in
+                    defer { gate.release() }
+                    self?.handleReady(
+                        epoch: requestEpoch,
+                        rendererID: rendererID,
+                        generation: requestGeneration,
+                        queueEpisode: requestQueueEpisode,
+                        requestTicket: ticket
+                    )
+                }
+            }
+        case .disarm:
+            renderer?.stopRequestingMediaData()
         }
-        if hasPendingWork {
-            startRequests(on: renderer, epoch: epoch, generation: generation)
-        } else {
-            stopRequests(on: renderer)
-        }
+        publishRendererPumpObservation()
     }
 
     private func handle(
@@ -657,16 +889,30 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 return
             }
             recordCompressedRendererFailure(reason)
-            if retriedCompressedAttemptKey == attemptKey {
-                beginFallback()
-            } else {
-                retriedCompressedAttemptKey = attemptKey
-                beginCompressedRetry()
-            }
-        case .automaticFlush:
-            if replacing {
+            do {
+                try pruneExpired(at: synchronizer.currentTime())
+            } catch {
+                classifyAndEmitDecode(error)
                 return
             }
+            let actions = progressMonitor.rendererFailed(
+                key: attemptKey,
+                hasReplay: !replay.isEmpty
+            )
+            guard !actions.isEmpty else {
+                emitTerminal(.audioRendererFailed(reason))
+                return
+            }
+            processProgressActions(
+                actions,
+                fallbackReason: .repeatedCompressedRendererFailure
+            )
+        case .automaticFlush:
+            if replacing { return }
+            fenceRendererQueueMutation(
+                rendererID: rendererID,
+                epoch: epoch
+            )
             ingestRecovery(.automaticFlush)
         case .outputConfigurationChanged:
             if replacing { return }
@@ -687,6 +933,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         lastRouteSnapshot = snapshot
         currentOutput = snapshot.category
         publishRouteDiagnosticContext(snapshot)
+        invalidateProgressMonitor()
         guard snapshot.reason != .initial else { return }
         if replacing {
             pendingReevaluation = true
@@ -804,20 +1051,138 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         processRecoveryActions(actions)
     }
 
+    private func processProgressActions(
+        _ actions: [AudioRendererProgressAction],
+        fallbackReason: AudioFallbackReason,
+        preprunedRecoveryTime: CMTime? = nil,
+        automaticFlushOrigin: Bool = false
+    ) {
+        for action in actions {
+            switch action {
+            case .replay:
+                incrementDiagnostic(\.recoveryTransactionCount)
+                if let preprunedRecoveryTime {
+                    recoverPreprunedReplay(at: preprunedRecoveryTime)
+                } else {
+                    recoverAtCurrentPlayhead()
+                }
+            case let .scheduleDeadline(ticket):
+                if automaticFlushOrigin {
+                    automaticFlushProgressOrigin.markCurrent(ticket)
+                } else {
+                    automaticFlushProgressOrigin.clear()
+                }
+                scheduleProgressDeadline(ticket)
+            case .rebuildCompressed:
+                beginCompressedRetry()
+            case .fallbackPCM:
+                beginFallback(reason: fallbackReason)
+            case .terminalTicketExhausted:
+                emitTerminal(.audioRendererFailed(Self.progressTicketExhaustedError))
+            }
+        }
+    }
+
+    private func scheduleProgressDeadline(_ ticket: AudioRendererProgressTicket) {
+        guard configured, !stopped, !terminal, !replacing,
+              pendingRemoval == nil, let rendererID = renderer?.identity else {
+            _ = automaticFlushProgressOrigin.consumeIfCurrent(ticket)
+            return
+        }
+        let scheduledEpoch = epoch
+        let scheduledGeneration = generation
+        recoveryScheduler(Self.progressDeadlineDelay) { [weak self] in
+            guard let self else { return }
+            if executor.isIsolated {
+                progressDeadlineFired(
+                    ticket,
+                    epoch: scheduledEpoch,
+                    rendererID: rendererID,
+                    generation: scheduledGeneration
+                )
+            } else {
+                executor.submit { [weak self] in
+                    self?.progressDeadlineFired(
+                        ticket,
+                        epoch: scheduledEpoch,
+                        rendererID: rendererID,
+                        generation: scheduledGeneration
+                    )
+                }
+            }
+        }
+    }
+
+    private func progressDeadlineFired(
+        _ ticket: AudioRendererProgressTicket,
+        epoch: UInt64,
+        rendererID: AudioRendererIdentity,
+        generation: MediaGeneration
+    ) {
+        let automaticFlushOrigin =
+            automaticFlushProgressOrigin.consumeIfCurrent(ticket)
+        guard isCurrent(epoch: epoch, rendererID: rendererID, generation: generation),
+              !terminal, !replacing, pendingRemoval == nil else { return }
+        let actions = progressMonitor.deadlineFired(
+            ticket,
+            token: currentProgressToken
+        )
+        if automaticFlushOrigin, !actions.isEmpty {
+            incrementDiagnostic(\.automaticFlushNoProgressCount)
+        }
+        processProgressActions(
+            actions,
+            fallbackReason: .compressedRendererNoProgressAfterRebuild
+        )
+    }
+
     private func performRecovery(
         ticket _: AudioRecoveryTicket,
         causes: Set<AudioRecoveryCause>
     ) {
         guard !terminal, !replacing, pendingRemoval == nil else { return }
+        if route == .systemCompressed,
+           let attemptKey = currentCompressedAttemptKey {
+            let recoveryTime = synchronizer.currentTime()
+            do {
+                try pruneExpired(at: recoveryTime)
+            } catch {
+                classifyAndEmitDecode(error)
+                return
+            }
+            guard let token = currentProgressToken else { return }
+            let actions = if causes.contains(.automaticFlush) {
+                progressMonitor.automaticFlush(
+                    key: attemptKey,
+                    token: token,
+                    hasReplay: !replay.isEmpty
+                )
+            } else {
+                progressMonitor.correlatedRecovery(
+                    key: attemptKey,
+                    token: token,
+                    hasReplay: !replay.isEmpty
+                )
+            }
+            if actions.isEmpty {
+                incrementDiagnostic(\.suppressedCorrelatedTriggerCount)
+                driveRenderer()
+            } else {
+                processProgressActions(
+                    actions,
+                    fallbackReason: .compressedRendererNoProgressAfterRebuild,
+                    preprunedRecoveryTime: recoveryTime,
+                    automaticFlushOrigin: causes.contains(.automaticFlush)
+                )
+            }
+            return
+        }
+
         incrementDiagnostic(\.recoveryTransactionCount)
         if route == .ffmpegPCM,
            !causes.isDisjoint(with: [.outputConfigurationChanged, .routeChanged]),
            let pcmOutputFormat,
-           !supportChecker.supports(
-               format: pcmOutputFormat,
-               route: .ffmpegPCM,
-               output: currentOutput
-           ) {
+           !pcmOutputValidator.isValidPCMOutput(pcmOutputFormat) {
             emitTerminal(.audioRendererFailed(Self.unsupportedPCMError))
             return
         }
@@ -825,8 +1190,17 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func recoverAtCurrentPlayhead() {
-        guard !terminal, !replacing, let renderer else { return }
         let recoveryTime = synchronizer.currentTime()
+        do {
+            try pruneExpired(at: recoveryTime)
+            recoverPreprunedReplay(at: recoveryTime)
+        } catch {
+            classifyAndEmitDecode(error)
+        }
+    }
+
+    private func recoverPreprunedReplay(at _: CMTime) {
+        guard !terminal, !replacing, let renderer else { return }
         snapshotLock.lock()
         if publicSnapshot.recoveryCount < UInt64.max {
             publicSnapshot.recoveryCount += 1
@@ -837,52 +1211,46 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         // playback executor, so no observer can see the empty window. Publishing
         // an invalidation for it made a routine renderer automatic flush tear
         // down the video anchor and stop display submission.
-        renderer.flush()
+        resetRendererQueue(renderer)
         resetPCMPreroll()
-        do {
-            try pruneExpired(at: recoveryTime)
-            for index in replay.indices {
-                replay[index].sentCompressed = false
-                replay[index].decoded = false
-            }
-            pendingPCM.removeAll(keepingCapacity: false)
-            if route == .ffmpegPCM {
-                consecutiveInvalidPacketCount = 0
-                decoder?.flush()
-            }
-            if route == .systemCompressed {
-                try drainCompressed()
-            } else {
-                try decodeAvailable()
-                try drainPCM()
-            }
-            updateReadiness()
-        } catch {
-            classifyAndEmitDecode(error)
+        for index in replay.indices {
+            replay[index].sentCompressed = false
+            replay[index].decoded = false
         }
+        needsDecoderResetBeforeNextCompressedEnqueue = true
+        pendingPCM.removeAll(keepingCapacity: false)
+        if route == .ffmpegPCM {
+            consecutiveInvalidPacketCount = 0
+            decoder?.flush()
+        }
+        driveRenderer()
     }
 
-    private func beginFallback() {
+    private func beginFallback(reason: AudioFallbackReason) {
         guard !fallbackUsed, !replacing, !terminal,
               pendingRemoval == nil, let renderer,
               format != nil, codec != nil else { return }
         recoveryCoordinator.invalidate()
         pendingReevaluation = false
-        fallbackUsed = true
-        incrementDiagnostic(\.pcmFallbackCount)
-        snapshotLock.withLock {
-            publicSnapshot.diagnostics.lastFallbackReason =
-                .repeatedCompressedRendererFailure
-        }
+        recordFallback(reason)
         beginRemoval(of: renderer, continuation: .fallback)
     }
 
-    private var currentCompressedAttemptKey: CompressedAttemptKey? {
+    private var currentCompressedAttemptKey: AudioCompressedAttemptKey? {
         guard let fingerprint else { return nil }
-        return CompressedAttemptKey(
+        return AudioCompressedAttemptKey(
             generation: generation,
             fingerprint: fingerprint,
-            routeRevision: lastRouteSnapshot?.revision ?? 0
+            routeRevision: lastRouteSnapshot?.revision ?? 0,
+            islandID: activeContinuityIslandID
+        )
+    }
+
+    private var currentProgressToken: AudioRendererProgressToken? {
+        guard let activeContinuityIslandID else { return nil }
+        return rendererDemandProgress.token(
+            generation: generation,
+            islandID: activeContinuityIslandID
         )
     }
 
@@ -939,9 +1307,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         if !keepsClockRunning {
             setSynchronizerRate(0, time: synchronizer.currentTime())
         }
-        stopRequests(on: renderer)
+        resetRendererQueue(renderer)
+        invalidateRendererDemandLifetime(on: renderer)
         renderer.stopObserving()
-        renderer.flush()
         resetPCMPreroll()
         let transition = PendingRemoval(
             rendererID: renderer.identity,
@@ -1000,7 +1368,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         switch transition.continuation {
         case .configure:
             do {
-                try activateCompressedRenderer()
+                try activateConfiguredRenderer()
             } catch {
                 classifyAndEmitDecode(error)
             }
@@ -1016,56 +1384,83 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func completeCompressedRetryAfterRemoval() {
         guard configured, !stopped, replacing, !terminal else { return }
+        let replacement: any AudioRenderer
         do {
-            let replacement = try rendererFactory.makeRenderer(mediaKind: .compressed)
-            renderer = replacement
-            rendererAttached = false
-            installCallbacks(on: replacement, epoch: epoch, generation: generation)
+            replacement = try rendererFactory.makeRenderer(mediaKind: .compressed)
+        } catch {
+            beginFallbackWithoutRemoval(reason: .repeatedCompressedRendererFailure)
+            return
+        }
+
+        renderer = replacement
+        rendererAttached = false
+        installCallbacks(on: replacement, epoch: epoch, generation: generation)
+        do {
             try synchronizer.attach(replacement)
-            rendererAttached = true
+        } catch {
+            replacement.stopObserving()
+            renderer = nil
+            rendererAttached = false
+            invalidateRendererDemandLifetime(on: replacement)
+            beginFallbackWithoutRemoval(reason: .repeatedCompressedRendererFailure)
+            return
+        }
+        rendererAttached = true
+        establishRendererDemandLifetime(for: replacement)
+
+        do {
             try pruneExpired(at: synchronizer.currentTime())
-            for index in replay.indices {
-                replay[index].sentCompressed = false
-            }
-            replacing = false
-            compressedRetryPreservesReadiness = false
-            startRequests(on: replacement, epoch: epoch, generation: generation)
-            try drainCompressed()
-            refreshMediaRequestState()
-            updateReadiness()
-            if pendingReevaluation {
-                pendingReevaluation = false
-                ingestRecovery(.routeChanged)
-            }
         } catch {
             classifyAndEmitDecode(error)
+            return
+        }
+        replacing = false
+        compressedRetryPreservesReadiness = false
+        if let attemptKey = currentCompressedAttemptKey,
+           let token = currentProgressToken {
+            processProgressActions(
+                progressMonitor.replacementReady(
+                    key: attemptKey,
+                    token: token,
+                    hasReplay: !replay.isEmpty
+                ),
+                fallbackReason: .compressedRendererNoProgressAfterRebuild
+            )
+        } else {
+            driveRenderer()
+        }
+        if pendingReevaluation {
+            pendingReevaluation = false
+            ingestRecovery(.routeChanged)
+        }
+    }
+
+    private func beginFallbackWithoutRemoval(reason: AudioFallbackReason) {
+        guard !fallbackUsed, configured, !stopped, !terminal,
+              pendingRemoval == nil, renderer == nil else { return }
+        recoveryCoordinator.invalidate()
+        invalidateProgressMonitor()
+        pendingReevaluation = false
+        recordFallback(reason)
+        replacing = true
+        compressedRetryPreservesReadiness = false
+        fallbackReadinessGraceActive = false
+        updateSnapshot(route: route, ready: false)
+        completeFallbackAfterRemoval()
+    }
+
+    private func recordFallback(_ reason: AudioFallbackReason) {
+        fallbackUsed = true
+        incrementDiagnostic(\.pcmFallbackCount)
+        snapshotLock.withLock {
+            publicSnapshot.diagnostics.lastFallbackReason = reason
         }
     }
 
     private func completeFallbackAfterRemoval() {
-        guard configured, !stopped, replacing, !terminal,
-              let format, let codec else { return }
+        guard configured, !stopped, replacing, !terminal else { return }
         do {
-            let decoder = try decoderFactory.makeDecoder(codec: codec, format: format)
-            let replacement = try rendererFactory.makeRenderer(mediaKind: .linearPCM)
-            self.decoder = decoder
-            consecutiveInvalidPacketCount = 0
-            renderer = replacement
-            rendererAttached = false
-            resetPCMPreroll()
-            installCallbacks(on: replacement, epoch: epoch, generation: generation)
-            try synchronizer.attach(replacement)
-            rendererAttached = true
-            updateSnapshot(route: .ffmpegPCM, ready: fallbackReadinessGraceActive)
-            replacing = false
-            needsAnchor = true
-            startRequests(on: replacement, epoch: epoch, generation: generation)
-            try pruneExpired(at: synchronizer.currentTime())
-            for index in replay.indices { replay[index].decoded = false }
-            try decodeAvailable()
-            try drainPCM()
-            refreshMediaRequestState()
-            updateReadiness()
+            try activatePCMRenderer()
             if pendingReevaluation {
                 pendingReevaluation = false
                 ingestRecovery(.routeChanged)
@@ -1075,15 +1470,108 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
-    private func drainCompressed() throws {
+    private func activatePCMRenderer() throws {
+        guard let codec else {
+            throw PlaybackCoreError.audioRendererFailed("audio.codec.missing")
+        }
+        let stagedDecoder = try decoderFactory.makeDecoder(
+            codec: codec,
+            extradata: decoderExtradata
+        )
+        let replacement: any AudioRenderer
+        do {
+            replacement = try rendererFactory.makeRenderer(mediaKind: .linearPCM)
+        } catch {
+            stagedDecoder.destroy()
+            decoder = nil
+            renderer = nil
+            rendererAttached = false
+            invalidateRendererDemandLifetime(on: nil)
+            throw error
+        }
+        consecutiveInvalidPacketCount = 0
+        rendererAttached = false
+        resetPCMPreroll()
+        installCallbacks(on: replacement, epoch: epoch, generation: generation)
+        do {
+            try synchronizer.attach(replacement)
+        } catch {
+            replacement.stopObserving()
+            renderer = nil
+            rendererAttached = false
+            invalidateRendererDemandLifetime(on: replacement)
+            stagedDecoder.destroy()
+            decoder = nil
+            throw error
+        }
+        decoder = stagedDecoder
+        renderer = replacement
+        rendererAttached = true
+        establishRendererDemandLifetime(for: replacement)
+        updateSnapshot(route: .ffmpegPCM, ready: fallbackReadinessGraceActive)
+        replacing = false
+        needsAnchor = true
+        try pruneExpired(at: synchronizer.currentTime())
+        for index in replay.indices { replay[index].decoded = false }
+        driveRenderer()
+    }
+
+    private func driveRenderer() {
+        guard configured, !stopped, !terminal else { return }
+        do {
+            try trimReplayHistory()
+            guard !replacing, rendererAttached, renderer != nil else {
+                publishRendererPumpObservation()
+                updateReadiness()
+                return
+            }
+            switch route {
+            case .systemCompressed:
+                try enqueueCompressedUntilBackpressured()
+            case .ffmpegPCM:
+                try enqueuePCMUntilBackpressured()
+            }
+        } catch {
+            classifyAndEmitDecode(error)
+            return
+        }
+        reconcileRendererRequest(hasPendingWork: pendingRendererSampleCount > 0)
+        updateReadiness()
+    }
+
+    private var pendingRendererSampleCount: Int {
+        switch route {
+        case .systemCompressed:
+            replay.lazy.filter { !$0.sentCompressed }.count
+        case .ffmpegPCM:
+            pendingPCM.count + replay.lazy.filter { !$0.decoded }.count
+        }
+    }
+
+    private func enqueueCompressedUntilBackpressured() throws {
         guard route == .systemCompressed,
               let renderer,
               renderer.mediaKind == .compressed,
               rendererAttached, !replacing, !terminal else { return }
-        while renderer.isReadyForMoreMediaData,
-              let index = replay.firstIndex(where: { !$0.sentCompressed }) {
+        while let index = replay.firstIndex(where: { !$0.sentCompressed }) {
             let sample = replay[index].sample
-            try renderer.enqueue(sample.sampleBuffer)
+            let needsDecoderReset = needsDecoderResetBeforeNextCompressedEnqueue
+            let sampleBuffer = if needsDecoderReset {
+                try SampleBufferBuilder
+                    .copyingAudioSampleBufferWithResetDecoderBeforeDecoding(sample.sampleBuffer)
+            } else {
+                sample.sampleBuffer
+            }
+            guard try renderer.enqueue(sampleBuffer) == .accepted else {
+                incrementDiagnostic(\.rendererBackpressureCount)
+                recordRendererBackpressure(on: renderer)
+                return
+            }
+            recordRendererAcceptance(on: renderer)
+            recordRendererAcceptanceDiagnostic(at: sample.presentationTimeStamp)
+            if needsDecoderReset {
+                needsDecoderResetBeforeNextCompressedEnqueue = false
+            }
             replay[index].sentCompressed = true
             if !replay[index].acceptedCompressed {
                 replay[index].acceptedCompressed = true
@@ -1091,6 +1579,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             }
             beginStartupWaitIfNeeded()
             anchorIfNeeded(at: sample.presentationTimeStamp)
+            if !renderer.isReadyForMoreMediaData {
+                recordRendererBackpressure(on: renderer)
+            }
         }
     }
 
@@ -1120,10 +1611,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             }
             for output in outputs {
                 guard let outputFormat = CMSampleBufferGetFormatDescription(output),
-                      CMFormatDescriptionGetMediaSubType(outputFormat) == kAudioFormatLinearPCM else {
-                    throw PlaybackCoreError.audioFallbackDecode(
-                        FFmpegPCMAudioDecoder.invalidCallbackErrorCode
-                    )
+                      pcmOutputValidator.isValidPCMOutput(outputFormat) else {
+                    throw PlaybackCoreError.audioRendererFailed(Self.unsupportedPCMError)
                 }
                 pcmOutputFormat = outputFormat
             }
@@ -1132,20 +1621,31 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
-    private func drainPCM() throws {
+    private func enqueuePCMUntilBackpressured() throws {
         guard route == .ffmpegPCM,
               let renderer,
               renderer.mediaKind == .linearPCM,
               rendererAttached, !replacing, !terminal else { return }
-        while renderer.isReadyForMoreMediaData {
-            while renderer.isReadyForMoreMediaData, !pendingPCM.isEmpty {
-                let sample = pendingPCM.removeFirst()
-                try renderer.enqueue(sample)
+        while true {
+            if let sample = pendingPCM.first {
+                guard try renderer.enqueue(sample) == .accepted else {
+                    incrementDiagnostic(\.rendererBackpressureCount)
+                    recordRendererBackpressure(on: renderer)
+                    return
+                }
+                recordRendererAcceptance(on: renderer)
+                recordRendererAcceptanceDiagnostic(
+                    at: CMSampleBufferGetPresentationTimeStamp(sample)
+                )
+                pendingPCM.removeFirst()
                 recordPCMPreroll(sample)
                 anchorIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sample))
+                if !renderer.isReadyForMoreMediaData {
+                    recordRendererBackpressure(on: renderer)
+                }
+                continue
             }
-            guard renderer.isReadyForMoreMediaData,
-                  replay.contains(where: { !$0.decoded }) else { return }
+            guard replay.contains(where: { !$0.decoded }) else { return }
             try decodeAvailable()
             guard !pendingPCM.isEmpty else { return }
         }
@@ -1159,33 +1659,170 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func pruneExpired(at time: CMTime) throws {
         guard time.isNumeric else { return }
-        replay.removeAll { entry in
-            let duration = entry.sample.duration
-            guard duration.isNumeric, duration >= .zero else { return false }
-            let end = CMTimeAdd(entry.sample.presentationTimeStamp, duration)
-            return end.isNumeric && CMTimeCompare(end, time) <= 0
+        try validateReplayAccounting()
+        let protectorID = replayProtectorID(in: replay, floor: recoveryFloor)
+        let candidates = replay.filter { entry in
+            guard entry.retentionID != protectorID,
+                  isCompletedReplayHistory(entry),
+                  let interval = replayInterval(of: entry) else { return true }
+            return CMTimeCompare(interval.end, time) > 0
         }
+        let plan = try makeReplayRetentionPlan(
+            candidates: candidates,
+            floor: recoveryFloor
+        )
+        commitReplayRetentionPlan(plan)
     }
 
     private func trimReplayHistory() throws {
-        while replay.count > Self.replayCapacity {
-            // An entry that has not reached the active renderer/decoder is work,
-            // not history, and may never be silently overwritten. Prefer the
-            // farthest-future completed entry so the bounded recovery window
-            // continues to cover the current clock during a segment burst.
-            let removable = replay.indices.reversed().first { index in
-                switch route {
-                case .systemCompressed:
-                    replay[index].sentCompressed
-                case .ffmpegPCM:
-                    replay[index].decoded
-                }
-            }
-            guard let removable else { break }
-            replay.remove(at: removable)
+        try validateReplayAccounting()
+        commitReplayRetentionPlan(try makeReplayRetentionPlan(
+            candidates: replay,
+            floor: recoveryFloor
+        ))
+    }
+
+    private func makeReplayRetentionPlan(
+        candidates: [ReplayEntry],
+        floor: CMTime?
+    ) throws -> ReplayRetentionPlan {
+        var planned = candidates
+        let protectorID = replayProtectorID(in: candidates, floor: floor)
+
+        func isRemovable(_ entry: ReplayEntry) -> Bool {
+            entry.retentionID != protectorID && isCompletedReplayHistory(entry)
         }
-        guard replay.count <= Self.replayHardCapacity else {
-            throw PlaybackCoreError.audioRendererFailed("audio.replay.backpressure")
+
+        while true {
+            let payloadBytes = try replayPayloadBytes(of: planned)
+            guard planned.count > replayHardCount
+                    || payloadBytes > replayRetentionLimits.maximumOwnedBytes else { break }
+            guard let index = planned.firstIndex(where: isRemovable) else {
+                throw replayCapacityFailure()
+            }
+            planned.remove(at: index)
+        }
+
+        while let newest = planned.last {
+            guard let newestInterval = replayInterval(of: newest) else {
+                throw replayAccountingFailure()
+            }
+            guard let oldestTail = planned.first(where: {
+                $0.retentionID != protectorID
+            }) else { break }
+            guard let oldestInterval = replayInterval(of: oldestTail) else {
+                throw replayAccountingFailure()
+            }
+            let span = CMTimeSubtract(newestInterval.end, oldestInterval.start)
+            guard span.isNumeric, CMTimeCompare(span, .zero) > 0 else {
+                throw replayAccountingFailure()
+            }
+            guard CMTimeCompare(span, replayRetentionLimits.latestTailHorizon) > 0
+            else { break }
+            guard let index = planned.firstIndex(where: isRemovable) else {
+                throw replayCapacityFailure()
+            }
+            planned.remove(at: index)
+        }
+
+        while planned.count > replayRetentionLimits.maximumCount {
+            guard let index = planned.firstIndex(where: isRemovable) else { break }
+            planned.remove(at: index)
+        }
+        guard planned.count <= replayHardCount else {
+            throw replayCapacityFailure()
+        }
+
+        var byteBudget = OwnedByteBudget(
+            limit: replayRetentionLimits.maximumOwnedBytes
+        )
+        for entry in planned {
+            guard try byteBudget.reserve(entry.ownedPayloadBytes) else {
+                throw replayCapacityFailure()
+            }
+        }
+        return ReplayRetentionPlan(entries: planned, byteBudget: byteBudget)
+    }
+
+    private func replayPayloadBytes(of entries: [ReplayEntry]) throws -> Int {
+        var budget = OwnedByteBudget(limit: Int.max)
+        for entry in entries {
+            guard try budget.reserve(entry.ownedPayloadBytes) else {
+                throw replayAccountingFailure()
+            }
+        }
+        return budget.used
+    }
+
+    private func validateReplayAccounting() throws {
+        guard try replayPayloadBytes(of: replay) == replayByteBudget.used else {
+            throw replayAccountingFailure()
+        }
+    }
+
+    private func replayProtectorID(
+        in entries: [ReplayEntry],
+        floor: CMTime?
+    ) -> UInt64? {
+        guard let floor, floor.isNumeric else { return nil }
+        return entries.first(where: { replayEntry($0, covers: floor) })?.retentionID
+    }
+
+    private func replayEntry(_ entry: ReplayEntry, covers time: CMTime) -> Bool {
+        guard time.isNumeric, let interval = replayInterval(of: entry) else { return false }
+        return CMTimeCompare(interval.start, time) <= 0
+            && CMTimeCompare(time, interval.end) < 0
+    }
+
+    private func replayInterval(
+        of entry: ReplayEntry
+    ) -> (start: CMTime, end: CMTime)? {
+        let start = entry.coverageStartPTS
+        let sampleStart = entry.sample.presentationTimeStamp
+        let duration = entry.sample.duration
+        guard start.isNumeric, sampleStart.isNumeric, duration.isNumeric,
+              CMTimeCompare(start, sampleStart) <= 0,
+              CMTimeCompare(duration, .zero) > 0 else { return nil }
+        let end = CMTimeAdd(sampleStart, duration)
+        guard end.isNumeric, CMTimeCompare(end, sampleStart) > 0 else { return nil }
+        return (start, end)
+    }
+
+    private func isCompletedReplayHistory(_ entry: ReplayEntry) -> Bool {
+        switch route {
+        case .systemCompressed: entry.sentCompressed
+        case .ffmpegPCM: entry.decoded
+        }
+    }
+
+    private func commitReplayRetentionPlan(_ plan: ReplayRetentionPlan) {
+        replay = plan.entries
+        replayByteBudget = plan.byteBudget
+    }
+
+    private func clearReplay(keepingCapacity: Bool) {
+        replay.removeAll(keepingCapacity: keepingCapacity)
+        replayByteBudget.reset()
+    }
+
+    private func replayCapacityFailure() -> PlaybackCoreError {
+        .audioRendererFailed(CompressedAudioRetentionPolicy.replayCapacityError)
+    }
+
+    private func replayAccountingFailure() -> PlaybackCoreError {
+        .audioRendererFailed(CompressedAudioRetentionPolicy.accountingError)
+    }
+
+    private func replayRetentionFailure(from error: any Error) -> PlaybackCoreError {
+        guard let core = error as? PlaybackCoreError else {
+            return replayAccountingFailure()
+        }
+        switch core {
+        case .audioRendererFailed(CompressedAudioRetentionPolicy.replayCapacityError),
+             .audioRendererFailed(CompressedAudioRetentionPolicy.accountingError):
+            return core
+        default:
+            return replayAccountingFailure()
         }
     }
 
@@ -1412,12 +2049,13 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func emitTerminal(_ error: PlaybackCoreError) {
         guard !terminal else { return }
         recoveryCoordinator.invalidate()
+        automaticFlushProgressOrigin.clear()
         terminal = true
         replacing = false
         fallbackReadinessGraceActive = false
         compressedRetryPreservesReadiness = false
         sharedTimelineOpened = false
-        if let renderer { stopRequests(on: renderer) }
+        reconcileRendererRequest(hasPendingWork: false)
         renderer?.stopObserving()
         updateSnapshot(route: route, ready: false)
         failureSink(error, generation)
@@ -1455,11 +2093,116 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         _ keyPath: WritableKeyPath<DiagnosticsState, UInt64>
     ) {
         snapshotLock.withLock {
-            let value = publicSnapshot.diagnostics[keyPath: keyPath]
-            if value < UInt64.max {
-                publicSnapshot.diagnostics[keyPath: keyPath] = value + 1
+            PlaybackDiagnosticSaturatingCounter.increment(
+                &publicSnapshot.diagnostics[keyPath: keyPath]
+            )
+        }
+    }
+
+    private func publishRendererPumpObservation() {
+        let pendingSampleCount = pendingRendererSampleCount
+        let rendererRequestArmed = rendererPumpState.isRequestArmed
+        snapshotLock.withLock {
+            publicSnapshot.diagnostics.pendingSampleCount = pendingSampleCount
+            publicSnapshot.diagnostics.rendererRequestArmed = rendererRequestArmed
+        }
+    }
+
+    private func recordRendererAcceptanceDiagnostic(at presentationTimeStamp: CMTime) {
+        guard presentationTimeStamp.isNumeric,
+              presentationTimeStamp.seconds.isFinite else { return }
+        let ptsSeconds = presentationTimeStamp.seconds
+        let monotonicInstant = diagnosticsNow()
+        snapshotLock.withLock {
+            if let previous = publicSnapshot.diagnostics.lastAcceptedPTSSeconds,
+               ptsSeconds <= previous {
+                return
+            }
+            publicSnapshot.diagnostics.lastAcceptedPTSSeconds = ptsSeconds
+            if monotonicInstant.isFinite {
+                publicSnapshot.diagnostics.lastRendererProgressMonotonicInstant =
+                    monotonicInstant
             }
         }
+    }
+
+    private func resetRendererProgressObservation() {
+        snapshotLock.withLock {
+            publicSnapshot.diagnostics.pendingSampleCount = 0
+            publicSnapshot.diagnostics.rendererRequestArmed = false
+            publicSnapshot.diagnostics.lastAcceptedPTSSeconds = nil
+            publicSnapshot.diagnostics.lastRendererProgressMonotonicInstant = nil
+        }
+    }
+
+    private func invalidateProgressMonitor() {
+        progressMonitor.invalidate()
+        automaticFlushProgressOrigin.clear()
+    }
+
+    private func recordRendererAcceptance(on renderer: any AudioRenderer) {
+        rendererDemandProgress.accepted(
+            rendererID: renderer.identity,
+            epoch: epoch,
+            queueEpisode: rendererDemandProgress.queueEpisode
+        )
+    }
+
+    private func recordRendererBackpressure(on renderer: any AudioRenderer) {
+        rendererDemandProgress.backpressured(
+            rendererID: renderer.identity,
+            epoch: epoch,
+            queueEpisode: rendererDemandProgress.queueEpisode
+        )
+    }
+
+    private func invalidateRendererRequest(on renderer: (any AudioRenderer)?) {
+        if case .disarm = rendererPumpState.invalidateRegistration() {
+            renderer?.stopRequestingMediaData()
+        }
+    }
+
+    private func fenceRendererQueueMutation(
+        rendererID: AudioRendererIdentity,
+        epoch: UInt64
+    ) {
+        invalidateRendererRequest(on: renderer)
+        rendererDemandProgress.queueWasReset(
+            rendererID: rendererID,
+            epoch: epoch
+        )
+        publishRendererPumpObservation()
+    }
+
+    private func resetRendererQueue(_ renderer: any AudioRenderer) {
+        invalidateRendererRequest(on: renderer)
+        rendererDemandProgress.queueWasReset(
+            rendererID: renderer.identity,
+            epoch: epoch
+        )
+        renderer.flush()
+        publishRendererPumpObservation()
+    }
+
+    private func invalidateRendererDemandLifetime(on renderer: (any AudioRenderer)?) {
+        if case .disarm = rendererPumpState.rendererDidChange() {
+            renderer?.stopRequestingMediaData()
+        }
+        rendererDemandProgress.rendererDidChange(to: nil, epoch: epoch)
+        automaticFlushProgressOrigin.clear()
+        publishRendererPumpObservation()
+    }
+
+    private func establishRendererDemandLifetime(for renderer: any AudioRenderer) {
+        if case .disarm = rendererPumpState.rendererDidChange() {
+            renderer.stopRequestingMediaData()
+        }
+        rendererDemandProgress.rendererDidChange(
+            to: renderer.identity,
+            epoch: epoch
+        )
+        automaticFlushProgressOrigin.clear()
+        publishRendererPumpObservation()
     }
 
     private func beginStartupWaitIfNeeded() {

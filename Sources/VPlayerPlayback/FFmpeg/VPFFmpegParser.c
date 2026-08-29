@@ -48,6 +48,10 @@ static enum AVCodecID vpff_parser_codec_id(VPFFCodec codec) {
             return AV_CODEC_ID_EAC3;
         case VPFF_CODEC_MP2:
             return AV_CODEC_ID_MP2;
+        case VPFF_CODEC_MP1:
+            return AV_CODEC_ID_MP1;
+        case VPFF_CODEC_MP3:
+            return AV_CODEC_ID_MP3;
         case VPFF_CODEC_UNSUPPORTED:
             return AV_CODEC_ID_NONE;
     }
@@ -56,7 +60,8 @@ static enum AVCodecID vpff_parser_codec_id(VPFFCodec codec) {
 
 static bool vpff_parser_is_audio(VPFFCodec codec) {
     return codec == VPFF_CODEC_AAC || codec == VPFF_CODEC_AC3 ||
-           codec == VPFF_CODEC_EAC3 || codec == VPFF_CODEC_MP2;
+           codec == VPFF_CODEC_EAC3 || codec == VPFF_CODEC_MP1 ||
+           codec == VPFF_CODEC_MP2 || codec == VPFF_CODEC_MP3;
 }
 
 static bool vpff_parser_valid_pointer_size(const void *pointer, size_t size) {

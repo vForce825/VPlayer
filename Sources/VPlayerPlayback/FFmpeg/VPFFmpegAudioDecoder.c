@@ -56,6 +56,10 @@ static enum AVCodecID vpff_audio_codec_id(VPFFCodec codec) {
             return AV_CODEC_ID_EAC3;
         case VPFF_CODEC_MP2:
             return AV_CODEC_ID_MP2;
+        case VPFF_CODEC_MP1:
+            return AV_CODEC_ID_MP1;
+        case VPFF_CODEC_MP3:
+            return AV_CODEC_ID_MP3;
         case VPFF_CODEC_UNSUPPORTED:
         case VPFF_CODEC_H264:
         case VPFF_CODEC_HEVC:

@@ -10,6 +10,193 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
+    func testAutomaticFlushOriginTrackerRetainsOnlyCurrentTicket() {
+        var tracker = AudioAutomaticFlushProgressOriginTracker()
+        let first = AudioRendererProgressTicket(rawValue: 1)
+        let second = AudioRendererProgressTicket(rawValue: 2)
+
+        tracker.markCurrent(first)
+        tracker.markCurrent(second)
+        XCTAssertEqual(tracker.retainedTicketCount, 1)
+        XCTAssertFalse(tracker.consumeIfCurrent(first))
+        XCTAssertEqual(tracker.retainedTicketCount, 1)
+        XCTAssertTrue(tracker.consumeIfCurrent(second))
+        XCTAssertEqual(tracker.retainedTicketCount, 0)
+    }
+
+    func testAutomaticFlushReplayDoesNotResetUniqueMediaProgressAge() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        harness.diagnosticsClock.set(10)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+        }
+
+        harness.diagnosticsClock.set(20)
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        XCTAssertEqual(
+            try XCTUnwrap(harness.pipeline.diagnostics.lastRendererProgressAgeSeconds),
+            10,
+            accuracy: 0.001
+        )
+
+        harness.diagnosticsClock.set(25)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+        XCTAssertEqual(harness.pipeline.diagnostics.lastAcceptedPTSSeconds, 2)
+        XCTAssertEqual(harness.pipeline.diagnostics.lastRendererProgressAgeSeconds, 0)
+    }
+
+    func testPCMRecoveryReplayDoesNotResetUniqueMediaProgressAge() throws {
+        let harness = try makeHarness()
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true)
+        harness.diagnosticsClock.set(10)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: compressed,
+            in: harness,
+            reason: "unique-progress"
+        )
+        harness.synchronizer.completeRemoval(
+            index: transition.removalIndex,
+            didRemove: true
+        )
+        drain(harness.executor)
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcm.configureReadiness(ready: true)
+        pcm.fireReady()
+        drain(harness.executor)
+
+        harness.diagnosticsClock.set(20)
+        pcm.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(
+            try XCTUnwrap(harness.pipeline.diagnostics.lastRendererProgressAgeSeconds),
+            10,
+            accuracy: 0.001
+        )
+
+        harness.diagnosticsClock.set(25)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+        XCTAssertEqual(harness.pipeline.diagnostics.lastAcceptedPTSSeconds, 2)
+        XCTAssertEqual(harness.pipeline.diagnostics.lastRendererProgressAgeSeconds, 0)
+    }
+
+    func testReplacementWindowPublishesPendingWorkBeforeRendererReattaches() throws {
+        let harness = try makeHarness()
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                format: try self.makeFormat(codec: .ac3),
+                codec: .ac3,
+                generation: MediaGeneration(rawValue: 2),
+                fingerprint: self.fingerprint(2)
+            )
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 2),
+                generation: MediaGeneration(rawValue: 2)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                codec: .ac3,
+                pts: CMTime(value: 2, timescale: 1),
+                generation: MediaGeneration(rawValue: 2),
+                continuityIslandID: AudioContinuityIslandID(rawValue: 2)
+            ))
+        }
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.pendingSampleCount, 1)
+        XCTAssertFalse(harness.pipeline.diagnostics.rendererRequestArmed)
+    }
+
+    func testPumpDiagnosticsExposePendingBackpressureRearmAndMonotonicProgress() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+        harness.diagnosticsClock.set(10)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 7, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+
+        var diagnostics = harness.pipeline.diagnostics
+        XCTAssertEqual(diagnostics.pendingSampleCount, 1)
+        XCTAssertTrue(diagnostics.rendererRequestArmed)
+        XCTAssertEqual(diagnostics.rendererBackpressureCount, 1)
+        XCTAssertEqual(diagnostics.rendererRequestRearmCount, 0)
+        XCTAssertNil(diagnostics.lastAcceptedPTSSeconds)
+        XCTAssertNil(diagnostics.lastRendererProgressAgeSeconds)
+
+        harness.diagnosticsClock.set(12)
+        renderer.configureReadiness(ready: true)
+        renderer.fireReady()
+        drain(harness.executor)
+
+        diagnostics = harness.pipeline.diagnostics
+        XCTAssertEqual(diagnostics.pendingSampleCount, 0)
+        XCTAssertFalse(diagnostics.rendererRequestArmed)
+        XCTAssertEqual(diagnostics.lastAcceptedPTSSeconds, 7)
+        XCTAssertEqual(diagnostics.lastRendererProgressAgeSeconds, 0)
+
+        harness.diagnosticsClock.set(15.25)
+        XCTAssertEqual(
+            try XCTUnwrap(harness.pipeline.diagnostics.lastRendererProgressAgeSeconds),
+            3.25,
+            accuracy: 0.001
+        )
+
+        renderer.configureEnqueueResults([.backpressured, .accepted])
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 8, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+
+        diagnostics = harness.pipeline.diagnostics
+        XCTAssertEqual(diagnostics.pendingSampleCount, 1)
+        XCTAssertTrue(diagnostics.rendererRequestArmed)
+        XCTAssertEqual(diagnostics.rendererBackpressureCount, 2)
+        XCTAssertEqual(diagnostics.rendererRequestRearmCount, 1)
+
+        harness.diagnosticsClock.set(20)
+        renderer.fireReady()
+        drain(harness.executor)
+        diagnostics = harness.pipeline.diagnostics
+        XCTAssertEqual(diagnostics.pendingSampleCount, 0)
+        XCTAssertFalse(diagnostics.rendererRequestArmed)
+        XCTAssertEqual(diagnostics.lastAcceptedPTSSeconds, 8)
+        XCTAssertEqual(diagnostics.lastRendererProgressAgeSeconds, 0)
+    }
+
     func testDiagnosticsCountAcceptedRecoveryTriggersTransactionsAndSuppression() throws {
         let harness = try makeHarness(initialRouteCategory: .airPlay)
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
@@ -45,13 +232,16 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         renderer.emit(.automaticFlush(.zero))
         drain(harness.executor)
         XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushTriggerCount, 1)
-        XCTAssertEqual(harness.pipeline.diagnostics.recoveryTransactionCount, 2)
-        XCTAssertEqual(harness.pipeline.recoveryCount, 2)
+        XCTAssertEqual(harness.pipeline.diagnostics.recoveryTransactionCount, 1)
+        XCTAssertEqual(harness.pipeline.recoveryCount, 1)
     }
 
     func testDiagnosticsCountCompressedRetryAndRepeatedFailureFallback() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
 
         first.emit(.failed("diagnostics:first"))
         drain(harness.executor)
@@ -227,6 +417,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     func testSecondCompressedFailureForSameAttemptFallsBackToPCMExactlyOnce() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         first.emit(.failed("compressed:first"))
         drain(harness.executor)
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
@@ -248,13 +441,16 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             .compressed, .compressed, .linearPCM,
         ])
         XCTAssertEqual(harness.decoderFactory.snapshot.count, 1)
-        XCTAssertTrue(harness.support.checkSnapshot.isEmpty)
+        XCTAssertEqual(harness.support.formatIDSnapshot, [kAudioFormatLinearPCM])
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
     func testNewGenerationStartsFreshCompressedRetryAttempt() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         first.emit(.failed("generation:old"))
         drain(harness.executor)
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
@@ -263,6 +459,16 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let retry = try XCTUnwrap(harness.renderers.snapshot.last)
         performWithoutThrow(on: harness.executor) {
             harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 2)
+            )
+        }
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                generation: MediaGeneration(rawValue: 2)
+            ))
         }
         retry.emit(.failed("generation:new"))
         drain(harness.executor)
@@ -280,6 +486,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     func testNewFingerprintStartsFreshCompressedRetryAttemptForSameGeneration() throws {
         let harness = try makeHarness(fingerprint: fingerprint(1))
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         first.emit(.failed("fingerprint:old"))
         drain(harness.executor)
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
@@ -296,6 +505,13 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         harness.synchronizer.completeRemoval(index: 1, didRemove: true)
         drain(harness.executor)
         let reconfigured = try XCTUnwrap(harness.renderers.snapshot.last)
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(id: 2))
+        }
 
         reconfigured.emit(.failed("fingerprint:new"))
         drain(harness.executor)
@@ -312,6 +528,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     func testNewRouteRevisionStartsFreshCompressedRetryAttemptAndInvalidatesPendingRecovery() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         first.emit(.failed("route:old"))
         drain(harness.executor)
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
@@ -338,7 +557,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [
             .compressed, .compressed, .compressed,
         ])
-        XCTAssertTrue(replacement.snapshot.operations.filter { $0 == "flush" }.isEmpty)
+        XCTAssertEqual(
+            replacement.snapshot.operations.filter { $0 == "flush" }.count,
+            1,
+            "the replacement owns one replay independent of the invalidated route collection"
+        )
         XCTAssertTrue(harness.support.checkSnapshot.isEmpty)
         XCTAssertEqual(harness.pipeline.route, .systemCompressed)
     }
@@ -346,6 +569,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     func testStaleFailureCallbackFromRemovedCompressedRendererCannotConsumeRetryBudget() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         let staleHandler = try XCTUnwrap(first.captureEventHandler())
         first.emit(.failed("current"))
         drain(harness.executor)
@@ -391,7 +617,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             rendererFactory: renderers,
             decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
             routeMonitor: FakeAudioRouteMonitor(),
-            supportChecker: FakeAudioFormatSupportChecker(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
             clockMode: .externallyManaged,
             readinessSink: { change, generation in
                 readiness.append(change, generation: generation)
@@ -405,12 +632,20 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
             )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
             pipeline.setSharedTimelineOpened(true)
         }
         let first = try XCTUnwrap(renderers.snapshot.first)
         first.configureReadiness(ready: true, sufficient: true)
         try perform(on: executor) {
-            try pipeline.enqueue(try self.makeSample(id: 1))
+            try pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 7, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
         }
         XCTAssertTrue(pipeline.isReadyForPlayback)
         XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
@@ -435,7 +670,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
         first.configureReadiness(ready: true, sufficient: true)
         try perform(on: harness.executor) {
-            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 7, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
             harness.pipeline.setSharedTimelineOpened(true)
         }
         XCTAssertTrue(harness.pipeline.isReadyForPlayback)
@@ -497,10 +736,13 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.decoderFactory.snapshot.isEmpty)
     }
 
-    func testCompressedRetryInfrastructureFailuresAreTerminalWithoutPCM() throws {
+    func testCompressedRetryRemovalFailureIsTerminalButReplacementConstructionCanUsePCM() throws {
         do {
             let harness = try makeHarness()
             let first = try XCTUnwrap(harness.renderers.snapshot.first)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
             first.emit(.failed("remove"))
             drain(harness.executor)
             harness.synchronizer.completeRemoval(index: 0, didRemove: false)
@@ -515,37 +757,51 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         do {
             let harness = try makeHarness()
             let first = try XCTUnwrap(harness.renderers.snapshot.first)
-            harness.renderers.configureCreateError(.audioRendererFailed("retry.create"))
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
+            harness.renderers.configureNextCreateError(
+                .audioRendererFailed("retry.create"),
+                for: .compressed
+            )
             first.emit(.failed("create"))
             drain(harness.executor)
             harness.synchronizer.completeRemoval(index: 0, didRemove: true)
             drain(harness.executor)
-            XCTAssertEqual(harness.failures.snapshot.map(\.error), [
-                .audioRendererFailed("retry.create"),
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+            XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [
+                .compressed, .linearPCM,
             ])
-            XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
-            XCTAssertTrue(harness.decoderFactory.snapshot.isEmpty)
+            XCTAssertEqual(harness.decoderFactory.snapshot.count, 1)
         }
 
         do {
             let harness = try makeHarness()
             let first = try XCTUnwrap(harness.renderers.snapshot.first)
-            harness.synchronizer.configureAttachError(.audioRendererFailed("retry.attach"))
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
+            harness.synchronizer.configureNextAttachError(
+                .audioRendererFailed("retry.attach")
+            )
             first.emit(.failed("attach"))
             drain(harness.executor)
             harness.synchronizer.completeRemoval(index: 0, didRemove: true)
             drain(harness.executor)
-            XCTAssertEqual(harness.failures.snapshot.map(\.error), [
-                .audioRendererFailed("retry.attach"),
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+            XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [
+                .compressed, .compressed, .linearPCM,
             ])
-            XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
-            XCTAssertTrue(harness.decoderFactory.snapshot.isEmpty)
+            XCTAssertEqual(harness.decoderFactory.snapshot.count, 1)
         }
     }
 
     func testPCMRendererFailureRemainsTerminalAndNeverSwitchesBackToCompressed() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         first.emit(.failed("compressed:first"))
         drain(harness.executor)
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
@@ -649,7 +905,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 rendererFactory: renderers,
                 decoderFactory: decoderFactory,
                 routeMonitor: routeMonitor,
-                supportChecker: support
+                decodeCapabilityChecker: support,
+                pcmOutputValidator: support
             )
             weakPipeline = pipeline
             try perform(on: executor) {
@@ -763,50 +1020,600 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 3)
     }
 
-    func testReadyCallbackStormCoalescesAndStopsRequestingWhenThereIsNoWork() throws {
+    func testCompressedEnqueueBackpressureRetainsUnsentHeadWithoutTerminalFailure() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
         renderer.configureReadiness(ready: true)
-
-        for _ in 0..<100 { renderer.fireReady() }
-        drain(harness.executor)
-
-        XCTAssertLessThan(renderer.snapshot.readinessCheckCount, 10)
-        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
+        renderer.configureEnqueueResults([.backpressured, .accepted, .accepted])
 
         try perform(on: harness.executor) {
-            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
         }
+
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+        XCTAssertEqual(harness.pipeline.diagnostics.acceptedCompressedMediaDurationSeconds, 0)
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+        ])
+        XCTAssertEqual(harness.pipeline.diagnostics.acceptedCompressedMediaDurationSeconds, 2)
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPCMEnqueueBackpressureRetainsPendingHeadWithoutDataLoss() throws {
+        let harness = try makeHarness()
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        let samplePTS = CMTime(value: 3, timescale: 2)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1, pts: samplePTS))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: compressed,
+            in: harness,
+            reason: "pcm-backpressure"
+        )
+        harness.synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
+        drain(harness.executor)
+
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcm.configureReadiness(ready: true)
+        pcm.configureEnqueueResults([.backpressured, .accepted])
+        pcm.fireReady()
+        drain(harness.executor)
+
+        XCTAssertTrue(pcm.snapshot.enqueuedPTS.isEmpty)
+        XCTAssertEqual(pcm.snapshot.requestCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        pcm.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(pcm.snapshot.enqueuedPTS, [samplePTS])
+        XCTAssertEqual(pcm.snapshot.requestCount, 1)
+        XCTAssertEqual(pcm.snapshot.stopRequestCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testAutomaticFlushWhileBackpressuredRearmsRequestAndReplaysWhenReady() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        let samplePTS = CMTime(value: 7, timescale: 1)
+        renderer.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: samplePTS,
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+
+        renderer.configureReadiness(ready: true)
+        renderer.fireReady()
+        drain(harness.executor)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [samplePTS])
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
+
+        renderer.configureReadiness(ready: true)
+        renderer.configureEnqueueResults([.backpressured, .accepted])
+        renderer.emit(.automaticFlush(samplePTS))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+
         XCTAssertEqual(renderer.snapshot.requestCount, 2)
-        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 1)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [samplePTS])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        renderer.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [samplePTS, samplePTS])
+        XCTAssertEqual(renderer.snapshot.requestCount, 2)
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 2)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReadyCallbackAndNormalEnqueueShareOnePumpWithoutDoubleRegistration() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.configureEnqueueResults([
+            .backpressured, .backpressured, .accepted, .accepted,
+        ])
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+
+        renderer.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+        ])
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testSystemRendererReportsNotReadyAsBackpressure() throws {
+        let underlying = AlwaysBackpressuredAVSampleBufferAudioRenderer()
+        let renderer = SystemAudioRenderer(
+            identity: AudioRendererIdentity(rawValue: 99),
+            mediaKind: .compressed,
+            renderer: underlying
+        )
+        let sample = try makeSample(id: 1)
+
+        XCTAssertEqual(try renderer.enqueue(sample.sampleBuffer), .backpressured)
+        XCTAssertEqual(underlying.enqueueCount, 0)
+    }
+
+    func testSystemRendererDoesNotReregisterActiveMediaRequest() {
+        let underlying = AlwaysBackpressuredAVSampleBufferAudioRenderer()
+        let renderer = SystemAudioRenderer(
+            identity: AudioRendererIdentity(rawValue: 100),
+            mediaKind: .compressed,
+            renderer: underlying
+        )
+
+        renderer.requestMediaDataWhenReady {}
+        renderer.requestMediaDataWhenReady {}
+
+        XCTAssertEqual(underlying.requestCount, 1)
+        XCTAssertEqual(underlying.stopRequestCount, 0)
+
+        renderer.stopRequestingMediaData()
+        renderer.stopRequestingMediaData()
+
+        XCTAssertEqual(underlying.stopRequestCount, 1)
+    }
+
+    func testSystemRendererForwardsDemandCallbackButEnqueueIsNotAcknowledgement() throws {
+        let underlying = ControllableAVSampleBufferAudioRenderer()
+        let renderer = SystemAudioRenderer(
+            identity: AudioRendererIdentity(rawValue: 101),
+            mediaKind: .compressed,
+            renderer: underlying
+        )
+        let callbacks = LockedAudioCompletionCount()
+        renderer.requestMediaDataWhenReady { callbacks.increment() }
+
+        XCTAssertEqual(callbacks.value, 0)
+        XCTAssertEqual(
+            try renderer.enqueue(makeSample(id: 1).sampleBuffer),
+            .accepted
+        )
+        XCTAssertEqual(underlying.enqueueCount, 1)
+        XCTAssertEqual(
+            callbacks.value,
+            0,
+            "enqueue acceptance is not a renderer-consumption acknowledgement"
+        )
+
+        underlying.fireReady()
+        XCTAssertEqual(callbacks.value, 1)
+    }
+
+    func testSynchronizerRejectsNonSystemRendererInsteadOfSilentlyAttaching() {
+        let synchronizer: any AudioRenderSynchronizing = SystemAudioSynchronizer(
+            AVSampleBufferRenderSynchronizer()
+        )
+        let renderer = FakeAudioRenderer(identity: 101, mediaKind: .compressed)
+
+        assertCoreError(.audioRendererFailed("audio.renderer.type-mismatch")) {
+            try synchronizer.attach(renderer)
+        }
+    }
+
+    func testActivateContinuityIslandFlushesAndCannotReplayPreviousIsland() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.configureEnqueueResults([.accepted, .backpressured])
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        let operationsBeforeActivation = renderer.snapshot.operations.count
+
+        let nextIsland = AudioContinuityIslandID(rawValue: 2)
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                nextIsland,
+                generation: MediaGeneration(rawValue: 1)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 3,
+                pts: CMTime(value: 10, timescale: 1),
+                continuityIslandID: nextIsland
+            ))
+        }
+
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
+        XCTAssertEqual(
+            Array(renderer.snapshot.operations.dropFirst(operationsBeforeActivation)),
+            ["stopRequest", "flush", "enqueue"]
+        )
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 10, timescale: 1),
+        ])
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 10, timescale: 1),
+            CMTime(value: 10, timescale: 1),
+        ])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testEnqueueRejectsSampleFromInactiveIsland() throws {
+        let harness = try makeHarness()
+        let activeIsland = AudioContinuityIslandID(rawValue: 7)
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                activeIsland,
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+
+        assertCoreError(.audioRendererFailed("audio.island.mismatch")) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: 1,
+                    continuityIslandID: AudioContinuityIslandID(rawValue: 8)
+                ))
+            }
+        }
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testInactiveIslandMismatchPrecedesCodecMismatchForCurrentGeneration() throws {
+        let harness = try makeHarness()
+        let activeIsland = AudioContinuityIslandID(rawValue: 7)
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                activeIsland,
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+
+        assertCoreError(.audioRendererFailed("audio.island.mismatch")) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: 1,
+                    codec: .ac3,
+                    continuityIslandID: AudioContinuityIslandID(rawValue: 8)
+                ))
+            }
+        }
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testStaleGenerationSampleIsIgnoredBeforeIslandAndCodecValidation() throws {
+        let harness = try makeHarness()
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 7),
+                generation: MediaGeneration(rawValue: 1)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                codec: .ac3,
+                generation: MediaGeneration(rawValue: 2),
+                continuityIslandID: AudioContinuityIslandID(rawValue: 8)
+            ))
+        }
+
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPrepareAnchorReplaysOnlyCurrentIslandAtOrAfterCommonPTS() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+
+        let currentIsland = AudioContinuityIslandID(rawValue: 11)
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                currentIsland,
+                generation: MediaGeneration(rawValue: 1)
+            )
+            for id in 2...4 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    pts: CMTime(value: Int64(id - 1), timescale: 1),
+                    duration: CMTime(value: 1, timescale: 1),
+                    continuityIslandID: currentIsland
+                ))
+            }
+            try harness.pipeline.prepareAnchor(
+                at: CMTime(value: 2, timescale: 1),
+                in: currentIsland
+            )
+        }
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            .zero,
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+            CMTime(value: 3, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+            CMTime(value: 3, timescale: 1),
+        ])
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 2)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPrepareAnchorForcesResetOnlyOnFirstAcceptedReplayBuffer() throws {
+        let harness = try makeResetAttachmentHarness()
+        let first = try makeSample(
+            id: 1,
+            pts: CMTime(value: 1, timescale: 1)
+        )
+        let second = try makeSample(
+            id: 2,
+            pts: CMTime(value: 2, timescale: 1)
+        )
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(first)
+            try harness.pipeline.enqueue(second)
+            try harness.pipeline.prepareAnchor(
+                at: CMTime(value: 1, timescale: 1),
+                in: AudioContinuityIslandID(rawValue: 1)
+            )
+        }
+
+        XCTAssertEqual(harness.renderer.acceptedResetDecoderSnapshot, [
+            false, false, true, false,
+        ])
+        XCTAssertNil(CMGetAttachment(
+            first.sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding,
+            attachmentModeOut: nil
+        ))
+        XCTAssertNil(CMGetAttachment(
+            second.sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding,
+            attachmentModeOut: nil
+        ))
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testBackpressuredResetReplayPreservesResetUntilFirstAcceptance() throws {
+        let harness = try makeResetAttachmentHarness()
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        harness.renderer.configureEnqueueResults([.backpressured, .accepted])
+
+        harness.renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderer.attemptedResetDecoderSnapshot, [false, true])
+        XCTAssertEqual(harness.renderer.acceptedResetDecoderSnapshot, [false])
+
+        harness.renderer.fireReady()
+        drain(harness.executor)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+
+        XCTAssertEqual(harness.renderer.attemptedResetDecoderSnapshot, [
+            false, true, true, false,
+        ])
+        XCTAssertEqual(harness.renderer.acceptedResetDecoderSnapshot, [false, true, false])
+        XCTAssertEqual(harness.renderer.requestCountSnapshot, 1)
+        XCTAssertEqual(harness.renderer.stopRequestCountSnapshot, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testCompressedRendererRebuildResetsOnlyFirstAcceptedReplayBuffer() throws {
+        let harness = try makeResetAttachmentHarness()
+        let firstSample = try makeSample(
+            id: 1,
+            pts: CMTime(value: 1, timescale: 1)
+        )
+        let secondSample = try makeSample(
+            id: 2,
+            pts: CMTime(value: 2, timescale: 1)
+        )
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(firstSample)
+            try harness.pipeline.enqueue(secondSample)
+        }
+
+        harness.renderer.emit(.failed("compressed:first"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.renderers.snapshot.count, 1)
+
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+
+        XCTAssertEqual(harness.renderers.snapshot.count, 2)
+        XCTAssertEqual(replacement.acceptedResetDecoderSnapshot, [true, false])
+        XCTAssertNil(CMGetAttachment(
+            firstSample.sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding,
+            attachmentModeOut: nil
+        ))
+        XCTAssertNil(CMGetAttachment(
+            secondSample.sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding,
+            attachmentModeOut: nil
+        ))
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testStaleGenerationIslandActivationIsIgnored() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 99),
+                generation: MediaGeneration(rawValue: 2)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+        ])
+        XCTAssertFalse(renderer.snapshot.operations.contains("flush"))
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReadyCallbackStormCoalescesAndStopsRequestingWhenThereIsNoWork() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1)
+            ))
+        }
+
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let releaseExecutor = DispatchSemaphore(value: 0)
+        harness.executor.submit {
+            blockerEntered.signal()
+            _ = releaseExecutor.wait(timeout: .now() + 5)
+        }
+        XCTAssertEqual(blockerEntered.wait(timeout: .now() + 2), .success)
+
+        for _ in 0..<100 { renderer.fireReady() }
+        releaseExecutor.signal()
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [CMTime(value: 1, timescale: 1)])
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 0)
+
+        renderer.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+        ])
+        XCTAssertEqual(renderer.snapshot.requestCount, 1)
+        XCTAssertEqual(renderer.snapshot.stopRequestCount, 1)
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
     func testReplayPreservesUnexpiredSamplesInsteadOfOverwritingThemAtNinetySixPackets() throws {
         let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
         for id in 0..<96 {
             try perform(on: harness.executor) {
                 try harness.pipeline.enqueue(try self.makeSample(
                     id: UInt64(id + 1),
-                    pts: CMTime(value: Int64(id * 2), timescale: 10),
-                    duration: CMTime(value: 2, timescale: 10)
+                    pts: CMTime(value: Int64(id), timescale: 10),
+                    duration: CMTime(value: 1, timescale: 10)
                 ))
             }
         }
         try perform(on: harness.executor) {
             try harness.pipeline.enqueue(try self.makeSample(
                 id: 97,
-                pts: CMTime(value: 30, timescale: 1)
+                pts: CMTime(value: 96, timescale: 10)
             ))
         }
 
-        harness.synchronizer.setCurrentTime(CMTime(value: 3, timescale: 10))
+        harness.synchronizer.setCurrentTime(CMTime(value: 15, timescale: 100))
         try perform(on: harness.executor) {
-            try harness.pipeline.enqueue(try self.makeSample(id: 98, pts: CMTime(value: 100, timescale: 1)))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 98,
+                pts: CMTime(value: 97, timescale: 10)
+            ))
         }
-        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
         let transition = try beginFallbackAfterCompressedRetry(
-            initialRenderer: compressed,
+            initialRenderer: renderer,
             in: harness,
             reason: "force-replay-inspection"
         )
@@ -823,6 +1630,539 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertFalse(pushed.contains(1))
         XCTAssertTrue(pushed.contains(2))
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplayByteBudgetPrunesCompletedHistoryBeforeCountCap() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 9,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        let harness = try makeHarness(
+            replayRetentionLimits: limits,
+            replayHardCount: 10
+        )
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+
+        try perform(on: harness.executor) {
+            harness.pipeline.updateRecoveryFloor(CMTime(value: 1, timescale: 2))
+            for id in 1...3 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    pts: CMTime(value: Int64(id - 1), timescale: 1),
+                    duration: CMTime(value: 1, timescale: 1),
+                    payloadBytes: 4
+                ))
+            }
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1, 3])
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 8)
+        }
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
+            .zero,
+            CMTime(value: 1, timescale: 1),
+            CMTime(value: 2, timescale: 1),
+            .zero,
+            CMTime(value: 2, timescale: 1),
+        ])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplayBudgetNeverDropsBackpressuredUnsentHead() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 9,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        let harness = try makeHarness(
+            replayRetentionLimits: limits,
+            replayHardCount: 10
+        )
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+
+        try perform(on: harness.executor) {
+            for id in 1...3 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    pts: CMTime(value: Int64(id - 1), timescale: 1),
+                    duration: CMTime(value: 1, timescale: 1),
+                    payloadBytes: 4
+                ))
+            }
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1, 2])
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 8)
+        }
+
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+        XCTAssertEqual(harness.failures.snapshot, [AudioFailureRecord(
+            error: .audioRendererFailed(
+                CompressedAudioRetentionPolicy.replayCapacityError
+            ),
+            generation: MediaGeneration(rawValue: 1)
+        )])
+    }
+
+    func testReplaySoftCountAllowsMandatoryWorkOnlyUntilInjectedHardCount() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 2,
+            maximumOwnedBytes: 100,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        let harness = try makeHarness(
+            replayRetentionLimits: limits,
+            replayHardCount: 3
+        )
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+
+        try perform(on: harness.executor) {
+            for id in 1...4 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    pts: CMTime(value: Int64(id - 1), timescale: 10),
+                    duration: CMTime(value: 1, timescale: 10)
+                ))
+            }
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1, 2, 3])
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 6)
+        }
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+            .audioRendererFailed(CompressedAudioRetentionPolicy.replayCapacityError),
+        ])
+    }
+
+    func testReplayTimeHorizonKeepsLatestCompletedTailAndFloorProtector() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 100,
+            latestTailHorizon: CMTime(value: 2, timescale: 1)
+        )
+        let harness = try makeHarness(
+            replayRetentionLimits: limits,
+            replayHardCount: 10
+        )
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+
+        try perform(on: harness.executor) {
+            harness.pipeline.updateRecoveryFloor(CMTime(value: 1, timescale: 2))
+            for id in 1...4 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    pts: CMTime(value: Int64(id - 1), timescale: 1),
+                    duration: CMTime(value: 1, timescale: 1),
+                    payloadBytes: 2
+                ))
+            }
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1, 3, 4])
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 6)
+        }
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplayAccountingCountsCMSampleBufferCopyNotSourceDataSharingAssumption() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 100,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        var continuity = AudioContinuityBuffer(retentionLimits: limits)
+        let frame = CompressedAudioFrame(
+            id: 1,
+            payload: Data(repeating: 0xA5, count: 4),
+            codec: .aac,
+            generation: MediaGeneration(rawValue: 1),
+            presentationTimeStamp: .zero,
+            duration: CMTime(value: 1, timescale: 1),
+            frameSampleCount: 1_024
+        )
+        let admitted: AdmittedAudioFrame
+        switch try continuity.admit(frame) {
+        case let .admitted(value): admitted = value
+        case let .dropped(reason):
+            return XCTFail("unexpected continuity drop: \(reason)")
+        }
+        let sampleBuffer = try SampleBufferBuilder.makeAudio(
+            frame: admitted,
+            formatDescription: makeFormat(codec: .aac),
+            forceResetDecoderBeforeDecoding: false
+        )
+        let sample = CompressedAudioSample(
+            id: 1,
+            sampleBuffer: sampleBuffer,
+            codec: .aac,
+            generation: MediaGeneration(rawValue: 1),
+            presentationTimeStamp: .zero,
+            duration: CMTime(value: 1, timescale: 1),
+            continuityIslandID: admitted.continuityIslandID,
+            effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
+        )
+        let continuityBytes = continuity.retainedPayloadBytes
+        let harness = try makeHarness(replayRetentionLimits: limits)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(sample)
+            XCTAssertEqual(continuityBytes, 4)
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 4)
+            XCTAssertEqual(
+                continuityBytes + harness.pipeline.retainedReplayPayloadBytes,
+                8
+            )
+        }
+    }
+
+    func testPrepareAnchorRejectsCommonPTSOutsideActualReplayCoverageBeforeFlush() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        let baselineFlushCount = renderer.snapshot.operations.filter { $0 == "flush" }.count
+
+        assertCoreError(.audioRendererFailed(
+            CompressedAudioRetentionPolicy.unretainedAnchorError
+        )) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.prepareAnchor(
+                    at: CMTime(value: 2, timescale: 1),
+                    in: AudioContinuityIslandID(rawValue: 1)
+                )
+            }
+        }
+
+        XCTAssertEqual(
+            renderer.snapshot.operations.filter { $0 == "flush" }.count,
+            baselineFlushCount
+        )
+    }
+
+    func testReplayShortGapFillUsesEffectiveHalfOpenCoverage() throws {
+        var continuity = AudioContinuityBuffer()
+        let format = try makeFormat(codec: .aac)
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        let floor = CMTime(value: 11, timescale: 10)
+
+        var samples: [CompressedAudioSample] = []
+        for (id, pts) in [
+            (UInt64(1), CMTime.zero),
+            (UInt64(2), CMTime(value: 12, timescale: 10)),
+        ] {
+            let frame = CompressedAudioFrame(
+                id: id,
+                payload: Data(repeating: UInt8(id), count: 2),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                presentationTimeStamp: pts,
+                duration: CMTime(value: 1, timescale: 1),
+                frameSampleCount: 1_024
+            )
+            let admitted: AdmittedAudioFrame
+            switch try continuity.admit(frame) {
+            case let .admitted(value): admitted = value
+            case let .dropped(reason):
+                return XCTFail("unexpected continuity drop: \(reason)")
+            }
+            samples.append(CompressedAudioSample(
+                id: id,
+                sampleBuffer: try SampleBufferBuilder.makeAudio(
+                    frame: admitted,
+                    formatDescription: format,
+                    forceResetDecoderBeforeDecoding: false
+                ),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                presentationTimeStamp: admitted.normalizedPresentationTimeStamp,
+                duration: admitted.duration,
+                continuityIslandID: admitted.continuityIslandID,
+                effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
+            ))
+        }
+        XCTAssertNotNil(continuity.anchorCandidate(at: floor))
+        let replaySamples = samples
+
+        try perform(on: harness.executor) {
+            for sample in replaySamples { try harness.pipeline.enqueue(sample) }
+            harness.pipeline.updateRecoveryFloor(floor)
+            try harness.pipeline.prepareAnchor(
+                at: floor,
+                in: AudioContinuityIslandID(rawValue: 1)
+            )
+        }
+        XCTAssertGreaterThan(
+            renderer.snapshot.operations.filter { $0 == "flush" }.count,
+            0
+        )
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplayShortGapKeepsEffectiveCoverageWhenPreviousFrameExpiresAtFloor() throws {
+        var continuity = AudioContinuityBuffer()
+        let format = try makeFormat(codec: .aac)
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        let floor = CMTime(value: 11, timescale: 10)
+
+        var samples: [CompressedAudioSample] = []
+        for (id, pts) in [
+            (UInt64(1), CMTime.zero),
+            (UInt64(2), CMTime(value: 12, timescale: 10)),
+        ] {
+            let frame = CompressedAudioFrame(
+                id: id,
+                payload: Data(repeating: UInt8(id), count: 2),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                presentationTimeStamp: pts,
+                duration: CMTime(value: 1, timescale: 1),
+                frameSampleCount: 1_024
+            )
+            let admitted: AdmittedAudioFrame
+            switch try continuity.admit(frame) {
+            case let .admitted(value): admitted = value
+            case let .dropped(reason):
+                return XCTFail("unexpected continuity drop: \(reason)")
+            }
+            samples.append(CompressedAudioSample(
+                id: id,
+                sampleBuffer: try SampleBufferBuilder.makeAudio(
+                    frame: admitted,
+                    formatDescription: format,
+                    forceResetDecoderBeforeDecoding: false
+                ),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                presentationTimeStamp: admitted.normalizedPresentationTimeStamp,
+                duration: admitted.duration,
+                continuityIslandID: admitted.continuityIslandID,
+                effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
+            ))
+        }
+        XCTAssertNotNil(continuity.anchorCandidate(at: floor))
+        let replaySamples = samples
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(replaySamples[0])
+        }
+        harness.synchronizer.setCurrentTime(floor)
+        try perform(on: harness.executor) {
+            harness.pipeline.updateRecoveryFloor(floor)
+            try harness.pipeline.enqueue(replaySamples[1])
+            try harness.pipeline.prepareAnchor(
+                at: floor,
+                in: AudioContinuityIslandID(rawValue: 1)
+            )
+        }
+
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testShortGapCoverageSurvivesRecoveryPruningBeforeFollowingSampleArrives()
+        throws {
+        var continuity = AudioContinuityBuffer()
+        let format = try makeFormat(codec: .aac)
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        let floorInsideGap = CMTime(value: 11, timescale: 10)
+
+        func sample(
+            id: UInt64,
+            pts: CMTime
+        ) throws -> CompressedAudioSample {
+            let frame = CompressedAudioFrame(
+                id: id,
+                payload: Data(repeating: UInt8(id), count: 2),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                presentationTimeStamp: pts,
+                duration: CMTime(value: 1, timescale: 1),
+                frameSampleCount: 1_024
+            )
+            let admitted: AdmittedAudioFrame
+            switch try continuity.admit(frame) {
+            case let .admitted(value): admitted = value
+            case let .dropped(reason):
+                XCTFail("unexpected continuity drop: \(reason)")
+                throw PlaybackCoreError.audioRendererFailed("test.continuity.drop")
+            }
+            return CompressedAudioSample(
+                id: id,
+                sampleBuffer: try SampleBufferBuilder.makeAudio(
+                    frame: admitted,
+                    formatDescription: format,
+                    forceResetDecoderBeforeDecoding: false
+                ),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                presentationTimeStamp: admitted.normalizedPresentationTimeStamp,
+                duration: admitted.duration,
+                continuityIslandID: admitted.continuityIslandID,
+                effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
+            )
+        }
+
+        let firstSample = try sample(id: 1, pts: .zero)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(firstSample)
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1])
+        }
+
+        harness.synchronizer.setCurrentTime(floorInsideGap)
+        renderer.emit(.automaticFlush(floorInsideGap))
+        drain(harness.executor)
+        try perform(on: harness.executor) {
+            XCTAssertEqual(
+                harness.pipeline.retainedReplaySampleIDs,
+                [],
+                "automatic recovery must remove A before B supplies its gap coverage"
+            )
+        }
+
+        let secondSample = try sample(
+            id: 2,
+            pts: CMTime(value: 12, timescale: 10)
+        )
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(secondSample)
+            harness.pipeline.updateRecoveryFloor(floorInsideGap)
+            try harness.pipeline.prepareAnchor(
+                at: floorInsideGap,
+                in: AudioContinuityIslandID(rawValue: 1)
+            )
+        }
+
+        assertCoreError(.audioRendererFailed(
+            CompressedAudioRetentionPolicy.unretainedAnchorError
+        )) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.prepareAnchor(
+                    at: CMTime(value: 22, timescale: 10),
+                    in: AudioContinuityIslandID(rawValue: 1)
+                )
+            }
+        }
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testActivateContinuityIslandFlushesAndCannotReplayPreviousIslandAfterByteCap() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 4,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        let harness = try makeHarness(
+            replayRetentionLimits: limits,
+            replayHardCount: 10
+        )
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        let nextIsland = AudioContinuityIslandID(rawValue: 2)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 1, timescale: 1),
+                payloadBytes: 4
+            ))
+            harness.pipeline.activateContinuityIsland(
+                nextIsland,
+                generation: MediaGeneration(rawValue: 1)
+            )
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 0)
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1),
+                continuityIslandID: nextIsland,
+                payloadBytes: 4
+            ))
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [2])
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 4)
+        }
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.suffix(1), [
+            CMTime(value: 1, timescale: 1),
+        ])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplayClearPathsResetByteCounter() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 4,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        let harness = try makeHarness(replayRetentionLimits: limits)
+        let firstRenderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        firstRenderer.configureReadiness(ready: true)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1, payloadBytes: 4))
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 4)
+            harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 0)
+
+            let secondIsland = AudioContinuityIslandID(rawValue: 2)
+            harness.pipeline.activateContinuityIsland(
+                secondIsland,
+                generation: MediaGeneration(rawValue: 2)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                generation: MediaGeneration(rawValue: 2),
+                continuityIslandID: secondIsland,
+                payloadBytes: 4
+            ))
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 3),
+                generation: MediaGeneration(rawValue: 2)
+            )
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 0)
+
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 3,
+                generation: MediaGeneration(rawValue: 2),
+                continuityIslandID: AudioContinuityIslandID(rawValue: 3),
+                payloadBytes: 4
+            ))
+            try harness.pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 3),
+                fingerprint: self.fingerprint(3)
+            )
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 0)
+
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 4),
+                generation: MediaGeneration(rawValue: 3)
+            )
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 4,
+                generation: MediaGeneration(rawValue: 3),
+                continuityIslandID: AudioContinuityIslandID(rawValue: 4),
+                payloadBytes: 4
+            ))
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 4)
+            harness.pipeline.stop()
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 0)
+        }
     }
 
     func testAsyncFailureWaitsForSuccessfulRemovalThenReplaysPCMAndAnchorsExactlyOnce() throws {
@@ -975,6 +2315,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         do {
             let harness = try makeHarness()
             let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
             let transition = try beginFallbackAfterCompressedRetry(
                 initialRenderer: compressed,
                 in: harness,
@@ -1011,6 +2354,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             let harness = try makeHarness()
             harness.decoderFactory.createError = .audioFallbackDecode(-12_345)
             let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
             let transition = try beginFallbackAfterCompressedRetry(
                 initialRenderer: compressed,
                 in: harness,
@@ -1024,6 +2370,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         do {
             let harness = try makeHarness()
             let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
             let transition = try beginFallbackAfterCompressedRetry(
                 initialRenderer: compressed,
                 in: harness,
@@ -1075,6 +2424,842 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.route, .systemCompressed)
     }
 
+    func testSecondAutomaticFlushBeforeDeadlineDoesNotReplayOrRebuild() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let initialEnqueueCount = renderer.snapshot.enqueuedPTS.count
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        let firstReplayCount = renderer.snapshot.enqueuedPTS.count
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        XCTAssertEqual(firstReplayCount, initialEnqueueCount + 1)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, firstReplayCount)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+    }
+
+    func testOutputConfigurationCorrelatedWithAutomaticFlushDoesNotReplayBeforeProgressDeadline() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        let replayedCount = renderer.snapshot.enqueuedPTS.count
+        renderer.emit(.outputConfigurationChanged)
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, replayedCount)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
+        XCTAssertEqual(harness.pipeline.recoveryCount, 1)
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+    }
+
+    func testDeadlineWithoutMediaProgressRebuildsCompressedRendererOnce() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 1)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
+        guard harness.synchronizer.removalCount == 1 else { return }
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testSharedSynchronizerAdvanceAfterAutomaticFlushStillRebuildsCompressed() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        harness.synchronizer.setCurrentTime(CMTime(value: 1, timescale: 2))
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+    }
+
+    func testNewAcceptedInputAfterAutomaticFlushStillRebuildsWithoutRendererConsumption()
+        throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 1)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+    }
+
+    func testSilentAlwaysAcceptingRendererCannotClearAutomaticFlushBaseline() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        harness.synchronizer.setCurrentTime(CMTime(value: 1, timescale: 2))
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 1)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+    }
+
+    func testPostReplayBackpressureThenCurrentReadyKeepsCompressed() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 10)
+            ))
+        }
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        XCTAssertTrue(harness.pipeline.diagnostics.rendererRequestArmed)
+
+        renderer.fireReady()
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 0)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+    }
+
+    func testImmediateReadyWithoutPostResetAcceptanceAndBackpressureIsNotConsumption()
+        throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        renderer.configureReadiness(ready: true)
+        renderer.fireReady()
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 1)
+    }
+
+    func testReadyCallbackCapturedBeforeRecoveryFlushCannotClearNewBaseline() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 10),
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        let staleReady = try XCTUnwrap(renderer.captureReadyHandler())
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        staleReady()
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 1)
+    }
+
+    func testStaleReadyCannotSuppressCurrentCallbackWhileExecutorIsBlocked() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 10)
+            ))
+        }
+        let staleReady = try XCTUnwrap(renderer.captureReadyHandler())
+
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        let currentReady = try XCTUnwrap(renderer.captureReadyHandler())
+
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let releaseExecutor = DispatchSemaphore(value: 0)
+        harness.executor.submit {
+            blockerEntered.signal()
+            _ = releaseExecutor.wait(timeout: .now() + 5)
+        }
+        XCTAssertEqual(blockerEntered.wait(timeout: .now() + 2), .success)
+
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        staleReady()
+        for _ in 0..<100 { currentReady() }
+        releaseExecutor.signal()
+        drain(harness.executor)
+
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(
+            renderer.snapshot.enqueuedPTS.filter {
+                $0 == CMTime(value: 2, timescale: 10)
+            }.count,
+            1,
+            "the current registration must process its callback storm exactly once"
+        )
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 0)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testCurrentReadyStormCannotBePerturbedByLaterStaleCallbacks() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 10)
+            ))
+        }
+        let staleReady = try XCTUnwrap(renderer.captureReadyHandler())
+
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        let currentReady = try XCTUnwrap(renderer.captureReadyHandler())
+
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let releaseExecutor = DispatchSemaphore(value: 0)
+        harness.executor.submit {
+            blockerEntered.signal()
+            _ = releaseExecutor.wait(timeout: .now() + 5)
+        }
+        XCTAssertEqual(blockerEntered.wait(timeout: .now() + 2), .success)
+
+        renderer.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        for _ in 0..<100 { currentReady() }
+        for _ in 0..<100 { staleReady() }
+        releaseExecutor.signal()
+        drain(harness.executor)
+
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(
+            renderer.snapshot.enqueuedPTS.filter {
+                $0 == CMTime(value: 2, timescale: 10)
+            }.count,
+            1
+        )
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 0)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReplacementNoProgressFallsBackOnlyAfterItsOwnDeadline() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        original.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        guard harness.synchronizer.removalCount == 1 else { return }
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true)
+        replacement.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.recoveryScheduler.advance(by: .milliseconds(999))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.recoveryScheduler.advance(by: .milliseconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 2)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        guard harness.synchronizer.removalCount == 2 else { return }
+        harness.synchronizer.completeRemoval(index: 1, didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(
+            harness.pipeline.diagnostics.lastFallbackReason,
+            .compressedRendererNoProgressAfterRebuild
+        )
+    }
+
+    func testProgressDeadlineTicketExhaustionTerminatesWithoutPCMOrCrash() throws {
+        let harness = try makeHarness(progressDeadlineTicketStart: UInt64.max)
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+
+        original.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+            .audioRendererFailed(AudioRenderPipeline.progressTicketExhaustedError),
+        ])
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [
+            .compressed,
+            .compressed,
+        ])
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.pcmFallbackCount, 0)
+    }
+
+    func testReplacementSharedClockAndInputMotionStillFallsBackAtItsDeadline() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        original.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true)
+        replacement.fireReady()
+        drain(harness.executor)
+
+        harness.synchronizer.setCurrentTime(CMTime(value: 1, timescale: 2))
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 10, timescale: 1)
+            ))
+        }
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 2)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        harness.synchronizer.completeRemoval(index: 1, didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(
+            harness.pipeline.diagnostics.lastFallbackReason,
+            .compressedRendererNoProgressAfterRebuild
+        )
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+    }
+
+    func testAutomaticFlushWithoutLocalMediaNeverConsumesRebuildBudget() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+
+        renderer.emit(.automaticFlush(.zero))
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(2))
+        drain(harness.executor)
+
+        XCTAssertTrue(renderer.snapshot.operations.filter { $0 == "flush" }.isEmpty)
+        XCTAssertEqual(harness.pipeline.recoveryCount, 0)
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        renderer.emit(.failed("after-empty-flush:-1"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+    }
+
+    func testAutomaticFlushPrunesExpiredOnlyReplayBeforeStartingProgressAttempt() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        harness.synchronizer.setCurrentTime(CMTime(value: 2, timescale: 1))
+        let readsBeforeRecovery = harness.synchronizer.currentTimeReadCount
+
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+
+        XCTAssertEqual(
+            harness.synchronizer.currentTimeReadCount - readsBeforeRecovery,
+            1,
+            "the replay eligibility check and recovery must share one playhead capture"
+        )
+        XCTAssertEqual(harness.pipeline.recoveryCount, 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 0)
+
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 0)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 2, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        renderer.emit(.failed("fresh:first"))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertTrue(harness.decoderFactory.snapshot.isEmpty)
+    }
+
+    func testRendererFailureAndNoProgressShareOneRebuildBudget() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+
+        original.emit(.failed("first:-1"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true)
+        replacement.fireReady()
+        drain(harness.executor)
+
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+        XCTAssertEqual(harness.synchronizer.removalCount, 2)
+        guard harness.synchronizer.removalCount == 2 else { return }
+        harness.synchronizer.completeRemoval(index: 1, didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [
+            .compressed, .compressed, .linearPCM,
+        ])
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+    }
+
+    func testReplacementConstructionOrAttachFailureFallsBackWithoutRemovingMissingRenderer() throws {
+        for failure in ["create", "attach"] {
+            let harness = try makeHarness()
+            let original = try XCTUnwrap(harness.renderers.snapshot.first)
+            original.configureReadiness(ready: true)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            }
+            original.emit(.failed("original:\(failure)"))
+            drain(harness.executor)
+            if failure == "create" {
+                harness.renderers.configureNextCreateError(
+                    .audioRendererFailed("replacement.create"),
+                    for: .compressed
+                )
+            } else {
+                harness.synchronizer.configureNextAttachError(
+                    .audioRendererFailed("replacement.attach")
+                )
+            }
+
+            harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+            drain(harness.executor)
+
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+            XCTAssertEqual(harness.renderers.snapshot.last?.mediaKind, .linearPCM)
+            XCTAssertEqual(harness.decoderFactory.snapshot.count, 1)
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        }
+    }
+
+    func testInitialCompressedAttachFailureRollsBackUnattachedCandidate() throws {
+        let harness = try makeHarness(configure: false)
+        let expected = PlaybackCoreError.audioRendererFailed("initial.compressed.attach")
+        harness.synchronizer.configureNextAttachError(expected)
+
+        assertCoreError(expected) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.configure(
+                    format: try self.makeFormat(codec: .aac),
+                    codec: .aac,
+                    generation: MediaGeneration(rawValue: 1),
+                    fingerprint: self.fingerprint(1)
+                )
+            }
+        }
+
+        let candidate = try XCTUnwrap(harness.renderers.snapshot.first)
+        XCTAssertEqual(candidate.snapshot.observationStartCount, 1)
+        XCTAssertEqual(candidate.snapshot.observationStopCount, 1)
+        XCTAssertNil(candidate.captureEventHandler())
+        XCTAssertTrue(harness.synchronizer.attachedSnapshot.isEmpty)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        performWithoutThrow(on: harness.executor) { harness.pipeline.stop() }
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+    }
+
+    func testUnavailableDecoderPCMRendererCreateFailureDestroysStagedDecoder() throws {
+        let harness = makeCapabilityHarness()
+        harness.decodeCapability.supported = false
+        let expected = PlaybackCoreError.audioRendererFailed("initial.pcm.create")
+        harness.renderers.configureNextCreateError(expected, for: .linearPCM)
+
+        assertCoreError(expected) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.configure(
+                    self.makeRenderConfiguration(
+                        codec: .aac,
+                        extradata: Data([0x12, 0x10]),
+                        fingerprint: self.fingerprint(1)
+                    ),
+                    generation: MediaGeneration(rawValue: 1)
+                )
+            }
+        }
+
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+        XCTAssertTrue(harness.renderers.snapshot.isEmpty)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        performWithoutThrow(on: harness.executor) { harness.pipeline.stop() }
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+    }
+
+    func testUnavailableDecoderPCMRendererAttachFailureRollsBackStagedResources() throws {
+        let harness = makeCapabilityHarness()
+        harness.decodeCapability.supported = false
+        let expected = PlaybackCoreError.audioRendererFailed("initial.pcm.attach")
+        harness.synchronizer.configureNextAttachError(expected)
+
+        assertCoreError(expected) {
+            try perform(on: harness.executor) {
+                try harness.pipeline.configure(
+                    self.makeRenderConfiguration(
+                        codec: .aac,
+                        extradata: Data([0x12, 0x10]),
+                        fingerprint: self.fingerprint(1)
+                    ),
+                    generation: MediaGeneration(rawValue: 1)
+                )
+            }
+        }
+
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        let candidate = try XCTUnwrap(harness.renderers.snapshot.first)
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+        XCTAssertEqual(candidate.snapshot.observationStopCount, 1)
+        XCTAssertNil(candidate.captureEventHandler())
+        XCTAssertTrue(harness.synchronizer.attachedSnapshot.isEmpty)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        performWithoutThrow(on: harness.executor) { harness.pipeline.stop() }
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+    }
+
+    func testPCMFallbackAttachFailureRollsBackStagedResourcesAndEmitsExactError() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: original,
+            in: harness,
+            reason: "fallback-attach"
+        )
+        let expected = PlaybackCoreError.audioRendererFailed("fallback.pcm.attach")
+        harness.synchronizer.configureNextAttachError(expected)
+
+        harness.synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
+        drain(harness.executor)
+
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        let candidate = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(candidate.mediaKind, .linearPCM)
+        XCTAssertEqual(candidate.snapshot.observationStopCount, 1)
+        XCTAssertNil(candidate.captureEventHandler())
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+        XCTAssertEqual(harness.failures.snapshot, [
+            AudioFailureRecord(error: expected, generation: MediaGeneration(rawValue: 1)),
+        ])
+
+        performWithoutThrow(on: harness.executor) { harness.pipeline.stop() }
+        XCTAssertEqual(harness.synchronizer.removalCount, 2)
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+    }
+
+    func testUnavailableLocalSystemDecoderStartsDirectlyOnPCM() throws {
+        let harness = makeCapabilityHarness(initialRouteCategory: .hdmi)
+        harness.decodeCapability.supported = false
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                self.makeRenderConfiguration(
+                    codec: .aac,
+                    extradata: Data([0xDE, 0xAD]),
+                    fingerprint: self.fingerprint(1)
+                ),
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.linearPCM])
+        XCTAssertEqual(harness.decoderFactory.creationSnapshot.map(\.extradata), [Data([0xDE, 0xAD])])
+        XCTAssertEqual(harness.pipeline.diagnostics.lastFallbackReason, .systemDecoderUnavailable)
+        XCTAssertEqual(harness.decodeCapability.formatIDSnapshot, [kAudioFormatMPEG4AAC])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testAvailableLocalDecoderStartsCompressedRegardlessOfOutputRoute() throws {
+        for category in [AudioOutputRouteCategory.hdmi, .airPlay, .other, .none] {
+            let harness = makeCapabilityHarness(initialRouteCategory: category)
+            harness.decodeCapability.supported = true
+
+            try perform(on: harness.executor) {
+                try harness.pipeline.configure(
+                    self.makeRenderConfiguration(
+                        codec: .aac,
+                        extradata: Data([0xCA, 0xFE]),
+                        fingerprint: self.fingerprint(1)
+                    ),
+                    generation: MediaGeneration(rawValue: 1)
+                )
+            }
+
+            XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+            XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
+            XCTAssertTrue(harness.decoderFactory.creationSnapshot.isEmpty)
+            XCTAssertEqual(harness.decodeCapability.formatIDSnapshot, [kAudioFormatMPEG4AAC])
+        }
+    }
+
+    func testPCMDecoderReceivesOriginalExtradataNotSystemMagicCookie() throws {
+        let sourceExtradata = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        let harness = makeCapabilityHarness()
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                self.makeRenderConfiguration(
+                    codec: .aac,
+                    extradata: sourceExtradata,
+                    fingerprint: self.fingerprint(1)
+                ),
+                generation: MediaGeneration(rawValue: 1)
+            )
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        original.emit(.failed("first:-1"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.emit(.failed("second:-2"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 1, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(harness.decoderFactory.creationSnapshot.map(\.extradata), [sourceExtradata])
+        XCTAssertNotEqual(sourceExtradata, Data([0x11, 0x90]))
+    }
+
+    func testPCMValidatorChecksEveryDecodedOutputDescription() throws {
+        let harness = makeCapabilityHarness()
+        harness.decoderFactory.pushBody = { sample in
+            [
+                try self.makePCMBuffer(pts: sample.presentationTimeStamp),
+                try self.makePCMBuffer(pts: CMTimeAdd(
+                    sample.presentationTimeStamp,
+                    CMTime(value: 1, timescale: 48_000)
+                )),
+            ]
+        }
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                self.makeRenderConfiguration(
+                    codec: .aac,
+                    extradata: Data([0x12, 0x10]),
+                    fingerprint: self.fingerprint(1)
+                ),
+                generation: MediaGeneration(rawValue: 1)
+            )
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        original.emit(.failed("first:-1"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.emit(.failed("second:-2"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 1, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pcmValidator.formatIDSnapshot, [
+            kAudioFormatLinearPCM,
+            kAudioFormatLinearPCM,
+        ])
+    }
+
     func testRunningRendererKeepsReadinessAcrossPrerollDipsAndAutomaticFlushes() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.preroll-latch")
         let synchronizer = FakeAudioSynchronizer()
@@ -1090,7 +3275,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             rendererFactory: renderers,
             decoderFactory: decoderFactory,
             routeMonitor: FakeAudioRouteMonitor(),
-            supportChecker: FakeAudioFormatSupportChecker(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
             clockMode: .externallyManaged,
             readinessSink: { change, generation in
                 readiness.append(change, generation: generation)
@@ -1102,6 +3288,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 codec: .aac,
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
             )
         }
         let renderer = try XCTUnwrap(renderers.snapshot.first)
@@ -1149,7 +3339,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
             },
             routeMonitor: FakeAudioRouteMonitor(),
-            supportChecker: FakeAudioFormatSupportChecker(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
             clockMode: .externallyManaged
         )
         try perform(on: executor) {
@@ -1158,6 +3349,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 codec: .aac,
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
             )
         }
         let renderer = try XCTUnwrap(renderers.snapshot.first)
@@ -1213,6 +3408,12 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         renderer.configureReadiness(ready: true, sufficient: false)
         harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
         drain(harness.executor)
+        performWithoutThrow(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 2)
+            )
+        }
 
         // The preroll latch must not survive a flush: the renderer is empty again,
         // so readiness has to be re-earned rather than inherited.
@@ -1249,7 +3450,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             rendererFactory: renderers,
             decoderFactory: decoderFactory,
             routeMonitor: routeMonitor,
-            supportChecker: support,
+            decodeCapabilityChecker: support,
+            pcmOutputValidator: support,
             clockMode: .externallyManaged,
             readinessSink: { change, generation in readiness.append(change, generation: generation) }
         )
@@ -1259,6 +3461,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 codec: .aac,
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
             )
             try pipeline.enqueue(try self.makeSample(id: 1))
         }
@@ -1317,7 +3523,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
             },
             routeMonitor: FakeAudioRouteMonitor(),
-            supportChecker: FakeAudioFormatSupportChecker(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
             clockMode: .externallyManaged,
             readinessSink: { change, generation in
                 readiness.append(change, generation: generation)
@@ -1329,6 +3536,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 codec: .aac,
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
             )
         }
         let compressed = try XCTUnwrap(renderers.snapshot.first)
@@ -1408,17 +3619,20 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
     }
 
-    func testSecondAutomaticFlushDuringSettleStartsSecondCompressedRecovery() throws {
+    func testSecondAutomaticFlushDuringSettleDoesNotStartSecondCompressedRecovery() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
 
         renderer.emit(.automaticFlush(.zero))
         drain(harness.executor)
         renderer.emit(.automaticFlush(CMTime(value: 1, timescale: 1)))
         drain(harness.executor)
 
-        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 2)
-        XCTAssertEqual(harness.pipeline.recoveryCount, 2)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
+        XCTAssertEqual(harness.pipeline.recoveryCount, 1)
         XCTAssertTrue(harness.support.checkSnapshot.isEmpty)
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
         XCTAssertEqual(harness.pipeline.route, .systemCompressed)
@@ -1427,6 +3641,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     func testSecondAutomaticFlushSupersedesFirstQueuedRecoveryTransaction() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
         let blockerEntered = DispatchSemaphore(value: 0)
         let releaseExecutor = DispatchSemaphore(value: 0)
         harness.executor.submit {
@@ -1503,7 +3720,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             rendererFactory: renderers,
             decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
             routeMonitor: FakeAudioRouteMonitor(),
-            supportChecker: FakeAudioFormatSupportChecker(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
             recoveryScheduler: scheduler.schedule
         )
         try perform(on: executor) {
@@ -1513,12 +3731,16 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
             )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
         }
         let renderer = try XCTUnwrap(renderers.snapshot.first)
 
         renderer.emit(.automaticFlush(.zero))
         drain(executor)
-        XCTAssertEqual(pipeline.recoveryCount, 1)
+        XCTAssertEqual(pipeline.recoveryCount, 0)
         XCTAssertEqual(scheduler.pendingCount, 1)
 
         let blockerEntered = DispatchSemaphore(value: 0)
@@ -1537,8 +3759,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(pipeline.diagnostics.outputConfigurationTriggerCount, 1)
         XCTAssertEqual(
             pipeline.diagnostics.suppressedCorrelatedTriggerCount,
-            0,
-            "an event ordered after settle expiry must begin a new transaction"
+            1,
+            "only the automatic flush without replay is suppressed; the later event is collected"
         )
         XCTAssertEqual(scheduler.pendingCount, 1)
 
@@ -1546,7 +3768,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             scheduler.runNextOnExecutor()
             drain(executor)
         }
-        XCTAssertEqual(pipeline.recoveryCount, 2)
+        XCTAssertEqual(pipeline.recoveryCount, 1)
     }
 
     func testCollectionDeadlineAfterStopOrReconfigureCannotRecoverStaleRenderer() throws {
@@ -1645,7 +3867,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
         XCTAssertEqual(harness.renderers.snapshot.count, 1)
         XCTAssertEqual(harness.synchronizer.removalCount, 1)
-        XCTAssertEqual(first.snapshot.stopRequestCount, 1)
+        XCTAssertEqual(first.snapshot.stopRequestCount, 0)
         XCTAssertEqual(harness.synchronizer.attachedSnapshot, [first.identity])
 
         try perform(on: harness.executor) {
@@ -1669,6 +3891,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.synchronizer.attachedSnapshot, [first.identity, replacement.identity])
         replacement.configureReadiness(ready: true)
         try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 3)
+            )
             try harness.pipeline.enqueue(try self.makeSample(
                 id: 2,
                 codec: .mp2,
@@ -1801,6 +4027,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
 
         performWithoutThrow(on: harness.executor) {
             harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 2)
+            )
         }
         XCTAssertEqual(
             transition.retryRenderer.snapshot.requestCount,
@@ -1836,7 +4066,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
         XCTAssertEqual(
             compressed.snapshot.requestCount,
-            1,
+            0,
             "compressed renderer was not removed"
         )
         XCTAssertEqual(compressed.snapshot.observationStartCount, 1)
@@ -2062,6 +4292,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     func testOldCallbacksAfterConfigureFlushStopAndRemovalAreHarmless() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
+        first.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let staleReadyHandler = try XCTUnwrap(first.captureReadyHandler())
         first.emit(.failed("first"))
         drain(harness.executor)
         XCTAssertEqual(harness.synchronizer.removalCount, 1)
@@ -2075,6 +4310,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             )
         }
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        staleReadyHandler()
         first.fireReady()
         first.emit(.automaticFlush(.zero))
         drain(harness.executor)
@@ -2100,7 +4336,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let native = FakeFFmpegAudioDecoderAPI()
         let decoder = try FFmpegPCMAudioDecoder(
             codec: .aac,
-            format: makeFormat(codec: .aac),
+            extradata: Data([0x12, 0x10]),
             api: native
         )
         let originalPTS = CMTime(value: 1001, timescale: 30000)
@@ -2138,10 +4374,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(layout.mChannelBitmap.rawValue, 0)
     }
 
-    func testLivePCMDecoderCreateWithoutCookieUsesNullZeroABIAndDestroys() throws {
+    func testLivePCMDecoderCreateWithEmptyExtradataUsesNullZeroABIAndDestroys() throws {
         let decoder = try FFmpegPCMAudioDecoder(
             codec: .ac3,
-            format: makeFormat(codec: .ac3)
+            extradata: Data()
         )
         decoder.destroy()
         decoder.destroy()
@@ -2149,7 +4385,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
 
     func testPCMAdapterRejectsUnknownMalformedFutureAndOverflowingCallbacks() throws {
         let native = FakeFFmpegAudioDecoderAPI()
-        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, format: makeFormat(codec: .aac), api: native)
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: Data([0x12, 0x10]),
+            api: native
+        )
         native.overrideToken = 999
         native.outputScripts = [[.stereo(frames: 1)]]
         assertCoreError(.audioFallbackDecode(FFmpegPCMAudioDecoder.invalidCallbackErrorCode)) {
@@ -2167,7 +4407,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             let native = FakeFFmpegAudioDecoderAPI()
             native.overrideStructSize = 40
             native.outputScripts = [[.stereo(frames: 1)]]
-            let decoder = try FFmpegPCMAudioDecoder(codec: .aac, format: makeFormat(codec: .aac), api: native)
+            let decoder = try FFmpegPCMAudioDecoder(
+                codec: .aac,
+                extradata: Data([0x12, 0x10]),
+                api: native
+            )
             assertCoreError(.audioFallbackDecode(FFmpegPCMAudioDecoder.invalidCallbackErrorCode)) {
                 _ = try decoder.push(makeSample(id: 1))
             }
@@ -2176,7 +4420,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             let native = FakeFFmpegAudioDecoderAPI()
             native.overrideABIVersion = 2
             native.outputScripts = [[.stereo(frames: 1)]]
-            let decoder = try FFmpegPCMAudioDecoder(codec: .aac, format: makeFormat(codec: .aac), api: native)
+            let decoder = try FFmpegPCMAudioDecoder(
+                codec: .aac,
+                extradata: Data([0x12, 0x10]),
+                api: native
+            )
             assertCoreError(.audioFallbackDecode(FFmpegPCMAudioDecoder.invalidCallbackErrorCode)) {
                 _ = try decoder.push(makeSample(id: 1))
             }
@@ -2185,7 +4433,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             let native = FakeFFmpegAudioDecoderAPI()
             native.overrideStructSize = 72
             native.outputScripts = [[.stereo(frames: 1)]]
-            let decoder = try FFmpegPCMAudioDecoder(codec: .aac, format: makeFormat(codec: .aac), api: native)
+            let decoder = try FFmpegPCMAudioDecoder(
+                codec: .aac,
+                extradata: Data([0x12, 0x10]),
+                api: native
+            )
             XCTAssertEqual(try decoder.push(makeSample(id: 1)).count, 1)
         }
     }
@@ -2231,6 +4483,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(decoder.pushedIDSnapshot, [1])
         performWithoutThrow(on: harness.executor) {
             harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 2)
+            )
         }
         decoder.configurePushError(.audioFallbackDecode(-32_110))
 
@@ -2276,13 +4532,18 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             rendererFactory: renderers,
             decoderFactory: decoderFactory,
             routeMonitor: routeMonitor,
-            supportChecker: support
+            decodeCapabilityChecker: support,
+            pcmOutputValidator: support
         )
         try perform(on: executor) {
             try pipeline.configure(
                 format: try self.makeFormat(codec: .aac), codec: .aac,
                 generation: MediaGeneration(rawValue: 1),
                 fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
             )
             for id in 1...96 { try pipeline.enqueue(try self.makeSample(id: UInt64(id))) }
         }
@@ -2319,7 +4580,14 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(MemoryLayout<VPFFPCMFrame>.offset(of: \.channel_layout_mask), 48)
         XCTAssertEqual(MemoryLayout<VPFFPCMFrame>.stride, 56)
 
-        for codec in [VPFF_CODEC_AAC, VPFF_CODEC_AC3, VPFF_CODEC_EAC3, VPFF_CODEC_MP2] {
+        for codec in [
+            VPFF_CODEC_AAC,
+            VPFF_CODEC_AC3,
+            VPFF_CODEC_EAC3,
+            VPFF_CODEC_MP1,
+            VPFF_CODEC_MP2,
+            VPFF_CODEC_MP3,
+        ] {
             var decoder: OpaquePointer?
             XCTAssertEqual(vp_ffmpeg_audio_decoder_create(codec, nil, 0, { _, frame in
                 guard let frame else { return }
@@ -2391,7 +4659,11 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         codec: VPlayerPlayback.AudioCodec = .aac,
         configure: Bool = true,
         initialRouteCategory: AudioOutputRouteCategory = .other,
-        fingerprint: MediaFormatFingerprint = MediaFormatFingerprint(bytes: Data([1]))
+        fingerprint: MediaFormatFingerprint = MediaFormatFingerprint(bytes: Data([1])),
+        replayRetentionLimits: CompressedAudioRetentionLimits =
+            CompressedAudioRetentionPolicy.replay,
+        replayHardCount: Int = CompressedAudioRetentionPolicy.replayHardCount,
+        progressDeadlineTicketStart: UInt64? = nil
     ) throws -> AudioHarness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio")
         let synchronizer = FakeAudioSynchronizer()
@@ -2411,9 +4683,13 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             rendererFactory: renderers,
             decoderFactory: decoderFactory,
             routeMonitor: routeMonitor,
-            supportChecker: support,
+            decodeCapabilityChecker: support,
+            pcmOutputValidator: support,
             recoveryScheduler: recoveryScheduler.schedule,
-            diagnosticsNow: diagnosticsClock.now
+            diagnosticsNow: diagnosticsClock.now,
+            replayRetentionLimits: replayRetentionLimits,
+            replayHardCount: replayHardCount,
+            testingProgressDeadlineTicketStart: progressDeadlineTicketStart
         )
         if configure {
             try perform(on: executor) {
@@ -2423,6 +4699,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                     generation: MediaGeneration(rawValue: 1),
                     fingerprint: fingerprint
                 )
+                pipeline.activateContinuityIsland(
+                    AudioContinuityIslandID(rawValue: 1),
+                    generation: MediaGeneration(rawValue: 1)
+                )
             }
         }
         return AudioHarness(
@@ -2430,6 +4710,84 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             decoderFactory: decoderFactory, routeMonitor: routeMonitor,
             support: support, failures: failures, recoveryScheduler: recoveryScheduler,
             diagnosticsClock: diagnosticsClock,
+            pipeline: pipeline
+        )
+    }
+
+    private func makeCapabilityHarness(
+        initialRouteCategory: AudioOutputRouteCategory = .other
+    ) -> CapabilityAudioHarness {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.capability")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let decoderFactory = FakePCMAudioDecoderFactory { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+        }
+        let decodeCapability = FakeCoreAudioDecodeCapabilityChecker()
+        let pcmValidator = FakePCMOutputFormatValidator()
+        let failures = LockedAudioFailures(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { error, generation in failures.append(error, generation: generation) },
+            rendererFactory: renderers,
+            decoderFactory: decoderFactory,
+            routeMonitor: FakeAudioRouteMonitor(initialCategory: initialRouteCategory),
+            decodeCapabilityChecker: decodeCapability,
+            pcmOutputValidator: pcmValidator,
+            recoveryScheduler: ManualAudioRecoveryScheduler().schedule
+        )
+        return CapabilityAudioHarness(
+            executor: executor,
+            synchronizer: synchronizer,
+            renderers: renderers,
+            decoderFactory: decoderFactory,
+            decodeCapability: decodeCapability,
+            pcmValidator: pcmValidator,
+            failures: failures,
+            pipeline: pipeline
+        )
+    }
+
+    private func makeResetAttachmentHarness() throws -> ResetAttachmentAudioHarness {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.reset-attachment")
+        let synchronizer = FakeAudioSynchronizer()
+        let rendererFactory = ResetAttachmentAudioRendererFactory()
+        let decoderFactory = FakePCMAudioDecoderFactory { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+        }
+        let recoveryScheduler = ManualAudioRecoveryScheduler()
+        let failures = LockedAudioFailures(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { error, generation in failures.append(error, generation: generation) },
+            rendererFactory: rendererFactory,
+            decoderFactory: decoderFactory,
+            routeMonitor: FakeAudioRouteMonitor(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            recoveryScheduler: recoveryScheduler.schedule
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        return ResetAttachmentAudioHarness(
+            executor: executor,
+            synchronizer: synchronizer,
+            renderer: try XCTUnwrap(rendererFactory.snapshot.first),
+            renderers: rendererFactory,
+            failures: failures,
+            recoveryScheduler: recoveryScheduler,
             pipeline: pipeline
         )
     }
@@ -2471,12 +4829,29 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     }
 
     private func makeFormat(codec: VPlayerPlayback.AudioCodec) throws -> CMAudioFormatDescription {
-        try AudioFormatDescriptionBuilder.make(
+        return try AudioFormatDescriptionBuilder.make(SystemCompressedAudioFormat(
+            profileID: profileID(for: codec),
             codec: codec,
+            formatID: formatID(for: codec),
             sampleRate: 48_000,
-            channelLayout: AudioChannelLayout(channelCount: 2, nativeMask: 3),
-            cookie: codec == .aac ? Data([0x11, 0x90]) : nil
-        ).description
+            channelCount: 2,
+            framesPerPacket: framesPerPacket(for: codec),
+            layout: .bitmap(AudioChannelBitmap(rawValue: 3)),
+            magicCookie: codec == .aac ? Data([0x11, 0x90]) : nil
+        )).description
+    }
+
+    private func makeRenderConfiguration(
+        codec: VPlayerPlayback.AudioCodec,
+        extradata: Data,
+        fingerprint: MediaFormatFingerprint
+    ) throws -> CompressedAudioRenderConfiguration {
+        CompressedAudioRenderConfiguration(
+            formatDescription: try makeFormat(codec: codec),
+            codec: codec,
+            decoderExtradata: extradata,
+            fingerprint: fingerprint
+        )
     }
 
     private func makeSample(
@@ -2484,19 +4859,45 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         codec: VPlayerPlayback.AudioCodec = .aac,
         pts: CMTime = CMTime(value: 1, timescale: 10),
         duration: CMTime = CMTime(value: 1, timescale: 10),
-        generation: MediaGeneration = MediaGeneration(rawValue: 1)
+        generation: MediaGeneration = MediaGeneration(rawValue: 1),
+        continuityIslandID: AudioContinuityIslandID = AudioContinuityIslandID(rawValue: 1),
+        payloadBytes: Int = 2
     ) throws -> CompressedAudioSample {
         let format = try makeFormat(codec: codec)
-        let buffer = try SampleBufferBuilder.makeAudio(
-            data: Data([UInt8(truncatingIfNeeded: id), 0xAA]),
-            formatDescription: format,
+        let frame = CompressedAudioFrame(
+            id: id,
+            payload: Data(
+                repeating: UInt8(truncatingIfNeeded: id),
+                count: payloadBytes
+            ),
+            codec: codec,
+            generation: generation,
             presentationTimeStamp: pts,
-            variableFramesInPacket: codec == .aac ? 1_024 : 1_536
+            duration: duration,
+            frameSampleCount: Int32(framesPerPacket(for: codec) == 0
+                ? 1_536
+                : framesPerPacket(for: codec))
+        )
+        let buffer = try SampleBufferBuilder.makeAudio(
+            frame: AdmittedAudioFrame(
+                frame: frame,
+                normalizedPresentationTimeStamp: pts,
+                effectiveCoverageStartPTS: pts,
+                duration: duration,
+                continuityIslandID: continuityIslandID,
+                startsNewIsland: false,
+                gapBefore: nil,
+                resetDecoderBeforeDecoding: false,
+                fillDiscontinuitiesWithSilence: false
+            ),
+            formatDescription: format,
+            forceResetDecoderBeforeDecoding: false
         )
         return CompressedAudioSample(
             id: id, sampleBuffer: buffer, codec: codec,
             generation: generation,
-            presentationTimeStamp: pts, duration: duration
+            presentationTimeStamp: pts, duration: duration,
+            continuityIslandID: continuityIslandID
         )
     }
 
@@ -2591,6 +4992,206 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     }
 }
 
+private struct ResetAttachmentAudioHarness {
+    let executor: PlaybackSerialExecutor
+    let synchronizer: FakeAudioSynchronizer
+    let renderer: ResetAttachmentAudioRenderer
+    let renderers: ResetAttachmentAudioRendererFactory
+    let failures: LockedAudioFailures
+    let recoveryScheduler: ManualAudioRecoveryScheduler
+    let pipeline: AudioRenderPipeline
+}
+
+private final class ResetAttachmentAudioRendererFactory:
+    AudioRendererFactory,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var nextIdentity: UInt64 = 1
+    private var renderers: [ResetAttachmentAudioRenderer] = []
+
+    func makeRenderer(mediaKind: AudioRendererMediaKind) throws -> any AudioRenderer {
+        lock.withLock {
+            let renderer = ResetAttachmentAudioRenderer(
+                identity: AudioRendererIdentity(rawValue: nextIdentity),
+                mediaKind: mediaKind
+            )
+            nextIdentity += 1
+            renderers.append(renderer)
+            return renderer
+        }
+    }
+
+    var snapshot: [ResetAttachmentAudioRenderer] {
+        lock.withLock { renderers }
+    }
+}
+
+private final class ResetAttachmentAudioRenderer: AudioRenderer, @unchecked Sendable {
+    let identity: AudioRendererIdentity
+    let mediaKind: AudioRendererMediaKind
+
+    private let lock = NSLock()
+    private var ready = true
+    private var sufficient = false
+    private var enqueueResults: [AudioRendererEnqueueResult] = []
+    private var attemptedResetDecoder: [Bool] = []
+    private var acceptedResetDecoder: [Bool] = []
+    private var readyHandler: (@Sendable () -> Void)?
+    private var eventHandler: (@Sendable (AudioRendererEvent) -> Void)?
+    private var requestCount = 0
+    private var stopRequestCount = 0
+
+    init(identity: AudioRendererIdentity, mediaKind: AudioRendererMediaKind) {
+        self.identity = identity
+        self.mediaKind = mediaKind
+    }
+
+    var isReadyForMoreMediaData: Bool { lock.withLock { ready } }
+
+    var hasSufficientMediaDataForReliablePlaybackStart: Bool {
+        lock.withLock { sufficient }
+    }
+
+    func configureEnqueueResults(_ results: [AudioRendererEnqueueResult]) {
+        lock.withLock { enqueueResults = results }
+    }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
+        let resetDecoder = CMGetAttachment(
+            sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding,
+            attachmentModeOut: nil
+        ).map { CFEqual($0, kCFBooleanTrue) } ?? false
+        return lock.withLock {
+            attemptedResetDecoder.append(resetDecoder)
+            let scriptedResult = enqueueResults.isEmpty ? nil : enqueueResults.removeFirst()
+            guard ready, scriptedResult != .backpressured else { return .backpressured }
+            acceptedResetDecoder.append(resetDecoder)
+            return .accepted
+        }
+    }
+
+    func flush() {}
+
+    func requestMediaDataWhenReady(_ handler: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            requestCount += 1
+            readyHandler = handler
+        }
+    }
+
+    func stopRequestingMediaData() {
+        lock.withLock {
+            stopRequestCount += 1
+            readyHandler = nil
+        }
+    }
+
+    func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void) {
+        lock.withLock { eventHandler = handler }
+    }
+
+    func stopObserving() {
+        lock.withLock { eventHandler = nil }
+    }
+
+    func fireReady() {
+        lock.withLock { readyHandler }?()
+    }
+
+    func emit(_ event: AudioRendererEvent) {
+        lock.withLock { eventHandler }?(event)
+    }
+
+    var attemptedResetDecoderSnapshot: [Bool] {
+        lock.withLock { attemptedResetDecoder }
+    }
+
+    var acceptedResetDecoderSnapshot: [Bool] {
+        lock.withLock { acceptedResetDecoder }
+    }
+
+    var requestCountSnapshot: Int { lock.withLock { requestCount } }
+    var stopRequestCountSnapshot: Int { lock.withLock { stopRequestCount } }
+}
+
+private final class ControllableAVSampleBufferAudioRenderer:
+    AVSampleBufferAudioRenderer,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var storedEnqueueCount = 0
+    private var readyHandler: (@Sendable () -> Void)?
+
+    override var isReadyForMoreMediaData: Bool { true }
+
+    override func enqueue(_ sampleBuffer: CMSampleBuffer) {
+        _ = sampleBuffer
+        lock.withLock { storedEnqueueCount += 1 }
+    }
+
+    override func requestMediaDataWhenReady(
+        on queue: dispatch_queue_t,
+        using block: @escaping @Sendable () -> Void
+    ) {
+        _ = queue
+        lock.withLock { readyHandler = block }
+    }
+
+    override func stopRequestingMediaData() {
+        lock.withLock { readyHandler = nil }
+    }
+
+    func fireReady() {
+        lock.withLock { readyHandler }?()
+    }
+
+    var enqueueCount: Int { lock.withLock { storedEnqueueCount } }
+}
+
+private final class AlwaysBackpressuredAVSampleBufferAudioRenderer:
+    AVSampleBufferAudioRenderer,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var storedEnqueueCount = 0
+    private var storedRequestCount = 0
+    private var storedStopRequestCount = 0
+
+    override var isReadyForMoreMediaData: Bool { false }
+
+    override func enqueue(_ sampleBuffer: CMSampleBuffer) {
+        _ = sampleBuffer
+        lock.withLock { storedEnqueueCount += 1 }
+    }
+
+    override func requestMediaDataWhenReady(
+        on queue: dispatch_queue_t,
+        using block: @escaping @Sendable () -> Void
+    ) {
+        _ = queue
+        _ = block
+        lock.withLock { storedRequestCount += 1 }
+    }
+
+    override func stopRequestingMediaData() {
+        lock.withLock { storedStopRequestCount += 1 }
+    }
+
+    var enqueueCount: Int {
+        lock.withLock { storedEnqueueCount }
+    }
+
+    var requestCount: Int {
+        lock.withLock { storedRequestCount }
+    }
+
+    var stopRequestCount: Int {
+        lock.withLock { storedStopRequestCount }
+    }
+}
+
 private struct AudioHarness {
     let executor: PlaybackSerialExecutor
     let synchronizer: FakeAudioSynchronizer
@@ -2601,6 +5202,17 @@ private struct AudioHarness {
     let failures: LockedAudioFailures
     let recoveryScheduler: ManualAudioRecoveryScheduler
     let diagnosticsClock: ManualAudioDiagnosticsClock
+    let pipeline: AudioRenderPipeline
+}
+
+private struct CapabilityAudioHarness {
+    let executor: PlaybackSerialExecutor
+    let synchronizer: FakeAudioSynchronizer
+    let renderers: FakeAudioRendererFactory
+    let decoderFactory: FakePCMAudioDecoderFactory
+    let decodeCapability: FakeCoreAudioDecodeCapabilityChecker
+    let pcmValidator: FakePCMOutputFormatValidator
+    let failures: LockedAudioFailures
     let pipeline: AudioRenderPipeline
 }
 
@@ -2794,15 +5406,35 @@ private final class LegacySynchronousAudioPipeline: AudioRenderPipelineProtocol 
     private(set) var stopCount = 0
 
     func configure(
-        format _: CMAudioFormatDescription,
-        codec _: VPlayerPlayback.AudioCodec,
-        generation _: MediaGeneration,
-        fingerprint _: MediaFormatFingerprint
+        _: CompressedAudioRenderConfiguration,
+        generation _: MediaGeneration
     ) throws {}
 
     func enqueue(_: CompressedAudioSample) throws {}
+    func activateContinuityIsland(_: AudioContinuityIslandID, generation _: MediaGeneration) {}
+    func updateRecoveryFloor(_: CMTime?) {}
+    func prepareAnchor(at _: CMTime, in _: AudioContinuityIslandID) throws {}
     func flush(to _: MediaGeneration) {}
     func stop() { stopCount += 1 }
+}
+
+private extension AudioRenderPipeline {
+    func configure(
+        format: CMAudioFormatDescription,
+        codec: VPlayerPlayback.AudioCodec,
+        generation: MediaGeneration,
+        fingerprint: MediaFormatFingerprint
+    ) throws {
+        try configure(
+            CompressedAudioRenderConfiguration(
+                formatDescription: format,
+                codec: codec,
+                decoderExtradata: Data(),
+                fingerprint: fingerprint
+            ),
+            generation: generation
+        )
+    }
 }
 
 private func formatID(for codec: VPlayerPlayback.AudioCodec) -> AudioFormatID {
@@ -2811,5 +5443,29 @@ private func formatID(for codec: VPlayerPlayback.AudioCodec) -> AudioFormatID {
     case .ac3: kAudioFormatAC3
     case .eac3: kAudioFormatEnhancedAC3
     case .mp2: kAudioFormatMPEGLayer2
+    case .mp1: kAudioFormatMPEGLayer1
+    case .mp3: kAudioFormatMPEGLayer3
+    }
+}
+
+private func profileID(for codec: VPlayerPlayback.AudioCodec) -> AudioCodecProfileID {
+    switch codec {
+    case .aac: .aacLC
+    case .ac3: .ac3
+    case .eac3: .eac3
+    case .mp1: .mpegLayer1
+    case .mp2: .mpegLayer2
+    case .mp3: .mpegLayer3
+    }
+}
+
+private func framesPerPacket(for codec: VPlayerPlayback.AudioCodec) -> UInt32 {
+    switch codec {
+    case .aac: 1_024
+    case .ac3: 1_536
+    case .eac3: 0
+    case .mp1: 384
+    case .mp2: 1_152
+    case .mp3: 0
     }
 }

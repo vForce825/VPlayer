@@ -3,7 +3,6 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import CoreMedia
-import Foundation
 
 public enum CodedFieldOrder: UInt8, Sendable, Equatable {
     case unknown, progressive, tt, bb, tb, bt
@@ -63,46 +62,4 @@ public struct CompressedVideoAccessUnit: @unchecked Sendable {
 enum VideoAssemblerEvent: @unchecked Sendable {
     case format(CMVideoFormatDescription, MediaFormatFingerprint)
     case accessUnit(CompressedVideoAccessUnit)
-}
-
-final class AssemblyFormatState {
-    private(set) var trackSet: DemuxTrackSet
-    private(set) var videoParameterSets: [Data]
-    private(set) var audioCookie: Data?
-
-    init(
-        trackSet: DemuxTrackSet,
-        videoParameterSets: [Data] = [],
-        audioCookie: Data? = nil
-    ) {
-        self.trackSet = trackSet
-        self.videoParameterSets = videoParameterSets
-        self.audioCookie = audioCookie
-    }
-
-    func resetVideo(for trackSet: DemuxTrackSet) {
-        self.trackSet = trackSet
-        videoParameterSets = []
-    }
-
-    func resetAudio(for trackSet: DemuxTrackSet) {
-        self.trackSet = trackSet
-        audioCookie = nil
-    }
-
-    func commitVideoParameterSets(_ parameterSets: [Data]) {
-        videoParameterSets = parameterSets
-    }
-
-    func commitAudioCookie(_ cookie: Data?) {
-        audioCookie = cookie
-    }
-
-    func fingerprint() throws -> MediaFormatFingerprint {
-        try MediaFormatFingerprint(
-            trackSet: trackSet,
-            videoParameterSets: videoParameterSets,
-            audioCookie: audioCookie
-        )
-    }
 }
