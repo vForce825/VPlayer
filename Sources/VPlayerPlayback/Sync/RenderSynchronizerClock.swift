@@ -12,6 +12,8 @@ public final class RenderSynchronizerClock: PlaybackClock, @unchecked Sendable {
     private let hostTimeConverter: (CMTime) -> CMTime
     private let pauseAction: () -> Void
     private let anchorAction: (CMTime, CMTime, Float) -> Void
+    private let latencyLock = NSLock()
+    private var outputLatency: CMTime = .zero
 
     public convenience init(synchronizer: AVSampleBufferRenderSynchronizer) {
         self.init(
@@ -46,7 +48,12 @@ public final class RenderSynchronizerClock: PlaybackClock, @unchecked Sendable {
     public var currentTime: CMTime { currentTimeProvider() }
 
     public func mediaTime(forHostTime hostTime: CMTime) -> CMTime {
-        hostTimeConverter(hostTime)
+        let latency = latencyLock.withLock { outputLatency }
+        let effectiveHostTime = CMTimeSubtract(hostTime, latency)
+        guard effectiveHostTime.isNumeric else {
+            return hostTimeConverter(hostTime)
+        }
+        return hostTimeConverter(effectiveHostTime)
     }
 
     public func pause() {
@@ -55,5 +62,15 @@ public final class RenderSynchronizerClock: PlaybackClock, @unchecked Sendable {
 
     public func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         anchorAction(mediaTime, hostTime, rate)
+    }
+
+    public func setAudioOutputLatency(_ latency: CMTime) {
+        latencyLock.withLock {
+            if latency.isNumeric, CMTimeCompare(latency, .zero) >= 0 {
+                outputLatency = latency
+            } else {
+                outputLatency = .zero
+            }
+        }
     }
 }

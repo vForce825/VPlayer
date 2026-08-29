@@ -9,4 +9,9 @@ public protocol PlaybackClock: AnyObject {
     func mediaTime(forHostTime hostTime: CMTime) -> CMTime
     func pause()
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float)
+    func setAudioOutputLatency(_ latency: CMTime)
+}
+
+public extension PlaybackClock {
+    func setAudioOutputLatency(_ latency: CMTime) {}
 }

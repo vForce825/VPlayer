@@ -63,7 +63,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     // reservoir, which is governed by CompressedAudioRetentionPolicy.
     private static let pendingPCMCapacity = 96
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
-    private static let compressedStartupPrerollDuration = CMTime(value: 1, timescale: 4)
+    private static let compressedStartupPrerollDuration = CMTime(value: 350, timescale: 1_000)
     // Switching from AVFoundation's compressed renderer to the FFmpeg PCM
     // fallback is a renderer handoff, not a media-timeline interruption. Keep
     // an externally managed video clock running while the replacement acquires
@@ -234,6 +234,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var needsDecoderResetBeforeNextCompressedEnqueue = false
     private var pcmPrerollStart: CMTime?
     private var pcmPrerollEnd: CMTime?
+    private var compressedPrerollStart: CMTime?
+    private var compressedPrerollEnd: CMTime?
     private var acceptedCompressedRunStart: CMTime?
     private var acceptedCompressedRunEnd: CMTime?
     private var consecutiveInvalidPacketCount = 0
@@ -352,6 +354,14 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             )
         }
         return PlaybackAnchorLeadTimePolicy.minimumLeadTime
+    }
+
+    var outputLatency: CMTime {
+        if let snapshot = currentRouteSnapshot {
+            let total = max(0, snapshot.outputLatency) + max(0, snapshot.ioBufferDuration)
+            return CMTime(seconds: total, preferredTimescale: 1_000)
+        }
+        return .zero
     }
 
     func configure(
@@ -1590,6 +1600,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             replay[index].sentCompressed = true
             if !replay[index].acceptedCompressed {
                 replay[index].acceptedCompressed = true
+                recordCompressedPreroll(sample)
                 recordAcceptedCompressedMedia(sample)
             }
             beginStartupWaitIfNeeded()
@@ -1917,11 +1928,42 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private var hasMinimumCompressedPreroll: Bool {
-        guard let start = acceptedCompressedRunStart,
-              let end = acceptedCompressedRunEnd else { return false }
+        guard let start = compressedPrerollStart,
+              let end = compressedPrerollEnd else { return false }
         let duration = CMTimeSubtract(end, start)
         return duration.isNumeric &&
             CMTimeCompare(duration, requiredCompressedStartupPrerollDuration) >= 0
+    }
+
+    private func recordCompressedPreroll(_ sample: CompressedAudioSample) {
+        let pts = sample.presentationTimeStamp
+        let duration = sample.duration
+        let end = CMTimeAdd(pts, duration)
+        guard pts.isNumeric,
+              duration.isNumeric,
+              CMTimeCompare(duration, .zero) > 0,
+              end.isNumeric else { return }
+
+        guard let currentStart = compressedPrerollStart,
+              let currentEnd = compressedPrerollEnd else {
+            compressedPrerollStart = pts
+            compressedPrerollEnd = end
+            return
+        }
+        guard CMTimeCompare(pts, currentStart) >= 0,
+              CMTimeCompare(pts, currentEnd) <= 0 else {
+            compressedPrerollStart = pts
+            compressedPrerollEnd = end
+            return
+        }
+        if CMTimeCompare(end, currentEnd) > 0 {
+            compressedPrerollEnd = end
+        }
+    }
+
+    private func resetCompressedPreroll() {
+        compressedPrerollStart = nil
+        compressedPrerollEnd = nil
     }
 
     private var requiredPCMStartupPrerollDuration: CMTime {
@@ -1982,6 +2024,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func resetPCMPreroll() {
         pcmPrerollStart = nil
         pcmPrerollEnd = nil
+        resetCompressedPreroll()
     }
 
     private func recordAcceptedCompressedMedia(_ sample: CompressedAudioSample) {

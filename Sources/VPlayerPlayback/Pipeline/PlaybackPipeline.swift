@@ -601,6 +601,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         readiness?.setMaximumAnchorLag(tuning.maximumAnchorLag)
         readiness?.configure(requiredVideoFrameCount: videoCoordinator.requiredVideoFrameCount)
         readiness?.setAnchorLeadTime(audio.anchorLeadTime)
+        clock.setAudioOutputLatency(audio.outputLatency)
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
             failIsolated(.unsupportedProtocol(scheme))
@@ -1893,6 +1894,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         readiness.setAnchorLeadTime(audio.anchorLeadTime)
+        clock.setAudioOutputLatency(audio.outputLatency)
         if tracks?.video == nil {
             updateAudioOnlyReadinessIsolated()
             updateReadinessDiagnosticsIsolated(readiness)
