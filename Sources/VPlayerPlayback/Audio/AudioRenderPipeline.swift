@@ -63,6 +63,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     // reservoir, which is governed by CompressedAudioRetentionPolicy.
     private static let pendingPCMCapacity = 96
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
+    private static let compressedStartupPrerollDuration = CMTime(value: 1, timescale: 4)
     // Switching from AVFoundation's compressed renderer to the FFmpeg PCM
     // fallback is a renderer handoff, not a media-timeline interruption. Keep
     // an externally managed video clock running while the replacement acquires
@@ -1877,7 +1878,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             renderer?.hasSufficientMediaDataForReliablePlaybackStart == true
         if !startupPrerollSatisfied {
             let pcmHasPreroll = route == .ffmpegPCM && hasMinimumPCMPreroll
-            startupPrerollSatisfied = rendererSufficient || pcmHasPreroll
+            let compressedHasPreroll = route == .systemCompressed && hasMinimumCompressedPreroll
+            startupPrerollSatisfied = rendererSufficient || pcmHasPreroll || compressedHasPreroll
         }
         if startupPrerollSatisfied {
             fallbackReadinessGraceActive = false
@@ -1900,6 +1902,26 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
               self.generation == generation else { return }
         fallbackReadinessGraceActive = false
         updateReadiness()
+    }
+
+    private var requiredCompressedStartupPrerollDuration: CMTime {
+        guard let lastRouteSnapshot else { return Self.compressedStartupPrerollDuration }
+        let latency = max(0, lastRouteSnapshot.outputLatency) + max(0, lastRouteSnapshot.ioBufferDuration)
+        if latency > 0.05 {
+            let dynamicPreroll = CMTime(seconds: latency + 0.25, preferredTimescale: 1_000)
+            return CMTimeCompare(dynamicPreroll, Self.compressedStartupPrerollDuration) > 0
+                ? dynamicPreroll
+                : Self.compressedStartupPrerollDuration
+        }
+        return Self.compressedStartupPrerollDuration
+    }
+
+    private var hasMinimumCompressedPreroll: Bool {
+        guard let start = acceptedCompressedRunStart,
+              let end = acceptedCompressedRunEnd else { return false }
+        let duration = CMTimeSubtract(end, start)
+        return duration.isNumeric &&
+            CMTimeCompare(duration, requiredCompressedStartupPrerollDuration) >= 0
     }
 
     private var requiredPCMStartupPrerollDuration: CMTime {

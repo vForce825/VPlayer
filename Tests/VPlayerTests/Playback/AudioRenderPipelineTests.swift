@@ -959,7 +959,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         for codec in [VPlayerPlayback.AudioCodec.aac, .ac3, .eac3, .mp2] {
             let harness = try makeHarness(codec: codec)
             let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
-            compressed.configureReadiness(ready: true, sufficient: false)
+            compressed.configureReadiness(ready: false, sufficient: false)
 
             for id in 0..<6 {
                 try perform(on: harness.executor) {
@@ -4997,6 +4997,28 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.diagnostics.outputCategory, .bluetooth)
         XCTAssertEqual(harness.pipeline.diagnostics.routeRevision, 1)
         XCTAssertEqual(harness.pipeline.anchorLeadTime.seconds, 0.320, accuracy: 0.001)
+    }
+
+    func testCompressedRouteBecomesReadyWhenMinimumCompressedPrerollIsEnqueuedEvenIfSufficientFlagIsFalse() throws {
+        let harness = try makeHarness(codec: .ac3)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: false)
+
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        for id in 1...10 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    codec: .ac3,
+                    pts: CMTime(value: Int64((id - 1) * 30), timescale: 1_000),
+                    duration: CMTime(value: 30, timescale: 1_000)
+                ))
+            }
+        }
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
     }
 
     private func assertCoreError(
