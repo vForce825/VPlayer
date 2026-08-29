@@ -94,7 +94,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
         pendingTeardown = nil
 
         do {
-            let next = try factory.makePipeline(
+            let next = try await factory.makePipeline(
                 tuning: tuning,
                 channelID: request.channelID
             ) { [weak self] event in
@@ -187,6 +187,18 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
                 userMessage: "视频解码失败，请尝试其他频道。",
                 diagnosticCode: "video.decode.status.\(status)"
             )
+        case let .videoSampleBuffer(reason):
+            PlaybackFailure(
+                code: "video.sample-buffer",
+                userMessage: "视频帧处理失败，请稍后重试。",
+                diagnosticCode: "video.sample-buffer.reason.\(safeRendererReason(reason))"
+            )
+        case let .videoRendererFailed(reason):
+            PlaybackFailure(
+                code: "video.renderer",
+                userMessage: "视频输出失败，请稍后重试。",
+                diagnosticCode: "video.renderer.reason.\(safeRendererReason(reason))"
+            )
         case .audioFormatDescription:
             PlaybackFailure(code: "audio.format", userMessage: "无法解析音频格式，请尝试其他频道。")
         case let .audioFallbackDecode(status):
@@ -211,6 +223,10 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
     }
 
     private static func safeAudioRendererReason(_ reason: String) -> String {
+        safeRendererReason(reason)
+    }
+
+    private static func safeRendererReason(_ reason: String) -> String {
         guard !reason.isEmpty, reason.utf8.count <= 128,
               reason.unicodeScalars.allSatisfy({ scalar in
                   switch scalar.value {

@@ -223,7 +223,7 @@ final class FieldMetadataReaderTests: XCTestCase {
 
     func testPresentationOriginRemainsSeparateFromPresentationFrame() throws {
         let frame = VideoPresentationFrame(
-            storage: .pixelBuffer(try VideoTestFactories.nv12()),
+            pixelBuffer: try VideoTestFactories.nv12(),
             presentationTimeStamp: .zero,
             duration: CMTime(value: 1, timescale: 25),
             generation: MediaGeneration(rawValue: 1),

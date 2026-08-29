@@ -97,7 +97,7 @@ final class FakeMetalCommandQueue: YADIFCommandSubmitting, @unchecked Sendable {
     func complete(identifier: UInt64, result: YADIFCommandResult) {
         complete(
             identifier: identifier,
-            completion: YADIFCommandCompletion(result: result, outputPlanes: nil)
+            completion: YADIFCommandCompletion(result: result)
         )
     }
 

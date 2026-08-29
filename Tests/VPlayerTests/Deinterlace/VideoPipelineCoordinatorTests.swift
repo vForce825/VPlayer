@@ -958,7 +958,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         generation: MediaGeneration? = nil
     ) -> VideoPresentationFrame {
         VideoPresentationFrame(
-            storage: .pixelBuffer(source.pixelBuffer),
+            pixelBuffer: source.pixelBuffer,
             presentationTimeStamp: presentationTimeStamp,
             duration: source.duration,
             generation: generation ?? source.generation,
@@ -1220,7 +1220,7 @@ private final class FakeCoordinatorYADIFProcessor: YADIFFrameProcessing, @unchec
         let pending = pendingCompletions
         let frames = submissions.suffix(pending.count).enumerated().map { offset, item in
             VideoPresentationFrame(
-                storage: .pixelBuffer(item.frame.frame.pixelBuffer),
+                pixelBuffer: item.frame.frame.pixelBuffer,
                 presentationTimeStamp: item.frame.presentationTimeStamp,
                 duration: item.frame.fieldDuration,
                 generation: item.frame.frame.generation,

@@ -44,8 +44,8 @@ final class PassthroughVideoProcessorTests: XCTestCase {
         XCTAssertEqual(outputs.map(\.duration), [progressive.duration, interlaced.duration])
         XCTAssertEqual(outputs.map(\.formatMetadata), [progressive.formatMetadata, interlaced.formatMetadata])
         XCTAssertEqual(results.isolationChecks, [true, true])
-        XCTAssertTrue(try pixelBuffer(from: outputs[0].storage) === progressiveBuffer)
-        XCTAssertTrue(try pixelBuffer(from: outputs[1].storage) === interlacedBuffer)
+        XCTAssertTrue(outputs[0].pixelBuffer === progressiveBuffer)
+        XCTAssertTrue(outputs[1].pixelBuffer === interlacedBuffer)
     }
 
     func testResetRestartsSequenceAtOne() throws {
@@ -186,12 +186,6 @@ final class PassthroughVideoProcessorTests: XCTestCase {
         )
     }
 
-    private func pixelBuffer(from storage: VideoFrameStorage) throws -> CVPixelBuffer {
-        guard case let .pixelBuffer(pixelBuffer) = storage else {
-            throw PlaybackFailure(code: "unexpected-storage", userMessage: "Expected pixel buffer")
-        }
-        return pixelBuffer
-    }
 }
 
 private final class ProcessorResultRecorder: @unchecked Sendable {

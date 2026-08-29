@@ -620,11 +620,10 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 } while nextMinute <= clock.now
             }
             // Sampling is not free and is not neutral. Every heartbeat walks the
-            // app's accessibility tree on its main thread, which is also where
-            // CAMetalDisplayLink delivers callbacks. During steady-state
+            // app's accessibility tree on its main thread. During steady-state
             // performance validation, sample only at the same one-minute cadence
-            // as the assertions; otherwise the observer itself manufactures the
-            // missed callbacks and presentation drops it is trying to measure.
+            // as the assertions; otherwise the observer itself disturbs the
+            // playback workload it is trying to measure.
             let heartbeatInterval: Duration =
                 configuration.validatesSteadyStatePerformance ? .seconds(60) : .seconds(10)
             try await clock.sleep(for: heartbeatInterval)

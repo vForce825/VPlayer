@@ -187,7 +187,7 @@ struct FullScreenPlayerView: View {
             Color.black.ignoresSafeArea()
 
             if let context = model.presentationContext {
-                MetalPlayerView(context: context)
+                SampleBufferPlayerView(context: context)
                     .ignoresSafeArea()
             }
 

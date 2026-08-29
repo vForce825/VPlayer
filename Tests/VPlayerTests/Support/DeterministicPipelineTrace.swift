@@ -1199,18 +1199,6 @@ private final class AuditTraceRenderer: PlaybackVideoRendering, @unchecked Senda
         }
     }
 
-    func draw(
-        targetMediaTime _: CMTime,
-        drawable _: any CAMetalDrawable
-    ) -> VideoRenderDecision {
-        VideoRenderDecision(
-            action: .waiting,
-            sourceAccessUnitID: nil,
-            sequenceNumber: nil,
-            droppedFrameCount: 0
-        )
-    }
-
     func resetPresentationTiming() {}
 
     func snapshot() -> AuditTraceRendererSnapshot {
@@ -1355,7 +1343,6 @@ private final class ImmediatePsFTraceProbe: LumaScanProbing, @unchecked Sendable
 
 private final class TracePlaybackClock: PlaybackClock, @unchecked Sendable {
     var currentTime = CMTime.negativeInfinity
-    func mediaTime(forHostTime _: CMTime) -> CMTime { currentTime }
     func pause() {}
     func anchor(mediaTime: CMTime, atHostTime _: CMTime, rate _: Float) {
         currentTime = mediaTime
@@ -1493,39 +1480,21 @@ private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable 
 
 func lumaDigest(_ presentation: VideoPresentationFrame) throws -> UInt64 {
     var digest: UInt64 = 0xcbf29ce484222325
-    switch presentation.storage {
-    case let .pixelBuffer(pixelBuffer):
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
-            throw DeterministicTraceError.missingPlane
-        }
-        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-        let componentBytes = CVPixelBufferGetPixelFormatType(pixelBuffer)
-            == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ? 2 : 1
-        for row in 0..<height {
-            let bytes = base.advanced(by: row * rowBytes).assumingMemoryBound(to: UInt8.self)
-            for index in 0..<(width * componentBytes) {
-                digest = (digest ^ UInt64(bytes[index])) &* 0x100000001b3
-            }
-        }
-    case let .metalPlanes(planes):
-        let texture = planes.luma
-        let componentBytes = texture.pixelFormat == .r16Unorm ? 2 : 1
-        let rowBytes = texture.width * componentBytes
-        var bytes = [UInt8](repeating: 0, count: rowBytes * texture.height)
-        bytes.withUnsafeMutableBytes { storage in
-            texture.getBytes(
-                storage.baseAddress!,
-                bytesPerRow: rowBytes,
-                from: MTLRegionMake2D(0, 0, texture.width, texture.height),
-                mipmapLevel: 0
-            )
-        }
-        for byte in bytes {
-            digest = (digest ^ UInt64(byte)) &* 0x100000001b3
+    let pixelBuffer = presentation.pixelBuffer
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
+        throw DeterministicTraceError.missingPlane
+    }
+    let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+    let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+    let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+    let componentBytes = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ? 2 : 1
+    for row in 0..<height {
+        let bytes = base.advanced(by: row * rowBytes).assumingMemoryBound(to: UInt8.self)
+        for index in 0..<(width * componentBytes) {
+            digest = (digest ^ UInt64(bytes[index])) &* 0x100000001b3
         }
     }
     return digest

@@ -20,14 +20,8 @@ enum YADIFCommandResult: Sendable, Equatable {
     case failed
 }
 
-struct YADIFOutputPlaneSets: @unchecked Sendable {
-    let first: MetalPlaneSet
-    let second: MetalPlaneSet
-}
-
 struct YADIFCommandCompletion: @unchecked Sendable {
     let result: YADIFCommandResult
-    let outputPlanes: YADIFOutputPlaneSets?
 }
 
 public struct YADIFJob: @unchecked Sendable {
@@ -57,6 +51,7 @@ public enum YADIFFailure: Error, Equatable, Sendable {
     case unsupportedPixelFormat(OSType)
     case poolCreationFailed(CVReturn)
     case poolAllocationFailed(CVReturn)
+    case incompatibleRendererAttributes
     case nonIOSurfaceOutput
     case invalidPlaneLayout
     case metalTextureCacheCreationFailed(CVReturn)
@@ -299,45 +294,6 @@ final class YADIFEncodedResources: @unchecked Sendable {
         self.mappings = mappings
     }
 
-    func makeOutputPlaneSets() -> YADIFOutputPlaneSets? {
-        let presentationFormats: (luma: MTLPixelFormat, chroma: MTLPixelFormat)
-        switch CVPixelBufferGetPixelFormatType(outputs.0) {
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            presentationFormats = (.r8Unorm, .rg8Unorm)
-        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
-            presentationFormats = (.r16Unorm, .rg16Unorm)
-        default:
-            return nil
-        }
-
-        func planeSet(
-            mapping: YADIFMappedTextures,
-            pixelBuffer: CVPixelBuffer
-        ) -> MetalPlaneSet? {
-            guard let luma = mapping.luma.makeTextureView(
-                pixelFormat: presentationFormats.luma
-            ), let chroma = mapping.chroma.makeTextureView(
-                pixelFormat: presentationFormats.chroma
-            ) else { return nil }
-            return MetalPlaneSet(
-                luma: luma,
-                chroma: chroma,
-                retainedObjects: [
-                    pixelBuffer as AnyObject,
-                    textureMapper,
-                    mapping.luma as AnyObject,
-                    mapping.chroma as AnyObject,
-                ] + mapping.wrappers.map { $0 as AnyObject }
-            )
-        }
-        guard let first = planeSet(mapping: mappings[3], pixelBuffer: outputs.0),
-              let second = planeSet(mapping: mappings[4], pixelBuffer: outputs.1) else {
-            return nil
-        }
-        return YADIFOutputPlaneSets(first: first, second: second)
-    }
 }
 
 private struct YADIFKernelUniforms {

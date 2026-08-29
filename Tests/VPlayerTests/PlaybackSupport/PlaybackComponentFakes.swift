@@ -6,7 +6,6 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
-import QuartzCore
 import VideoToolbox
 @testable import VPlayerPlayback
 
@@ -112,7 +111,7 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
         tuning: PlaybackTuning,
         channelID _: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
-    ) throws -> any PlaybackPipelineProtocol {
+    ) async throws -> any PlaybackPipelineProtocol {
         try lock.withLock {
             guard !queued.isEmpty else { throw PlaybackCoreError.demuxOpen(-99) }
             makeCount += 1
@@ -188,7 +187,7 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
     ) {
         let result = Result<[VideoPresentationFrame], PlaybackFailure>.success([
             VideoPresentationFrame(
-                storage: .pixelBuffer(frame.pixelBuffer),
+                pixelBuffer: frame.pixelBuffer,
                 presentationTimeStamp: frame.presentationTimeStamp,
                 duration: frame.duration,
                 generation: frame.generation,
@@ -282,7 +281,7 @@ final class FakePipelineYADIFProcessor: YADIFFrameProcessing, @unchecked Sendabl
         lock.withLock { submittedOrders.append(order) }
         completion(.success([
             VideoPresentationFrame(
-                storage: .pixelBuffer(frame.frame.pixelBuffer),
+                pixelBuffer: frame.frame.pixelBuffer,
                 presentationTimeStamp: frame.presentationTimeStamp,
                 duration: frame.fieldDuration,
                 generation: frame.frame.generation,
@@ -303,13 +302,28 @@ final class FakePipelineYADIFProcessor: YADIFFrameProcessing, @unchecked Sendabl
 }
 
 final class FakePipelineVideoRenderer: PlaybackVideoRendering, @unchecked Sendable {
+    private struct PendingReset {
+        let request: VideoRendererResetRequest
+        let completion: SystemVideoOutput.Acceptance
+        var trailingFrames: [VideoPresentationFrame]
+    }
+
     private let lock = NSLock()
     private(set) var frames: [VideoPresentationFrame] = []
     private(set) var flushes: [MediaGeneration] = []
     private(set) var resetCount = 0
+    private var automaticallyCompletesResets = true
+    private var pendingReset: PendingReset?
 
     func enqueue(_ frame: VideoPresentationFrame) {
-        lock.withLock { frames.append(frame) }
+        lock.withLock {
+            if var pendingReset {
+                pendingReset.trailingFrames.append(frame)
+                self.pendingReset = pendingReset
+            } else {
+                frames.append(frame)
+            }
+        }
     }
 
     func flush(to generation: MediaGeneration) {
@@ -319,12 +333,58 @@ final class FakePipelineVideoRenderer: PlaybackVideoRendering, @unchecked Sendab
         }
     }
 
-    func draw(targetMediaTime _: CMTime, drawable _: any CAMetalDrawable) -> VideoRenderDecision {
-        VideoRenderDecision(action: .waiting, sourceAccessUnitID: nil, sequenceNumber: nil, droppedFrameCount: 0)
-    }
-
     func resetPresentationTiming() {
         lock.withLock { resetCount += 1 }
+    }
+
+    func reset(
+        _ request: VideoRendererResetRequest,
+        completion: @escaping SystemVideoOutput.Acceptance
+    ) {
+        let result: Result<VideoEnqueueReceipt, PlaybackCoreError>? = lock.withLock {
+            if automaticallyCompletesResets {
+                flushes.append(request.generation)
+                frames.removeAll(keepingCapacity: true)
+                frames.append(contentsOf: request.seedFrames)
+                return .success(VideoEnqueueReceipt(
+                    generation: request.generation,
+                    sequenceNumbers: Set(request.seedFrames.map(\.sequenceNumber))
+                ))
+            }
+            precondition(pendingReset == nil, "测试渲染器只允许一个未完成的重置")
+            pendingReset = PendingReset(
+                request: request,
+                completion: completion,
+                trailingFrames: []
+            )
+            return nil
+        }
+        if let result { completion(result) }
+    }
+
+    func setAutomaticallyCompletesResets(_ value: Bool) {
+        lock.withLock { automaticallyCompletesResets = value }
+    }
+
+    var pendingResetRequest: VideoRendererResetRequest? {
+        lock.withLock { pendingReset?.request }
+    }
+
+    func completePendingReset() {
+        let pending: PendingReset? = lock.withLock {
+            guard let pendingReset else { return nil }
+            self.pendingReset = nil
+            flushes.append(pendingReset.request.generation)
+            frames.removeAll(keepingCapacity: true)
+            frames.append(contentsOf: pendingReset.request.seedFrames)
+            frames.append(contentsOf: pendingReset.trailingFrames)
+            return pendingReset
+        }
+        guard let pending else { return }
+        pending.completion(.success(VideoEnqueueReceipt(
+            generation: pending.request.generation,
+            sequenceNumbers: Set(pending.request.seedFrames.map(\.sequenceNumber))
+        )))
     }
 
     func snapshot() -> (frames: [VideoPresentationFrame], flushes: [MediaGeneration], resets: Int) {
@@ -539,7 +599,6 @@ final class FakePipelineClock: PlaybackClock, @unchecked Sendable {
     private(set) var anchors: [(CMTime, CMTime, Float)] = []
 
     var currentTime: CMTime { lock.withLock { storedTime } }
-    func mediaTime(forHostTime hostTime: CMTime) -> CMTime { hostTime }
     func pause() { lock.withLock { pauses += 1 } }
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         lock.withLock {

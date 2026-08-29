@@ -7,8 +7,25 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class ProjectConfigurationTests: XCTestCase {
-    func testDeploymentTargetIsTVOS18() {
-        XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 18.0")
+    func testDeploymentTargetIsTVOS26Everywhere() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let projectYAML = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("project.yml"),
+            encoding: .utf8
+        )
+        let generatedProject = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "VPlayer.xcodeproj/project.pbxproj"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 26.0")
+        XCTAssertFalse(projectYAML.contains("deploymentTarget: \"18.0\""))
+        XCTAssertFalse(generatedProject.contains("TVOS_DEPLOYMENT_TARGET = 18.0;"))
         XCTAssertEqual(PlaybackFoundation.contractVersion, 1)
     }
 
@@ -143,7 +160,8 @@ final class ProjectConfigurationTests: XCTestCase {
             ),
             "future video fixtures must be copied as a folder resource when introduced"
         )
-        XCTAssertTrue(generatedProject.contains("Shaders.metal in Sources"))
+        XCTAssertTrue(generatedProject.contains("YADIF.metal in Sources"))
+        XCTAssertTrue(generatedProject.contains("ScanProbe.metal in Sources"))
         XCTAssertTrue(generatedProject.contains("Video in Resources"))
     }
 

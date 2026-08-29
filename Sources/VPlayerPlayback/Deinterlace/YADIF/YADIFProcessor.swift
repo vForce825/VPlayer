@@ -68,11 +68,6 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
             encoded = nil
         }
 
-        func takeOutputPlanesBeforeUserCompletion() -> YADIFOutputPlaneSets? {
-            let outputPlanes = encoded?.makeOutputPlaneSets()
-            encoded = nil
-            return outputPlanes
-        }
     }
 
     private let commandQueue: any MTLCommandQueue
@@ -104,17 +99,16 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
         )
         commandBuffer.addCompletedHandler { buffer in
             if buffer.status == .completed {
-                let outputPlanes = resources.takeOutputPlanesBeforeUserCompletion()
+                resources.releaseBeforeUserCompletion()
                 completion(YADIFCommandCompletion(
                     result: .completedWithGPUInterval(.init(
                         gpuStartTime: buffer.gpuStartTime,
                         gpuEndTime: buffer.gpuEndTime
-                    )),
-                    outputPlanes: outputPlanes
+                    ))
                 ))
             } else {
                 resources.releaseBeforeUserCompletion()
-                completion(YADIFCommandCompletion(result: .failed, outputPlanes: nil))
+                completion(YADIFCommandCompletion(result: .failed))
             }
         }
         commandBuffer.commit()
@@ -241,6 +235,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         textureCache: CVMetalTextureCache,
         clock: any PlaybackClock,
         diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
+        recommendedPixelBufferAttributes: CVPixelBufferAttributes = .init(rawAttributes: [:]),
         maximumInFlight: Int = 3,
         maximumPendingFrames: Int = 4,
         dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
@@ -252,7 +247,9 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         )
         try self.init(
             commandSubmitter: submitter,
-            surfacePool: ProgressiveSurfacePool(),
+            surfacePool: ProgressiveSurfacePool(
+                recommendedAttributes: recommendedPixelBufferAttributes
+            ),
             clock: clock,
             maximumInFlight: maximumInFlight,
             maximumPendingFrames: maximumPendingFrames,
@@ -677,10 +674,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             case .completed, .completedWithGPUInterval:
                 actions.append(.complete(
                     completed.ready.completion,
-                    .success(Self.presentationFrames(
-                        for: completed,
-                        outputPlanes: completion.outputPlanes
-                    ))
+                    .success(Self.presentationFrames(for: completed))
                 ))
             case .failed:
                 actions.append(.complete(
@@ -762,20 +756,13 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     }
 
     private static func presentationFrames(
-        for completed: InFlightJob,
-        outputPlanes: YADIFOutputPlaneSets?
+        for completed: InFlightJob
     ) -> [VideoPresentationFrame] {
         let normalized = completed.ready.job.current
         return [completed.outputs.first, completed.outputs.second].enumerated().map {
             index, output in
-            let storage: VideoFrameStorage
-            if let outputPlanes {
-                storage = .metalPlanes(index == 0 ? outputPlanes.first : outputPlanes.second)
-            } else {
-                storage = .pixelBuffer(output)
-            }
             return VideoPresentationFrame(
-                storage: storage,
+                pixelBuffer: output,
                 presentationTimeStamp: index == 0
                     ? normalized.presentationTimeStamp
                     : CMTimeAdd(normalized.presentationTimeStamp, normalized.fieldDuration),

@@ -5,7 +5,7 @@
 import SwiftUI
 import VPlayerPlayback
 
-struct MetalPlayerView: UIViewRepresentable {
+struct SampleBufferPlayerView: UIViewRepresentable {
     let context: PlaybackPresentationContext
 
     final class Coordinator {
@@ -20,13 +20,16 @@ struct MetalPlayerView: UIViewRepresentable {
         Coordinator(context: context)
     }
 
-    func makeUIView(context _: Context) -> MetalVideoView {
-        context.makeMetalVideoView()
+    func makeUIView(context _: Context) -> SampleBufferVideoView {
+        context.makeVideoView()
     }
 
-    func updateUIView(_: MetalVideoView, context _: Context) {}
+    func updateUIView(_: SampleBufferVideoView, context _: Context) {}
 
-    static func dismantleUIView(_ uiView: MetalVideoView, coordinator: Coordinator) {
+    static func dismantleUIView(
+        _ uiView: SampleBufferVideoView,
+        coordinator: Coordinator
+    ) {
         _ = uiView
         coordinator.context.detach()
     }

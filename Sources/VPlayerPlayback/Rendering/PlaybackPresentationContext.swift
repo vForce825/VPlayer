@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFoundation
 import CoreMedia
 import Foundation
-import Metal
 import UIKit
 
 public enum PlaybackPresentationRoute: UInt8, Sendable, Equatable {
@@ -55,6 +55,13 @@ private final class PresentationReadinessAdapter: DisplayReadinessControlling {
     }
 }
 
+@MainActor
+private final class SystemPresentationControlAdapter: DisplayLinkControlling {
+    func pause() {}
+    func resetPresentationTiming() {}
+    func resume() {}
+}
+
 public final class PlaybackPresentationContext: @unchecked Sendable {
     private struct CriteriaRequest {
         let formatIdentity: ObjectIdentifier
@@ -64,67 +71,33 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
 
     typealias DisplayManagerFactory = @MainActor @Sendable (UIWindow) -> any DisplayCriteriaManaging
 
-    private let renderer: any VideoRendering
-    private let clock: any PlaybackClock
-    private let device: any MTLDevice
     private let switchStarted: @Sendable () -> Void
     private let switchEnded: @Sendable () -> Void
     private let displayManagerFactory: DisplayManagerFactory
 
-    @MainActor private var cachedView: MetalVideoView?
+    @MainActor private var cachedView: SampleBufferVideoView?
+    @MainActor private let presentationControl = SystemPresentationControlAdapter()
     @MainActor private var criteriaController: DisplayCriteriaController?
     @MainActor private weak var attachedWindow: UIWindow?
     @MainActor private var pendingCriteria: CriteriaRequest?
-    @MainActor private var submissionPaused = true
-    @MainActor private var displayModeSwitchPending = false
     @MainActor private var terminal = false
 
     init(
-        renderer: any VideoRendering,
-        clock: any PlaybackClock,
-        device: any MTLDevice,
+        switchStarted: @escaping @Sendable () -> Void = {},
+        switchEnded: @escaping @Sendable () -> Void = {},
         displayManagerFactory: @escaping DisplayManagerFactory = {
             WindowDisplayCriteriaManager(window: $0)
         }
     ) {
-        self.renderer = renderer
-        self.clock = clock
-        self.device = device
-        switchStarted = {}
-        switchEnded = {}
-        self.displayManagerFactory = displayManagerFactory
-    }
-
-    init(
-        renderer: any VideoRendering,
-        clock: any PlaybackClock,
-        device: any MTLDevice,
-        switchStarted: @escaping @Sendable () -> Void,
-        switchEnded: @escaping @Sendable () -> Void,
-        displayManagerFactory: @escaping DisplayManagerFactory = {
-            WindowDisplayCriteriaManager(window: $0)
-        }
-    ) {
-        self.renderer = renderer
-        self.clock = clock
-        self.device = device
         self.switchStarted = switchStarted
         self.switchEnded = switchEnded
         self.displayManagerFactory = displayManagerFactory
     }
 
     @MainActor
-    public func makeMetalVideoView() -> MetalVideoView {
+    public func makeVideoView() -> SampleBufferVideoView {
         if let cachedView { return cachedView }
-        let view = MetalVideoView(
-            frame: .zero,
-            clock: clock,
-            renderer: renderer,
-            device: device
-        )
-        if let pendingCriteria {
-            view.setPreferredContentFrameRate(pendingCriteria.outputFrameRate)
-        }
+        let view = SampleBufferVideoView(frame: .zero)
         view.windowDidChange = { [weak self] window in
             guard let self else { return }
             if let window {
@@ -133,36 +106,34 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
                 self.detach()
             }
         }
-        applySubmissionState(to: view)
-        if terminal { view.stopDisplayLink() }
+        if terminal { view.windowDidChange = nil }
         cachedView = view
         return view
     }
 
     @MainActor
+    var videoRenderer: AVSampleBufferVideoRenderer {
+        makeVideoView().videoRenderer
+    }
+
+    @MainActor
     public func attach(to window: UIWindow) {
         guard !terminal else { return }
-        let view = makeMetalVideoView()
-        guard attachedWindow !== window || criteriaController == nil else {
-            applySubmissionState(to: view)
-            return
-        }
+        _ = makeVideoView()
+        guard attachedWindow !== window || criteriaController == nil else { return }
         criteriaController?.leaveFullScreen()
         attachedWindow = window
         let readiness = PresentationReadinessAdapter(
-            switchWillStart: { [weak self] in
-                self?.displayModeSwitchPending = true
-            },
+            switchWillStart: {},
             switchStarted: switchStarted,
             switchEnded: switchEnded
         )
         let controller = DisplayCriteriaController(
             manager: displayManagerFactory(window),
-            displayLink: view,
+            displayLink: presentationControl,
             readiness: readiness
         )
         criteriaController = controller
-        applySubmissionState(to: view)
         if let pendingCriteria {
             controller.enterFullScreen(
                 formatDescription: pendingCriteria.formatDescription,
@@ -176,32 +147,21 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
         criteriaController?.leaveFullScreen()
         criteriaController = nil
         attachedWindow = nil
-        cachedView?.pauseDisplayLink()
     }
 
     @MainActor
     func pauseSubmission() {
-        guard !terminal else { return }
-        submissionPaused = true
-        cachedView?.pauseDisplayLink()
+        // The shared AVSampleBufferRenderSynchronizer owns pause state.
     }
 
     @MainActor
     func resumeSubmission() {
-        guard !terminal else { return }
-        submissionPaused = false
-        displayModeSwitchPending = false
-        guard attachedWindow != nil else {
-            cachedView?.pauseDisplayLink()
-            return
-        }
-        cachedView?.resumeDisplayLink()
+        // The shared AVSampleBufferRenderSynchronizer owns resume state.
     }
 
     @MainActor
     func resetPresentationTiming() {
-        guard !terminal else { return }
-        cachedView?.resetPresentationTiming()
+        // System renderers resolve their timing from the shared synchronizer.
     }
 
     @MainActor
@@ -221,7 +181,6 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
             return
         }
         pendingCriteria = request
-        cachedView?.setPreferredContentFrameRate(outputFrameRate)
         criteriaController?.enterFullScreen(
             formatDescription: formatDescription,
             outputFrameRate: outputFrameRate
@@ -232,23 +191,11 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
     public func teardown() {
         guard !terminal else { return }
         terminal = true
-        submissionPaused = true
         pendingCriteria = nil
         criteriaController?.leaveFullScreen()
         criteriaController = nil
         attachedWindow = nil
         cachedView?.windowDidChange = nil
-        cachedView?.pauseDisplayLink()
-        cachedView?.stopDisplayLink()
-    }
-
-    @MainActor
-    private func applySubmissionState(to view: MetalVideoView) {
-        if submissionPaused || displayModeSwitchPending || attachedWindow == nil || terminal {
-            view.pauseDisplayLink()
-        } else {
-            view.resumeDisplayLink()
-        }
     }
 }
 

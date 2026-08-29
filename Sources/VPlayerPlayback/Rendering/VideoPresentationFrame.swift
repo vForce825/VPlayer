@@ -4,31 +4,9 @@
 
 import CoreMedia
 import CoreVideo
-import Metal
-
-public enum VideoFrameStorage: @unchecked Sendable {
-    case pixelBuffer(CVPixelBuffer)
-    case metalPlanes(MetalPlaneSet)
-}
-
-public struct MetalPlaneSet: @unchecked Sendable {
-    public let luma: any MTLTexture
-    public let chroma: any MTLTexture
-    public let retainedObjects: [AnyObject]
-
-    public init(
-        luma: any MTLTexture,
-        chroma: any MTLTexture,
-        retainedObjects: [AnyObject]
-    ) {
-        self.luma = luma
-        self.chroma = chroma
-        self.retainedObjects = retainedObjects
-    }
-}
 
 public struct VideoPresentationFrame: @unchecked Sendable {
-    public let storage: VideoFrameStorage
+    public let pixelBuffer: CVPixelBuffer
     public let presentationTimeStamp: CMTime
     public let duration: CMTime
     public let generation: MediaGeneration
@@ -37,7 +15,7 @@ public struct VideoPresentationFrame: @unchecked Sendable {
     public let formatMetadata: VideoFormatMetadata
 
     public init(
-        storage: VideoFrameStorage,
+        pixelBuffer: CVPixelBuffer,
         presentationTimeStamp: CMTime,
         duration: CMTime,
         generation: MediaGeneration,
@@ -45,7 +23,7 @@ public struct VideoPresentationFrame: @unchecked Sendable {
         sourceAccessUnitID: UInt64,
         formatMetadata: VideoFormatMetadata
     ) {
-        self.storage = storage
+        self.pixelBuffer = pixelBuffer
         self.presentationTimeStamp = presentationTimeStamp
         self.duration = duration
         self.generation = generation

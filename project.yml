@@ -2,7 +2,7 @@ name: VPlayer
 options:
   bundleIdPrefix: com.vplayer
   deploymentTarget:
-    tvOS: "18.0"
+    tvOS: "26.0"
   createIntermediateGroups: true
   groupSortPosition: top
   developmentLanguage: zh-Hans
@@ -17,7 +17,7 @@ targets:
   VPlayerCore:
     type: framework
     platform: tvOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "26.0"
     sources:
       - path: Sources/VPlayerCore
     settings:
@@ -30,7 +30,7 @@ targets:
   VPlayerPlayback:
     type: framework
     platform: tvOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "26.0"
     sources:
       - path: Sources/VPlayerPlayback
         excludes:
@@ -66,7 +66,7 @@ targets:
   VPlayer:
     type: application
     platform: tvOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "26.0"
     sources:
       - path: Sources/VPlayerApp
         excludes:
@@ -87,7 +87,7 @@ targets:
   VPlayerTests:
     type: bundle.unit-test
     platform: tvOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "26.0"
     sources:
       - path: Tests/VPlayerTests
       - path: Tests/Fixtures/playlists
@@ -113,7 +113,7 @@ targets:
   VPlayerUITests:
     type: bundle.ui-testing
     platform: tvOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "26.0"
     sources:
       - path: Tests/VPlayerUITests
         excludes:
