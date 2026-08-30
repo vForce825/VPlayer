@@ -59,7 +59,7 @@ final class AudioCodecProfileRegistryTests: XCTestCase {
             XCTAssertEqual(inspected.systemFormat.profileID, profileID)
             XCTAssertEqual(inspected.systemFormat.formatID, formatID)
             XCTAssertEqual(inspected.sampleCount, sampleCount)
-            XCTAssertEqual(inspected.systemFormat.magicCookie, asc)
+            XCTAssertEqual(inspected.systemFormat.magicCookie, coreAudioCookie(for: asc))
         }
     }
 
@@ -97,6 +97,17 @@ final class AudioCodecProfileRegistryTests: XCTestCase {
             channelLayout: AudioChannelLayout(channelCount: 2, nativeMask: 3),
             extradata: extradata
         )
+    }
+
+    private func coreAudioCookie(for asc: Data) -> Data {
+        Data([
+            0x03, UInt8(23 + asc.count), 0x00, 0x00, 0x00,
+            0x04, UInt8(15 + asc.count), 0x40, 0x15,
+            0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x05, UInt8(asc.count),
+        ]) + asc + Data([0x06, 0x01, 0x02])
     }
 }
 

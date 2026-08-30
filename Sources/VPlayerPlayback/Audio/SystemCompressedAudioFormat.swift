@@ -80,6 +80,7 @@ struct FramedCompressedAudioFrame: Sendable {
 struct InspectedCompressedAudioFrame: Sendable {
     let payload: Data
     let sampleCount: Int32
+    let decoderExtradata: Data
     let systemFormat: SystemCompressedAudioFormat
 }
 

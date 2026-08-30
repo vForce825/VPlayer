@@ -76,6 +76,57 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         })
     }
 
+    func testProgressiveAACFixtureDecodesAssemblerFramesThroughRealPCMDecoder() throws {
+        let result = try assemble(path: "progressive-h264-aac.ts")
+        let source = try XCTUnwrap(result.trackSet.audio)
+        let configuration = try XCTUnwrap(result.audioConfigurations.first)
+
+        XCTAssertTrue(source.extradata.isEmpty)
+        XCTAssertEqual(configuration.decoderExtradata, Data([0x11, 0x90]))
+
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: configuration.decoderExtradata
+        )
+        defer { decoder.destroy() }
+
+        var decodedFrameCount = 0
+        var continuity = AudioContinuityBuffer()
+        let firstFrame = try XCTUnwrap(result.audioFrames.first)
+        continuity.reset(to: firstFrame.generation)
+        for frame in result.audioFrames.prefix(12) {
+            guard case let .admitted(admitted) = try continuity.admit(frame) else {
+                return XCTFail("fixture audio frame must pass canonical continuity admission")
+            }
+            let sampleBuffer = try SampleBufferBuilder.makeAudio(
+                frame: admitted,
+                formatDescription: configuration.formatDescription,
+                forceResetDecoderBeforeDecoding: false
+            )
+            let sample = CompressedAudioSample(
+                id: frame.id,
+                sampleBuffer: sampleBuffer,
+                codec: frame.codec,
+                generation: frame.generation,
+                presentationTimeStamp: admitted.normalizedPresentationTimeStamp,
+                duration: admitted.duration,
+                continuityIslandID: admitted.continuityIslandID,
+                effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
+            )
+            let outputs = try decoder.push(sample)
+            for output in outputs {
+                let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(output))
+                let description = try XCTUnwrap(
+                    CMAudioFormatDescriptionGetStreamBasicDescription(format)
+                )
+                XCTAssertEqual(description.pointee.mFormatID, kAudioFormatLinearPCM)
+            }
+            decodedFrameCount += outputs.count
+        }
+
+        XCTAssertGreaterThan(decodedFrameCount, 0)
+    }
+
     func testInterlacedTransportStreamTraversesRealDemuxAndAssemblers() throws {
         let result = try assemble(path: "interlaced-h264-mp2.ts")
 
@@ -557,6 +608,7 @@ private struct AssembledFixture {
     let demuxPackets: [DemuxPacket]
     let videoFormats: [CMVideoFormatDescription]
     let videoAccessUnits: [CompressedVideoAccessUnit]
+    let audioConfigurations: [CompressedAudioRenderConfiguration]
     let audioFormats: [CMAudioFormatDescription]
     let audioFrames: [CompressedAudioFrame]
 }
@@ -564,6 +616,7 @@ private struct AssembledFixture {
 private final class AssemblerOutputRecorder {
     private var videoFormats: [CMVideoFormatDescription] = []
     private var videoAccessUnits: [CompressedVideoAccessUnit] = []
+    private var audioConfigurations: [CompressedAudioRenderConfiguration] = []
     private var audioFormats: [CMAudioFormatDescription] = []
     private var audioFrames: [CompressedAudioFrame] = []
 
@@ -577,6 +630,7 @@ private final class AssemblerOutputRecorder {
     func record(_ event: AudioAssemblerEvent) {
         switch event {
         case let .format(configuration):
+            audioConfigurations.append(configuration)
             audioFormats.append(configuration.formatDescription)
         case let .frame(frame):
             audioFrames.append(frame)
@@ -594,6 +648,7 @@ private final class AssemblerOutputRecorder {
             demuxPackets: demuxPackets,
             videoFormats: videoFormats,
             videoAccessUnits: videoAccessUnits,
+            audioConfigurations: audioConfigurations,
             audioFormats: audioFormats,
             audioFrames: audioFrames
         )

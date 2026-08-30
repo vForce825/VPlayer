@@ -27,7 +27,7 @@ final class AACAudioCodecProfileTests: XCTestCase {
         ))
     }
 
-    func testLCASCBuildsAACFormatWith1024FramesAndExactASC() throws {
+    func testLCASCBuildsAACFormatWith1024FramesAndCoreAudioCookie() throws {
         let asc = Data([0x11, 0x90])
         let source = makeSource(sampleRate: 48_000, channels: 2, extradata: asc)
         let inspected = try AACAudioCodecProfile(source: source).inspect(
@@ -41,7 +41,7 @@ final class AACAudioCodecProfileTests: XCTestCase {
         XCTAssertEqual(inspected.systemFormat.sampleRate, 48_000)
         XCTAssertEqual(inspected.systemFormat.channelCount, 2)
         XCTAssertEqual(inspected.systemFormat.framesPerPacket, 1_024)
-        XCTAssertEqual(inspected.systemFormat.magicCookie, asc)
+        XCTAssertEqual(inspected.systemFormat.magicCookie, coreAudioCookie(for: asc))
 
         let explicitFrequencyASC = Data([0x17, 0x80, 0x5D, 0xC0, 0x10])
         let explicitSource = makeSource(
@@ -53,7 +53,10 @@ final class AACAudioCodecProfileTests: XCTestCase {
             makeFrame(Data([0x04])), source: explicitSource
         )
         XCTAssertEqual(explicit.systemFormat.sampleRate, 48_000)
-        XCTAssertEqual(explicit.systemFormat.magicCookie, explicitFrequencyASC)
+        XCTAssertEqual(
+            explicit.systemFormat.magicCookie,
+            coreAudioCookie(for: explicitFrequencyASC)
+        )
     }
 
     func testExplicitSBRASCBuildsHEAACFormatWith2048FramesAndOutputRate() throws {
@@ -69,7 +72,7 @@ final class AACAudioCodecProfileTests: XCTestCase {
         XCTAssertEqual(inspected.systemFormat.sampleRate, 48_000)
         XCTAssertEqual(inspected.systemFormat.channelCount, 2)
         XCTAssertEqual(inspected.systemFormat.framesPerPacket, 2_048)
-        XCTAssertEqual(inspected.systemFormat.magicCookie, asc)
+        XCTAssertEqual(inspected.systemFormat.magicCookie, coreAudioCookie(for: asc))
     }
 
     func testExplicitPSASCBuildsHEAACV2FormatWith2048FramesAndStereoOutput() throws {
@@ -85,7 +88,7 @@ final class AACAudioCodecProfileTests: XCTestCase {
         XCTAssertEqual(inspected.systemFormat.sampleRate, 48_000)
         XCTAssertEqual(inspected.systemFormat.channelCount, 2)
         XCTAssertEqual(inspected.systemFormat.framesPerPacket, 2_048)
-        XCTAssertEqual(inspected.systemFormat.magicCookie, asc)
+        XCTAssertEqual(inspected.systemFormat.magicCookie, coreAudioCookie(for: asc))
     }
 
     func testExplicitSBRASCRejectsNonDualRateConfiguration() {
@@ -158,7 +161,25 @@ final class AACAudioCodecProfileTests: XCTestCase {
         XCTAssertEqual(inspected.systemFormat.formatID, kAudioFormatMPEG4AAC)
         XCTAssertEqual(inspected.systemFormat.sampleRate, 24_000)
         XCTAssertEqual(inspected.systemFormat.framesPerPacket, 1_024)
-        XCTAssertEqual(inspected.systemFormat.magicCookie, Data([0x13, 0x10]))
+        XCTAssertEqual(
+            inspected.systemFormat.magicCookie,
+            coreAudioCookie(for: Data([0x13, 0x10]))
+        )
+    }
+
+    func testADTSCoreAudioMagicCookieIsAcceptedByAudioConverter() throws {
+        let source = makeSource(sampleRate: 44_100, channels: 2, extradata: Data())
+        let inspected = try AACAudioCodecProfile(source: source).inspect(
+            makeFrame(makeADTSFrame(
+                payload: Data([0x51, 0x52, 0x53]),
+                frequencyIndex: 4,
+                channels: 2
+            )),
+            source: source
+        )
+        let format = try AudioFormatDescriptionBuilder.make(inspected.systemFormat).description
+
+        try assertCoreAudioAcceptsMagicCookie(format)
     }
 
     func testADTSTrailingByteIsRejected() throws {
@@ -224,5 +245,57 @@ final class AACAudioCodecProfileTests: XCTestCase {
             0xFC,
         ])
         return header + payload
+    }
+
+    private func coreAudioCookie(for asc: Data) -> Data {
+        Data([
+            0x03, UInt8(23 + asc.count), 0x00, 0x00, 0x00,
+            0x04, UInt8(15 + asc.count), 0x40, 0x15,
+            0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x05, UInt8(asc.count),
+        ]) + asc + Data([0x06, 0x01, 0x02])
+    }
+
+    private func assertCoreAudioAcceptsMagicCookie(
+        _ format: CMAudioFormatDescription
+    ) throws {
+        var input = try XCTUnwrap(
+            CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee
+        )
+        var cookieSize = 0
+        let cookiePointer = try XCTUnwrap(
+            CMAudioFormatDescriptionGetMagicCookie(format, sizeOut: &cookieSize)
+        )
+        XCTAssertGreaterThan(cookieSize, 0)
+        guard cookieSize > 0, cookieSize <= Int(UInt32.max) else { return }
+
+        let bytesPerFrame = UInt32(MemoryLayout<Int16>.size) * input.mChannelsPerFrame
+        var output = AudioStreamBasicDescription(
+            mSampleRate: input.mSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: bytesPerFrame,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: bytesPerFrame,
+            mChannelsPerFrame: input.mChannelsPerFrame,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+        var converterReference: AudioConverterRef?
+        let creationStatus = AudioConverterNew(&input, &output, &converterReference)
+        XCTAssertEqual(creationStatus, noErr)
+        guard creationStatus == noErr else { return }
+        let converter = try XCTUnwrap(converterReference)
+        defer { AudioConverterDispose(converter) }
+
+        let cookieStatus = AudioConverterSetProperty(
+            converter,
+            kAudioConverterDecompressionMagicCookie,
+            UInt32(cookieSize),
+            cookiePointer
+        )
+        XCTAssertEqual(cookieStatus, noErr)
     }
 }

@@ -53,11 +53,12 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         XCTAssertEqual(rawFrame.presentationTimeStamp, CMTime(value: -1, timescale: 2))
         XCTAssertEqual(rawFrame.duration, CMTime(value: 1_024, timescale: 48_000))
         XCTAssertEqual(rawFrame.frameSampleCount, 1_024)
+        XCTAssertEqual(rawConfiguration.decoderExtradata, Data([0x11, 0x90]))
         try assertFormat(
             rawConfiguration.formatDescription,
             formatID: kAudioFormatMPEG4AAC,
             framesPerPacket: 1_024,
-            cookie: Data([0x11, 0x90])
+            cookie: coreAudioCookie(for: Data([0x11, 0x90]))
         )
 
         let adtsPayload = Data([0x21, 0x10, 0x56, 0xE5])
@@ -83,11 +84,12 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         XCTAssertEqual(adtsFrame.payload, adtsPayload)
         XCTAssertEqual(adtsFrame.presentationTimeStamp, CMTime(value: 1, timescale: 2))
         XCTAssertEqual(adtsFrame.frameSampleCount, 1_024)
+        XCTAssertEqual(adtsConfiguration.decoderExtradata, Data([0x11, 0x90]))
         try assertFormat(
             adtsConfiguration.formatDescription,
             formatID: kAudioFormatMPEG4AAC,
             framesPerPacket: 1_024,
-            cookie: Data([0x11, 0x90])
+            cookie: coreAudioCookie(for: Data([0x11, 0x90]))
         )
     }
 
@@ -111,11 +113,12 @@ final class CompressedAudioAssemblerTests: XCTestCase {
             XCTAssertEqual(events.kinds, ["format", "frame"])
             XCTAssertEqual(frame.frameSampleCount, 2_048)
             XCTAssertEqual(frame.duration, CMTime(value: 2_048, timescale: 48_000))
+            XCTAssertEqual(configuration.decoderExtradata, asc)
             try assertFormat(
                 configuration.formatDescription,
                 formatID: formatID,
                 framesPerPacket: 2_048,
-                cookie: asc
+                cookie: coreAudioCookie(for: asc)
             )
         }
     }
@@ -664,6 +667,17 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         if hasCRC { data.append(contentsOf: [0x12, 0x34]) }
         data.append(payload)
         return data
+    }
+
+    private func coreAudioCookie(for asc: Data) -> Data {
+        Data([
+            0x03, UInt8(23 + asc.count), 0x00, 0x00, 0x00,
+            0x04, UInt8(15 + asc.count), 0x40, 0x15,
+            0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x05, UInt8(asc.count),
+        ]) + asc + Data([0x06, 0x01, 0x02])
     }
 }
 
