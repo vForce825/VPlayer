@@ -2755,7 +2755,7 @@ private final class VisibleVideoRendererReference: @unchecked Sendable {
 struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
     static func makeSynchronizer() -> AVSampleBufferRenderSynchronizer {
         let synchronizer = AVSampleBufferRenderSynchronizer()
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
         return synchronizer
     }
 
