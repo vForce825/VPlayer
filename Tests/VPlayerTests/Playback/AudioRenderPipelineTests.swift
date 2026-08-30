@@ -3326,6 +3326,79 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
     }
 
+    func testPrepareAnchorInvalidatesRunningTimelineReadinessUntilRendererReprerolls() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.anchor-preroll")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { _, _ in },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { sample in
+                [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+            },
+            routeMonitor: FakeAudioRouteMonitor(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in
+                readiness.append(change, generation: generation)
+            }
+        )
+        let generation = MediaGeneration(rawValue: 1)
+        let island = AudioContinuityIslandID(rawValue: 1)
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: generation,
+                fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(island, generation: generation)
+        }
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 1, timescale: 2)
+            ))
+        }
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+        try perform(on: executor) {
+            pipeline.setSharedTimelineOpened(true)
+        }
+
+        // prepareAnchor performs a destructive renderer flush. Model the real
+        // renderer's post-flush state before the call returns: the old startup
+        // preroll must not survive onto the replayed queue.
+        renderer.configureReadiness(ready: true, sufficient: false)
+        try perform(on: executor) {
+            try pipeline.prepareAnchor(at: .zero, in: island)
+        }
+
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .invalidated])
+
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 2),
+                duration: CMTime(value: 1, timescale: 2)
+            ))
+        }
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .invalidated, .available]
+        )
+    }
+
     func testExternallyManagedAutomaticFlushReplaysFiveSecondBurstFromCurrentClock() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-flush-time")
         let synchronizer = FakeAudioSynchronizer()
