@@ -529,6 +529,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 CompressedAudioRetentionPolicy.unretainedAnchorError
             )
         }
+        // Every anchor preparation below performs a destructive renderer flush.
+        // That creates a new preroll generation even when the shared timeline was
+        // already open: the replayed queue must earn sufficiency of its own before
+        // startup, pause recovery, or display-mode recovery can open the gate.
+        updateSnapshot(route: route, ready: false)
         if let renderer { resetRendererQueue(renderer) }
         pendingPCM.removeAll(keepingCapacity: false)
         decoder?.flush()

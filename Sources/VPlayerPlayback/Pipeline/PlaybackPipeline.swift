@@ -2445,7 +2445,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                         preparation,
                         audioCandidate: audioCandidate,
                         candidateVideo: candidateVideo,
-                        requiresVideo: requiresVideo,
                         result: result
                     )
                 }
@@ -2470,7 +2469,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         _ preparation: AnchorPreparationTransaction,
         audioCandidate: AudioContinuityAnchorCandidate,
         candidateVideo: [VideoPresentationFrame],
-        requiresVideo: Bool,
         result: Result<VideoEnqueueReceipt, PlaybackCoreError>
     ) {
         assertIsolated()
@@ -2502,17 +2500,16 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             guard receipt.generation == preparation.generation,
                   receipt.sequenceNumbers == expectedSequences,
                   audioContinuity.anchorCandidate(at: preparation.commonPTS)?.id
-                    == audioCandidate.id,
-                  hasSufficientMediaForAnchor(
-                    commonPTS: preparation.commonPTS,
-                    audioIsland: audioCandidate,
-                    videoFrames: candidateVideo,
-                    requireVideo: requiresVideo
-                  ) else {
+                    == audioCandidate.id else {
                 anchorPreparationTransaction = nil
+                updateReadinessIsolated()
                 return
             }
         }
+        // A successful physical reset completes the destructive preparation,
+        // even when its freshly replayed audio queue is still prerolling. Commit
+        // it once and remember the prepared cycle; the later audio-available
+        // callback can then open the gate without flushing both renderers again.
         // Keep frames that arrived while the physical reset was in flight. The
         // reset seeds already cover `candidateVideo`; later frames were queued
         // behind the same output barrier and must remain available for recovery.
