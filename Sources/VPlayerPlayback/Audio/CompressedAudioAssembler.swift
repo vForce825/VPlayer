@@ -154,7 +154,7 @@ final class CompressedAudioAssembler {
                 eventSink(.format(CompressedAudioRenderConfiguration(
                     formatDescription: formatDescription,
                     codec: descriptor.codec,
-                    decoderExtradata: descriptor.extradata,
+                    decoderExtradata: inspected.decoderExtradata,
                     fingerprint: fingerprint
                 )))
                 emittedFingerprint = fingerprint

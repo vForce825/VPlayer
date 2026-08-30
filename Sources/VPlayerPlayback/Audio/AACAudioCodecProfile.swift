@@ -66,6 +66,7 @@ struct AACAudioCodecProfile: CompressedAudioCodecProfile {
         return InspectedCompressedAudioFrame(
             payload: frame.payload,
             sampleCount: facts.sampleCount,
+            decoderExtradata: source.extradata,
             systemFormat: facts.systemFormat
         )
     }
@@ -95,7 +96,7 @@ struct AACAudioCodecProfile: CompressedAudioCodecProfile {
                 sampleRate: asc.outputSampleRate,
                 channelCount: asc.outputChannelCount,
                 framesPerPacket: formatFacts.3,
-                cookie: asc.bytes,
+                cookie: asc.coreAudioMagicCookie,
                 source: source
             )
         )
@@ -131,20 +132,21 @@ struct AACAudioCodecProfile: CompressedAudioCodecProfile {
         guard frameLength == frame.payload.count, frameLength > headerLength else {
             throw AudioCodecProfileValidation.error()
         }
-        let cookie = Data([
+        let asc = try AudioSpecificConfig.parse(Data([
             UInt8((2 << 3) | (frequencyIndex >> 1)),
             UInt8(((frequencyIndex & 1) << 7) | (channelConfiguration << 3)),
-        ])
+        ]))
         return InspectedCompressedAudioFrame(
             payload: Data(frame.payload.dropFirst(headerLength)),
             sampleCount: 1_024,
+            decoderExtradata: asc.bytes,
             systemFormat: try makeFormat(
                 profileID: .aacLC,
                 formatID: kAudioFormatMPEG4AAC,
                 sampleRate: source.sampleRate,
                 channelCount: source.channelLayout.channelCount,
                 framesPerPacket: 1_024,
-                cookie: cookie,
+                cookie: asc.coreAudioMagicCookie,
                 source: source
             )
         )

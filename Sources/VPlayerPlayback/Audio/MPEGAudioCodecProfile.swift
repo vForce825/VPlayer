@@ -47,6 +47,7 @@ struct MPEGAudioCodecProfile: CompressedAudioCodecProfile {
         return InspectedCompressedAudioFrame(
             payload: frame.payload,
             sampleCount: header.sampleCount,
+            decoderExtradata: source.extradata,
             systemFormat: SystemCompressedAudioFormat(
                 profileID: facts.profileID,
                 codec: codec,

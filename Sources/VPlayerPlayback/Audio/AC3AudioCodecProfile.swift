@@ -41,6 +41,7 @@ struct AC3AudioCodecProfile: CompressedAudioCodecProfile {
         return InspectedCompressedAudioFrame(
             payload: frame.payload,
             sampleCount: header.sampleCount,
+            decoderExtradata: source.extradata,
             systemFormat: SystemCompressedAudioFormat(
                 profileID: .ac3,
                 codec: .ac3,

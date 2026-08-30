@@ -485,9 +485,9 @@ final class CompressedVideoAssemblerTests: XCTestCase {
     }
 
     private func assertSharedAVFingerprintsRemainComplete(resetVideoFirst: Bool) throws {
-        let initialCookie = Data([0x11, 0x90])
+        let initialASC = Data([0x11, 0x90])
         let initialAudio = try XCTUnwrap(AssemblerTestFixtures.audioTracks(
-            extradata: initialCookie
+            extradata: initialASC
         ).audio)
         let initialParameterSets = [
             AssemblerTestFixtures.h264SPS,
@@ -530,7 +530,7 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             videoParameterSets: initialParameterSets,
             audioSystemFormat: audioSystemFingerprintComponent(
                 descriptor: initialAudio,
-                magicCookie: initialCookie
+                magicCookie: try AudioSpecificConfig.parse(initialASC).coreAudioMagicCookie
             )
         )
         XCTAssertEqual(videoEvents.compactMap(\.formatFingerprint).last, initialExpected)
@@ -538,11 +538,11 @@ final class CompressedVideoAssemblerTests: XCTestCase {
 
         var changedSPS = AssemblerTestFixtures.h264SPS
         changedSPS[3] = 0x20
-        let resetCookie = Data([0x12, 0x10])
+        let resetASC = Data([0x12, 0x10])
         let resetAudio = try XCTUnwrap(AssemblerTestFixtures.audioTracks(
             streamIndex: 3,
             sampleRate: 44_100,
-            extradata: resetCookie
+            extradata: resetASC
         ).audio)
         let resetParameterSets = [changedSPS, AssemblerTestFixtures.h264PPS]
         let resetTracks = try AssemblerTestFixtures.videoTracks(
@@ -571,7 +571,7 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             videoParameterSets: resetParameterSets,
             audioSystemFormat: audioSystemFingerprintComponent(
                 descriptor: resetAudio,
-                magicCookie: resetCookie
+                magicCookie: try AudioSpecificConfig.parse(resetASC).coreAudioMagicCookie
             )
         )
         XCTAssertEqual(videoEvents.compactMap(\.formatFingerprint).last, resetExpected)

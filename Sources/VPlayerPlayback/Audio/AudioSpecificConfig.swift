@@ -23,6 +23,33 @@ struct AudioSpecificConfig: Sendable, Hashable {
     let outputChannelCount: Int32
     let bytes: Data
 
+    private init(
+        kind: Kind,
+        outputSampleRate: Int32,
+        outputChannelCount: Int32,
+        bytes: Data
+    ) {
+        self.kind = kind
+        self.outputSampleRate = outputSampleRate
+        self.outputChannelCount = outputChannelCount
+        self.bytes = bytes
+    }
+
+    var coreAudioMagicCookie: Data {
+        // parse 已把 ASC 限制在 64 字节内，所有 descriptor 长度都只需一个字节。
+        var cookie = Data([
+            0x03, UInt8(23 + bytes.count), 0x00, 0x00, 0x00,
+            0x04, UInt8(15 + bytes.count), 0x40, 0x15,
+            0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x05, UInt8(bytes.count),
+        ])
+        cookie.append(bytes)
+        cookie.append(contentsOf: [0x06, 0x01, 0x02])
+        return cookie
+    }
+
     static func parse(_ data: Data) throws -> AudioSpecificConfig {
         guard !data.isEmpty, data.count <= maximumBytes else {
             throw AudioCodecProfileValidation.error()

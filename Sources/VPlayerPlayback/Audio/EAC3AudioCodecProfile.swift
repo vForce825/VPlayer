@@ -30,6 +30,7 @@ struct EAC3AudioCodecProfile: CompressedAudioCodecProfile {
         return InspectedCompressedAudioFrame(
             payload: frame.payload,
             sampleCount: sampleCount,
+            decoderExtradata: source.extradata,
             systemFormat: SystemCompressedAudioFormat(
                 profileID: .eac3,
                 codec: .eac3,
