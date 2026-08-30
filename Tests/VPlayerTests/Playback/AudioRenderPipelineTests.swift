@@ -4999,7 +4999,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.anchorLeadTime.seconds, 0.320, accuracy: 0.001)
     }
 
-    func testCompressedRouteBecomesReadyWhenMinimumCompressedPrerollIsEnqueuedEvenIfSufficientFlagIsFalse() throws {
+    func testCompressedStartupWaitsForRendererSufficiencyAcrossOutputConfigurationRecovery() throws {
         let harness = try makeHarness(codec: .ac3)
         let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
         compressed.configureReadiness(ready: true, sufficient: false)
@@ -5015,6 +5015,29 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                     duration: CMTime(value: 30, timescale: 1_000)
                 ))
             }
+        }
+        drain(harness.executor)
+
+        XCTAssertEqual(compressed.snapshot.enqueuedPTS.count, 15)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        compressed.emit(.outputConfigurationChanged)
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+
+        XCTAssertEqual(compressed.snapshot.operations.filter { $0 == "flush" }.count, 1)
+        XCTAssertEqual(harness.pipeline.recoveryCount, 1)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        compressed.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 16,
+                codec: .ac3,
+                pts: CMTime(value: 450, timescale: 1_000),
+                duration: CMTime(value: 30, timescale: 1_000)
+            ))
         }
         drain(harness.executor)
 
