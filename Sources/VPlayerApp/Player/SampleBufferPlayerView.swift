@@ -5,7 +5,16 @@
 import SwiftUI
 import VPlayerPlayback
 
-struct SampleBufferPlayerView: UIViewRepresentable {
+struct SampleBufferPlayerView: View {
+    let context: PlaybackPresentationContext
+
+    var body: some View {
+        SampleBufferVideoRepresentable(context: context)
+            .id(ObjectIdentifier(context))
+    }
+}
+
+private struct SampleBufferVideoRepresentable: UIViewRepresentable {
     let context: PlaybackPresentationContext
 
     final class Coordinator {

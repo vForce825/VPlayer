@@ -3,10 +3,13 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+import Combine
 import CoreMedia
 import CoreVideo
+import SwiftUI
 import UIKit
 import XCTest
+@testable import VPlayer
 @testable import VPlayerPlayback
 
 @MainActor
@@ -30,6 +33,37 @@ final class PlaybackPresentationContextTests: XCTestCase {
         context.teardown()
         context.teardown()
         XCTAssertNil(first.windowDidChange)
+    }
+
+    func testPlayerViewReplacesMountedVideoViewWhenPresentationContextChanges() async throws {
+        let firstContext = PlaybackPresentationContext()
+        let secondContext = PlaybackPresentationContext()
+        let firstVideoView = firstContext.makeVideoView()
+        let secondVideoView = secondContext.makeVideoView()
+        let state = PresentationContextViewState(context: firstContext)
+        let hostingController = UIHostingController(
+            rootView: PresentationContextSwitchHarness(state: state)
+        )
+        let window = try makeWindow()
+        window.rootViewController = hostingController
+        window.makeKeyAndVisible()
+        hostingController.view.layoutIfNeeded()
+        await Task.yield()
+
+        XCTAssertTrue(firstVideoView.isDescendant(of: hostingController.view))
+        XCTAssertFalse(secondVideoView.isDescendant(of: hostingController.view))
+
+        state.context = secondContext
+        await Task.yield()
+        hostingController.view.layoutIfNeeded()
+        await Task.yield()
+
+        XCTAssertFalse(firstVideoView.isDescendant(of: hostingController.view))
+        XCTAssertTrue(secondVideoView.isDescendant(of: hostingController.view))
+
+        window.isHidden = true
+        firstContext.teardown()
+        secondContext.teardown()
     }
 
     func testAttachIsIdempotentAndCriteriaAreDeduplicated() throws {
@@ -155,6 +189,23 @@ final class PlaybackPresentationContextTests: XCTestCase {
         )
         XCTAssertEqual(status, noErr)
         return try XCTUnwrap(format)
+    }
+}
+
+@MainActor
+private final class PresentationContextViewState: ObservableObject {
+    @Published var context: PlaybackPresentationContext
+
+    init(context: PlaybackPresentationContext) {
+        self.context = context
+    }
+}
+
+private struct PresentationContextSwitchHarness: View {
+    @ObservedObject var state: PresentationContextViewState
+
+    var body: some View {
+        SampleBufferPlayerView(context: state.context)
     }
 }
 
