@@ -326,6 +326,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         withSnapshot { $0.isReadyForPlayback }
     }
 
+    var isOutputRouteReadyForSharedAnchor: Bool {
+        guard let snapshot = currentRouteSnapshot else { return false }
+        return snapshot.category != .none
+    }
+
     var recoveryCount: UInt64 {
         withSnapshot { $0.recoveryCount }
     }
@@ -957,11 +962,23 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         if let lastRouteSnapshot {
             guard snapshot.revision > lastRouteSnapshot.revision else { return }
         }
+        let hadUsableOutputRoute = lastRouteSnapshot.map { $0.category != .none } ?? false
         lastRouteSnapshot = snapshot
         currentOutput = snapshot.category
         publishRouteDiagnosticContext(snapshot)
         invalidateProgressMonitor()
-        guard snapshot.reason != .initial else { return }
+        guard snapshot.category != .none else {
+            updateSnapshot(route: route, ready: false)
+            return
+        }
+        if !hadUsableOutputRoute {
+            let wasReady = isReadyForPlayback
+            updateReadiness()
+            if clockMode == .externallyManaged, wasReady, isReadyForPlayback {
+                readinessSink?(.outputRouteAvailable, generation)
+            }
+            return
+        }
         if replacing {
             pendingReevaluation = true
             return
