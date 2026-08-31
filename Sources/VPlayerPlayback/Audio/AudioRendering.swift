@@ -225,10 +225,12 @@ enum AudioClockMode: Sendable, Equatable {
 public enum AudioRenderReadinessChange: Sendable, Equatable {
     case invalidated
     case available
+    case outputRouteAvailable
 }
 
 public protocol AudioRenderPipelineProtocol: AnyObject {
     var isReadyForPlayback: Bool { get }
+    var isOutputRouteReadyForSharedAnchor: Bool { get }
     var route: AudioRoute { get }
     var currentRouteSnapshot: AudioOutputRouteSnapshot? { get }
     var anchorLeadTime: CMTime { get }
@@ -265,6 +267,7 @@ public extension AudioRenderPipelineProtocol {
 
     var recoveryCount: UInt64 { 0 }
     var diagnostics: AudioRenderDiagnostics { .zero }
+    var isOutputRouteReadyForSharedAnchor: Bool { true }
     var currentRouteSnapshot: AudioOutputRouteSnapshot? { nil }
     var anchorLeadTime: CMTime {
         if let snapshot = currentRouteSnapshot {

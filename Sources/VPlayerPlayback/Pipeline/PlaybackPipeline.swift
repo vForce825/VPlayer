@@ -168,6 +168,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     private struct PreparedAnchor {
         let cycleID: UInt64
         let commonPTS: CMTime
+        let routeRevision: UInt64?
     }
 
     private struct AnchorPreparationTransaction {
@@ -175,6 +176,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         let generation: MediaGeneration
         let islandID: AudioContinuityIslandID
         let commonPTS: CMTime
+        let routeRevision: UInt64?
     }
 
     private struct AudioGapReanchorTransaction {
@@ -550,6 +552,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 display.pauseSubmission()
                 renderer.resetPresentationTiming()
             case .available:
+                updateReadinessIsolated()
+            case .outputRouteAvailable:
                 updateReadinessIsolated()
             }
         }
@@ -1934,6 +1938,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         assertIsolated()
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         readiness.setAnchorLeadTime(audio.anchorLeadTime)
+        guard audio.isOutputRouteReadyForSharedAnchor else {
+            updateReadinessDiagnosticsIsolated(readiness)
+            return
+        }
         if tracks?.video == nil {
             updateAudioOnlyReadinessIsolated()
             updateReadinessDiagnosticsIsolated(readiness)
@@ -2367,12 +2375,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         guard !terminal,
               !paused,
               anchorPreparationTransaction == nil,
+              audio.isOutputRouteReadyForSharedAnchor,
               let readiness else { return false }
         if let floor = readiness.minimumRecoveryAnchorPTS,
            CMTimeCompare(commonPTS, floor) < 0 {
             return false
         }
         let expectedCycle = readiness.cycleID
+        let expectedRouteRevision = audio.currentRouteSnapshot?.revision
         let requiresVideo = tracks?.video != nil
         guard synchronizeAudioRecoveryFloorIsolated(
             readiness.minimumRecoveryAnchorPTS
@@ -2403,7 +2413,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
 
         let alreadyPrepared = preparedAnchor.map {
-            $0.cycleID == expectedCycle && CMTimeCompare($0.commonPTS, commonPTS) == 0
+            $0.cycleID == expectedCycle
+                && $0.routeRevision == expectedRouteRevision
+                && CMTimeCompare($0.commonPTS, commonPTS) == 0
         } ?? false
         if !alreadyPrepared {
             let reanchorSignpost = signposts?.begin(
@@ -2417,7 +2429,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 cycleID: expectedCycle,
                 generation: expectedGeneration,
                 islandID: audioCandidate.id,
-                commonPTS: commonPTS
+                commonPTS: commonPTS,
+                routeRevision: expectedRouteRevision
             )
             anchorPreparationTransaction = preparation
             do {
@@ -2429,6 +2442,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             } catch {
                 anchorPreparationTransaction = nil
                 failIsolated(.audioRendererFailed("audio.anchor"))
+                return false
+            }
+            guard outputRouteRevisionMatchesIsolated(preparation.routeRevision) else {
+                anchorPreparationTransaction = nil
+                updateReadinessIsolated()
                 return false
             }
             let resetReason: VideoRendererResetRequest.Reason =
@@ -2457,6 +2475,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
               !paused,
               generationController.current == expectedGeneration,
               readiness.cycleID == expectedCycle,
+              outputRouteRevisionMatchesIsolated(expectedRouteRevision),
               hasSufficientMediaForAnchor(
                   commonPTS: commonPTS,
                   audioIsland: audioCandidate,
@@ -2476,13 +2495,15 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             transaction.cycleID == preparation.cycleID
                 && transaction.generation == preparation.generation
                 && transaction.islandID == preparation.islandID
+                && transaction.routeRevision == preparation.routeRevision
                 && CMTimeCompare(transaction.commonPTS, preparation.commonPTS) == 0
         } == true
         guard isInstalledTransaction else { return }
         guard !terminal,
               !paused,
               generationController.current == preparation.generation,
-              readiness?.cycleID == preparation.cycleID else {
+              readiness?.cycleID == preparation.cycleID,
+              outputRouteRevisionMatchesIsolated(preparation.routeRevision) else {
             // Pause and display-mode changes can invalidate the readiness cycle
             // while AVFoundation is still completing its asynchronous flush.
             // Retaining this transaction would veto every future re-anchor.
@@ -2535,7 +2556,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
         preparedAnchor = PreparedAnchor(
             cycleID: preparation.cycleID,
-            commonPTS: preparation.commonPTS
+            commonPTS: preparation.commonPTS,
+            routeRevision: preparation.routeRevision
         )
         renderer.resetPresentationTiming()
         anchorPreparationTransaction = nil
@@ -2545,6 +2567,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             audioGapReanchorTransaction = nil
         }
         updateReadinessIsolated()
+    }
+
+    private func outputRouteRevisionMatchesIsolated(_ expectedRevision: UInt64?) -> Bool {
+        assertIsolated()
+        guard let expectedRevision else { return true }
+        return audio.currentRouteSnapshot?.revision == expectedRevision
     }
 
     private func hasSufficientMediaForAnchor(

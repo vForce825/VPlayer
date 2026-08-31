@@ -2,11 +2,27 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFoundation
 import Foundation
+
+protocol PlaybackAudioSessionPreparing: Sendable {
+    func prepareForPlayback() throws
+}
+
+struct SystemPlaybackAudioSessionPreparer: PlaybackAudioSessionPreparing {
+    func prepareForPlayback() throws {
+        try AVAudioSession.sharedInstance().setActive(true)
+    }
+}
+
+private struct NoopPlaybackAudioSessionPreparer: PlaybackAudioSessionPreparing {
+    func prepareForPlayback() throws {}
+}
 
 public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
     PlaybackMediaInformationProviding {
     private let factory: any PlaybackPipelineFactory
+    private let audioSessionPreparer: any PlaybackAudioSessionPreparing
     private var state = PlaybackState.idle
     private var pipeline: (any PlaybackPipelineProtocol)?
     private var request: PlaybackRequest?
@@ -21,13 +37,27 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
     private var mediaInformationContinuations:
         [UUID: AsyncStream<PlaybackMediaInformation?>.Continuation] = [:]
     private var tuning = PlaybackTuning.default
+    private static let audioSessionActivationFailure = PlaybackFailure(
+        code: "audio.session.activation",
+        userMessage: "无法启用音频播放，请检查播放设备后重试。"
+    )
 
     public init() {
         factory = SystemPlaybackPipelineFactory()
+        audioSessionPreparer = SystemPlaybackAudioSessionPreparer()
     }
 
     init(factory: any PlaybackPipelineFactory) {
         self.factory = factory
+        audioSessionPreparer = NoopPlaybackAudioSessionPreparer()
+    }
+
+    init(
+        factory: any PlaybackPipelineFactory,
+        audioSessionPreparer: any PlaybackAudioSessionPreparing
+    ) {
+        self.factory = factory
+        self.audioSessionPreparer = audioSessionPreparer
     }
 
     public func events() -> AsyncStream<PlaybackState> {
@@ -92,6 +122,15 @@ public actor PlaybackController: PlaybackEngine, PlaybackMetricsProviding,
         if let teardown { await teardown.value }
         guard sessionID == id else { return }
         pendingTeardown = nil
+
+        do {
+            // tvOS 的 setActive 是同步操作。只有它成功返回后才创建管线，
+            // 因而音频路由监视器采集的是本次激活后的 currentRoute。
+            try audioSessionPreparer.prepareForPlayback()
+        } catch {
+            publish(.failed(Self.audioSessionActivationFailure))
+            return
+        }
 
         do {
             let next = try await factory.makePipeline(

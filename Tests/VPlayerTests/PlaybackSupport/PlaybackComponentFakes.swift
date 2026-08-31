@@ -102,9 +102,14 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     private var queued: [FakeControllerPipeline]
     private var makeCount = 0
     private var requestedTunings: [PlaybackTuning] = []
+    private let onMakePipeline: @Sendable () -> Void
 
-    init(_ pipelines: [FakeControllerPipeline]) {
+    init(
+        _ pipelines: [FakeControllerPipeline],
+        onMakePipeline: @escaping @Sendable () -> Void = {}
+    ) {
         queued = pipelines
+        self.onMakePipeline = onMakePipeline
     }
 
     func makePipeline(
@@ -112,7 +117,8 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
         channelID _: String,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) async throws -> any PlaybackPipelineProtocol {
-        try lock.withLock {
+        onMakePipeline()
+        return try lock.withLock {
             guard !queued.isEmpty else { throw PlaybackCoreError.demuxOpen(-99) }
             makeCount += 1
             requestedTunings.append(tuning)
@@ -126,6 +132,50 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     var requestedTuningsSnapshot: [PlaybackTuning] {
         lock.withLock { requestedTunings }
     }
+}
+
+final class FakePlaybackAudioSessionPreparer: PlaybackAudioSessionPreparing,
+    @unchecked Sendable {
+    private let lock = NSLock()
+    private let error: (any Error)?
+    private let onPrepare: @Sendable () -> Void
+    private var callCount = 0
+
+    init(
+        error: (any Error)? = nil,
+        onPrepare: @escaping @Sendable () -> Void = {}
+    ) {
+        self.error = error
+        self.onPrepare = onPrepare
+    }
+
+    func prepareForPlayback() throws {
+        lock.withLock { callCount += 1 }
+        onPrepare()
+        if let error { throw error }
+    }
+
+    var callCountSnapshot: Int { lock.withLock { callCount } }
+}
+
+enum FakePlaybackAudioSessionPreparationError: Error {
+    case activation
+}
+
+final class LockedControllerStartupTrace: @unchecked Sendable {
+    enum Event: Equatable {
+        case activated
+        case pipelineFactoryCalled
+    }
+
+    private let lock = NSLock()
+    private var events: [Event] = []
+
+    func append(_ event: Event) {
+        lock.withLock { events.append(event) }
+    }
+
+    var snapshot: [Event] { lock.withLock { events } }
 }
 
 final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
