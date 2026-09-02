@@ -9,6 +9,45 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class CompressedAudioAssemblerTests: XCTestCase {
+    func testGenerationRebindDropsLateAudioParserCallbackAndRebuildsAtNextPush() throws {
+        let codec = VPlayerPlayback.AudioCodec.mp3
+        let payload = AssemblerTestFixtures.syntheticMPEGFrame(codec: codec)
+        let factory = ScriptedFFmpegParserFactory()
+        let tracks = try AssemblerTestFixtures.audioTracks(codec: codec, extradata: Data())
+        let binding = AssemblyEpochBinding(epochID: AssemblyEpochID(
+            timelineEpoch: TimelineEpochID(rawValue: 1),
+            instanceToken: 1
+        ))
+        var events: [AudioAssemblerEvent] = []
+        let subject = try CompressedAudioAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { events.append($0) },
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks),
+            binding: binding
+        )
+        let oldHandle = try XCTUnwrap(factory.handles.first)
+
+        _ = binding.rebind()
+        try oldHandle.emit(AssemblerTestFixtures.parsedAudioFrame(
+            bytes: payload,
+            pts: 0,
+            frameSamples: 1_152
+        ))
+        XCTAssertTrue(events.isEmpty)
+
+        try subject.push(AssemblerTestFixtures.audioPacket(data: payload, codec: codec))
+        XCTAssertEqual(oldHandle.destroyCount, 1)
+        XCTAssertEqual(factory.handles.count, 2)
+        try XCTUnwrap(factory.handles.last).emit(AssemblerTestFixtures.parsedAudioFrame(
+            bytes: payload,
+            pts: 0,
+            frameSamples: 1_152
+        ))
+        XCTAssertEqual(events.compactMap(\.frame).count, 1)
+    }
+
     func testOversizedRawAACEmitsDecodeBreakAndNextValidAURecovers() throws {
         let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data([0x11, 0x90]))
         var events: [AudioAssemblerEvent] = []

@@ -25,7 +25,7 @@ enum PlayerControlsVisibilityPolicy {
 
     static func mode(for state: PlaybackState) -> Mode {
         switch state {
-        case .idle, .preparing, .paused:
+        case .idle, .preparing, .buffering, .recovering, .paused:
             .pinned
         case .playing:
             .timed
@@ -117,13 +117,19 @@ enum PlayerControlsCommandPolicy {
     }
 }
 
+enum PlayerFailureActionPolicy {
+    static func showsRetry(for failure: PlaybackFailure) -> Bool {
+        failure.retryDisposition == .retrySameRequest
+    }
+}
+
 /// Keeps tvOS from treating uninterrupted video watching as user inactivity.
 /// Paused, stopped, and failed playback deliberately return control to the
 /// system so the app cannot suppress the screen saver indefinitely.
 enum PlaybackIdleTimerPolicy {
     static func isDisabled(for state: PlaybackState) -> Bool {
         switch state {
-        case .preparing, .playing:
+        case .preparing, .buffering, .recovering, .playing:
             true
         case .idle, .paused, .stopped, .failed:
             false
@@ -240,11 +246,6 @@ struct FullScreenPlayerView: View {
 
             statusOverlay
 
-            if let notice = model.visibleNotice {
-                PlayerNoticeBanner(notice: notice)
-                    .transition(.opacity)
-            }
-
             if shouldMountTransportOverlays {
                 PlayerControlsOverlay(
                     isPaused: model.isPaused,
@@ -308,23 +309,40 @@ struct FullScreenPlayerView: View {
                 .accessibilityIdentifier("player-preparing")
                 .padding(24)
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+        case .buffering:
+            ProgressView("正在缓冲…")
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("player-buffering")
+                .padding(24)
+                .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+        case .recovering:
+            ProgressView("正在恢复播放…")
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("player-recovering")
+                .padding(24)
+                .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
         case let .failed(failure):
+            let showsRetry = PlayerFailureActionPolicy.showsRetry(for: failure)
+            let initialFocus: FailureControl = showsRetry ? .retry : .back
             VStack(spacing: 20) {
                 Text(failure.userMessage)
                 HStack {
-                    Button("重试", action: model.retry)
-                        .accessibilityIdentifier("player-retry")
-                        .focused($failureFocus, equals: .retry)
+                    if showsRetry {
+                        Button("重试", action: model.retry)
+                            .accessibilityIdentifier("player-retry")
+                            .focused($failureFocus, equals: .retry)
+                    }
                     Button("返回", action: close)
+                        .accessibilityIdentifier("player-back")
                         .focused($failureFocus, equals: .back)
                     Button("播放设置") { showsSettings = true }
                         .focused($failureFocus, equals: .settings)
                 }
-                .defaultFocus($failureFocus, .retry)
+                .defaultFocus($failureFocus, initialFocus)
             }
             .padding(32)
             .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 16))
-            .onAppear { failureFocus = .retry }
+            .onAppear { failureFocus = initialFocus }
         case .playing, .paused, .stopped:
             EmptyView()
         }

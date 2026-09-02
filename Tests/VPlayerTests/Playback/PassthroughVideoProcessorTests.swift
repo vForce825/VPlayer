@@ -9,6 +9,27 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PassthroughVideoProcessorTests: XCTestCase {
+    func testStaleGenerationReturnsTypedCancellationWithoutAdvancingSequence() throws {
+        let processor = PassthroughVideoProcessor()
+        let activeGeneration = MediaGeneration(rawValue: 9)
+        let stale = try makeFrame(id: 1, generation: MediaGeneration(rawValue: 8))
+        let current = try makeFrame(id: 2, generation: activeGeneration)
+        let results = ProcessorResultRecorder()
+
+        processor.reset(to: activeGeneration)
+        processor.submit(stale) { results.record($0, isIsolated: true) }
+        processor.submit(current) { results.record($0, isIsolated: true) }
+
+        let recorded = results.results
+        guard case .cancelled(.staleGeneration) = recorded[0] else {
+            return XCTFail("stale input must be an explicit typed cancellation")
+        }
+        guard case let .produced(batch) = recorded[1] else {
+            return XCTFail("current input must produce a non-empty batch")
+        }
+        XCTAssertEqual(batch.frames.map(\.sequenceNumber), [1])
+    }
+
     func testProgressiveAndInterlacedFramesPreserveIdentityTimingMetadataAndSequence() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.processor.identity")
         let processor = PassthroughVideoProcessor()
@@ -36,7 +57,7 @@ final class PassthroughVideoProcessorTests: XCTestCase {
         }
 
         XCTAssertEqual(processor.requiredInputFrameCount, 1)
-        let outputs = try results.successes.flatMap { try $0.get() }
+        let outputs = results.producedFrames
         XCTAssertEqual(outputs.map(\.sequenceNumber), [1, 2])
         XCTAssertEqual(outputs.map(\.sourceAccessUnitID), [11, 12])
         XCTAssertEqual(outputs.map(\.generation), [generation, generation])
@@ -64,28 +85,8 @@ final class PassthroughVideoProcessorTests: XCTestCase {
             processor.submit(second) { results.record($0, isIsolated: executor.isIsolated) }
         }
 
-        let outputs = try results.successes.flatMap { try $0.get() }
+        let outputs = results.producedFrames
         XCTAssertEqual(outputs.map(\.sequenceNumber), [1, 1])
-    }
-
-    func testStaleGenerationSucceedsWithEmptyArrayWithoutAdvancingSequence() throws {
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.processor.stale")
-        let processor = PassthroughVideoProcessor()
-        let activeGeneration = MediaGeneration(rawValue: 9)
-        let stale = try makeFrame(id: 1, generation: MediaGeneration(rawValue: 8))
-        let current = try makeFrame(id: 2, generation: activeGeneration)
-        let results = ProcessorResultRecorder()
-
-        execute(on: executor) {
-            processor.reset(to: activeGeneration)
-            processor.submit(stale) { results.record($0, isIsolated: executor.isIsolated) }
-            processor.submit(current) { results.record($0, isIsolated: executor.isIsolated) }
-        }
-
-        let outputs = try results.successes.map { try $0.get() }
-        XCTAssertEqual(outputs.count, 2)
-        XCTAssertTrue(outputs[0].isEmpty)
-        XCTAssertEqual(outputs[1].map(\.sequenceNumber), [1])
     }
 
     func testPublicMetadataEqualityComparesDimensionsAndEveryStoredField() {
@@ -190,11 +191,11 @@ final class PassthroughVideoProcessorTests: XCTestCase {
 
 private final class ProcessorResultRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var storedResults: [Result<[VideoPresentationFrame], PlaybackFailure>] = []
+    private var storedResults: [VideoProcessingResult] = []
     private var storedIsolationChecks: [Bool] = []
 
     func record(
-        _ result: Result<[VideoPresentationFrame], PlaybackFailure>,
+        _ result: VideoProcessingResult,
         isIsolated: Bool
     ) {
         lock.lock()
@@ -203,10 +204,17 @@ private final class ProcessorResultRecorder: @unchecked Sendable {
         lock.unlock()
     }
 
-    var successes: [Result<[VideoPresentationFrame], PlaybackFailure>] {
+    var results: [VideoProcessingResult] {
         lock.lock()
         defer { lock.unlock() }
         return storedResults
+    }
+
+    var producedFrames: [VideoPresentationFrame] {
+        results.flatMap { result -> [VideoPresentationFrame] in
+            guard case let .produced(batch) = result else { return [] }
+            return batch.frames
+        }
     }
 
     var isolationChecks: [Bool] {

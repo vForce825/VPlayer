@@ -11,7 +11,6 @@ actor UITestPlaybackEngine: PlaybackEngine {
     private var state: PlaybackState = .idle
     private var request: PlaybackRequest?
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
-    private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
 
     init(fixture: String?) {
         self.fixture = fixture
@@ -31,19 +30,6 @@ actor UITestPlaybackEngine: PlaybackEngine {
         return pair.stream
     }
 
-    func notices() -> AsyncStream<PlaybackNotice> {
-        let id = UUID()
-        let pair = AsyncStream.makeStream(
-            of: PlaybackNotice.self,
-            bufferingPolicy: .bufferingNewest(4)
-        )
-        noticeContinuations[id] = pair.continuation
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeNoticeContinuation(id) }
-        }
-        return pair.stream
-    }
-
     func play(_ request: PlaybackRequest) async {
         self.request = request
         publish(.preparing(request))
@@ -51,13 +37,37 @@ actor UITestPlaybackEngine: PlaybackEngine {
         if fixture == "preparing" {
             return
         }
-        if fixture == "failed" || fixture == "failed-diagnostic" {
+        if fixture == "buffering" {
+            publish(.buffering(request))
+            return
+        }
+        if fixture == "recovering" {
+            publish(.recovering(request))
+            return
+        }
+        if let fixture, [
+            "failed",
+            "failed-diagnostic",
+            "failed-choose-channel",
+            "failed-do-not-retry",
+        ].contains(fixture) {
+            let retryDisposition: PlaybackRetryDisposition = switch fixture {
+            case "failed-choose-channel": .chooseAnotherChannel
+            case "failed-do-not-retry": .doNotRetry
+            default: .retrySameRequest
+            }
+            let userMessage = switch retryDisposition {
+            case .retrySameRequest: "测试播放失败，请重试。"
+            case .chooseAnotherChannel: "该频道无法播放，请选择其他频道。"
+            case .doNotRetry: "播放已结束。"
+            }
             publish(.failed(PlaybackFailure(
                 code: "ui.fixture",
-                userMessage: "测试播放失败，请重试。",
+                userMessage: userMessage,
                 diagnosticCode: fixture == "failed-diagnostic"
                     ? "video.decode.status.-12909"
-                    : nil
+                    : nil,
+                retryDisposition: retryDisposition
             )))
             return
         }
@@ -81,18 +91,9 @@ actor UITestPlaybackEngine: PlaybackEngine {
         }
     }
 
-    private func publish(_ notice: PlaybackNotice) {
-        for continuation in noticeContinuations.values {
-            continuation.yield(notice)
-        }
-    }
-
     private func removeEventContinuation(_ id: UUID) {
         eventContinuations[id] = nil
     }
 
-    private func removeNoticeContinuation(_ id: UUID) {
-        noticeContinuations[id] = nil
-    }
 }
 #endif

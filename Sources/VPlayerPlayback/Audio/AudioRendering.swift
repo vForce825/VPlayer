@@ -226,6 +226,8 @@ public enum AudioRenderReadinessChange: Sendable, Equatable {
     case invalidated
     case available
     case outputRouteAvailable
+    case outputRouteUnavailable
+    case anchorTimingChanged(routeRevision: UInt64)
 }
 
 public protocol AudioRenderPipelineProtocol: AnyObject {
@@ -255,6 +257,7 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
         in islandID: AudioContinuityIslandID
     ) throws
     func setSharedTimelineOpened(_ opened: Bool)
+    func recoverFromAudioSessionReset()
     func flush(to generation: MediaGeneration)
     func stop()
     func stopAwaitingRendererRemoval() async
@@ -267,8 +270,6 @@ public extension AudioRenderPipelineProtocol {
 
     var recoveryCount: UInt64 { 0 }
     var diagnostics: AudioRenderDiagnostics { .zero }
-    var isOutputRouteReadyForSharedAnchor: Bool { true }
-    var currentRouteSnapshot: AudioOutputRouteSnapshot? { nil }
     var anchorLeadTime: CMTime {
         if let snapshot = currentRouteSnapshot {
             return PlaybackAnchorLeadTimePolicy.compute(
@@ -400,10 +401,13 @@ public struct AudioOutputRouteSnapshot: Sendable, Equatable {
         lhs.category == rhs.category
             && lhs.reason == rhs.reason
             && lhs.revision == rhs.revision
+            && lhs.outputLatency == rhs.outputLatency
+            && lhs.ioBufferDuration == rhs.ioBufferDuration
     }
 }
 
 public protocol AudioRouteMonitoring: AnyObject, Sendable {
     func start(_ handler: @escaping @Sendable (AudioOutputRouteSnapshot) -> Void)
+    func resample(reason: AudioRouteChangeReason)
     func stop()
 }

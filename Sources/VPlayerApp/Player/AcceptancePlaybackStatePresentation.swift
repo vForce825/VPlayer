@@ -14,6 +14,10 @@ struct AcceptancePlaybackStatePresentation: Equatable, Sendable {
             "idle"
         case .preparing:
             "preparing"
+        case .buffering:
+            "buffering"
+        case .recovering:
+            "recovering"
         case .playing:
             "playing"
         case .paused:

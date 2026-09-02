@@ -4,12 +4,58 @@
 
 import CoreMedia
 
+public struct VideoProcessingFrameBatch: @unchecked Sendable {
+    public let first: VideoPresentationFrame
+    public let remaining: [VideoPresentationFrame]
+
+    public init(
+        first: VideoPresentationFrame,
+        remaining: [VideoPresentationFrame] = []
+    ) {
+        self.first = first
+        self.remaining = remaining
+    }
+
+    public var frames: [VideoPresentationFrame] {
+        [first] + remaining
+    }
+}
+
+public enum VideoProcessingTransientDropReason: Sendable, Equatable {
+    case queuePressure
+    case resourcePressure
+    case invalidTiming
+}
+
+public enum VideoProcessingStructuralFailure: Sendable, Equatable {
+    case invalidSurface
+    case surfacePool
+    case rendererAttributes
+    case textureMapping
+    case shaderPipeline
+    case commandExecution
+}
+
+public enum VideoProcessingCancellationReason: Sendable, Equatable {
+    case staleGeneration
+    case reset
+    case draining
+    case referenceWindowDiscard
+}
+
+public enum VideoProcessingResult: @unchecked Sendable {
+    case produced(VideoProcessingFrameBatch)
+    case transientDrop(VideoProcessingTransientDropReason)
+    case structuralFailure(VideoProcessingStructuralFailure)
+    case cancelled(VideoProcessingCancellationReason)
+}
+
 public protocol VideoFrameProcessing: AnyObject {
     var requiredInputFrameCount: Int { get }
     func reset(to generation: MediaGeneration)
     func submit(
         _ frame: DecodedVideoFrame,
-        completion: @escaping @Sendable (Result<[VideoPresentationFrame], PlaybackFailure>) -> Void
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
     )
 }
 
@@ -27,21 +73,23 @@ public final class PassthroughVideoProcessor: VideoFrameProcessing, @unchecked S
 
     public func submit(
         _ frame: DecodedVideoFrame,
-        completion: @escaping @Sendable (Result<[VideoPresentationFrame], PlaybackFailure>) -> Void
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
     ) {
         guard frame.generation == generation else {
-            completion(.success([]))
+            completion(.cancelled(.staleGeneration))
             return
         }
         sequence &+= 1
-        completion(.success([VideoPresentationFrame(
-            pixelBuffer: frame.pixelBuffer,
-            presentationTimeStamp: frame.presentationTimeStamp,
-            duration: frame.duration,
-            generation: frame.generation,
-            sequenceNumber: sequence,
-            sourceAccessUnitID: frame.accessUnitID,
-            formatMetadata: frame.formatMetadata
-        )]))
+        completion(.produced(VideoProcessingFrameBatch(
+            first: VideoPresentationFrame(
+                pixelBuffer: frame.pixelBuffer,
+                presentationTimeStamp: frame.presentationTimeStamp,
+                duration: frame.duration,
+                generation: frame.generation,
+                sequenceNumber: sequence,
+                sourceAccessUnitID: frame.accessUnitID,
+                formatMetadata: frame.formatMetadata
+            )
+        )))
     }
 }

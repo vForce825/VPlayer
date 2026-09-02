@@ -97,6 +97,12 @@ final class AudioOutputRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         }
     }
 
+    func resample(reason: AudioRouteChangeReason) {
+        let lifecycle = withLock { activeLifecycle }
+        guard lifecycle != 0 else { return }
+        enqueueRouteChange(reason: reason, for: lifecycle)
+    }
+
     private static func category(from ports: [AVAudioSession.Port]) -> AudioOutputRouteCategory {
         if ports.isEmpty { return .none }
         if ports.contains(AVAudioSession.Port.HDMI) { return .hdmi }

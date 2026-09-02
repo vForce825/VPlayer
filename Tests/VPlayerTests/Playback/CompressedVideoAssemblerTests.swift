@@ -9,6 +9,39 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class CompressedVideoAssemblerTests: XCTestCase {
+    func testGenerationRebindDropsLateParserCallbackAndRebuildsAtNextPush() throws {
+        let factory = ScriptedFFmpegParserFactory()
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        let binding = AssemblyEpochBinding(epochID: AssemblyEpochID(
+            timelineEpoch: TimelineEpochID(rawValue: 1),
+            instanceToken: 1
+        ))
+        var events: [VideoAssemblerEvent] = []
+        let subject = try CompressedVideoAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { events.append($0) },
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks),
+            binding: binding
+        )
+        let oldHandle = try XCTUnwrap(factory.handles.first)
+
+        _ = binding.rebind()
+        try oldHandle.emit(AssemblerTestFixtures.parsedVideoFrame(
+            bytes: AssemblerTestFixtures.h264AccessUnit()
+        ))
+        XCTAssertTrue(events.isEmpty)
+
+        try subject.push(AssemblerTestFixtures.videoPacket())
+        XCTAssertEqual(oldHandle.destroyCount, 1)
+        XCTAssertEqual(factory.handles.count, 2)
+        try XCTUnwrap(factory.handles.last).emit(AssemblerTestFixtures.parsedVideoFrame(
+            bytes: AssemblerTestFixtures.h264AccessUnit()
+        ))
+        XCTAssertEqual(events.compactMap(\.accessUnit).count, 1)
+    }
+
     func testCanInitializeAndDrainWithoutFrames() throws {
         let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
         let tracks = DemuxTrackSet(
@@ -441,7 +474,7 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         }
     }
 
-    func testDrainResetDiscardOldStateAndIDsContinueUntilDeterministicExhaustion() throws {
+    func testDrainRebindDiscardsOldStateAndIDsContinueUntilDeterministicExhaustion() throws {
         let delayedAU = AssemblerTestFixtures.h264AccessUnit()
         let factory = ScriptedFFmpegParserFactory(
             pushScript: { handle, _, _, _, _, _ in
@@ -459,29 +492,34 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         )
         var events: [VideoAssemblerEvent] = []
         let tracks = try AssemblerTestFixtures.videoTracks()
+        let binding = AssemblyEpochBinding(epochID: AssemblyEpochID(
+            timelineEpoch: TimelineEpochID(rawValue: 8),
+            instanceToken: 1
+        ))
         let subject = try CompressedVideoAssembler(
             trackSet: tracks,
             generationProvider: { MediaGeneration(rawValue: 8) },
             eventSink: { events.append($0) },
             parserFactory: factory,
             formatState: AssemblyFormatState(trackSet: tracks),
+            binding: binding,
             startingID: UInt64.max - 1
         )
 
         try subject.push(AssemblerTestFixtures.videoPacket())
         try subject.drain()
         try subject.drain()
-        try subject.reset(for: AssemblerTestFixtures.videoTracks(streamIndex: 2))
-        XCTAssertEqual(factory.handles[0].destroyCount, 1)
-        XCTAssertEqual(factory.handles.count, 2)
+        _ = binding.rebind()
         XCTAssertEqual(events.compactMap(\.accessUnit).map(\.id), [UInt64.max - 1, UInt64.max])
 
-        XCTAssertThrowsError(try subject.push(AssemblerTestFixtures.videoPacket(streamIndex: 2))) { error in
+        XCTAssertThrowsError(try subject.push(AssemblerTestFixtures.videoPacket())) { error in
             XCTAssertEqual(
                 error as? PlaybackCoreError,
                 .videoDecode(CompressedVideoAssembler.idExhaustedErrorCode)
             )
         }
+        XCTAssertEqual(factory.handles[0].destroyCount, 1)
+        XCTAssertEqual(factory.handles.count, 2)
     }
 
     private func assertSharedAVFingerprintsRemainComplete(resetVideoFirst: Bool) throws {
@@ -550,16 +588,41 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             audio: resetAudio,
             extradata: AssemblerTestFixtures.annexBParameterSets(resetParameterSets)
         )
+        let resetState = AssemblyFormatState(trackSet: resetTracks)
+        let resetVideo: CompressedVideoAssembler
+        let resetAudioAssembler: CompressedAudioAssembler
         if resetVideoFirst {
-            try video.reset(for: resetTracks)
-            try audio.reset(for: resetTracks)
+            resetVideo = try CompressedVideoAssembler(
+                trackSet: resetTracks,
+                generationProvider: { MediaGeneration(rawValue: 2) },
+                eventSink: { videoEvents.append($0) },
+                parserFactory: videoFactory,
+                formatState: resetState
+            )
+            resetAudioAssembler = try CompressedAudioAssembler(
+                trackSet: resetTracks,
+                generationProvider: { MediaGeneration(rawValue: 2) },
+                eventSink: { audioEvents.append($0) },
+                formatState: resetState
+            )
         } else {
-            try audio.reset(for: resetTracks)
-            try video.reset(for: resetTracks)
+            resetAudioAssembler = try CompressedAudioAssembler(
+                trackSet: resetTracks,
+                generationProvider: { MediaGeneration(rawValue: 2) },
+                eventSink: { audioEvents.append($0) },
+                formatState: resetState
+            )
+            resetVideo = try CompressedVideoAssembler(
+                trackSet: resetTracks,
+                generationProvider: { MediaGeneration(rawValue: 2) },
+                eventSink: { videoEvents.append($0) },
+                parserFactory: videoFactory,
+                formatState: resetState
+            )
         }
 
-        try video.push(AssemblerTestFixtures.videoPacket(streamIndex: 2))
-        try audio.push(AssemblerTestFixtures.audioPacket(
+        try resetVideo.push(AssemblerTestFixtures.videoPacket(streamIndex: 2))
+        try resetAudioAssembler.push(AssemblerTestFixtures.audioPacket(
             data: Data([0x22, 0x11]),
             streamIndex: 3,
             codec: .aac,

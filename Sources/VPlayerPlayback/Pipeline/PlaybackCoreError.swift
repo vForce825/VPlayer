@@ -13,6 +13,7 @@ enum PlaybackCoreError: Error, Sendable, Equatable {
     case unsupportedAudioCodec
     case videoFormatDescription(OSStatus)
     case hardwareDecoderUnavailable
+    case videoDecoderTransitionTimeout
     case videoDecode(OSStatus)
     case videoSampleBuffer(String)
     case videoRendererFailed(String)
@@ -22,4 +23,22 @@ enum PlaybackCoreError: Error, Sendable, Equatable {
     case renderTextureMapping
     case metalCommand(String)
     case cancelled
+}
+
+extension PlaybackCoreError {
+    var retryDisposition: PlaybackRetryDisposition {
+        switch self {
+        case .unsupportedProtocol, .unsupportedVideoCodec, .unsupportedAudioCodec,
+             .videoFormatDescription, .videoDecode, .audioFormatDescription,
+             .audioFallbackDecode:
+            .chooseAnotherChannel
+        case .demuxOpen, .demuxRead, .networkTimeout, .hardwareDecoderUnavailable,
+             .videoDecoderTransitionTimeout,
+             .videoSampleBuffer, .videoRendererFailed, .audioRendererFailed,
+             .renderTextureMapping, .metalCommand:
+            .retrySameRequest
+        case .cancelled:
+            .doNotRetry
+        }
+    }
 }

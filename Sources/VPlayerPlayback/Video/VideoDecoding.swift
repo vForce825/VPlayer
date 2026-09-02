@@ -116,27 +116,97 @@ public enum VideoDecoderFailure: Error, Sendable, Equatable {
     case backpressureTimeout
 }
 
+/// Identifies one decoder transition and, after a successful configure, the
+/// decoder session established by that transition.
+///
+/// Tokens are deliberately opaque and freshly generated. Media generation is
+/// not enough to fence a same-generation session replacement or route switch.
+public struct VideoDecoderTransitionToken: Sendable, Hashable {
+    private let rawValue: UUID
+
+    public init() {
+        rawValue = UUID()
+    }
+}
+
+public enum VideoDecoderTransitionOutcome: Sendable, Equatable {
+    case completed
+    case failed(VideoDecoderFailure)
+}
+
+public enum VideoDecoderTransition: @unchecked Sendable {
+    case configure(
+        token: VideoDecoderTransitionToken,
+        format: CMVideoFormatDescription,
+        generation: MediaGeneration
+    )
+    case drainAndInvalidate(token: VideoDecoderTransitionToken)
+    case invalidate(token: VideoDecoderTransitionToken)
+}
+
+public struct VideoDecoderEventIdentity: Sendable, Hashable {
+    public let generation: MediaGeneration
+    public let transitionToken: VideoDecoderTransitionToken
+
+    public init(
+        generation: MediaGeneration,
+        transitionToken: VideoDecoderTransitionToken
+    ) {
+        self.generation = generation
+        self.transitionToken = transitionToken
+    }
+}
+
+public enum VideoDecoderSubmissionDisposition: Sendable, Equatable {
+    case produced
+    case noFrame
+    case cancelled
+}
+
+public enum VideoDecoderTransitionRequirement: Sendable, Equatable {
+    /// The current media format remains valid, but the decoder implementation
+    /// or native session must change before this access unit is submitted.
+    case reconfigure
+}
+
 public enum VideoDecoderEvent: @unchecked Sendable {
-    case frame(DecodedVideoFrame)
-    case recoverableFailure(VideoDecoderFailure, generation: MediaGeneration)
-    case fatalFailure(VideoDecoderFailure, generation: MediaGeneration)
+    case frame(DecodedVideoFrame, identity: VideoDecoderEventIdentity)
+    case recoverableFailure(VideoDecoderFailure, identity: VideoDecoderEventIdentity)
+    case fatalFailure(VideoDecoderFailure, identity: VideoDecoderEventIdentity)
     /// A submission that could not be handed to the decode session at all.
     ///
     /// Submission does not happen on the caller's thread, so the failure cannot
     /// come back as a `throw` from `decode`. It carries the same failures the
     /// synchronous path used to raise and is classified identically.
-    case submissionFailure(VideoDecoderFailure, generation: MediaGeneration)
+    case submissionFailure(
+        accessUnitID: UInt64,
+        failure: VideoDecoderFailure,
+        identity: VideoDecoderEventIdentity
+    )
     /// The decoder has finished with one submitted access unit, whether it
     /// produced a frame, dropped it, or rejected it asynchronously.
     ///
     /// This is deliberately separate from `frame`: reordered decoders can
     /// produce zero or multiple frames for a submission, while admission needs
     /// exactly one release signal for every accepted access unit.
-    case submissionCompleted(accessUnitID: UInt64, generation: MediaGeneration)
+    case submissionCompleted(
+        accessUnitID: UInt64,
+        identity: VideoDecoderEventIdentity,
+        disposition: VideoDecoderSubmissionDisposition
+    )
+    /// Native transition work has finished. The token lets the coordinator
+    /// reject a superseded configure without reopening admission.
+    case transitionCompleted(
+        token: VideoDecoderTransitionToken,
+        outcome: VideoDecoderTransitionOutcome
+    )
 }
 
 public protocol VideoDecoding: AnyObject {
-    func configure(format: CMVideoFormatDescription, generation: MediaGeneration) throws
+    func transition(_ transition: VideoDecoderTransition)
+    func transitionRequirement(
+        for accessUnit: CompressedVideoAccessUnit
+    ) -> VideoDecoderTransitionRequirement?
     /// Hands an access unit to the decoder. Submission is asynchronous, so a
     /// failure to submit arrives as `VideoDecoderEvent.submissionFailure`
     /// rather than as a `throw`; the signature stays throwing for decoders that
@@ -144,12 +214,13 @@ public protocol VideoDecoding: AnyObject {
     /// emit exactly one matching `submissionCompleted`; a call that throws was
     /// rejected synchronously and emits no completion.
     func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws
-    func finishDelayedFrames() throws
-    func waitForAsynchronousFrames() throws
-    func invalidate()
     func setTuning(_ tuning: PlaybackTuning)
 }
 
 public extension VideoDecoding {
+    func transitionRequirement(
+        for _: CompressedVideoAccessUnit
+    ) -> VideoDecoderTransitionRequirement? { nil }
+
     func setTuning(_ tuning: PlaybackTuning) {}
 }

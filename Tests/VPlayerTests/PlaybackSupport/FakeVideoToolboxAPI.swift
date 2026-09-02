@@ -71,6 +71,7 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
     private let lock = NSLock()
     private var nextSessionRawValue: UInt64 = 1
     private var createScripts: [CreateScript] = []
+    private var createInterceptions: [@Sendable () -> Void] = []
     private var setStatuses: [OSStatus] = []
     private var supportedPropertySnapshots: [VTSupportedPropertySnapshot] = []
     private var copyResults: [VTPropertyCopyResult] = []
@@ -104,6 +105,10 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
 
     func enqueueCreate(_ script: CreateScript) {
         withLock { createScripts.append(script) }
+    }
+
+    func enqueueCreateInterception(_ action: @escaping @Sendable () -> Void) {
+        withLock { createInterceptions.append(action) }
     }
 
     func enqueueSetStatus(_ status: OSStatus) {
@@ -173,7 +178,11 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
         decoderSpecification: [String: VTPropertyValue],
         imageBufferAttributes: [String: VTPropertyValue]
     ) -> (status: OSStatus, session: (any VideoToolboxSession)?) {
-        withLock {
+        let result: (
+            status: OSStatus,
+            session: (any VideoToolboxSession)?,
+            interception: (@Sendable () -> Void)?
+        ) = withLock {
             operations.append("create")
             creates.append(CreateRecord(
                 mediaSubtype: CMFormatDescriptionGetMediaSubType(format),
@@ -183,13 +192,20 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
             let script = createScripts.isEmpty
                 ? CreateScript(status: noErr)
                 : createScripts.removeFirst()
-            guard script.returnsSession else { return (script.status, nil) }
+            let interception = createInterceptions.isEmpty
+                ? nil
+                : createInterceptions.removeFirst()
+            guard script.returnsSession else {
+                return (script.status, nil, interception)
+            }
             let session = FakeVideoToolboxSession(
                 id: VTSessionID(rawValue: nextSessionRawValue)
             )
             nextSessionRawValue &+= 1
-            return (script.status, session)
+            return (script.status, session, interception)
         }
+        result.interception?()
+        return (result.status, result.session)
     }
 
     func setProperty(

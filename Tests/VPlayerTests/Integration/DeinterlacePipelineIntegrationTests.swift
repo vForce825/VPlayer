@@ -160,7 +160,7 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
     func testGPUCommandErrorIsTerminalAndTyped() async throws {
         let result = try await harness.runGPUCommandErrorRegression()
 
-        XCTAssertEqual(result.failure?.code, "metal.command")
+        XCTAssertEqual(result.failure, .commandExecution)
         XCTAssertEqual(result.successfulPresentationCount, 0)
         XCTAssertEqual(result.commandSubmissionCount, 1)
     }

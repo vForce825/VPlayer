@@ -56,6 +56,46 @@ final class FullScreenPlayerUITests: XCTestCase {
     }
 
     @MainActor
+    func testBufferingFixtureExposesPinnedBufferingStatus() {
+        let app = launchFixture(playback: "buffering")
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        XCTAssertTrue(app.descendants(matching: .any)["player-buffering"].waitForExistence(
+            timeout: 3
+        ))
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "buffering")
+        XCTAssertEqual(
+            app.otherElements["player-controls-visibility"].value as? String,
+            "visible"
+        )
+    }
+
+    @MainActor
+    func testRecoveringFixtureExposesPinnedRecoveryStatus() {
+        let app = launchFixture(playback: "recovering")
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        XCTAssertTrue(app.descendants(matching: .any)["player-recovering"].waitForExistence(
+            timeout: 3
+        ))
+        let state = app.otherElements["player-acceptance-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String, "recovering")
+        XCTAssertEqual(
+            app.otherElements["player-controls-visibility"].value as? String,
+            "visible"
+        )
+    }
+
+    @MainActor
     func testPlayingFixtureAutoHidesAndRemoteCommandsWakeBothOverlays() {
         let app = launchFixture()
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
@@ -173,6 +213,27 @@ final class FullScreenPlayerUITests: XCTestCase {
         XCTAssertTrue(state.waitForExistence(timeout: 3))
         XCTAssertEqual(state.value as? String, "failed:video.decode.status.-12909")
         XCTAssertFalse(state.hasFocus)
+    }
+
+    @MainActor
+    func testNonRetryFailuresHideRetryAndFocusTheExistingBackControl() {
+        for fixture in ["failed-choose-channel", "failed-do-not-retry"] {
+            let app = launchFixture(playback: fixture)
+            XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+            selectTab(named: "频道", in: app)
+            XCTAssertTrue(app.buttons["channel.http"].wait(
+                for: \.hasFocus,
+                toEqual: true,
+                timeout: 2
+            ))
+            XCUIRemote.shared.press(.select)
+
+            let back = app.buttons["player-back"]
+            XCTAssertTrue(back.waitForExistence(timeout: 3))
+            XCTAssertTrue(back.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+            XCTAssertEqual(app.buttons.matching(identifier: "player-retry").count, 0)
+            app.terminate()
+        }
     }
 
     @MainActor

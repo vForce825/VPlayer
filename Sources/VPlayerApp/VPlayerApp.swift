@@ -232,9 +232,6 @@ struct VPlayerApp: App {
     private let backgroundRefreshRegistrar: BackgroundRefreshRegistrar
 
     init() {
-        let audioSessionConfigurator = SystemAudioSessionConfigurator()
-        audioSessionConfigurator.configureOnce()
-
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)
         if configuration.resetsPlaybackSettings {
             UserDefaults.standard.removeObject(

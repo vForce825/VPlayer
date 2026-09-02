@@ -2,10 +2,84 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreMedia
 import XCTest
 @testable import VPlayerPlayback
 
 final class BoundedMediaQueueTests: XCTestCase {
+    func testCompressedVideoOverflowRejectsNewestWithoutLaterRandomAccess() throws {
+        var subject = CompressedVideoReservoir(limits: CompressedVideoRetentionLimits(
+            maximumCount: 2,
+            maximumOwnedBytes: 1_024,
+            latestTailHorizon: CMTime(value: 10, timescale: 1)
+        ))
+        XCTAssertTrue(subject.append(try videoUnit(id: 1, randomAccess: true)).accepted)
+        XCTAssertTrue(subject.append(try videoUnit(id: 2, randomAccess: false)).accepted)
+
+        let overflow = subject.append(try videoUnit(id: 3, randomAccess: false))
+
+        XCTAssertFalse(overflow.accepted)
+        XCTAssertEqual(subject.map(\.id), [1, 2])
+    }
+
+    func testCompressedVideoOverflowMovesAtomicallyToDecodableSuffix() throws {
+        var subject = CompressedVideoReservoir(limits: CompressedVideoRetentionLimits(
+            maximumCount: 2,
+            maximumOwnedBytes: 1_024,
+            latestTailHorizon: CMTime(value: 10, timescale: 1)
+        ))
+        _ = subject.append(try videoUnit(id: 1, randomAccess: true))
+        _ = subject.append(try videoUnit(id: 2, randomAccess: false))
+
+        let overflow = subject.append(try videoUnit(id: 3, randomAccess: true))
+
+        XCTAssertEqual(overflow, CompressedVideoReservoirMutation(
+            accepted: true,
+            droppedCount: 2
+        ))
+        XCTAssertEqual(subject.map(\.id), [3])
+    }
+
+    func testCompressedVideoOverflowCanPreserveEarliestWindowWhileReadinessIsClosed() throws {
+        var subject = CompressedVideoReservoir(limits: CompressedVideoRetentionLimits(
+            maximumCount: 2,
+            maximumOwnedBytes: 1_024,
+            latestTailHorizon: CMTime(value: 10, timescale: 1)
+        ))
+        _ = subject.append(try videoUnit(id: 1, randomAccess: true))
+        _ = subject.append(try videoUnit(id: 2, randomAccess: false))
+
+        let overflow = subject.append(
+            try videoUnit(id: 3, randomAccess: true),
+            decodableSuffixMayStartAt: { _ in false }
+        )
+
+        XCTAssertFalse(overflow.accepted)
+        XCTAssertEqual(subject.map(\.id), [1, 2])
+    }
+
+    func testOversizedRandomAccessDoesNotEraseExistingDecodableGOP() throws {
+        let first = try videoUnit(id: 1, randomAccess: true)
+        let bytes = CMSampleBufferGetTotalSampleSize(first.sampleBuffer)
+        var subject = CompressedVideoReservoir(limits: CompressedVideoRetentionLimits(
+            maximumCount: 4,
+            maximumOwnedBytes: bytes,
+            latestTailHorizon: CMTime(value: 10, timescale: 1)
+        ))
+        XCTAssertTrue(subject.append(first).accepted)
+
+        let overflow = subject.append(try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: MediaGeneration(rawValue: 1),
+            randomAccess: true,
+            pts: CMTime(value: 2, timescale: 25),
+            data: Data(repeating: 0x01, count: bytes + 1)
+        ))
+
+        XCTAssertFalse(overflow.accepted)
+        XCTAssertEqual(subject.map(\.id), [1])
+    }
+
     func testRejectNewestNeverGrowsPastCapacity() {
         var subject = BoundedMediaQueue<Int>(capacity: 2, overflow: .rejectNewest)
 
@@ -127,6 +201,18 @@ final class BoundedMediaQueueTests: XCTestCase {
     func testQueueIsConditionallySendable() {
         func requireSendable<T: Sendable>(_: T.Type) {}
         requireSendable(BoundedMediaQueue<Int>.self)
+    }
+
+    private func videoUnit(
+        id: UInt64,
+        randomAccess: Bool
+    ) throws -> CompressedVideoAccessUnit {
+        try PlaybackFakeMedia.accessUnit(
+            id: id,
+            generation: MediaGeneration(rawValue: 1),
+            randomAccess: randomAccess,
+            pts: CMTime(value: Int64(id), timescale: 25)
+        )
     }
 }
 

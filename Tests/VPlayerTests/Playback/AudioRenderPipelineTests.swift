@@ -857,6 +857,26 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testAwaitedStopDeadlineCompletesWhenSynchronizerNeverCallsBack() async throws {
+        let harness = try makeHarness()
+        let completions = LockedAudioCompletionCount()
+        let stop = Task {
+            await harness.pipeline.stopAwaitingRendererRemoval()
+            completions.increment()
+        }
+        try await eventually { harness.synchronizer.removalCount == 1 }
+
+        harness.recoveryScheduler.advance(by: .seconds(2))
+        drain(harness.executor)
+        await stop.value
+        XCTAssertEqual(completions.value, 1)
+
+        harness.synchronizer.completeRemoval(didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(completions.value, 1)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+    }
+
     func testAwaitedStopHandlesNoRendererAndPendingConfigureRemovalWithoutCreatingReplacement() async throws {
         let unconfigured = try makeHarness(configure: false)
         await unconfigured.pipeline.stopAwaitingRendererRemoval()
@@ -4152,7 +4172,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let monitor = AudioOutputRouteMonitor(
             executor: executor,
             notificationCenter: center,
-            snapshotProvider: { [.HDMI, .airPlay] }
+            snapshotProvider: { [.HDMI, .airPlay] },
+            latencyProvider: { (0, 0) }
         )
         monitor.start { snapshots.append($0) }
 
@@ -4182,6 +4203,456 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         monitor.stop()
     }
 
+    func testRouteSnapshotEqualityIncludesLatencyAndIOBufferDuration() {
+        let baseline = AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 4,
+            outputLatency: 0.200,
+            ioBufferDuration: 0.020
+        )
+
+        XCTAssertNotEqual(baseline, AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 4,
+            outputLatency: 0.250,
+            ioBufferDuration: 0.020
+        ))
+        XCTAssertNotEqual(baseline, AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 4,
+            outputLatency: 0.200,
+            ioBufferDuration: 0.030
+        ))
+    }
+
+    func testRouteNotificationResamplesFreshLatencyAndIOBufferDuration() {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route-latency")
+        let center = NotificationCenter()
+        let latency = MutableRouteLatency(outputLatency: 0.100, ioBufferDuration: 0.010)
+        let snapshots = LockedRouteSnapshots(executor: executor)
+        let monitor = AudioOutputRouteMonitor(
+            executor: executor,
+            notificationCenter: center,
+            snapshotProvider: { [.airPlay] },
+            latencyProvider: latency.snapshot
+        )
+        monitor.start { snapshots.append($0) }
+        drain(executor)
+        latency.set(outputLatency: 0.300, ioBufferDuration: 0.030)
+
+        center.post(
+            name: AVAudioSession.routeChangeNotification,
+            object: nil,
+            userInfo: [
+                AVAudioSessionRouteChangeReasonKey:
+                    AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue,
+            ]
+        )
+        drain(executor)
+
+        XCTAssertEqual(snapshots.snapshot.map(\.outputLatency), [0.100, 0.300])
+        XCTAssertEqual(snapshots.snapshot.map(\.ioBufferDuration), [0.010, 0.030])
+        monitor.stop()
+    }
+
+    func testOutputConfigurationChangeResamplesAndPublishesFreshRouteSnapshot() throws {
+        let harness = try makeHarness(initialRouteCategory: .airPlay)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        let refreshed = AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 1,
+            outputLatency: 0.450,
+            ioBufferDuration: 0.025
+        )
+        harness.routeMonitor.setNextResampleSnapshot(refreshed)
+
+        renderer.emit(.outputConfigurationChanged)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.routeMonitor.resampleCountSnapshot, 1)
+        XCTAssertEqual(harness.pipeline.currentRouteSnapshot, refreshed)
+        XCTAssertEqual(harness.pipeline.diagnostics.routeRevision, refreshed.revision)
+        XCTAssertEqual(harness.pipeline.anchorLeadTime.seconds, 0.575, accuracy: 0.001)
+    }
+
+    func testNoOutputRouteFailsExactlyAtDeadlineOnce() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+
+        harness.recoveryScheduler.advance(by: .milliseconds(2_999))
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+
+        harness.recoveryScheduler.advance(by: .milliseconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot, [
+            AudioFailureRecord(
+                error: .audioRendererFailed("audio.output-route.unavailable"),
+                generation: MediaGeneration(rawValue: 1)
+            ),
+        ])
+
+        harness.recoveryScheduler.advance(by: .seconds(30))
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot.count, 1)
+    }
+
+    func testUsableRouteCancelsNoOutputRouteDeadline() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .hdmi,
+            reason: .newDeviceAvailable,
+            revision: 1
+        ))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(3))
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testConfigureInvalidatesOldNoOutputRouteTicketIdentity() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 2),
+                fingerprint: self.fingerprint(2)
+            )
+        }
+        harness.recoveryScheduler.advance(by: .seconds(3))
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testStopAndRendererReplacementInvalidateNoOutputRouteTickets() throws {
+        do {
+            let harness = try makeHarness(initialRouteCategory: .none)
+            try perform(on: harness.executor) { harness.pipeline.stop() }
+            harness.recoveryScheduler.advance(by: .seconds(3))
+            drain(harness.executor)
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        }
+
+        do {
+            let harness = try makeHarness(initialRouteCategory: .none)
+            let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+            renderer.configureReadiness(ready: true)
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: 1,
+                    pts: .zero,
+                    duration: CMTime(value: 10, timescale: 1)
+                ))
+            }
+            renderer.emit(.automaticFlush(.zero))
+            drain(harness.executor)
+            harness.recoveryScheduler.advance(by: .seconds(1))
+            drain(harness.executor)
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            harness.recoveryScheduler.advance(by: .seconds(2))
+            drain(harness.executor)
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        }
+    }
+
+    func testCompressedRetryCreatesFreshNoRouteDeadlineForReplacementIdentity() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+        }
+
+        original.emit(.failed("retry:first"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertNotEqual(replacement.identity, original.identity)
+        replacement.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        replacement.fireReady()
+        drain(harness.executor)
+        replacement.fireReady()
+        drain(harness.executor)
+
+        harness.recoveryScheduler.advance(by: .milliseconds(2_999))
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        harness.recoveryScheduler.advance(by: .milliseconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+            .audioRendererFailed("audio.output-route.unavailable"),
+        ])
+        harness.recoveryScheduler.advance(by: .seconds(30))
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot.count, 1)
+    }
+
+    func testUsableRouteCancelsCompressedReplacementNoRouteDeadline() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        original.emit(.failed("retry:first"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true, maximumEnqueuesPerCallback: 1)
+        replacement.fireReady()
+        drain(harness.executor)
+        replacement.fireReady()
+        drain(harness.executor)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .hdmi,
+            reason: .newDeviceAvailable,
+            revision: 1
+        ))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(3))
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPCMFallbackCreatesFreshNoRouteDeadlineForReplacementIdentity() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: original,
+            in: harness,
+            reason: "fallback"
+        )
+        harness.synchronizer.completeRemoval(
+            index: transition.removalIndex,
+            didRemove: true
+        )
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(replacement.mediaKind, .linearPCM)
+        XCTAssertNotEqual(replacement.identity, original.identity)
+
+        harness.recoveryScheduler.advance(by: .milliseconds(2_999))
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        harness.recoveryScheduler.advance(by: .milliseconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+            .audioRendererFailed("audio.output-route.unavailable"),
+        ])
+        harness.recoveryScheduler.advance(by: .seconds(30))
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot.count, 1)
+    }
+
+    func testUsableRouteCancelsPCMReplacementNoRouteDeadline() throws {
+        let harness = try makeHarness(initialRouteCategory: .none)
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: original,
+            in: harness,
+            reason: "fallback"
+        )
+        harness.synchronizer.completeRemoval(
+            index: transition.removalIndex,
+            didRemove: true
+        )
+        drain(harness.executor)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .newDeviceAvailable,
+            revision: 1
+        ))
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(3))
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testAudioSessionResetRebuildsCompressedRendererWithoutChangingGeneration() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            harness.pipeline.recoverFromAudioSessionReset()
+        }
+
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+        XCTAssertNotEqual(replacement.identity, original.identity)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testAudioSessionResetDestroysAndRecreatesPCMDecoderAndRenderer() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let fallback = try beginFallbackAfterCompressedRetry(
+            initialRenderer: original,
+            in: harness,
+            reason: "reset"
+        )
+        harness.synchronizer.completeRemoval(index: fallback.removalIndex, didRemove: true)
+        drain(harness.executor)
+        let pcmRenderer = try XCTUnwrap(harness.renderers.snapshot.last)
+        let decoder = try XCTUnwrap(harness.decoderFactory.snapshot.last)
+
+        try perform(on: harness.executor) {
+            harness.pipeline.recoverFromAudioSessionReset()
+        }
+        XCTAssertEqual(harness.synchronizer.removalCount, fallback.removalIndex + 2)
+        harness.synchronizer.completeRemoval(
+            index: fallback.removalIndex + 1,
+            didRemove: true
+        )
+        drain(harness.executor)
+
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(replacement.mediaKind, .linearPCM)
+        XCTAssertNotEqual(replacement.identity, pcmRenderer.identity)
+        XCTAssertEqual(decoder.destroyCountSnapshot, 1)
+        XCTAssertEqual(harness.decoderFactory.snapshot.count, 2)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testAudioSessionResetDuringFallbackRemovalPreservesPCMTarget() throws {
+        let harness = try makeHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let fallback = try beginFallbackAfterCompressedRetry(
+            initialRenderer: original,
+            in: harness,
+            reason: "reset"
+        )
+
+        try perform(on: harness.executor) {
+            harness.pipeline.recoverFromAudioSessionReset()
+        }
+        harness.synchronizer.completeRemoval(index: fallback.removalIndex, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.renderers.snapshot.last?.mediaKind, .linearPCM)
+        XCTAssertEqual(harness.decoderFactory.snapshot.count, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testOnlyUsableRouteTimingChangesPublishAnchorTimingChange() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio-route-timing")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let routeMonitor = FakeAudioRouteMonitor(initialCategory: .airPlay)
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { _, _ in },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
+            routeMonitor: routeMonitor,
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            recoveryScheduler: ManualAudioRecoveryScheduler().schedule,
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in
+                readiness.append(change, generation: generation)
+            }
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: MediaGeneration(rawValue: 1),
+                fingerprint: self.fingerprint(1)
+            )
+        }
+
+        routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 1,
+            outputLatency: 0.400,
+            ioBufferDuration: 0.020
+        ))
+        drain(executor)
+        routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 2,
+            outputLatency: 0.400,
+            ioBufferDuration: 0.020
+        ))
+        drain(executor)
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        routeMonitor.setNextResampleSnapshot(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 3,
+            outputLatency: 0.400,
+            ioBufferDuration: 0.020
+        ))
+        renderer.emit(.outputConfigurationChanged)
+        renderer.emit(.automaticFlush(.zero))
+        drain(executor)
+        routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .none,
+            reason: .oldDeviceUnavailable,
+            revision: 4
+        ))
+        drain(executor)
+
+        XCTAssertEqual(readiness.snapshot, [
+            AudioReadinessRecord(
+                change: .anchorTimingChanged(routeRevision: 1),
+                generation: MediaGeneration(rawValue: 1)
+            ),
+            AudioReadinessRecord(
+                change: .outputRouteUnavailable,
+                generation: MediaGeneration(rawValue: 1)
+            ),
+        ])
+    }
+
     func testRouteMonitorPreservesBufferedAndDrainBoundaryNotificationOrder() {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route-start-race")
         let center = RouteChangesDuringObserverInstallationNotificationCenter()
@@ -4190,6 +4661,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             executor: executor,
             notificationCenter: center,
             snapshotProvider: { [.airPlay] },
+            latencyProvider: { (0, 0) },
             initialDrainBoundaryHook: {
                 center.post(
                     name: AVAudioSession.routeChangeNotification,
@@ -4271,7 +4743,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let monitor = AudioOutputRouteMonitor(
             executor: executor,
             notificationCenter: center,
-            snapshotProvider: { [.HDMI] }
+            snapshotProvider: { [.HDMI] },
+            latencyProvider: { (0, 0) }
         )
         monitor.start { _ in XCTFail("old handler must not run") }
         center.post(name: AVAudioSession.routeChangeNotification, object: nil)
@@ -5413,6 +5886,28 @@ private final class LockedRouteSnapshots: @unchecked Sendable {
     var isolationSnapshot: [Bool] { lock.lock(); defer { lock.unlock() }; return isolation }
 }
 
+private final class MutableRouteLatency: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outputLatency: TimeInterval
+    private var ioBufferDuration: TimeInterval
+
+    init(outputLatency: TimeInterval, ioBufferDuration: TimeInterval) {
+        self.outputLatency = outputLatency
+        self.ioBufferDuration = ioBufferDuration
+    }
+
+    func set(outputLatency: TimeInterval, ioBufferDuration: TimeInterval) {
+        lock.withLock {
+            self.outputLatency = outputLatency
+            self.ioBufferDuration = ioBufferDuration
+        }
+    }
+
+    func snapshot() -> (outputLatency: TimeInterval, ioBufferDuration: TimeInterval) {
+        lock.withLock { (outputLatency, ioBufferDuration) }
+    }
+}
+
 private final class RouteChangesDuringObserverInstallationNotificationCenter:
     NotificationCenter,
     @unchecked Sendable
@@ -5539,7 +6034,11 @@ private final class LockedAudioCompletionCount: @unchecked Sendable {
 
 private final class LegacySynchronousAudioPipeline: AudioRenderPipelineProtocol {
     var isReadyForPlayback = false
+    var isOutputRouteReadyForSharedAnchor = true
     var route = AudioRoute.systemCompressed
+    var currentRouteSnapshot: AudioOutputRouteSnapshot? {
+        AudioOutputRouteSnapshot(category: .other, reason: .initial, revision: 0)
+    }
     private(set) var stopCount = 0
 
     func configure(
@@ -5551,6 +6050,7 @@ private final class LegacySynchronousAudioPipeline: AudioRenderPipelineProtocol 
     func activateContinuityIsland(_: AudioContinuityIslandID, generation _: MediaGeneration) {}
     func updateRecoveryFloor(_: CMTime?) {}
     func prepareAnchor(at _: CMTime, in _: AudioContinuityIslandID) throws {}
+    func recoverFromAudioSessionReset() {}
     func flush(to _: MediaGeneration) {}
     func stop() { stopCount += 1 }
 }

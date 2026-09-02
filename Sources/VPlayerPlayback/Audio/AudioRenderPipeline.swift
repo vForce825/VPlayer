@@ -70,6 +70,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     // still close readiness and surface the stall.
     private static let fallbackReadinessGrace: DispatchTimeInterval = .seconds(1)
     private static let progressDeadlineDelay: DispatchTimeInterval = .seconds(1)
+    private static let noOutputRouteDeadlineDelay: DispatchTimeInterval = .seconds(3)
+    private static let noOutputRouteError = "audio.output-route.unavailable"
     private static let maximumConsecutiveInvalidPackets = 8
 
     private struct DiagnosticsState {
@@ -157,6 +159,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private struct PublicSnapshot {
         var isReadyForPlayback = false
         var route = AudioRoute.systemCompressed
+        var routeSnapshot: AudioOutputRouteSnapshot?
         var recoveryCount: UInt64 = 0
         var diagnostics = DiagnosticsState()
     }
@@ -180,6 +183,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         case configure
         case compressedRetry
         case fallback
+        case audioSessionReset
         case stop
     }
 
@@ -190,6 +194,14 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         var targetEpoch: UInt64
         var targetGeneration: MediaGeneration
         var continuation: RemovalContinuation
+    }
+
+    private struct NoOutputRouteTicket: Sendable, Equatable {
+        let sequence: UInt64
+        let routeRevision: UInt64
+        let epoch: UInt64
+        let rendererID: AudioRendererIdentity
+        let generation: MediaGeneration
     }
 
     private enum RecoveryDeadline: Sendable {
@@ -244,6 +256,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var terminal = false
     private var configured = false
     private var stopped = true
+    private var stopDeadlineRevision: UInt64 = 0
     private var fallbackUsed = false
     private var progressMonitor: AudioRendererRecoveryProgressMonitor
     private var automaticFlushProgressOrigin =
@@ -252,6 +265,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var pendingReevaluation = false
     private var recoveryCoordinator = AudioRecoveryCoordinator()
     private var pendingRemoval: PendingRemoval?
+    private var nextNoOutputRouteTicket: UInt64? = 1
+    private var pendingNoOutputRouteTicket: NoOutputRouteTicket?
     private var fallbackReadinessGraceActive = false
     private var compressedRetryPreservesReadiness = false
     private var sharedTimelineOpened = false
@@ -345,7 +360,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     var currentRouteSnapshot: AudioOutputRouteSnapshot? {
-        withSnapshot { _ in lastRouteSnapshot }
+        withSnapshot { $0.routeSnapshot }
     }
 
     var anchorLeadTime: CMTime {
@@ -560,6 +575,36 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         sharedTimelineOpened = opened
     }
 
+    func recoverFromAudioSessionReset() {
+        guard executor.isIsolated else {
+            executor.submit { [weak self] in self?.recoverFromAudioSessionReset() }
+            return
+        }
+        guard configured, !stopped, !terminal else { return }
+        recoveryCoordinator.invalidate()
+        invalidateProgressMonitor()
+        pendingReevaluation = false
+        if var pendingRemoval {
+            switch pendingRemoval.continuation {
+            case .configure, .stop:
+                return
+            case .fallback:
+                fallbackReadinessGraceActive = false
+                compressedRetryPreservesReadiness = false
+                updateSnapshot(route: route, ready: false)
+                return
+            case .compressedRetry, .audioSessionReset:
+                break
+            }
+            pendingRemoval.continuation = .audioSessionReset
+            self.pendingRemoval = pendingRemoval
+            updateSnapshot(route: route, ready: false)
+            return
+        }
+        guard let renderer else { return }
+        beginRemoval(of: renderer, continuation: .audioSessionReset)
+    }
+
     func flush(to generation: MediaGeneration) {
         guard executor.isIsolated else {
             executor.submit { [weak self] in self?.flush(to: generation) }
@@ -576,6 +621,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         self.generation = generation
         terminal = false
         pendingReevaluation = false
+        invalidateNoOutputRouteDeadline()
         recoveryCoordinator.invalidate()
         invalidateProgressMonitor()
         needsAnchor = false
@@ -604,7 +650,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             switch pendingRemoval.continuation {
             case .configure, .stop:
                 routeMonitor.stop()
-            case .compressedRetry, .fallback:
+            case .compressedRetry, .fallback, .audioSessionReset:
                 startRouteMonitor(epoch: newEpoch, generation: generation)
             }
             updateReadiness()
@@ -656,6 +702,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         replacing = false
         terminal = false
         pendingReevaluation = false
+        invalidateNoOutputRouteDeadline()
         recoveryCoordinator.invalidate()
         invalidateProgressMonitor()
         fallbackReadinessGraceActive = false
@@ -670,8 +717,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             pendingRemoval.continuation = .stop
             self.pendingRemoval = pendingRemoval
             replacing = true
+            armStopDeadline()
         } else if let renderer {
             beginRemoval(of: renderer, continuation: .stop)
+            armStopDeadline()
         } else {
             replacing = false
             completeStopCompletions()
@@ -693,9 +742,31 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func completeStopCompletions() {
+        stopDeadlineRevision &+= 1
         let completions = stopCompletions
         stopCompletions.removeAll(keepingCapacity: false)
         for completion in completions { completion() }
+    }
+
+    private func armStopDeadline() {
+        stopDeadlineRevision &+= 1
+        let revision = stopDeadlineRevision
+        recoveryScheduler(.seconds(2)) { [weak self] in
+            guard let self else { return }
+            executor.submit { [weak self] in
+                guard let self,
+                      stopDeadlineRevision == revision,
+                      stopped,
+                      pendingRemoval?.continuation == .stop else { return }
+                pendingRemoval = nil
+                renderer?.stopObserving()
+                renderer = nil
+                rendererAttached = false
+                replacing = false
+                updateReadiness()
+                completeStopCompletions()
+            }
+        }
     }
 
     private func takeEpoch() throws -> UInt64 {
@@ -745,6 +816,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         terminal = false
         needsAnchor = false
         pendingReevaluation = false
+        invalidateNoOutputRouteDeadline()
         recoveryCoordinator.invalidate()
         invalidateProgressMonitor()
         fallbackReadinessGraceActive = false
@@ -752,6 +824,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         sharedTimelineOpened = false
         currentOutput = .other
         lastRouteSnapshot = nil
+        snapshotLock.withLock { publicSnapshot.routeSnapshot = nil }
         resetStartupWait()
         publishCompressedDiagnosticContext(
             codec: configuration.codec,
@@ -820,6 +893,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func startRouteMonitor(epoch: UInt64, generation: MediaGeneration) {
         routeMonitor.stop()
         lastRouteSnapshot = nil
+        snapshotLock.withLock { publicSnapshot.routeSnapshot = nil }
         routeMonitor.start { [weak self] snapshot in
             guard let self else { return }
             if executor.isIsolated {
@@ -948,6 +1022,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             ingestRecovery(.automaticFlush)
         case .outputConfigurationChanged:
             if replacing { return }
+            routeMonitor.resample(reason: .routeConfigurationChange)
             ingestRecovery(.outputConfigurationChanged)
         }
     }
@@ -962,14 +1037,33 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         if let lastRouteSnapshot {
             guard snapshot.revision > lastRouteSnapshot.revision else { return }
         }
-        let hadUsableOutputRoute = lastRouteSnapshot.map { $0.category != .none } ?? false
+        let previousRouteSnapshot = lastRouteSnapshot
+        let hadUsableOutputRoute = previousRouteSnapshot.map { $0.category != .none } ?? false
         lastRouteSnapshot = snapshot
         currentOutput = snapshot.category
-        publishRouteDiagnosticContext(snapshot)
+        publishRouteSnapshot(snapshot)
         invalidateProgressMonitor()
         guard snapshot.category != .none else {
-            updateSnapshot(route: route, ready: false)
+            let wasReady = isReadyForPlayback
+            updateSnapshot(
+                route: route,
+                ready: false,
+                invalidation: .outputRouteUnavailable
+            )
+            if hadUsableOutputRoute, !wasReady {
+                readinessSink?(.outputRouteUnavailable, generation)
+            }
+            scheduleNoOutputRouteDeadline(for: snapshot)
             return
+        }
+        invalidateNoOutputRouteDeadline()
+        let anchorTimingChanged = previousRouteSnapshot.map {
+            $0.category != .none
+                && ($0.outputLatency != snapshot.outputLatency
+                    || $0.ioBufferDuration != snapshot.ioBufferDuration)
+        } ?? false
+        if anchorTimingChanged {
+            readinessSink?(.anchorTimingChanged(routeRevision: snapshot.revision), generation)
         }
         if !hadUsableOutputRoute {
             let wasReady = isReadyForPlayback
@@ -997,6 +1091,53 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             incrementDiagnostic(\.routeChangeTriggerCount)
         }
         processRecoveryActions(recoveryCoordinator.ingest(cause))
+    }
+
+    private func scheduleNoOutputRouteDeadline(
+        for snapshot: AudioOutputRouteSnapshot
+    ) {
+        guard let rendererID = renderer?.identity,
+              let sequence = nextNoOutputRouteTicket else {
+            invalidateNoOutputRouteDeadline()
+            return
+        }
+        nextNoOutputRouteTicket = sequence == UInt64.max ? nil : sequence + 1
+        let ticket = NoOutputRouteTicket(
+            sequence: sequence,
+            routeRevision: snapshot.revision,
+            epoch: epoch,
+            rendererID: rendererID,
+            generation: generation
+        )
+        pendingNoOutputRouteTicket = ticket
+        recoveryScheduler(Self.noOutputRouteDeadlineDelay) { [weak self] in
+            guard let self else { return }
+            executor.submit { [weak self] in
+                self?.handleNoOutputRouteDeadline(ticket)
+            }
+        }
+    }
+
+    private func scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded() {
+        guard let snapshot = lastRouteSnapshot,
+              snapshot.category == AudioOutputRouteCategory.none else { return }
+        scheduleNoOutputRouteDeadline(for: snapshot)
+    }
+
+    private func handleNoOutputRouteDeadline(_ ticket: NoOutputRouteTicket) {
+        guard pendingNoOutputRouteTicket == ticket,
+              epoch == ticket.epoch,
+              generation == ticket.generation,
+              renderer?.identity == ticket.rendererID,
+              lastRouteSnapshot?.revision == ticket.routeRevision,
+              lastRouteSnapshot?.category == AudioOutputRouteCategory.none,
+              configured, !stopped, !terminal, !replacing else { return }
+        pendingNoOutputRouteTicket = nil
+        emitTerminal(.audioRendererFailed(Self.noOutputRouteError))
+    }
+
+    private func invalidateNoOutputRouteDeadline() {
+        pendingNoOutputRouteTicket = nil
     }
 
     private func processRecoveryActions(_ actions: [AudioRecoveryAction]) {
@@ -1322,7 +1463,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             preservesReadiness = clockMode == .externallyManaged && isReadyForPlayback
             compressedRetryPreservesReadiness = false
             fallbackReadinessGraceActive = preservesReadiness
-        case .configure, .stop:
+        case .configure, .audioSessionReset, .stop:
             preservesReadiness = false
             compressedRetryPreservesReadiness = false
             fallbackReadinessGraceActive = false
@@ -1343,6 +1484,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
         updateSnapshot(route: route, ready: preservesReadiness)
         let keepsClockRunning: Bool
+        invalidateNoOutputRouteDeadline()
         if case .compressedRetry = continuation {
             keepsClockRunning = preservesReadiness
         } else {
@@ -1391,7 +1533,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
               renderer?.identity == rendererID,
               replacing, !terminal else { return }
         switch transition.continuation {
-        case .configure, .compressedRetry, .fallback:
+        case .configure, .compressedRetry, .fallback, .audioSessionReset:
             guard configured, !stopped else { return }
         case .stop:
             guard stopped, !configured else { return }
@@ -1420,6 +1562,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             completeCompressedRetryAfterRemoval()
         case .fallback:
             completeFallbackAfterRemoval()
+        case .audioSessionReset:
+            completeAudioSessionResetAfterRemoval()
         case .stop:
             replacing = false
             updateReadiness()
@@ -1460,6 +1604,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
         replacing = false
         compressedRetryPreservesReadiness = false
+        scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded()
         if let attemptKey = currentCompressedAttemptKey,
            let token = currentProgressToken {
             processProgressActions(
@@ -1477,6 +1622,50 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             pendingReevaluation = false
             ingestRecovery(.routeChanged)
         }
+    }
+
+    private func completeAudioSessionResetAfterRemoval() {
+        guard configured, !stopped, replacing, !terminal else { return }
+        switch route {
+        case .systemCompressed:
+            let replacement: any AudioRenderer
+            do {
+                replacement = try rendererFactory.makeRenderer(mediaKind: .compressed)
+                renderer = replacement
+                installCallbacks(on: replacement, epoch: epoch, generation: generation)
+                try synchronizer.attach(replacement)
+            } catch {
+                replacementCleanupAfterFailedAttachment()
+                classifyAndEmitDecode(error)
+                return
+            }
+            rendererAttached = true
+            establishRendererDemandLifetime(for: replacement)
+            for index in replay.indices {
+                replay[index].sentCompressed = false
+                replay[index].acceptedCompressed = false
+            }
+            replacing = false
+            scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded()
+            driveRenderer()
+        case .ffmpegPCM:
+            decoder?.destroy()
+            decoder = nil
+            pendingPCM.removeAll(keepingCapacity: true)
+            for index in replay.indices { replay[index].decoded = false }
+            do {
+                try activatePCMRenderer()
+            } catch {
+                classifyAndEmitDecode(error)
+            }
+        }
+    }
+
+    private func replacementCleanupAfterFailedAttachment() {
+        renderer?.stopObserving()
+        invalidateRendererDemandLifetime(on: renderer)
+        renderer = nil
+        rendererAttached = false
     }
 
     private func beginFallbackWithoutRemoval(reason: AudioFallbackReason) {
@@ -1554,6 +1743,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         establishRendererDemandLifetime(for: replacement)
         updateSnapshot(route: .ffmpegPCM, ready: fallbackReadinessGraceActive)
         replacing = false
+        scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded()
         needsAnchor = true
         try pruneExpired(at: synchronizer.currentTime())
         for index in replay.indices { replay[index].decoded = false }
@@ -2060,7 +2250,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
-    private func publishRouteDiagnosticContext(_ snapshot: AudioOutputRouteSnapshot) {
+    private func publishRouteSnapshot(_ snapshot: AudioOutputRouteSnapshot) {
         let category: AudioDiagnosticOutputCategory
         switch snapshot.category {
         case .hdmi: category = .hdmi
@@ -2070,6 +2260,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         case .none: category = .none
         }
         snapshotLock.withLock {
+            publicSnapshot.routeSnapshot = snapshot
             publicSnapshot.diagnostics.outputCategory = category
             publicSnapshot.diagnostics.routeRevision = snapshot.revision
         }
@@ -2122,7 +2313,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         route: AudioRoute,
         ready: Bool,
         rendererReady: Bool = false,
-        rendererSufficient: Bool = false
+        rendererSufficient: Bool = false,
+        invalidation: AudioRenderReadinessChange = .invalidated
     ) {
         // Publishing "not ready" always clears the preroll latch, so a renderer
         // replacement or flush cannot carry the previous renderer's satisfied
@@ -2137,7 +2329,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         publicSnapshot.diagnostics.rendererSufficient = rendererSufficient
         snapshotLock.unlock()
         if clockMode == .externallyManaged, readinessChanged {
-            readinessSink?(ready ? .available : .invalidated, generation)
+            readinessSink?(ready ? .available : invalidation, generation)
         }
     }
 

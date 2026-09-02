@@ -10,6 +10,308 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VideoToolboxDecoderTests: XCTestCase {
+    func testConfigureTransitionReturnsWhileNativeQueueIsBlockedAndCompletesOnceOnExecutor() throws {
+        let harness = makeHarness()
+        let queueBlocked = expectation(description: "native submission queue blocked")
+        let transitionReturned = expectation(description: "transition call returned")
+        let releaseQueue = DispatchSemaphore(value: 0)
+        defer { releaseQueue.signal() }
+        harness.submissionQueue.async {
+            queueBlocked.fulfill()
+            releaseQueue.wait()
+        }
+        wait(for: [queueBlocked], timeout: 2)
+
+        let token = VideoDecoderTransitionToken()
+        let format = try makeFormat(codec: kCMVideoCodecType_H264)
+        harness.executor.submit {
+            harness.decoder.transition(.configure(
+                token: token,
+                format: format,
+                generation: MediaGeneration(rawValue: 41)
+            ))
+            transitionReturned.fulfill()
+        }
+
+        wait(for: [transitionReturned], timeout: 2)
+        XCTAssertTrue(harness.events.transitionCompletions.isEmpty)
+
+        releaseQueue.signal()
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.events.transitionCompletions, [
+            TransitionCompletionRecord(
+                token: token,
+                outcome: .completed
+            ),
+        ])
+        XCTAssertEqual(harness.events.transitionIsolationChecks, [true])
+    }
+
+    func testNewerInvalidateSupersedesConfigureAlreadyInsideNativeCreation() throws {
+        let harness = makeHarness()
+        let configureEnteredNativeCreation = expectation(
+            description: "configure entered native creation"
+        )
+        let releaseConfigure = DispatchSemaphore(value: 0)
+        defer { releaseConfigure.signal() }
+        harness.api.enqueueCreateInterception {
+            configureEnteredNativeCreation.fulfill()
+            releaseConfigure.wait()
+        }
+
+        let configureToken = VideoDecoderTransitionToken()
+        harness.decoder.transition(.configure(
+            token: configureToken,
+            format: try makeFormat(codec: kCMVideoCodecType_H264),
+            generation: MediaGeneration(rawValue: 46)
+        ))
+        wait(for: [configureEnteredNativeCreation], timeout: 2)
+
+        let invalidateToken = VideoDecoderTransitionToken()
+        harness.decoder.transition(.invalidate(token: invalidateToken))
+        releaseConfigure.signal()
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+            try decode(harness, id: 460, generation: 46)
+        }
+        XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
+        XCTAssertEqual(harness.events.transitionCompletions.filter {
+            $0.token == configureToken || $0.token == invalidateToken
+        }, [
+            TransitionCompletionRecord(token: configureToken, outcome: .completed),
+            TransitionCompletionRecord(token: invalidateToken, outcome: .completed),
+        ])
+    }
+
+    func testNewerConfigurePreventsSupersededCandidateFromBecomingTemporarilyActive() throws {
+        let harness = makeHarness()
+        let firstConfigureEntered = expectation(description: "first configure entered creation")
+        let secondConfigureEntered = expectation(description: "second configure entered creation")
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let releaseSecond = DispatchSemaphore(value: 0)
+        defer {
+            releaseFirst.signal()
+            releaseSecond.signal()
+        }
+        harness.api.enqueueCreateInterception {
+            firstConfigureEntered.fulfill()
+            releaseFirst.wait()
+        }
+        harness.api.enqueueCreateInterception {
+            secondConfigureEntered.fulfill()
+            releaseSecond.wait()
+        }
+
+        let firstToken = VideoDecoderTransitionToken()
+        harness.decoder.transition(.configure(
+            token: firstToken,
+            format: try makeFormat(codec: kCMVideoCodecType_H264),
+            generation: MediaGeneration(rawValue: 47)
+        ))
+        wait(for: [firstConfigureEntered], timeout: 2)
+
+        let secondToken = VideoDecoderTransitionToken()
+        harness.decoder.transition(.configure(
+            token: secondToken,
+            format: try makeFormat(codec: kCMVideoCodecType_H264),
+            generation: MediaGeneration(rawValue: 48)
+        ))
+        releaseFirst.signal()
+        wait(for: [secondConfigureEntered], timeout: 2)
+        drain(harness.executor)
+
+        let staleAccessUnit = try makeAccessUnit(
+            id: 470,
+            generation: 47,
+            isRandomAccess: true
+        )
+        assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+            try perform(on: harness.executor) {
+                try harness.decoder.decode(
+                    staleAccessUnit,
+                    flags: ._EnableAsynchronousDecompression
+                )
+            }
+        }
+
+        releaseSecond.signal()
+        harness.drainSubmissions()
+        drain(harness.executor)
+        try decode(harness, id: 480, generation: 48)
+
+        XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 2))
+        XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
+        XCTAssertEqual(harness.events.transitionCompletions.filter {
+            $0.token == firstToken || $0.token == secondToken
+        }, [
+            TransitionCompletionRecord(token: firstToken, outcome: .completed),
+            TransitionCompletionRecord(token: secondToken, outcome: .completed),
+        ])
+    }
+
+    func testProducedAndNoFrameCompletionsCarryTheConfiguredTransitionIdentityInOrder() throws {
+        let harness = makeHarness()
+        let configurationToken = VideoDecoderTransitionToken()
+        let format = try makeFormat(codec: kCMVideoCodecType_H264)
+        harness.decoder.transition(.configure(
+            token: configurationToken,
+            format: format,
+            generation: MediaGeneration(rawValue: 42)
+        ))
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        try decode(harness, id: 101, generation: 42)
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        drain(harness.executor)
+
+        try decode(harness, id: 102, generation: 42)
+        harness.api.deliver(index: 1, output: output(infoFlags: .frameDropped))
+        drain(harness.executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: MediaGeneration(rawValue: 42),
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(harness.events.identifiedOutputEvents, [
+            .frame(accessUnitID: 101, identity: identity),
+            .completed(accessUnitID: 101, identity: identity, disposition: .produced),
+            .completed(accessUnitID: 102, identity: identity, disposition: .noFrame),
+        ])
+    }
+
+    func testInvalidateTransitionImmediatelyFencesFrameAndCancelsLeaseExactlyOnce() throws {
+        let harness = makeHarness()
+        let configurationToken = VideoDecoderTransitionToken()
+        let format = try makeFormat(codec: kCMVideoCodecType_H264)
+        harness.decoder.transition(.configure(
+            token: configurationToken,
+            format: format,
+            generation: MediaGeneration(rawValue: 43)
+        ))
+        harness.drainSubmissions()
+        drain(harness.executor)
+        try decode(harness, id: 103, generation: 43)
+
+        let queueBlocked = expectation(description: "native submission queue blocked")
+        let transitionReturned = expectation(description: "invalidate transition returned")
+        let releaseQueue = DispatchSemaphore(value: 0)
+        defer { releaseQueue.signal() }
+        harness.submissionQueue.async {
+            queueBlocked.fulfill()
+            releaseQueue.wait()
+        }
+        wait(for: [queueBlocked], timeout: 2)
+
+        let invalidateToken = VideoDecoderTransitionToken()
+        harness.executor.submit {
+            harness.decoder.transition(.invalidate(token: invalidateToken))
+            transitionReturned.fulfill()
+        }
+        wait(for: [transitionReturned], timeout: 2)
+
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        drain(harness.executor)
+        let identity = VideoDecoderEventIdentity(
+            generation: MediaGeneration(rawValue: 43),
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(harness.events.identifiedOutputEvents, [
+            .completed(accessUnitID: 103, identity: identity, disposition: .cancelled),
+        ])
+        XCTAssertFalse(harness.events.transitionCompletions.contains {
+            $0.token == invalidateToken
+        })
+
+        releaseQueue.signal()
+        harness.drainSubmissions()
+        drain(harness.executor)
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.events.identifiedOutputEvents, [
+            .completed(accessUnitID: 103, identity: identity, disposition: .cancelled),
+        ])
+        XCTAssertEqual(harness.events.transitionCompletions.filter {
+            $0.token == invalidateToken
+        }, [
+            TransitionCompletionRecord(token: invalidateToken, outcome: .completed),
+        ])
+    }
+
+    func testDrainAndInvalidateTransitionReturnsWhileNativeQueueIsBlocked() throws {
+        let harness = makeHarness()
+        let configurationToken = VideoDecoderTransitionToken()
+        harness.decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(codec: kCMVideoCodecType_H264),
+            generation: MediaGeneration(rawValue: 44)
+        ))
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        let queueBlocked = expectation(description: "native submission queue blocked")
+        let transitionReturned = expectation(description: "drain transition returned")
+        let releaseQueue = DispatchSemaphore(value: 0)
+        defer { releaseQueue.signal() }
+        harness.submissionQueue.async {
+            queueBlocked.fulfill()
+            releaseQueue.wait()
+        }
+        wait(for: [queueBlocked], timeout: 2)
+
+        let token = VideoDecoderTransitionToken()
+        harness.executor.submit {
+            harness.decoder.transition(.drainAndInvalidate(token: token))
+            transitionReturned.fulfill()
+        }
+        wait(for: [transitionReturned], timeout: 2)
+        XCTAssertFalse(harness.events.transitionCompletions.contains { $0.token == token })
+
+        releaseQueue.signal()
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.api.snapshot.finishedSessionIDs, [VTSessionID(rawValue: 1)])
+        XCTAssertEqual(harness.api.snapshot.waitedSessionIDs, [VTSessionID(rawValue: 1)])
+        XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
+        XCTAssertEqual(harness.events.transitionCompletions.filter { $0.token == token }, [
+            TransitionCompletionRecord(token: token, outcome: .completed),
+        ])
+    }
+
+    func testDrainAndInvalidateBestEffortInvalidatesAfterFinishAndWaitFailures() throws {
+        let harness = makeHarness()
+        harness.decoder.transition(.configure(
+            token: VideoDecoderTransitionToken(),
+            format: try makeFormat(codec: kCMVideoCodecType_H264),
+            generation: MediaGeneration(rawValue: 45)
+        ))
+        harness.drainSubmissions()
+        drain(harness.executor)
+        harness.api.enqueueFinishStatus(kVTVideoDecoderMalfunctionErr)
+        harness.api.enqueueWaitStatus(kVTInvalidSessionErr)
+
+        let token = VideoDecoderTransitionToken()
+        harness.decoder.transition(.drainAndInvalidate(token: token))
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.api.snapshot.operations.suffix(3), [
+            "finish", "wait", "invalidate",
+        ])
+        XCTAssertEqual(harness.events.transitionCompletions.filter { $0.token == token }, [
+            TransitionCompletionRecord(
+                token: token,
+                outcome: .failed(.malfunction(kVTVideoDecoderMalfunctionErr))
+            ),
+        ])
+    }
+
     func testDecoderOutputPoolFloorShrinksForFourKP010Memory() {
         XCTAssertEqual(
             PlaybackTuning.default.decoderOutputPoolFloor(
@@ -153,29 +455,25 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.api.snapshot.decodes.count, 1)
     }
 
-    func testUnsupportedCodecFailsBeforeAPIAndPreservesActiveSession() throws {
+    func testUnsupportedCodecPermanentlyFencesAndInvalidatesActiveSession() throws {
         let harness = makeHarness()
         try configure(harness, generation: 1)
         let unsupported = try makeFormat(codec: kCMVideoCodecType_JPEG)
 
         assertFailure(.sessionCreate(kVTVideoDecoderUnsupportedDataFormatErr)) {
-            try perform(on: harness.executor) {
-                try harness.decoder.configure(
-                    format: unsupported,
-                    generation: MediaGeneration(rawValue: 2)
-                )
-            }
+            try configure(harness, format: unsupported, generation: 2)
         }
 
         XCTAssertEqual(
             harness.api.snapshot.operations,
-            ["create", "copy", "set", "set", "set", "copy"]
+            ["create", "copy", "set", "set", "set", "copy", "invalidate"]
         )
-        try decode(harness, id: 11, generation: 1)
-        XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
+        assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+            try decode(harness, id: 11, generation: 1)
+        }
     }
 
-    func testCandidateCreateSetAndCopyFailuresInvalidateOnlyCandidateAndPreserveOld() throws {
+    func testCandidateCreateSetAndCopyFailuresInvalidateCandidateAndFencedOldSession() throws {
         struct Scenario {
             let arrange: (FakeVideoToolboxAPI) -> Void
             let expected: VideoDecoderFailure
@@ -205,13 +503,17 @@ final class VideoToolboxDecoderTests: XCTestCase {
                 try configure(harness, generation: 8)
             }
 
-            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 2)])
-            try decode(harness, id: 99, generation: 7)
-            XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
+            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [
+                VTSessionID(rawValue: 2),
+                VTSessionID(rawValue: 1),
+            ])
+            assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+                try decode(harness, id: 99, generation: 7)
+            }
         }
     }
 
-    func testFalseMissingAndWrongTypeHardwarePropertiesRejectCandidateAndPreserveOld() throws {
+    func testFalseMissingAndWrongTypeHardwarePropertiesFenceOldSession() throws {
         let rejectedValues: [VTPropertyValue?] = [
             .boolean(false),
             nil,
@@ -229,9 +531,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
                 try configure(harness, generation: 6)
             }
 
-            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 2)])
-            try decode(harness, id: 12, generation: 5)
-            XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
+            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [
+                VTSessionID(rawValue: 2),
+                VTSessionID(rawValue: 1),
+            ])
+            assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+                try decode(harness, id: 12, generation: 5)
+            }
         }
     }
 
@@ -246,7 +552,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 2))
     }
 
-    func testCreateAndHardwareFailuresRemainBaseFailuresAndPreserveOldSession() throws {
+    func testCreateAndHardwareFailuresRemainBaseFailuresAndFenceOldSession() throws {
         typealias Scenario = (
             expected: VideoDecoderFailure,
             arrange: (FakeVideoToolboxAPI) -> Void
@@ -277,9 +583,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
                 try configure(harness, generation: 8)
             }
 
-            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 2)])
-            try decode(harness, id: 100, generation: 7)
-            XCTAssertEqual(harness.api.snapshot.decodes.last?.sessionID, VTSessionID(rawValue: 1))
+            XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [
+                VTSessionID(rawValue: 2),
+                VTSessionID(rawValue: 1),
+            ])
+            assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+                try decode(harness, id: 100, generation: 7)
+            }
         }
     }
 
@@ -290,7 +600,9 @@ final class VideoToolboxDecoderTests: XCTestCase {
             rawValue: 0x4000 | VTDecodeFrameFlags._EnableTemporalProcessing.rawValue
         )
 
-        try decode(harness, id: 1, generation: 8, flags: callerFlags)
+        assertFailure(.sessionCreate(kVTInvalidSessionErr)) {
+            try decode(harness, id: 1, generation: 8, flags: callerFlags)
+        }
         XCTAssertTrue(harness.api.snapshot.decodes.isEmpty)
 
         try decode(harness, id: 2, generation: 9, flags: callerFlags)
@@ -355,7 +667,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         harness.api.deliver(index: 2, output: output(status: noErr, imageBuffer: try makePixelBuffer()))
 
         try decode(harness, id: 3, generation: 4)
-        try perform(on: harness.executor) { harness.decoder.invalidate() }
+        try invalidate(harness)
         harness.api.deliver(index: 3, output: output(status: noErr, imageBuffer: try makePixelBuffer()))
         drain(harness.executor)
 
@@ -513,40 +825,13 @@ final class VideoToolboxDecoderTests: XCTestCase {
         )
     }
 
-    func testFinishAndWaitStatusesThrowWithoutEventsAndSuccessCallsActiveSession() throws {
-        let harness = makeHarness()
-        try configure(harness, generation: 5)
-        harness.api.enqueueFinishStatus(-31_001)
-        harness.api.enqueueWaitStatus(kVTVideoDecoderMalfunctionErr)
-
-        assertFailure(.malfunction(-31_001)) {
-            try perform(on: harness.executor) { try harness.decoder.finishDelayedFrames() }
-        }
-        assertFailure(.malfunction(kVTVideoDecoderMalfunctionErr)) {
-            try perform(on: harness.executor) { try harness.decoder.waitForAsynchronousFrames() }
-        }
-        try perform(on: harness.executor) { try harness.decoder.finishDelayedFrames() }
-        try perform(on: harness.executor) { try harness.decoder.waitForAsynchronousFrames() }
-
-        XCTAssertEqual(harness.api.snapshot.finishedSessionIDs, [
-            VTSessionID(rawValue: 1), VTSessionID(rawValue: 1),
-        ])
-        XCTAssertEqual(harness.api.snapshot.waitedSessionIDs, [
-            VTSessionID(rawValue: 1), VTSessionID(rawValue: 1),
-        ])
-        XCTAssertTrue(harness.events.events.isEmpty)
-    }
-
     func testInvalidateClearsBeforeAPICallAndIsIdempotent() throws {
         let harness = makeHarness()
         try configure(harness, generation: 1)
         try decode(harness, id: 1, generation: 1)
 
-        try perform(on: harness.executor) {
-            harness.decoder.invalidate()
-            harness.decoder.invalidate()
-        }
-        drain(harness.executor)
+        try invalidate(harness)
+        try invalidate(harness)
 
         XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
         XCTAssertTrue(harness.events.frames.isEmpty)
@@ -880,12 +1165,50 @@ final class VideoToolboxDecoderTests: XCTestCase {
         generation: UInt64,
         codec: CMVideoCodecType = kCMVideoCodecType_H264
     ) throws {
-        let format = try makeFormat(codec: codec)
+        try configure(
+            harness,
+            format: makeFormat(codec: codec),
+            generation: generation
+        )
+    }
+
+    private func configure(
+        _ harness: DecoderHarness,
+        format: CMVideoFormatDescription,
+        generation: UInt64
+    ) throws {
+        let token = VideoDecoderTransitionToken()
         try perform(on: harness.executor) {
-            try harness.decoder.configure(
+            harness.decoder.transition(.configure(
+                token: token,
                 format: format,
                 generation: MediaGeneration(rawValue: generation)
-            )
+            ))
+        }
+        harness.drainSubmissions()
+        drain(harness.executor)
+        guard let outcome = harness.events.takeTransitionOutcome(token: token) else {
+            XCTFail("missing configure transition completion")
+            return
+        }
+        if case let .failed(failure) = outcome {
+            throw failure
+        }
+    }
+
+    private func invalidate(_ harness: DecoderHarness) throws {
+        let token = VideoDecoderTransitionToken()
+        try perform(on: harness.executor) {
+            harness.decoder.transition(.invalidate(token: token))
+        }
+        harness.drainSubmissions()
+        drain(harness.executor)
+        guard let outcome = harness.events.takeTransitionOutcome(token: token) else {
+            XCTFail("missing invalidate transition completion")
+            return
+        }
+        if case let .failed(failure) = outcome {
+            throw failure
         }
     }
 
@@ -1134,6 +1457,20 @@ private struct CompletionRecord: Sendable, Hashable {
     let generation: MediaGeneration
 }
 
+private struct TransitionCompletionRecord: Sendable, Equatable {
+    let token: VideoDecoderTransitionToken
+    let outcome: VideoDecoderTransitionOutcome
+}
+
+private enum IdentifiedDecoderOutputEvent: Sendable, Equatable {
+    case frame(accessUnitID: UInt64, identity: VideoDecoderEventIdentity)
+    case completed(
+        accessUnitID: UInt64,
+        identity: VideoDecoderEventIdentity,
+        disposition: VideoDecoderSubmissionDisposition
+    )
+}
+
 private final class DecoderEventRecorder: @unchecked Sendable {
     private let executor: PlaybackSerialExecutor
     private let lock = NSLock()
@@ -1157,6 +1494,22 @@ private final class DecoderEventRecorder: @unchecked Sendable {
         return storedEvents
     }
 
+    func takeTransitionOutcome(
+        token: VideoDecoderTransitionToken
+    ) -> VideoDecoderTransitionOutcome? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = storedEvents.firstIndex(where: { event in
+            guard case let .transitionCompleted(eventToken, _) = event else { return false }
+            return eventToken == token
+        }),
+        case let .transitionCompleted(_, outcome) = storedEvents.remove(at: index) else {
+            return nil
+        }
+        storedIsolationChecks.remove(at: index)
+        return outcome
+    }
+
     var isolationChecks: [Bool] {
         lock.lock()
         defer { lock.unlock() }
@@ -1165,7 +1518,7 @@ private final class DecoderEventRecorder: @unchecked Sendable {
 
     var frames: [DecodedVideoFrame] {
         events.compactMap { event in
-            guard case let .frame(frame) = event else { return nil }
+            guard case let .frame(frame, _) = event else { return nil }
             return frame
         }
     }
@@ -1173,24 +1526,24 @@ private final class DecoderEventRecorder: @unchecked Sendable {
     var failures: [FailureRecord] {
         events.compactMap { event in
             switch event {
-            case .frame, .submissionCompleted:
+            case .frame, .submissionCompleted, .transitionCompleted:
                 return nil
-            case let .recoverableFailure(failure, generation):
+            case let .recoverableFailure(failure, identity):
                 return FailureRecord(
                     failure: failure,
-                    generation: generation,
+                    generation: identity.generation,
                     disposition: .recoverable
                 )
-            case let .fatalFailure(failure, generation):
+            case let .fatalFailure(failure, identity):
                 return FailureRecord(
                     failure: failure,
-                    generation: generation,
+                    generation: identity.generation,
                     disposition: .fatal
                 )
-            case let .submissionFailure(failure, generation):
+            case let .submissionFailure(_, failure, identity):
                 return FailureRecord(
                     failure: failure,
-                    generation: generation,
+                    generation: identity.generation,
                     disposition: .submission
                 )
             }
@@ -1199,10 +1552,50 @@ private final class DecoderEventRecorder: @unchecked Sendable {
 
     var completions: [CompletionRecord] {
         events.compactMap { event in
-            guard case let .submissionCompleted(accessUnitID, generation) = event else {
+            guard case let .submissionCompleted(accessUnitID, identity, _) = event else {
                 return nil
             }
-            return CompletionRecord(accessUnitID: accessUnitID, generation: generation)
+            return CompletionRecord(
+                accessUnitID: accessUnitID,
+                generation: identity.generation
+            )
+        }
+    }
+
+    var transitionCompletions: [TransitionCompletionRecord] {
+        events.compactMap { event in
+            guard case let .transitionCompleted(token, outcome) = event else { return nil }
+            return TransitionCompletionRecord(token: token, outcome: outcome)
+        }
+    }
+
+    var transitionIsolationChecks: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return zip(storedEvents, storedIsolationChecks).compactMap { event, isIsolated in
+            guard case .transitionCompleted = event else { return nil }
+            return isIsolated
+        }
+    }
+
+
+    var identifiedOutputEvents: [IdentifiedDecoderOutputEvent] {
+        events.compactMap { event in
+            switch event {
+            case let .frame(frame, identity):
+                return .frame(accessUnitID: frame.accessUnitID, identity: identity)
+            case let .submissionCompleted(accessUnitID, identity, disposition):
+                return .completed(
+                    accessUnitID: accessUnitID,
+                    identity: identity,
+                    disposition: disposition
+                )
+            case .recoverableFailure,
+                 .fatalFailure,
+                 .submissionFailure,
+                 .transitionCompleted:
+                return nil
+            }
         }
     }
 }

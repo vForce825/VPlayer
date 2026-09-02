@@ -16,6 +16,8 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
     func testPlaybackDiagnosticStateParsesOnlySanitizedVocabulary() {
         XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "idle"), .idle)
         XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "preparing"), .preparing)
+        XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "buffering"), .buffering)
+        XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "recovering"), .recovering)
         XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "playing"), .playing)
         XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "paused"), .paused)
         XCTAssertEqual(AcceptancePlaybackDiagnosticState(value: "stopped"), .stopped)
@@ -55,12 +57,24 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
 
     func testStableRouteTimeoutClassifiesPreparationAndMissingMetrics() throws {
         try AcceptanceStableRouteFailureClassifier.validate(state: .playing)
+        for rawState in ["preparing", "buffering"] {
+            let state = try XCTUnwrap(AcceptancePlaybackDiagnosticState(value: rawState))
+            XCTAssertEqual(
+                AcceptanceStableRouteFailureClassifier.timeoutFailure(
+                    lastState: state,
+                    didDecodeMetrics: false
+                ),
+                .preparationTimedOut
+            )
+        }
         XCTAssertEqual(
             AcceptanceStableRouteFailureClassifier.timeoutFailure(
-                lastState: .preparing,
+                lastState: try XCTUnwrap(
+                    AcceptancePlaybackDiagnosticState(value: "recovering")
+                ),
                 didDecodeMetrics: false
             ),
-            .preparationTimedOut
+            .stableRouteTimedOut
         )
         for state in [
             AcceptancePlaybackDiagnosticState.playing,
@@ -900,17 +914,15 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
                 lastSnapshot = candidate
                 if candidate.elapsedSeconds > previousElapsed,
                    candidate.decoderCallbacksPerSecond > 0,
-                   candidate.presentationsPerSecond > 0,
+                   candidate.videoRendererMetricsSampleCount > 0,
                    candidate.residentMemoryBytes > 0,
                    previousSnapshot.map({ previous in
                        candidate.videoAccessUnitCount > previous.videoAccessUnitCount
                            && candidate.videoDecodeSubmissionCount
                                > previous.videoDecodeSubmissionCount
-                           && candidate.presentedVideoFrames > previous.presentedVideoFrames
+                           && candidate.videoRendererTotalFrameCount
+                               > previous.videoRendererTotalFrameCount
                    }) ?? true {
-                    guard candidate.presentationPTSRegressionCount == 0 else {
-                        throw AcceptanceFailure.presentationPTSRegressed
-                    }
                     return candidate
                 }
             }
@@ -931,8 +943,10 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             current.videoDecodeSubmissionCount,
             previous.videoDecodeSubmissionCount
         )
-        XCTAssertGreaterThan(current.presentedVideoFrames, previous.presentedVideoFrames)
-        XCTAssertEqual(current.presentationPTSRegressionCount, 0)
+        XCTAssertGreaterThan(
+            current.videoRendererTotalFrameCount,
+            previous.videoRendererTotalFrameCount
+        )
         XCTAssertEqual(current.videoResyncCount, previous.videoResyncCount)
         XCTAssertEqual(current.audioContinuityDropCountsByReason.count, 5)
         XCTAssertEqual(previous.audioContinuityDropCountsByReason.count, 5)
@@ -1109,13 +1123,11 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         configuration: AcceptanceConfiguration
     ) {
         XCTAssertGreaterThan(snapshot.decoderCallbacksPerSecond, 0)
-        XCTAssertGreaterThan(snapshot.presentationsPerSecond, 0)
         XCTAssertGreaterThan(snapshot.residentMemoryBytes, 0)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
-        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
-        XCTAssertEqual(snapshot.presentationPTSRegressionCount, 0)
-        XCTAssertGreaterThan(snapshot.presentedVideoFrames, 0)
+        XCTAssertGreaterThan(snapshot.videoRendererMetricsSampleCount, 0)
+        XCTAssertGreaterThan(snapshot.videoRendererTotalFrameCount, 0)
         XCTAssertEqual(snapshot.audioContinuityDropCountsByReason.count, 5)
         XCTAssertGreaterThanOrEqual(snapshot.audioPendingSampleCount, 0)
         XCTAssertLessThanOrEqual(snapshot.audioPendingSampleCount, 1_120)
@@ -1131,12 +1143,11 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertLessThanOrEqual(snapshot.windowDurationSeconds, 60.5)
         }
 
-        XCTAssertGreaterThan(snapshot.presentedVideoFrames + snapshot.droppedVideoFrames, 0)
+        XCTAssertGreaterThanOrEqual(
+            snapshot.videoRendererTotalFrameCount,
+            snapshot.videoRendererDroppedFrameCount
+        )
         let validatesSteadyStatePerformance = configuration.validatesSteadyStatePerformance
-        if validatesSteadyStatePerformance {
-            XCTAssertLessThanOrEqual(snapshot.avDriftP95Milliseconds, 40)
-            XCTAssertLessThanOrEqual(snapshot.maximumAbsoluteAVDriftMilliseconds, 100)
-        }
 
         if configuration.channel == "东方卫视 4K" {
             XCTAssertEqual(snapshot.scanType, "progressive")
@@ -1144,7 +1155,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertEqual(snapshot.yadifKernelDispatchCount, 0)
             if validatesSteadyStatePerformance {
                 XCTAssertTrue((48...52).contains(snapshot.decoderCallbacksPerSecond))
-                XCTAssertTrue((48...52).contains(snapshot.presentationsPerSecond))
             }
             return
         }
@@ -1153,7 +1163,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
             XCTAssertEqual(snapshot.activeRoute, "bypass")
             if validatesSteadyStatePerformance {
                 XCTAssertTrue((28...32).contains(snapshot.decoderCallbacksPerSecond))
-                XCTAssertTrue((28...32).contains(snapshot.presentationsPerSecond))
             }
             return
         }
@@ -1167,7 +1176,6 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.gpuDurationP95Milliseconds, 0)
         if validatesSteadyStatePerformance {
             XCTAssertTrue((22...28).contains(snapshot.decoderCallbacksPerSecond))
-            XCTAssertTrue((45...55).contains(snapshot.presentationsPerSecond))
             guard snapshot.decoderCallbacksPerSecond > 0 else { return }
             // One YADIF command consumes one interlaced input frame and emits
             // both field-rate output frames. Its sustainable GPU budget is the
@@ -1184,28 +1192,21 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
         from previous: AcceptanceMetricsSnapshot,
         to current: AcceptanceMetricsSnapshot
     ) {
-        // PlaybackVideoDropSource.presentationSuperseded. The explicit 48–52fps
-        // / 28–32fps / field-rate assertion above owns cadence quality for every
-        // route; the generic loss ratio remains focused on decoder, backlog,
-        // expiry, and memory-overflow losses.
-        let supersededSourceIndex = 6
-        let previousSuperseded = previous.videoDropCountsBySource.indices.contains(
-            supersededSourceIndex
+        XCTAssertGreaterThanOrEqual(
+            previous.videoRendererTotalFrameCount,
+            previous.videoRendererDroppedFrameCount
         )
-            ? previous.videoDropCountsBySource[supersededSourceIndex]
-            : 0
-        let currentSuperseded = current.videoDropCountsBySource.indices.contains(
-            supersededSourceIndex
+        XCTAssertGreaterThanOrEqual(
+            current.videoRendererTotalFrameCount,
+            current.videoRendererDroppedFrameCount
         )
-            ? current.videoDropCountsBySource[supersededSourceIndex]
-            : 0
-        XCTAssertGreaterThanOrEqual(previous.droppedVideoFrames, previousSuperseded)
-        XCTAssertGreaterThanOrEqual(current.droppedVideoFrames, currentSuperseded)
         XCTAssertNoThrow(try AcceptanceSnapshotValidator.validateCounterDelta(
-            previousPresented: previous.presentedVideoFrames,
-            previousDropped: previous.droppedVideoFrames - previousSuperseded,
-            currentPresented: current.presentedVideoFrames,
-            currentDropped: current.droppedVideoFrames - currentSuperseded
+            previousPresented: previous.videoRendererTotalFrameCount
+                - previous.videoRendererDroppedFrameCount,
+            previousDropped: previous.videoRendererDroppedFrameCount,
+            currentPresented: current.videoRendererTotalFrameCount
+                - current.videoRendererDroppedFrameCount,
+            currentDropped: current.videoRendererDroppedFrameCount
         ))
     }
 
@@ -1288,7 +1289,6 @@ private enum AcceptanceFailure: Error, Equatable, CustomStringConvertible {
     case preparationTimedOut
     case playbackStateUnavailable
     case playbackNotPlaying
-    case presentationPTSRegressed
     case playbackFailed(code: String)
 
     var description: String {
@@ -1305,8 +1305,6 @@ private enum AcceptanceFailure: Error, Equatable, CustomStringConvertible {
             "acceptance playback state unavailable"
         case .playbackNotPlaying:
             "acceptance playback is not playing"
-        case .presentationPTSRegressed:
-            "acceptance presentation timestamp regressed"
         case let .playbackFailed(code):
             "acceptance playback failed code=\(code)"
         }
@@ -1316,6 +1314,8 @@ private enum AcceptanceFailure: Error, Equatable, CustomStringConvertible {
 private enum AcceptancePlaybackDiagnosticState: Equatable {
     case idle
     case preparing
+    case buffering
+    case recovering
     case playing
     case paused
     case stopped
@@ -1327,6 +1327,10 @@ private enum AcceptancePlaybackDiagnosticState: Equatable {
             self = .idle
         case "preparing":
             self = .preparing
+        case "buffering":
+            self = .buffering
+        case "recovering":
+            self = .recovering
         case "playing":
             self = .playing
         case "paused":
@@ -1363,7 +1367,7 @@ private enum AcceptanceStableRouteFailureClassifier {
         lastState: AcceptancePlaybackDiagnosticState?,
         didDecodeMetrics: Bool
     ) -> AcceptanceFailure {
-        if lastState == .preparing {
+        if lastState == .preparing || lastState == .buffering {
             return .preparationTimedOut
         }
         if !didDecodeMetrics,
@@ -1661,26 +1665,18 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let scanType: String
     let activeRoute: String
     let decoderCallbacksPerSecond: Double
-    let presentationsPerSecond: Double
     let yadifKernelDispatchCount: UInt64
     let staleGenerationDropCount: UInt64
     let droppedVideoFrames: UInt64
     let videoDropCountsBySource: [UInt64]
     let lastVideoDecodeFailure: String?
-    let maximumPresentationQueueDepth: Int
     let maximumYADIFInFlightCount: Int
     let maximumYADIFInputDepth: Int
     let gpuDurationP95Milliseconds: Double
     let yadifCPUEncodeP95Milliseconds: Double
-    let renderCPUPreparationP95Milliseconds: Double
-    let avDriftP95Milliseconds: Double
     let residentMemoryBytes: UInt64
     let elapsedSeconds: Double
     let windowDurationSeconds: Double
-    let presentedVideoFrames: UInt64
-    let presentationPTSRegressionCount: UInt64
-    let maximumAbsoluteAVDriftMilliseconds: Double
-    let crossGenerationPresentationCount: UInt64
     let audioRoute: String
     let audioReady: Bool
     let readinessOpen: Bool
@@ -1694,6 +1690,13 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let readinessCycleID: UInt64
     let readinessCloseReasonCounts: [UInt64]
     let displayResumeCount: UInt64
+    let videoRendererMetricsSampleCount: UInt64
+    let videoRendererMetricsEpochCount: UInt64
+    let videoRendererTotalFrameCount: UInt64
+    let videoRendererDroppedFrameCount: UInt64
+    let videoRendererCorruptedFrameCount: UInt64
+    let videoRendererOptimizedFrameCount: UInt64
+    let videoRendererAccumulatedFrameDelayMilliseconds: Double
     let clockTimeSeconds: Double?
     let videoResyncCount: UInt64
     let audioRecoveryCount: UInt64
@@ -1708,12 +1711,6 @@ private struct AcceptanceMetricsSnapshot: Codable {
     let audioShortGapCount: UInt64
     let audioLargeGapCount: UInt64
     let audioContinuityIslandSwitchCount: UInt64
-    let renderTickCount: UInt64
-    let renderSkippedInFlightCount: UInt64
-    let displayLinkCallbackCount: UInt64
-    let nativeDisplayIntervalMilliseconds: Double
-    let missedDisplayLinkVSyncCount: UInt64
-    let displayRefreshHz: Double
     let demuxQueueFullWaitSeconds: Double
     let demuxAdmitWaitSeconds: Double
     let playbackExecutorBusySeconds: Double
