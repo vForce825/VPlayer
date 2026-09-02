@@ -12,6 +12,14 @@ enum VideoRendererBackendEvent: @unchecked Sendable {
     case requiresFlushToResumeDecoding
 }
 
+struct VideoRendererPerformanceSnapshot: Sendable, Equatable {
+    let totalFrameCount: UInt64
+    let droppedFrameCount: UInt64
+    let corruptedFrameCount: UInt64
+    let optimizedFrameCount: UInt64
+    let accumulatedFrameDelaySeconds: Double
+}
+
 protocol SampleBufferVideoRenderingBackend: AnyObject, Sendable {
     var isReadyForMoreMediaData: Bool { get }
     var status: AVQueuedSampleBufferRenderingStatus { get }
@@ -27,6 +35,9 @@ protocol SampleBufferVideoRenderingBackend: AnyObject, Sendable {
     func flush(
         removeDisplayedImage: Bool,
         completion: @escaping @Sendable () -> Void
+    )
+    func loadPerformanceMetrics(
+        completion: @escaping @Sendable (VideoRendererPerformanceSnapshot?) -> Void
     )
     func startObserving(_ handler: @escaping @Sendable (VideoRendererBackendEvent) -> Void)
     func stopObserving()
@@ -79,6 +90,32 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
             removingDisplayedImage: removeDisplayedImage,
             completionHandler: completion
         )
+    }
+
+    func loadPerformanceMetrics(
+        completion: @escaping @Sendable (VideoRendererPerformanceSnapshot?) -> Void
+    ) {
+        renderer.loadVideoPerformanceMetrics { metrics in
+            guard let metrics,
+                  metrics.totalNumberOfFrames >= 0,
+                  metrics.numberOfDroppedFrames >= 0,
+                  metrics.numberOfCorruptedFrames >= 0,
+                  metrics.numberOfFramesDisplayedUsingOptimizedCompositing >= 0,
+                  metrics.totalAccumulatedFrameDelay.isFinite,
+                  metrics.totalAccumulatedFrameDelay >= 0 else {
+                completion(nil)
+                return
+            }
+            completion(VideoRendererPerformanceSnapshot(
+                totalFrameCount: UInt64(metrics.totalNumberOfFrames),
+                droppedFrameCount: UInt64(metrics.numberOfDroppedFrames),
+                corruptedFrameCount: UInt64(metrics.numberOfCorruptedFrames),
+                optimizedFrameCount: UInt64(
+                    metrics.numberOfFramesDisplayedUsingOptimizedCompositing
+                ),
+                accumulatedFrameDelaySeconds: metrics.totalAccumulatedFrameDelay
+            ))
+        }
     }
 
     func startObserving(_ handler: @escaping @Sendable (VideoRendererBackendEvent) -> Void) {

@@ -119,8 +119,9 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     public let requiredInputFrameCount = 3
 
     private typealias Completion = @Sendable (
-        Result<[VideoPresentationFrame], PlaybackFailure>
+        VideoProcessingResult
     ) -> Void
+    private typealias DrainCompletion = @Sendable () -> Void
 
     private struct InputKey: Hashable, Sendable {
         let generation: MediaGeneration
@@ -139,6 +140,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         let completion: Completion
         let firstSequenceNumber: UInt64
         let epoch: UInt64
+        let lifecycleID: UInt64
     }
 
     private struct InFlightJob: @unchecked Sendable {
@@ -159,14 +161,22 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         var staleGenerationDrops: UInt64 = 0
     }
 
+    private struct DrainBarrier: @unchecked Sendable {
+        let cutoffLifecycleID: UInt64
+        let completion: DrainCompletion
+    }
+
     private enum UserAction: @unchecked Sendable {
-        case complete(Completion, Result<[VideoPresentationFrame], PlaybackFailure>)
+        case complete(Completion, VideoProcessingResult)
+        case completeDrain(DrainCompletion)
         case drop(@Sendable (YADIFDropEvent) -> Void, YADIFDropEvent)
 
         func perform() {
             switch self {
             case let .complete(completion, result):
                 completion(result)
+            case let .completeDrain(completion):
+                completion()
             case let .drop(sink, event):
                 sink(event)
             }
@@ -196,12 +206,16 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private var readyJobs: [ReadyJob] = []
     private var submissionAttempts: [UInt64: SubmissionAttempt] = [:]
     private var inFlightJobs: [UInt64: InFlightJob] = [:]
+    private var commandSubmissionsInProgress: [UInt64: UInt64] = [:]
     private var nextInFlightIdentifier: UInt64 = 1
+    private var nextLifecycleID: UInt64 = 1
     private var nextSequenceNumber: UInt64 = 1
     private var counters = Counters()
     private var isDraining = false
-    private var drainBarriers: [Completion] = []
+    private var drainBarriers: [DrainBarrier] = []
     private var schedulerIsRunning = false
+    private var pendingUserActions: [UserAction] = []
+    private var userActionPumpIsRunning = false
 
     public convenience init(
         device: any MTLDevice,
@@ -308,8 +322,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         lock.lock()
         maximumPendingFrames = count
         enforcePendingBoundLocked(actions: &actions)
+        finishDrainIfPossibleLocked(actions: &actions)
+        enqueueUserActionsLocked(actions)
         lock.unlock()
-        perform(actions)
+        driveUserActions()
         driveScheduler()
     }
 
@@ -317,21 +333,20 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         var actions: [UserAction] = []
         lock.lock()
         resetLocked(to: generation, actions: &actions)
+        enqueueUserActionsLocked(actions)
         lock.unlock()
-        perform(actions)
+        driveUserActions()
         driveScheduler()
     }
 
     public func submit(
         _ frame: DecodedVideoFrame,
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
     ) {
         guard frame.presentationTimeStamp.isNumeric,
               frame.duration.isNumeric,
               CMTimeCompare(frame.duration, .zero) > 0 else {
-            completion(.failure(Self.invalidTimingFailure))
+            enqueueAndDrive(.complete(completion, .transientDrop(.invalidTiming)))
             return
         }
         let fieldDuration = CMTimeMultiplyByRatio(
@@ -341,7 +356,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         )
         guard fieldDuration.isNumeric,
               CMTimeCompare(fieldDuration, .zero) > 0 else {
-            completion(.failure(Self.invalidTimingFailure))
+            enqueueAndDrive(.complete(completion, .transientDrop(.invalidTiming)))
             return
         }
         let order: ResolvedFieldOrder
@@ -380,18 +395,16 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         normalized frame: NormalizedDecodedFrame,
         order: ResolvedFieldOrder,
         discontinuity: Bool = false,
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
     ) {
         var actions: [UserAction] = []
         lock.lock()
         if isDraining {
-            actions.append(.complete(completion, .success([])))
+            actions.append(.complete(completion, .cancelled(.draining)))
         } else if frame.frame.generation < generation {
             counters.staleGenerationDrops &+= 1
             metrics?.recordStaleGenerationDrop()
-            actions.append(.complete(completion, .success([])))
+            actions.append(.complete(completion, .cancelled(.staleGeneration)))
         } else {
             if frame.frame.generation > generation {
                 resetLocked(to: frame.frame.generation, actions: &actions)
@@ -407,26 +420,29 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             finishDrainIfPossibleLocked(actions: &actions)
         }
         recordDepthsLocked()
+        enqueueUserActionsLocked(actions)
         lock.unlock()
-        perform(actions)
+        driveUserActions()
         driveScheduler()
     }
 
     public func drain(
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
+        completion: @escaping @Sendable () -> Void
     ) {
         var actions: [UserAction] = []
         lock.lock()
         isDraining = true
-        drainBarriers.append(completion)
         consumeLocked(window.drain(), actions: &actions)
         enforcePendingBoundLocked(actions: &actions)
+        drainBarriers.append(DrainBarrier(
+            cutoffLifecycleID: nextLifecycleID &- 1,
+            completion: completion
+        ))
         finishDrainIfPossibleLocked(actions: &actions)
         recordDepthsLocked()
+        enqueueUserActionsLocked(actions)
         lock.unlock()
-        perform(actions)
+        driveUserActions()
         driveScheduler()
     }
 
@@ -450,7 +466,9 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     }
 
     private var occupiedSubmissionSlotCountLocked: Int {
-        inFlightJobs.count + submissionAttempts.count
+        let committedOrSubmitting = Set(inFlightJobs.keys)
+            .union(commandSubmissionsInProgress.keys)
+        return submissionAttempts.count + committedOrSubmitting.count
     }
 
     private func isCurrentLocked(_ ready: ReadyJob) -> Bool {
@@ -464,7 +482,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     ) {
         for discarded in transition.discarded {
             if let completion = popPendingCompletionLocked(for: discarded) {
-                actions.append(.complete(completion, .success([])))
+                actions.append(.complete(
+                    completion,
+                    .cancelled(.referenceWindowDiscard)
+                ))
             }
         }
         guard let job = transition.job,
@@ -473,11 +494,14 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         }
         let firstSequence = nextSequenceNumber
         nextSequenceNumber &+= 2
+        let lifecycleID = nextLifecycleID
+        nextLifecycleID &+= 1
         readyJobs.append(ReadyJob(
             job: job,
             completion: completion,
             firstSequenceNumber: firstSequence,
-            epoch: segmentEpoch
+            epoch: segmentEpoch,
+            lifecycleID: lifecycleID
         ))
     }
 
@@ -524,8 +548,9 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             enforcePendingBoundLocked(actions: &actions)
             finishDrainIfPossibleLocked(actions: &actions)
             schedulerIsRunning = false
+            enqueueUserActionsLocked(actions)
             lock.unlock()
-            perform(actions)
+            driveUserActions()
             return
         }
     }
@@ -538,9 +563,11 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         }
         lock.unlock()
 
-        let outputs: (first: CVPixelBuffer, second: CVPixelBuffer)
+        var allocatedOutputs: (first: CVPixelBuffer, second: CVPixelBuffer)?
         do {
-            outputs = try outputAllocator(selected.ready.job.current.frame.pixelBuffer)
+            allocatedOutputs = try outputAllocator(
+                selected.ready.job.current.frame.pixelBuffer
+            )
         } catch let failure {
             var actions: [UserAction] = []
             lock.lock()
@@ -548,26 +575,39 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
                attempt.completionIsOpen {
                 actions.append(.complete(
                     attempt.ready.completion,
-                    .failure(Self.playbackFailure(for: failure))
+                    Self.processingResult(for: failure)
                 ))
             }
             finishDrainIfPossibleLocked(actions: &actions)
+            enqueueUserActionsLocked(actions)
             lock.unlock()
-            perform(actions)
+            driveUserActions()
             return
         }
 
         lock.lock()
-        guard let attempt = submissionAttempts.removeValue(forKey: identifier) else {
+        guard let attempt = submissionAttempts[identifier] else {
             lock.unlock()
             return
         }
         guard attempt.completionIsOpen,
               isCurrentLocked(attempt.ready) else {
-            var actions: [UserAction] = []
-            finishDrainIfPossibleLocked(actions: &actions)
             lock.unlock()
-            perform(actions)
+            // Keep the attempt registered as a retirement gate until the
+            // allocator-owned surfaces have actually left this processor.
+            allocatedOutputs = nil
+            var actions: [UserAction] = []
+            lock.lock()
+            _ = submissionAttempts.removeValue(forKey: identifier)
+            finishDrainIfPossibleLocked(actions: &actions)
+            enqueueUserActionsLocked(actions)
+            lock.unlock()
+            driveUserActions()
+            return
+        }
+        _ = submissionAttempts.removeValue(forKey: identifier)
+        guard allocatedOutputs != nil else {
+            lock.unlock()
             return
         }
         let signpostLifetime = PlaybackSignpostLifetime(
@@ -579,9 +619,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         )
         inFlightJobs[identifier] = InFlightJob(
             ready: attempt.ready,
-            outputs: outputs,
+            outputs: allocatedOutputs!,
             signpostLifetime: signpostLifetime
         )
+        commandSubmissionsInProgress[identifier] = attempt.ready.lifecycleID
         counters.submitted &+= 1
         metrics?.recordYADIFKernelDispatch(
             inFlightCount: activeInFlightCountLocked,
@@ -598,28 +639,44 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         do {
             try commandSubmitter.submit(
                 job: attempt.ready.job,
-                outputs: outputs
+                outputs: allocatedOutputs!
             ) { completion in
                 self.commandCompleted(identifier: identifier, completion: completion)
             }
+            var actions: [UserAction] = []
+            lock.lock()
+            allocatedOutputs = nil
+            commandSubmissionsInProgress.removeValue(forKey: identifier)
+            finishDrainIfPossibleLocked(actions: &actions)
+            enqueueUserActionsLocked(actions)
+            lock.unlock()
+            driveUserActions()
         } catch let failure {
             var actions: [UserAction] = []
             lock.lock()
-            if let rolledBack = inFlightJobs.removeValue(forKey: identifier) {
-                rolledBack.signpostLifetime.finish()
-                if isCurrentLocked(rolledBack.ready) {
+            commandSubmissionsInProgress.removeValue(forKey: identifier)
+            var rolledBack = inFlightJobs.removeValue(forKey: identifier)
+            if let job = rolledBack {
+                job.signpostLifetime.finish()
+                if isCurrentLocked(job.ready) {
                     counters.submitted -= 1
                     actions.append(.complete(
-                        rolledBack.ready.completion,
-                        .failure(Self.playbackFailure(for: failure))
+                        job.ready.completion,
+                        Self.processingResult(for: failure)
                     ))
                 } else {
-                    actions.append(.complete(rolledBack.ready.completion, .success([])))
+                    actions.append(.complete(
+                        job.ready.completion,
+                        .cancelled(.reset)
+                    ))
                 }
             }
+            rolledBack = nil
+            allocatedOutputs = nil
             finishDrainIfPossibleLocked(actions: &actions)
+            enqueueUserActionsLocked(actions)
             lock.unlock()
-            perform(actions)
+            driveUserActions()
         }
     }
 
@@ -639,7 +696,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             let dropped = readyJobs.remove(at: lateIndex ?? readyJobs.startIndex)
             counters.gpuQueueFullDrops &+= 1
             metrics?.recordVideoDrop(count: 2, source: .deinterlaceQueueFull)
-            actions.append(.complete(dropped.completion, .success([])))
+            actions.append(.complete(
+                dropped.completion,
+                .transientDrop(.queuePressure)
+            ))
             actions.append(.drop(dropSink, YADIFDropEvent(
                 reason: .gpuQueueFull,
                 sourceAccessUnitID: dropped.job.current.frame.accessUnitID,
@@ -654,12 +714,13 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     ) {
         var actions: [UserAction] = []
         lock.lock()
-        guard let completed = inFlightJobs.removeValue(forKey: identifier) else {
+        var completed = inFlightJobs.removeValue(forKey: identifier)
+        guard completed != nil else {
             lock.unlock()
             return
         }
-        let isCurrent = isCurrentLocked(completed.ready)
-        completed.signpostLifetime.finish()
+        let isCurrent = isCurrentLocked(completed!.ready)
+        completed!.signpostLifetime.finish()
         if case let .completedWithGPUInterval(interval) = completion.result,
            let duration = interval.durationMilliseconds {
             metrics?.recordGPUDuration(milliseconds: duration)
@@ -668,25 +729,33 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             counters.completed &+= 1
         }
         if !isCurrent {
-            actions.append(.complete(completed.ready.completion, .success([])))
+            actions.append(.complete(
+                completed!.ready.completion,
+                .cancelled(.reset)
+            ))
         } else {
             switch completion.result {
             case .completed, .completedWithGPUInterval:
                 actions.append(.complete(
-                    completed.ready.completion,
-                    .success(Self.presentationFrames(for: completed))
+                    completed!.ready.completion,
+                    .produced(Self.presentationFrames(for: completed!))
                 ))
             case .failed:
                 actions.append(.complete(
-                    completed.ready.completion,
-                    .failure(Self.commandFailure)
+                    completed!.ready.completion,
+                    .structuralFailure(.commandExecution)
                 ))
             }
         }
+        // For cancelled/failed work this drops the processor's last surface
+        // ownership before a waiting drain barrier is made observable. A
+        // produced action intentionally carries the surfaces to its consumer.
+        completed = nil
         finishDrainIfPossibleLocked(actions: &actions)
         recordDepthsLocked()
+        enqueueUserActionsLocked(actions)
         lock.unlock()
-        perform(actions)
+        driveUserActions()
         driveScheduler()
     }
 
@@ -698,12 +767,12 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         _ = window.reset(generation: generation)
         for completions in pendingCompletions.values {
             for completion in completions {
-                actions.append(.complete(completion, .success([])))
+                actions.append(.complete(completion, .cancelled(.reset)))
             }
         }
         pendingCompletions.removeAll(keepingCapacity: true)
         for ready in readyJobs {
-            actions.append(.complete(ready.completion, .success([])))
+            actions.append(.complete(ready.completion, .cancelled(.reset)))
         }
         readyJobs.removeAll(keepingCapacity: true)
         for identifier in Array(submissionAttempts.keys) {
@@ -711,41 +780,72 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
                   attempt.completionIsOpen else {
                 continue
             }
-            actions.append(.complete(attempt.ready.completion, .success([])))
+            actions.append(.complete(attempt.ready.completion, .cancelled(.reset)))
             attempt.completionIsOpen = false
             submissionAttempts[identifier] = attempt
         }
-        for barrier in drainBarriers {
-            actions.append(.complete(barrier, .success([])))
-        }
-        drainBarriers.removeAll(keepingCapacity: true)
         self.generation = generation
         nextSequenceNumber = 1
         counters = Counters()
         isDraining = false
+        finishDrainIfPossibleLocked(actions: &actions)
         recordDepthsLocked()
     }
 
     private func finishDrainIfPossibleLocked(actions: inout [UserAction]) {
-        guard isDraining,
-              readyJobs.isEmpty,
-              window.unemittedCount == 0,
-              !submissionAttempts.values.contains(where: {
-                  $0.completionIsOpen
-                      && isCurrentLocked($0.ready)
-              }),
-              activeInFlightCountLocked == 0 else {
-            return
+        guard !drainBarriers.isEmpty else { return }
+        var waiting: [DrainBarrier] = []
+        waiting.reserveCapacity(drainBarriers.count)
+        for barrier in drainBarriers {
+            let cutoff = barrier.cutoffLifecycleID
+            let hasUnretiredWork = readyJobs.contains {
+                $0.lifecycleID <= cutoff
+            } || submissionAttempts.values.contains {
+                $0.ready.lifecycleID <= cutoff
+            } || inFlightJobs.values.contains {
+                $0.ready.lifecycleID <= cutoff
+            } || commandSubmissionsInProgress.values.contains {
+                $0 <= cutoff
+            }
+            if hasUnretiredWork {
+                waiting.append(barrier)
+            } else {
+                actions.append(.completeDrain(barrier.completion))
+            }
         }
-        let barriers = drainBarriers
-        drainBarriers.removeAll(keepingCapacity: true)
-        for barrier in barriers {
-            actions.append(.complete(barrier, .success([])))
-        }
+        drainBarriers = waiting
     }
 
-    private func perform(_ actions: [UserAction]) {
-        for action in actions { action.perform() }
+    private func enqueueAndDrive(_ action: UserAction) {
+        lock.lock()
+        pendingUserActions.append(action)
+        lock.unlock()
+        driveUserActions()
+    }
+
+    private func enqueueUserActionsLocked(_ actions: [UserAction]) {
+        pendingUserActions.append(contentsOf: actions)
+    }
+
+    /// User callbacks may re-enter the processor and native completions may
+    /// arrive on arbitrary queues. Queueing while the state lock is held gives
+    /// every callback the same order as its state transition; the single pump
+    /// then invokes callbacks without holding that lock.
+    private func driveUserActions() {
+        lock.lock()
+        guard !userActionPumpIsRunning else {
+            lock.unlock()
+            return
+        }
+        userActionPumpIsRunning = true
+        while !pendingUserActions.isEmpty {
+            let action = pendingUserActions.removeFirst()
+            lock.unlock()
+            action.perform()
+            lock.lock()
+        }
+        userActionPumpIsRunning = false
+        lock.unlock()
     }
 
     private func recordDepthsLocked() {
@@ -757,43 +857,38 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
 
     private static func presentationFrames(
         for completed: InFlightJob
-    ) -> [VideoPresentationFrame] {
+    ) -> VideoProcessingFrameBatch {
         let normalized = completed.ready.job.current
-        return [completed.outputs.first, completed.outputs.second].enumerated().map {
-            index, output in
-            return VideoPresentationFrame(
-                pixelBuffer: output,
-                presentationTimeStamp: index == 0
-                    ? normalized.presentationTimeStamp
-                    : CMTimeAdd(normalized.presentationTimeStamp, normalized.fieldDuration),
-                duration: normalized.fieldDuration,
-                generation: normalized.frame.generation,
-                sequenceNumber: completed.ready.firstSequenceNumber + UInt64(index),
-                sourceAccessUnitID: normalized.frame.accessUnitID,
-                formatMetadata: normalized.frame.formatMetadata
-            )
-        }
+        let first = VideoPresentationFrame(
+            pixelBuffer: completed.outputs.first,
+            presentationTimeStamp: normalized.presentationTimeStamp,
+            duration: normalized.fieldDuration,
+            generation: normalized.frame.generation,
+            sequenceNumber: completed.ready.firstSequenceNumber,
+            sourceAccessUnitID: normalized.frame.accessUnitID,
+            formatMetadata: normalized.frame.formatMetadata
+        )
+        let second = VideoPresentationFrame(
+            pixelBuffer: completed.outputs.second,
+            presentationTimeStamp: CMTimeAdd(
+                normalized.presentationTimeStamp,
+                normalized.fieldDuration
+            ),
+            duration: normalized.fieldDuration,
+            generation: normalized.frame.generation,
+            sequenceNumber: completed.ready.firstSequenceNumber + 1,
+            sourceAccessUnitID: normalized.frame.accessUnitID,
+            formatMetadata: normalized.frame.formatMetadata
+        )
+        return VideoProcessingFrameBatch(first: first, remaining: [second])
     }
 
-    private static func playbackFailure(for failure: YADIFFailure) -> PlaybackFailure {
-        switch failure {
-        case .commandBufferAllocationFailed, .commandFailed:
-            return commandFailure
-        default:
-            return textureFailure
+    private static func processingResult(for failure: YADIFFailure) -> VideoProcessingResult {
+        switch failure.processingClassification {
+        case let .transient(reason):
+            .transientDrop(reason)
+        case let .structural(failure):
+            .structuralFailure(failure)
         }
     }
-
-    private static let invalidTimingFailure = PlaybackFailure(
-        code: "video.timing",
-        userMessage: "视频时间戳无效，请尝试其他频道。"
-    )
-    private static let textureFailure = PlaybackFailure(
-        code: "video.texture",
-        userMessage: "视频纹理处理失败，请稍后重试。"
-    )
-    private static let commandFailure = PlaybackFailure(
-        code: "metal.command",
-        userMessage: "视频渲染失败，请稍后重试。"
-    )
 }

@@ -243,34 +243,64 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             let executor = PlaybackSerialExecutor(
                 label: "org.vplayer.tests.fixture.device.\(path)"
             )
+            let submissionQueue = DispatchQueue(
+                label: "org.vplayer.tests.fixture.device.submit.\(path)"
+            )
             let processor = PassthroughVideoProcessor()
             let decoded = DeviceDecodeRecorder()
-            let decoder = VideoToolboxDecoder(executor: executor) { event in
+            let transitions = DeviceTransitionRecorder()
+            let decoder = VideoToolboxDecoder(
+                executor: executor,
+                eventSink: { event in
                 switch event {
                 case let .frame(frame):
                     processor.submit(frame) { decoded.record($0) }
                 case let .recoverableFailure(failure, _),
-                     let .fatalFailure(failure, _),
-                     let .submissionFailure(failure, _):
+                     let .fatalFailure(failure, _):
+                    decoded.record(failure)
+                case let .submissionFailure(_, failure, _):
                     decoded.record(failure)
                 case .submissionCompleted:
                     break
+                case let .transitionCompleted(token, outcome):
+                    transitions.record(token: token, outcome: outcome)
                 }
-            }
+                },
+                api: SystemVideoToolboxAPI(),
+                submissionQueue: submissionQueue
+            )
             let format = try XCTUnwrap(assembled.videoFormats.last)
             let generation = MediaGeneration(rawValue: 1)
+            let configureToken = VideoDecoderTransitionToken()
 
             try perform(on: executor) {
                 processor.reset(to: generation)
-                try decoder.configure(format: format, generation: generation)
+                decoder.transition(.configure(
+                    token: configureToken,
+                    format: format,
+                    generation: generation
+                ))
+            }
+            submissionQueue.sync {}
+            drain(executor)
+            XCTAssertEqual(
+                transitions.outcome(for: configureToken),
+                .completed,
+                path
+            )
+            try perform(on: executor) {
                 for accessUnit in assembled.videoAccessUnits {
                     try decoder.decode(accessUnit, flags: [])
                 }
-                try decoder.finishDelayedFrames()
-                try decoder.waitForAsynchronousFrames()
             }
+            submissionQueue.sync {}
+            let drainToken = VideoDecoderTransitionToken()
+            try perform(on: executor) {
+                decoder.transition(.drainAndInvalidate(token: drainToken))
+            }
+            submissionQueue.sync {}
             drain(executor)
-            performWithoutThrowing(on: executor) { decoder.invalidate() }
+            XCTAssertEqual(transitions.outcome(for: drainToken), .completed, path)
 
             XCTAssertEqual(processor.requiredInputFrameCount, 1, path)
             XCTAssertTrue(decoded.failures.isEmpty, "\(path): \(decoded.failures)")
@@ -729,10 +759,10 @@ private final class DeviceDecodeRecorder: @unchecked Sendable {
     private var storedFailures: [VideoDecoderFailure] = []
     private var storedPresentationFrameCount = 0
 
-    func record(_ result: Result<[VideoPresentationFrame], PlaybackFailure>) {
+    func record(_ result: VideoProcessingResult) {
         lock.lock()
-        if case let .success(frames) = result {
-            storedPresentationFrameCount += frames.count
+        if case let .produced(batch) = result {
+            storedPresentationFrameCount += batch.frames.count
         }
         lock.unlock()
     }
@@ -753,6 +783,24 @@ private final class DeviceDecodeRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storedPresentationFrameCount
+    }
+}
+
+private final class DeviceTransitionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outcomes: [VideoDecoderTransitionToken: VideoDecoderTransitionOutcome] = [:]
+
+    func record(
+        token: VideoDecoderTransitionToken,
+        outcome: VideoDecoderTransitionOutcome
+    ) {
+        lock.withLock { outcomes[token] = outcome }
+    }
+
+    func outcome(
+        for token: VideoDecoderTransitionToken
+    ) -> VideoDecoderTransitionOutcome? {
+        lock.withLock { outcomes[token] }
     }
 }
 #endif

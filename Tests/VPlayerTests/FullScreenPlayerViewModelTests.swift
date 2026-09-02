@@ -16,6 +16,8 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertEqual(PlayerControlsVisibilityPolicy.idleTimeout, .seconds(3))
         XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .playing(request)))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .preparing(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .buffering(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .recovering(request)))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .paused(request)))
     }
 
@@ -28,6 +30,8 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .playing(request)))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .idle))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .preparing(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .buffering(request)))
+        XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .recovering(request)))
         XCTAssertTrue(PlayerControlsVisibilityPolicy.staysVisible(for: .paused(request)))
         XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .stopped))
         XCTAssertFalse(PlayerControlsVisibilityPolicy.staysVisible(for: .failed(failure)))
@@ -51,6 +55,14 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             .pinned
         )
         XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .buffering(request)),
+            .pinned
+        )
+        XCTAssertEqual(
+            PlayerControlsVisibilityPolicy.mode(for: .recovering(request)),
+            .pinned
+        )
+        XCTAssertEqual(
             PlayerControlsVisibilityPolicy.mode(for: .paused(request)),
             .pinned
         )
@@ -66,6 +78,12 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         )
         XCTAssertTrue(
             PlayerControlsVisibilityPolicy.mountsOverlays(for: .preparing(request))
+        )
+        XCTAssertTrue(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .buffering(request))
+        )
+        XCTAssertTrue(
+            PlayerControlsVisibilityPolicy.mountsOverlays(for: .recovering(request))
         )
         XCTAssertTrue(
             PlayerControlsVisibilityPolicy.mountsOverlays(for: .paused(request))
@@ -172,10 +190,29 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
 
         XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .idle))
         XCTAssertTrue(PlaybackIdleTimerPolicy.isDisabled(for: .preparing(request)))
+        XCTAssertTrue(PlaybackIdleTimerPolicy.isDisabled(for: .buffering(request)))
+        XCTAssertTrue(PlaybackIdleTimerPolicy.isDisabled(for: .recovering(request)))
         XCTAssertTrue(PlaybackIdleTimerPolicy.isDisabled(for: .playing(request)))
         XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .paused(request)))
         XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .stopped))
         XCTAssertFalse(PlaybackIdleTimerPolicy.isDisabled(for: .failed(failure)))
+    }
+
+    func testFailureActionPolicyShowsRetryOnlyForTheSameRequestDisposition() {
+        for (disposition, expected) in [
+            (PlaybackRetryDisposition.retrySameRequest, true),
+            (.chooseAnotherChannel, false),
+            (.doNotRetry, false),
+        ] {
+            XCTAssertEqual(
+                PlayerFailureActionPolicy.showsRetry(for: PlaybackFailure(
+                    code: "fixture.failure",
+                    userMessage: "播放失败。",
+                    retryDisposition: disposition
+                )),
+                expected
+            )
+        }
     }
 
     func testPlayerLifecycleStopsOnlyWhenDisappearanceIsNotCausedBySettingsSheet() {
@@ -206,18 +243,19 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         )
 
         model.start()
-        try await eventually { log.values.count >= 4 }
+        try await eventually { log.values.count >= 3 }
 
-        XCTAssertEqual(Array(log.values.prefix(4)), [
-            "events", "notices", "play", "presentation",
+        XCTAssertEqual(Array(log.values.prefix(3)), [
+            "events", "play", "presentation",
         ])
     }
 
     func testMediaInformationSubscriptionClearsOnRetryAndStop() async throws {
         let media = ViewModelMediaInformationFeed()
+        let engine = ViewModelPlaybackEngine(log: .init())
         let model = FullScreenPlayerViewModel(
             request: makeRequest(),
-            engine: ViewModelPlaybackEngine(log: .init()),
+            engine: engine,
             presentationProvider: { nil },
             mediaInformationProvider: { await media.stream() },
             settings: makeSettings()
@@ -233,6 +271,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         ))
         try await eventually { model.mediaInformation?.width == 1_920 }
 
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually { model.mediaInformation == nil }
 
@@ -269,6 +310,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         try await eventually { model.mediaInformation?.width == 1_920 }
 
         await media.prepareNextPlay()
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually { await retryGate.hasWaiter }
         XCTAssertNil(model.mediaInformation)
@@ -345,6 +389,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
 
         model.togglePause()
         try await eventually { await engine.pauses == [true] }
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually { await engine.playCount == 2 }
         await model.stop()
@@ -352,6 +399,47 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
 
         let stopCount = await engine.stopCount
         XCTAssertEqual(stopCount, 1)
+    }
+
+    func testRetryActionReplaysOnlyRetrySameRequestFailures() async {
+        let cases: [(PlaybackRetryDisposition, Int)] = [
+            (.retrySameRequest, 2),
+            (.chooseAnotherChannel, 1),
+            (.doNotRetry, 1),
+        ]
+
+        for (disposition, expectedPlayCount) in cases {
+            let engine = ViewModelPlaybackEngine(log: .init())
+            let model = FullScreenPlayerViewModel(
+                request: makeRequest(),
+                engine: engine,
+                presentationProvider: { nil },
+                settings: makeSettings()
+            )
+            model.start()
+            let didStart = await waitUntil { await engine.playCount == 1 }
+            XCTAssertTrue(didStart)
+
+            let failure = PlaybackFailure(
+                code: "fixture.failure",
+                userMessage: "播放失败。",
+                retryDisposition: disposition
+            )
+            await engine.emit(state: .failed(failure))
+            let didApplyFailure = await waitUntil { model.state == .failed(failure) }
+            XCTAssertTrue(didApplyFailure)
+
+            model.retry()
+            for _ in 0..<100 { await Task.yield() }
+
+            let playCount = await engine.playCount
+            XCTAssertEqual(
+                playCount,
+                expectedPlayCount,
+                "retry disposition \(disposition) must own the action contract"
+            )
+            await model.stop()
+        }
     }
 
     func testRapidPauseTogglesRetireExactCommandsAndReconcileAcknowledgements() async throws {
@@ -365,7 +453,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .preparing(request))
         try await eventually { model.state == .preparing(request) }
         await engine.emit(state: .playing(request))
@@ -433,7 +521,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .preparing(request))
         try await eventually { model.state == .preparing(request) }
         await engine.emit(state: .playing(request))
@@ -474,7 +562,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .preparing(request))
         try await eventually { model.state == .preparing(request) }
         await engine.emit(state: .playing(request))
@@ -519,7 +607,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .preparing(request))
         try await eventually { model.state == .preparing(request) }
         await engine.emit(state: .playing(request))
@@ -529,6 +617,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             await engine.operations.contains("pause:true:end")
         }
 
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually { await engine.playCount == 2 }
         await engine.emit(state: .paused(request))
@@ -575,7 +666,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .preparing(request))
         try await eventually { model.state == .preparing(request) }
         await engine.emit(state: .playing(request))
@@ -585,6 +676,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         model.togglePause()
         try await eventually { await firstPauseGate.hasWaiter }
 
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually { await engine.playCount == 2 }
         await firstPauseGate.open()
@@ -609,36 +703,6 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             }
         }
         await model.stop()
-    }
-
-    func testRepeatedVisibleNoticeDoesNotRestartOrExtendThreeSecondTimer() async throws {
-        let sleep = ViewModelSleepProbe()
-        let engine = ViewModelPlaybackEngine(log: ViewModelOperationLog())
-        let model = FullScreenPlayerViewModel(
-            request: makeRequest(),
-            engine: engine,
-            presentationProvider: { nil },
-            settings: makeSettings(),
-            sleep: { try await sleep.sleep(for: $0) }
-        )
-        model.start()
-        try await eventually { await engine.hasNoticeSubscriber }
-        let notice = PlaybackNotice(
-            id: "temporal-unavailable",
-            message: "Apple 反交错不可用，可在设置中切换到 Metal YADIF 2x。",
-            duration: .seconds(3),
-            isFocusStealing: false
-        )
-
-        await engine.emit(notice: notice)
-        try await eventually { model.visibleNotice == notice }
-        await engine.emit(notice: notice)
-        try await Task.sleep(for: .milliseconds(30))
-        let durations = await sleep.durations
-        XCTAssertEqual(durations, [.seconds(3)])
-
-        await sleep.finish()
-        try await eventually { model.visibleNotice == nil }
     }
 
     func testConcurrentStopsWaitForSuspendedStartupAndTheSameEngineStop() async throws {
@@ -733,6 +797,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
 
         model.start()
         try await eventually { provider.firstCallHasWaiter }
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually {
             provider.callCount == 2 && model.presentationContext === sharedContext
@@ -763,6 +830,9 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         model.start()
         try await eventually { await engine.playCount == 1 }
 
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
         model.retry()
         try await eventually { await retryGate.hasWaiter }
         let stopFinished = ViewModelFlag()
@@ -793,7 +863,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .playing(request))
         try await eventually { model.state == .playing(request) }
 
@@ -830,7 +900,7 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             settings: makeSettings()
         )
         model.start()
-        try await eventually { await engine.subscriberCount == 2 }
+        try await eventually { await engine.subscriberCount == 1 }
         await engine.emit(state: .preparing(request))
         try await eventually { model.state == .preparing(request) }
         await engine.emit(state: .playing(request))
@@ -909,6 +979,14 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
             streamURL: URL(string: "https://fixture.invalid/live")
                 ?? URL(fileURLWithPath: "/fixture.invalid/live"),
             title: "Fixture"
+        )
+    }
+
+    private func retryableFailure() -> PlaybackFailure {
+        PlaybackFailure(
+            code: "fixture.retryable",
+            userMessage: "播放失败。",
+            retryDisposition: .retrySameRequest
         )
     }
 
@@ -1047,7 +1125,6 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     private let pauseGate: ViewModelAsyncGate?
     private let pauseGates: [Int: ViewModelAsyncGate]
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
-    private var noticeContinuations: [UUID: AsyncStream<PlaybackNotice>.Continuation] = [:]
     private(set) var playCount = 0
     private(set) var stopCount = 0
     private(set) var completedTunings: [PlaybackTuning] = []
@@ -1055,7 +1132,7 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
     private var tuningCallCount = 0
     private var pauseCallCount = 0
 
-    var subscriberCount: Int { eventContinuations.count + noticeContinuations.count }
+    var subscriberCount: Int { eventContinuations.count }
 
     init(
         eventsGate: ViewModelBlockingGate? = nil,
@@ -1088,16 +1165,6 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         eventContinuations[id] = pair.continuation
         pair.continuation.onTermination = { [weak self] _ in
             Task { await self?.removeEventContinuation(id) }
-        }
-        return pair.stream
-    }
-
-    func notices() -> AsyncStream<PlaybackNotice> {
-        let id = UUID()
-        let pair = AsyncStream.makeStream(of: PlaybackNotice.self)
-        noticeContinuations[id] = pair.continuation
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeNoticeContinuation(id) }
         }
         return pair.stream
     }
@@ -1143,9 +1210,6 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine {
         eventContinuations[id] = nil
     }
 
-    private func removeNoticeContinuation(_ id: UUID) {
-        noticeContinuations[id] = nil
-    }
 }
 
 private final class ViewModelOperationLog: @unchecked Sendable {
@@ -1226,11 +1290,9 @@ private actor ViewModelNonCooperativeMediaInformationProvider {
 private actor ViewModelPlaybackEngine: PlaybackEngine {
     private let log: ViewModelOperationLog
     private var stateContinuation: AsyncStream<PlaybackState>.Continuation?
-    private var noticeContinuation: AsyncStream<PlaybackNotice>.Continuation?
     private(set) var playCount = 0
     private(set) var stopCount = 0
     private(set) var pauses: [Bool] = []
-    var hasNoticeSubscriber: Bool { noticeContinuation != nil }
 
     init(log: ViewModelOperationLog) {
         self.log = log
@@ -1240,13 +1302,6 @@ private actor ViewModelPlaybackEngine: PlaybackEngine {
         let pair = AsyncStream.makeStream(of: PlaybackState.self)
         stateContinuation = pair.continuation
         log.append("events")
-        return pair.stream
-    }
-
-    func notices() -> AsyncStream<PlaybackNotice> {
-        let pair = AsyncStream.makeStream(of: PlaybackNotice.self)
-        noticeContinuation = pair.continuation
-        log.append("notices")
         return pair.stream
     }
 
@@ -1272,22 +1327,4 @@ private actor ViewModelPlaybackEngine: PlaybackEngine {
         stateContinuation?.yield(state)
     }
 
-    func emit(notice: PlaybackNotice) {
-        noticeContinuation?.yield(notice)
-    }
-}
-
-private actor ViewModelSleepProbe {
-    private(set) var durations: [Duration] = []
-    private var continuation: CheckedContinuation<Void, any Error>?
-
-    func sleep(for duration: Duration) async throws {
-        durations.append(duration)
-        try await withCheckedThrowingContinuation { continuation = $0 }
-    }
-
-    func finish() {
-        continuation?.resume()
-        continuation = nil
-    }
 }

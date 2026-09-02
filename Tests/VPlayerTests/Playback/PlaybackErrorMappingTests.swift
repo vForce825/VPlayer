@@ -16,6 +16,7 @@ final class PlaybackErrorMappingTests: XCTestCase {
         XCTAssertEqual(failure.code, "video.decode")
         XCTAssertEqual(failure.userMessage, "视频解码失败，请尝试其他频道。")
         XCTAssertNil(failure.diagnosticCode)
+        XCTAssertEqual(failure.retryDisposition, .retrySameRequest)
     }
 
     func testVideoDecodeMappingPreservesSignedStatusOnlyInDiagnosticCode() {
@@ -26,6 +27,15 @@ final class PlaybackErrorMappingTests: XCTestCase {
         XCTAssertEqual(failure.userMessage, "视频解码失败，请尝试其他频道。")
         XCTAssertEqual(failure.diagnosticCode, "video.decode.status.-12909")
         XCTAssertFalse(failure.diagnosticCode?.contains(secret) == true)
+    }
+
+    func testVideoDecoderTransitionTimeoutHasStableRetryableChineseFailure() {
+        let failure = PlaybackController.failure(for: .videoDecoderTransitionTimeout)
+
+        XCTAssertEqual(failure.code, "video.decoder-timeout")
+        XCTAssertEqual(failure.userMessage, "视频解码器响应超时，请稍后重试。")
+        XCTAssertEqual(failure.diagnosticCode, "video.decoder-transition.timeout")
+        XCTAssertEqual(failure.retryDisposition, .retrySameRequest)
     }
 
     func testAudioFailuresExposeOnlyBoundedMachineSafeDiagnostics() {
@@ -57,6 +67,7 @@ final class PlaybackErrorMappingTests: XCTestCase {
             (.unsupportedAudioCodec, "audio.codec", "不支持此频道的音频编码，请尝试其他频道。"),
             (.videoFormatDescription(-3), "video.format", "无法解析视频格式，请尝试其他频道。"),
             (.hardwareDecoderUnavailable, "video.hardware", "硬件视频解码器不可用，请稍后重试。"),
+            (.videoDecoderTransitionTimeout, "video.decoder-timeout", "视频解码器响应超时，请稍后重试。"),
             (.videoDecode(-4), "video.decode", "视频解码失败，请尝试其他频道。"),
             (.audioFormatDescription(-5), "audio.format", "无法解析音频格式，请尝试其他频道。"),
             (.audioFallbackDecode(-6), "audio.decode", "音频解码失败，请尝试其他频道。"),
@@ -70,6 +81,37 @@ final class PlaybackErrorMappingTests: XCTestCase {
             let failure = PlaybackController.failure(for: core)
             XCTAssertEqual(failure.code, code)
             XCTAssertEqual(failure.userMessage, message)
+        }
+    }
+
+    func testEveryCoreFailureMapsToExplicitRetryDisposition() {
+        let cases: [(PlaybackCoreError, PlaybackRetryDisposition)] = [
+            (.unsupportedProtocol("udp"), .chooseAnotherChannel),
+            (.demuxOpen(-1), .retrySameRequest),
+            (.demuxRead(-2), .retrySameRequest),
+            (.networkTimeout, .retrySameRequest),
+            (.unsupportedVideoCodec, .chooseAnotherChannel),
+            (.unsupportedAudioCodec, .chooseAnotherChannel),
+            (.videoFormatDescription(-3), .chooseAnotherChannel),
+            (.hardwareDecoderUnavailable, .retrySameRequest),
+            (.videoDecoderTransitionTimeout, .retrySameRequest),
+            (.videoDecode(-4), .chooseAnotherChannel),
+            (.videoSampleBuffer("sample"), .retrySameRequest),
+            (.videoRendererFailed("renderer"), .retrySameRequest),
+            (.audioFormatDescription(-5), .chooseAnotherChannel),
+            (.audioFallbackDecode(-6), .chooseAnotherChannel),
+            (.audioRendererFailed("renderer"), .retrySameRequest),
+            (.renderTextureMapping, .retrySameRequest),
+            (.metalCommand("command"), .retrySameRequest),
+            (.cancelled, .doNotRetry),
+        ]
+
+        for (core, disposition) in cases {
+            XCTAssertEqual(
+                PlaybackController.failure(for: core).retryDisposition,
+                disposition,
+                "retry disposition mismatch for \(core)"
+            )
         }
     }
 

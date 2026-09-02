@@ -7,6 +7,78 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PresentationTimestampNormalizerTests: XCTestCase {
+    func testMissingVideoPTSWaitsForFirstAudioOriginAndStartsOnThatTimeline() throws {
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        sut.configureMaximumReorderDepth(2)
+        sut.beginAwaitingAudioTimelineOrigin()
+
+        XCTAssertTrue(sut.push(
+            try decodedFrame(id: 1, pts90k: nil),
+            discontinuity: false
+        ).isEmpty)
+        XCTAssertTrue(sut.push(
+            try decodedFrame(id: 2, pts90k: nil),
+            discontinuity: false
+        ).isEmpty)
+
+        let output = sut.observeAudioTimelineOrigin(CMTime(value: 10, timescale: 1))
+
+        XCTAssertEqual(output.map(ptsValue), [900_000, 903_600])
+        XCTAssertTrue(output.allSatisfy(\.timingWasSynthesized))
+    }
+
+    func testTrustedVideoPTSIsNotShiftedByAudioOrigin() throws {
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        _ = sut.observeAudioTimelineOrigin(CMTime(value: 10, timescale: 1))
+
+        let output = sut.push(
+            try decodedFrame(id: 1, pts90k: 1_080_000),
+            discontinuity: false
+        ) + sut.drain()
+
+        XCTAssertEqual(output.map(ptsValue), [1_080_000])
+        XCTAssertFalse(try XCTUnwrap(output.first).timingWasSynthesized)
+    }
+
+    func testDecoderGenerationRebindPreservesTimelineCursorAndAudioOrigin() throws {
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        sut.configureMaximumReorderDepth(2)
+        XCTAssertTrue(sut.push(
+            try decodedFrame(id: 1, pts90k: nil),
+            discontinuity: false
+        ).isEmpty)
+        XCTAssertEqual(
+            sut.observeAudioTimelineOrigin(CMTime(value: 10, timescale: 1)).map(ptsValue),
+            [900_000]
+        )
+
+        sut.rebindDecoderGeneration(generation(2))
+        XCTAssertTrue(sut.push(
+            try decodedFrame(id: 2, pts90k: nil, generation: 2),
+            discontinuity: false
+        ).isEmpty)
+
+        XCTAssertEqual(sut.drain().map(ptsValue), [903_600])
+    }
+
+    func testAudioOriginWaitRetainsAtMostSixteenMissingPTSFrames() throws {
+        var sut = PresentationTimestampNormalizer(generation: generation(1))
+        sut.configureMaximumReorderDepth(8)
+        sut.beginAwaitingAudioTimelineOrigin()
+        for index in 0..<17 {
+            XCTAssertTrue(sut.push(
+                try decodedFrame(id: UInt64(index), pts90k: nil),
+                discontinuity: false
+            ).isEmpty)
+        }
+
+        let output = sut.observeAudioTimelineOrigin(CMTime(value: 10, timescale: 1))
+
+        XCTAssertEqual(output.count, 16)
+        XCTAssertEqual(output.first?.frame.accessUnitID, 1)
+        XCTAssertEqual(output.first.map(ptsValue), 900_000)
+    }
+
     func testReordersBFramesByTransportPTSNotCallbackOrder() throws {
         var sut = PresentationTimestampNormalizer(generation: generation(7))
         sut.configureMaximumReorderDepth(4)

@@ -417,6 +417,8 @@ final class VPlayerAppStartupTests: XCTestCase {
         let presentations = [
             AcceptancePlaybackStatePresentation(state: .idle).value,
             AcceptancePlaybackStatePresentation(state: .preparing(request)).value,
+            AcceptancePlaybackStatePresentation(state: .buffering(request)).value,
+            AcceptancePlaybackStatePresentation(state: .recovering(request)).value,
             AcceptancePlaybackStatePresentation(state: .playing(request)).value,
             AcceptancePlaybackStatePresentation(state: .paused(request)).value,
             AcceptancePlaybackStatePresentation(state: .stopped).value,
@@ -424,7 +426,7 @@ final class VPlayerAppStartupTests: XCTestCase {
         ]
 
         XCTAssertEqual(presentations, [
-            "idle", "preparing", "playing", "paused", "stopped",
+            "idle", "preparing", "buffering", "recovering", "playing", "paused", "stopped",
             "failed:decoder.invalid-data",
         ])
         for presentation in presentations {

@@ -48,6 +48,8 @@ public struct PresentationTimestampNormalizer: Sendable {
     private static let transportTimescale: CMTimeScale = 90_000
     private static let minimumReorderDepth = 2
     private static let maximumReorderDepth = 8
+    private static let maximumAudioOriginWaitFrameCount = 16
+    private static let maximumAudioOriginWaitDuration = CMTime(value: 1, timescale: 1)
 
     private var generation: MediaGeneration
     private var unwrapper = Timestamp33Unwrapper()
@@ -59,6 +61,8 @@ public struct PresentationTimestampNormalizer: Sendable {
     private var lastAccessUnitID: UInt64?
     private var nominalFrameDuration: CMTime?
     private var maximumReorderDepth = 2
+    private var audioTimelineOrigin: CMTime?
+    private var awaitingAudioTimelineOrigin = false
 
     public init(generation: MediaGeneration) {
         self.generation = generation
@@ -88,6 +92,11 @@ public struct PresentationTimestampNormalizer: Sendable {
         )
         pending.sort(by: pendingFramePrecedes)
 
+        if shouldWaitForAudioTimelineOrigin {
+            boundAudioOriginWait()
+            return []
+        }
+
         var output: [NormalizedDecodedFrame] = []
         while pending.count > maximumReorderDepth {
             let removalIndex = expiredMissingFrameIndex() ?? pending.startIndex
@@ -114,6 +123,7 @@ public struct PresentationTimestampNormalizer: Sendable {
     }
 
     public mutating func drain() -> [NormalizedDecodedFrame] {
+        awaitingAudioTimelineOrigin = false
         var output: [NormalizedDecodedFrame] = []
         output.reserveCapacity(pending.count)
         while !pending.isEmpty {
@@ -128,6 +138,48 @@ public struct PresentationTimestampNormalizer: Sendable {
         resetTimingHistory(generation: generation)
     }
 
+    /// Begins a fresh media timeline whose video timestamps may need to be
+    /// synthesized from the first usable audio timestamp.
+    public mutating func beginAwaitingAudioTimelineOrigin() {
+        audioTimelineOrigin = nil
+        awaitingAudioTimelineOrigin = true
+    }
+
+    /// Captures exactly one nonnegative numeric audio origin for this timeline.
+    /// Trusted video timestamps are never shifted; only synthesized timestamps
+    /// use this value.
+    public mutating func observeAudioTimelineOrigin(
+        _ origin: CMTime
+    ) -> [NormalizedDecodedFrame] {
+        guard audioTimelineOrigin == nil,
+              origin.isNumeric,
+              CMTimeCompare(origin, .zero) >= 0 else { return [] }
+        audioTimelineOrigin = CMTimeConvertScale(
+            origin,
+            timescale: Self.transportTimescale,
+            method: .roundHalfAwayFromZero
+        )
+        awaitingAudioTimelineOrigin = false
+
+        var output: [NormalizedDecodedFrame] = []
+        output.reserveCapacity(pending.count)
+        while !pending.isEmpty {
+            let first = pending.removeFirst()
+            output.append(normalize(first, next: pending.first))
+        }
+        return output
+    }
+
+    /// Rebinds decoder ownership without creating a new media timeline. Native
+    /// callbacks queued by the old decoder are discarded, while the timestamp
+    /// unwrap epoch, cadence and exact presentation cursor remain continuous.
+    public mutating func rebindDecoderGeneration(_ generation: MediaGeneration) {
+        guard generation >= self.generation else { return }
+        self.generation = generation
+        pending.removeAll(keepingCapacity: true)
+        lastAccessUnitID = nil
+    }
+
     private mutating func resetTimingHistory(generation: MediaGeneration) {
         self.generation = generation
         unwrapper.reset()
@@ -137,6 +189,37 @@ public struct PresentationTimestampNormalizer: Sendable {
         lastOutputPTS = nil
         lastExactOutputPTS = nil
         lastAccessUnitID = nil
+        audioTimelineOrigin = nil
+        awaitingAudioTimelineOrigin = false
+    }
+
+    private var shouldWaitForAudioTimelineOrigin: Bool {
+        awaitingAudioTimelineOrigin
+            && audioTimelineOrigin == nil
+            && lastOutputPTS == nil
+            && pending.allSatisfy { $0.trustedPTS90k == nil }
+    }
+
+    private mutating func boundAudioOriginWait() {
+        while pending.count > Self.maximumAudioOriginWaitFrameCount
+            || audioOriginWaitDurationExceedsLimit() {
+            pending.removeFirst()
+        }
+    }
+
+    private func audioOriginWaitDurationExceedsLimit() -> Bool {
+        var total = CMTime.zero
+        for item in pending {
+            let duration = positiveNumericDuration(item.frame.duration)
+                ? item.frame.duration
+                : (nominalFrameDuration ?? Self.fallback25iDuration)
+            total = CMTimeAdd(total, duration)
+            if !total.isNumeric
+                || CMTimeCompare(total, Self.maximumAudioOriginWaitDuration) > 0 {
+                return true
+            }
+        }
+        return false
     }
 
     private func pendingFramePrecedes(_ lhs: PendingFrame, _ rhs: PendingFrame) -> Bool {
@@ -251,14 +334,22 @@ public struct PresentationTimestampNormalizer: Sendable {
                 lastExactOutputPTS ?? lastOutputPTS,
                 effectiveDuration
             )
+            let anchoredExactOutputPTS: CMTime
+            if let audioTimelineOrigin,
+               CMTimeCompare(audioTimelineOrigin, exactOutputPTS) > 0 {
+                anchoredExactOutputPTS = audioTimelineOrigin
+            } else {
+                anchoredExactOutputPTS = exactOutputPTS
+            }
             outputPTS = strictlyIncreasingTransportPTS(
-                from: exactOutputPTS,
+                from: anchoredExactOutputPTS,
                 after: lastOutputPTS
             )
-            lastExactOutputPTS = exactOutputPTS
+            lastExactOutputPTS = anchoredExactOutputPTS
             timingWasSynthesized = true
         } else {
-            outputPTS = CMTime(value: 0, timescale: Self.transportTimescale)
+            outputPTS = audioTimelineOrigin
+                ?? CMTime(value: 0, timescale: Self.transportTimescale)
             lastExactOutputPTS = outputPTS
             timingWasSynthesized = true
         }

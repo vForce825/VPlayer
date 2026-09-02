@@ -64,6 +64,35 @@ public enum YADIFFailure: Error, Equatable, Sendable {
     case commandFailed
 }
 
+enum YADIFProcessingFailureClassification: Sendable, Equatable {
+    case transient(VideoProcessingTransientDropReason)
+    case structural(VideoProcessingStructuralFailure)
+}
+
+extension YADIFFailure {
+    var processingClassification: YADIFProcessingFailureClassification {
+        switch self {
+        case .invalidDimensions, .unsupportedPixelFormat,
+             .nonIOSurfaceOutput, .invalidPlaneLayout:
+            .structural(.invalidSurface)
+        case .poolCreationFailed:
+            .structural(.surfacePool)
+        case .poolAllocationFailed, .commandBufferAllocationFailed,
+             .commandEncoderAllocationFailed:
+            .transient(.resourcePressure)
+        case .incompatibleRendererAttributes:
+            .structural(.rendererAttributes)
+        case .metalTextureCacheCreationFailed, .metalTextureMappingFailed:
+            .structural(.textureMapping)
+        case .shaderLibraryUnavailable, .shaderFunctionUnavailable,
+             .pipelineCreationFailed:
+            .structural(.shaderPipeline)
+        case .commandFailed:
+            .structural(.commandExecution)
+        }
+    }
+}
+
 struct YADIFSurfaceDescription: Equatable, Sendable {
     let width: Int
     let height: Int

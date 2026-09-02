@@ -541,6 +541,8 @@ final class FakeAudioRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
     private var handler: (@Sendable (AudioOutputRouteSnapshot) -> Void)?
     private var startCount = 0
     private var stopCount = 0
+    private var resampleCount = 0
+    private var nextResampleSnapshot: AudioOutputRouteSnapshot?
     private let initialCategory: AudioOutputRouteCategory
 
     init(initialCategory: AudioOutputRouteCategory = .other) {
@@ -572,6 +574,24 @@ final class FakeAudioRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {
         lock.unlock()
         copied?(snapshot)
     }
+
+    func setNextResampleSnapshot(_ snapshot: AudioOutputRouteSnapshot) {
+        lock.withLock { nextResampleSnapshot = snapshot }
+    }
+
+    func resample(reason _: AudioRouteChangeReason) {
+        let delivery = lock.withLock { () -> (
+            (@Sendable (AudioOutputRouteSnapshot) -> Void)?,
+            AudioOutputRouteSnapshot?
+        ) in
+            resampleCount += 1
+            defer { nextResampleSnapshot = nil }
+            return (handler, nextResampleSnapshot)
+        }
+        if let snapshot = delivery.1 { delivery.0?(snapshot) }
+    }
+
+    var resampleCountSnapshot: Int { lock.withLock { resampleCount } }
 }
 
 final class FakeAudioFormatSupportChecker:

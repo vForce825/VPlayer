@@ -114,18 +114,25 @@ final class DecodeSubmissionBacklog: @unchecked Sendable {
 /// output comes back: the executor can no longer read the session itself.
 private final class SessionIdentityBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var identity: (id: VTSessionID, generation: MediaGeneration)?
+    private var identity: (id: VTSessionID, event: VideoDecoderEventIdentity)?
 
-    func set(id: VTSessionID, generation: MediaGeneration) {
-        lock.withLock { identity = (id, generation) }
+    func set(id: VTSessionID, event: VideoDecoderEventIdentity) {
+        lock.withLock { identity = (id, event) }
     }
 
     func clear() {
         lock.withLock { identity = nil }
     }
 
-    func matches(id: VTSessionID, generation: MediaGeneration) -> Bool {
-        lock.withLock { identity?.id == id && identity?.generation == generation }
+    func matches(id: VTSessionID, event: VideoDecoderEventIdentity) -> Bool {
+        lock.withLock { identity?.id == id && identity?.event == event }
+    }
+
+    func event(for generation: MediaGeneration) -> VideoDecoderEventIdentity? {
+        lock.withLock {
+            guard identity?.event.generation == generation else { return nil }
+            return identity?.event
+        }
     }
 }
 
@@ -143,8 +150,23 @@ final class SubmissionEpoch: @unchecked Sendable {
 
     var value: UInt64 { lock.withLock { current } }
 
-    func bump() {
-        lock.withLock { current &+= 1 }
+    @discardableResult
+    func bump() -> UInt64 {
+        lock.withLock {
+            current &+= 1
+            return current
+        }
+    }
+
+    /// Publishes transition-owned state only while no newer transition has
+    /// begun. Holding the revision lock across publication closes the race
+    /// between a final revision check and a newer transition's immediate fence.
+    func performIfCurrent(_ expected: UInt64, _ body: () -> Void) -> Bool {
+        lock.withLock {
+            guard current == expected else { return false }
+            body()
+            return true
+        }
     }
 }
 
@@ -173,42 +195,43 @@ private final class DecodeCompletionLease: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
     private let accessUnitID: UInt64
-    private let generation: MediaGeneration
+    private let identity: VideoDecoderEventIdentity
     private let executor: PlaybackSerialExecutor
     private let eventSink: @Sendable (VideoDecoderEvent) -> Void
 
     init(
         accessUnitID: UInt64,
-        generation: MediaGeneration,
+        identity: VideoDecoderEventIdentity,
         executor: PlaybackSerialExecutor,
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
     ) {
         self.accessUnitID = accessUnitID
-        self.generation = generation
+        self.identity = identity
         self.executor = executor
         self.eventSink = eventSink
     }
 
-    func schedule() {
-        guard let event = takeEvent() else { return }
+    func schedule(_ disposition: VideoDecoderSubmissionDisposition) {
+        guard let event = takeEvent(disposition) else { return }
         let eventSink = eventSink
         executor.submit { eventSink(event) }
     }
 
     /// Used when output handling is already on the playback executor, so the
     /// completion cannot overtake the frame or failure produced by that output.
-    func deliverIsolated() {
-        guard let event = takeEvent() else { return }
+    func deliverIsolated(_ disposition: VideoDecoderSubmissionDisposition) {
+        guard let event = takeEvent(disposition) else { return }
         eventSink(event)
     }
 
-    private func takeEvent() -> VideoDecoderEvent? {
+    private func takeEvent(_ disposition: VideoDecoderSubmissionDisposition) -> VideoDecoderEvent? {
         lock.withLock {
             guard !completed else { return nil }
             completed = true
             return .submissionCompleted(
                 accessUnitID: accessUnitID,
-                generation: generation
+                identity: identity,
+                disposition: disposition
             )
         }
     }
@@ -240,7 +263,7 @@ private final class DecodeCompletionRegistry: @unchecked Sendable {
         let pending = lock.withLock {
             leases.removeValue(forKey: sessionID).map { Array($0.values) } ?? []
         }
-        for lease in pending { lease.schedule() }
+        for lease in pending { lease.schedule(.cancelled) }
     }
 }
 
@@ -261,12 +284,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private struct ActiveSession {
         let session: any VideoToolboxSession
         let id: VTSessionID
-        let generation: MediaGeneration
+        let identity: VideoDecoderEventIdentity
     }
 
     private struct DecodeToken: @unchecked Sendable {
         let accessUnitID: UInt64
-        let generation: MediaGeneration
+        let identity: VideoDecoderEventIdentity
         let parserMetadata: VideoParserMetadata
     }
 
@@ -382,20 +405,74 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         // reaches the decoder at the next configure rather than immediately.
     }
 
-    public func configure(
-        format: CMVideoFormatDescription,
-        generation: MediaGeneration
-    ) throws {
-        submissionEpoch.bump()
+    /// Starts a native decoder transition without waiting on the submission
+    /// queue. Fencing is applied before enqueue so already queued submissions
+    /// and callbacks cannot cross into the replacement session.
+    public func transition(_ transition: VideoDecoderTransition) {
+        let transitionRevision = submissionEpoch.bump()
         backlog.resumeAfterSessionChange()
-        try submissionQueue.sync {
-            try configureIsolated(format: format, generation: generation)
+        sessionIdentity.clear()
+
+        submissionQueue.async { [self] in
+            let token: VideoDecoderTransitionToken
+            let outcome: VideoDecoderTransitionOutcome
+            switch transition {
+            case let .configure(candidateToken, format, generation):
+                token = candidateToken
+                do {
+                    try configureIsolated(
+                        format: format,
+                        identity: VideoDecoderEventIdentity(
+                            generation: generation,
+                            transitionToken: candidateToken
+                        ),
+                        transitionRevision: transitionRevision
+                    )
+                    outcome = .completed
+                } catch let failure as VideoDecoderFailure {
+                    if submissionEpoch.value == transitionRevision {
+                        invalidateIsolated()
+                    }
+                    outcome = .failed(failure)
+                } catch {
+                    if submissionEpoch.value == transitionRevision {
+                        invalidateIsolated()
+                    }
+                    outcome = .failed(.sessionCreate(kVTVideoDecoderMalfunctionErr))
+                }
+            case let .drainAndInvalidate(drainToken):
+                token = drainToken
+                outcome = drainAndInvalidateIsolated()
+            case let .invalidate(invalidateToken):
+                token = invalidateToken
+                invalidateIsolated()
+                outcome = .completed
+            }
+            executor.submit { [eventSink] in
+                eventSink(.transitionCompleted(token: token, outcome: outcome))
+            }
         }
+    }
+
+    private func drainAndInvalidateIsolated() -> VideoDecoderTransitionOutcome {
+        guard let current = active else { return .completed }
+        var failure: VideoDecoderFailure?
+        let finishStatus = api.finishDelayedFrames(current.session)
+        if finishStatus != noErr {
+            failure = Self.classify(finishStatus).failure
+        }
+        let waitStatus = api.waitForAsynchronousFrames(current.session)
+        if waitStatus != noErr, failure == nil {
+            failure = Self.classify(waitStatus).failure
+        }
+        invalidateIsolated()
+        return failure.map(VideoDecoderTransitionOutcome.failed) ?? .completed
     }
 
     private func configureIsolated(
         format: CMVideoFormatDescription,
-        generation: MediaGeneration
+        identity: VideoDecoderEventIdentity,
+        transitionRevision: UInt64
     ) throws {
         let subtype = CMFormatDescriptionGetMediaSubType(format)
         guard subtype == kCMVideoCodecType_H264 ||
@@ -472,6 +549,21 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         // own they prove nothing: a session that never reported its acceleration
         // and one that reported hardware look identical afterwards. Record what
         // actually came back.
+        var previous: ActiveSession?
+        let installed = submissionEpoch.performIfCurrent(transitionRevision) {
+            previous = active
+            active = ActiveSession(
+                session: candidate,
+                id: candidate.id,
+                identity: identity
+            )
+            sessionIdentity.set(id: candidate.id, event: identity)
+        }
+        guard installed else {
+            api.invalidate(candidate)
+            return
+        }
+
         metrics?.recordDecoderSession(
             summary: Self.sessionSummary(
                 format: format,
@@ -483,14 +575,6 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 hardwareValue: hardware.value
             )
         )
-
-        let previous = active
-        active = ActiveSession(
-            session: candidate,
-            id: candidate.id,
-            generation: generation
-        )
-        sessionIdentity.set(id: candidate.id, generation: generation)
         if let previous {
             completionRegistry.completeAll(sessionID: previous.id)
             submissionWindow.reset(sessionID: previous.id)
@@ -604,15 +688,20 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         _ accessUnit: CompressedVideoAccessUnit,
         flags: VTDecodeFrameFlags
     ) throws {
+        guard let identity = sessionIdentity.event(for: accessUnit.generation) else {
+            throw VideoDecoderFailure.sessionCreate(kVTInvalidSessionErr)
+        }
         let completion = DecodeCompletionLease(
             accessUnitID: accessUnit.id,
-            generation: accessUnit.generation,
+            identity: identity,
             executor: executor,
             eventSink: eventSink
         )
         guard backlog.admit(isRandomAccess: accessUnit.isRandomAccess) == .submit else {
             metrics?.recordVideoDrop(source: .decodeSubmissionBacklog)
-            completion.schedule()
+            // Queue shedding intentionally skips an AU before native admission;
+            // it is not evidence that an accepted decode produced no frame.
+            completion.schedule(.cancelled)
             return
         }
         let epoch = submissionEpoch.value
@@ -624,7 +713,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 metrics?.recordDecodeSubmissionDepth(backlog.maximumDepth)
             }
             guard let self else {
-                completion.schedule()
+                completion.schedule(.cancelled)
                 return
             }
             // The session this unit was meant for has already been torn down;
@@ -632,32 +721,42 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             // references were never sent.
             guard submissionEpoch.value == epoch else {
                 metrics?.recordStaleGenerationDrop()
-                completion.schedule()
+                completion.schedule(.cancelled)
                 return
             }
-            submitIsolated(accessUnit, flags: flags, completion: completion)
+            submitIsolated(
+                accessUnit,
+                identity: identity,
+                flags: flags,
+                completion: completion
+            )
         }
     }
 
     private func submitIsolated(
         _ accessUnit: CompressedVideoAccessUnit,
+        identity: VideoDecoderEventIdentity,
         flags: VTDecodeFrameFlags,
         completion: DecodeCompletionLease
     ) {
-        guard let active, accessUnit.generation == active.generation else {
-            completion.schedule()
+        guard let active, identity == active.identity else {
+            completion.schedule(.cancelled)
             return
         }
         let token = DecodeToken(
             accessUnitID: accessUnit.id,
-            generation: accessUnit.generation,
+            identity: identity,
             parserMetadata: accessUnit.parserMetadata
         )
         let sessionID = active.id
         sampleFramesBeingDecoded(active)
         guard submissionWindow.claim(sessionID: sessionID) else {
-            report(.backpressureTimeout, generation: accessUnit.generation)
-            completion.schedule()
+            report(
+                .backpressureTimeout,
+                accessUnitID: accessUnit.id,
+                identity: identity
+            )
+            completion.schedule(.noFrame)
             return
         }
         let submissionLease = DecodeSubmissionLease { [submissionWindow] in
@@ -700,8 +799,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             metrics?.recordDecoderOutputQueued(outstanding: outstandingOutputs.enter())
             executor.submit { [weak self] in
                 outstandingOutputs.leave()
-                self?.handle(output: output, token: token, sessionID: sessionID)
-                completion.deliverIsolated()
+                let disposition = self?.handle(
+                    output: output,
+                    token: token,
+                    sessionID: sessionID
+                ) ?? .cancelled
+                completion.deliverIsolated(disposition)
             }
         }
         metrics?.recordVideoDecodeSubmission(
@@ -720,8 +823,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     "decode submission failed status=\(status, privacy: .public)"
                 )
             }
-            report(classified.failure, generation: accessUnit.generation)
-            completion.schedule()
+            report(
+                classified.failure,
+                accessUnitID: accessUnit.id,
+                identity: identity
+            )
+            completion.schedule(.noFrame)
             return
         }
     }
@@ -743,52 +850,28 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         metrics?.recordFramesBeingDecoded(Int(count))
     }
 
-    private func report(_ failure: VideoDecoderFailure, generation: MediaGeneration) {
+    private func report(
+        _ failure: VideoDecoderFailure,
+        accessUnitID: UInt64,
+        identity: VideoDecoderEventIdentity
+    ) {
         let eventSink = eventSink
-        executor.submit { eventSink(.submissionFailure(failure, generation: generation)) }
-    }
-
-    /// Flushes, and so waits for units already queued rather than cancelling
-    /// them: a caller asking the decoder to emit what it is holding means the
-    /// ones it has not been handed yet too. Teardown paths follow this with
-    /// `invalidate`, which is where cancellation belongs.
-    public func finishDelayedFrames() throws {
-        try submissionQueue.sync {
-            guard let active else { return }
-            let status = api.finishDelayedFrames(active.session)
-            guard status == noErr else {
-                Self.logger.error(
-                    "finish delayed frames failed status=\(status, privacy: .public)"
-                )
-                throw Self.classify(status).failure
-            }
+        executor.submit {
+            eventSink(.submissionFailure(
+                accessUnitID: accessUnitID,
+                failure: failure,
+                identity: identity
+            ))
         }
     }
 
-    public func waitForAsynchronousFrames() throws {
-        try submissionQueue.sync {
-            guard let active else { return }
-            let status = api.waitForAsynchronousFrames(active.session)
-            guard status == noErr else {
-                Self.logger.error(
-                    "wait for asynchronous frames failed status=\(status, privacy: .public)"
-                )
-                throw Self.classify(status).failure
-            }
-        }
-    }
-
-    public func invalidate() {
-        submissionEpoch.bump()
-        backlog.resumeAfterSessionChange()
+    private func invalidateIsolated() {
         sessionIdentity.clear()
-        submissionQueue.sync {
-            guard let current = active else { return }
-            active = nil
-            completionRegistry.completeAll(sessionID: current.id)
-            submissionWindow.reset(sessionID: current.id)
-            api.invalidate(current.session)
-        }
+        guard let current = active else { return }
+        active = nil
+        completionRegistry.completeAll(sessionID: current.id)
+        submissionWindow.reset(sessionID: current.id)
+        api.invalidate(current.session)
     }
 
     static func sessionSummary(
@@ -841,10 +924,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         output: VTDecodeOutput,
         token: DecodeToken,
         sessionID: VTSessionID
-    ) {
-        guard sessionIdentity.matches(id: sessionID, generation: token.generation) else {
+    ) -> VideoDecoderSubmissionDisposition {
+        guard sessionIdentity.matches(id: sessionID, event: token.identity) else {
             metrics?.recordStaleGenerationDrop()
-            return
+            return .cancelled
         }
 
         guard output.status == noErr else {
@@ -854,20 +937,20 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     "decode callback failed status=\(output.status, privacy: .public) infoFlags=\(output.infoFlags.rawValue, privacy: .public) hasImage=\(output.imageBuffer != nil, privacy: .public)"
                 )
             }
-            emit(classified, generation: token.generation)
-            return
+            emit(classified, identity: token.identity)
+            return .noFrame
         }
         guard let pixelBuffer = output.imageBuffer else {
             if output.infoFlags.contains(.frameDropped)
                 || output.infoFlags.contains(.frameInterrupted) {
                 metrics?.recordVideoDrop(source: .decoderSubmission)
-                return
+                return .noFrame
             }
             emit(
                 Self.classify(kVTVideoDecoderMalfunctionErr),
-                generation: token.generation
+                identity: token.identity
             )
-            return
+            return .noFrame
         }
 
         do {
@@ -875,36 +958,42 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 from: pixelBuffer,
                 compatibilityCheck: compatibilityCheck
             )
-            eventSink(.frame(DecodedVideoFrame(
-                accessUnitID: token.accessUnitID,
-                pixelBuffer: pixelBuffer,
-                presentationTimeStamp: output.presentationTimeStamp,
-                duration: output.duration,
-                generation: token.generation,
-                parserMetadata: token.parserMetadata,
-                formatMetadata: formatMetadata
-            )))
+            eventSink(.frame(
+                DecodedVideoFrame(
+                    accessUnitID: token.accessUnitID,
+                    pixelBuffer: pixelBuffer,
+                    presentationTimeStamp: output.presentationTimeStamp,
+                    duration: output.duration,
+                    generation: token.identity.generation,
+                    parserMetadata: token.parserMetadata,
+                    formatMetadata: formatMetadata
+                ),
+                identity: token.identity
+            ))
+            return .produced
         } catch let failure as VideoDecoderFailure {
             emit(
                 ClassifiedFailure(failure: failure, isRecoverable: false),
-                generation: token.generation
+                identity: token.identity
             )
+            return .noFrame
         } catch {
             emit(
                 ClassifiedFailure(
                     failure: .malfunction(kVTVideoDecoderMalfunctionErr),
                     isRecoverable: false
                 ),
-                generation: token.generation
+                identity: token.identity
             )
+            return .noFrame
         }
     }
 
-    private func emit(_ classified: ClassifiedFailure, generation: MediaGeneration) {
+    private func emit(_ classified: ClassifiedFailure, identity: VideoDecoderEventIdentity) {
         if classified.isRecoverable {
-            eventSink(.recoverableFailure(classified.failure, generation: generation))
+            eventSink(.recoverableFailure(classified.failure, identity: identity))
         } else {
-            eventSink(.fatalFailure(classified.failure, generation: generation))
+            eventSink(.fatalFailure(classified.failure, identity: identity))
         }
     }
 

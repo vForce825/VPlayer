@@ -202,6 +202,277 @@ private func deliverTestFrame(
 final class FFmpegVideoDecoderTests: XCTestCase {
     private let generation = MediaGeneration(rawValue: 2)
 
+    func testFFmpegConfigureTransitionReturnsWhileNativeQueueIsBlocked() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.transition")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.transition.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        let queueBlocked = expectation(description: "native submission queue blocked")
+        let transitionReturned = expectation(description: "transition call returned")
+        let releaseQueue = DispatchSemaphore(value: 0)
+        defer { releaseQueue.signal() }
+        queue.async {
+            queueBlocked.fulfill()
+            releaseQueue.wait()
+        }
+        wait(for: [queueBlocked], timeout: 2)
+
+        let token = VideoDecoderTransitionToken()
+        let format = try makeFormat(fieldCount: 2)
+        let targetGeneration = generation
+        executor.submit {
+            decoder.transition(.configure(
+                token: token,
+                format: format,
+                generation: targetGeneration
+            ))
+            transitionReturned.fulfill()
+        }
+        wait(for: [transitionReturned], timeout: 2)
+        XCTAssertTrue(events.events.isEmpty)
+
+        releaseQueue.signal()
+        queue.sync {}
+        drain(executor)
+
+        XCTAssertEqual(events.events, [
+            .transition(token: token, outcome: .completed),
+        ])
+    }
+
+    func testFFmpegDrainAndInvalidateReturnsWhileQueueBlockedThenFlushesAndDestroys() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.drain")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.drain.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        decoder.transition(.configure(
+            token: VideoDecoderTransitionToken(),
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+
+        let queueBlocked = expectation(description: "native submission queue blocked")
+        let transitionReturned = expectation(description: "drain transition returned")
+        let releaseQueue = DispatchSemaphore(value: 0)
+        defer { releaseQueue.signal() }
+        queue.async {
+            queueBlocked.fulfill()
+            releaseQueue.wait()
+        }
+        wait(for: [queueBlocked], timeout: 2)
+
+        let token = VideoDecoderTransitionToken()
+        executor.submit {
+            decoder.transition(.drainAndInvalidate(token: token))
+            transitionReturned.fulfill()
+        }
+        wait(for: [transitionReturned], timeout: 2)
+        XCTAssertEqual(handle.tokens, [])
+        XCTAssertEqual(handle.destroyCount, 0)
+
+        releaseQueue.signal()
+        queue.sync {}
+        drain(executor)
+
+        XCTAssertEqual(handle.tokens, [0])
+        XCTAssertEqual(handle.destroyCount, 1)
+        XCTAssertEqual(events.events.filter {
+            if case let .transition(eventToken, _) = $0 { return eventToken == token }
+            return false
+        }, [
+            .transition(token: token, outcome: .completed),
+        ])
+    }
+
+    func testFFmpegCompletionIsProducedOnlyWhenPushEntersAUsableFrame() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.disposition")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.disposition.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+
+        handle.handlePush { token in
+            if handle.tokens.count == 1 {
+                deliverTestFrame(token: token, to: captured.receiver)
+            }
+            return .success
+        }
+        try decoder.decode(makeAccessUnit(id: 17), flags: [])
+        try decoder.decode(makeAccessUnit(id: 18), flags: [])
+        queue.sync {}
+        drain(executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(events.events, [
+            .transition(token: configurationToken, outcome: .completed),
+            .frame(accessUnitID: 17, identity: identity),
+            .completed(accessUnitID: 17, identity: identity, disposition: .produced),
+            .completed(accessUnitID: 18, identity: identity, disposition: .noFrame),
+        ])
+    }
+
+    func testFFmpegPushFailureCompletesNoFrameEvenAfterSynchronousOutput() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.failure-disposition")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.failure-disposition.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+        handle.handlePush { token in
+            deliverTestFrame(token: token, to: captured.receiver)
+            return FFmpegVideoPushResult(status: -123, failureToken: token)
+        }
+
+        try decoder.decode(makeAccessUnit(id: 19), flags: [])
+        queue.sync {}
+        drain(executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(events.events, [
+            .transition(token: configurationToken, outcome: .completed),
+            .frame(accessUnitID: 19, identity: identity),
+            .submissionFailure(.badData(-123), identity: identity),
+            .completed(accessUnitID: 19, identity: identity, disposition: .noFrame),
+        ])
+    }
+
+    func testFFmpegPushFailureAfterConcurrentTransitionCompletesCancelledExactlyOnce() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.failure-transition")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.failure-transition.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+
+        handle.pushResult = FFmpegVideoPushResult(status: -123, failureToken: nil)
+        handle.arrangeBlockedPush()
+        try decoder.decode(makeAccessUnit(id: 20), flags: [])
+        XCTAssertTrue(handle.waitUntilPushStarts(timeout: 2))
+
+        let invalidationToken = VideoDecoderTransitionToken()
+        decoder.transition(.invalidate(token: invalidationToken))
+        handle.releaseBlockedPush()
+        queue.sync {}
+        drain(executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(events.events, [
+            .transition(token: configurationToken, outcome: .completed),
+            .completed(accessUnitID: 20, identity: identity, disposition: .cancelled),
+            .transition(token: invalidationToken, outcome: .completed),
+        ])
+    }
+
+    func testFFmpegReorderedOldAUFrameMakesTheCurrentPushProduced() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.reordered")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.reordered.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+        handle.handlePush { _ in
+            let tokens = handle.tokens
+            if tokens.count == 2 {
+                deliverTestFrame(token: tokens[0], to: captured.receiver)
+            }
+            return .success
+        }
+
+        try decoder.decode(makeAccessUnit(id: 21), flags: [])
+        try decoder.decode(makeAccessUnit(id: 22), flags: [])
+        queue.sync {}
+        drain(executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(events.events, [
+            .transition(token: configurationToken, outcome: .completed),
+            .completed(accessUnitID: 21, identity: identity, disposition: .noFrame),
+            .frame(accessUnitID: 21, identity: identity),
+            .completed(accessUnitID: 22, identity: identity, disposition: .produced),
+        ])
+    }
+
     func testLegalYUV420PFixtureIsDeterministicAndDeliveredByLiveBridge() throws {
         let bytes = try fixture(named: "h264-yuv420p-one-frame.h264")
         XCTAssertEqual(bytes.count, 56)
@@ -522,7 +793,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         try decoder.decode(makeAccessUnit(id: 17), flags: [])
         queue.sync {}
@@ -547,7 +818,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         try decoder.decode(makeAccessUnit(id: 19), flags: [])
         queue.sync {}
@@ -574,9 +845,9 @@ final class FFmpegVideoDecoderTests: XCTestCase {
                 switch event {
                 case .submissionFailure:
                     trace.record("failure")
-                case let .submissionCompleted(accessUnitID, _):
+                case let .submissionCompleted(accessUnitID, _, _):
                     trace.record("complete.\(accessUnitID)")
-                case .frame, .recoverableFailure, .fatalFailure:
+                case .frame, .recoverableFailure, .fatalFailure, .transitionCompleted:
                     break
                 }
             },
@@ -584,7 +855,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             submissionQueue: queue,
             submissionStartSink: { trace.record("begin.\($0)") }
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         handle.arrangeBlockedPush()
         try decoder.decode(makeAccessUnit(id: 101), flags: [])
@@ -638,7 +909,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         try decoder.decode(makeAccessUnit(id: 111), flags: [])
         queue.sync {}
@@ -672,7 +943,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         let releaseExecutor = DispatchSemaphore(value: 0)
         executor.submit { releaseExecutor.wait() }
@@ -730,10 +1001,18 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         )
     }
 
-    func testFailureNamingAlreadyClaimedTokenDoesNotPermitItsFrame() throws {
+    func testFailureNamingAlreadyClaimedTokenPermitsOnlyItsExactFrame() throws {
         XCTAssertEqual(
             try eventsAfterOrdinaryFailure { $0[0] },
-            ordinaryFailureEventsWithoutFrame
+            [
+                .completed(accessUnitID: 201, generation: generation),
+                .frame(accessUnitID: 201),
+                .submissionFailure(
+                    .badData(kVTVideoDecoderUnsupportedDataFormatErr),
+                    generation: generation
+                ),
+                .completed(accessUnitID: 202, generation: generation),
+            ]
         )
     }
 
@@ -750,13 +1029,13 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             submissionQueue: queue
         )
         let format = try makeFormat(fieldCount: 2)
-        try decoder.configure(format: format, generation: generation)
+        try configure(decoder, format: format, queue: queue, executor: executor)
         try decoder.decode(makeAccessUnit(id: 160), flags: [])
         queue.sync {}
         drain(executor)
         let oldToken = try XCTUnwrap(handle.tokens.first)
 
-        try decoder.configure(format: format, generation: generation)
+        try configure(decoder, format: format, queue: queue, executor: executor)
         try decoder.decode(makeAccessUnit(id: 161), flags: [])
         queue.sync {}
         drain(executor)
@@ -788,18 +1067,12 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         ])
     }
 
-    func testDelayedFailureWithMatchingPendingTokenPermitsClaimedFrame() throws {
-        XCTAssertEqual(
-            try eventsAfterDelayedFailure { $0[1] },
-            delayedFailureEvents(includeFrame: true)
-        )
+    func testDrainFailureWithMatchingOldTokenFencesClaimedFrameAtTransition() throws {
+        try assertDrainFailureFencesClaimedFrame { $0[1] }
     }
 
-    func testDelayedFailureWithoutTokenDoesNotPermitClaimedFrame() throws {
-        XCTAssertEqual(
-            try eventsAfterDelayedFailure { _ in nil },
-            delayedFailureEvents(includeFrame: false)
-        )
+    func testDrainFailureWithoutTokenFencesClaimedFrameAtTransition() throws {
+        try assertDrainFailureFencesClaimedFrame { _ in nil }
     }
 
     func testClaimedFrameIsCancelledBySameGenerationReconfigure() throws {
@@ -815,7 +1088,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             submissionQueue: queue
         )
         let format = try makeFormat(fieldCount: 2)
-        try decoder.configure(format: format, generation: generation)
+        try configure(decoder, format: format, queue: queue, executor: executor)
         let oldReceiver = try XCTUnwrap(captured.receiver)
         try decoder.decode(makeAccessUnit(id: 141), flags: [])
         queue.sync {}
@@ -824,7 +1097,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         let releaseExecutor = DispatchSemaphore(value: 0)
         executor.submit { releaseExecutor.wait() }
         deliverTestFrame(token: try XCTUnwrap(handle.tokens.first), to: oldReceiver)
-        try decoder.configure(format: format, generation: generation)
+        enqueueConfigure(decoder, format: format, queue: queue)
         releaseExecutor.signal()
         drain(executor)
 
@@ -845,7 +1118,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
         let oldReceiver = try XCTUnwrap(captured.receiver)
         try decoder.decode(makeAccessUnit(id: 142), flags: [])
         queue.sync {}
@@ -854,7 +1127,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         let releaseExecutor = DispatchSemaphore(value: 0)
         executor.submit { releaseExecutor.wait() }
         deliverTestFrame(token: try XCTUnwrap(handle.tokens.first), to: oldReceiver)
-        decoder.invalidate()
+        enqueueInvalidate(decoder, queue: queue)
         releaseExecutor.signal()
         drain(executor)
 
@@ -876,7 +1149,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             submissionQueue: queue
         )
         let format = try makeFormat(fieldCount: 2)
-        try decoder.configure(format: format, generation: generation)
+        try configure(decoder, format: format, queue: queue, executor: executor)
 
         try decoder.decode(makeAccessUnit(id: 150), flags: [])
         queue.sync {}
@@ -895,7 +1168,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         }
         try decoder.decode(makeAccessUnit(id: 151), flags: [])
         queue.sync {}
-        try decoder.configure(format: format, generation: generation)
+        enqueueConfigure(decoder, format: format, queue: queue)
         releaseExecutor.signal()
         drain(executor)
 
@@ -921,7 +1194,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         try decoder.decode(makeAccessUnit(id: 151), flags: [])
         queue.sync {}
@@ -940,7 +1213,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         }
         try decoder.decode(makeAccessUnit(id: 152), flags: [])
         queue.sync {}
-        decoder.invalidate()
+        enqueueInvalidate(decoder, queue: queue)
         releaseExecutor.signal()
         drain(executor)
 
@@ -966,7 +1239,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         let releaseQueue = DispatchSemaphore(value: 0)
         queue.async { releaseQueue.wait() }
@@ -1002,7 +1275,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             )))
         )
 
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
         try decoder.decode(makeAccessUnit(id: 66), flags: [])
         queue.sync {}
         drain(executor)
@@ -1027,7 +1300,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         let claimedID = UInt64(301)
         try decoder.decode(makeAccessUnit(id: claimedID), flags: [])
@@ -1087,40 +1360,6 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         )
     }
 
-    func testUnsupportedDelayedFramePushRetiresSession() throws {
-        let captured = CapturedReceiver()
-        let handle = FakeFFmpegVideoDecoderHandle()
-        handle.pushResult = FFmpegVideoPushResult(
-            status: Int32(VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT),
-            failureToken: nil
-        )
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.flush-failure")
-        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.flush-failure.submit")
-        let events = FFmpegEventRecorder()
-        let decoder = FFmpegVideoDecoder(
-            executor: executor,
-            eventSink: { events.record($0) },
-            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
-            submissionQueue: queue
-        )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
-
-        try decoder.finishDelayedFrames()
-        try decoder.decode(makeAccessUnit(id: 131), flags: [])
-        queue.sync {}
-        drain(executor)
-
-        XCTAssertEqual(handle.tokens, [0])
-        XCTAssertEqual(handle.destroyCount, 1)
-        XCTAssertEqual(events.events, [
-            .submissionFailure(
-                .badData(kVTVideoDecoderUnsupportedDataFormatErr),
-                generation: generation
-            ),
-            .completed(accessUnitID: 131, generation: generation),
-        ])
-    }
-
     func testQueuedUnitFromReplacedSameGenerationSessionOnlyCompletes() throws {
         let captured = CapturedReceiver()
         let handle = FakeFFmpegVideoDecoderHandle()
@@ -1136,7 +1375,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             sessionTransitionSink: { _ in transitioned.signal() }
         )
         let format = try makeFormat(fieldCount: 2)
-        try decoder.configure(format: format, generation: generation)
+        try configure(decoder, format: format, queue: queue, executor: executor)
         XCTAssertEqual(transitioned.wait(timeout: .now()), .success)
 
         let releaseQueue = DispatchSemaphore(value: 0)
@@ -1145,21 +1384,14 @@ final class FFmpegVideoDecoderTests: XCTestCase {
 
         // Replacing the decoder without advancing the media generation still
         // starts a new reference chain. The queued old unit must not enter it.
-        let configureResult = LockedTestError()
-        let configured = DispatchSemaphore(value: 0)
-        let targetGeneration = generation
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try decoder.configure(format: format, generation: targetGeneration)
-            } catch {
-                configureResult.store(error)
-            }
-            configured.signal()
-        }
+        let replacementToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: replacementToken,
+            format: format,
+            generation: generation
+        ))
         XCTAssertEqual(transitioned.wait(timeout: .now() + 2), .success)
         releaseQueue.signal()
-        XCTAssertEqual(configured.wait(timeout: .now() + 2), .success)
-        XCTAssertNil(configureResult.error)
         queue.sync {}
         drain(executor)
 
@@ -1167,6 +1399,50 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         XCTAssertEqual(events.events, [
             .completed(accessUnitID: 23, generation: generation),
         ])
+    }
+
+    func testUnsupportedReconfigureDestroysPreviousSessionAndLeavesNoActiveHandle() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.unsupported-reconfigure")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.unsupported-reconfigure.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        try configure(
+            decoder,
+            format: makeFormat(fieldCount: 2),
+            queue: queue,
+            executor: executor
+        )
+        let token = VideoDecoderTransitionToken()
+
+        decoder.transition(.configure(
+            token: token,
+            format: try makeFormat(
+                fieldCount: 2,
+                codecType: kCMVideoCodecType_HEVC
+            ),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+
+        XCTAssertEqual(handle.destroyCount, 1)
+        XCTAssertTrue(events.events.contains(.transition(
+            token: token,
+            outcome: .failed(.sessionCreate(kVTVideoDecoderUnsupportedDataFormatErr))
+        )))
+        XCTAssertThrowsError(try decoder.decode(makeAccessUnit(id: 24), flags: [])) { error in
+            XCTAssertEqual(error as? VideoDecoderFailure, .sessionCreate(kVTInvalidSessionErr))
+        }
+
+        invalidate(decoder, queue: queue, executor: executor)
+        XCTAssertEqual(handle.destroyCount, 1, "failed configure must not leave an active handle")
     }
 
     func testSessionReplacementSerializesDestroyAfterInProgressPush() throws {
@@ -1184,34 +1460,25 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             sessionTransitionSink: { _ in transitioned.signal() }
         )
         let format = try makeFormat(fieldCount: 2)
-        try decoder.configure(format: format, generation: generation)
+        try configure(decoder, format: format, queue: queue, executor: executor)
         XCTAssertEqual(transitioned.wait(timeout: .now()), .success)
 
         handle.arrangeBlockedPush()
         try decoder.decode(makeAccessUnit(id: 31), flags: [])
         XCTAssertTrue(handle.waitUntilPushStarts(timeout: 2))
 
-        let configureResult = LockedTestError()
-        let configured = DispatchSemaphore(value: 0)
-        let targetGeneration = generation
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try decoder.configure(format: format, generation: targetGeneration)
-            } catch {
-                configureResult.store(error)
-            }
-            configured.signal()
-        }
+        decoder.transition(.configure(
+            token: VideoDecoderTransitionToken(),
+            format: format,
+            generation: generation
+        ))
         XCTAssertEqual(transitioned.wait(timeout: .now() + 2), .success)
 
         // The epoch changes immediately, but teardown stays behind the active
         // push on the submission queue.
-        XCTAssertEqual(configured.wait(timeout: .now() + 0.05), .timedOut)
         XCTAssertFalse(handle.hadConcurrentDestroy)
 
         handle.releaseBlockedPush()
-        XCTAssertEqual(configured.wait(timeout: .now() + 2), .success)
-        XCTAssertNil(configureResult.error)
         queue.sync {}
         drain(executor)
 
@@ -1224,7 +1491,8 @@ final class FFmpegVideoDecoderTests: XCTestCase {
     func testRoutingDecoderRejectsDecodeWhenNoRouteIsConfigured() throws {
         let decoder = RoutingVideoDecoder(
             videoToolbox: FakeVideoDecoder(),
-            ffmpeg: FakeVideoDecoder()
+            ffmpeg: FakeVideoDecoder(),
+            eventSink: { _ in }
         )
 
         XCTAssertThrowsError(try decoder.decode(makeAccessUnit(id: 29), flags: [])) { error in
@@ -1233,6 +1501,230 @@ final class FFmpegVideoDecoderTests: XCTestCase {
                 .sessionCreate(kVTInvalidSessionErr)
             )
         }
+    }
+
+    func testRoutingChildRelayActivatesSelectedRouteWithoutManualReceive() throws {
+        let childRelay = RoutingVideoDecoderChildRelay()
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { events.record($0) }
+        )
+        childRelay.install(decoder)
+        videoToolbox.setTransitionEventSink(automaticallyCompletes: false) {
+            childRelay.receive($0, from: .videoToolbox)
+        }
+        ffmpeg.setTransitionEventSink(automaticallyCompletes: false) {
+            childRelay.receive($0, from: .ffmpeg)
+        }
+
+        let token = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: token,
+            format: try makeFormat(fieldCount: 1),
+            generation: generation
+        ))
+        videoToolbox.completeTransition(token: token, outcome: .completed)
+        try decoder.decode(makeAccessUnit(id: 30), flags: [])
+
+        XCTAssertEqual(videoToolbox.decodedAccessUnitIDs(generation: generation), [30])
+        XCTAssertEqual(events.events, [
+            .transition(token: token, outcome: .completed),
+        ])
+    }
+
+    func testRoutingRouteRemainsInactiveUntilMatchingChildTransitionCompletes() throws {
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { events.record($0) }
+        )
+        let token = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: token,
+            format: try makeFormat(fieldCount: 1),
+            generation: generation
+        ))
+
+        XCTAssertEqual(videoToolbox.snapshot(), [
+            .transitionConfigure(token, generation),
+        ])
+        XCTAssertThrowsError(try decoder.decode(makeAccessUnit(id: 30), flags: []))
+        XCTAssertTrue(events.events.isEmpty)
+
+        decoder.receive(
+            .transitionCompleted(token: token, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        XCTAssertNoThrow(try decoder.decode(makeAccessUnit(id: 30), flags: []))
+        XCTAssertEqual(events.events, [
+            .transition(token: token, outcome: .completed),
+        ])
+    }
+
+    func testRoutingSameGenerationOldRouteDropsMediaButCancelsAcceptedCompletion() throws {
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { events.record($0) }
+        )
+        let videoToolboxToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: videoToolboxToken,
+            format: try makeFormat(fieldCount: 1),
+            generation: generation
+        ))
+        decoder.receive(
+            .transitionCompleted(token: videoToolboxToken, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        let ffmpegToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: ffmpegToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        let oldIdentity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: videoToolboxToken
+        )
+        let oldFrame = VideoTestFactories.decodedFrame(
+            id: 31,
+            pixelBuffer: try VideoTestFactories.pixelBuffer(
+                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            ),
+            presentationTimeStamp: CMTime(value: 31, timescale: 25),
+            duration: CMTime(value: 1, timescale: 25),
+            generation: generation,
+            parserMetadata: makeAccessUnit(id: 31).parserMetadata
+        )
+        decoder.receive(.frame(oldFrame, identity: oldIdentity), from: .videoToolbox)
+        decoder.receive(
+            .submissionFailure(
+                accessUnitID: 31,
+                failure: .badData(-31),
+                identity: oldIdentity
+            ),
+            from: .videoToolbox
+        )
+        decoder.receive(
+            .submissionCompleted(
+                accessUnitID: 31,
+                identity: oldIdentity,
+                disposition: .noFrame
+            ),
+            from: .videoToolbox
+        )
+
+        XCTAssertThrowsError(try decoder.decode(makeAccessUnit(id: 32), flags: []))
+        decoder.receive(
+            .transitionCompleted(token: ffmpegToken, outcome: .completed),
+            from: .ffmpeg
+        )
+        XCTAssertNoThrow(try decoder.decode(makeAccessUnit(id: 32), flags: []))
+
+        XCTAssertEqual(events.events, [
+            .transition(token: videoToolboxToken, outcome: .completed),
+            .completed(accessUnitID: 31, identity: oldIdentity, disposition: .cancelled),
+            .transition(token: ffmpegToken, outcome: .completed),
+        ])
+        XCTAssertEqual(ffmpeg.snapshot().first, .transitionConfigure(ffmpegToken, generation))
+    }
+
+    func testRoutingParserRequiresFFmpegTransitionOnlyAtInterlacedRandomAccess() throws {
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { _ in }
+        )
+        let format = try makeFormat(fieldCount: 1)
+        let initialToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: initialToken,
+            format: format,
+            generation: generation
+        ))
+        decoder.receive(
+            .transitionCompleted(token: initialToken, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        func accessUnit(
+            id: UInt64,
+            randomAccess: Bool,
+            interlaced: Bool
+        ) -> CompressedVideoAccessUnit {
+            let base = makeAccessUnit(id: id)
+            return CompressedVideoAccessUnit(
+                id: id,
+                sampleBuffer: base.sampleBuffer,
+                generation: base.generation,
+                isRandomAccess: randomAccess,
+                parserMetadata: VideoParserMetadata(
+                    fieldOrder: interlaced ? .tt : .progressive,
+                    pictureStructure: .frame,
+                    isInterlaced: interlaced,
+                    repeatFirstField: false,
+                    topFieldFirst: interlaced ? true : nil,
+                    sourcePTS90k: nil
+                )
+            )
+        }
+
+        XCTAssertNil(decoder.transitionRequirement(for: accessUnit(
+            id: 40,
+            randomAccess: false,
+            interlaced: true
+        )))
+        XCTAssertNil(decoder.transitionRequirement(for: accessUnit(
+            id: 41,
+            randomAccess: true,
+            interlaced: false
+        )))
+
+        let triggeringRandomAccess = accessUnit(
+            id: 42,
+            randomAccess: true,
+            interlaced: true
+        )
+        XCTAssertEqual(
+            decoder.transitionRequirement(for: triggeringRandomAccess),
+            .reconfigure
+        )
+        let ffmpegToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: ffmpegToken,
+            format: format,
+            generation: generation
+        ))
+
+        XCTAssertEqual(ffmpeg.snapshot().first, .transitionConfigure(ffmpegToken, generation))
+        XCTAssertThrowsError(try decoder.decode(triggeringRandomAccess, flags: []))
+
+        decoder.receive(
+            .transitionCompleted(token: ffmpegToken, outcome: .completed),
+            from: .ffmpeg
+        )
+        XCTAssertNoThrow(try decoder.decode(triggeringRandomAccess, flags: []))
+        XCTAssertEqual(ffmpeg.snapshot().filter { operation in
+            guard case let .decode(id, decodedGeneration, _) = operation else {
+                return false
+            }
+            return id == triggeringRandomAccess.id && decodedGeneration == generation
+        }.count, 1)
     }
 
     func testPlanarChromaIsInterleavedIntoOneBiPlanarSurfaceAtHalfGeometry() throws {
@@ -1252,7 +1744,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             submissionQueue: queue
         )
 
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
         try decoder.decode(
             makeAccessUnit(id: 7),
             flags: VTDecodeFrameFlags()
@@ -1356,6 +1848,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
     func testFrameForAnUnknownTokenIsDropped() throws {
         let captured = CapturedReceiver()
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.stale")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.stale.submit")
         let frames = FrameRecorder()
         let decoder = FFmpegVideoDecoder(
             executor: executor,
@@ -1364,9 +1857,9 @@ final class FFmpegVideoDecoderTests: XCTestCase {
                 captured: captured,
                 handle: FakeFFmpegVideoDecoderHandle()
             ),
-            submissionQueue: DispatchQueue(label: "org.vplayer.tests.ffmpeg.stale.submit")
+            submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
 
         var pixels = [UInt8](repeating: 0, count: 16 * 8 * 2)
         pixels.withUnsafeMutableBufferPointer { buffer in
@@ -1416,7 +1909,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
         try decoder.decode(makeAccessUnit(id: 201), flags: [])
         queue.sync {}
         drain(executor)
@@ -1439,36 +1932,21 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         return events.events
     }
 
-    private func delayedFailureEvents(includeFrame: Bool) -> [RecordedFFmpegDecoderEvent] {
-        var values: [RecordedFFmpegDecoderEvent] = [
-            .completed(accessUnitID: 211, generation: generation),
-            .completed(accessUnitID: 212, generation: generation),
-        ]
-        if includeFrame {
-            values.append(.frame(accessUnitID: 211))
-        }
-        values.append(.submissionFailure(
-            .badData(kVTVideoDecoderUnsupportedDataFormatErr),
-            generation: generation
-        ))
-        return values
-    }
-
-    private func eventsAfterDelayedFailure(
+    private func assertDrainFailureFencesClaimedFrame(
         failureToken: @escaping @Sendable ([Int64]) -> Int64?
-    ) throws -> [RecordedFFmpegDecoderEvent] {
+    ) throws {
         let captured = CapturedReceiver()
         let handle = FakeFFmpegVideoDecoderHandle()
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.delayed-token")
         let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.delayed-token.submit")
-        let events = FFmpegEventRecorder()
+        let events = DetailedFFmpegEventRecorder()
         let decoder = FFmpegVideoDecoder(
             executor: executor,
             eventSink: { events.record($0) },
             api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
             submissionQueue: queue
         )
-        try decoder.configure(format: try makeFormat(fieldCount: 2), generation: generation)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
         try decoder.decode(makeAccessUnit(id: 211), flags: [])
         try decoder.decode(makeAccessUnit(id: 212), flags: [])
         queue.sync {}
@@ -1486,10 +1964,33 @@ final class FFmpegVideoDecoderTests: XCTestCase {
                 failureToken: failureToken(pendingTokens)
             )
         }
-        try decoder.finishDelayedFrames()
+        let transitionToken = VideoDecoderTransitionToken()
+        decoder.transition(.drainAndInvalidate(token: transitionToken))
+        queue.sync {}
         releaseExecutor.signal()
         drain(executor)
-        return events.events
+
+        XCTAssertEqual(events.events.compactMap { event -> UInt64? in
+            guard case let .completed(accessUnitID, _, _) = event else { return nil }
+            return accessUnitID
+        }, [211, 212])
+        XCTAssertFalse(events.events.contains { event in
+            if case .frame = event { return true }
+            return false
+        })
+        XCTAssertFalse(events.events.contains { event in
+            if case .submissionFailure = event { return true }
+            return false
+        })
+        XCTAssertEqual(events.events.filter { event in
+            guard case let .transition(token, _) = event else { return false }
+            return token == transitionToken
+        }, [
+            .transition(
+                token: transitionToken,
+                outcome: .failed(.badData(kVTVideoDecoderUnsupportedDataFormatErr))
+            ),
+        ])
     }
 
     private func fixture(named name: String) throws -> Data {
@@ -1603,7 +2104,50 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         wait(for: [completed], timeout: 2)
     }
 
-    private func makeFormat(fieldCount: Int?) throws -> CMVideoFormatDescription {
+    private func configure(
+        _ decoder: FFmpegVideoDecoder,
+        format: CMVideoFormatDescription,
+        queue: DispatchQueue,
+        executor: PlaybackSerialExecutor
+    ) throws {
+        enqueueConfigure(decoder, format: format, queue: queue)
+        drain(executor)
+    }
+
+    private func enqueueConfigure(
+        _ decoder: FFmpegVideoDecoder,
+        format: CMVideoFormatDescription,
+        queue: DispatchQueue
+    ) {
+        decoder.transition(.configure(
+            token: VideoDecoderTransitionToken(),
+            format: format,
+            generation: generation
+        ))
+        queue.sync {}
+    }
+
+    private func invalidate(
+        _ decoder: FFmpegVideoDecoder,
+        queue: DispatchQueue,
+        executor: PlaybackSerialExecutor
+    ) {
+        enqueueInvalidate(decoder, queue: queue)
+        drain(executor)
+    }
+
+    private func enqueueInvalidate(
+        _ decoder: FFmpegVideoDecoder,
+        queue: DispatchQueue
+    ) {
+        decoder.transition(.invalidate(token: VideoDecoderTransitionToken()))
+        queue.sync {}
+    }
+
+    private func makeFormat(
+        fieldCount: Int?,
+        codecType: CMVideoCodecType = kCMVideoCodecType_H264
+    ) throws -> CMVideoFormatDescription {
         var extensions: [CFString: Any] = [
             kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
             kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
@@ -1615,7 +2159,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         var format: CMVideoFormatDescription?
         let status = CMVideoFormatDescriptionCreate(
             allocator: nil,
-            codecType: kCMVideoCodecType_H264,
+            codecType: codecType,
             width: 16,
             height: 8,
             extensions: extensions as CFDictionary,
@@ -1632,6 +2176,51 @@ private enum RecordedFFmpegDecoderEvent: Equatable {
     case frame(accessUnitID: UInt64)
 }
 
+private enum DetailedFFmpegDecoderEvent: Sendable, Equatable {
+    case transition(
+        token: VideoDecoderTransitionToken,
+        outcome: VideoDecoderTransitionOutcome
+    )
+    case frame(accessUnitID: UInt64, identity: VideoDecoderEventIdentity)
+    case submissionFailure(VideoDecoderFailure, identity: VideoDecoderEventIdentity)
+    case completed(
+        accessUnitID: UInt64,
+        identity: VideoDecoderEventIdentity,
+        disposition: VideoDecoderSubmissionDisposition
+    )
+}
+
+private final class DetailedFFmpegEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [DetailedFFmpegDecoderEvent] = []
+
+    func record(_ event: VideoDecoderEvent) {
+        let recorded: DetailedFFmpegDecoderEvent?
+        switch event {
+        case let .transitionCompleted(token, outcome):
+            recorded = .transition(token: token, outcome: outcome)
+        case let .frame(frame, identity):
+            recorded = .frame(accessUnitID: frame.accessUnitID, identity: identity)
+        case let .submissionFailure(_, failure, identity):
+            recorded = .submissionFailure(failure, identity: identity)
+        case let .submissionCompleted(accessUnitID, identity, disposition):
+            recorded = .completed(
+                accessUnitID: accessUnitID,
+                identity: identity,
+                disposition: disposition
+            )
+        case .recoverableFailure, .fatalFailure:
+            recorded = nil
+        }
+        guard let recorded else { return }
+        lock.withLock { storage.append(recorded) }
+    }
+
+    var events: [DetailedFFmpegDecoderEvent] {
+        lock.withLock { storage }
+    }
+}
+
 private final class FFmpegEventRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [RecordedFFmpegDecoderEvent] = []
@@ -1639,13 +2228,13 @@ private final class FFmpegEventRecorder: @unchecked Sendable {
     func record(_ event: VideoDecoderEvent) {
         let recorded: RecordedFFmpegDecoderEvent?
         switch event {
-        case let .submissionFailure(failure, generation):
-            recorded = .submissionFailure(failure, generation: generation)
-        case let .submissionCompleted(accessUnitID, generation):
-            recorded = .completed(accessUnitID: accessUnitID, generation: generation)
-        case let .frame(frame):
+        case let .submissionFailure(_, failure, identity):
+            recorded = .submissionFailure(failure, generation: identity.generation)
+        case let .submissionCompleted(accessUnitID, identity, _):
+            recorded = .completed(accessUnitID: accessUnitID, generation: identity.generation)
+        case let .frame(frame, _):
             recorded = .frame(accessUnitID: frame.accessUnitID)
-        case .recoverableFailure, .fatalFailure:
+        case .recoverableFailure, .fatalFailure, .transitionCompleted:
             recorded = nil
         }
         guard let recorded else { return }
@@ -1684,7 +2273,7 @@ private final class FrameRecorder: @unchecked Sendable {
     private var frames: [DecodedVideoFrame] = []
 
     func record(_ event: VideoDecoderEvent) {
-        guard case let .frame(frame) = event else { return }
+        guard case let .frame(frame, _) = event else { return }
         lock.lock()
         frames.append(frame)
         lock.broadcast()

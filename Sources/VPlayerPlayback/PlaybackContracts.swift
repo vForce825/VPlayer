@@ -33,48 +33,44 @@ public struct PlaybackRequest: Identifiable, Equatable, Sendable {
     }
 }
 
+public enum PlaybackRetryDisposition: Equatable, Sendable {
+    case retrySameRequest
+    case chooseAnotherChannel
+    case doNotRetry
+}
+
 public struct PlaybackFailure: Error, Equatable, Sendable {
     public let code: String
     public let userMessage: String
     public let diagnosticCode: String?
+    public let retryDisposition: PlaybackRetryDisposition
 
     public init(
         code: String,
         userMessage: String,
-        diagnosticCode: String? = nil
+        diagnosticCode: String? = nil,
+        retryDisposition: PlaybackRetryDisposition = .retrySameRequest
     ) {
         self.code = code
         self.userMessage = userMessage
         self.diagnosticCode = diagnosticCode
+        self.retryDisposition = retryDisposition
     }
 }
 
 public enum PlaybackState: Equatable, Sendable {
     case idle
     case preparing(PlaybackRequest)
+    case buffering(PlaybackRequest)
+    case recovering(PlaybackRequest)
     case playing(PlaybackRequest)
     case paused(PlaybackRequest)
     case stopped
     case failed(PlaybackFailure)
 }
 
-public struct PlaybackNotice: Identifiable, Equatable, Sendable {
-    public let id: String
-    public let message: String
-    public let duration: Duration
-    public let isFocusStealing: Bool
-
-    public init(id: String, message: String, duration: Duration, isFocusStealing: Bool) {
-        self.id = id
-        self.message = message
-        self.duration = duration
-        self.isFocusStealing = isFocusStealing
-    }
-}
-
 public protocol PlaybackEngine: Actor {
     func events() -> AsyncStream<PlaybackState>
-    func notices() -> AsyncStream<PlaybackNotice>
     func play(_ request: PlaybackRequest) async
     func setPaused(_ paused: Bool) async
     func stop() async

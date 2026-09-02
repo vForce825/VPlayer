@@ -12,14 +12,15 @@ final class CompressedVideoAssembler {
     private let generationProvider: () -> MediaGeneration
     private let eventSink: (VideoAssemblerEvent) -> Void
     private let parserFactory: any FFmpegParserFactory
+    private let binding: AssemblyEpochBinding
     private let formatState: AssemblyFormatState
-    private var tracks: DemuxTrackSet
-    private var descriptor: VideoTrackDescriptor
+    private let descriptor: VideoTrackDescriptor
     private var parser: (any FFmpegParserHandle)?
     private var nextID: UInt64?
     private var parameterSets: [Data] = []
     private var formatDescription: CMVideoFormatDescription?
     private var emittedFingerprint: MediaFormatFingerprint?
+    private var parserOperationID: AssemblyOperationID?
 
     init(
         trackSet: DemuxTrackSet,
@@ -27,19 +28,22 @@ final class CompressedVideoAssembler {
         eventSink: @escaping (VideoAssemblerEvent) -> Void,
         parserFactory: any FFmpegParserFactory = LiveFFmpegParserFactory(),
         formatState: AssemblyFormatState,
+        binding: AssemblyEpochBinding = .standalone(),
         startingID: UInt64 = 1
     ) throws {
         guard let descriptor = trackSet.video else {
             throw PlaybackCoreError.videoDecode(Self.invalidInputErrorCode)
         }
-        self.tracks = trackSet
         self.descriptor = descriptor
         self.generationProvider = generationProvider
         self.eventSink = eventSink
         self.parserFactory = parserFactory
         self.formatState = formatState
+        self.binding = binding
         nextID = startingID
-        parser = try makeParser(for: descriptor)
+        let operationID = try currentOperationID()
+        parserOperationID = operationID
+        parser = try makeParser(for: descriptor, operationID: operationID)
         try prepareExtradata(descriptor.extradata)
     }
 
@@ -48,6 +52,7 @@ final class CompressedVideoAssembler {
     }
 
     func push(_ packet: DemuxPacket) throws {
+        try ensureParserIsCurrent()
         guard packet.streamIndex == descriptor.streamIndex,
               packet.codec == .video(descriptor.codec),
               !packet.data.isEmpty else {
@@ -60,33 +65,36 @@ final class CompressedVideoAssembler {
     }
 
     func drain() throws {
+        try ensureParserIsCurrent()
         try parser?.drain()
     }
 
-    func reset(for trackSet: DemuxTrackSet) throws {
-        guard let descriptor = trackSet.video else {
-            throw PlaybackCoreError.videoDecode(Self.invalidInputErrorCode)
-        }
-        parser?.destroy()
-        parser = nil
-        tracks = trackSet
-        self.descriptor = descriptor
-        formatState.resetVideo(for: trackSet)
-        parser = try makeParser(for: descriptor)
-        parameterSets = []
-        formatDescription = nil
-        emittedFingerprint = nil
-        try prepareExtradata(descriptor.extradata)
-    }
-
     private func makeParser(
-        for descriptor: VideoTrackDescriptor
+        for descriptor: VideoTrackDescriptor,
+        operationID: AssemblyOperationID
     ) throws -> any FFmpegParserHandle {
         try parserFactory.makeParser(configuration: FFmpegParserConfiguration(video: descriptor)) {
             [weak self] frame in
-            guard let self else { return }
+            guard let self, binding.accepts(operationID) else { return }
             try receive(frame)
         }
+    }
+
+    private func currentOperationID() throws -> AssemblyOperationID {
+        guard let operationID = binding.currentOperationID() else {
+            throw PlaybackCoreError.videoDecode(Self.invalidInputErrorCode)
+        }
+        return operationID
+    }
+
+    private func ensureParserIsCurrent() throws {
+        let operationID = try currentOperationID()
+        guard parserOperationID != operationID else { return }
+        parser?.destroy()
+        parser = nil
+        parserOperationID = operationID
+        parser = try makeParser(for: descriptor, operationID: operationID)
+        try prepareExtradata(descriptor.extradata)
     }
 
     private func receive(_ frame: FFmpegParsedFrame) throws {

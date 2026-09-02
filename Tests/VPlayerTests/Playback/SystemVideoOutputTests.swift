@@ -8,6 +8,38 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SystemVideoOutputTests: XCTestCase {
+    func testPerformanceMetricsRefreshIsSingleFlightAndFeedsSharedCollector() throws {
+        let backend = FakeVideoRendererBackend()
+        let metrics = PlaybackMetrics(channelID: "renderer-native-metrics", now: { 1 })
+        let harness = makeHarness(backend: backend, metrics: metrics)
+
+        harness.output.refreshPerformanceMetrics()
+        harness.output.refreshPerformanceMetrics()
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.performanceMetricsRequestCount, 1)
+
+        backend.completePerformanceMetrics(
+            VideoRendererPerformanceSnapshot(
+                totalFrameCount: 12,
+                droppedFrameCount: 2,
+                corruptedFrameCount: 1,
+                optimizedFrameCount: 9,
+                accumulatedFrameDelaySeconds: 0.125
+            )
+        )
+        harness.output.waitUntilIdleForTesting()
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.videoRendererMetricsSampleCount, 1)
+        XCTAssertEqual(snapshot.videoRendererTotalFrameCount, 12)
+        XCTAssertEqual(snapshot.videoRendererDroppedFrameCount, 2)
+        XCTAssertEqual(
+            snapshot.videoRendererAccumulatedFrameDelayMilliseconds,
+            125,
+            accuracy: 0.000_001
+        )
+    }
+
     func testBackpressureKeepsSingleRequestArmedAndDrainsInTimestampOrder() throws {
         let backend = FakeVideoRendererBackend()
         backend.ready = false
@@ -298,6 +330,33 @@ final class SystemVideoOutputTests: XCTestCase {
         XCTAssertEqual(removal.requestCount, 2)
     }
 
+    func testResetFlushDeadlineFailsExactlyOnceAndFencesLateCompletion() async throws {
+        let backend = FakeVideoRendererBackend()
+        let harness = makeHarness(backend: backend)
+        let result = VideoResetResultBox()
+        let completed = expectation(description: "刷新超时完成")
+
+        harness.output.reset(.init(
+            generation: MediaGeneration(rawValue: 1),
+            reason: .timelineDiscontinuity,
+            removeDisplayedImage: true,
+            seedFrames: []
+        )) { value in
+            result.record(value)
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 3)
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(
+            result.error,
+            .videoRendererFailed("renderer.flush-timeout")
+        )
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(result.count, 1)
+    }
+
     func testRecoveryCoalescesBackendEventsAndReplaysPipelineSeeds() throws {
         let backend = FakeVideoRendererBackend()
         let recovery = VideoOutputEventBox()
@@ -391,6 +450,7 @@ final class SystemVideoOutputTests: XCTestCase {
     private func makeHarness(
         backend: FakeVideoRendererBackend,
         ledger: VideoSurfaceBudgetLedger = VideoSurfaceBudgetLedger(),
+        metrics: PlaybackMetrics? = nil,
         removal: FakeVideoRendererRemoval = FakeVideoRendererRemoval(),
         recoverySink: @escaping @Sendable (MediaGeneration) -> Void = { _ in },
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void = { _, _ in }
@@ -398,6 +458,7 @@ final class SystemVideoOutputTests: XCTestCase {
         let output = SystemVideoOutput(
             backend: backend,
             ledger: ledger,
+            metrics: metrics,
             removeRenderer: removal.remove,
             recoverySink: recoverySink,
             failureSink: failureSink
@@ -460,6 +521,22 @@ private final class VideoReceiptBox: @unchecked Sendable {
     }
 }
 
+private final class VideoResetResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedCount = 0
+    private var storedError: PlaybackCoreError?
+
+    var count: Int { lock.withLock { storedCount } }
+    var error: PlaybackCoreError? { lock.withLock { storedError } }
+
+    func record(_ result: Result<VideoEnqueueReceipt, PlaybackCoreError>) {
+        lock.withLock {
+            storedCount += 1
+            if case let .failure(error) = result { storedError = error }
+        }
+    }
+}
+
 private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     @unchecked Sendable {
     private let lock = NSLock()
@@ -474,6 +551,10 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     private var readiness: (@Sendable () -> Void)?
     private var flushCompletions: [@Sendable () -> Void] = []
     private var eventHandler: (@Sendable (VideoRendererBackendEvent) -> Void)?
+    private var performanceMetricsCompletions: [
+        @Sendable (VideoRendererPerformanceSnapshot?) -> Void
+    ] = []
+    private(set) var performanceMetricsRequestCount = 0
 
     var isReadyForMoreMediaData: Bool { lock.withLock { ready } }
 
@@ -511,6 +592,15 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
         }
     }
 
+    func loadPerformanceMetrics(
+        completion: @escaping @Sendable (VideoRendererPerformanceSnapshot?) -> Void
+    ) {
+        lock.withLock {
+            performanceMetricsRequestCount += 1
+            performanceMetricsCompletions.append(completion)
+        }
+    }
+
     func startObserving(_ handler: @escaping @Sendable (VideoRendererBackendEvent) -> Void) {
         lock.withLock { eventHandler = handler }
     }
@@ -525,6 +615,11 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
 
     func completeFlush(at index: Int) {
         lock.withLock { flushCompletions[index] }()
+    }
+
+    func completePerformanceMetrics(_ snapshot: VideoRendererPerformanceSnapshot?) {
+        let completion = lock.withLock { performanceMetricsCompletions.removeFirst() }
+        completion(snapshot)
     }
 
     func emit(_ event: VideoRendererBackendEvent) {

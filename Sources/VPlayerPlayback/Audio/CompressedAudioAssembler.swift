@@ -12,14 +12,16 @@ final class CompressedAudioAssembler {
     private let generationProvider: () -> MediaGeneration
     private let eventSink: (AudioAssemblerEvent) -> Void
     private let parserFactory: any FFmpegParserFactory
+    private let binding: AssemblyEpochBinding
     private let formatState: AssemblyFormatState
-    private var descriptor: AudioTrackDescriptor
-    private var profile: any CompressedAudioCodecProfile
+    private let descriptor: AudioTrackDescriptor
+    private let profile: any CompressedAudioCodecProfile
     private var framer: (any CompressedAudioFramingStrategy)?
     private var nextID: UInt64?
     private var systemFormat: SystemCompressedAudioFormat?
     private var formatDescription: CMAudioFormatDescription?
     private var emittedFingerprint: MediaFormatFingerprint?
+    private var framerOperationID: AssemblyOperationID?
 
     private struct AudioUnitRejection: Error {
         let reason: AudioDecodeBreakReason
@@ -31,6 +33,7 @@ final class CompressedAudioAssembler {
         eventSink: @escaping (AudioAssemblerEvent) -> Void,
         parserFactory: any FFmpegParserFactory = LiveFFmpegParserFactory(),
         formatState: AssemblyFormatState,
+        binding: AssemblyEpochBinding = .standalone(),
         startingID: UInt64 = 1
     ) throws {
         guard let descriptor = trackSet.audio else { throw Self.validationError() }
@@ -40,6 +43,7 @@ final class CompressedAudioAssembler {
         self.eventSink = eventSink
         self.parserFactory = parserFactory
         self.formatState = formatState
+        self.binding = binding
         nextID = startingID
         try configureProfileAndFramer()
     }
@@ -49,6 +53,7 @@ final class CompressedAudioAssembler {
     }
 
     func push(_ packet: DemuxPacket) throws {
+        try ensureFramerIsCurrent()
         guard packet.streamIndex == descriptor.streamIndex,
               packet.codec == .audio(descriptor.codec),
               !packet.data.isEmpty,
@@ -79,6 +84,7 @@ final class CompressedAudioAssembler {
     }
 
     func drain() throws {
+        try ensureFramerIsCurrent()
         do {
             try framer?.drain()
         } catch let error as PlaybackCoreError
@@ -91,19 +97,6 @@ final class CompressedAudioAssembler {
         }
     }
 
-    func reset(for trackSet: DemuxTrackSet) throws {
-        guard let descriptor = trackSet.audio else { throw Self.validationError() }
-        framer?.destroy()
-        framer = nil
-        self.descriptor = descriptor
-        profile = try AudioCodecProfileRegistry.profile(for: descriptor)
-        formatState.resetAudio(for: trackSet)
-        systemFormat = nil
-        formatDescription = nil
-        emittedFingerprint = nil
-        try configureProfileAndFramer()
-    }
-
     private func configureProfileAndFramer() throws {
         guard descriptor.sampleRate > 0, descriptor.channelLayout.channelCount > 0 else {
             throw Self.validationError()
@@ -111,12 +104,16 @@ final class CompressedAudioAssembler {
         if let initial = try profile.initialSystemFormat(source: descriptor) {
             try install(initial)
         }
-        framer = try makeFramer()
+        let operationID = try currentOperationID()
+        framerOperationID = operationID
+        framer = try makeFramer(operationID: operationID)
     }
 
-    private func makeFramer() throws -> any CompressedAudioFramingStrategy {
+    private func makeFramer(
+        operationID: AssemblyOperationID
+    ) throws -> any CompressedAudioFramingStrategy {
         let receiver: (FramedCompressedAudioFrame) throws -> Void = { [weak self] frame in
-            guard let self else { return }
+            guard let self, binding.accepts(operationID) else { return }
             try receive(frame)
         }
         switch profile.framing {
@@ -134,6 +131,22 @@ final class CompressedAudioAssembler {
                 receiver: receiver
             )
         }
+    }
+
+    private func currentOperationID() throws -> AssemblyOperationID {
+        guard let operationID = binding.currentOperationID() else {
+            throw Self.validationError()
+        }
+        return operationID
+    }
+
+    private func ensureFramerIsCurrent() throws {
+        let operationID = try currentOperationID()
+        guard framerOperationID != operationID else { return }
+        framer?.destroy()
+        framer = nil
+        framerOperationID = operationID
+        framer = try makeFramer(operationID: operationID)
     }
 
     private func receive(_ framed: FramedCompressedAudioFrame) throws {
@@ -197,7 +210,9 @@ final class CompressedAudioAssembler {
     private func rejectCurrentUnit(reason: AudioDecodeBreakReason) throws {
         framer?.destroy()
         framer = nil
-        framer = try makeFramer()
+        let operationID = try currentOperationID()
+        framerOperationID = operationID
+        framer = try makeFramer(operationID: operationID)
         eventSink(.decodeBreak(reason))
     }
 

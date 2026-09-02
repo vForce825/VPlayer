@@ -22,6 +22,33 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         source: .parser
     )
 
+    func testEveryYADIFFailureHasAnExhaustiveTypedProcessingClassification() {
+        let cases: [(YADIFFailure, YADIFProcessingFailureClassification)] = [
+            (.invalidDimensions, .structural(.invalidSurface)),
+            (.unsupportedPixelFormat(0x1234), .structural(.invalidSurface)),
+            (.poolCreationFailed(-1), .structural(.surfacePool)),
+            (.poolAllocationFailed(-2), .transient(.resourcePressure)),
+            (.incompatibleRendererAttributes, .structural(.rendererAttributes)),
+            (.nonIOSurfaceOutput, .structural(.invalidSurface)),
+            (.invalidPlaneLayout, .structural(.invalidSurface)),
+            (.metalTextureCacheCreationFailed(-3), .structural(.textureMapping)),
+            (
+                .metalTextureMappingFailed(plane: 1, status: -4),
+                .structural(.textureMapping)
+            ),
+            (.shaderLibraryUnavailable, .structural(.shaderPipeline)),
+            (.shaderFunctionUnavailable("field"), .structural(.shaderPipeline)),
+            (.pipelineCreationFailed, .structural(.shaderPipeline)),
+            (.commandBufferAllocationFailed, .transient(.resourcePressure)),
+            (.commandEncoderAllocationFailed, .transient(.resourcePressure)),
+            (.commandFailed, .structural(.commandExecution)),
+        ]
+
+        for (failure, expected) in cases {
+            XCTAssertEqual(failure.processingClassification, expected, "\(failure)")
+        }
+    }
+
     func testPublicContractsAreSendableAndQueueLimitsAreValidated() throws {
         assertSendable(YADIFDropReason.self)
         assertSendable(YADIFDropEvent.self)
@@ -84,7 +111,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         }
     }
 
-    func testDecodedCompatibilityRejectsInvalidTimingWithOneStableFailureAndNoGPUWork() throws {
+    func testDecodedCompatibilityDropsInvalidTimingAsTypedTransientWithoutGPUWork() throws {
         let invalidFrames = try [
             decoded(id: 1, pts: .invalid),
             decoded(id: 2, pts: .indefinite),
@@ -92,24 +119,14 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             decoded(id: 4, duration: CMTime(value: -1, timescale: 25)),
             decoded(id: 5, duration: .indefinite),
         ]
-        var failures: [PlaybackFailure] = []
-
         for frame in invalidFrames {
             let harness = try makeHarness()
             harness.processor.submit(frame) { harness.results.record(id: frame.accessUnitID, result: $0) }
             let result = try XCTUnwrap(harness.results.results(for: frame.accessUnitID).first)
-            guard case let .failure(failure) = result else {
-                return XCTFail("invalid timing must fail")
-            }
-            failures.append(failure)
+            assertTransientDrop(result, reason: .invalidTiming)
             XCTAssertEqual(harness.queue.committedCount, 0)
             XCTAssertEqual(harness.processor.metricsSnapshot.inFlightCount, 0)
         }
-
-        XCTAssertEqual(Set(failures.map(\.code)).count, 1)
-        XCTAssertEqual(Set(failures.map(\.userMessage)).count, 1)
-        XCTAssertFalse(failures[0].code.isEmpty)
-        XCTAssertFalse(failures[0].userMessage.isEmpty)
     }
 
     func testOutputsReserveExactTimingMetadataAndSequenceBeforeArbitraryGPUCompletion() throws {
@@ -128,8 +145,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         harness.queue.complete(identifier: identifiers[1], result: .completed)
         harness.queue.complete(identifier: identifiers[0], result: .completed)
 
-        let sourceTwo = try success(harness.results.singleResult(for: 2))
-        let sourceOne = try success(harness.results.singleResult(for: 1))
+        let sourceTwo = try producedFrames(harness.results.singleResult(for: 2))
+        let sourceOne = try producedFrames(harness.results.singleResult(for: 1))
         XCTAssertEqual(sourceOne.map(\.sequenceNumber), [1, 2])
         XCTAssertEqual(sourceTwo.map(\.sequenceNumber), [3, 4])
         XCTAssertEqual(sourceOne.map(\.presentationTimeStamp), [
@@ -173,7 +190,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             completion: YADIFCommandCompletion(result: .completed)
         )
 
-        let frames = try success(harness.results.singleResult(for: 1))
+        let frames = try producedFrames(harness.results.singleResult(for: 1))
         XCTAssertEqual(frames.count, 2)
         XCTAssertTrue(try pixelBuffer(from: frames[0]) === submission.outputs.first)
         XCTAssertTrue(try pixelBuffer(from: frames[1]) === submission.outputs.second)
@@ -226,7 +243,10 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             sourceAccessUnitID: 4,
             presentationTimeStamp: CMTime(value: 3, timescale: 25)
         )])
-        XCTAssertTrue(try success(harness.results.singleResult(for: 4)).isEmpty)
+        assertTransientDrop(
+            harness.results.singleResult(for: 4),
+            reason: .queuePressure
+        )
         XCTAssertEqual(harness.results.results(for: 4).count, 1)
         XCTAssertEqual(harness.processor.metricsSnapshot.gpuQueueFullDropCount, 1)
         XCTAssertEqual(harness.processor.metricsSnapshot.pendingFrameCount, 2)
@@ -334,7 +354,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertEqual(dropIDsWhileBlocked, Array(UInt64(2)...8))
         XCTAssertEqual(resultCountsWhileBlocked, Array(repeating: 1, count: 7))
         for id in UInt64(2)...8 {
-            XCTAssertEqual(try? success(results.singleResult(for: id)).count, 0)
+            assertTransientDrop(results.singleResult(for: id), reason: .queuePressure)
         }
         XCTAssertEqual(results.results(for: 1).count, 1)
         XCTAssertEqual(results.results(for: 9).count, 1)
@@ -419,7 +439,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         let nextGeneration = MediaGeneration(rawValue: generation.rawValue + 1)
         harness.processor.reset(to: nextGeneration)
 
-        XCTAssertTrue(try success(harness.results.singleResult(for: 2)).isEmpty)
+        assertCancelled(harness.results.singleResult(for: 2), reason: .reset)
         XCTAssertTrue(harness.results.results(for: 1).isEmpty)
         XCTAssertNotNil(retainedToken)
         XCTAssertEqual(harness.processor.metricsSnapshot, YADIFProcessorMetrics(
@@ -433,7 +453,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         harness.queue.complete(identifier: identifier, result: .completed)
 
-        XCTAssertTrue(try success(harness.results.singleResult(for: 1)).isEmpty)
+        assertCancelled(harness.results.singleResult(for: 1), reason: .reset)
         XCTAssertEqual(harness.results.results(for: 1).count, 1)
         XCTAssertNil(retainedToken)
 
@@ -442,7 +462,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         let newIdentifier = try XCTUnwrap(harness.queue.submissionIdentifiers.last)
         harness.queue.complete(identifier: newIdentifier, result: .completed)
         XCTAssertEqual(
-            try success(harness.results.singleResult(for: 3)).map(\.sequenceNumber),
+            try producedFrames(harness.results.singleResult(for: 3)).map(\.sequenceNumber),
             [1, 2]
         )
     }
@@ -455,7 +475,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         harness.processor.reset(to: generation)
 
-        XCTAssertTrue(try success(harness.results.singleResult(for: 2)).isEmpty)
+        assertCancelled(harness.results.singleResult(for: 2), reason: .reset)
         XCTAssertTrue(harness.results.results(for: 1).isEmpty)
         XCTAssertEqual(harness.processor.metricsSnapshot.submittedJobCount, 0)
         submit(try normalized(id: 3), to: harness)
@@ -464,14 +484,14 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         harness.queue.complete(identifier: staleIdentifier, result: .completed)
 
-        XCTAssertTrue(try success(harness.results.singleResult(for: 1)).isEmpty)
+        assertCancelled(harness.results.singleResult(for: 1), reason: .reset)
         XCTAssertEqual(harness.results.results(for: 1).count, 1)
         XCTAssertEqual(harness.processor.metricsSnapshot.completedJobCount, 0)
         XCTAssertEqual(harness.queue.submittedSourceAccessUnitIDs, [1, 3])
         let currentIdentifier = try XCTUnwrap(harness.queue.submissionIdentifiers.last)
         harness.queue.complete(identifier: currentIdentifier, result: .completed)
         XCTAssertEqual(
-            try success(harness.results.singleResult(for: 3)).map(\.sequenceNumber),
+            try producedFrames(harness.results.singleResult(for: 3)).map(\.sequenceNumber),
             [1, 2]
         )
         XCTAssertEqual(harness.processor.metricsSnapshot.submittedJobCount, 1)
@@ -505,26 +525,37 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertTrue(results.results(for: 1).isEmpty)
         queue.complete(identifier: identifier, result: .completed)
 
-        XCTAssertEqual(try success(results.singleResult(for: 1)).count, 2)
+        XCTAssertEqual(try producedFrames(results.singleResult(for: 1)).count, 2)
         XCTAssertNil(retainedProcessor)
     }
 
     func testSynchronousSubmissionFailuresRollbackSlotCloseOnceAndContinueScheduling() throws {
-        for (failure, expectedCode) in [
-            (YADIFFailure.commandBufferAllocationFailed, "metal.command"),
-            (.metalTextureMappingFailed(plane: 0, status: -61), "video.texture"),
-            (.commandEncoderAllocationFailed, "video.texture"),
+        for (failure, expected) in [
+            (
+                YADIFFailure.commandBufferAllocationFailed,
+                YADIFProcessingFailureClassification.transient(.resourcePressure)
+            ),
+            (
+                .metalTextureMappingFailed(plane: 0, status: -61),
+                .structural(.textureMapping)
+            ),
+            (
+                .commandEncoderAllocationFailed,
+                .transient(.resourcePressure)
+            ),
         ] {
             let harness = try makeHarness(maximumInFlight: 1)
             harness.queue.failNextSubmission(with: failure)
             submit(try normalized(id: 1), to: harness)
             submit(try normalized(id: 2), to: harness)
 
-            let failed = harness.results.singleResult(for: 1)
-            guard case let .failure(playbackFailure) = failed else {
-                return XCTFail("synchronous submission failure must fail the current input")
+            let result = harness.results.singleResult(for: 1)
+            switch expected {
+            case let .transient(reason):
+                assertTransientDrop(result, reason: reason)
+            case let .structural(failure):
+                assertStructuralFailure(result, failure: failure)
             }
-            XCTAssertEqual(playbackFailure.code, expectedCode)
             XCTAssertEqual(harness.results.results(for: 1).count, 1)
             XCTAssertEqual(harness.processor.metricsSnapshot.inFlightCount, 0)
 
@@ -534,7 +565,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         }
     }
 
-    func testTerminalCommandFailureReturnsStableFailureAndReleasesSlot() throws {
+    func testTerminalCommandFailureReturnsTypedStructuralFailureAndReleasesSlot() throws {
         let harness = try makeHarness(maximumInFlight: 1)
         submit(try normalized(id: 1), to: harness)
         submit(try normalized(id: 2), to: harness)
@@ -542,11 +573,10 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         harness.queue.complete(identifier: identifier, result: .failed)
 
-        guard case let .failure(failure) = harness.results.singleResult(for: 1) else {
-            return XCTFail("terminal command failure must not be a blank success")
-        }
-        XCTAssertEqual(failure.code, "metal.command")
-        XCTAssertFalse(failure.userMessage.isEmpty)
+        assertStructuralFailure(
+            harness.results.singleResult(for: 1),
+            failure: .commandExecution
+        )
         XCTAssertEqual(harness.results.results(for: 1).count, 1)
         XCTAssertEqual(harness.processor.metricsSnapshot.inFlightCount, 0)
         XCTAssertEqual(harness.processor.metricsSnapshot.completedJobCount, 1)
@@ -573,7 +603,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             results.record(id: 2, result: $0)
         }
 
-        let outputs = try success(results.singleResult(for: 1))
+        let outputs = try producedFrames(results.singleResult(for: 1))
         XCTAssertEqual(outputs.count, 2)
         XCTAssertEqual(outputs.map(\.sequenceNumber), [1, 2])
         XCTAssertEqual(results.results(for: 1).count, 1)
@@ -585,26 +615,26 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
     func testDrainProcessesOneFrameTailActsAsBarrierAndRejectsSubmitsUntilReset() throws {
         let harness = try makeHarness(maximumInFlight: 1)
+        let barriers = YADIFDrainBarrierRecorder()
         submit(try normalized(id: 1), to: harness)
-        harness.processor.drain { harness.results.record(id: 100, result: $0) }
+        harness.processor.drain { barriers.record(id: 100) }
 
         XCTAssertEqual(harness.queue.submittedSourceAccessUnitIDs, [1])
         XCTAssertTrue(harness.results.results(for: 1).isEmpty)
-        XCTAssertTrue(harness.results.results(for: 100).isEmpty)
+        XCTAssertEqual(barriers.count(for: 100), 0)
 
         submit(try normalized(id: 2), to: harness)
-        XCTAssertTrue(try success(harness.results.singleResult(for: 2)).isEmpty)
+        assertCancelled(harness.results.singleResult(for: 2), reason: .draining)
         let identifier = try XCTUnwrap(harness.queue.submissionIdentifiers.first)
         harness.queue.complete(identifier: identifier, result: .completed)
 
-        let tail = try success(harness.results.singleResult(for: 1))
+        let tail = try producedFrames(harness.results.singleResult(for: 1))
         XCTAssertEqual(tail.count, 2)
         XCTAssertEqual(tail.map(\.sourceAccessUnitID), [1, 1])
-        XCTAssertTrue(try success(harness.results.singleResult(for: 100)).isEmpty)
-        XCTAssertEqual(harness.results.results(for: 100).count, 1)
+        XCTAssertEqual(barriers.count(for: 100), 1)
 
-        harness.processor.drain { harness.results.record(id: 101, result: $0) }
-        XCTAssertTrue(try success(harness.results.singleResult(for: 101)).isEmpty)
+        harness.processor.drain { barriers.record(id: 101) }
+        XCTAssertEqual(barriers.count(for: 101), 1)
 
         let nextGeneration = MediaGeneration(rawValue: generation.rawValue + 1)
         harness.processor.reset(to: nextGeneration)
@@ -614,6 +644,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
     func testDuplicateNormalizedInstanceOwnsBothCompletionsExactlyOnceThroughDrain() throws {
         let harness = try makeHarness(maximumInFlight: 1)
+        let barriers = YADIFDrainBarrierRecorder()
         let frame = try normalized(id: 1)
         harness.processor.submit(normalized: frame, order: top) {
             harness.results.record(id: 101, result: $0)
@@ -624,15 +655,19 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         let firstResultBeforeDrain = harness.results.results(for: 101).first
         let secondResultCountBeforeDrain = harness.results.results(for: 102).count
-        harness.processor.drain { harness.results.record(id: 103, result: $0) }
+        harness.processor.drain { barriers.record(id: 103) }
         harness.queue.completeNext(.completed)
 
-        XCTAssertEqual(try? firstResultBeforeDrain?.get().count, 0)
+        if let firstResultBeforeDrain {
+            assertCancelled(firstResultBeforeDrain, reason: .referenceWindowDiscard)
+        } else {
+            XCTFail("first duplicate completion must close before drain")
+        }
         XCTAssertEqual(secondResultCountBeforeDrain, 0)
         XCTAssertEqual(harness.queue.submittedSourceAccessUnitIDs, [1])
-        XCTAssertEqual(try? success(harness.results.singleResult(for: 102)).count, 2)
-        XCTAssertEqual(try? success(harness.results.singleResult(for: 103)).count, 0)
-        for id in UInt64(101)...103 {
+        XCTAssertEqual(try? producedFrames(harness.results.singleResult(for: 102)).count, 2)
+        XCTAssertEqual(barriers.count(for: 103), 1)
+        for id in UInt64(101)...102 {
             XCTAssertEqual(harness.results.results(for: id).count, 1)
         }
     }
@@ -649,8 +684,11 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         harness.processor.reset(to: generation)
 
-        XCTAssertEqual(try? success(harness.results.singleResult(for: 101)).count, 0)
-        XCTAssertEqual(try? success(harness.results.singleResult(for: 102)).count, 0)
+        assertCancelled(
+            harness.results.singleResult(for: 101),
+            reason: .referenceWindowDiscard
+        )
+        assertCancelled(harness.results.singleResult(for: 102), reason: .reset)
         XCTAssertEqual(harness.results.results(for: 101).count, 1)
         XCTAssertEqual(harness.results.results(for: 102).count, 1)
         XCTAssertEqual(harness.queue.committedCount, 0)
@@ -659,6 +697,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
     func testSameInputKeyIncreasingTimestampsPopCompletionsInSubmissionOrder() throws {
         let submitter = ImmediateYADIFCommandSubmitter()
         let results = YADIFProcessorResultRecorder()
+        let barriers = YADIFDrainBarrierRecorder()
         let processor = try YADIFProcessor(
             commandSubmitter: submitter,
             surfacePool: ProgressiveSurfacePool(),
@@ -683,18 +722,18 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         processor.submit(normalized: later, order: top) {
             results.record(id: 102, result: $0)
         }
-        processor.drain { results.record(id: 103, result: $0) }
+        processor.drain { barriers.record(id: 103) }
 
         XCTAssertEqual(
-            try? success(results.singleResult(for: 101)).first?.presentationTimeStamp,
+            try? producedFrames(results.singleResult(for: 101)).first?.presentationTimeStamp,
             first.presentationTimeStamp
         )
         XCTAssertEqual(
-            try? success(results.singleResult(for: 102)).first?.presentationTimeStamp,
+            try? producedFrames(results.singleResult(for: 102)).first?.presentationTimeStamp,
             laterTimestamp
         )
-        XCTAssertEqual(try? success(results.singleResult(for: 103)).count, 0)
-        for id in UInt64(101)...103 {
+        XCTAssertEqual(barriers.count(for: 103), 1)
+        for id in UInt64(101)...102 {
             XCTAssertEqual(results.results(for: id).count, 1)
         }
     }
@@ -717,8 +756,14 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             harness.results.record(id: 102, result: $0)
         }
 
-        XCTAssertEqual(try? success(harness.results.singleResult(for: 101)).count, 0)
-        XCTAssertEqual(try? success(harness.results.singleResult(for: 102)).count, 0)
+        assertCancelled(
+            harness.results.singleResult(for: 101),
+            reason: .referenceWindowDiscard
+        )
+        assertCancelled(
+            harness.results.singleResult(for: 102),
+            reason: .referenceWindowDiscard
+        )
         XCTAssertEqual(harness.results.results(for: 101).count, 1)
         XCTAssertEqual(harness.results.results(for: 102).count, 1)
         XCTAssertEqual(harness.queue.committedCount, 0)
@@ -757,8 +802,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
 
         processor.reset(to: generation)
 
-        XCTAssertTrue(try success(results.singleResult(for: 1)).isEmpty)
-        XCTAssertTrue(try success(results.singleResult(for: 2)).isEmpty)
+        assertCancelled(results.singleResult(for: 1), reason: .reset)
+        assertCancelled(results.singleResult(for: 2), reason: .reset)
         XCTAssertEqual(results.results(for: 1).count, 1)
         XCTAssertEqual(results.results(for: 2).count, 1)
         XCTAssertEqual(processor.metricsSnapshot.submittedJobCount, 0)
@@ -776,6 +821,7 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             try allocator.allocate(matching: source)
         }
         let results = YADIFProcessorResultRecorder()
+        let barriers = YADIFDrainBarrierRecorder()
         let processor = try YADIFProcessor(
             commandSubmitter: queue,
             surfacePool: ProgressiveSurfacePool(),
@@ -791,22 +837,131 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         }
         let drainReturned = expectation(description: "blocked drain returned")
         DispatchQueue.global().async {
-            processor.drain { results.record(id: 100, result: $0) }
+            processor.drain { barriers.record(id: 100) }
             drainReturned.fulfill()
         }
         XCTAssertTrue(allocator.waitUntilBlocked())
         XCTAssertTrue(results.results(for: 1).isEmpty)
-        XCTAssertTrue(results.results(for: 100).isEmpty)
+        XCTAssertEqual(barriers.count(for: 100), 0)
 
         allocator.unblock()
         wait(for: [drainReturned], timeout: 5)
         XCTAssertEqual(queue.committedCount, 1)
-        XCTAssertTrue(results.results(for: 100).isEmpty)
+        XCTAssertEqual(barriers.count(for: 100), 0)
 
         queue.completeNext(.completed)
-        XCTAssertEqual(try success(results.singleResult(for: 1)).count, 2)
-        XCTAssertTrue(try success(results.singleResult(for: 100)).isEmpty)
-        XCTAssertEqual(results.results(for: 100).count, 1)
+        XCTAssertEqual(try producedFrames(results.singleResult(for: 1)).count, 2)
+        XCTAssertEqual(barriers.count(for: 100), 1)
+    }
+
+    func testResetDuringDrainWaitsForOldGPUCompletionAndOrdersSubmitBeforeBarrier() throws {
+        let harness = try makeHarness(maximumInFlight: 1)
+        let events = YADIFLifecycleEventRecorder()
+        let frame = try normalized(id: 1)
+        harness.processor.submit(normalized: frame, order: top) { result in
+            harness.results.record(id: 1, result: result)
+            events.record("submit")
+        }
+        harness.processor.drain { events.record("drain") }
+        let identifier = try XCTUnwrap(harness.queue.submissionIdentifiers.first)
+        XCTAssertEqual(events.snapshot, [])
+
+        harness.processor.reset(to: MediaGeneration(rawValue: generation.rawValue + 1))
+
+        XCTAssertEqual(events.snapshot, [])
+        harness.queue.complete(identifier: identifier, result: .completed)
+        XCTAssertEqual(events.snapshot, ["submit", "drain"])
+        assertCancelled(harness.results.singleResult(for: 1), reason: .reset)
+    }
+
+    func testResetDuringDrainWaitsUntilBlockedAllocatorRetiresBeforeBarrier() throws {
+        let queue = FakeMetalCommandQueue()
+        let allocator = BlockingYADIFOutputAllocator()
+        let events = YADIFLifecycleEventRecorder()
+        let results = YADIFProcessorResultRecorder()
+        let outputAllocator: YADIFOutputAllocator = { source in
+            try allocator.allocate(matching: source)
+        }
+        let processor = try YADIFProcessor(
+            commandSubmitter: queue,
+            surfacePool: ProgressiveSurfacePool(),
+            outputAllocator: outputAllocator,
+            clock: TestYADIFClock(),
+            maximumInFlight: 1,
+            maximumPendingFrames: 2
+        )
+        processor.reset(to: generation)
+        let frame = try normalized(id: 1)
+        processor.submit(normalized: frame, order: top) { result in
+            results.record(id: 1, result: result)
+            events.record("submit")
+        }
+        let drainReturned = expectation(description: "drain returned after allocator")
+        DispatchQueue.global().async {
+            processor.drain { events.record("drain") }
+            drainReturned.fulfill()
+        }
+        XCTAssertTrue(allocator.waitUntilBlocked())
+
+        processor.reset(to: MediaGeneration(rawValue: generation.rawValue + 1))
+
+        XCTAssertEqual(events.snapshot, ["submit"])
+        allocator.unblock()
+        wait(for: [drainReturned], timeout: 5)
+        XCTAssertEqual(events.snapshot, ["submit", "drain"])
+        XCTAssertEqual(queue.committedCount, 0)
+        assertCancelled(results.singleResult(for: 1), reason: .reset)
+    }
+
+    func testOldDrainCutoffDoesNotWaitForNewGenerationWork() throws {
+        let harness = try makeHarness(maximumInFlight: 2)
+        let events = YADIFLifecycleEventRecorder()
+        let oldFrame = try normalized(id: 1)
+        harness.processor.submit(normalized: oldFrame, order: top) { result in
+            harness.results.record(id: 1, result: result)
+            events.record("old-submit")
+        }
+        harness.processor.drain { events.record("old-drain") }
+        let oldIdentifier = try XCTUnwrap(harness.queue.submissionIdentifiers.first)
+
+        let nextGeneration = MediaGeneration(rawValue: generation.rawValue + 1)
+        harness.processor.reset(to: nextGeneration)
+        for id in UInt64(2)...4 {
+            submit(try normalized(id: id, generation: nextGeneration), to: harness)
+        }
+        XCTAssertEqual(harness.queue.pendingSubmissionCount, 2)
+
+        harness.queue.complete(identifier: oldIdentifier, result: .completed)
+
+        XCTAssertEqual(events.snapshot, ["old-submit", "old-drain"])
+        assertCancelled(harness.results.singleResult(for: 1), reason: .reset)
+        XCTAssertGreaterThan(harness.queue.pendingSubmissionCount, 0)
+        XCTAssertTrue(harness.results.results(for: 2).isEmpty)
+    }
+
+    func testDrainBarrierCallbackMayReenterResetAndSubmitWithoutDeadlock() throws {
+        let harness = try makeHarness(maximumInFlight: 1)
+        let nextGeneration = MediaGeneration(rawValue: generation.rawValue + 1)
+        let reentered = expectation(description: "drain callback reentered processor")
+        let oldFrame = try normalized(id: 1)
+        let newFrame = try normalized(id: 2, generation: nextGeneration)
+        let order = top
+        harness.processor.submit(normalized: oldFrame, order: top) {
+            harness.results.record(id: 1, result: $0)
+        }
+        harness.processor.drain {
+            harness.processor.reset(to: nextGeneration)
+            harness.processor.submit(normalized: newFrame, order: order) {
+                harness.results.record(id: 2, result: $0)
+            }
+            reentered.fulfill()
+        }
+
+        harness.queue.completeNext(.completed)
+
+        wait(for: [reentered], timeout: 1)
+        XCTAssertEqual(try producedFrames(harness.results.singleResult(for: 1)).count, 2)
+        XCTAssertTrue(harness.results.results(for: 2).isEmpty)
     }
 
     func testDiscontinuityOrderChangeGapAndStaleGenerationCloseEachAffectedInputExactlyOnce() throws {
@@ -818,14 +973,20 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             discontinuity: true,
             to: harness
         )
-        XCTAssertTrue(try success(harness.results.singleResult(for: 1)).isEmpty)
+        assertCancelled(
+            harness.results.singleResult(for: 1),
+            reason: .referenceWindowDiscard
+        )
 
         submit(
             try normalized(id: 3, pts: CMTime(value: 2, timescale: 25)),
             order: bottom,
             to: harness
         )
-        XCTAssertTrue(try success(harness.results.singleResult(for: 2)).isEmpty)
+        assertCancelled(
+            harness.results.singleResult(for: 2),
+            reason: .referenceWindowDiscard
+        )
 
         submit(
             try normalized(id: 4, pts: CMTime(value: 3, timescale: 25)),
@@ -839,11 +1000,14 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
             order: bottom,
             to: harness
         )
-        XCTAssertTrue(try success(harness.results.singleResult(for: 4)).isEmpty)
+        assertCancelled(
+            harness.results.singleResult(for: 4),
+            reason: .referenceWindowDiscard
+        )
 
         let staleGeneration = MediaGeneration(rawValue: generation.rawValue - 1)
         submit(try normalized(id: 6, generation: staleGeneration), to: harness)
-        XCTAssertTrue(try success(harness.results.singleResult(for: 6)).isEmpty)
+        assertCancelled(harness.results.singleResult(for: 6), reason: .staleGeneration)
         XCTAssertEqual(harness.processor.metricsSnapshot.staleGenerationDropCount, 1)
         for id in [1, 2, 4, 6] {
             XCTAssertEqual(harness.results.results(for: UInt64(id)).count, 1)
@@ -1054,10 +1218,55 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         return try XCTUnwrap(pixelBuffer)
     }
 
-    private func success(
-        _ result: Result<[VideoPresentationFrame], PlaybackFailure>
+    private func producedFrames(
+        _ result: VideoProcessingResult,
+        file: StaticString = #filePath,
+        line: UInt = #line
     ) throws -> [VideoPresentationFrame] {
-        try result.get()
+        guard case let .produced(batch) = result else {
+            XCTFail("expected a produced frame batch, got \(result)", file: file, line: line)
+            throw PlaybackFailure(
+                code: "unexpected-processing-result",
+                userMessage: "expected produced frames"
+            )
+        }
+        return batch.frames
+    }
+
+    private func assertCancelled(
+        _ result: VideoProcessingResult,
+        reason: VideoProcessingCancellationReason,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .cancelled(actual) = result else {
+            return XCTFail("expected cancellation, got \(result)", file: file, line: line)
+        }
+        XCTAssertEqual(actual, reason, file: file, line: line)
+    }
+
+    private func assertTransientDrop(
+        _ result: VideoProcessingResult,
+        reason: VideoProcessingTransientDropReason,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .transientDrop(actual) = result else {
+            return XCTFail("expected transient drop, got \(result)", file: file, line: line)
+        }
+        XCTAssertEqual(actual, reason, file: file, line: line)
+    }
+
+    private func assertStructuralFailure(
+        _ result: VideoProcessingResult,
+        failure: VideoProcessingStructuralFailure,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .structuralFailure(actual) = result else {
+            return XCTFail("expected structural failure, got \(result)", file: file, line: line)
+        }
+        XCTAssertEqual(actual, failure, file: file, line: line)
     }
 
     private func pixelBuffer(from frame: VideoPresentationFrame) throws -> CVPixelBuffer {
@@ -1089,18 +1298,18 @@ private final class TestYADIFClock: PlaybackClock, @unchecked Sendable {
 
 private final class YADIFProcessorResultRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var stored: [UInt64: [Result<[VideoPresentationFrame], PlaybackFailure>]] = [:]
+    private var stored: [UInt64: [VideoProcessingResult]] = [:]
 
     func record(
         id: UInt64,
-        result: Result<[VideoPresentationFrame], PlaybackFailure>
+        result: VideoProcessingResult
     ) {
         lock.withLock { stored[id, default: []].append(result) }
     }
 
     func results(
         for id: UInt64
-    ) -> [Result<[VideoPresentationFrame], PlaybackFailure>] {
+    ) -> [VideoProcessingResult] {
         lock.withLock { stored[id] ?? [] }
     }
 
@@ -1108,14 +1317,32 @@ private final class YADIFProcessorResultRecorder: @unchecked Sendable {
         for id: UInt64,
         file: StaticString = #filePath,
         line: UInt = #line
-    ) -> Result<[VideoPresentationFrame], PlaybackFailure> {
+    ) -> VideoProcessingResult {
         let values = results(for: id)
         XCTAssertEqual(values.count, 1, file: file, line: line)
-        return values.first ?? .failure(PlaybackFailure(
-            code: "missing-test-result",
-            userMessage: "The expected processor callback did not fire"
-        ))
+        return values.first ?? .cancelled(.reset)
     }
+}
+
+private final class YADIFDrainBarrierRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [UInt64: Int] = [:]
+
+    func record(id: UInt64) {
+        lock.withLock { counts[id, default: 0] += 1 }
+    }
+
+    func count(for id: UInt64) -> Int {
+        lock.withLock { counts[id, default: 0] }
+    }
+}
+
+private final class YADIFLifecycleEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    var snapshot: [String] { lock.withLock { events } }
+    func record(_ event: String) { lock.withLock { events.append(event) } }
 }
 
 private final class YADIFDropRecorder: @unchecked Sendable {

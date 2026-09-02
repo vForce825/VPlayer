@@ -34,7 +34,6 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let scanType: String
     public let activeRoute: String
     public let decoderCallbacksPerSecond: Double
-    public let presentationsPerSecond: Double
     public let yadifKernelDispatchCount: UInt64
     public let staleGenerationDropCount: UInt64
     public let droppedVideoFrames: UInt64
@@ -43,23 +42,13 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // Sanitized classification and status of the most recent decode failure,
     // e.g. "badData:-12909". A drop total cannot say which fault is repeating.
     public let lastVideoDecodeFailure: String?
-    public let maximumPresentationQueueDepth: Int
     public let maximumYADIFInFlightCount: Int
     public let maximumYADIFInputDepth: Int
     public let gpuDurationP95Milliseconds: Double
     public let yadifCPUEncodeP95Milliseconds: Double
-    public let renderCPUPreparationP95Milliseconds: Double
-    public let avDriftP95Milliseconds: Double
     public let residentMemoryBytes: UInt64
     public let elapsedSeconds: Double
     public let windowDurationSeconds: Double
-    public let presentedVideoFrames: UInt64
-    // Unique frames must be selected in media-time order within one media
-    // timeline. A non-zero value is direct evidence that recovery replayed
-    // already-presented video after a same-timeline stall.
-    public let presentationPTSRegressionCount: UInt64
-    public let maximumAbsoluteAVDriftMilliseconds: Double
-    public let crossGenerationPresentationCount: UInt64
     public let audioRoute: String
     public let audioReady: Bool
     public let readinessOpen: Bool
@@ -88,6 +77,15 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     // this stops advancing while frames keep arriving, the submission side is
     // stranded rather than the decode side.
     public let displayResumeCount: UInt64
+    // Native counters sampled from the exact AVSampleBufferVideoRenderer that
+    // is attached to the visible display layer.
+    public let videoRendererMetricsSampleCount: UInt64
+    public let videoRendererMetricsEpochCount: UInt64
+    public let videoRendererTotalFrameCount: UInt64
+    public let videoRendererDroppedFrameCount: UInt64
+    public let videoRendererCorruptedFrameCount: UInt64
+    public let videoRendererOptimizedFrameCount: UInt64
+    public let videoRendererAccumulatedFrameDelayMilliseconds: Double
     // Media time the playback clock currently reports. Compared against
     // `videoLatestPTSSeconds` this separates "the clock is not running" from
     // "frames are not reaching the presentation queue".
@@ -122,29 +120,6 @@ public struct PlaybackMetricsSnapshot: Codable, Sendable, Equatable {
     public let audioAutomaticFlushNoProgressCount: UInt64
     public let audioLastAcceptedPTSSeconds: Double?
     public let audioLastRendererProgressAgeSeconds: Double?
-    // Display-link callbacks that reached the renderer. Divided by elapsed time
-    // this is the *actual* tick rate, which is what separates "the display link
-    // is missing ticks" from "the renderer refused ticks it was offered".
-    public let renderTickCount: UInt64
-    // Ticks the renderer declined because every in-flight slot was still held by
-    // an incomplete GPU submission. A declined tick presents nothing, so the
-    // frame that was due lands on the next tick as a superseded drop.
-    public let renderSkippedInFlightCount: UInt64
-    // Every delegate callback CoreAnimation delivered, counted before the driver
-    // decides whether to draw. Against `renderTickCount` this separates a
-    // display link that is not calling us from one whose callbacks we discard.
-    public let displayLinkCallbackCount: UInt64
-    // The shortest gap seen between two callbacks. Kept as a cross-check on
-    // `displayRefreshHz` rather than as the period itself: the link's target
-    // timestamps are not strictly quantized to vsync boundaries, so this reads
-    // slightly short of the true one.
-    public let nativeDisplayIntervalMilliseconds: Double
-    // Vsyncs that passed with no callback, derived from gaps that are whole
-    // multiples of the native period.
-    public let missedDisplayLinkVSyncCount: UInt64
-    // What the screen itself reports, which is also what the display link's
-    // frame-rate range is pinned to.
-    public let displayRefreshHz: Double
     // Where the read path loses time. `queueFullWait` rising means the app is not
     // draining fast enough to keep reading; both near zero means the source
     // simply is not delivering realtime, and nothing in the app will fix it.
@@ -236,6 +211,11 @@ enum PlaybackDiagnosticSaturatingCounter {
             value += 1
         }
     }
+
+    static func add(_ amount: UInt64, to value: inout UInt64) {
+        let (sum, overflow) = value.addingReportingOverflow(amount)
+        value = overflow ? UInt64.max : sum
+    }
 }
 
 public extension PlaybackMetricsSnapshot {
@@ -244,26 +224,18 @@ public extension PlaybackMetricsSnapshot {
         scanType = try container.decode(String.self, forKey: .init("scanType"))
         activeRoute = try container.decode(String.self, forKey: .init("activeRoute"))
         decoderCallbacksPerSecond = try container.decode(Double.self, forKey: .init("decoderCallbacksPerSecond"))
-        presentationsPerSecond = try container.decode(Double.self, forKey: .init("presentationsPerSecond"))
         yadifKernelDispatchCount = try container.decode(UInt64.self, forKey: .init("yadifKernelDispatchCount"))
         staleGenerationDropCount = try container.decode(UInt64.self, forKey: .init("staleGenerationDropCount"))
         droppedVideoFrames = try container.decode(UInt64.self, forKey: .init("droppedVideoFrames"))
         videoDropCountsBySource = try container.decode([UInt64].self, forKey: .init("videoDropCountsBySource"))
         lastVideoDecodeFailure = try container.decodeIfPresent(String.self, forKey: .init("lastVideoDecodeFailure"))
-        maximumPresentationQueueDepth = try container.decode(Int.self, forKey: .init("maximumPresentationQueueDepth"))
         maximumYADIFInFlightCount = try container.decode(Int.self, forKey: .init("maximumYADIFInFlightCount"))
         maximumYADIFInputDepth = try container.decode(Int.self, forKey: .init("maximumYADIFInputDepth"))
         gpuDurationP95Milliseconds = try container.decode(Double.self, forKey: .init("gpuDurationP95Milliseconds"))
         yadifCPUEncodeP95Milliseconds = try container.decode(Double.self, forKey: .init("yadifCPUEncodeP95Milliseconds"))
-        renderCPUPreparationP95Milliseconds = try container.decode(Double.self, forKey: .init("renderCPUPreparationP95Milliseconds"))
-        avDriftP95Milliseconds = try container.decode(Double.self, forKey: .init("avDriftP95Milliseconds"))
         residentMemoryBytes = try container.decode(UInt64.self, forKey: .init("residentMemoryBytes"))
         elapsedSeconds = try container.decode(Double.self, forKey: .init("elapsedSeconds"))
         windowDurationSeconds = try container.decode(Double.self, forKey: .init("windowDurationSeconds"))
-        presentedVideoFrames = try container.decode(UInt64.self, forKey: .init("presentedVideoFrames"))
-        presentationPTSRegressionCount = try container.decode(UInt64.self, forKey: .init("presentationPTSRegressionCount"))
-        maximumAbsoluteAVDriftMilliseconds = try container.decode(Double.self, forKey: .init("maximumAbsoluteAVDriftMilliseconds"))
-        crossGenerationPresentationCount = try container.decode(UInt64.self, forKey: .init("crossGenerationPresentationCount"))
         audioRoute = try container.decode(String.self, forKey: .init("audioRoute"))
         audioReady = try container.decode(Bool.self, forKey: .init("audioReady"))
         readinessOpen = try container.decode(Bool.self, forKey: .init("readinessOpen"))
@@ -308,6 +280,34 @@ public extension PlaybackMetricsSnapshot {
         readinessCycleID = try container.decode(UInt64.self, forKey: .init("readinessCycleID"))
         readinessCloseReasonCounts = try container.decode([UInt64].self, forKey: .init("readinessCloseReasonCounts"))
         displayResumeCount = try container.decode(UInt64.self, forKey: .init("displayResumeCount"))
+        videoRendererMetricsSampleCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("videoRendererMetricsSampleCount")
+        ) ?? 0
+        videoRendererMetricsEpochCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("videoRendererMetricsEpochCount")
+        ) ?? 0
+        videoRendererTotalFrameCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("videoRendererTotalFrameCount")
+        ) ?? 0
+        videoRendererDroppedFrameCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("videoRendererDroppedFrameCount")
+        ) ?? 0
+        videoRendererCorruptedFrameCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("videoRendererCorruptedFrameCount")
+        ) ?? 0
+        videoRendererOptimizedFrameCount = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .init("videoRendererOptimizedFrameCount")
+        ) ?? 0
+        videoRendererAccumulatedFrameDelayMilliseconds = try container.decodeIfPresent(
+            Double.self,
+            forKey: .init("videoRendererAccumulatedFrameDelayMilliseconds")
+        ) ?? 0
         clockTimeSeconds = try container.decodeIfPresent(Double.self, forKey: .init("clockTimeSeconds"))
         videoResyncCount = try container.decode(UInt64.self, forKey: .init("videoResyncCount"))
         audioRecoveryCount = try container.decode(UInt64.self, forKey: .init("audioRecoveryCount"))
@@ -359,12 +359,6 @@ public extension PlaybackMetricsSnapshot {
             forKey: .init("audioLastRendererProgressAgeSeconds")
         )
 
-        renderTickCount = try container.decode(UInt64.self, forKey: .init("renderTickCount"))
-        renderSkippedInFlightCount = try container.decode(UInt64.self, forKey: .init("renderSkippedInFlightCount"))
-        displayLinkCallbackCount = try container.decode(UInt64.self, forKey: .init("displayLinkCallbackCount"))
-        nativeDisplayIntervalMilliseconds = try container.decode(Double.self, forKey: .init("nativeDisplayIntervalMilliseconds"))
-        missedDisplayLinkVSyncCount = try container.decode(UInt64.self, forKey: .init("missedDisplayLinkVSyncCount"))
-        displayRefreshHz = try container.decode(Double.self, forKey: .init("displayRefreshHz"))
         demuxQueueFullWaitSeconds = try container.decode(Double.self, forKey: .init("demuxQueueFullWaitSeconds"))
         demuxAdmitWaitSeconds = try container.decode(Double.self, forKey: .init("demuxAdmitWaitSeconds"))
         playbackExecutorBusySeconds = try container.decode(Double.self, forKey: .init("playbackExecutorBusySeconds"))
@@ -397,26 +391,18 @@ public extension PlaybackMetricsSnapshot {
         try container.encode(scanType, forKey: .init("scanType"))
         try container.encode(activeRoute, forKey: .init("activeRoute"))
         try container.encode(decoderCallbacksPerSecond, forKey: .init("decoderCallbacksPerSecond"))
-        try container.encode(presentationsPerSecond, forKey: .init("presentationsPerSecond"))
         try container.encode(yadifKernelDispatchCount, forKey: .init("yadifKernelDispatchCount"))
         try container.encode(staleGenerationDropCount, forKey: .init("staleGenerationDropCount"))
         try container.encode(droppedVideoFrames, forKey: .init("droppedVideoFrames"))
         try container.encode(videoDropCountsBySource, forKey: .init("videoDropCountsBySource"))
         try container.encodeIfPresent(lastVideoDecodeFailure, forKey: .init("lastVideoDecodeFailure"))
-        try container.encode(maximumPresentationQueueDepth, forKey: .init("maximumPresentationQueueDepth"))
         try container.encode(maximumYADIFInFlightCount, forKey: .init("maximumYADIFInFlightCount"))
         try container.encode(maximumYADIFInputDepth, forKey: .init("maximumYADIFInputDepth"))
         try container.encode(gpuDurationP95Milliseconds, forKey: .init("gpuDurationP95Milliseconds"))
         try container.encode(yadifCPUEncodeP95Milliseconds, forKey: .init("yadifCPUEncodeP95Milliseconds"))
-        try container.encode(renderCPUPreparationP95Milliseconds, forKey: .init("renderCPUPreparationP95Milliseconds"))
-        try container.encode(avDriftP95Milliseconds, forKey: .init("avDriftP95Milliseconds"))
         try container.encode(residentMemoryBytes, forKey: .init("residentMemoryBytes"))
         try container.encode(elapsedSeconds, forKey: .init("elapsedSeconds"))
         try container.encode(windowDurationSeconds, forKey: .init("windowDurationSeconds"))
-        try container.encode(presentedVideoFrames, forKey: .init("presentedVideoFrames"))
-        try container.encode(presentationPTSRegressionCount, forKey: .init("presentationPTSRegressionCount"))
-        try container.encode(maximumAbsoluteAVDriftMilliseconds, forKey: .init("maximumAbsoluteAVDriftMilliseconds"))
-        try container.encode(crossGenerationPresentationCount, forKey: .init("crossGenerationPresentationCount"))
         try container.encode(audioRoute, forKey: .init("audioRoute"))
         try container.encode(audioReady, forKey: .init("audioReady"))
         try container.encode(readinessOpen, forKey: .init("readinessOpen"))
@@ -434,6 +420,34 @@ public extension PlaybackMetricsSnapshot {
         try container.encode(readinessCycleID, forKey: .init("readinessCycleID"))
         try container.encode(readinessCloseReasonCounts, forKey: .init("readinessCloseReasonCounts"))
         try container.encode(displayResumeCount, forKey: .init("displayResumeCount"))
+        try container.encode(
+            videoRendererMetricsSampleCount,
+            forKey: .init("videoRendererMetricsSampleCount")
+        )
+        try container.encode(
+            videoRendererMetricsEpochCount,
+            forKey: .init("videoRendererMetricsEpochCount")
+        )
+        try container.encode(
+            videoRendererTotalFrameCount,
+            forKey: .init("videoRendererTotalFrameCount")
+        )
+        try container.encode(
+            videoRendererDroppedFrameCount,
+            forKey: .init("videoRendererDroppedFrameCount")
+        )
+        try container.encode(
+            videoRendererCorruptedFrameCount,
+            forKey: .init("videoRendererCorruptedFrameCount")
+        )
+        try container.encode(
+            videoRendererOptimizedFrameCount,
+            forKey: .init("videoRendererOptimizedFrameCount")
+        )
+        try container.encode(
+            videoRendererAccumulatedFrameDelayMilliseconds,
+            forKey: .init("videoRendererAccumulatedFrameDelayMilliseconds")
+        )
         try container.encodeIfPresent(clockTimeSeconds, forKey: .init("clockTimeSeconds"))
         try container.encode(videoResyncCount, forKey: .init("videoResyncCount"))
         try container.encode(audioRecoveryCount, forKey: .init("audioRecoveryCount"))
@@ -462,12 +476,6 @@ public extension PlaybackMetricsSnapshot {
         try container.encode(audioAutomaticFlushNoProgressCount, forKey: .init("audioAutomaticFlushNoProgressCount"))
         try container.encodeIfPresent(audioLastAcceptedPTSSeconds, forKey: .init("audioLastAcceptedPTSSeconds"))
         try container.encodeIfPresent(audioLastRendererProgressAgeSeconds, forKey: .init("audioLastRendererProgressAgeSeconds"))
-        try container.encode(renderTickCount, forKey: .init("renderTickCount"))
-        try container.encode(renderSkippedInFlightCount, forKey: .init("renderSkippedInFlightCount"))
-        try container.encode(displayLinkCallbackCount, forKey: .init("displayLinkCallbackCount"))
-        try container.encode(nativeDisplayIntervalMilliseconds, forKey: .init("nativeDisplayIntervalMilliseconds"))
-        try container.encode(missedDisplayLinkVSyncCount, forKey: .init("missedDisplayLinkVSyncCount"))
-        try container.encode(displayRefreshHz, forKey: .init("displayRefreshHz"))
         try container.encode(demuxQueueFullWaitSeconds, forKey: .init("demuxQueueFullWaitSeconds"))
         try container.encode(demuxAdmitWaitSeconds, forKey: .init("demuxAdmitWaitSeconds"))
         try container.encode(playbackExecutorBusySeconds, forKey: .init("playbackExecutorBusySeconds"))
@@ -539,13 +547,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         var scanType = "unknown"
         var activeRoute = "rawWhileClassifying"
         var decoderCallbackTimes: [TimeInterval] = []
-        var presentationTimes: [TimeInterval] = []
         var gpuDurations: [TimedValue] = []
         var yadifCPUEncodeDurations: [TimedValue] = []
-        var renderCPUPreparationDurations: [TimedValue] = []
         var decodeCallbackLatencies: [TimedValue] = []
         var decodeSubmissions: [TimedValue] = []
-        var avDrifts: [TimedValue] = []
         var yadifKernelDispatchCount: UInt64 = 0
         var staleGenerationDropCount: UInt64 = 0
         var droppedVideoFrames: UInt64 = 0
@@ -553,14 +558,8 @@ final class PlaybackMetrics: @unchecked Sendable {
             repeating: 0, count: VideoDropSource.allCases.count
         )
         var lastVideoDecodeFailure: String?
-        var maximumPresentationQueueDepth = 0
         var maximumYADIFInFlightCount = 0
         var maximumYADIFInputDepth = 0
-        var presentedVideoFrames: UInt64 = 0
-        var presentationPTSRegressionCount: UInt64 = 0
-        var lastUniquePresentationPTS: CMTime?
-        var maximumAbsoluteAVDriftMilliseconds = 0.0
-        var crossGenerationPresentationCount: UInt64 = 0
         var audioRoute = "systemCompressed"
         var audioReady = false
         var readinessOpen = false
@@ -584,17 +583,18 @@ final class PlaybackMetrics: @unchecked Sendable {
             count: PlaybackReadinessCloseReason.allCases.count
         )
         var displayResumeCount: UInt64 = 0
+        var videoRendererPerformanceBaseline: VideoRendererPerformanceSnapshot?
+        var videoRendererMetricsSampleCount: UInt64 = 0
+        var videoRendererMetricsEpochCount: UInt64 = 0
+        var videoRendererTotalFrameCount: UInt64 = 0
+        var videoRendererDroppedFrameCount: UInt64 = 0
+        var videoRendererCorruptedFrameCount: UInt64 = 0
+        var videoRendererOptimizedFrameCount: UInt64 = 0
+        var videoRendererAccumulatedFrameDelaySeconds = 0.0
         var clockTimeSeconds: Double?
         var videoResyncCount: UInt64 = 0
         var audioRecoveryCount: UInt64 = 0
         var audioDiagnostics = AudioRenderDiagnostics.zero
-        var renderTickCount: UInt64 = 0
-        var renderSkippedInFlightCount: UInt64 = 0
-        var displayLinkCallbackCount: UInt64 = 0
-        var previousDisplayLinkTimestamp: CFTimeInterval?
-        var nativeDisplayIntervalSeconds = 0.0
-        var missedDisplayLinkVSyncCount: UInt64 = 0
-        var displayRefreshHz = 0.0
         var demuxQueueFullWaitNanoseconds: UInt64 = 0
         var demuxAdmitWaitNanoseconds: UInt64 = 0
         var playbackExecutorBusyNanoseconds: UInt64 = 0
@@ -608,7 +608,6 @@ final class PlaybackMetrics: @unchecked Sendable {
         var maximumDecodeSubmissionDepth = 0
         var maximumFramesBeingDecoded = 0
         var decoderSessionSummary: String?
-        var avDriftGraceUntil: TimeInterval = 0
         var lastPrunedAt: TimeInterval
 
         init(startedAt: TimeInterval) {
@@ -617,6 +616,8 @@ final class PlaybackMetrics: @unchecked Sendable {
     }
 
     private static let retainedWindowSeconds: TimeInterval = 120
+    private static let maximumAccumulatedFrameDelaySeconds =
+        Double.greatestFiniteMagnitude / 1_000
     private let lock = NSLock()
     private let now: Now
     private let residentMemoryProvider: ResidentMemoryProvider
@@ -742,62 +743,69 @@ final class PlaybackMetrics: @unchecked Sendable {
         lock.withLock { state.audioDiagnostics = audioDiagnostics }
     }
 
-    func recordRenderTick(skippedInFlight: Bool) {
-        lock.withLock {
-            state.renderTickCount &+= 1
-            if skippedInFlight { state.renderSkippedInFlightCount &+= 1 }
-        }
-    }
-
-    func recordDisplayRefreshRate(framesPerSecond: Double) {
-        guard framesPerSecond.isFinite, framesPerSecond > 0 else { return }
-        lock.withLock {
-            if state.displayRefreshHz != framesPerSecond {
-                // A content/display cadence change starts a new measurement
-                // epoch. The transition gap is intentional, not missed vsyncs.
-                state.previousDisplayLinkTimestamp = nil
-                state.nativeDisplayIntervalSeconds = 0
-            }
-            state.displayRefreshHz = framesPerSecond
-        }
-    }
-
-    /// Gaps are measured against the requested presentation cadence when one is
-    /// known. The shortest gap ever seen is a poor stand-in: display-link target
-    /// timestamps are not strictly quantized, so one short outlier would rescale
-    /// every later gap into a miss.
-    func recordDisplayLinkCallback(targetPresentationTimestamp: CFTimeInterval) {
-        guard targetPresentationTimestamp.isFinite else { return }
-        lock.withLock {
-            state.displayLinkCallbackCount &+= 1
-            let previous = state.previousDisplayLinkTimestamp
-            state.previousDisplayLinkTimestamp = targetPresentationTimestamp
-            guard let previous else { return }
-            let delta = targetPresentationTimestamp - previous
-            // A second of silence is a stall, not a cadence, and folding it into
-            // the miss count would bury the one-vsync gaps this exists to find.
-            guard delta > 0.001, delta < 1 else { return }
-            state.nativeDisplayIntervalSeconds = state.nativeDisplayIntervalSeconds > 0
-                ? min(state.nativeDisplayIntervalSeconds, delta)
-                : delta
-            let period = state.displayRefreshHz > 0
-                ? 1 / state.displayRefreshHz
-                : state.nativeDisplayIntervalSeconds
-            let periods = Int((delta / period).rounded())
-            if periods > 1 {
-                state.missedDisplayLinkVSyncCount &+= UInt64(periods - 1)
-            }
-        }
-    }
-
     func recordDisplaySubmissionResume() {
+        lock.withLock { state.displayResumeCount &+= 1 }
+    }
+
+    func recordVideoRendererPerformance(_ snapshot: VideoRendererPerformanceSnapshot) {
+        guard snapshot.accumulatedFrameDelaySeconds.isFinite,
+              snapshot.accumulatedFrameDelaySeconds >= 0 else { return }
         lock.withLock {
-            state.displayResumeCount &+= 1
-            // Readiness recovery and display-mode switches intentionally pause
-            // callbacks. The first callback after resume begins a fresh cadence
-            // epoch instead of charging the paused interval as missed frames.
-            state.previousDisplayLinkTimestamp = nil
-            state.nativeDisplayIntervalSeconds = 0
+            PlaybackDiagnosticSaturatingCounter.increment(
+                &state.videoRendererMetricsSampleCount
+            )
+            guard let baseline = state.videoRendererPerformanceBaseline else {
+                state.videoRendererPerformanceBaseline = snapshot
+                PlaybackDiagnosticSaturatingCounter.increment(
+                    &state.videoRendererMetricsEpochCount
+                )
+                state.videoRendererTotalFrameCount = snapshot.totalFrameCount
+                state.videoRendererDroppedFrameCount = snapshot.droppedFrameCount
+                state.videoRendererCorruptedFrameCount = snapshot.corruptedFrameCount
+                state.videoRendererOptimizedFrameCount = snapshot.optimizedFrameCount
+                state.videoRendererAccumulatedFrameDelaySeconds =
+                    min(
+                        snapshot.accumulatedFrameDelaySeconds,
+                        Self.maximumAccumulatedFrameDelaySeconds
+                    )
+                return
+            }
+
+            let rolledBack = snapshot.totalFrameCount < baseline.totalFrameCount
+                || snapshot.droppedFrameCount < baseline.droppedFrameCount
+                || snapshot.corruptedFrameCount < baseline.corruptedFrameCount
+                || snapshot.optimizedFrameCount < baseline.optimizedFrameCount
+                || snapshot.accumulatedFrameDelaySeconds
+                    < baseline.accumulatedFrameDelaySeconds
+            state.videoRendererPerformanceBaseline = snapshot
+            guard !rolledBack else {
+                PlaybackDiagnosticSaturatingCounter.increment(
+                    &state.videoRendererMetricsEpochCount
+                )
+                return
+            }
+            PlaybackDiagnosticSaturatingCounter.add(
+                snapshot.totalFrameCount - baseline.totalFrameCount,
+                to: &state.videoRendererTotalFrameCount
+            )
+            PlaybackDiagnosticSaturatingCounter.add(
+                snapshot.droppedFrameCount - baseline.droppedFrameCount,
+                to: &state.videoRendererDroppedFrameCount
+            )
+            PlaybackDiagnosticSaturatingCounter.add(
+                snapshot.corruptedFrameCount - baseline.corruptedFrameCount,
+                to: &state.videoRendererCorruptedFrameCount
+            )
+            PlaybackDiagnosticSaturatingCounter.add(
+                snapshot.optimizedFrameCount - baseline.optimizedFrameCount,
+                to: &state.videoRendererOptimizedFrameCount
+            )
+            let accumulatedDelay = state.videoRendererAccumulatedFrameDelaySeconds
+                + snapshot.accumulatedFrameDelaySeconds
+                - baseline.accumulatedFrameDelaySeconds
+            state.videoRendererAccumulatedFrameDelaySeconds = accumulatedDelay.isFinite
+                ? min(accumulatedDelay, Self.maximumAccumulatedFrameDelaySeconds)
+                : Self.maximumAccumulatedFrameDelaySeconds
         }
     }
 
@@ -883,51 +891,6 @@ final class PlaybackMetrics: @unchecked Sendable {
         }
     }
 
-    func recordPresentationCompletion(
-        generation: MediaGeneration,
-        activeGeneration: MediaGeneration,
-        isUniquePresentation: Bool,
-        presentationTimeStamp: CMTime,
-        targetMediaTime: CMTime
-    ) {
-        let timestamp = now()
-        lock.withLock {
-            pruneIfNeeded(at: timestamp)
-            guard generation == activeGeneration else {
-                state.crossGenerationPresentationCount &+= 1
-                return
-            }
-            guard isUniquePresentation else { return }
-            if presentationTimeStamp.isNumeric {
-                if let previousPTS = state.lastUniquePresentationPTS,
-                   CMTimeCompare(presentationTimeStamp, previousPTS) < 0 {
-                    state.presentationPTSRegressionCount &+= 1
-                }
-                state.lastUniquePresentationPTS = presentationTimeStamp
-            }
-            state.presentationTimes.append(timestamp)
-            state.presentedVideoFrames &+= 1
-            guard timestamp >= state.avDriftGraceUntil,
-                  presentationTimeStamp.isNumeric,
-                  targetMediaTime.isNumeric else { return }
-            let drift = abs(CMTimeSubtract(presentationTimeStamp, targetMediaTime).seconds * 1_000)
-            guard drift.isFinite else { return }
-            state.avDrifts.append(TimedValue(timestamp: timestamp, value: drift))
-            state.maximumAbsoluteAVDriftMilliseconds = max(
-                state.maximumAbsoluteAVDriftMilliseconds,
-                drift
-            )
-        }
-    }
-
-    // Decoder replacement can advance MediaGeneration while remaining on the
-    // same media timeline, so generation changes must not erase regression
-    // history. Only callers that know a genuine timeline reset occurred may
-    // clear the comparison baseline; the cumulative evidence remains intact.
-    func resetPresentationTimeline() {
-        lock.withLock { state.lastUniquePresentationPTS = nil }
-    }
-
     func recordYADIFKernelDispatch(inFlightCount: Int, inputDepth: Int) {
         lock.withLock {
             state.yadifKernelDispatchCount &+= 1
@@ -938,15 +901,6 @@ final class PlaybackMetrics: @unchecked Sendable {
     func recordYADIFDepths(inFlightCount: Int, inputDepth: Int) {
         lock.withLock {
             recordYADIFDepthsLocked(inFlightCount: inFlightCount, inputDepth: inputDepth)
-        }
-    }
-
-    func recordPresentationQueueDepth(_ depth: Int) {
-        lock.withLock {
-            state.maximumPresentationQueueDepth = max(
-                state.maximumPresentationQueueDepth,
-                max(0, depth)
-            )
         }
     }
 
@@ -964,11 +918,6 @@ final class PlaybackMetrics: @unchecked Sendable {
             state.droppedVideoFrames &+= amount
             state.videoDropCountsBySource[source.rawValue] &+= amount
         }
-    }
-
-    func beginAVDriftGracePeriod(seconds: TimeInterval) {
-        let graceUntil = now() + max(0, seconds)
-        lock.withLock { state.avDriftGraceUntil = max(state.avDriftGraceUntil, graceUntil) }
     }
 
     func recordDecodeCallbackLatency(milliseconds: Double) {
@@ -1002,17 +951,6 @@ final class PlaybackMetrics: @unchecked Sendable {
         }
     }
 
-    func recordRenderCPUPreparation(milliseconds: Double) {
-        guard milliseconds.isFinite, milliseconds >= 0 else { return }
-        let timestamp = now()
-        lock.withLock {
-            pruneIfNeeded(at: timestamp)
-            state.renderCPUPreparationDurations.append(
-                TimedValue(timestamp: timestamp, value: milliseconds)
-            )
-        }
-    }
-
     func snapshot(window requestedWindow: Duration) -> PlaybackMetricsSnapshot {
         let timestamp = now()
         let requestedSeconds = max(0, Self.seconds(requestedWindow))
@@ -1025,44 +963,30 @@ final class PlaybackMetrics: @unchecked Sendable {
             return state
         }
         let decoderCount = captured.decoderCallbackTimes.lazy.filter { $0 >= cutoff }.count
-        let presentationCount = captured.presentationTimes.lazy.filter { $0 >= cutoff }.count
         let gpu = captured.gpuDurations.lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let yadifCPUEncode = captured.yadifCPUEncodeDurations
-            .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
-        let renderCPUPreparation = captured.renderCPUPreparationDurations
             .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let decodeLatency = captured.decodeCallbackLatencies
             .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let decodeSubmission = captured.decodeSubmissions
             .lazy.filter { $0.timestamp >= cutoff }.map(\.value)
-        let drift = captured.avDrifts.lazy.filter { $0.timestamp >= cutoff }.map(\.value)
         let rateDivisor = windowSeconds > 0 ? windowSeconds : 1
         return PlaybackMetricsSnapshot(
             scanType: captured.scanType,
             activeRoute: captured.activeRoute,
             decoderCallbacksPerSecond: Double(decoderCount) / rateDivisor,
-            presentationsPerSecond: Double(presentationCount) / rateDivisor,
             yadifKernelDispatchCount: captured.yadifKernelDispatchCount,
             staleGenerationDropCount: captured.staleGenerationDropCount,
             droppedVideoFrames: captured.droppedVideoFrames,
             videoDropCountsBySource: captured.videoDropCountsBySource,
             lastVideoDecodeFailure: captured.lastVideoDecodeFailure,
-            maximumPresentationQueueDepth: captured.maximumPresentationQueueDepth,
             maximumYADIFInFlightCount: captured.maximumYADIFInFlightCount,
             maximumYADIFInputDepth: captured.maximumYADIFInputDepth,
             gpuDurationP95Milliseconds: Self.percentile95(Array(gpu)),
             yadifCPUEncodeP95Milliseconds: Self.percentile95(Array(yadifCPUEncode)),
-            renderCPUPreparationP95Milliseconds: Self.percentile95(
-                Array(renderCPUPreparation)
-            ),
-            avDriftP95Milliseconds: Self.percentile95(Array(drift)),
             residentMemoryBytes: residentMemoryProvider(),
             elapsedSeconds: elapsed,
             windowDurationSeconds: windowSeconds,
-            presentedVideoFrames: captured.presentedVideoFrames,
-            presentationPTSRegressionCount: captured.presentationPTSRegressionCount,
-            maximumAbsoluteAVDriftMilliseconds: captured.maximumAbsoluteAVDriftMilliseconds,
-            crossGenerationPresentationCount: captured.crossGenerationPresentationCount,
             audioRoute: captured.audioRoute,
             audioReady: captured.audioReady,
             readinessOpen: captured.readinessOpen,
@@ -1082,6 +1006,20 @@ final class PlaybackMetrics: @unchecked Sendable {
             readinessCycleID: captured.readinessCycleID,
             readinessCloseReasonCounts: captured.readinessCloseReasonCounts,
             displayResumeCount: captured.displayResumeCount,
+            videoRendererMetricsSampleCount:
+                captured.videoRendererMetricsSampleCount,
+            videoRendererMetricsEpochCount:
+                captured.videoRendererMetricsEpochCount,
+            videoRendererTotalFrameCount:
+                captured.videoRendererTotalFrameCount,
+            videoRendererDroppedFrameCount:
+                captured.videoRendererDroppedFrameCount,
+            videoRendererCorruptedFrameCount:
+                captured.videoRendererCorruptedFrameCount,
+            videoRendererOptimizedFrameCount:
+                captured.videoRendererOptimizedFrameCount,
+            videoRendererAccumulatedFrameDelayMilliseconds:
+                captured.videoRendererAccumulatedFrameDelaySeconds * 1_000,
             clockTimeSeconds: captured.clockTimeSeconds,
             videoResyncCount: captured.videoResyncCount,
             audioRecoveryCount: captured.audioRecoveryCount,
@@ -1122,12 +1060,6 @@ final class PlaybackMetrics: @unchecked Sendable {
                 captured.audioDiagnostics.lastAcceptedPTSSeconds,
             audioLastRendererProgressAgeSeconds:
                 captured.audioDiagnostics.lastRendererProgressAgeSeconds,
-            renderTickCount: captured.renderTickCount,
-            renderSkippedInFlightCount: captured.renderSkippedInFlightCount,
-            displayLinkCallbackCount: captured.displayLinkCallbackCount,
-            nativeDisplayIntervalMilliseconds: captured.nativeDisplayIntervalSeconds * 1_000,
-            missedDisplayLinkVSyncCount: captured.missedDisplayLinkVSyncCount,
-            displayRefreshHz: captured.displayRefreshHz,
             demuxQueueFullWaitSeconds: Double(captured.demuxQueueFullWaitNanoseconds) / 1_000_000_000,
             demuxAdmitWaitSeconds: Double(captured.demuxAdmitWaitNanoseconds) / 1_000_000_000,
             playbackExecutorBusySeconds:
@@ -1161,13 +1093,10 @@ final class PlaybackMetrics: @unchecked Sendable {
         guard timestamp - state.lastPrunedAt >= 1 else { return }
         let cutoff = timestamp - Self.retainedWindowSeconds
         state.decoderCallbackTimes.removeAll { $0 < cutoff }
-        state.presentationTimes.removeAll { $0 < cutoff }
         state.gpuDurations.removeAll { $0.timestamp < cutoff }
         state.yadifCPUEncodeDurations.removeAll { $0.timestamp < cutoff }
-        state.renderCPUPreparationDurations.removeAll { $0.timestamp < cutoff }
         state.decodeCallbackLatencies.removeAll { $0.timestamp < cutoff }
         state.decodeSubmissions.removeAll { $0.timestamp < cutoff }
-        state.avDrifts.removeAll { $0.timestamp < cutoff }
         state.lastPrunedAt = timestamp
     }
 

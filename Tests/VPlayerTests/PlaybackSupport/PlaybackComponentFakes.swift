@@ -10,10 +10,18 @@ import VideoToolbox
 @testable import VPlayerPlayback
 
 final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
+    enum AudioLifecycleOperation: Equatable {
+        case pause(Bool, UInt64)
+        case reset(UInt64)
+    }
+
     private let lock = NSLock()
     private var sink: (@Sendable (PlaybackPipelineEvent) -> Void)?
     private(set) var starts: [URL] = []
+    private(set) var startReadinessCycles: [UInt64] = []
     private(set) var pauses: [(Bool, UInt64)] = []
+    private(set) var audioSessionResetRecoveries: [UInt64] = []
+    private(set) var audioLifecycleOperations: [AudioLifecycleOperation] = []
     private(set) var stopCount = 0
     private(set) var completedStopCount = 0
     private(set) var tunings: [PlaybackTuning] = []
@@ -34,12 +42,28 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
         lock.withLock { self.sink = sink }
     }
 
-    func start(url: URL) {
-        lock.withLock { starts.append(url) }
+    func start(url: URL, readinessCycle: UInt64, initiallyPaused: Bool) {
+        lock.withLock {
+            startReadinessCycles.append(readinessCycle)
+            if initiallyPaused {
+                pauses.append((true, readinessCycle))
+            }
+            starts.append(url)
+        }
     }
 
     func setPaused(_ paused: Bool, readinessCycle: UInt64) {
-        lock.withLock { pauses.append((paused, readinessCycle)) }
+        lock.withLock {
+            pauses.append((paused, readinessCycle))
+            audioLifecycleOperations.append(.pause(paused, readinessCycle))
+        }
+    }
+
+    func recoverFromAudioSessionReset(readinessCycle: UInt64) {
+        lock.withLock {
+            audioSessionResetRecoveries.append(readinessCycle)
+            audioLifecycleOperations.append(.reset(readinessCycle))
+        }
     }
 
     func setTuning(_ tuning: PlaybackTuning) {
@@ -49,6 +73,8 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
         metrics?.snapshot(window: window)
     }
+
+    var terminalMetricsProvider: (any PlaybackTerminalMetricsProviding)? { metrics }
 
     func stop() async {
         let shouldWait = lock.withLock { () -> Bool in
@@ -78,7 +104,10 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
 
     func snapshot() -> (
         starts: [URL],
+        startReadinessCycles: [UInt64],
         pauses: [(Bool, UInt64)],
+        audioSessionResetRecoveries: [UInt64],
+        audioLifecycleOperations: [AudioLifecycleOperation],
         tunings: [PlaybackTuning],
         stopCount: Int,
         completedStopCount: Int,
@@ -87,7 +116,10 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
         lock.withLock {
             (
                 starts,
+                startReadinessCycles,
                 pauses,
+                audioSessionResetRecoveries,
+                audioLifecycleOperations,
                 tunings,
                 stopCount,
                 completedStopCount,
@@ -134,31 +166,94 @@ final class FakeControllerPipelineFactory: PlaybackPipelineFactory, @unchecked S
     }
 }
 
-final class FakePlaybackAudioSessionPreparer: PlaybackAudioSessionPreparing,
+final class SuspendedControllerPipelineFactory: PlaybackPipelineFactory, @unchecked Sendable {
+    private struct PendingMake {
+        let eventSink: @Sendable (PlaybackPipelineEvent) -> Void
+        let continuation: CheckedContinuation<FakeControllerPipeline, any Error>
+    }
+
+    private let lock = NSLock()
+    private var pendingMakes: [Int: PendingMake] = [:]
+    private var nextCallID = 0
+
+    func makePipeline(
+        tuning _: PlaybackTuning,
+        channelID _: String,
+        eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
+    ) async throws -> any PlaybackPipelineProtocol {
+        let pipeline = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<FakeControllerPipeline, any Error>) in
+            lock.withLock {
+                nextCallID += 1
+                pendingMakes[nextCallID] = PendingMake(
+                    eventSink: eventSink,
+                    continuation: continuation
+                )
+            }
+        }
+        return pipeline
+    }
+
+    func succeed(callID: Int, with pipeline: FakeControllerPipeline) {
+        let pending = lock.withLock { pendingMakes.removeValue(forKey: callID) }
+        guard let pending else { return }
+        pipeline.install(pending.eventSink)
+        pending.continuation.resume(returning: pipeline)
+    }
+
+    func fail(callID: Int, with error: PlaybackCoreError) {
+        let pending = lock.withLock { pendingMakes.removeValue(forKey: callID) }
+        pending?.continuation.resume(throwing: error)
+    }
+
+    func isPending(callID: Int) -> Bool {
+        lock.withLock { pendingMakes[callID] != nil }
+    }
+}
+
+final class FakePlaybackAudioSessionOwner: PlaybackAudioSessionOwning,
     @unchecked Sendable {
     private let lock = NSLock()
     private let error: (any Error)?
-    private let onPrepare: @Sendable () -> Void
+    private let onAcquire: @Sendable () -> Void
     private var callCount = 0
+    private var nextID: UInt64 = 1
 
     init(
         error: (any Error)? = nil,
-        onPrepare: @escaping @Sendable () -> Void = {}
+        onAcquire: @escaping @Sendable () -> Void = {}
     ) {
         self.error = error
-        self.onPrepare = onPrepare
+        self.onAcquire = onAcquire
     }
 
-    func prepareForPlayback() throws {
-        lock.withLock { callCount += 1 }
-        onPrepare()
+    @MainActor
+    func acquire(
+        eventHandler _: @escaping @MainActor @Sendable (
+            PlaybackAudioSessionLease,
+            PlaybackAudioSessionEvent
+        ) -> Void
+    ) throws -> PlaybackAudioSessionLease {
+        let id = lock.withLock { () -> UInt64 in
+            callCount += 1
+            defer { nextID += 1 }
+            return nextID
+        }
+        onAcquire()
         if let error { throw error }
+        return PlaybackAudioSessionLease(id: id, generation: id)
     }
+
+    @MainActor
+    func release(_: PlaybackAudioSessionLease) {}
+
+    @MainActor
+    func requestResume(for _: PlaybackAudioSessionLease) -> Bool { false }
 
     var callCountSnapshot: Int { lock.withLock { callCount } }
 }
 
-enum FakePlaybackAudioSessionPreparationError: Error {
+enum FakePlaybackAudioSessionOwnerError: Error {
     case activation
 }
 
@@ -182,15 +277,24 @@ final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
     private let lock = NSLock()
     private var sink: (@Sendable (DemuxEvent) -> Void)?
     private(set) var startedURLs: [URL] = []
+    private var startObservation: (@Sendable () -> Bool)?
+    private(set) var startObservations: [Bool] = []
     private(set) var cancelCount = 0
     var startError: PlaybackCoreError?
 
     func start(url: URL, sink: @escaping @Sendable (DemuxEvent) -> Void) throws {
         if let startError { throw startError }
+        let observer = lock.withLock { startObservation }
+        let observation = observer?()
         lock.withLock {
             startedURLs.append(url)
+            if let observation { startObservations.append(observation) }
             self.sink = sink
         }
+    }
+
+    func setStartObservation(_ observation: @escaping @Sendable () -> Bool) {
+        lock.withLock { startObservation = observation }
     }
 
     func cancel() {
@@ -202,18 +306,16 @@ final class FakePipelineDemuxer: MediaDemuxing, @unchecked Sendable {
         current?(event)
     }
 
-    func snapshot() -> (startedURLs: [URL], cancelCount: Int) {
-        lock.withLock { (startedURLs, cancelCount) }
+    func snapshot() -> (startedURLs: [URL], cancelCount: Int, startObservations: [Bool]) {
+        lock.withLock { (startedURLs, cancelCount, startObservations) }
     }
 }
 
 final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendable {
     private struct PendingCompletion: @unchecked Sendable {
         let accessUnitID: UInt64
-        let result: Result<[VideoPresentationFrame], PlaybackFailure>
-        let completion: @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
+        let result: VideoProcessingResult
+        let completion: @Sendable (VideoProcessingResult) -> Void
     }
 
     private let lock = NSLock()
@@ -233,10 +335,10 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
 
     func submit(
         _ frame: DecodedVideoFrame,
-        completion: @escaping @Sendable (Result<[VideoPresentationFrame], PlaybackFailure>) -> Void
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
     ) {
-        let result = Result<[VideoPresentationFrame], PlaybackFailure>.success([
-            VideoPresentationFrame(
+        let result = VideoProcessingResult.produced(VideoProcessingFrameBatch(
+            first: VideoPresentationFrame(
                 pixelBuffer: frame.pixelBuffer,
                 presentationTimeStamp: frame.presentationTimeStamp,
                 duration: frame.duration,
@@ -244,8 +346,8 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
                 sequenceNumber: frame.accessUnitID,
                 sourceAccessUnitID: frame.accessUnitID,
                 formatMetadata: frame.formatMetadata
-            ),
-        ])
+            )
+        ))
         let shouldComplete = lock.withLock { () -> Bool in
             submittedMetadata.append(frame.parserMetadata)
             if !automaticallyCompletes {
@@ -291,7 +393,7 @@ final class FakePipelineVideoProcessor: VideoFrameProcessing, @unchecked Sendabl
 
     func completePending(
         accessUnitID: UInt64,
-        with result: Result<[VideoPresentationFrame], PlaybackFailure>
+        with result: VideoProcessingResult
     ) {
         let completion = lock.withLock { () -> PendingCompletion? in
             guard let index = pendingCompletions.firstIndex(where: {
@@ -324,13 +426,11 @@ final class FakePipelineYADIFProcessor: YADIFFrameProcessing, @unchecked Sendabl
         normalized frame: NormalizedDecodedFrame,
         order: ResolvedFieldOrder,
         discontinuity _: Bool,
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
     ) {
         lock.withLock { submittedOrders.append(order) }
-        completion(.success([
-            VideoPresentationFrame(
+        completion(.produced(VideoProcessingFrameBatch(
+            first: VideoPresentationFrame(
                 pixelBuffer: frame.frame.pixelBuffer,
                 presentationTimeStamp: frame.presentationTimeStamp,
                 duration: frame.fieldDuration,
@@ -338,17 +438,11 @@ final class FakePipelineYADIFProcessor: YADIFFrameProcessing, @unchecked Sendabl
                 sequenceNumber: frame.frame.accessUnitID,
                 sourceAccessUnitID: frame.frame.accessUnitID,
                 formatMetadata: frame.frame.formatMetadata
-            ),
-        ]))
+            )
+        )))
     }
 
-    func drain(
-        completion: @escaping @Sendable (
-            Result<[VideoPresentationFrame], PlaybackFailure>
-        ) -> Void
-    ) {
-        completion(.success([]))
-    }
+    func drain(completion: @escaping @Sendable () -> Void) { completion() }
 }
 
 final class FakePipelineVideoRenderer: PlaybackVideoRendering, @unchecked Sendable {
@@ -446,6 +540,11 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private let lock = NSLock()
     var ready = false
     var selectedRoute = VPlayerPlayback.AudioRoute.systemCompressed
+    private var routeSnapshot = AudioOutputRouteSnapshot(
+        category: .other,
+        reason: .initial,
+        revision: 0
+    )
     private(set) var configured: [(
         VPlayerPlayback.AudioCodec,
         MediaGeneration,
@@ -457,6 +556,8 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private(set) var continuityIslandActivations: [(AudioContinuityIslandID, MediaGeneration)] = []
     private(set) var recoveryFloors: [CMTime?] = []
     private(set) var anchorPreparations: [(CMTime, AudioContinuityIslandID)] = []
+    private(set) var audioSessionResetRecoveryCount = 0
+    private(set) var sharedTimelineOpenedValues: [Bool] = []
     private(set) var stopCount = 0
     var stopAutomaticallyCompletes = true
     var enqueueError: PlaybackCoreError?
@@ -471,7 +572,11 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
     private var stopContinuations: [CheckedContinuation<Void, Never>] = []
 
     var isReadyForPlayback: Bool { lock.withLock { ready } }
+    var isOutputRouteReadyForSharedAnchor: Bool { true }
     var route: VPlayerPlayback.AudioRoute { lock.withLock { selectedRoute } }
+    var currentRouteSnapshot: AudioOutputRouteSnapshot? {
+        lock.withLock { routeSnapshot }
+    }
 
     func configure(
         _ configuration: CompressedAudioRenderConfiguration,
@@ -541,6 +646,17 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
         if let error = result.0 { throw error }
     }
 
+    func recoverFromAudioSessionReset() {
+        lock.withLock {
+            audioSessionResetRecoveryCount += 1
+            ready = false
+        }
+    }
+
+    func setSharedTimelineOpened(_ opened: Bool) {
+        lock.withLock { sharedTimelineOpenedValues.append(opened) }
+    }
+
     func flush(to generation: MediaGeneration) {
         let handlers = lock.withLock {
             flushes.append(generation)
@@ -587,6 +703,10 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
 
     func setReady(_ value: Bool) { lock.withLock { ready = value } }
 
+    func setRouteSnapshot(_ snapshot: AudioOutputRouteSnapshot) {
+        lock.withLock { routeSnapshot = snapshot }
+    }
+
     func setFlushHandler(_ handler: (@Sendable (MediaGeneration) -> Void)?) {
         lock.withLock { flushHandler = handler }
     }
@@ -624,6 +744,8 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
         continuityIslandActivations: [(AudioContinuityIslandID, MediaGeneration)],
         recoveryFloors: [CMTime?],
         anchorPreparations: [(CMTime, AudioContinuityIslandID)],
+        audioSessionResetRecoveryCount: Int,
+        sharedTimelineOpenedValues: [Bool],
         stops: Int,
         isStopWaiting: Bool
     ) {
@@ -635,6 +757,8 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
                 continuityIslandActivations,
                 recoveryFloors,
                 anchorPreparations,
+                audioSessionResetRecoveryCount,
+                sharedTimelineOpenedValues,
                 stopCount,
                 !stopContinuations.isEmpty
             )
@@ -708,11 +832,15 @@ final class FakePlaybackDisplay: PlaybackDisplayControlling, @unchecked Sendable
 
 final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked Sendable {
     final class Video: VideoAccessUnitAssembling {
+        private let eventSink: @Sendable (VideoAssemblerEvent) -> Void
         private(set) var packets: [DemuxPacket] = []
-        private(set) var resetTracks: [DemuxTrackSet] = []
         var pushError: PlaybackCoreError?
         var drainError: PlaybackCoreError?
         private(set) var drainCount = 0
+        init(eventSink: @escaping @Sendable (VideoAssemblerEvent) -> Void = { _ in }) {
+            self.eventSink = eventSink
+        }
+        func emit(_ event: VideoAssemblerEvent) { eventSink(event) }
         func push(_ packet: DemuxPacket) throws {
             if let pushError { throw pushError }
             packets.append(packet)
@@ -721,15 +849,18 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
             drainCount += 1
             if let drainError { throw drainError }
         }
-        func reset(for trackSet: DemuxTrackSet) throws { resetTracks.append(trackSet) }
     }
 
     final class Audio: AudioSampleAssembling {
+        private let eventSink: @Sendable (AudioAssemblerEvent) -> Void
         private(set) var packets: [DemuxPacket] = []
-        private(set) var resetTracks: [DemuxTrackSet] = []
         var pushError: PlaybackCoreError?
         var drainError: PlaybackCoreError?
         private(set) var drainCount = 0
+        init(eventSink: @escaping @Sendable (AudioAssemblerEvent) -> Void = { _ in }) {
+            self.eventSink = eventSink
+        }
+        func emit(_ event: AudioAssemblerEvent) { eventSink(event) }
         func push(_ packet: DemuxPacket) throws {
             if let pushError { throw pushError }
             packets.append(packet)
@@ -738,25 +869,38 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
             drainCount += 1
             if let drainError { throw drainError }
         }
-        func reset(for trackSet: DemuxTrackSet) throws { resetTracks.append(trackSet) }
     }
 
-    let video = Video()
-    let audio = Audio()
+    private var madeVideos: [Video] = []
+    private var madeAudios: [Audio] = []
+    var video: Video { madeVideos.last ?? Video() }
+    var audio: Audio { madeAudios.last ?? Audio() }
+    var videoInstances: [Video] { madeVideos }
+    var audioInstances: [Audio] { madeAudios }
 
     func makeVideo(
         trackSet _: DemuxTrackSet,
         generationProvider _: @escaping @Sendable () -> MediaGeneration,
-        eventSink _: @escaping @Sendable (VideoAssemblerEvent) -> Void,
-        formatState _: AssemblyFormatState
-    ) throws -> any VideoAccessUnitAssembling { video }
+        eventSink: @escaping @Sendable (VideoAssemblerEvent) -> Void,
+        formatState _: AssemblyFormatState,
+        binding _: AssemblyEpochBinding
+    ) throws -> any VideoAccessUnitAssembling {
+        let video = Video(eventSink: eventSink)
+        madeVideos.append(video)
+        return video
+    }
 
     func makeAudio(
         trackSet _: DemuxTrackSet,
         generationProvider _: @escaping @Sendable () -> MediaGeneration,
-        eventSink _: @escaping @Sendable (AudioAssemblerEvent) -> Void,
-        formatState _: AssemblyFormatState
-    ) throws -> any AudioSampleAssembling { audio }
+        eventSink: @escaping @Sendable (AudioAssemblerEvent) -> Void,
+        formatState _: AssemblyFormatState,
+        binding _: AssemblyEpochBinding
+    ) throws -> any AudioSampleAssembling {
+        let audio = Audio(eventSink: eventSink)
+        madeAudios.append(audio)
+        return audio
+    }
 }
 
 final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecked Sendable {
@@ -767,7 +911,8 @@ final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecke
         trackSet: DemuxTrackSet,
         generationProvider: @escaping @Sendable () -> MediaGeneration,
         eventSink: @escaping @Sendable (VideoAssemblerEvent) -> Void,
-        formatState: AssemblyFormatState
+        formatState: AssemblyFormatState,
+        binding: AssemblyEpochBinding
     ) throws -> any VideoAccessUnitAssembling {
         let parserFactory = ScriptedFFmpegParserFactory { handle, _, bytes, pts, dts, _ in
             var sps = AssemblerTestFixtures.h264SPS
@@ -790,7 +935,8 @@ final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecke
                 eventSink(event)
             },
             parserFactory: parserFactory,
-            formatState: formatState
+            formatState: formatState,
+            binding: binding
         )
     }
 
@@ -798,7 +944,8 @@ final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecke
         trackSet: DemuxTrackSet,
         generationProvider: @escaping @Sendable () -> MediaGeneration,
         eventSink: @escaping @Sendable (AudioAssemblerEvent) -> Void,
-        formatState: AssemblyFormatState
+        formatState: AssemblyFormatState,
+        binding: AssemblyEpochBinding
     ) throws -> any AudioSampleAssembling {
         try CompressedAudioAssembler(
             trackSet: trackSet,
@@ -811,7 +958,8 @@ final class AssemblerBackedPlaybackBuilder: PlaybackAssemblerBuilding, @unchecke
                 }
                 eventSink(event)
             },
-            formatState: formatState
+            formatState: formatState,
+            binding: binding
         )
     }
 
@@ -995,11 +1143,12 @@ enum PlaybackFakeMedia {
         generation: MediaGeneration,
         randomAccess: Bool,
         pts: CMTime? = nil,
-        duration: CMTime? = nil
+        duration: CMTime? = nil,
+        data: Data = Data([0x00, 0x00, 0x00, 0x01])
     ) throws -> CompressedVideoAccessUnit {
         let format = try videoFormat()
         let buffer = try SampleBufferBuilder.makeVideo(
-            data: Data([0x00, 0x00, 0x00, 0x01]),
+            data: data,
             formatDescription: format,
             presentationTimeStamp: pts ?? CMTime(value: Int64(id), timescale: 25),
             decodeTimeStamp: .invalid,

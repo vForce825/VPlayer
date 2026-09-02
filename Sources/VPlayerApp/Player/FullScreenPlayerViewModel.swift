@@ -16,23 +16,19 @@ final class FullScreenPlayerViewModel {
 
     typealias PresentationProvider = @Sendable () async -> PlaybackPresentationContext?
     typealias MediaInformationProvider = @Sendable () async -> AsyncStream<PlaybackMediaInformation?>
-    typealias Sleep = @Sendable (Duration) async throws -> Void
 
     let request: PlaybackRequest
     private let engine: any PlaybackEngine
     private let presentationProvider: PresentationProvider
     private let mediaInformationProvider: MediaInformationProvider
     private let settings: PlaybackSettingsStore
-    private let sleep: Sleep
     private var stateTask: Task<Void, Never>?
-    private var noticeTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
     private var mediaInformationProviderTask: Task<Void, Never>?
     private var mediaInformationTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
-    private var noticeDismissalTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
     private var desiredPaused = false
@@ -43,7 +39,6 @@ final class FullScreenPlayerViewModel {
     private var stopped = false
 
     private(set) var state: PlaybackState = .idle
-    private(set) var visibleNotice: PlaybackNotice?
     private(set) var presentationContext: PlaybackPresentationContext?
     private(set) var mediaInformation: PlaybackMediaInformation?
 
@@ -56,15 +51,13 @@ final class FullScreenPlayerViewModel {
                 continuation.finish()
             }
         },
-        settings: PlaybackSettingsStore,
-        sleep: @escaping Sleep = { try await Task.sleep(for: $0) }
+        settings: PlaybackSettingsStore
     ) {
         self.request = request
         self.engine = engine
         self.presentationProvider = presentationProvider
         self.mediaInformationProvider = mediaInformationProvider
         self.settings = settings
-        self.sleep = sleep
     }
 
     var isPaused: Bool {
@@ -84,22 +77,12 @@ final class FullScreenPlayerViewModel {
             guard let self else { return }
             let states = await engine.events()
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-            let notices = await engine.notices()
-            guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             stateTask = Task { [weak self] in
                 for await state in states {
                     guard let self,
                           !Task.isCancelled,
                           isCurrent(lifecycle: lifecycle) else { return }
                     self.apply(state)
-                }
-            }
-            noticeTask = Task { [weak self] in
-                for await notice in notices {
-                    guard let self,
-                          !Task.isCancelled,
-                          isCurrent(lifecycle: lifecycle) else { return }
-                    self.present(notice)
                 }
             }
             await engine.play(request)
@@ -116,7 +99,7 @@ final class FullScreenPlayerViewModel {
         switch state {
         case .playing, .paused:
             break
-        case .idle, .preparing, .stopped, .failed:
+        case .idle, .preparing, .buffering, .recovering, .stopped, .failed:
             return
         }
         desiredPaused.toggle()
@@ -142,7 +125,9 @@ final class FullScreenPlayerViewModel {
     }
 
     func retry() {
-        guard !stopped else { return }
+        guard !stopped,
+              case let .failed(failure) = state,
+              failure.retryDisposition == .retrySameRequest else { return }
         resetMediaInformation()
         playbackGeneration &+= 1
         resetPauseIntent()
@@ -178,7 +163,6 @@ final class FullScreenPlayerViewModel {
         let presentation = presentationTask
         let pause = pauseTask
         let states = stateTask
-        let notices = noticeTask
         let mediaInformationProvider = mediaInformationProviderTask
         let mediaInformation = mediaInformationTask
         playback?.cancel()
@@ -187,17 +171,12 @@ final class FullScreenPlayerViewModel {
         mediaInformation?.cancel()
         pause?.cancel()
         states?.cancel()
-        notices?.cancel()
-        noticeDismissalTask?.cancel()
         playbackTask = nil
         presentationTask = nil
         mediaInformationProviderTask = nil
         mediaInformationTask = nil
         resetPauseIntent()
         stateTask = nil
-        noticeTask = nil
-        noticeDismissalTask = nil
-        visibleNotice = nil
         self.mediaInformation = nil
         state = .stopped
         presentationContext?.detach()
@@ -208,7 +187,6 @@ final class FullScreenPlayerViewModel {
             await playback?.value
             await pause?.value
             await states?.value
-            await notices?.value
             await mediaInformation?.value
             await engine.stop()
         }
@@ -259,7 +237,7 @@ final class FullScreenPlayerViewModel {
     private func apply(_ newState: PlaybackState) {
         state = newState
         switch newState {
-        case .preparing:
+        case .preparing, .buffering, .recovering:
             acceptsAuthoritativePauseState = true
         case .playing:
             applyAuthoritativePauseState(false)
@@ -317,20 +295,4 @@ final class FullScreenPlayerViewModel {
         mediaInformation = nil
     }
 
-    private func present(_ notice: PlaybackNotice) {
-        if visibleNotice?.id == notice.id { return }
-        noticeDismissalTask?.cancel()
-        visibleNotice = notice
-        noticeDismissalTask = Task { [weak self] in
-            do {
-                try await self?.sleep(notice.duration)
-            } catch {
-                return
-            }
-            guard let self,
-                  !Task.isCancelled,
-                  visibleNotice?.id == notice.id else { return }
-            visibleNotice = nil
-        }
-    }
 }

@@ -8,6 +8,69 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackMetricsTests: XCTestCase {
+    func testNativeRendererMetricsAccumulateDeltasAndRebaseWholeEpochOnRollback() {
+        let metrics = PlaybackMetrics(channelID: "native-renderer", now: { 1 })
+
+        metrics.recordVideoRendererPerformance(.init(
+            totalFrameCount: 10,
+            droppedFrameCount: 2,
+            corruptedFrameCount: 1,
+            optimizedFrameCount: 5,
+            accumulatedFrameDelaySeconds: 0.1
+        ))
+        metrics.recordVideoRendererPerformance(.init(
+            totalFrameCount: 15,
+            droppedFrameCount: 3,
+            corruptedFrameCount: 1,
+            optimizedFrameCount: 7,
+            accumulatedFrameDelaySeconds: 0.15
+        ))
+        metrics.recordVideoRendererPerformance(.init(
+            totalFrameCount: 1,
+            droppedFrameCount: 0,
+            corruptedFrameCount: 0,
+            optimizedFrameCount: 1,
+            accumulatedFrameDelaySeconds: 0.01
+        ))
+        metrics.recordVideoRendererPerformance(.init(
+            totalFrameCount: 4,
+            droppedFrameCount: 1,
+            corruptedFrameCount: 0,
+            optimizedFrameCount: 2,
+            accumulatedFrameDelaySeconds: 0.04
+        ))
+
+        let snapshot = metrics.snapshot(window: .seconds(60))
+        XCTAssertEqual(snapshot.videoRendererMetricsSampleCount, 4)
+        XCTAssertEqual(snapshot.videoRendererMetricsEpochCount, 2)
+        XCTAssertEqual(snapshot.videoRendererTotalFrameCount, 18)
+        XCTAssertEqual(snapshot.videoRendererDroppedFrameCount, 4)
+        XCTAssertEqual(snapshot.videoRendererCorruptedFrameCount, 1)
+        XCTAssertEqual(snapshot.videoRendererOptimizedFrameCount, 8)
+        XCTAssertEqual(
+            snapshot.videoRendererAccumulatedFrameDelayMilliseconds,
+            180,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testNativeRendererAccumulatedDelayRemainsFiniteAtNumericLimit() {
+        let metrics = PlaybackMetrics(channelID: "native-renderer-limit", now: { 1 })
+
+        metrics.recordVideoRendererPerformance(.init(
+            totalFrameCount: 1,
+            droppedFrameCount: 0,
+            corruptedFrameCount: 0,
+            optimizedFrameCount: 1,
+            accumulatedFrameDelaySeconds: .greatestFiniteMagnitude
+        ))
+
+        let milliseconds = metrics.snapshot(window: .seconds(60))
+            .videoRendererAccumulatedFrameDelayMilliseconds
+        XCTAssertTrue(milliseconds.isFinite)
+        XCTAssertGreaterThan(milliseconds, 0)
+    }
+
     func testMetricsEncodingUsesExplicitAllowlistWithoutReflection() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -464,7 +527,6 @@ final class PlaybackMetricsTests: XCTestCase {
             now: { clock.value },
             residentMemoryProvider: { 123_456 }
         )
-        let generation = MediaGeneration(rawValue: 7)
         let top = ResolvedFieldOrder(
             parity: .top,
             confidence: .signaled,
@@ -487,26 +549,13 @@ final class PlaybackMetricsTests: XCTestCase {
             clock.value = TimeInterval(second)
             metrics.recordDecoderCallback()
             if second.isMultiple(of: 2) {
-                let presentationTime = CMTime(seconds: TimeInterval(second), preferredTimescale: 1_000)
-                metrics.recordPresentationCompletion(
-                    generation: generation,
-                    activeGeneration: generation,
-                    isUniquePresentation: true,
-                    presentationTimeStamp: presentationTime,
-                    targetMediaTime: CMTimeAdd(
-                        presentationTime,
-                        CMTime(value: Int64(second % 20 + 1), timescale: 1_000)
-                    )
-                )
                 metrics.recordVideoDrop(count: second == 60 ? 2 : 0, source: .presentationExpired)
-                metrics.recordPresentationQueueDepth(min(12, second))
             }
         }
         for duration in 1...20 {
             metrics.recordYADIFKernelDispatch(inFlightCount: min(3, duration), inputDepth: min(4, duration))
             metrics.recordGPUDuration(milliseconds: Double(duration))
             metrics.recordYADIFCPUEncode(milliseconds: Double(duration) / 10)
-            metrics.recordRenderCPUPreparation(milliseconds: Double(duration) / 20)
         }
         metrics.recordStaleGenerationDrop()
         metrics.recordVideoDrop(count: 1, source: .deinterlaceQueueFull)
@@ -527,21 +576,14 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.elapsedSeconds, 60, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.windowDurationSeconds, 60, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.decoderCallbacksPerSecond, 1, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentationsPerSecond, 0.5, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentedVideoFrames, 30)
         XCTAssertEqual(snapshot.yadifKernelDispatchCount, 20)
         XCTAssertEqual(snapshot.staleGenerationDropCount, 1)
         XCTAssertEqual(snapshot.droppedVideoFrames, 3)
-        XCTAssertLessThanOrEqual(snapshot.maximumPresentationQueueDepth, 12)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
         XCTAssertEqual(snapshot.gpuDurationP95Milliseconds, 19, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.yadifCPUEncodeP95Milliseconds, 1.9, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.renderCPUPreparationP95Milliseconds, 0.95, accuracy: 0.000_001)
-        XCTAssertLessThanOrEqual(snapshot.avDriftP95Milliseconds, 20)
-        XCTAssertLessThanOrEqual(snapshot.maximumAbsoluteAVDriftMilliseconds, 20)
         XCTAssertEqual(snapshot.residentMemoryBytes, 123_456)
-        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 0)
         XCTAssertEqual(snapshot.audioRoute, "ffmpegPCM")
         XCTAssertTrue(snapshot.audioReady)
         XCTAssertFalse(snapshot.readinessOpen)
@@ -557,69 +599,6 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(snapshot.maximumVideoDecodeSubmissionMilliseconds, 7.5)
     }
 
-    // A 50 Hz panel presenting every frame and a 60 Hz panel losing one tick in
-    // six produce the same callback rate, and only the native period tells them
-    // apart.
-    func testDisplayLinkCadenceReportsTheNativePeriodAndCountsOnlyWholeMissedVSyncs() {
-        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
-        let period = 1.0 / 60
-        var timestamp = 100.0
-        for step in [1, 1, 2, 1, 3, 1] {
-            metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
-            timestamp += period * Double(step)
-        }
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
-        // A stall is not a cadence: folding it in would bury the single-vsync
-        // gaps this counter exists to find.
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp + 5)
-
-        let snapshot = metrics.snapshot(window: .seconds(60))
-        XCTAssertEqual(snapshot.displayLinkCallbackCount, 8)
-        XCTAssertEqual(snapshot.nativeDisplayIntervalMilliseconds, period * 1_000, accuracy: 0.001)
-        XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 3)
-    }
-
-    // The shortest gap ever seen reads short of the true period, so one outlier
-    // would rescale every later gap into a miss. The screen's own rate does not.
-    func testReportedRefreshRateRatherThanTheShortestGapDecidesWhatCountsAsAMiss() {
-        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
-        metrics.recordDisplayRefreshRate(framesPerSecond: 60)
-        var timestamp = 100.0
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
-        // An early outlier three quarters of a period long.
-        timestamp += 0.75 / 60
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
-        for _ in 0..<4 {
-            timestamp += 1.0 / 60
-            metrics.recordDisplayLinkCallback(targetPresentationTimestamp: timestamp)
-        }
-
-        let snapshot = metrics.snapshot(window: .seconds(60))
-        XCTAssertEqual(snapshot.displayRefreshHz, 60)
-        XCTAssertLessThan(snapshot.nativeDisplayIntervalMilliseconds, 1_000 / 60)
-        XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 0)
-    }
-
-    func testCadenceChangeAndSubmissionResumeStartFreshMeasurementEpochs() {
-        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
-        metrics.recordDisplayRefreshRate(framesPerSecond: 60)
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 100)
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 100 + 1.0 / 60)
-
-        metrics.recordDisplayRefreshRate(framesPerSecond: 50)
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 101)
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 101 + 1.0 / 50)
-        metrics.recordDisplaySubmissionResume()
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 102)
-        metrics.recordDisplayLinkCallback(targetPresentationTimestamp: 102 + 1.0 / 50)
-
-        let snapshot = metrics.snapshot(window: .seconds(60))
-        XCTAssertEqual(snapshot.displayRefreshHz, 50)
-        XCTAssertEqual(snapshot.nativeDisplayIntervalMilliseconds, 20, accuracy: 0.001)
-        XCTAssertEqual(snapshot.missedDisplayLinkVSyncCount, 0)
-        XCTAssertEqual(snapshot.displayResumeCount, 1)
-    }
-
     func testWindowedRatesAndPercentilesExcludeOldSamplesWithoutResettingSessionTotals() {
         let clock = MetricsTestClock()
         let metrics = PlaybackMetrics(
@@ -627,154 +606,20 @@ final class PlaybackMetricsTests: XCTestCase {
             now: { clock.value },
             residentMemoryProvider: { 0 }
         )
-        let generation = MediaGeneration(rawValue: 1)
         metrics.recordDecoderCallback()
         metrics.recordGPUDuration(milliseconds: 99)
         metrics.recordYADIFCPUEncode(milliseconds: 88)
-        metrics.recordRenderCPUPreparation(milliseconds: 77)
         clock.value = 120
         metrics.recordDecoderCallback()
         metrics.recordGPUDuration(milliseconds: 4)
         metrics.recordYADIFCPUEncode(milliseconds: 3)
-        metrics.recordRenderCPUPreparation(milliseconds: 2)
-        metrics.recordPresentationCompletion(
-            generation: generation,
-            activeGeneration: MediaGeneration(rawValue: 2),
-            isUniquePresentation: true,
-            presentationTimeStamp: .zero,
-            targetMediaTime: CMTime(value: 9, timescale: 1_000)
-        )
 
         let snapshot = metrics.snapshot(window: .seconds(60))
 
         XCTAssertEqual(snapshot.windowDurationSeconds, 60, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.decoderCallbacksPerSecond, 1.0 / 60.0, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentationsPerSecond, 0, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.gpuDurationP95Milliseconds, 4, accuracy: 0.000_001)
         XCTAssertEqual(snapshot.yadifCPUEncodeP95Milliseconds, 3, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.renderCPUPreparationP95Milliseconds, 2, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentedVideoFrames, 0)
-        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
-    }
-
-    func testFiveSecondReanchorGraceExcludesTransientDrift() {
-        let clock = MetricsTestClock()
-        let metrics = PlaybackMetrics(
-            channelID: "channel",
-            now: { clock.value },
-            residentMemoryProvider: { 0 }
-        )
-        let generation = MediaGeneration(rawValue: 1)
-        clock.value = 10
-        metrics.beginAVDriftGracePeriod(seconds: 5)
-        metrics.recordPresentationCompletion(
-            generation: generation,
-            activeGeneration: generation,
-            isUniquePresentation: true,
-            presentationTimeStamp: .zero,
-            targetMediaTime: CMTime(value: 900, timescale: 1_000)
-        )
-        clock.value = 15
-        metrics.recordPresentationCompletion(
-            generation: generation,
-            activeGeneration: generation,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(value: 15_000, timescale: 1_000),
-            targetMediaTime: CMTime(value: 15_025, timescale: 1_000)
-        )
-
-        let snapshot = metrics.snapshot(window: .seconds(60))
-
-        XCTAssertEqual(snapshot.avDriftP95Milliseconds, 25, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.maximumAbsoluteAVDriftMilliseconds, 25, accuracy: 0.000_001)
-        XCTAssertEqual(snapshot.presentedVideoFrames, 2)
-    }
-
-    func testUniquePresentationPTSRegressionIsCountedWithinOneGeneration() {
-        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
-        let generation = MediaGeneration(rawValue: 1)
-
-        for pts in [10.0, 10.04, 9.0] {
-            let time = CMTime(seconds: pts, preferredTimescale: 1_000)
-            metrics.recordPresentationCompletion(
-                generation: generation,
-                activeGeneration: generation,
-                isUniquePresentation: true,
-                presentationTimeStamp: time,
-                targetMediaTime: time
-            )
-        }
-
-        XCTAssertEqual(
-            metrics.snapshot(window: .seconds(60)).presentationPTSRegressionCount,
-            1
-        )
-    }
-
-    func testUniquePresentationPTSRegressionSurvivesDecoderGenerationChange() {
-        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
-        let firstGeneration = MediaGeneration(rawValue: 1)
-        let secondGeneration = MediaGeneration(rawValue: 2)
-
-        metrics.recordPresentationCompletion(
-            generation: firstGeneration,
-            activeGeneration: firstGeneration,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(seconds: 10, preferredTimescale: 1_000),
-            targetMediaTime: CMTime(seconds: 10, preferredTimescale: 1_000)
-        )
-        metrics.recordPresentationCompletion(
-            generation: firstGeneration,
-            activeGeneration: secondGeneration,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(seconds: 9, preferredTimescale: 1_000),
-            targetMediaTime: CMTime(seconds: 9, preferredTimescale: 1_000)
-        )
-        metrics.recordPresentationCompletion(
-            generation: secondGeneration,
-            activeGeneration: secondGeneration,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(seconds: 1, preferredTimescale: 1_000),
-            targetMediaTime: CMTime(seconds: 1, preferredTimescale: 1_000)
-        )
-
-        let snapshot = metrics.snapshot(window: .seconds(60))
-        XCTAssertEqual(snapshot.presentationPTSRegressionCount, 1)
-        XCTAssertEqual(snapshot.crossGenerationPresentationCount, 1)
-    }
-
-    func testExplicitTimelineResetAllowsAnEarlierPTSWithoutErasingEvidence() {
-        let metrics = PlaybackMetrics(channelID: "channel", now: { 0 })
-        let firstGeneration = MediaGeneration(rawValue: 1)
-        let secondGeneration = MediaGeneration(rawValue: 2)
-
-        metrics.recordPresentationCompletion(
-            generation: firstGeneration,
-            activeGeneration: firstGeneration,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(seconds: 10, preferredTimescale: 1_000),
-            targetMediaTime: CMTime(seconds: 10, preferredTimescale: 1_000)
-        )
-        metrics.recordPresentationCompletion(
-            generation: firstGeneration,
-            activeGeneration: firstGeneration,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(seconds: 9, preferredTimescale: 1_000),
-            targetMediaTime: CMTime(seconds: 9, preferredTimescale: 1_000)
-        )
-        metrics.resetPresentationTimeline()
-        metrics.recordPresentationCompletion(
-            generation: secondGeneration,
-            activeGeneration: secondGeneration,
-            isUniquePresentation: true,
-            presentationTimeStamp: CMTime(seconds: 1, preferredTimescale: 1_000),
-            targetMediaTime: CMTime(seconds: 1, preferredTimescale: 1_000)
-        )
-
-        XCTAssertEqual(
-            metrics.snapshot(window: .seconds(60)).presentationPTSRegressionCount,
-            1
-        )
     }
 
     func testSnapshotNeverClaimsAWindowLongerThanItsRetainedHistory() {
@@ -797,28 +642,17 @@ final class PlaybackMetricsTests: XCTestCase {
             now: { 60 },
             residentMemoryProvider: { 0 }
         )
-        let generation = MediaGeneration(rawValue: 4)
-
         DispatchQueue.concurrentPerform(iterations: 1_000) { index in
             metrics.recordDecoderCallback()
             metrics.recordYADIFKernelDispatch(
                 inFlightCount: index % 4,
                 inputDepth: index % 5
             )
-            metrics.recordPresentationCompletion(
-                generation: generation,
-                activeGeneration: generation,
-                isUniquePresentation: true,
-                presentationTimeStamp: CMTime(value: Int64(index), timescale: 1_000),
-                targetMediaTime: CMTime(value: Int64(index + 1), timescale: 1_000)
-            )
-            metrics.recordPresentationQueueDepth(index % 13)
         }
 
         let snapshot = metrics.snapshot(window: .seconds(60))
-        XCTAssertEqual(snapshot.presentedVideoFrames, 1_000)
+        XCTAssertEqual(snapshot.decoderCallbacksPerSecond, 1_000)
         XCTAssertEqual(snapshot.yadifKernelDispatchCount, 1_000)
-        XCTAssertEqual(snapshot.maximumPresentationQueueDepth, 12)
         XCTAssertEqual(snapshot.maximumYADIFInFlightCount, 3)
         XCTAssertEqual(snapshot.maximumYADIFInputDepth, 4)
     }

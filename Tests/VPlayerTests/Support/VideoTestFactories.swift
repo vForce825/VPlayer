@@ -8,6 +8,8 @@ import CoreVideo
 import Foundation
 @testable import VPlayerPlayback
 
+private let legacyTestVideoDecoderTransitionToken = VideoDecoderTransitionToken()
+
 enum VideoTestFactories {
     static let width = 64
     static let height = 36
@@ -313,4 +315,58 @@ private enum FactoryError: Error {
     case missingPlane(Int)
     case formatDescription(OSStatus)
     case invalidFixtureByteCount(Int)
+}
+
+// Convenience for tests whose behavior predates decoder-session fencing. New
+// transition/routing tests pass a stable identity explicitly.
+extension VideoDecoderEvent {
+    static func frame(_ frame: DecodedVideoFrame) -> Self {
+        .frame(frame, identity: testIdentity(generation: frame.generation))
+    }
+
+    static func recoverableFailure(
+        _ failure: VideoDecoderFailure,
+        generation: MediaGeneration
+    ) -> Self {
+        .recoverableFailure(failure, identity: testIdentity(generation: generation))
+    }
+
+    static func fatalFailure(
+        _ failure: VideoDecoderFailure,
+        generation: MediaGeneration
+    ) -> Self {
+        .fatalFailure(failure, identity: testIdentity(generation: generation))
+    }
+
+    static func submissionFailure(
+        _ failure: VideoDecoderFailure,
+        accessUnitID: UInt64 = 0,
+        generation: MediaGeneration
+    ) -> Self {
+        .submissionFailure(
+            accessUnitID: accessUnitID,
+            failure: failure,
+            identity: testIdentity(generation: generation)
+        )
+    }
+
+    static func submissionCompleted(
+        accessUnitID: UInt64,
+        generation: MediaGeneration
+    ) -> Self {
+        .submissionCompleted(
+            accessUnitID: accessUnitID,
+            identity: testIdentity(generation: generation),
+            disposition: .cancelled
+        )
+    }
+
+    private static func testIdentity(
+        generation: MediaGeneration
+    ) -> VideoDecoderEventIdentity {
+        VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: legacyTestVideoDecoderTransitionToken
+        )
+    }
 }

@@ -51,6 +51,7 @@ final class SystemVideoOutput: @unchecked Sendable {
 
     private let backend: any SampleBufferVideoRenderingBackend
     private let ledger: VideoSurfaceBudgetLedger
+    private let metrics: PlaybackMetrics?
     private let builder = VideoImageSampleBufferBuilder()
     private let removeRenderer: RendererRemoval
     private let recoverySink: @Sendable (MediaGeneration) -> Void
@@ -68,6 +69,7 @@ final class SystemVideoOutput: @unchecked Sendable {
     private var nextAcceptanceID: UInt64 = 1
     private var nextResetID: UInt64 = 1
     private var nextFlushOperationID: UInt64 = 1
+    private var stopFlushOperationID: UInt64 = 0
     private var requestToken: UInt64 = 0
     private var requestArmed = false
     private var inFlightFlush: (operationID: UInt64, transaction: ResetTransaction)?
@@ -76,19 +78,25 @@ final class SystemVideoOutput: @unchecked Sendable {
     private var stopFlushInProgress = false
     private var rendererRemovalCompleted = false
     private var rendererRemovalInFlight = false
+    private var rendererRemovalAttempt = 0
+    private var rendererRemovalToken: UInt64 = 0
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
     private var recoveryRequestInFlight = false
     private var recoveryCompletedWithoutProgress = false
+    private var performanceMetricsRequestInFlight = false
+    private var performanceMetricsRequestToken: UInt64 = 0
 
     init(
         backend: any SampleBufferVideoRenderingBackend,
         ledger: VideoSurfaceBudgetLedger = VideoSurfaceBudgetLedger(),
+        metrics: PlaybackMetrics? = nil,
         removeRenderer: @escaping RendererRemoval,
         recoverySink: @escaping @Sendable (MediaGeneration) -> Void = { _ in },
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     ) {
         self.backend = backend
         self.ledger = ledger
+        self.metrics = metrics
         self.removeRenderer = removeRenderer
         self.recoverySink = recoverySink
         self.failureSink = failureSink
@@ -102,6 +110,7 @@ final class SystemVideoOutput: @unchecked Sendable {
         renderer: AVSampleBufferVideoRenderer,
         synchronizer: AVSampleBufferRenderSynchronizer,
         ledger: VideoSurfaceBudgetLedger = VideoSurfaceBudgetLedger(),
+        metrics: PlaybackMetrics? = nil,
         recoverySink: @escaping @Sendable (MediaGeneration) -> Void,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     ) {
@@ -112,6 +121,7 @@ final class SystemVideoOutput: @unchecked Sendable {
         self.init(
             backend: VideoRendererBackend(renderer: renderer),
             ledger: ledger,
+            metrics: metrics,
             removeRenderer: removal.remove,
             recoverySink: recoverySink,
             failureSink: failureSink
@@ -207,6 +217,27 @@ final class SystemVideoOutput: @unchecked Sendable {
         // The shared AVSampleBufferRenderSynchronizer is the only clock.
     }
 
+    func refreshPerformanceMetrics() {
+        stateQueue.async { [self] in
+            guard !stopped, !performanceMetricsRequestInFlight else { return }
+            performanceMetricsRequestInFlight = true
+            performanceMetricsRequestToken &+= 1
+            let token = performanceMetricsRequestToken
+            backend.loadPerformanceMetrics { [weak self] snapshot in
+                self?.stateQueue.async { [weak self] in
+                    guard let self,
+                          !stopped,
+                          performanceMetricsRequestInFlight,
+                          performanceMetricsRequestToken == token else { return }
+                    performanceMetricsRequestInFlight = false
+                    if let snapshot {
+                        metrics?.recordVideoRendererPerformance(snapshot)
+                    }
+                }
+            }
+        }
+    }
+
     func stopAwaitingRendererRemoval() async {
         await withCheckedContinuation { continuation in
             stateQueue.async { [self] in
@@ -217,6 +248,8 @@ final class SystemVideoOutput: @unchecked Sendable {
                 stopWaiters.append(continuation)
                 guard !stopped else { return }
                 stopped = true
+                performanceMetricsRequestToken &+= 1
+                performanceMetricsRequestInFlight = false
                 stopRequestIsolated()
                 backend.stopObserving()
                 clearPendingIsolated(reason: "renderer.stopped")
@@ -228,6 +261,10 @@ final class SystemVideoOutput: @unchecked Sendable {
                 }
                 pendingReset = nil
                 startStopFlushIsolated()
+                stateQueue.asyncAfter(deadline: .now() + .seconds(2)) { [weak self] in
+                    guard let self, stopped, !rendererRemovalCompleted else { return }
+                    finishStopIsolated()
+                }
             }
         }
     }
@@ -344,6 +381,25 @@ final class SystemVideoOutput: @unchecked Sendable {
                 self?.physicalFlushCompletedIsolated(operationID: operationID)
             }
         }
+        stateQueue.asyncAfter(deadline: .now() + .seconds(2)) { [weak self] in
+            self?.resetFlushDeadlineFiredIsolated(operationID: operationID)
+        }
+    }
+
+    private func resetFlushDeadlineFiredIsolated(operationID: UInt64) {
+        guard let timedOut = inFlightFlush,
+              timedOut.operationID == operationID else { return }
+        inFlightFlush = nil
+        finishResetIsolated(
+            timedOut.transaction,
+            result: .failure(.videoRendererFailed("renderer.flush-timeout"))
+        )
+        if stopped {
+            startStopFlushIsolated()
+        } else if let latest = pendingReset {
+            pendingReset = nil
+            startResetIsolated(latest, clearPending: false)
+        }
     }
 
     private func physicalFlushCompletedIsolated(operationID: UInt64) {
@@ -413,12 +469,21 @@ final class SystemVideoOutput: @unchecked Sendable {
     private func startStopFlushIsolated() {
         guard inFlightFlush == nil, !stopFlushInProgress else { return }
         stopFlushInProgress = true
+        stopFlushOperationID &+= 1
+        let operationID = stopFlushOperationID
         backend.flush(removeDisplayedImage: true) { [weak self] in
-            self?.stateQueue.async { [weak self] in self?.completeStopFlushIsolated() }
+            self?.stateQueue.async { [weak self] in
+                self?.completeStopFlushIsolated(operationID: operationID)
+            }
+        }
+        stateQueue.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+            self?.completeStopFlushIsolated(operationID: operationID)
         }
     }
 
-    private func completeStopFlushIsolated() {
+    private func completeStopFlushIsolated(operationID: UInt64) {
+        guard stopFlushInProgress,
+              operationID == stopFlushOperationID else { return }
         stopFlushInProgress = false
         requestRendererRemovalIsolated()
     }
@@ -427,28 +492,43 @@ final class SystemVideoOutput: @unchecked Sendable {
         guard stopped,
               !rendererRemovalCompleted,
               !rendererRemovalInFlight else { return }
+        guard rendererRemovalAttempt < 2 else {
+            finishStopIsolated()
+            return
+        }
+        rendererRemovalAttempt += 1
         rendererRemovalInFlight = true
+        rendererRemovalToken &+= 1
+        let token = rendererRemovalToken
         removeRenderer { [weak self] removed in
             self?.stateQueue.async { [weak self] in
                 guard let self else { return }
+                guard rendererRemovalInFlight,
+                      rendererRemovalToken == token else { return }
                 rendererRemovalInFlight = false
                 if removed {
                     finishStopIsolated()
                 } else {
-                    // A false result means this scheduled removal did not detach
-                    // the renderer. Retry until the synchronizer confirms the
-                    // renderer is absent; teardown waiters are a real barrier.
-                    stateQueue.asyncAfter(deadline: .now() + .milliseconds(10)) {
+                    stateQueue.asyncAfter(deadline: .now() + .milliseconds(25)) {
                         [weak self] in self?.requestRendererRemovalIsolated()
                     }
                 }
             }
+        }
+        stateQueue.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+            guard let self,
+                  rendererRemovalInFlight,
+                  rendererRemovalToken == token else { return }
+            rendererRemovalInFlight = false
+            requestRendererRemovalIsolated()
         }
     }
 
     private func finishStopIsolated() {
         guard !rendererRemovalCompleted else { return }
         rendererRemovalCompleted = true
+        rendererRemovalInFlight = false
+        rendererRemovalToken &+= 1
         let waiters = stopWaiters
         stopWaiters.removeAll(keepingCapacity: false)
         for waiter in waiters { waiter.resume() }
