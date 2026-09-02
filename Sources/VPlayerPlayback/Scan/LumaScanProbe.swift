@@ -26,6 +26,8 @@ public enum LumaScanProbeFailure: Error, Equatable, Sendable {
 }
 
 public protocol LumaScanProbing: AnyObject, Sendable {
+    /// 仅在任务被接收时返回 true；拒绝时不回调，停止或切换代际可取消已接收任务。
+    @discardableResult
     func submit(
         current: CVPixelBuffer,
         previous: CVPixelBuffer,
@@ -33,7 +35,7 @@ public protocol LumaScanProbing: AnyObject, Sendable {
         completion: @escaping @Sendable (
             Result<ContentProbeSample, LumaScanProbeFailure>
         ) -> Void
-    )
+    ) -> Bool
 
     func stop(generation: MediaGeneration)
 }
@@ -200,6 +202,7 @@ public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
         self.init(backend: try makeBackend(), maximumFrames: maximumFrames)
     }
 
+    @discardableResult
     public func submit(
         current: CVPixelBuffer,
         previous: CVPixelBuffer,
@@ -207,7 +210,7 @@ public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
         completion: @escaping @Sendable (
             Result<ContentProbeSample, LumaScanProbeFailure>
         ) -> Void
-    ) {
+    ) -> Bool {
         let submission = stateLock.withLock { () -> SubmissionKey? in
             if let active = state.activeGeneration {
                 if generation < active {
@@ -229,7 +232,7 @@ public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
             return key
         }
         guard let submission else {
-            return
+            return false
         }
 
         let backendCompletion: @Sendable (
@@ -247,6 +250,7 @@ public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
         } catch {
             finish(submission, result: .failure(error), completion: completion)
         }
+        return true
     }
 
     public func stop(generation: MediaGeneration) {

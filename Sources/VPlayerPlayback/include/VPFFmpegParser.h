@@ -18,15 +18,6 @@ extern "C" {
 typedef struct VPFFParser VPFFParser;
 
 typedef enum {
-    VPFF_FIELD_ORDER_UNKNOWN = 0,
-    VPFF_FIELD_ORDER_PROGRESSIVE = 1,
-    VPFF_FIELD_ORDER_TT = 2,
-    VPFF_FIELD_ORDER_BB = 3,
-    VPFF_FIELD_ORDER_TB = 4,
-    VPFF_FIELD_ORDER_BT = 5
-} VPFFFieldOrder;
-
-typedef enum {
     VPFF_PICTURE_STRUCTURE_UNKNOWN = 0,
     VPFF_PICTURE_STRUCTURE_FRAME = 1,
     VPFF_PICTURE_STRUCTURE_TOP_FIELD = 2,
@@ -111,6 +102,14 @@ int32_t vp_ffmpeg_parser_push(
 
 int32_t vp_ffmpeg_parser_drain(VPFFParser *parser);
 void vp_ffmpeg_parser_destroy(VPFFParser *parser);
+
+#if DEBUG
+/* 仅供测试校验 AVFieldOrder 的显示场序映射。 */
+int8_t vp_ffmpeg_parser_debug_top_field_first(
+    int32_t field_order,
+    int32_t picture_structure
+);
+#endif
 
 #ifdef __cplusplus
 }

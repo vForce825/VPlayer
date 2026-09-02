@@ -833,7 +833,8 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             pictureStructure: parserMetadata.pictureStructure,
             isInterlaced: (parserMetadata.isInterlaced ?? false) || frame.isInterlaced,
             repeatFirstField: parserMetadata.repeatFirstField,
-            topFieldFirst: parserMetadata.topFieldFirst ?? frame.topFieldFirst,
+            topFieldFirst: parserMetadata.topFieldFirst
+                ?? (frame.isInterlaced ? frame.topFieldFirst : nil),
             sourcePTS90k: parserMetadata.sourcePTS90k
         )
     }

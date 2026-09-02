@@ -1145,7 +1145,6 @@ final class PlaybackPipelineTests: XCTestCase {
         let harness = makeHarness(
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 2,
-                psfConfirmationFrames: 2,
                 exitInterlacedConfirmationFrames: 2
             )
         )
@@ -2034,7 +2033,7 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(harness.renderer.snapshot().resets, 1)
     }
 
-    func testProgressiveAndInterlacedFramesBothUseInjectedPassthroughPath() async throws {
+    func testProgressiveUsesPassthroughAndSignalledInterlaceUsesYADIF() async throws {
         let harness = makeHarness()
         let generation = try await configure(harness)
         harness.audio.setReady(true)
@@ -2048,17 +2047,38 @@ final class PlaybackPipelineTests: XCTestCase {
             PlaybackFakeMedia.decodedFrame(
                 id: 1, generation: generation, pts: .zero, interlaced: false
             ),
+        ], in: harness)
+        try await eventually { !harness.processor.snapshot().metadata.isEmpty }
+        let passthroughCount = harness.processor.snapshot().metadata.count
+
+        try receiveAndReleaseNormalizedFrames([
             PlaybackFakeMedia.decodedFrame(
-                id: 2,
+                id: 10,
                 generation: generation,
-                pts: CMTime(value: 1, timescale: 25),
+                pts: CMTime(value: 10, timescale: 25),
                 interlaced: true
             ),
         ], in: harness)
+        try await eventually { !harness.yadif.snapshot().orders.isEmpty }
 
-        try await eventually { harness.processor.snapshot().metadata.count == 2 }
-        XCTAssertEqual(harness.processor.snapshot().metadata.map(\.isInterlaced), [false, true])
-        XCTAssertEqual(harness.renderer.snapshot().frames.count, 2)
+        XCTAssertEqual(harness.processor.snapshot().metadata.count, passthroughCount)
+        XCTAssertTrue(harness.processor.snapshot().metadata.allSatisfy { $0.isInterlaced == false })
+        let routedSnapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(routedSnapshot.requiredVideoFrameCount, 2)
+    }
+
+    func testTrackFieldOrderSelectsYADIFBeforeTheFirstDecodedFrame() async throws {
+        let harness = makeHarness()
+
+        _ = try await configure(
+            harness,
+            tracks: PlaybackFakeMedia.tracks(videoFieldOrder: .tt)
+        )
+
+        let snapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(snapshot.requiredVideoFrameCount, 2)
+        XCTAssertTrue(harness.processor.snapshot().metadata.isEmpty)
+        XCTAssertTrue(harness.yadif.snapshot().orders.isEmpty)
     }
 
     func testPipelineReadinessRequirementTracksCurrentCoordinatorRoute() async throws {
@@ -7180,11 +7200,12 @@ final class PlaybackPipelineTests: XCTestCase {
 
     private func configure(
         _ harness: Harness,
-        initialRandomAccessPTS: CMTime? = .zero
+        initialRandomAccessPTS: CMTime? = .zero,
+        tracks: DemuxTrackSet = PlaybackFakeMedia.tracks()
     ) async throws -> MediaGeneration {
         harness.pipeline.start(url: makeRequest().streamURL)
         try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
-        harness.demux.emit(.tracks(PlaybackFakeMedia.tracks()))
+        harness.demux.emit(.tracks(tracks))
         try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
         let fingerprint = MediaFormatFingerprint(bytes: Data([1]))
         harness.pipeline.receive(audio: .format(
@@ -7341,7 +7362,6 @@ final class PlaybackPipelineTests: XCTestCase {
         requiredVideoFrames: Int = 1,
         classifierConfiguration: ScanClassifierConfiguration = ScanClassifierConfiguration(
             progressiveConfirmationFrames: 1,
-            psfConfirmationFrames: 1,
             exitInterlacedConfirmationFrames: 1
         ),
         scanProbe: (any LumaScanProbing)? = nil,
@@ -7475,6 +7495,7 @@ final class PlaybackPipelineTests: XCTestCase {
             demux: demux,
             decoder: decoder,
             processor: processor,
+            yadif: yadifProcessor,
             renderer: renderer,
             audio: audio,
             assemblers: assemblers,
@@ -7666,6 +7687,7 @@ private struct Harness: @unchecked Sendable {
     let demux: FakePipelineDemuxer
     let decoder: FakeVideoDecoder
     let processor: FakePipelineVideoProcessor
+    let yadif: FakePipelineYADIFProcessor
     let renderer: FakePipelineVideoRenderer
     let audio: FakePipelineAudio
     let assemblers: FakePlaybackAssemblerBuilder
@@ -7877,6 +7899,7 @@ private struct SeededGenerator: RandomNumberGenerator {
 }
 
 private final class InconclusivePipelineScanProbe: LumaScanProbing, @unchecked Sendable {
+    @discardableResult
     func submit(
         current _: CVPixelBuffer,
         previous _: CVPixelBuffer,
@@ -7884,12 +7907,13 @@ private final class InconclusivePipelineScanProbe: LumaScanProbing, @unchecked S
         completion: @escaping @Sendable (
             Result<ContentProbeSample, LumaScanProbeFailure>
         ) -> Void
-    ) {
+    ) -> Bool {
         completion(.success(ContentProbeSample(
             combRatio: 0.04,
             motionRatio: 0,
             sampleCount: 2_304
         )))
+        return true
     }
 
     func stop(generation _: MediaGeneration) {}

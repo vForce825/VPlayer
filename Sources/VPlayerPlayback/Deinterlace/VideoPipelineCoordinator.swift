@@ -214,9 +214,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var normalizer: PresentationTimestampNormalizer
     private var videoFormat: CMVideoFormatDescription?
     private var previousProbeBuffer: CVPixelBuffer?
-    private var classificationProbeObservationCount = 0
+    private var completedClassificationProbeCount = 0
     private var nextProbeSubmissionID: UInt64 = 0
     private var activeProbeSubmissionID: UInt64?
+    private var activeProbeSignpostLifetime: PlaybackSignpostLifetime?
     private var decoderConfigured = false
     private var waitingForRandomAccess = true
     private var activeDecoderIdentity: VideoDecoderEventIdentity?
@@ -305,10 +306,14 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         metrics?.update(activeRoute: .rawWhileClassifying)
     }
 
-    func replaceFormat(_ format: CMVideoFormatDescription) {
+    func replaceFormat(
+        _ format: CMVideoFormatDescription,
+        streamFieldOrder: CodedFieldOrder = .unknown
+    ) {
         guard !stopped else { return }
         performTrueFormatChange(
             format: format,
+            streamFieldOrder: streamFieldOrder,
             reopenAdmission: true,
             resetsTimeline: false
         )
@@ -318,6 +323,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         guard !stopped else { return }
         performTrueFormatChange(
             format: nil,
+            streamFieldOrder: .unknown,
             reopenAdmission: false,
             resetsTimeline: true
         )
@@ -330,7 +336,10 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         }
     }
 
-    func installFormatForCurrentGeneration(_ format: CMVideoFormatDescription) {
+    func installFormatForCurrentGeneration(
+        _ format: CMVideoFormatDescription,
+        streamFieldOrder: CodedFieldOrder = .unknown
+    ) {
         guard !stopped else { return }
         videoFormat = format
         decoderConfigured = false
@@ -339,6 +348,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         pendingDecoderConfiguration = nil
         pendingDecoderInvalidation?.reopenAdmission = true
         recoveryBudget.beginMediaEpoch()
+        apply(streamFieldOrder: streamFieldOrder)
     }
 
     func installProcessingAdmissionFloor(
@@ -358,6 +368,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
 
     private func performTrueFormatChange(
         format: CMVideoFormatDescription?,
+        streamFieldOrder: CodedFieldOrder,
         reopenAdmission: Bool,
         resetsTimeline: Bool
     ) {
@@ -382,20 +393,30 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.reset(to: generation)
         probe?.stop(generation: oldGeneration)
         previousProbeBuffer = nil
-        classificationProbeObservationCount = 0
-        activeProbeSubmissionID = nil
+        completedClassificationProbeCount = 0
+        clearActiveProbeSubmission()
         videoFormat = format
         decoderConfigured = false
         waitingForRandomAccess = true
         activeDecoderIdentity = nil
         pendingDecoderConfiguration = nil
         recoveryBudget.beginMediaEpoch()
+        apply(streamFieldOrder: streamFieldOrder)
         hooks.resetPlayback(generation, requiredVideoFrameCount, .timeline)
         beginDecoderInvalidation(
             generation: generation,
             drain: shouldDrain,
             reopenAdmission: reopenAdmission
         )
+    }
+
+    private func apply(streamFieldOrder: CodedFieldOrder) {
+        guard let change = classifier.observeStreamFieldOrder(
+            streamFieldOrder,
+            generation: generation
+        ) else { return }
+        metrics?.update(scanType: change.current)
+        applyResolvedRoute()
     }
 
     @discardableResult
@@ -750,8 +771,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             yadif.reset(to: generation)
             probe?.stop(generation: oldGeneration)
             previousProbeBuffer = nil
-            classificationProbeObservationCount = 0
-            activeProbeSubmissionID = nil
+            completedClassificationProbeCount = 0
+            clearActiveProbeSubmission()
             decoderConfigured = false
             waitingForRandomAccess = true
             activeDecoderIdentity = nil
@@ -772,8 +793,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.reset(to: generation)
         probe?.stop(generation: generation)
         previousProbeBuffer = nil
-        classificationProbeObservationCount = 0
-        activeProbeSubmissionID = nil
+        completedClassificationProbeCount = 0
+        clearActiveProbeSubmission()
     }
 
     private static func diagnosticName(for failure: VideoDecoderFailure) -> (String, Int32) {
@@ -905,8 +926,8 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.reset(to: generation)
         probe?.stop(generation: oldGeneration)
         previousProbeBuffer = nil
-        classificationProbeObservationCount = 0
-        activeProbeSubmissionID = nil
+        completedClassificationProbeCount = 0
+        clearActiveProbeSubmission()
         decoderConfigured = false
         waitingForRandomAccess = true
         activeDecoderIdentity = nil
@@ -926,27 +947,25 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
               let previousProbeBuffer else { return }
         let submittedGeneration = generation
         let submittedEpoch = routeEpoch
-        if route == .rawWhileClassifying { classificationProbeObservationCount += 1 }
-        let shouldResolveStartup = route == .rawWhileClassifying
-            && classificationProbeObservationCount
-                >= Self.maximumClassificationProbeAttempts
         if activeProbeSubmissionID == nil {
             nextProbeSubmissionID &+= 1
             let submissionID = nextProbeSubmissionID
             activeProbeSubmissionID = submissionID
             let token = signposts?.begin(.scanProbe, correlation: frame.accessUnitID)
-            let signposts = signposts
-            probe.submit(
+            activeProbeSignpostLifetime = PlaybackSignpostLifetime(
+                signposts: signposts,
+                token: token
+            )
+            let accepted = probe.submit(
                 current: frame.pixelBuffer,
                 previous: previousProbeBuffer,
                 generation: submittedGeneration
             ) { [weak self] result in
-                if let token { signposts?.end(token) }
                 guard let self else { return }
                 hooks.schedule { [weak self] in
                     guard let self else { return }
                     if activeProbeSubmissionID == submissionID {
-                        activeProbeSubmissionID = nil
+                        clearActiveProbeSubmission()
                     }
                     guard !stopped,
                           generation == submittedGeneration,
@@ -954,18 +973,31 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                         metrics?.recordStaleGenerationDrop()
                         return
                     }
+                    completedClassificationProbeCount += 1
                     switch result {
                     case let .success(sample):
                         observeSupplementalProbe(frame, sample: sample)
                     case .failure:
                         observeProbeFailure(frame)
                     }
+                    if route == .rawWhileClassifying,
+                       completedClassificationProbeCount
+                           >= Self.maximumClassificationProbeAttempts {
+                        resolveAfterProbeBudget(frame)
+                    }
                 }
             }
+            if !accepted, activeProbeSubmissionID == submissionID {
+                clearActiveProbeSubmission()
+                resolveAfterProbeBudget(frame)
+            }
         }
-        if shouldResolveStartup, route == .rawWhileClassifying {
-            resolveAfterProbeBudget(frame)
-        }
+    }
+
+    private func clearActiveProbeSubmission() {
+        activeProbeSubmissionID = nil
+        activeProbeSignpostLifetime?.finish()
+        activeProbeSignpostLifetime = nil
     }
 
     private func observeSupplementalProbe(
@@ -999,7 +1031,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             presentationTimeStamp: frame.presentationTimeStamp
         )
         guard let change = classifier.observeProbeFailure(observation) else { return }
-        classificationProbeObservationCount = 0
+        completedClassificationProbeCount = 0
         metrics?.update(scanType: change.current)
         applyResolvedRoute()
     }
@@ -1016,7 +1048,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             presentationTimeStamp: frame.presentationTimeStamp
         )
         guard let change = classifier.resolveAfterProbeBudget(observation) else { return }
-        classificationProbeObservationCount = 0
+        completedClassificationProbeCount = 0
         metrics?.update(scanType: change.current)
         applyResolvedRoute()
     }

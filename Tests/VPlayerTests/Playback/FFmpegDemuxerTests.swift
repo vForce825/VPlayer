@@ -148,7 +148,7 @@ final class FFmpegDemuxerTests: XCTestCase {
         let bridge = FakeFFmpegDemuxBridge { handle in
             handle.emitTracks(
                 programID: 42,
-                video: .h264(extradata: Data([1, 2, 3])),
+                video: .h264(fieldOrder: 2, extradata: Data([1, 2, 3])),
                 audio: .aac(extradata: Data([0x12, 0x10])),
                 mutateBorrowedBytesAfterCallback: true
             )
@@ -179,6 +179,7 @@ final class FFmpegDemuxerTests: XCTestCase {
         }
         XCTAssertEqual(tracks.selectedProgramID, 42)
         XCTAssertEqual(tracks.video?.extradata, Data([1, 2, 3]))
+        XCTAssertEqual(tracks.video?.fieldOrder, .tt)
         XCTAssertEqual(tracks.audio?.extradata, Data([0x12, 0x10]))
         guard case let .packet(packet) = events.dropFirst().first else {
             return XCTFail("packet must follow tracks")
@@ -404,6 +405,12 @@ final class FFmpegDemuxerTests: XCTestCase {
                 var track = RawTrackSpec.aac()
                 track.channelOrder = unknownChannelOrder
                 handle.emitTracks(audio: track)
+                return 0
+            }),
+            ("unknown video field order", { handle in
+                var track = RawTrackSpec.h264()
+                track.fieldOrder = 99
+                handle.emitTracks(video: track)
                 return 0
             }),
             ("unknown error stage", { handle in
@@ -660,10 +667,17 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertEqual(VPFF_DISCONTINUITY_NONE.rawValue, 0)
         XCTAssertEqual(VPFF_DISCONTINUITY_FORMAT_CHANGE.rawValue, 1)
         XCTAssertEqual(VPFF_DISCONTINUITY_TIMELINE_RESET.rawValue, 2)
+        XCTAssertEqual(VPFF_FIELD_ORDER_UNKNOWN.rawValue, 0)
+        XCTAssertEqual(VPFF_FIELD_ORDER_PROGRESSIVE.rawValue, 1)
+        XCTAssertEqual(VPFF_FIELD_ORDER_TT.rawValue, 2)
+        XCTAssertEqual(VPFF_FIELD_ORDER_BB.rawValue, 3)
+        XCTAssertEqual(VPFF_FIELD_ORDER_TB.rawValue, 4)
+        XCTAssertEqual(VPFF_FIELD_ORDER_BT.rawValue, 5)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.kind), 0)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.has_program_id), 4)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.selected_program_id), 8)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.video), 16)
+        XCTAssertEqual(MemoryLayout<VPFFTrack>.offset(of: \.field_order), 53)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.audio), 96)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.packet), 176)
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.offset(of: \.error_kind), 240)
@@ -1234,6 +1248,7 @@ private extension RawTrackSpec {
         videoDelay: Int32 = 1,
         frameRateNum: Int32 = 0,
         frameRateDen: Int32 = 0,
+        fieldOrder: UInt8 = 0,
         extradata: Data = Data([1, 2, 3])
     ) -> Self {
         .init(
@@ -1242,6 +1257,7 @@ private extension RawTrackSpec {
             width: width,
             height: 1_080,
             videoDelay: videoDelay,
+            fieldOrder: fieldOrder,
             frameRateNum: frameRateNum,
             frameRateDen: frameRateDen,
             extradata: extradata

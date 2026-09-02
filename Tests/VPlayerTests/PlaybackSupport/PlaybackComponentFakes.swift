@@ -443,6 +443,10 @@ final class FakePipelineYADIFProcessor: YADIFFrameProcessing, @unchecked Sendabl
     }
 
     func drain(completion: @escaping @Sendable () -> Void) { completion() }
+
+    func snapshot() -> (resets: [MediaGeneration], orders: [ResolvedFieldOrder]) {
+        lock.withLock { (resetGenerations, submittedOrders) }
+    }
 }
 
 final class FakePipelineVideoRenderer: PlaybackVideoRendering, @unchecked Sendable {
@@ -972,7 +976,8 @@ enum PlaybackFakeMedia {
     static func tracks(
         videoExtradata: Data = Data(),
         audioExtradata: Data = Data([0x12, 0x10]),
-        videoFrameRate: MediaRational? = nil
+        videoFrameRate: MediaRational? = nil,
+        videoFieldOrder: CodedFieldOrder = .unknown
     ) -> DemuxTrackSet {
         DemuxTrackSet(
             selectedProgramID: 1,
@@ -984,7 +989,8 @@ enum PlaybackFakeMedia {
                 height: 1_080,
                 videoDelay: 0,
                 extradata: videoExtradata,
-                frameRate: videoFrameRate
+                frameRate: videoFrameRate,
+                fieldOrder: videoFieldOrder
             ),
             audio: AudioTrackDescriptor(
                 streamIndex: 101,
@@ -1199,11 +1205,11 @@ enum PlaybackFakeMedia {
             duration: duration,
             generation: generation,
             parserMetadata: VideoParserMetadata(
-                fieldOrder: interlaced ? .tb : .progressive,
+                fieldOrder: interlaced ? .tt : .progressive,
                 pictureStructure: pictureStructure,
                 isInterlaced: interlaced,
                 repeatFirstField: false,
-                topFieldFirst: interlaced,
+                topFieldFirst: interlaced ? true : nil,
                 sourcePTS90k: sourcePTS90k
             ),
             formatMetadata: VideoFormatMetadata(
@@ -1222,11 +1228,11 @@ enum PlaybackFakeMedia {
 
     static func parserMetadata(interlaced: Bool) -> VideoParserMetadata {
         VideoParserMetadata(
-            fieldOrder: interlaced ? .tb : .progressive,
+            fieldOrder: interlaced ? .tt : .progressive,
             pictureStructure: .frame,
             isInterlaced: interlaced,
             repeatFirstField: false,
-            topFieldFirst: interlaced,
+            topFieldFirst: interlaced ? true : nil,
             sourcePTS90k: nil
         )
     }

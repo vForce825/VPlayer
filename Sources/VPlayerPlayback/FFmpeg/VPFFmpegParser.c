@@ -302,17 +302,30 @@ static int8_t vpff_parser_interlaced(const VPFFParsedFrame *frame) {
 
 static int8_t vpff_parser_top_field_first(const VPFFParsedFrame *frame) {
     if (frame->field_order == VPFF_FIELD_ORDER_TT ||
-        frame->field_order == VPFF_FIELD_ORDER_TB ||
+        frame->field_order == VPFF_FIELD_ORDER_BT ||
         frame->picture_structure == VPFF_PICTURE_STRUCTURE_TOP_FIELD) {
         return 1;
     }
     if (frame->field_order == VPFF_FIELD_ORDER_BB ||
-        frame->field_order == VPFF_FIELD_ORDER_BT ||
+        frame->field_order == VPFF_FIELD_ORDER_TB ||
         frame->picture_structure == VPFF_PICTURE_STRUCTURE_BOTTOM_FIELD) {
         return 0;
     }
     return -1;
 }
+
+#if DEBUG
+int8_t vp_ffmpeg_parser_debug_top_field_first(
+    int32_t field_order,
+    int32_t picture_structure
+) {
+    const VPFFParsedFrame frame = {
+        .field_order = field_order,
+        .picture_structure = picture_structure,
+    };
+    return vpff_parser_top_field_first(&frame);
+}
+#endif
 
 static int vpff_parser_emit(
     VPFFParser *owned,

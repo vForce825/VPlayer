@@ -13,10 +13,8 @@ final class ScanTypeClassifierTests: XCTestCase {
         let configuration = ScanClassifierConfiguration()
 
         XCTAssertEqual(configuration.progressiveConfirmationFrames, 8)
-        XCTAssertEqual(configuration.psfConfirmationFrames, 12)
         XCTAssertEqual(configuration.exitInterlacedConfirmationFrames, 12)
         XCTAssertEqual(configuration.combThreshold, 0.08)
-        XCTAssertEqual(configuration.psfMaximumCombRatio, 0.02)
         XCTAssertEqual(configuration.motionThreshold, 0.015)
         XCTAssertEqual(configuration, ScanClassifierConfiguration())
 
@@ -63,20 +61,74 @@ final class ScanTypeClassifierTests: XCTestCase {
         }
     }
 
-    func testEachFieldSignalAloneRemainsUnknownWithoutProbe() {
-        let candidates = [
-            observation(isInterlaced: true),
-            observation(fieldOrder: .tt),
-            observation(fieldCount: 2),
-            observation(decodedOrder: order(.bottom, confidence: .signaled, source: .pixelBuffer)),
+    func testExplicitInterlacedSignalImmediatelyLocksAgainstLowCombContent() {
+        var sut = ScanTypeClassifier(generation: generation)
+        let explicitTop = order(.top, confidence: .signaled, source: .parser)
+
+        XCTAssertEqual(
+            sut.observe(observation(fieldOrder: .tt, isInterlaced: true))?.current,
+            .interlaced(explicitTop)
+        )
+
+        let lowComb = observation(
+            fieldOrder: .tt,
+            isInterlaced: true,
+            probe: probe(comb: 0.002, motion: 0.02)
+        )
+        for _ in 0..<12 {
+            XCTAssertNil(sut.observe(lowComb))
+        }
+        XCTAssertEqual(sut.current, .interlaced(explicitTop))
+    }
+
+    func testStreamFieldOrderImmediatelyLocksUntilGenerationReset() {
+        var sut = ScanTypeClassifier(generation: generation)
+
+        XCTAssertEqual(
+            sut.observeStreamFieldOrder(.tt, generation: generation)?.current,
+            .interlaced(order(.top, confidence: .signaled, source: .stream))
+        )
+        for _ in 0..<12 {
+            XCTAssertNil(sut.observe(progressiveObservation()))
+        }
+        XCTAssertEqual(
+            sut.current,
+            .interlaced(order(.top, confidence: .signaled, source: .stream))
+        )
+
+        let next = MediaGeneration(rawValue: generation.rawValue + 1)
+        sut.reset(generation: next)
+        XCTAssertNil(sut.observeStreamFieldOrder(.progressive, generation: next))
+        XCTAssertEqual(sut.current, .unknown)
+    }
+
+    func testEachExplicitFieldSignalImmediatelyConfirmsInterlaced() {
+        let assumedTop = order(.top, confidence: .assumed, source: .contentProbe)
+        let candidates: [(ScanObservation, ResolvedFieldOrder)] = [
+            (observation(isInterlaced: true), assumedTop),
+            (
+                observation(fieldOrder: .tt),
+                order(.top, confidence: .signaled, source: .parser)
+            ),
+            (observation(fieldCount: 2), assumedTop),
+            (
+                observation(
+                    decodedOrder: order(
+                        .bottom,
+                        confidence: .signaled,
+                        source: .pixelBuffer
+                    )
+                ),
+                order(.bottom, confidence: .signaled, source: .pixelBuffer)
+            ),
         ]
 
-        for candidate in candidates {
+        for (candidate, expectedOrder) in candidates {
             var sut = ScanTypeClassifier(generation: generation)
-            for _ in 0..<20 {
-                XCTAssertNil(sut.observe(candidate))
-            }
-            XCTAssertEqual(sut.current, .unknown)
+            XCTAssertEqual(
+                sut.observe(candidate)?.current,
+                .interlaced(expectedOrder)
+            )
         }
     }
 
@@ -98,8 +150,6 @@ final class ScanTypeClassifierTests: XCTestCase {
     func testBelowMotionAndMiddleCombProbesConfirmNeitherRoute() {
         var belowMotion = ScanTypeClassifier(generation: generation)
         XCTAssertNil(belowMotion.observe(observation(
-            fieldOrder: .tt,
-            isInterlaced: true,
             probe: probe(comb: 0.08, motion: 0.0149)
         )))
         XCTAssertEqual(belowMotion.current, .unknown)
@@ -107,110 +157,13 @@ final class ScanTypeClassifierTests: XCTestCase {
         var middleComb = ScanTypeClassifier(generation: generation)
         for _ in 0..<20 {
             XCTAssertNil(middleComb.observe(observation(
-                fieldOrder: .tt,
-                isInterlaced: true,
                 probe: probe(comb: 0.021, motion: 0.015)
             )))
         }
         XCTAssertEqual(middleComb.current, .unknown)
     }
 
-    func testPsFTransitionsOnlyOnTwelfthConsecutiveMovingLowCombSample() {
-        var sut = ScanTypeClassifier(generation: generation)
-        let sample = observation(
-            fieldOrder: .tt,
-            isInterlaced: true,
-            probe: probe(comb: 0.02, motion: 0.015)
-        )
-
-        let transitions = (1...13).map { _ in sut.observe(sample)?.current }
-
-        XCTAssertEqual(
-            transitions,
-            [nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-             .progressiveSegmentedFrame(order(.top, confidence: .signaled, source: .parser)), nil]
-        )
-    }
-
-    func testPsFStreakInterruptionRestartsTheCount() {
-        var sut = ScanTypeClassifier(generation: generation)
-        let sample = observation(
-            fieldCount: 2,
-            decodedOrder: order(.bottom, confidence: .signaled, source: .pixelBuffer),
-            probe: probe(comb: 0.01, motion: 0.08)
-        )
-
-        for _ in 0..<11 { XCTAssertNil(sut.observe(sample)) }
-        XCTAssertNil(sut.observe(observation(
-            fieldCount: 2,
-            probe: probe(comb: 0.04, motion: 0.08)
-        )))
-        for _ in 0..<11 { XCTAssertNil(sut.observe(sample)) }
-        XCTAssertEqual(
-            sut.observe(sample)?.current,
-            .progressiveSegmentedFrame(order(.bottom, confidence: .signaled, source: .pixelBuffer))
-        )
-    }
-
-    func testAsyncPsFStreakSurvivesBaseObservationsAndExplicitMissResetsIt() {
-        let configuration = ScanClassifierConfiguration(
-            progressiveConfirmationFrames: 8,
-            psfConfirmationFrames: 3,
-            exitInterlacedConfirmationFrames: 12
-        )
-        let base = observation(fieldOrder: .tt, isInterlaced: true)
-        let lowComb = observation(
-            fieldOrder: .tt,
-            isInterlaced: true,
-            probe: probe(comb: 0.01, motion: 0.08)
-        )
-        let nonqualifying = observation(
-            fieldOrder: .tt,
-            isInterlaced: true,
-            probe: probe(comb: 0.04, motion: 0.08)
-        )
-
-        var uninterrupted = ScanTypeClassifier(
-            generation: generation,
-            configuration: configuration
-        )
-        for _ in 0..<2 {
-            XCTAssertNil(uninterrupted.observe(base))
-            XCTAssertNil(uninterrupted.observeSupplementalProbe(lowComb))
-        }
-        XCTAssertNil(uninterrupted.observe(base))
-        XCTAssertEqual(
-            uninterrupted.observeSupplementalProbe(lowComb)?.current,
-            .progressiveSegmentedFrame(
-                order(.top, confidence: .signaled, source: .parser)
-            )
-        )
-
-        var interrupted = ScanTypeClassifier(
-            generation: generation,
-            configuration: configuration
-        )
-        for _ in 0..<2 {
-            XCTAssertNil(interrupted.observe(base))
-            XCTAssertNil(interrupted.observeSupplementalProbe(lowComb))
-        }
-        XCTAssertNil(interrupted.observe(base))
-        XCTAssertNil(interrupted.observeSupplementalProbe(nonqualifying))
-        for _ in 0..<2 {
-            XCTAssertNil(interrupted.observe(base))
-            XCTAssertNil(interrupted.observeSupplementalProbe(lowComb))
-        }
-        XCTAssertEqual(interrupted.current, .unknown)
-        XCTAssertNil(interrupted.observe(base))
-        XCTAssertEqual(
-            interrupted.observeSupplementalProbe(lowComb)?.current,
-            .progressiveSegmentedFrame(
-                order(.top, confidence: .signaled, source: .parser)
-            )
-        )
-    }
-
-    func testInterlacedExitsOnlyOnTwelfthTrustedProgressivePicture() {
+    func testSignalledInterlaceRemainsLockedUntilGenerationReset() {
         var sut = ScanTypeClassifier(generation: generation)
         _ = sut.observe(observation(
             fieldOrder: .tt,
@@ -219,48 +172,19 @@ final class ScanTypeClassifierTests: XCTestCase {
 
         let transitions = (1...13).map { _ in sut.observe(progressiveObservation())?.current }
 
+        XCTAssertEqual(transitions, Array(repeating: nil, count: 13))
         XCTAssertEqual(
-            transitions,
-            [nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, .progressive, nil]
+            sut.current,
+            .interlaced(order(.top, confidence: .signaled, source: .parser))
         )
     }
 
-    func testPsFExitsOnlyOnTwelfthTrustedProgressivePicture() {
-        var sut = confirmedPsFClassifier()
-
-        let transitions = (1...13).map { _ in sut.observe(progressiveObservation())?.current }
-
-        XCTAssertEqual(
-            transitions,
-            [nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, .progressive, nil]
-        )
-    }
-
-    func testAmbiguityInterruptsConfirmedRouteExitHysteresis() {
-        var sut = confirmedInterlacedClassifier()
-
-        for _ in 0..<11 { XCTAssertNil(sut.observe(progressiveObservation())) }
-        XCTAssertNil(sut.observe(observation()))
-        for _ in 0..<11 { XCTAssertNil(sut.observe(progressiveObservation())) }
-        XCTAssertEqual(sut.current, .interlaced(order(.top, confidence: .signaled, source: .parser)))
-        XCTAssertEqual(sut.observe(progressiveObservation())?.current, .progressive)
-    }
-
-    func testConclusiveInterlaceImmediatelyOverridesProgressiveAndPsF() {
+    func testExplicitInterlaceImmediatelyOverridesProgressive() {
         var progressive = confirmedProgressiveClassifier()
         XCTAssertEqual(
             progressive.observe(observation(
                 fieldOrder: .bb,
                 probe: probe(comb: 0.08, motion: 0.015)
-            ))?.current,
-            .interlaced(order(.bottom, confidence: .signaled, source: .parser))
-        )
-
-        var psf = confirmedPsFClassifier()
-        XCTAssertEqual(
-            psf.observe(observation(
-                fieldOrder: .tb,
-                probe: probe(comb: 0.3, motion: 0.2)
             ))?.current,
             .interlaced(order(.bottom, confidence: .signaled, source: .parser))
         )
@@ -364,7 +288,7 @@ final class ScanTypeClassifierTests: XCTestCase {
         XCTAssertEqual(sut.current, .interlaced(explicitTop))
     }
 
-    func testTopFieldFirstAloneRefinesAssumedOrderAndResetsProgressiveExitStreak() {
+    func testTopFieldFirstAloneRefinesContentDetectedOrderAndLocksInterlace() {
         var sut = ScanTypeClassifier(generation: generation)
         _ = sut.observe(observation(probe: probe(comb: 0.2, motion: 0.2)))
         for _ in 0..<11 { XCTAssertNil(sut.observe(progressiveObservation())) }
@@ -374,33 +298,14 @@ final class ScanTypeClassifierTests: XCTestCase {
             .interlaced(order(.bottom, confidence: .signaled, source: .parser))
         )
 
-        for _ in 0..<11 { XCTAssertNil(sut.observe(progressiveObservation())) }
+        for _ in 0..<13 { XCTAssertNil(sut.observe(progressiveObservation())) }
         XCTAssertEqual(
             sut.current,
             .interlaced(order(.bottom, confidence: .signaled, source: .parser))
         )
-        XCTAssertEqual(sut.observe(progressiveObservation())?.current, .progressive)
     }
 
-    func testProgressiveExitEventDoesNotExposeAnUnemittedOrderRefinement() {
-        let assumed = order(.top, confidence: .assumed, source: .contentProbe)
-        var sut = ScanTypeClassifier(generation: generation)
-        _ = sut.observe(observation(probe: probe(comb: 0.2, motion: 0.2)))
-        for _ in 0..<11 { XCTAssertNil(sut.observe(progressiveObservation())) }
-
-        let change = sut.observe(observation(
-            picture: .frame,
-            fieldOrder: .progressive,
-            isInterlaced: false,
-            topFieldFirst: false
-        ))
-
-        XCTAssertEqual(change?.previous, .interlaced(assumed))
-        XCTAssertEqual(change?.current, .progressive)
-        XCTAssertEqual(sut.current, .progressive)
-    }
-
-    func testConflictingPsFOrderRemainsNilAndIsHeldThroughAmbiguity() {
+    func testConflictingExplicitOrdersUseAssumedInterlaceAndRemainLocked() {
         var sut = ScanTypeClassifier(generation: generation)
         let conflictingSample = observation(
             fieldOrder: .tt,
@@ -409,10 +314,14 @@ final class ScanTypeClassifierTests: XCTestCase {
             probe: probe(comb: 0.01, motion: 0.08)
         )
 
-        for _ in 0..<11 { XCTAssertNil(sut.observe(conflictingSample)) }
-        XCTAssertEqual(sut.observe(conflictingSample)?.current, .progressiveSegmentedFrame(nil))
-        XCTAssertNil(sut.observe(observation(fieldOrder: .bb)))
-        XCTAssertEqual(sut.current, .progressiveSegmentedFrame(nil))
+        XCTAssertEqual(
+            sut.observe(conflictingSample)?.current,
+            .interlaced(order(.top, confidence: .assumed, source: .contentProbe))
+        )
+        XCTAssertEqual(
+            sut.observe(observation(fieldOrder: .bb))?.current,
+            .interlaced(order(.bottom, confidence: .signaled, source: .parser))
+        )
     }
 
     func testInvalidProbeValuesAndSampleCountsAreIgnoredRatherThanClamped() {
@@ -431,8 +340,6 @@ final class ScanTypeClassifierTests: XCTestCase {
             var sut = ScanTypeClassifier(generation: generation)
             for _ in 0..<20 {
                 XCTAssertNil(sut.observe(observation(
-                    fieldOrder: .tt,
-                    isInterlaced: true,
                     probe: invalid
                 )))
             }
@@ -443,22 +350,20 @@ final class ScanTypeClassifierTests: XCTestCase {
     func testZeroAndNegativeCustomCountsHaveEffectiveMinimumOne() {
         let configuration = ScanClassifierConfiguration(
             progressiveConfirmationFrames: 0,
-            psfConfirmationFrames: -4,
             exitInterlacedConfirmationFrames: 0
         )
 
         var progressive = ScanTypeClassifier(generation: generation, configuration: configuration)
         XCTAssertEqual(progressive.observe(progressiveObservation())?.current, .progressive)
 
-        var psf = ScanTypeClassifier(generation: generation, configuration: configuration)
+        var interlaced = ScanTypeClassifier(generation: generation, configuration: configuration)
         XCTAssertEqual(
-            psf.observe(observation(
+            interlaced.observe(observation(
                 fieldOrder: .tt,
                 probe: probe(comb: 0.01, motion: 0.08)
             ))?.current,
-            .progressiveSegmentedFrame(order(.top, confidence: .signaled, source: .parser))
+            .interlaced(order(.top, confidence: .signaled, source: .parser))
         )
-        XCTAssertEqual(psf.observe(progressiveObservation())?.current, .progressive)
     }
 
     func testFrameCodingDecodedFieldCountOneAndAbsentFlagsAreNotTrustedProgressive() {
@@ -475,7 +380,7 @@ final class ScanTypeClassifierTests: XCTestCase {
         }
     }
 
-    func testConflictingParserProgressiveAndDecodedFieldSignalIsNotTrustedProgressive() {
+    func testDecodedFieldSignalOverridesConflictingParserProgressive() {
         var sut = ScanTypeClassifier(generation: generation)
         let conflict = observation(
             picture: .frame,
@@ -484,8 +389,10 @@ final class ScanTypeClassifierTests: XCTestCase {
             fieldCount: 2
         )
 
-        for _ in 0..<20 { XCTAssertNil(sut.observe(conflict)) }
-        XCTAssertEqual(sut.current, .unknown)
+        XCTAssertEqual(
+            sut.observe(conflict)?.current,
+            .interlaced(order(.top, confidence: .assumed, source: .contentProbe))
+        )
     }
 
     private func confirmedProgressiveClassifier() -> ScanTypeClassifier {
@@ -500,17 +407,6 @@ final class ScanTypeClassifierTests: XCTestCase {
             fieldOrder: .tt,
             probe: probe(comb: 0.2, motion: 0.2)
         ))
-        return sut
-    }
-
-    private func confirmedPsFClassifier() -> ScanTypeClassifier {
-        var sut = ScanTypeClassifier(generation: generation)
-        let sample = observation(
-            fieldOrder: .tt,
-            isInterlaced: true,
-            probe: probe(comb: 0.01, motion: 0.08)
-        )
-        for _ in 0..<12 { _ = sut.observe(sample) }
         return sut
     }
 

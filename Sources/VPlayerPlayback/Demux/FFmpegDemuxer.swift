@@ -469,6 +469,9 @@ private enum RawDemuxEventCopier {
             guard raw.width > 0, raw.height > 0, raw.video_delay >= 0 else {
                 throw RawDemuxCopyError.malformed
             }
+            guard let fieldOrder = codedFieldOrder(raw.field_order) else {
+                throw RawDemuxCopyError.malformed
+            }
             guard let codec = videoCodec(raw.codec) else {
                 if raw.codec == VPFF_CODEC_UNSUPPORTED {
                     throw RawDemuxCopyError.unsupportedVideo
@@ -487,7 +490,8 @@ private enum RawDemuxEventCopier {
                     frameRate: MediaRational(
                         num: raw.frame_rate_num,
                         den: raw.frame_rate_den
-                    )
+                    ),
+                    fieldOrder: fieldOrder
                 ),
                 audio: nil,
                 byteCount: extradata.count
@@ -602,6 +606,18 @@ private enum RawDemuxEventCopier {
         switch value {
         case VPFF_CODEC_H264: .h264
         case VPFF_CODEC_HEVC: .hevc
+        default: nil
+        }
+    }
+
+    private static func codedFieldOrder(_ value: UInt8) -> CodedFieldOrder? {
+        switch value {
+        case 0: .unknown
+        case 1: .progressive
+        case 2: .tt
+        case 3: .bb
+        case 4: .tb
+        case 5: .bt
         default: nil
         }
     }

@@ -11,6 +11,19 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VideoPipelineCoordinatorTests: XCTestCase {
+    func testTrackFieldOrderRoutesMetalBeforeTheFirstDecodedFrame() throws {
+        let harness = makeHarness()
+
+        harness.coordinator.replaceFormat(
+            try PlaybackFakeMedia.videoFormat(),
+            streamFieldOrder: .tt
+        )
+
+        XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
+        XCTAssertEqual(harness.coordinator.requiredVideoFrameCount, 2)
+        XCTAssertEqual(harness.host.requiredVideoFrameCounts.last, 2)
+    }
+
     func testVideoRecoveryBudgetSharesFourTotalRecoveriesAndTwoStructuralRecoveries() {
         var budget = VideoRecoveryBudget(
             maximumRecoveriesPerMediaEpoch: 4,
@@ -525,7 +538,6 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
     func testSupplementalProbeDoesNotDoubleCountProgressiveFrame() throws {
         let harness = makeHarness(classifierConfiguration: ScanClassifierConfiguration(
             progressiveConfirmationFrames: 3,
-            psfConfirmationFrames: 3,
             exitInterlacedConfirmationFrames: 3
         ))
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
@@ -563,10 +575,9 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         XCTAssertTrue(harness.coordinator.isClassificationResolved)
     }
 
-    func testPsFProbeEvidenceBypassesBothDeinterlacers() throws {
+    func testLowCombContentCannotOverrideAuthoritativeFieldSignalling() throws {
         let harness = makeHarness(classifierConfiguration: ScanClassifierConfiguration(
             progressiveConfirmationFrames: 3,
-            psfConfirmationFrames: 2,
             exitInterlacedConfirmationFrames: 3
         ))
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
@@ -583,21 +594,15 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
                 generation: generation,
                 parser: fieldSignalledParser(sourcePTS90k: UInt64(id * 3_600))
             )))
-            if id > 10 {
-                harness.probe.completeFirst(.success(ContentProbeSample(
-                    combRatio: 0.01,
-                    motionRatio: 0.02,
-                    sampleCount: 2_304
-                )))
-            }
         }
 
-        XCTAssertEqual(harness.coordinator.route, .bypass)
+        XCTAssertEqual(harness.probe.pendingCount, 0)
+        XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
         XCTAssertEqual(harness.host.generation, generation)
-        XCTAssertTrue(harness.yadif.submissions.isEmpty)
+        XCTAssertFalse(harness.yadif.submissions.isEmpty)
     }
 
-    func testFailedProbeConservativelyRoutesFieldSignalledFramesToSelectedDeinterlacer() throws {
+    func testFieldSignallingRoutesWithoutWaitingForAProbeResult() throws {
         let harness = makeHarness()
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
         let generation = harness.host.generation
@@ -614,14 +619,13 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             )))
         }
 
-        harness.probe.completeFirst(.failure(.nonIOSurfaceInput))
-
+        XCTAssertEqual(harness.probe.pendingCount, 0)
         XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
         XCTAssertEqual(harness.host.generation, generation)
         XCTAssertTrue(harness.host.failures.isEmpty)
     }
 
-    func testThreeUnresolvedProbesConservativelyRouteFieldSignalledFrames() throws {
+    func testFieldSignalledFramesDoNotConsumeProbeBudget() throws {
         let harness = makeHarness()
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
         let generation = harness.host.generation
@@ -639,13 +643,13 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             )))
         }
 
-        XCTAssertEqual(harness.probe.pendingCount, 1)
+        XCTAssertEqual(harness.probe.pendingCount, 0)
         XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
         XCTAssertEqual(harness.host.generation, generation)
         XCTAssertTrue(harness.host.failures.isEmpty)
     }
 
-    func testThreeInconclusiveProbeAttemptsReleaseUnknownSourceThroughBypass() throws {
+    func testDecodedFramesDoNotConsumePendingProbeBudget() throws {
         let harness = makeHarness()
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
         let generation = harness.host.generation
@@ -655,7 +659,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             randomAccess: true
         ))
 
-        for id in 10...13 {
+        for id in 10...20 {
             harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
                 id: UInt64(id),
                 generation: generation,
@@ -664,9 +668,69 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(harness.probe.pendingCount, 1)
-        XCTAssertEqual(harness.coordinator.route, .bypass)
+        XCTAssertEqual(harness.coordinator.route, .rawWhileClassifying)
         XCTAssertEqual(harness.host.generation, generation)
         XCTAssertTrue(harness.yadif.submissions.isEmpty)
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
+    func testThirdCompletedInconclusiveProbeReleasesUnknownSourceThroughBypass() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+        let inconclusive = ContentProbeSample(
+            combRatio: 0.04,
+            motionRatio: 0.02,
+            sampleCount: 2_304
+        )
+
+        for id in 10...13 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+            if id > 10, id < 13 {
+                harness.probe.completeFirst(.success(inconclusive))
+            }
+        }
+
+        XCTAssertEqual(harness.probe.pendingCount, 1)
+        XCTAssertEqual(harness.coordinator.route, .rawWhileClassifying)
+
+        harness.probe.completeFirst(.success(inconclusive))
+
+        XCTAssertEqual(harness.coordinator.route, .bypass)
+        XCTAssertEqual(harness.host.generation, generation)
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
+    func testRejectedProbeSubmissionDoesNotLeavePhantomInFlightWork() throws {
+        let harness = makeHarness()
+        harness.probe.acceptsSubmissions = false
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        ))
+
+        for id in 10...12 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+
+        XCTAssertEqual(harness.probe.pendingCount, 0)
+        XCTAssertEqual(harness.coordinator.route, .bypass)
         XCTAssertTrue(harness.host.failures.isEmpty)
     }
 
@@ -808,13 +872,6 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
                 generation: generation,
                 parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
             )))
-            if id == 11 {
-                harness.probe.completeFirst(.success(ContentProbeSample(
-                    combRatio: 0.2,
-                    motionRatio: 0.2,
-                    sampleCount: 2_304
-                )))
-            }
         }
 
         XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
@@ -1497,12 +1554,32 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         let harness = makeHarness()
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
         let generation = harness.host.generation
-        try startMetalAttempt(
-            harness,
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
             generation: generation,
-            randomAccessUnitID: 1,
-            firstFrameID: 10
-        )
+            randomAccess: true
+        )))
+        for id in 10...11 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        harness.probe.completeFirst(.success(ContentProbeSample(
+            combRatio: 0.2,
+            motionRatio: 0.2,
+            sampleCount: 2_304
+        )))
+        for id in 12...14 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: UInt64(id),
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: UInt64(id * 3_600))
+            )))
+        }
+        XCTAssertEqual(harness.coordinator.route, .metalYADIF2x)
+        XCTAssertGreaterThan(harness.yadif.pendingCompletionCount(for: generation), 0)
         for id in 30...34 {
             harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
                 id: UInt64(id),
@@ -1696,7 +1773,6 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
     private func makeHarness(
         classifierConfiguration: ScanClassifierConfiguration = ScanClassifierConfiguration(
             progressiveConfirmationFrames: 1,
-            psfConfirmationFrames: 1,
             exitInterlacedConfirmationFrames: 1
         ),
         automaticallyCompletesTransitions: Bool = true,
@@ -2036,8 +2112,10 @@ private final class FakeCoordinatorProbe: LumaScanProbing, @unchecked Sendable {
 
     private(set) var pending: [Pending] = []
     private(set) var stopped: [MediaGeneration] = []
+    var acceptsSubmissions = true
     var pendingCount: Int { pending.count }
 
+    @discardableResult
     func submit(
         current _: CVPixelBuffer,
         previous _: CVPixelBuffer,
@@ -2045,8 +2123,10 @@ private final class FakeCoordinatorProbe: LumaScanProbing, @unchecked Sendable {
         completion: @escaping @Sendable (
             Result<ContentProbeSample, LumaScanProbeFailure>
         ) -> Void
-    ) {
+    ) -> Bool {
+        guard acceptsSubmissions else { return false }
         pending.append(Pending(generation: generation, completion: completion))
+        return true
     }
 
     func stop(generation: MediaGeneration) {
