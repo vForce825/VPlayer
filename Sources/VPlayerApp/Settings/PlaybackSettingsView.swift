@@ -10,7 +10,7 @@ import VPlayerPlayback
 /// rather than racing each other.
 @MainActor
 final class PlaybackTuningSelectionController {
-    private let engine: any PlaybackEngine
+    private weak var engine: (any PlaybackEngine)?
     private var task: Task<Void, Never>?
 
     init(engine: any PlaybackEngine) {
@@ -25,10 +25,9 @@ final class PlaybackTuningSelectionController {
         _ operation: @escaping @Sendable (any PlaybackEngine) async -> Void
     ) {
         let predecessor = task
-        let engine = engine
-        task = Task {
+        task = Task { [weak self] in
             await predecessor?.value
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, let engine = self?.engine else { return }
             await operation(engine)
         }
     }
