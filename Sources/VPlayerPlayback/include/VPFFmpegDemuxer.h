@@ -33,6 +33,15 @@ typedef enum {
 } VPFFChannelOrder;
 
 typedef enum {
+    VPFF_FIELD_ORDER_UNKNOWN = 0,
+    VPFF_FIELD_ORDER_PROGRESSIVE = 1,
+    VPFF_FIELD_ORDER_TT = 2,
+    VPFF_FIELD_ORDER_BB = 3,
+    VPFF_FIELD_ORDER_TB = 4,
+    VPFF_FIELD_ORDER_BT = 5
+} VPFFFieldOrder;
+
+typedef enum {
     VPFF_EVENT_INVALID = 0,
     VPFF_EVENT_TRACKS = 1,
     VPFF_EVENT_PACKET = 2,
@@ -84,6 +93,8 @@ typedef struct {
     int32_t channel_count;
     VPFFChannelOrder channel_order;
     uint8_t has_channel_layout_mask;
+    /* VPFFFieldOrder 原始值；复用保留填充位以维持 ABI 不变。 */
+    uint8_t field_order;
     uint64_t channel_layout_mask;
     /* Borrowed until the synchronous callback returns. NULL iff size is zero. */
     const uint8_t *extradata;
@@ -123,6 +134,8 @@ typedef struct {
 #else
 #define VPFF_DEMUX_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
 #endif
+VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFTrack, field_order) == 53, "VPFFTrack.field_order ABI");
+VPFF_DEMUX_STATIC_ASSERT(sizeof(VPFFTrack) == 80, "VPFFTrack size ABI");
 VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, kind) == 0, "VPFFDemuxEvent.kind ABI");
 VPFF_DEMUX_STATIC_ASSERT(offsetof(VPFFDemuxEvent, has_program_id) == 4,
                          "VPFFDemuxEvent.has_program_id ABI");

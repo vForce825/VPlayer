@@ -2042,7 +2042,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         let generation = generationController.current
         if let videoFormat {
             armVideoFormatCommitIsolated(mode: mode, generation: generation)
-            videoCoordinator.installFormatForCurrentGeneration(videoFormat)
+            videoCoordinator.installFormatForCurrentGeneration(
+                videoFormat,
+                streamFieldOrder: tracks?.video?.fieldOrder ?? .unknown
+            )
             if let activeDecoderInvalidationTicket,
                activeDecoderInvalidationTicket.generation == generation {
                 bindPendingVideoFormatCommitIsolated(to: activeDecoderInvalidationTicket)
@@ -2107,7 +2110,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         outputCadenceDurations.removeAll(keepingCapacity: true)
         if let videoFormat {
             armVideoFormatCommitIsolated(mode: mode, generation: nil)
-            videoCoordinator.replaceFormat(videoFormat)
+            videoCoordinator.replaceFormat(
+                videoFormat,
+                streamFieldOrder: tracks?.video?.fieldOrder ?? .unknown
+            )
             if var pending = pendingVideoFormatCommit,
                pending.generation == nil {
                 pending.generation = generationController.current

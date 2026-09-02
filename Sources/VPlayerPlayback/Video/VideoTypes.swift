@@ -4,7 +4,7 @@
 
 import CoreMedia
 
-public enum CodedFieldOrder: UInt8, Sendable, Equatable {
+public enum CodedFieldOrder: UInt8, Sendable, Equatable, Hashable {
     case unknown, progressive, tt, bb, tb, bt
 }
 

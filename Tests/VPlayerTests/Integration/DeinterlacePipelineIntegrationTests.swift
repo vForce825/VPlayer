@@ -32,12 +32,12 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(result.routes.contains(.bypass))
     }
 
-    func testPsFBypassesDeinterlacingThroughProductionCoordinator() async throws {
+    func testFieldSignalledPsFUsesAuthoritativeInterlacedRoute() async throws {
         let result = try await harness.play(fixture: .h2641080PsF25, frames: 16)
 
-        XCTAssertEqual(result.presentations.count, 16)
-        XCTAssertEqual(result.routes.last, .bypass)
-        XCTAssertEqual(result.metrics.yadifKernelDispatchCount, 0)
+        XCTAssertEqual(result.presentations.count, 32)
+        XCTAssertEqual(result.routes.last, .metalYADIF2x)
+        XCTAssertEqual(result.metrics.yadifKernelDispatchCount, 16)
         XCTAssertEqual(result.metrics.configurationCount, 1)
         XCTAssertGreaterThan(result.metrics.decodedAccessUnitCount, 16)
     }

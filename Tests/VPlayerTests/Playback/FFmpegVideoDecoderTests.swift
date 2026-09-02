@@ -176,7 +176,9 @@ private struct FakeFFmpegVideoDecoderAPI: FFmpegVideoDecoderAPI {
 
 private func deliverTestFrame(
     token: Int64,
-    to receiver: (@Sendable (BorrowedFFmpegVideoFrame) -> Void)?
+    to receiver: (@Sendable (BorrowedFFmpegVideoFrame) -> Void)?,
+    isInterlaced: Bool = true,
+    topFieldFirst: Bool = true
 ) {
     var pixels = [UInt8](repeating: 0, count: 16 * 8 * 2)
     pixels.withUnsafeMutableBufferPointer { buffer in
@@ -190,8 +192,8 @@ private func deliverTestFrame(
             width: 16,
             height: 8,
             token: token,
-            isInterlaced: true,
-            topFieldFirst: true,
+            isInterlaced: isInterlaced,
+            topFieldFirst: topFieldFirst,
             range: .video,
             abiVersion: VPFF_VIDEO_DECODER_ABI_VERSION,
             structSize: UInt32(MemoryLayout<VPFFVideoFrame>.size)
@@ -201,6 +203,34 @@ private func deliverTestFrame(
 
 final class FFmpegVideoDecoderTests: XCTestCase {
     private let generation = MediaGeneration(rawValue: 2)
+
+    func testProgressiveDecoderFrameDoesNotInventBottomFieldOrder() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.progressive")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.progressive.submit")
+        let frames = FrameRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { frames.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+
+        try configure(decoder, format: makeFormat(fieldCount: 1), queue: queue, executor: executor)
+        try decoder.decode(makeAccessUnit(id: 1), flags: [])
+        queue.sync {}
+        deliverTestFrame(
+            token: try XCTUnwrap(handle.tokens.first),
+            to: captured.receiver,
+            isInterlaced: false,
+            topFieldFirst: false
+        )
+
+        let decoded = try XCTUnwrap(frames.wait(timeout: 2))
+        XCTAssertEqual(decoded.parserMetadata.isInterlaced, false)
+        XCTAssertNil(decoded.parserMetadata.topFieldFirst)
+    }
 
     func testFFmpegConfigureTransitionReturnsWhileNativeQueueIsBlocked() throws {
         let captured = CapturedReceiver()

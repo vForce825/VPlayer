@@ -22,6 +22,7 @@ public enum FieldEvidenceSource: UInt8, Equatable, Sendable {
     case formatDescription
     case pixelBuffer
     case contentProbe
+    case stream
 }
 
 public struct ResolvedFieldOrder: Equatable, Sendable {

@@ -4,25 +4,19 @@
 
 public struct ScanClassifierConfiguration: Equatable, Sendable {
     public var progressiveConfirmationFrames: Int
-    public var psfConfirmationFrames: Int
     public var exitInterlacedConfirmationFrames: Int
     public var combThreshold: Float
-    public var psfMaximumCombRatio: Float
     public var motionThreshold: Float
 
     public init(
         progressiveConfirmationFrames: Int = 8,
-        psfConfirmationFrames: Int = 12,
         exitInterlacedConfirmationFrames: Int = 12,
         combThreshold: Float = 0.08,
-        psfMaximumCombRatio: Float = 0.02,
         motionThreshold: Float = 0.015
     ) {
         self.progressiveConfirmationFrames = progressiveConfirmationFrames
-        self.psfConfirmationFrames = psfConfirmationFrames
         self.exitInterlacedConfirmationFrames = exitInterlacedConfirmationFrames
         self.combThreshold = combThreshold
-        self.psfMaximumCombRatio = psfMaximumCombRatio
         self.motionThreshold = motionThreshold
     }
 }
@@ -45,7 +39,7 @@ public struct ScanTypeClassifier: Sendable {
     private var generation: MediaGeneration
     private let configuration: ScanClassifierConfiguration
     private var progressiveStreak = 0
-    private var psfStreak = 0
+    private var interlacedSignalLocked = false
 
     public init(
         generation: MediaGeneration,
@@ -67,6 +61,14 @@ public struct ScanTypeClassifier: Sendable {
         let probe = validProbe(observation.probe)
 
         if isSeparatedPicture(observation.parser.pictureStructure) {
+            interlacedSignalLocked = true
+            clearStreaks()
+            return transition(to: .interlaced(interlaceOrder(from: orderEvidence)))
+        }
+
+        let fieldSignalled = hasFieldSignalling(observation)
+        if fieldSignalled {
+            interlacedSignalLocked = true
             clearStreaks()
             return transition(to: .interlaced(interlaceOrder(from: orderEvidence)))
         }
@@ -78,47 +80,6 @@ public struct ScanTypeClassifier: Sendable {
             return transition(to: .interlaced(interlaceOrder(from: orderEvidence)))
         }
 
-        let fieldSignalled = hasFieldSignalling(observation)
-        let refinementOrder: ResolvedFieldOrder?
-        if case let .interlaced(existingOrder) = current,
-           existingOrder.confidence == .assumed,
-           case let .agree(explicitOrder) = orderEvidence,
-           explicitOrder.confidence != .assumed {
-            refinementOrder = explicitOrder
-        } else {
-            refinementOrder = nil
-        }
-
-        if fieldSignalled,
-           let probe,
-           probe.motionRatio >= configuration.motionThreshold,
-           probe.combRatio <= configuration.psfMaximumCombRatio {
-            progressiveStreak = 0
-            psfStreak = increment(psfStreak, toward: psfThreshold)
-
-            if psfStreak == psfThreshold,
-               !isConfirmedInterlaced,
-               !isConfirmedPsF {
-                let order: ResolvedFieldOrder?
-                if case let .agree(explicitOrder) = orderEvidence {
-                    order = explicitOrder
-                } else {
-                    order = nil
-                }
-                return transition(to: .progressiveSegmentedFrame(order))
-            }
-            return applyRefinement(refinementOrder)
-        }
-
-        // A probe for this field-signalled frame may arrive asynchronously. Keep the
-        // prior PsF streak intact until that supplemental evidence is observed.
-        if fieldSignalled, probe == nil {
-            progressiveStreak = 0
-            return applyRefinement(refinementOrder)
-        }
-
-        psfStreak = 0
-
         if isTrustedParserProgressive(observation) {
             let threshold = usesExitHysteresis
                 ? exitInterlacedThreshold
@@ -128,11 +89,34 @@ public struct ScanTypeClassifier: Sendable {
             if progressiveStreak == threshold, current != .progressive {
                 return transition(to: .progressive)
             }
-            return applyRefinement(refinementOrder)
+            return nil
         }
 
         progressiveStreak = 0
-        return applyRefinement(refinementOrder)
+        return nil
+    }
+
+    public mutating func observeStreamFieldOrder(
+        _ fieldOrder: CodedFieldOrder,
+        generation: MediaGeneration
+    ) -> ScanClassificationChange? {
+        guard generation == self.generation else { return nil }
+        let parity: FieldParity
+        switch fieldOrder {
+        case .tt, .bt:
+            parity = .top
+        case .bb, .tb:
+            parity = .bottom
+        case .unknown, .progressive:
+            return nil
+        }
+        interlacedSignalLocked = true
+        clearStreaks()
+        return transition(to: .interlaced(ResolvedFieldOrder(
+            parity: parity,
+            confidence: .signaled,
+            source: .stream
+        )))
     }
 
     /// Applies asynchronous luma evidence for a frame whose parser/field evidence was
@@ -144,51 +128,28 @@ public struct ScanTypeClassifier: Sendable {
               let probe = validProbe(observation.probe) else { return nil }
 
         let orderEvidence = explicitOrder(in: observation)
+        if isSeparatedPicture(observation.parser.pictureStructure)
+            || hasFieldSignalling(observation) {
+            interlacedSignalLocked = true
+            clearStreaks()
+            return transition(to: .interlaced(interlaceOrder(from: orderEvidence)))
+        }
         if probe.combRatio >= configuration.combThreshold,
            probe.motionRatio >= configuration.motionThreshold {
             clearStreaks()
             return transition(to: .interlaced(interlaceOrder(from: orderEvidence)))
         }
 
-        let refinementOrder: ResolvedFieldOrder?
-        if case let .interlaced(existingOrder) = current,
-           existingOrder.confidence == .assumed,
-           case let .agree(explicitOrder) = orderEvidence,
-           explicitOrder.confidence != .assumed {
-            refinementOrder = explicitOrder
-        } else {
-            refinementOrder = nil
-        }
-
-        if hasFieldSignalling(observation),
-           probe.motionRatio >= configuration.motionThreshold,
-           probe.combRatio <= configuration.psfMaximumCombRatio {
-            progressiveStreak = 0
-            psfStreak = increment(psfStreak, toward: psfThreshold)
-            if psfStreak == psfThreshold,
-               !isConfirmedInterlaced,
-               !isConfirmedPsF {
-                let order: ResolvedFieldOrder?
-                if case let .agree(explicitOrder) = orderEvidence {
-                    order = explicitOrder
-                } else {
-                    order = nil
-                }
-                return transition(to: .progressiveSegmentedFrame(order))
-            }
-            return applyRefinement(refinementOrder)
-        }
-        psfStreak = 0
-        return applyRefinement(refinementOrder)
+        return nil
     }
 
-    /// Falls back to the coded field signal only after the content probe has explicitly
-    /// failed. Successful probes still retain precedence so PsF can bypass deinterlacing.
+    /// 可选内容探针失败时，仍保留权威的场序信令。
     public mutating func observeProbeFailure(
         _ observation: ScanObservation
     ) -> ScanClassificationChange? {
         guard observation.generation == generation,
               hasFieldSignalling(observation) else { return nil }
+        interlacedSignalLocked = true
         clearStreaks()
         return transition(to: .interlaced(interlaceOrder(from: explicitOrder(in: observation))))
     }
@@ -203,6 +164,7 @@ public struct ScanTypeClassifier: Sendable {
               current == .unknown else { return nil }
         clearStreaks()
         if hasFieldSignalling(observation) {
+            interlacedSignalLocked = true
             return transition(
                 to: .interlaced(interlaceOrder(from: explicitOrder(in: observation)))
             )
@@ -213,6 +175,7 @@ public struct ScanTypeClassifier: Sendable {
     public mutating func reset(generation: MediaGeneration) {
         self.generation = generation
         current = .unknown
+        interlacedSignalLocked = false
         clearStreaks()
     }
 
@@ -229,10 +192,6 @@ public struct ScanTypeClassifier: Sendable {
         max(1, configuration.progressiveConfirmationFrames)
     }
 
-    private var psfThreshold: Int {
-        max(1, configuration.psfConfirmationFrames)
-    }
-
     private var exitInterlacedThreshold: Int {
         max(1, configuration.exitInterlacedConfirmationFrames)
     }
@@ -242,18 +201,12 @@ public struct ScanTypeClassifier: Sendable {
         return false
     }
 
-    private var isConfirmedPsF: Bool {
-        if case .progressiveSegmentedFrame = current { return true }
-        return false
-    }
-
     private var usesExitHysteresis: Bool {
-        isConfirmedInterlaced || isConfirmedPsF
+        isConfirmedInterlaced
     }
 
     private mutating func clearStreaks() {
         progressiveStreak = 0
-        psfStreak = 0
     }
 
     private func increment(_ value: Int, toward threshold: Int) -> Int {
@@ -274,15 +227,6 @@ public struct ScanTypeClassifier: Sendable {
             current: next,
             generation: generation
         )
-    }
-
-    private mutating func applyRefinement(
-        _ order: ResolvedFieldOrder?
-    ) -> ScanClassificationChange? {
-        guard let order else {
-            return nil
-        }
-        return transition(to: .interlaced(order))
     }
 
     private func interlaceOrder(from evidence: ExplicitOrderEvidence) -> ResolvedFieldOrder {
@@ -361,12 +305,16 @@ public struct ScanTypeClassifier: Sendable {
            [.tt, .bb, .tb, .bt].contains(coded) {
             return true
         }
+        if observation.parser.topFieldFirst != nil {
+            return true
+        }
         return observation.decodedFields.fieldCount == 2
             || observation.decodedFields.fieldOrder != nil
     }
 
     private func isTrustedParserProgressive(_ observation: ScanObservation) -> Bool {
-        guard !isSeparatedPicture(observation.parser.pictureStructure),
+        guard !interlacedSignalLocked,
+              !isSeparatedPicture(observation.parser.pictureStructure),
               observation.decodedFields.fieldCount != 2,
               observation.decodedFields.fieldOrder == nil else {
             return false

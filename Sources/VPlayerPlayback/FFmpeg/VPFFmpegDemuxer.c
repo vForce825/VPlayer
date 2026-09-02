@@ -169,6 +169,30 @@ static void vpff_install_silent_logging(void) {
     av_log_set_callback(vpff_silent_log_callback);
 }
 
+static int vpff_map_field_order(enum AVFieldOrder value, uint8_t *mapped) {
+    switch (value) {
+        case AV_FIELD_UNKNOWN:
+            *mapped = VPFF_FIELD_ORDER_UNKNOWN;
+            return 0;
+        case AV_FIELD_PROGRESSIVE:
+            *mapped = VPFF_FIELD_ORDER_PROGRESSIVE;
+            return 0;
+        case AV_FIELD_TT:
+            *mapped = VPFF_FIELD_ORDER_TT;
+            return 0;
+        case AV_FIELD_BB:
+            *mapped = VPFF_FIELD_ORDER_BB;
+            return 0;
+        case AV_FIELD_TB:
+            *mapped = VPFF_FIELD_ORDER_TB;
+            return 0;
+        case AV_FIELD_BT:
+            *mapped = VPFF_FIELD_ORDER_BT;
+            return 0;
+    }
+    return AVERROR_INVALIDDATA;
+}
+
 static bool vpff_utf8_is_valid(const uint8_t *bytes, size_t size) {
     size_t index = 0;
     while (index < size) {
@@ -1816,6 +1840,7 @@ static int vpff_make_video_track(
     VPFFOwnedTrack *track,
     int stream_index,
     const AVCodecParameters *parameters,
+    enum AVFieldOrder stream_field_order,
     AVRational time_base,
     AVRational frame_rate
 ) {
@@ -1840,7 +1865,10 @@ static int vpff_make_video_track(
     built.value.width = parameters->width;
     built.value.height = parameters->height;
     built.value.video_delay = parameters->video_delay;
-    int result = vpff_copy_public_extradata(&built, parameters);
+    int result = vpff_map_field_order(stream_field_order, &built.value.field_order);
+    if (result >= 0) {
+        result = vpff_copy_public_extradata(&built, parameters);
+    }
     if (result < 0) {
         vpff_owned_track_clear(&built);
         return result;
@@ -1907,13 +1935,18 @@ static int vpff_make_track_set(
                 (unsigned int)selection->video_stream_index >= format->nb_streams
                 ? NULL
                 : format->streams[selection->video_stream_index];
-            result = vpff_make_video_track(
-                &built.video,
-                selection->video_stream_index,
-                video_filter->context->par_out,
-                video_filter->context->time_base_out,
-                vpff_guess_frame_rate(format, video_stream)
-            );
+            if (video_stream == NULL || video_stream->codecpar == NULL) {
+                result = AVERROR_INVALIDDATA;
+            } else {
+                result = vpff_make_video_track(
+                    &built.video,
+                    selection->video_stream_index,
+                    video_filter->context->par_out,
+                    video_stream->codecpar->field_order,
+                    video_filter->context->time_base_out,
+                    vpff_guess_frame_rate(format, video_stream)
+                );
+            }
         }
     }
     if (result >= 0 && selection->audio_stream_index >= 0) {
@@ -1948,6 +1981,7 @@ static bool vpff_public_tracks_equal(
            a->width == b->width &&
            a->height == b->height &&
            a->video_delay == b->video_delay &&
+           a->field_order == b->field_order &&
            a->sample_rate == b->sample_rate &&
            a->channel_count == b->channel_count &&
            a->channel_order == b->channel_order &&

@@ -117,11 +117,10 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             decoder: decoder,
             passthrough: PassthroughVideoProcessor(),
             yadif: yadif,
-            probe: fixture == .h2641080PsF25 ? ImmediatePsFTraceProbe() : nil,
+            probe: nil,
             initialGeneration: host.generation,
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 1,
-                psfConfirmationFrames: 1,
                 exitInterlacedConfirmationFrames: 1
             ),
             hooks: host.hooks
@@ -214,7 +213,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             initialGeneration: host.generation,
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 1,
-                psfConfirmationFrames: 1,
                 exitInterlacedConfirmationFrames: 1
             ),
             hooks: host.hooks
@@ -293,9 +291,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
                 yadif: ImmediateRecordingTraceYADIF(),
                 probe: nil,
                 initialGeneration: unknownHost.generation,
-                    classifierConfiguration: ScanClassifierConfiguration(
+                classifierConfiguration: ScanClassifierConfiguration(
                     progressiveConfirmationFrames: 1,
-                    psfConfirmationFrames: 1,
                     exitInterlacedConfirmationFrames: 1
                 ),
                 hooks: unknownHost.hooks
@@ -343,7 +340,6 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             initialGeneration: repeatHost.generation,
             classifierConfiguration: ScanClassifierConfiguration(
                 progressiveConfirmationFrames: 1,
-                psfConfirmationFrames: 1,
                 exitInterlacedConfirmationFrames: 1
             ),
             hooks: repeatHost.hooks
@@ -1320,25 +1316,6 @@ private final class ImmediateRecordingTraceYADIF: YADIFFrameProcessing, @uncheck
     func drain(completion: @escaping @Sendable () -> Void) { completion() }
 
     func snapshot() -> [NormalizedDecodedFrame] { lock.withLock { submissions } }
-}
-
-private final class ImmediatePsFTraceProbe: LumaScanProbing, @unchecked Sendable {
-    func submit(
-        current _: CVPixelBuffer,
-        previous _: CVPixelBuffer,
-        generation _: MediaGeneration,
-        completion: @escaping @Sendable (
-            Result<ContentProbeSample, LumaScanProbeFailure>
-        ) -> Void
-    ) {
-        completion(.success(ContentProbeSample(
-            combRatio: 0.01,
-            motionRatio: 0.02,
-            sampleCount: VideoTestFactories.width * VideoTestFactories.height
-        )))
-    }
-
-    func stop(generation _: MediaGeneration) {}
 }
 
 private final class TracePlaybackClock: PlaybackClock, @unchecked Sendable {

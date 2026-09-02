@@ -41,6 +41,7 @@ public struct VideoTrackDescriptor: Sendable, Hashable {
     public let width: Int32
     public let height: Int32
     public let videoDelay: Int32
+    public let fieldOrder: CodedFieldOrder
     public let extradata: Data
 
     public init(
@@ -51,7 +52,8 @@ public struct VideoTrackDescriptor: Sendable, Hashable {
         height: Int32,
         videoDelay: Int32,
         extradata: Data,
-        frameRate: MediaRational? = nil
+        frameRate: MediaRational? = nil,
+        fieldOrder: CodedFieldOrder = .unknown
     ) {
         self.streamIndex = streamIndex
         self.codec = codec
@@ -60,6 +62,7 @@ public struct VideoTrackDescriptor: Sendable, Hashable {
         self.width = width
         self.height = height
         self.videoDelay = videoDelay
+        self.fieldOrder = fieldOrder
         self.extradata = extradata
     }
 }

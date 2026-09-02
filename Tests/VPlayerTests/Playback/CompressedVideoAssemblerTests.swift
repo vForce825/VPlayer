@@ -474,6 +474,29 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         }
     }
 
+    #if DEBUG
+    func testNativeParserTopFieldFirstUsesDisplayedFieldOrder() {
+        let frame = Int32(VPFF_PICTURE_STRUCTURE_FRAME.rawValue)
+
+        XCTAssertEqual(vp_ffmpeg_parser_debug_top_field_first(
+            Int32(VPFF_FIELD_ORDER_TT.rawValue),
+            frame
+        ), 1)
+        XCTAssertEqual(vp_ffmpeg_parser_debug_top_field_first(
+            Int32(VPFF_FIELD_ORDER_BB.rawValue),
+            frame
+        ), 0)
+        XCTAssertEqual(vp_ffmpeg_parser_debug_top_field_first(
+            Int32(VPFF_FIELD_ORDER_TB.rawValue),
+            frame
+        ), 0)
+        XCTAssertEqual(vp_ffmpeg_parser_debug_top_field_first(
+            Int32(VPFF_FIELD_ORDER_BT.rawValue),
+            frame
+        ), 1)
+    }
+    #endif
+
     func testDrainRebindDiscardsOldStateAndIDsContinueUntilDeterministicExhaustion() throws {
         let delayedAU = AssemblerTestFixtures.h264AccessUnit()
         let factory = ScriptedFFmpegParserFactory(
