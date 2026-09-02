@@ -139,6 +139,17 @@ final class FullScreenPlayerViewModel {
             await predecessor?.value
             guard let self,
                   isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+            let states = await engine.events()
+            guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+            stateTask?.cancel()
+            stateTask = Task { [weak self] in
+                for await state in states {
+                    guard let self,
+                          !Task.isCancelled,
+                          isCurrent(lifecycle: lifecycle) else { return }
+                    self.apply(state)
+                }
+            }
             await engine.play(request)
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             beginMediaInformationSubscription(
