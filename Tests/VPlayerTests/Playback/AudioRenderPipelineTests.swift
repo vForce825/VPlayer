@@ -605,7 +605,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
-    func testRunningCompressedRetryPreservesReadinessAndExternalClockOwnership() throws {
+    func testRunningCompressedRetryInvalidatesReadinessUntilReplacementPrerollsUnderExternalClock() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.retry-running")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -653,19 +653,36 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
 
         first.emit(.failed("running"))
         drain(executor)
-        XCTAssertTrue(pipeline.isReadyForPlayback)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted]
+        )
         XCTAssertEqual(synchronizer.rateSnapshot.map(\.0), rateSnapshot.map(\.0))
 
         synchronizer.completeRemoval(index: 0, didRemove: true)
         drain(executor)
-        XCTAssertTrue(pipeline.isReadyForPlayback)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted]
+        )
         XCTAssertEqual(synchronizer.rateSnapshot.map(\.0), rateSnapshot.map(\.0))
         XCTAssertEqual(renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+
+        let replacement = try XCTUnwrap(renderers.snapshot.last)
+        replacement.configureReadiness(ready: true, sufficient: true)
+        replacement.fireReady()
+        drain(executor)
+
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted, .available]
+        )
     }
 
-    func testRunningCompressedRetryPreservesLatchedReadinessAndStandaloneClockRate() throws {
+    func testRunningCompressedRetryPausesStandaloneClockAndReanchorsReplacement() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
         first.configureReadiness(ready: true, sufficient: true)
@@ -687,21 +704,29 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         first.emit(.failed("running:standalone"))
         drain(harness.executor)
 
-        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
-        XCTAssertEqual(harness.synchronizer.rateSnapshot.count, 1)
-        XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.0, 1)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        XCTAssertEqual(harness.synchronizer.rateSnapshot.count, 2)
+        XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.0, 0)
         XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.1, runningTime)
-        XCTAssertEqual(harness.synchronizer.rate, 1)
+        XCTAssertEqual(harness.synchronizer.rate, 0)
 
         harness.synchronizer.completeRemoval(index: 0, didRemove: true)
         drain(harness.executor)
 
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        XCTAssertEqual(harness.synchronizer.rateSnapshot.count, 2)
+        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
+
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true, sufficient: true)
+        replacement.fireReady()
+        drain(harness.executor)
+
         XCTAssertTrue(harness.pipeline.isReadyForPlayback)
-        XCTAssertEqual(harness.synchronizer.rateSnapshot.count, 1)
+        XCTAssertEqual(harness.synchronizer.rateSnapshot.count, 3)
         XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.0, 1)
         XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.1, runningTime)
         XCTAssertEqual(harness.synchronizer.rate, 1)
-        XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
@@ -2273,6 +2298,65 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
+    func testAirPlayPCMPrerollDoesNotScaleWithDownstreamOutputLatency() throws {
+        let packetDuration = CMTime(value: 1_024, timescale: 48_000)
+        let harness = try makeHarness(
+            codec: .ac3,
+            initialRouteCategory: .hdmi,
+            clockMode: .externallyManaged
+        )
+        harness.decoderFactory.pushBody = { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp, frameCount: 1_024)]
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            harness.pipeline.setSharedTimelineOpened(true)
+        }
+        for index in 0..<12 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    codec: .ac3,
+                    pts: CMTimeMultiply(packetDuration, multiplier: Int32(index)),
+                    duration: packetDuration
+                ))
+            }
+        }
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 1,
+            outputLatency: 2,
+            ioBufferDuration: 0.020
+        ))
+        drain(harness.executor)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcm.configureReadiness(
+            ready: true,
+            sufficient: false,
+            maximumEnqueuesPerCallback: 12
+        )
+        pcm.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(pcm.snapshot.enqueuedPTS.count, 12)
+        XCTAssertTrue(
+            harness.pipeline.isReadyForPlayback,
+            "下游 AirPlay 延迟只影响锚定提前量，不应放大本地 PCM 预卷门槛"
+        )
+        XCTAssertTrue(
+            harness.synchronizer.rateSnapshot.isEmpty,
+            "外部共享时钟必须保持由 PlaybackPipeline 独占控制"
+        )
+    }
+
     func testPCMRouteDropsOneInvalidCompressedPacketAndContinuesDecoding() throws {
         let harness = try makeHarness()
         let invalidPacketError: Int32 = -1_094_995_529
@@ -3402,7 +3486,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
 
         XCTAssertFalse(pipeline.isReadyForPlayback)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .invalidated])
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .invalidated]
+        )
 
         renderer.configureReadiness(ready: true, sufficient: true)
         try perform(on: executor) {
@@ -3525,7 +3612,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.pipeline.isReadyForPlayback)
     }
 
-    func testExternallyClockedFallbackBridgesReadinessWithoutChangingRateOrAnchor() throws {
+    func testExternallyClockedFallbackInvalidatesReadinessUntilPCMReplacementPrerolls() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-clock")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -3586,23 +3673,38 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 pts: CMTime(value: 2, timescale: 10)
             ))
         }
-        XCTAssertTrue(pipeline.isReadyForPlayback)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted, .rendererReplacementStarted]
+        )
         synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
         drain(executor)
-        XCTAssertTrue(pipeline.isReadyForPlayback)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted, .rendererReplacementStarted]
+        )
         let pcm = try XCTUnwrap(renderers.snapshot.last)
         pcm.configureReadiness(ready: true, sufficient: true)
         pcm.fireReady()
         drain(executor)
 
         XCTAssertTrue(synchronizer.rateSnapshot.isEmpty)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [
+                .available,
+                .rendererReplacementStarted,
+                .rendererReplacementStarted,
+                .available,
+            ]
+        )
         XCTAssertTrue(failures.snapshot.isEmpty)
     }
 
-    func testExternallyClockedFallbackGraceExpiresWhenReplacementCannotPreroll() async throws {
+    func testExternallyClockedFallbackInvalidatesImmediatelyWhenReplacementCannotPreroll() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.external-timeout")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -3660,18 +3762,19 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 pts: CMTime(value: 2, timescale: 10)
             ))
         }
-        XCTAssertTrue(pipeline.isReadyForPlayback)
-
-        try await eventually(timeout: .seconds(2)) {
-            readiness.snapshot.map(\.change) == [.available, .invalidated]
-        }
         XCTAssertFalse(pipeline.isReadyForPlayback)
-        try await Task.sleep(for: .milliseconds(100))
-        drain(executor)
-        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .invalidated])
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted, .rendererReplacementStarted]
+        )
 
         synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
         drain(executor)
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted, .rendererReplacementStarted]
+        )
         synchronizer.releaseRemoval(index: transition.removalIndex)
         synchronizer.releaseRemoval(index: 0)
     }
@@ -4577,7 +4680,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
-    func testOnlyUsableRouteTimingOrAirPlayOffsetChangesPublishAnchorTimingChange() throws {
+    func testUsableRouteTimingOrCategoryChangesPublishAnchorTimingChange() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio-route-timing")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -5213,7 +5316,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         replayRetentionLimits: CompressedAudioRetentionLimits =
             CompressedAudioRetentionPolicy.replay,
         replayHardCount: Int = CompressedAudioRetentionPolicy.replayHardCount,
-        progressDeadlineTicketStart: UInt64? = nil
+        progressDeadlineTicketStart: UInt64? = nil,
+        clockMode: AudioClockMode = .standalone
     ) throws -> AudioHarness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio")
         let synchronizer = FakeAudioSynchronizer()
@@ -5237,6 +5341,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             pcmOutputValidator: support,
             recoveryScheduler: recoveryScheduler.schedule,
             diagnosticsNow: diagnosticsClock.now,
+            clockMode: clockMode,
             replayRetentionLimits: replayRetentionLimits,
             replayHardCount: replayHardCount,
             testingProgressDeadlineTicketStart: progressDeadlineTicketStart
@@ -5615,6 +5720,84 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
         XCTAssertEqual(harness.pipeline.diagnostics.pcmFallbackCount, 1)
         XCTAssertEqual(harness.pipeline.diagnostics.lastFallbackReason, .unsupportedRoute)
+    }
+
+    func testRunningAirPlayAC3FallbackClosesSharedTimelineUntilPCMPrerolls() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.airplay-ac3")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let routeMonitor = FakeAudioRouteMonitor(initialCategory: .hdmi)
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let support = FakeAudioFormatSupportChecker()
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { _, _ in },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { sample in
+                [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+            },
+            routeMonitor: routeMonitor,
+            decodeCapabilityChecker: support,
+            pcmOutputValidator: support,
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in
+                readiness.append(change, generation: generation)
+            }
+        )
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .ac3),
+                codec: .ac3,
+                generation: MediaGeneration(rawValue: 1),
+                fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1),
+                generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        let compressed = try XCTUnwrap(renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: true)
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(id: 1, codec: .ac3))
+            pipeline.setSharedTimelineOpened(true)
+        }
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
+
+        routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 2
+        ))
+        drain(executor)
+
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [.available, .rendererReplacementStarted]
+        )
+
+        synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(executor)
+        let pcm = try XCTUnwrap(renderers.snapshot.last)
+        XCTAssertEqual(pcm.mediaKind, .linearPCM)
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+
+        pcm.configureReadiness(ready: true, sufficient: true)
+        pcm.fireReady()
+        drain(executor)
+
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(
+            readiness.snapshot.map(\.change),
+            [
+                .available,
+                .rendererReplacementStarted,
+                .available,
+            ]
+        )
     }
 
     func testInitialAirPlayRouteWithAC3FallsBackToPCMWithUnsupportedRouteReason() throws {
