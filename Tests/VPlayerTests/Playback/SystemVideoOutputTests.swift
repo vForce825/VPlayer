@@ -168,7 +168,8 @@ final class SystemVideoOutputTests: XCTestCase {
             generation: firstGeneration,
             reason: .timelineDiscontinuity,
             removeDisplayedImage: true,
-            seedFrames: [try frame(sequence: 1, pts: 1, generation: firstGeneration)]
+            seedFrames: [try frame(sequence: 1, pts: 1, generation: firstGeneration)],
+            presentationTimeOffset: CMTime(value: 1, timescale: 1)
         )) { result in
             if case .success = result {
                 XCTFail("被新周期取代的刷新不应成功")
@@ -182,7 +183,8 @@ final class SystemVideoOutputTests: XCTestCase {
             generation: secondGeneration,
             reason: .audioGap,
             removeDisplayedImage: true,
-            seedFrames: [try frame(sequence: 2, pts: 2, generation: secondGeneration)]
+            seedFrames: [try frame(sequence: 2, pts: 2, generation: secondGeneration)],
+            presentationTimeOffset: CMTime(value: 2, timescale: 1)
         )) { result in
             switch result {
             case let .success(receipt):
@@ -202,7 +204,7 @@ final class SystemVideoOutputTests: XCTestCase {
 
         backend.completeFlush(at: 1)
         wait(for: [first, second], timeout: 1)
-        XCTAssertEqual(backend.enqueuedPTS, [2])
+        XCTAssertEqual(backend.enqueuedPTS, [4], "合并刷新必须采用最新路由偏移")
     }
 
     func testCoalescedResetPreservesFramesArrivingAfterLatestRequest() throws {
@@ -254,6 +256,76 @@ final class SystemVideoOutputTests: XCTestCase {
         wait(for: [first, second], timeout: 1)
         harness.output.waitUntilIdleForTesting()
         XCTAssertEqual(backend.enqueuedPTS, [2, 3])
+    }
+
+    func testResetAppliesPresentationOffsetToSeedsAndFollowingFrames() throws {
+        let backend = FakeVideoRendererBackend()
+        let harness = makeHarness(backend: backend)
+        let generation = MediaGeneration(rawValue: 1)
+        let completed = expectation(description: "带 AirPlay 偏移的刷新完成")
+
+        harness.output.reset(.init(
+            generation: generation,
+            reason: .timelineDiscontinuity,
+            removeDisplayedImage: true,
+            seedFrames: [try frame(sequence: 1, pts: 1, generation: generation)],
+            presentationTimeOffset: CMTime(value: 2, timescale: 1)
+        )) { result in
+            if case let .failure(error) = result {
+                XCTFail("带偏移的刷新不应失败：\(error)")
+            }
+            completed.fulfill()
+        }
+        harness.output.waitUntilIdleForTesting()
+        harness.output.enqueue(try frame(
+            sequence: 2,
+            pts: 2,
+            generation: generation
+        ))
+        harness.output.waitUntilIdleForTesting()
+
+        backend.completeFlush(at: 0)
+        wait(for: [completed], timeout: 1)
+        harness.output.waitUntilIdleForTesting()
+
+        XCTAssertEqual(backend.enqueuedPTS, [3, 4])
+    }
+
+    func testFlushWithoutOffsetUpdatePreservesActivePresentationOffset() throws {
+        let backend = FakeVideoRendererBackend()
+        let harness = makeHarness(backend: backend)
+        let firstGeneration = MediaGeneration(rawValue: 1)
+        let secondGeneration = MediaGeneration(rawValue: 2)
+        let firstReset = expectation(description: "首次偏移刷新完成")
+
+        harness.output.reset(.init(
+            generation: firstGeneration,
+            reason: .timelineDiscontinuity,
+            removeDisplayedImage: true,
+            seedFrames: [],
+            presentationTimeOffset: CMTime(value: 2, timescale: 1)
+        )) { result in
+            if case let .failure(error) = result {
+                XCTFail("首次偏移刷新不应失败：\(error)")
+            }
+            firstReset.fulfill()
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0)
+        wait(for: [firstReset], timeout: 1)
+
+        harness.output.flush(to: secondGeneration)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 1)
+        harness.output.waitUntilIdleForTesting()
+        harness.output.enqueue(try frame(
+            sequence: 1,
+            pts: 1,
+            generation: secondGeneration
+        ))
+        harness.output.waitUntilIdleForTesting()
+
+        XCTAssertEqual(backend.enqueuedPTS, [3])
     }
 
     func testResetSeedOverflowRejectsAtomicallyWithoutTrailingLedgerOwner() throws {

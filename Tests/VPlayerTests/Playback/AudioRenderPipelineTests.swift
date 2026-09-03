@@ -4577,7 +4577,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
-    func testOnlyUsableRouteTimingChangesPublishAnchorTimingChange() throws {
+    func testOnlyUsableRouteTimingOrAirPlayOffsetChangesPublishAnchorTimingChange() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio-route-timing")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
@@ -4616,7 +4616,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         ))
         drain(executor)
         routeMonitor.emit(AudioOutputRouteSnapshot(
-            category: .airPlay,
+            category: .hdmi,
             reason: .routeConfigurationChange,
             revision: 2,
             outputLatency: 0.400,
@@ -4625,7 +4625,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         drain(executor)
         let renderer = try XCTUnwrap(renderers.snapshot.first)
         routeMonitor.setNextResampleSnapshot(AudioOutputRouteSnapshot(
-            category: .airPlay,
+            category: .hdmi,
             reason: .routeConfigurationChange,
             revision: 3,
             outputLatency: 0.400,
@@ -4644,6 +4644,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(readiness.snapshot, [
             AudioReadinessRecord(
                 change: .anchorTimingChanged(routeRevision: 1),
+                generation: MediaGeneration(rawValue: 1)
+            ),
+            AudioReadinessRecord(
+                change: .anchorTimingChanged(routeRevision: 2),
                 generation: MediaGeneration(rawValue: 1)
             ),
             AudioReadinessRecord(

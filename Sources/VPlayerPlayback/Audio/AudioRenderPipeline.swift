@@ -1067,7 +1067,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         let anchorTimingChanged = previousRouteSnapshot.map {
             $0.category != .none
                 && ($0.outputLatency != snapshot.outputLatency
-                    || $0.ioBufferDuration != snapshot.ioBufferDuration)
+                    || $0.ioBufferDuration != snapshot.ioBufferDuration
+                    || AirPlayVideoPresentationOffsetPolicy.requiresReanchor(
+                        from: $0,
+                        to: snapshot
+                    ))
         } ?? false
         if anchorTimingChanged {
             readinessSink?(.anchorTimingChanged(routeRevision: snapshot.revision), generation)
