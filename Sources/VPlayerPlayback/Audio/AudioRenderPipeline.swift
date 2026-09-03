@@ -63,12 +63,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     // reservoir, which is governed by CompressedAudioRetentionPolicy.
     private static let pendingPCMCapacity = 96
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
-    // Switching from AVFoundation's compressed renderer to the FFmpeg PCM
-    // fallback is a renderer handoff, not a media-timeline interruption. Keep
-    // an externally managed video clock running while the replacement acquires
-    // a short preroll, but bound the grace period so a broken replacement can
-    // still close readiness and surface the stall.
-    private static let fallbackReadinessGrace: DispatchTimeInterval = .seconds(1)
     private static let progressDeadlineDelay: DispatchTimeInterval = .seconds(1)
     private static let noOutputRouteDeadlineDelay: DispatchTimeInterval = .seconds(3)
     private static let noOutputRouteError = "audio.output-route.unavailable"
@@ -267,8 +261,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var pendingRemoval: PendingRemoval?
     private var nextNoOutputRouteTicket: UInt64? = 1
     private var pendingNoOutputRouteTicket: NoOutputRouteTicket?
-    private var fallbackReadinessGraceActive = false
-    private var compressedRetryPreservesReadiness = false
     private var sharedTimelineOpened = false
     private var stopCompletions: [StopCompletion] = []
     private var currentOutput = AudioOutputRouteCategory.other
@@ -400,7 +392,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             pendingRemoval.targetGeneration = generation
             pendingRemoval.continuation = .configure
             self.pendingRemoval = pendingRemoval
-            compressedRetryPreservesReadiness = false
             return
         }
         if let renderer {
@@ -520,8 +511,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         pendingReevaluation = false
         needsAnchor = false
         needsDecoderResetBeforeNextCompressedEnqueue = false
-        fallbackReadinessGraceActive = false
-        compressedRetryPreservesReadiness = false
         resetStartupWait()
         activeContinuityIslandID = islandID
         resetRendererProgressObservation()
@@ -589,8 +578,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             case .configure, .stop:
                 return
             case .fallback:
-                fallbackReadinessGraceActive = false
-                compressedRetryPreservesReadiness = false
                 updateSnapshot(route: route, ready: false)
                 return
             case .compressedRetry, .audioSessionReset:
@@ -625,8 +612,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         recoveryCoordinator.invalidate()
         invalidateProgressMonitor()
         needsAnchor = false
-        fallbackReadinessGraceActive = false
-        compressedRetryPreservesReadiness = false
         resetStartupWait()
         updateSnapshot(route: route, ready: false)
         setSynchronizerRate(0, time: synchronizer.currentTime())
@@ -705,8 +690,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         invalidateNoOutputRouteDeadline()
         recoveryCoordinator.invalidate()
         invalidateProgressMonitor()
-        fallbackReadinessGraceActive = false
-        compressedRetryPreservesReadiness = false
         sharedTimelineOpened = false
         routeMonitor.stop()
         let now = synchronizer.currentTime()
@@ -819,8 +802,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         invalidateNoOutputRouteDeadline()
         recoveryCoordinator.invalidate()
         invalidateProgressMonitor()
-        fallbackReadinessGraceActive = false
-        compressedRetryPreservesReadiness = false
         sharedTimelineOpened = false
         currentOutput = .other
         lastRouteSnapshot = nil
@@ -1066,12 +1047,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
         let anchorTimingChanged = previousRouteSnapshot.map {
             $0.category != .none
-                && ($0.outputLatency != snapshot.outputLatency
-                    || $0.ioBufferDuration != snapshot.ioBufferDuration
-                    || AirPlayVideoPresentationOffsetPolicy.requiresReanchor(
-                        from: $0,
-                        to: snapshot
-                    ))
+                && ($0.category != snapshot.category
+                    || $0.outputLatency != snapshot.outputLatency
+                    || $0.ioBufferDuration != snapshot.ioBufferDuration)
         } ?? false
         if anchorTimingChanged {
             readinessSink?(.anchorTimingChanged(routeRevision: snapshot.revision), generation)
@@ -1464,50 +1442,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         continuation: RemovalContinuation
     ) {
         guard pendingRemoval == nil else { return }
-        let preservesReadiness: Bool
-        switch continuation {
-        case .compressedRetry:
-            preservesReadiness = sharedTimelineOpened && isReadyForPlayback
-            compressedRetryPreservesReadiness = preservesReadiness
-            fallbackReadinessGraceActive = false
-        case .fallback:
-            preservesReadiness = clockMode == .externallyManaged && isReadyForPlayback
-            compressedRetryPreservesReadiness = false
-            fallbackReadinessGraceActive = preservesReadiness
-        case .configure, .audioSessionReset, .stop:
-            preservesReadiness = false
-            compressedRetryPreservesReadiness = false
-            fallbackReadinessGraceActive = false
-        }
-        replacing = true
-        if case .fallback = continuation, preservesReadiness {
-            // The replacement must earn its own PCM preroll; only the public
-            // readiness signal is bridged across this short handoff.
-            startupPrerollSatisfied = false
-            let scheduledEpoch = epoch
-            let scheduledGeneration = generation
-            executor.submit(after: Self.fallbackReadinessGrace) { [weak self] in
-                self?.expireFallbackReadinessGrace(
-                    epoch: scheduledEpoch,
-                    generation: scheduledGeneration
-                )
-            }
-        }
-        updateSnapshot(route: route, ready: preservesReadiness)
-        let keepsClockRunning: Bool
-        invalidateNoOutputRouteDeadline()
-        if case .compressedRetry = continuation {
-            keepsClockRunning = preservesReadiness
-        } else {
-            keepsClockRunning = false
-        }
-        if !keepsClockRunning {
-            setSynchronizerRate(0, time: synchronizer.currentTime())
-        }
-        resetRendererQueue(renderer)
-        invalidateRendererDemandLifetime(on: renderer)
-        renderer.stopObserving()
-        resetPCMPreroll()
+        let wasReady = isReadyForPlayback
         let transition = PendingRemoval(
             rendererID: renderer.identity,
             originEpoch: epoch,
@@ -1516,7 +1451,38 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             targetGeneration: generation,
             continuation: continuation
         )
+        replacing = true
+        sharedTimelineOpened = false
+        switch continuation {
+        case .compressedRetry, .audioSessionReset:
+            needsAnchor = true
+        case .configure, .fallback, .stop:
+            needsAnchor = false
+        }
         pendingRemoval = transition
+        let startsReplacement: Bool
+        if case .stop = continuation {
+            startsReplacement = false
+        } else {
+            startsReplacement = true
+        }
+        updateSnapshot(
+            route: route,
+            ready: false,
+            invalidation: startsReplacement ? .rendererReplacementStarted : .invalidated
+        )
+        if startsReplacement, clockMode == .externallyManaged, !wasReady {
+            // A lifecycle edge must not disappear merely because prepareAnchor
+            // already made readiness false while an asynchronous video reset is
+            // still in flight.
+            readinessSink?(.rendererReplacementStarted, generation)
+        }
+        invalidateNoOutputRouteDeadline()
+        setSynchronizerRate(0, time: synchronizer.currentTime())
+        resetRendererQueue(renderer)
+        invalidateRendererDemandLifetime(on: renderer)
+        renderer.stopObserving()
+        resetPCMPreroll()
         synchronizer.remove(renderer, at: .invalid) { [self] didRemove in
             executor.submit { [self] in
                 completeRemoval(
@@ -1614,7 +1580,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             return
         }
         replacing = false
-        compressedRetryPreservesReadiness = false
         scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded()
         if let attemptKey = currentCompressedAttemptKey,
            let token = currentProgressToken {
@@ -1687,8 +1652,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         pendingReevaluation = false
         recordFallback(reason)
         replacing = true
-        compressedRetryPreservesReadiness = false
-        fallbackReadinessGraceActive = false
         updateSnapshot(route: route, ready: false)
         completeFallbackAfterRemoval()
     }
@@ -1752,7 +1715,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         renderer = replacement
         rendererAttached = true
         establishRendererDemandLifetime(for: replacement)
-        updateSnapshot(route: .ffmpegPCM, ready: fallbackReadinessGraceActive)
+        updateSnapshot(route: .ffmpegPCM, ready: false)
         replacing = false
         scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded()
         needsAnchor = true
@@ -2094,13 +2057,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private func updateReadiness() {
         let attached = configured && !stopped && !terminal && !replacing && rendererAttached
         guard attached else {
-            // Compressed packets continue arriving while AVFoundation removes
-            // the failed renderer. They belong in replay, but must not let the
-            // enqueue-side readiness refresh puncture the bounded handoff grace.
-            updateSnapshot(
-                route: route,
-                ready: fallbackReadinessGraceActive || compressedRetryPreservesReadiness
-            )
+            // Packets may keep arriving while AVFoundation removes a renderer.
+            // They remain in replay, but no renderer means no audio clock owner.
+            updateSnapshot(route: route, ready: false)
             return
         }
         let rendererReady = renderer?.isReadyForMoreMediaData == true
@@ -2111,38 +2070,14 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             startupPrerollSatisfied = rendererSufficient || pcmHasPreroll
         }
         if startupPrerollSatisfied {
-            fallbackReadinessGraceActive = false
             freezeStartupWaitIfNeeded()
         }
         updateSnapshot(
             route: route,
-            ready: startupPrerollSatisfied || fallbackReadinessGraceActive,
+            ready: startupPrerollSatisfied,
             rendererReady: rendererReady,
             rendererSufficient: rendererSufficient
         )
-    }
-
-    private func expireFallbackReadinessGrace(
-        epoch: UInt64,
-        generation: MediaGeneration
-    ) {
-        guard fallbackReadinessGraceActive,
-              self.epoch == epoch,
-              self.generation == generation else { return }
-        fallbackReadinessGraceActive = false
-        updateReadiness()
-    }
-
-    private var requiredPCMStartupPrerollDuration: CMTime {
-        guard let lastRouteSnapshot else { return Self.pcmStartupPrerollDuration }
-        let latency = max(0, lastRouteSnapshot.outputLatency) + max(0, lastRouteSnapshot.ioBufferDuration)
-        if latency > 0.05 {
-            let dynamicPreroll = CMTime(seconds: latency + 0.25, preferredTimescale: 1_000)
-            return CMTimeCompare(dynamicPreroll, Self.pcmStartupPrerollDuration) > 0
-                ? dynamicPreroll
-                : Self.pcmStartupPrerollDuration
-        }
-        return Self.pcmStartupPrerollDuration
     }
 
     private var hasMinimumPCMPreroll: Bool {
@@ -2150,7 +2085,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
               let end = pcmPrerollEnd else { return false }
         let duration = CMTimeSubtract(end, start)
         return duration.isNumeric &&
-            CMTimeCompare(duration, requiredPCMStartupPrerollDuration) >= 0
+            CMTimeCompare(duration, Self.pcmStartupPrerollDuration) >= 0
     }
 
     private func recordPCMPreroll(_ sampleBuffer: CMSampleBuffer) {
@@ -2311,8 +2246,6 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         automaticFlushProgressOrigin.clear()
         terminal = true
         replacing = false
-        fallbackReadinessGraceActive = false
-        compressedRetryPreservesReadiness = false
         sharedTimelineOpened = false
         reconcileRendererRequest(hasPendingWork: false)
         renderer?.stopObserving()

@@ -695,6 +695,26 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 readyPublished = false
                 display.pauseSubmission()
                 renderer.resetPresentationTiming()
+            case .rendererReplacementStarted:
+                let wasOpen = readiness?.isOpen == true
+                preparedAnchor = nil
+                if let anchorPreparationTransaction {
+                    supersededAnchorPreparationTransaction = anchorPreparationTransaction
+                    self.anchorPreparationTransaction = nil
+                }
+                readyPublished = false
+                if wasOpen {
+                    readiness?.close(.audioReplacement)
+                    display.pauseSubmission()
+                    renderer.resetPresentationTiming()
+                }
+                // The audio component has no attached master renderer now, but
+                // the playback pipeline must remember that this media already
+                // opened once so recovery can continue the current GOP.
+                audio.setSharedTimelineOpened(false)
+                guard synchronizeAudioRecoveryFloorIsolated(
+                    readiness?.minimumRecoveryAnchorPTS
+                ) else { return }
             case .available:
                 pendingAnchorTimingRecoveryRevision = nil
                 updateReadinessIsolated()
@@ -2957,8 +2977,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 generation: expectedGeneration,
                 reason: resetReason,
                 removeDisplayedImage: true,
-                seedFrames: candidateVideo,
-                presentationTimeOffset: audio.videoPresentationOffset
+                seedFrames: candidateVideo
             )) { [weak self] result in
                 guard let self else { return }
                 executor.submit { [self] in
@@ -3076,6 +3095,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
             commonPTS: preparation.commonPTS,
             routeRevision: preparation.routeRevision
         )
+        if pendingAnchorTimingRecoveryRevision == preparation.routeRevision {
+            pendingAnchorTimingRecoveryRevision = nil
+        }
         renderer.resetPresentationTiming()
         anchorPreparationTransaction = nil
         if let gapTransaction = audioGapReanchorTransaction,

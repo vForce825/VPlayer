@@ -381,13 +381,6 @@ final class PlaybackPipelineTests: XCTestCase {
             ioBufferDuration: 0.020
         ))
         try await eventually { harness.renderer.pendingResetRequest != nil }
-        XCTAssertEqual(
-            try XCTUnwrap(
-                harness.renderer.pendingResetRequest?.presentationTimeOffset
-            ).seconds,
-            0.400,
-            accuracy: 0.001
-        )
         harness.renderer.completePendingReset()
         try await eventually {
             harness.clock.snapshot().anchors.count == 1
@@ -523,13 +516,6 @@ final class PlaybackPipelineTests: XCTestCase {
         harness.renderer.completePendingReset()
 
         try await eventually { harness.renderer.pendingResetRequest != nil }
-        XCTAssertEqual(
-            try XCTUnwrap(
-                harness.renderer.pendingResetRequest?.presentationTimeOffset
-            ).seconds,
-            0.650,
-            accuracy: 0.001
-        )
         XCTAssertTrue(
             harness.clock.snapshot().anchors.isEmpty,
             "路由变化前启动的异步锚定事务不得提交"
@@ -647,6 +633,49 @@ final class PlaybackPipelineTests: XCTestCase {
         )
     }
 
+    func testCompletedAnchorTimingRecoveryDoesNotMaskLaterAudioInvalidation() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 1)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually { harness.clock.snapshot().anchors.count == 1 }
+
+        harness.audio.setRouteSnapshot(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 1,
+            outputLatency: 0.300,
+            ioBufferDuration: 0.020
+        ))
+        harness.pipeline.receive(
+            audioReadiness: .anchorTimingChanged(routeRevision: 1),
+            generation: generation
+        )
+        harness.pipeline.refreshReadiness()
+        try await eventually { harness.clock.snapshot().anchors.count == 2 }
+
+        let pausesBeforeInvalidation = harness.clock.snapshot().pauses
+        harness.audio.setReady(false)
+        harness.pipeline.receive(audioReadiness: .invalidated, generation: generation)
+        _ = await harness.pipeline.debugSnapshot()
+
+        XCTAssertEqual(harness.clock.snapshot().pauses, pausesBeforeInvalidation + 1)
+        XCTAssertEqual(harness.display.snapshot().last, "pause")
+    }
+
     func testAudioSessionResetRebuildClosesSharedGateAndReanchorsWithoutRewinding()
         async throws {
         let harness = makeHarness()
@@ -691,6 +720,13 @@ final class PlaybackPipelineTests: XCTestCase {
 
         harness.pipeline.recoverFromAudioSessionReset(readinessCycle: 1)
         _ = await harness.pipeline.debugSnapshot()
+        let pausesAfterRecoveryStarted = harness.clock.snapshot().pauses
+        harness.audio.setReady(false)
+        harness.pipeline.receive(
+            audioReadiness: .rendererReplacementStarted,
+            generation: generation
+        )
+        _ = await harness.pipeline.debugSnapshot()
 
         XCTAssertEqual(harness.audio.snapshot().audioSessionResetRecoveryCount, 1)
         XCTAssertEqual(harness.audio.snapshot().sharedTimelineOpenedValues.last, false)
@@ -702,6 +738,11 @@ final class PlaybackPipelineTests: XCTestCase {
             1
         )
         XCTAssertEqual(harness.clock.snapshot().anchors.count, 1)
+        XCTAssertEqual(
+            harness.clock.snapshot().pauses,
+            pausesAfterRecoveryStarted,
+            "同一 session-reset 的 renderer 生命周期事件不得二次关闭共享门"
+        )
 
         harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
             id: 2,
@@ -5582,7 +5623,10 @@ final class PlaybackPipelineTests: XCTestCase {
         }
 
         harness.audio.setReady(false)
-        harness.pipeline.receive(audioReadiness: .invalidated, generation: generation)
+        harness.pipeline.receive(
+            audioReadiness: .rendererReplacementStarted,
+            generation: generation
+        )
         harness.pipeline.receive(video: .accessUnit(try PlaybackFakeMedia.accessUnit(
             id: 100,
             generation: generation,
@@ -6039,6 +6083,56 @@ final class PlaybackPipelineTests: XCTestCase {
             "fresh readiness must finish the in-flight preparation without flushing twice"
         )
         XCTAssertEqual(harness.clock.snapshot().anchors.count, 1)
+    }
+
+    func testRendererReplacementSupersedesAsynchronousAnchorPreparation() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.renderer.setAutomaticallyCompletesResets(false)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+        try receiveAndReleaseNormalizedFrames([
+            PlaybackFakeMedia.decodedFrame(
+                id: 1,
+                generation: generation,
+                pts: .zero,
+                interlaced: false
+            ),
+        ], in: harness)
+        try await eventually { harness.renderer.pendingResetRequest != nil }
+        let preparationCount = harness.audio.snapshot().anchorPreparations.count
+
+        harness.audio.setReady(false)
+        harness.pipeline.receive(
+            audioReadiness: .rendererReplacementStarted,
+            generation: generation
+        )
+        _ = await harness.pipeline.debugSnapshot()
+        harness.renderer.completePendingReset()
+        _ = await harness.pipeline.debugSnapshot()
+
+        XCTAssertTrue(harness.clock.snapshot().anchors.isEmpty)
+        XCTAssertFalse(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
+
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audioReadiness: .available, generation: generation)
+        try await eventually { harness.renderer.pendingResetRequest != nil }
+        XCTAssertEqual(
+            harness.audio.snapshot().anchorPreparations.count,
+            preparationCount + 1,
+            "新 renderer 必须重新准备共同 PTS，不能复用旧 renderer 的锚定事务"
+        )
+
+        harness.renderer.completePendingReset()
+        try await eventually {
+            harness.clock.snapshot().anchors.count == 1
+                && harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
     }
 
     func testExternalAudioInvalidationClosesAndReopensTheSoleReadinessGate() async throws {

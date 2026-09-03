@@ -38,29 +38,6 @@ final class VideoSampleBufferBuilderTests: XCTestCase {
         ))
     }
 
-    func testBuildAddsPresentationOffsetWithoutMutatingSourceFrameTiming() throws {
-        let frame = makeFrame(
-            pixelBuffer: try VideoTestFactories.nv12(),
-            presentationTimeStamp: CMTime(value: 2_000, timescale: 1_000)
-        )
-        let offset = CMTime(value: 450, timescale: 1_000)
-
-        let sample = try VideoImageSampleBufferBuilder().make(
-            frame: frame,
-            presentationTimeOffset: offset
-        )
-
-        XCTAssertEqual(
-            CMTimeCompare(
-                CMSampleBufferGetPresentationTimeStamp(sample),
-                CMTime(value: 2_450, timescale: 1_000)
-            ),
-            0
-        )
-        XCTAssertEqual(frame.presentationTimeStamp, CMTime(value: 2_000, timescale: 1_000))
-        XCTAssertEqual(CMSampleBufferGetDuration(sample), frame.duration)
-    }
-
     func testBuilderRebuildsDescriptionWhenPixelFormatChangesAndResetDropsCache() throws {
         let builder = VideoImageSampleBufferBuilder()
         let nv12 = try VideoTestFactories.pixelBuffer(
