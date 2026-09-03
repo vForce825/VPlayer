@@ -15,6 +15,7 @@ public enum AudioFallbackReason: String, Codable, Sendable, Equatable {
     case repeatedCompressedRendererFailure
     case systemDecoderUnavailable
     case compressedRendererNoProgressAfterRebuild
+    case unsupportedRoute
 }
 
 public enum AudioDiagnosticOutputCategory: String, Codable, Sendable, Equatable {

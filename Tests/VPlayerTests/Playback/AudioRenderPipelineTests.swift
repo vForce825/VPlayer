@@ -5590,6 +5590,42 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.pipeline.isReadyForPlayback)
     }
 
+    func testAirPlayRouteWithAC3FallsBackToPCMWithUnsupportedRouteReason() throws {
+        let harness = try makeHarness(codec: .ac3, initialRouteCategory: .hdmi)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: true)
+
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertEqual(harness.pipeline.diagnostics.pcmFallbackCount, 0)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .routeConfigurationChange,
+            revision: 2
+        ))
+        drain(harness.executor)
+
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(harness.pipeline.diagnostics.pcmFallbackCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.lastFallbackReason, .unsupportedRoute)
+    }
+
+    func testInitialAirPlayRouteWithAC3FallsBackToPCMWithUnsupportedRouteReason() throws {
+        let harness = try makeHarness(codec: .ac3, initialRouteCategory: .airPlay)
+        drain(harness.executor)
+
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertEqual(harness.pipeline.diagnostics.pcmFallbackCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.lastFallbackReason, .unsupportedRoute)
+    }
+
+
     private func assertCoreError(
         _ expected: PlaybackCoreError,
         file: StaticString = #filePath,

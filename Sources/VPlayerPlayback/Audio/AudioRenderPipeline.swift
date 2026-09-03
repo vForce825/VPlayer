@@ -1057,6 +1057,13 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             return
         }
         invalidateNoOutputRouteDeadline()
+
+        if snapshot.category == .airPlay, route == .systemCompressed,
+           codec == .ac3 {
+            beginFallback(reason: .unsupportedRoute)
+            return
+        }
+
         let anchorTimingChanged = previousRouteSnapshot.map {
             $0.category != .none
                 && ($0.outputLatency != snapshot.outputLatency
