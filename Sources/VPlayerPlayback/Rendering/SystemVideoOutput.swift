@@ -25,6 +25,22 @@ struct VideoRendererResetRequest: @unchecked Sendable {
     let reason: Reason
     let removeDisplayedImage: Bool
     let seedFrames: [VideoPresentationFrame]
+    // nil 表示保留当前偏移；共享时钟重新锚定时传入新路由对应的值。
+    let presentationTimeOffset: CMTime?
+
+    init(
+        generation: MediaGeneration,
+        reason: Reason,
+        removeDisplayedImage: Bool,
+        seedFrames: [VideoPresentationFrame],
+        presentationTimeOffset: CMTime? = nil
+    ) {
+        self.generation = generation
+        self.reason = reason
+        self.removeDisplayedImage = removeDisplayedImage
+        self.seedFrames = seedFrames
+        self.presentationTimeOffset = presentationTimeOffset
+    }
 }
 
 final class SystemVideoOutput: @unchecked Sendable {
@@ -64,6 +80,7 @@ final class SystemVideoOutput: @unchecked Sendable {
 
     // All mutable properties are stateQueue-isolated.
     private var generation = MediaGeneration(rawValue: 0)
+    private var presentationTimeOffset = CMTime.zero
     private var pending: [PendingFrame] = []
     private var acceptances: [UInt64: PendingAcceptance] = [:]
     private var nextAcceptanceID: UInt64 = 1
@@ -174,6 +191,11 @@ final class SystemVideoOutput: @unchecked Sendable {
         stateQueue.async { [self] in
             guard !stopped else {
                 completion(.failure(.videoRendererFailed("renderer.stopped")))
+                return
+            }
+            if let offset = request.presentationTimeOffset,
+               !offset.isNumeric || CMTimeCompare(offset, .zero) < 0 {
+                completion(.failure(.videoRendererFailed("renderer.presentation-offset")))
                 return
             }
             let transaction = ResetTransaction(
@@ -335,7 +357,10 @@ final class SystemVideoOutput: @unchecked Sendable {
         while backend.isReadyForMoreMediaData, !pending.isEmpty {
             let next = pending.removeFirst()
             do {
-                backend.enqueue(try builder.make(frame: next.frame))
+                backend.enqueue(try builder.make(
+                    frame: next.frame,
+                    presentationTimeOffset: presentationTimeOffset
+                ))
                 if recoveryCompletedWithoutProgress, !recoveryRequestInFlight {
                     recoveryCompletedWithoutProgress = false
                 }
@@ -368,6 +393,9 @@ final class SystemVideoOutput: @unchecked Sendable {
     ) {
         stopRequestIsolated()
         generation = transaction.request.generation
+        if let offset = transaction.request.presentationTimeOffset {
+            presentationTimeOffset = offset
+        }
         if clearPending {
             clearPendingIsolated(reason: "renderer.reset")
         }

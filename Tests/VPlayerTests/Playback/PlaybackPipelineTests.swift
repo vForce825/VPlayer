@@ -381,6 +381,13 @@ final class PlaybackPipelineTests: XCTestCase {
             ioBufferDuration: 0.020
         ))
         try await eventually { harness.renderer.pendingResetRequest != nil }
+        XCTAssertEqual(
+            try XCTUnwrap(
+                harness.renderer.pendingResetRequest?.presentationTimeOffset
+            ).seconds,
+            0.400,
+            accuracy: 0.001
+        )
         harness.renderer.completePendingReset()
         try await eventually {
             harness.clock.snapshot().anchors.count == 1
@@ -516,6 +523,13 @@ final class PlaybackPipelineTests: XCTestCase {
         harness.renderer.completePendingReset()
 
         try await eventually { harness.renderer.pendingResetRequest != nil }
+        XCTAssertEqual(
+            try XCTUnwrap(
+                harness.renderer.pendingResetRequest?.presentationTimeOffset
+            ).seconds,
+            0.650,
+            accuracy: 0.001
+        )
         XCTAssertTrue(
             harness.clock.snapshot().anchors.isEmpty,
             "路由变化前启动的异步锚定事务不得提交"

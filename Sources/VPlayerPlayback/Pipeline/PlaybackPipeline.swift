@@ -2957,7 +2957,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
                 generation: expectedGeneration,
                 reason: resetReason,
                 removeDisplayedImage: true,
-                seedFrames: candidateVideo
+                seedFrames: candidateVideo,
+                presentationTimeOffset: audio.videoPresentationOffset
             )) { [weak self] result in
                 guard let self else { return }
                 executor.submit { [self] in

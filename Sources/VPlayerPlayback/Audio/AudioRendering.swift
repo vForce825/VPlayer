@@ -130,6 +130,29 @@ public enum PlaybackAnchorLeadTimePolicy {
     }
 }
 
+enum AirPlayVideoPresentationOffsetPolicy {
+    static func compute(for snapshot: AudioOutputRouteSnapshot?) -> CMTime {
+        guard let snapshot,
+              snapshot.category == .airPlay,
+              snapshot.outputLatency.isFinite,
+              snapshot.outputLatency > 0 else { return .zero }
+        return CMTime(
+            seconds: snapshot.outputLatency,
+            preferredTimescale: 1_000
+        )
+    }
+
+    static func requiresReanchor(
+        from previous: AudioOutputRouteSnapshot,
+        to current: AudioOutputRouteSnapshot
+    ) -> Bool {
+        let crossesAirPlayBoundary = (previous.category == .airPlay)
+            != (current.category == .airPlay)
+        return crossesAirPlayBoundary
+            || CMTimeCompare(compute(for: previous), compute(for: current)) != 0
+    }
+}
+
 public struct AudioRenderDiagnostics: Sendable, Equatable {
     public static let zero = AudioRenderDiagnostics()
 
@@ -238,6 +261,7 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
     var currentRouteSnapshot: AudioOutputRouteSnapshot? { get }
     var anchorLeadTime: CMTime { get }
     var outputLatency: CMTime { get }
+    var videoPresentationOffset: CMTime { get }
     // Diagnostics: how many times the renderer has been flushed and refilled from
     // the replay buffer. Each recovery is expensive, so a high rate shows up as
     // reduced ingest throughput rather than as an error.
@@ -286,6 +310,9 @@ public extension AudioRenderPipelineProtocol {
             return CMTime(seconds: total, preferredTimescale: 1_000)
         }
         return .zero
+    }
+    var videoPresentationOffset: CMTime {
+        AirPlayVideoPresentationOffsetPolicy.compute(for: currentRouteSnapshot)
     }
     func setSharedTimelineOpened(_: Bool) {}
 }

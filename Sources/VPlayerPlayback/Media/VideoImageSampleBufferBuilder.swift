@@ -8,9 +8,19 @@ import CoreVideo
 final class VideoImageSampleBufferBuilder: @unchecked Sendable {
     private var cachedDescription: CMVideoFormatDescription?
 
-    func make(frame: VideoPresentationFrame) throws -> CMSampleBuffer {
+    func make(
+        frame: VideoPresentationFrame,
+        presentationTimeOffset: CMTime = .zero
+    ) throws -> CMSampleBuffer {
         let pixelBuffer = frame.pixelBuffer
+        let presentationTimeStamp = CMTimeAdd(
+            frame.presentationTimeStamp,
+            presentationTimeOffset
+        )
         guard frame.presentationTimeStamp.isNumeric,
+              presentationTimeOffset.isNumeric,
+              CMTimeCompare(presentationTimeOffset, .zero) >= 0,
+              presentationTimeStamp.isNumeric,
               frame.duration.isNumeric,
               CMTimeCompare(frame.duration, .zero) > 0,
               CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
@@ -40,7 +50,7 @@ final class VideoImageSampleBufferBuilder: @unchecked Sendable {
 
         var timing = CMSampleTimingInfo(
             duration: frame.duration,
-            presentationTimeStamp: frame.presentationTimeStamp,
+            presentationTimeStamp: presentationTimeStamp,
             decodeTimeStamp: .invalid
         )
         var sampleBuffer: CMSampleBuffer?
