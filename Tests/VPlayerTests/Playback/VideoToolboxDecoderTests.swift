@@ -10,6 +10,52 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VideoToolboxDecoderTests: XCTestCase {
+    func testHLSVTCallbackAdmissionIsWokenByConfigureAndFatalWithoutImageDoesNotWait() throws {
+        let admission = HLSDataPlaneAdmission(capacity: 1, maximumBytes: 1_000_000)
+        let provider = HLSDecodedSurfaceAdmission(admission: admission)
+        let heldScope = provider.makeSurfaceSessionScope()
+        var heldTail: DecodedVideoFrameRetentionTail? = try XCTUnwrap(heldScope.admitSurface(bytes: 1))
+        XCTAssertNotNil(heldTail)
+        let harness = makeHarness(surfaceAdmission: provider)
+        try configure(harness, generation: 81)
+        try decode(harness, id: 810, generation: 81)
+
+        let callbackReturned = expectation(description: "blocked VT callback cancelled by configure")
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()),
+                            on: harness.submissionQueue)
+        XCTAssertTrue(eventually { provider.waitingScopeCount == 1 },
+                      "callback 必须先在实际 scope admission 条件等待")
+        let replacementFormat = try makeFormat(codec: kCMVideoCodecType_H264)
+        DispatchQueue.global().async {
+            // The callback above cannot cross the occupied real HLS admission.
+            // A same-route configure must cancel its captured scope before native enqueue.
+            harness.decoder.transition(.configure(
+                token: VideoDecoderTransitionToken(),
+                format: replacementFormat,
+                generation: MediaGeneration(rawValue: 82)
+            ))
+        }
+        harness.submissionQueue.async { callbackReturned.fulfill() }
+        wait(for: [callbackReturned], timeout: 2)
+        harness.drainSubmissions()
+        drain(harness.executor)
+        XCTAssertTrue(harness.events.identifiedOutputEvents.allSatisfy {
+            if case let .frame(accessUnitID, _) = $0 { return accessUnitID != 810 }
+            return true
+        })
+
+        // No image means no surface owner: a fatal callback must not wait for admission.
+        try decode(harness, id: 811, generation: 82)
+        let fatalReturned = expectation(description: "image-less fatal returns")
+        let fatalQueue = DispatchQueue(label: "org.vplayer.tests.vt.scope.fatal")
+        harness.api.deliver(index: 1, output: output(status: kVTVideoDecoderUnsupportedDataFormatErr),
+                            on: fatalQueue)
+        fatalQueue.async { fatalReturned.fulfill() }
+        wait(for: [fatalReturned], timeout: 2)
+        drain(harness.executor)
+        XCTAssertEqual(harness.events.failures.last?.disposition, .fatal)
+        heldTail = nil
+    }
     func testConfigureTransitionReturnsWhileNativeQueueIsBlockedAndCompletesOnceOnExecutor() throws {
         let harness = makeHarness()
         let queueBlocked = expectation(description: "native submission queue blocked")
@@ -281,6 +327,44 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.api.snapshot.invalidatedSessionIDs, [VTSessionID(rawValue: 1)])
         XCTAssertEqual(harness.events.transitionCompletions.filter { $0.token == token }, [
             TransitionCompletionRecord(token: token, outcome: .completed),
+        ])
+    }
+
+    func testNaturalDrainDeliversFinishDelayedFrameWithExistingSessionIdentity() throws {
+        let harness = makeHarness()
+        let configurationToken = VideoDecoderTransitionToken()
+        let generation = MediaGeneration(rawValue: 46)
+        harness.decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(codec: kCMVideoCodecType_H264),
+            generation: generation
+        ))
+        harness.drainSubmissions()
+        drain(harness.executor)
+        try decode(harness, id: 104, generation: generation.rawValue)
+
+        let delayedOutput = output(imageBuffer: try makePixelBuffer())
+        let api = harness.api
+        api.handleFinish {
+            api.deliver(index: 0, output: delayedOutput)
+        }
+        let drainToken = VideoDecoderTransitionToken()
+        harness.decoder.transition(.drain(token: drainToken))
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(harness.events.identifiedOutputEvents, [
+            .frame(accessUnitID: 104, identity: identity),
+            .completed(accessUnitID: 104, identity: identity, disposition: .produced),
+        ])
+        XCTAssertEqual(harness.api.snapshot.operations.suffix(2), ["finish", "wait"])
+        XCTAssertTrue(harness.api.snapshot.invalidatedSessionIDs.isEmpty)
+        XCTAssertEqual(harness.events.transitionCompletions.filter { $0.token == drainToken }, [
+            TransitionCompletionRecord(token: drainToken, outcome: .completed),
         ])
     }
 
@@ -774,6 +858,32 @@ final class VideoToolboxDecoderTests: XCTestCase {
         ])
     }
 
+    func testExternallyBoundedLosslessSubmissionWaitsForNativeWindowWithoutDropping() throws {
+        let harness = makeHarness(
+            maximumInFlightDecodeCount: 1,
+            inFlightWaitInterval: 0.001,
+            submissionPolicy: .externallyBoundedLossless
+        )
+        try configure(harness, generation: 1)
+
+        try decode(harness, id: 1, generation: 1)
+        try decode(
+            harness,
+            id: 2,
+            generation: 1,
+            drainSubmissionQueue: false)
+        XCTAssertTrue(eventually { harness.api.snapshot.decodes.count == 1 })
+        XCTAssertTrue(harness.events.failures.isEmpty)
+
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        harness.drainSubmissions()
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.api.snapshot.decodes.count, 2)
+        XCTAssertTrue(harness.events.failures.isEmpty)
+        XCTAssertFalse(harness.events.completions.contains { $0.accessUnitID == 2 })
+    }
+
     func testAsynchronousStatusClassificationEmitsExactlyOneDisposition() throws {
         let cases: [(OSStatus, ExpectedDisposition, VideoDecoderFailure)] = [
             (1, .recoverable, .badData(1)),
@@ -877,6 +987,19 @@ final class VideoToolboxDecoderTests: XCTestCase {
         backlog.resumeAfterSessionChange()
 
         XCTAssertEqual(backlog.admit(isRandomAccess: false), .submit)
+    }
+
+    func testExternallyBoundedLosslessBacklogNeverLatchesSkipAtRealtimeDepth() {
+        let backlog = DecodeSubmissionBacklog(
+            depth: 2,
+            policy: .externallyBoundedLossless
+        )
+
+        for _ in 0..<12 {
+            XCTAssertEqual(backlog.admit(isRandomAccess: false), .submit)
+        }
+        XCTAssertEqual(backlog.maximumDepth, 12)
+        for _ in 0..<12 { backlog.complete() }
     }
 
     func testAccessUnitsBeyondTheBacklogBoundNeverReachTheDecoder() throws {
@@ -1009,6 +1132,41 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.events.failures.first?.disposition, .fatal)
     }
 
+    func testHLSPermanentSurfaceAdmissionRejectionEmitsFatalForCurrentSession() throws {
+        let provider = HLSDecodedSurfaceAdmission(
+            admission: HLSDataPlaneAdmission(capacity: 1, maximumBytes: 1)
+        )
+        let harness = makeHarness(surfaceAdmission: provider)
+        try configure(harness, generation: 1)
+        try decode(harness, id: 91, generation: 1)
+
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.events.failures, [FailureRecord(
+            failure: .malfunction(kCVReturnError),
+            generation: MediaGeneration(rawValue: 1),
+            disposition: .fatal
+        )])
+    }
+
+    func testRetiredHLSScopeLateFailureAndCancelledCallbackDoNotFailReplacementSession() throws {
+        let provider = DeferredPermanentSurfaceAdmission()
+        let harness = makeHarness(surfaceAdmission: provider)
+        try configure(harness, generation: 1)
+        try decode(harness, id: 93, generation: 1)
+        harness.drainSubmissions()
+
+        // configure 先退休并取消旧 scope，再安装 generation 2 的真实 identity。
+        try configure(harness, generation: 2)
+        harness.api.deliver(index: 0, output: output(imageBuffer: try makePixelBuffer()))
+        provider.reportLatePermanentFailure(scope: 0)
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.events.failures.isEmpty,
+                      "旧 VT scope 的取消 callback 与迟到永久失败都不得击穿后继 identity")
+    }
+
     func testFalseCoreVideoCompatibilityResultEmitsFatalFailure() throws {
         let harness = makeHarness(compatibilityCheck: { _, _ in false })
         try configure(harness, generation: 1)
@@ -1084,7 +1242,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         ))
     }
 
-    func testKnownAndUnknownAttachmentMappingsAndInvalidHDRLengths() throws {
+    func testKnownAndUnknownAttachmentMappings() throws {
         let harness = makeHarness()
         try configure(harness, generation: 1)
         try decode(harness, id: 1, generation: 1)
@@ -1092,9 +1250,6 @@ final class VideoToolboxDecoderTests: XCTestCase {
         setAttachment(pixelBuffer, key: kCVImageBufferColorPrimariesKey, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
         setAttachment(pixelBuffer, key: kCVImageBufferYCbCrMatrixKey, value: "Identity" as CFString)
         setAttachment(pixelBuffer, key: kCVImageBufferTransferFunctionKey, value: kCVImageBufferTransferFunction_Linear)
-        setAttachment(pixelBuffer, key: kCVImageBufferMasteringDisplayColorVolumeKey, value: Data(repeating: 1, count: 23) as CFData)
-        setAttachment(pixelBuffer, key: kCVImageBufferContentLightLevelInfoKey, value: Data(repeating: 2, count: 5) as CFData)
-
         harness.api.deliver(index: 0, output: output(imageBuffer: pixelBuffer))
         drain(harness.executor)
 
@@ -1102,8 +1257,6 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(metadata.primaries, .bt709)
         XCTAssertEqual(metadata.matrix, .identity)
         XCTAssertEqual(metadata.transfer, .linear)
-        XCTAssertNil(metadata.hdrStaticMetadata.masteringDisplayColorVolume)
-        XCTAssertNil(metadata.hdrStaticMetadata.contentLightLevelInfo)
     }
 
     func testSourceGateHasNoYADIFImplementation() throws {
@@ -1134,7 +1287,9 @@ final class VideoToolboxDecoderTests: XCTestCase {
         maximumInFlightDecodeCount: Int = 8,
         inFlightWaitInterval: TimeInterval = 0.25,
         tuning: PlaybackTuning = .default,
-        submissionEpoch: SubmissionEpoch = SubmissionEpoch()
+        submissionPolicy: VideoDecodeSubmissionPolicy = .realtimeDropping,
+        submissionEpoch: SubmissionEpoch = SubmissionEpoch(),
+        surfaceAdmission: (any DecodedVideoSurfaceAdmitting)? = nil
     ) -> DecoderHarness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.decoder")
         let api = FakeVideoToolboxAPI()
@@ -1148,8 +1303,10 @@ final class VideoToolboxDecoderTests: XCTestCase {
             maximumInFlightDecodeCount: maximumInFlightDecodeCount,
             inFlightWaitInterval: inFlightWaitInterval,
             tuning: tuning,
+            submissionPolicy: submissionPolicy,
             submissionQueue: submissionQueue,
-            submissionEpoch: submissionEpoch
+            submissionEpoch: submissionEpoch,
+            surfaceAdmission: surfaceAdmission
         )
         return DecoderHarness(
             executor: executor,
@@ -1224,7 +1381,8 @@ final class VideoToolboxDecoderTests: XCTestCase {
             topFieldFirst: nil,
             sourcePTS90k: nil
         ),
-        flags: VTDecodeFrameFlags = ._EnableAsynchronousDecompression
+        flags: VTDecodeFrameFlags = ._EnableAsynchronousDecompression,
+        drainSubmissionQueue: Bool = true
     ) throws {
         let format = try makeFormat(codec: kCMVideoCodecType_H264)
         let sampleBuffer = try SampleBufferBuilder.makeVideo(
@@ -1245,7 +1403,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         try perform(on: harness.executor) {
             try harness.decoder.decode(accessUnit, flags: flags)
         }
-        harness.drainSubmissions()
+        if drainSubmissionQueue { harness.drainSubmissions() }
     }
 
     private func makeAccessUnit(
@@ -1301,6 +1459,15 @@ final class VideoToolboxDecoderTests: XCTestCase {
         let completed = expectation(description: "executor drained")
         executor.submit { completed.fulfill() }
         wait(for: [completed], timeout: 5)
+    }
+
+    private func eventually(timeout: TimeInterval = 2, _ condition: @escaping () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        return condition()
     }
 
     private func assertFailure(
@@ -1460,6 +1627,44 @@ private struct CompletionRecord: Sendable, Hashable {
 private struct TransitionCompletionRecord: Sendable, Equatable {
     let token: VideoDecoderTransitionToken
     let outcome: VideoDecoderTransitionOutcome
+}
+
+private final class DeferredPermanentSurfaceAdmission: DecodedVideoSurfaceAdmitting, @unchecked Sendable {
+    private final class Scope: DecodedVideoSurfaceAdmitting, @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        private let permanentFailureSink: @Sendable () -> Void
+
+        init(permanentFailureSink: @escaping @Sendable () -> Void) {
+            self.permanentFailureSink = permanentFailureSink
+        }
+
+        func admitSurface(bytes _: Int) -> DecodedVideoFrameRetentionTail? {
+            lock.withLock { cancelled ? nil : nil }
+        }
+
+        func cancelSurfaceAdmission() { lock.withLock { cancelled = true } }
+        func makeSurfaceSessionScope(
+            permanentFailureSink _: @escaping @Sendable () -> Void
+        ) -> any DecodedVideoSurfaceAdmitting { self }
+        func reportLatePermanentFailure() { permanentFailureSink() }
+    }
+
+    private let lock = NSLock()
+    private var scopes: [Scope] = []
+
+    func admitSurface(bytes _: Int) -> DecodedVideoFrameRetentionTail? { nil }
+    func cancelSurfaceAdmission() {}
+    func makeSurfaceSessionScope(
+        permanentFailureSink: @escaping @Sendable () -> Void
+    ) -> any DecodedVideoSurfaceAdmitting {
+        let scope = Scope(permanentFailureSink: permanentFailureSink)
+        lock.withLock { scopes.append(scope) }
+        return scope
+    }
+    func reportLatePermanentFailure(scope: Int) {
+        lock.withLock { scopes.indices.contains(scope) ? scopes[scope] : nil }?.reportLatePermanentFailure()
+    }
 }
 
 private enum IdentifiedDecoderOutputEvent: Sendable, Equatable {

@@ -6,14 +6,30 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd "$script_dir/.." && pwd)"
 # shellcheck source=resolve-acceptance-development-team.sh
 source "$script_dir/resolve-acceptance-development-team.sh"
 
 child_pid=""
+server_pid=""
+port_file=""
 received_signal=""
+
+cleanup_fixture_server() {
+    if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+        kill -TERM "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        server_pid=""
+    fi
+    if [[ -n "$port_file" && -e "$port_file" ]]; then
+        rm -f "$port_file"
+        port_file=""
+    fi
+}
 
 abort_if_signaled() {
     [[ -z "$received_signal" ]] && return
+    cleanup_fixture_server
     if [[ -n "${run_directory:-}" ]]; then
         echo "acceptance interrupted; partial artifacts remain at: $run_directory" >&2
     else
@@ -25,6 +41,7 @@ abort_if_signaled() {
 forward_signal() {
     local signal="$1"
     received_signal="$signal"
+    cleanup_fixture_server
     if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
         kill -"$signal" -- "-$child_pid" 2>/dev/null \
             || kill -"$signal" "$child_pid" 2>/dev/null \
@@ -55,6 +72,7 @@ wait_for_child() {
 trap 'forward_signal INT' INT
 trap 'forward_signal TERM' TERM
 trap 'forward_signal HUP' HUP
+trap cleanup_fixture_server EXIT
 
 if [[ "${VPLAYER_ACCEPTANCE_PREFLIGHT_SIGNAL_TEST_MODE:-0}" == "1" ]]; then
     preflight_ready_file="${VPLAYER_ACCEPTANCE_PREFLIGHT_SIGNAL_TEST_READY_FILE:?preflight ready file required}"
@@ -82,23 +100,133 @@ if [[ "${VPLAYER_ACCEPTANCE_SIGNAL_TEST_MODE:-0}" == "1" ]]; then
 fi
 
 usage() {
-    echo "usage: $0 DEVICE_UDID CHANNEL POSITIVE_SECONDS [M3U_URL] [EPG_URL]" >&2
+    echo "usage: $0 [--airplay] [--long-playback] [--spawn-fixture-server] [--fixture-server URL] [--fixture-root DIR] [--output-dir DIR] DEVICE_UDID CHANNEL [POSITIVE_SECONDS] [M3U_URL] [EPG_URL]" >&2
 }
 
-if (( $# < 3 || $# > 5 )); then
-    usage
-    exit 64
-fi
+airplay_mode=0
+long_playback_mode=0
+spawn_fixture_server=0
+fixture_server_url=""
+fixture_root=""
+output_dir=""
+positional=()
 
-device_udid="$1"
-channel="$2"
-duration="$3"
-m3u_url="${4:-https://example.invalid/playlist.m3u}"
-epg_url="${5:-https://example.invalid/epg.xml}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --airplay)
+            airplay_mode=1
+            shift
+            ;;
+        --long-playback)
+            long_playback_mode=1
+            shift
+            ;;
+        --spawn-fixture-server)
+            spawn_fixture_server=1
+            shift
+            ;;
+        --fixture-server)
+            [[ $# -ge 2 ]] || { echo "option $1 requires an argument" >&2; exit 64; }
+            fixture_server_url="$2"
+            shift 2
+            ;;
+        --fixture-root)
+            [[ $# -ge 2 ]] || { echo "option $1 requires an argument" >&2; exit 64; }
+            fixture_root="$2"
+            shift 2
+            ;;
+        --output-dir)
+            [[ $# -ge 2 ]] || { echo "option $1 requires an argument" >&2; exit 64; }
+            output_dir="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            while [[ $# -gt 0 ]]; do
+                positional+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            echo "unknown option: $1" >&2
+            usage
+            exit 64
+            ;;
+        *)
+            positional+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if (( long_playback_mode != 0 )); then
+    if (( ${#positional[@]} < 2 || ${#positional[@]} > 5 )); then
+        usage
+        exit 64
+    fi
+    device_udid="${positional[0]}"
+    channel="${positional[1]}"
+    duration="${positional[2]:-7200}"
+    m3u_url="${positional[3]:-${fixture_server_url:-https://example.invalid/playlist.m3u}}"
+    epg_url="${positional[4]:-https://example.invalid/epg.xml}"
+else
+    if (( ${#positional[@]} < 3 || ${#positional[@]} > 5 )); then
+        usage
+        exit 64
+    fi
+    device_udid="${positional[0]}"
+    channel="${positional[1]}"
+    duration="${positional[2]}"
+    m3u_url="${positional[3]:-${fixture_server_url:-https://example.invalid/playlist.m3u}}"
+    epg_url="${positional[4]:-https://example.invalid/epg.xml}"
+fi
 
 if [[ ! "$duration" =~ ^[1-9][0-9]*$ ]]; then
     echo "duration must be a positive integer number of seconds" >&2
     exit 64
+fi
+
+if (( spawn_fixture_server != 0 )); then
+    fixture_root="${fixture_root:-$repository_root/Tests/VPlayerTests/Fixtures/Media}"
+    server_script="$repository_root/Scripts/Support/fixture_server.py"
+    if [[ ! -x "$server_script" ]]; then
+        echo "fixture server script not found or not executable: $server_script" >&2
+        exit 69
+    fi
+    if [[ ! -d "$fixture_root" ]]; then
+        echo "fixture root directory not found: $fixture_root" >&2
+        exit 69
+    fi
+    port_file="$(mktemp "${TMPDIR:-/tmp}/vplayer-fixture-port.XXXXXX")"
+    "$server_script" --root "$fixture_root" --port-file "$port_file" &
+    server_pid=$!
+
+    port=""
+    for _ in $(seq 1 250); do
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo "fixture server terminated unexpectedly" >&2
+            exit 69
+        fi
+        if [[ -s "$port_file" ]]; then
+            candidate="$(tr -d '[:space:]' <"$port_file")"
+            if [[ "$candidate" =~ ^[1-9][0-9]*$ ]] && curl --fail --silent --show-error --head "http://127.0.0.1:$candidate/SHA256SUMS" >/dev/null 2>&1; then
+                port="$candidate"
+                break
+            fi
+        fi
+        sleep 0.02
+    done
+    if [[ -z "$port" ]]; then
+        echo "fixture server failed to bind or verify readiness on loopback" >&2
+        cleanup_fixture_server
+        exit 69
+    fi
+    if [[ "$m3u_url" == "https://example.invalid/playlist.m3u" || -z "$m3u_url" ]]; then
+        m3u_url="http://127.0.0.1:$port/playlist.m3u"
+    fi
+    if [[ "$epg_url" == "https://example.invalid/epg.xml" || -z "$epg_url" ]]; then
+        epg_url="http://127.0.0.1:$port/epg.xml"
+    fi
 fi
 
 if [[ ! "$m3u_url" =~ ^https?:// ]]; then
@@ -119,7 +247,7 @@ if ! rg -q 'productType: AppleTV14,1' <<<"$device_details"; then
     exit 69
 fi
 destination_udid="$(
-    sed -nE 's/^[[:space:]]*• udid: ([A-Fa-f0-9-]+)$/\1/p' \
+    sed -nE 's/^[[:space:]]*[^[:alnum:]]*[[:space:]]*udid:[[:space:]]*([A-Fa-f0-9-]+)$/\1/p' \
         <<<"$device_details" | sed -n '1p'
 )"
 if [[ -z "$destination_udid" ]]; then
@@ -147,7 +275,7 @@ if [[ ! "$development_team" =~ ^[A-Z0-9]{10}$ ]]; then
 fi
 
 repository_root="$(cd "$script_dir/.." && pwd)"
-artifact_root="${VPLAYER_ACCEPTANCE_ARTIFACT_ROOT:-$repository_root/.superpowers/acceptance}"
+artifact_root="${output_dir:-${VPLAYER_ACCEPTANCE_ARTIFACT_ROOT:-$repository_root/.superpowers/acceptance}}"
 run_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 run_directory="$artifact_root/$run_id"
 derived_data="$run_directory/DerivedData"
@@ -165,6 +293,9 @@ encode_build_setting() {
     printf 'VPLAYER_ACCEPTANCE_EPG_URL_B64 = %s\n' "$(encode_build_setting "$epg_url")"
     printf 'VPLAYER_ACCEPTANCE_CHANNEL_B64 = %s\n' "$(encode_build_setting "$channel")"
     printf 'VPLAYER_ACCEPTANCE_SECONDS_B64 = %s\n' "$(encode_build_setting "$duration")"
+    if (( airplay_mode != 0 )); then
+        printf 'VPLAYER_ACCEPTANCE_AIRPLAY_B64 = %s\n' "$(encode_build_setting "1")"
+    fi
 } >"$acceptance_xcconfig"
 
 echo "running device acceptance on verified AppleTV14,1; artifacts: $run_directory"
@@ -183,10 +314,19 @@ xcodebuild test \
     -only-testing:VPlayerUITests/LongPlaybackAcceptanceTests/testLongRunningRealDevicePlayback \
     DEVELOPMENT_TEAM="$development_team" >"$console_log" 2>&1 &
 child_pid=$!
+(
+    while kill -0 "$child_pid" 2>/dev/null; do
+        pkill -f "devicectl diagnose" 2>/dev/null || true
+        sleep 1
+    done
+) &
+diagnose_watchdog_pid=$!
 set +e
 wait_for_child
 status=$?
 set -e
+kill "$diagnose_watchdog_pid" 2>/dev/null || true
+wait "$diagnose_watchdog_pid" 2>/dev/null || true
 
 privacy_violation=0
 if rg -a -F -q -- "$m3u_url" "$console_log"; then
@@ -198,19 +338,35 @@ elif rg -a -F -q -- "$epg_url" "$console_log"; then
 elif [[ -e "$result_bundle" ]] && rg -a -F -q -- "$epg_url" "$result_bundle"; then
     privacy_violation=1
 fi
+
+for target_url in "$m3u_url" "$epg_url"; do
+    if [[ "$target_url" == *\?* ]]; then
+        query_part="${target_url#*\?}"
+        if [[ -n "$query_part" ]]; then
+            if rg -a -F -q -- "$query_part" "$console_log" || { [[ -e "$result_bundle" ]] && rg -a -F -q -- "$query_part" "$result_bundle"; }; then
+                privacy_violation=1
+            fi
+        fi
+    fi
+done
+
 if (( privacy_violation != 0 )); then
+    cleanup_fixture_server
     echo "acceptance privacy scan failed; protected artifacts retained without console replay" >&2
     exit 78
 fi
 
 sed -n '1,$p' "$console_log"
 if [[ -n "$received_signal" ]]; then
+    cleanup_fixture_server
     echo "acceptance interrupted; partial artifacts remain at: $run_directory" >&2
     exit 130
 fi
 if (( status != 0 )); then
+    cleanup_fixture_server
     echo "acceptance failed; artifacts retained at: $run_directory" >&2
     exit "$status"
 fi
 
+cleanup_fixture_server
 echo "acceptance succeeded; result bundle: $result_bundle"

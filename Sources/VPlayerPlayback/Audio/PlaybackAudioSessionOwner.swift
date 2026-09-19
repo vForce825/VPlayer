@@ -3,376 +3,248 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+import CoreFoundation
 import Foundation
-import OSLog
+import Security
 
-private final class PlaybackAudioSessionNotificationToken: @unchecked Sendable {
-    private let value: NSObjectProtocol
+/// 只替代最底层同步SDK；步骤准入及真实结果提升属于Registry。
+protocol PlaybackAudioSessionSDK: AnyObject, Sendable {
+    func setPlaybackCategory(policy: AudioSessionActualPolicy) throws
+    func setSupportsMultichannelContent() throws
+    func activate() throws
+    func deactivate() throws
+    func currentRoute() -> any AudioSessionRouteSnapshot
+    func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool
+}
 
-    init(_ value: NSObjectProtocol) {
-        self.value = value
+/// 仅显式注入系统实例；Task9才建立唯一App runtime，本类型不调用sharedInstance。
+final class SystemPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
+    private let session: AVAudioSession
+    init(session: AVAudioSession) { self.session = session }
+    func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {
+        try session.setCategory(.playback, mode: .moviePlayback,
+            policy: policy == .longFormAudio ? .longFormAudio : .default, options: [])
     }
-
-    func remove(from notificationCenter: NotificationCenter) {
-        notificationCenter.removeObserver(value)
+    func setSupportsMultichannelContent() throws { try session.setSupportsMultichannelContent(true) }
+    func activate() throws { try session.setActive(true) }
+    func deactivate() throws { try session.setActive(false, options: .notifyOthersOnDeactivation) }
+    func currentRoute() -> any AudioSessionRouteSnapshot {
+        // 恰好一次系统route getter；不读latency/buffer/rate/channel标量。
+        SystemAudioSessionRouteSnapshot(route: session.currentRoute)
+    }
+    func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool {
+        guard let base = bytes.baseAddress else { return false }
+        return SecRandomCopyBytes(kSecRandomDefault, bytes.count, base) == errSecSuccess
     }
 }
 
-public struct PlaybackAudioSessionLease: Hashable, Sendable {
-    public let id: UInt64
-    public let generation: UInt64
-    public let isInterruptedAtAcquisition: Bool
-
-    public init(
-        id: UInt64,
-        generation: UInt64,
-        isInterruptedAtAcquisition: Bool = false
-    ) {
-        self.id = id
-        self.generation = generation
-        self.isInterruptedAtAcquisition = isInterruptedAtAcquisition
+/// 系统描述仅活在lane投影栈；不复制UID集合，也不进入Cell、record或日志。
+final class SystemAudioSessionRouteSnapshot: AudioSessionRouteSnapshot, @unchecked Sendable {
+    private let route: NSObject
+    private let outputs: NSArray?
+    init(route: NSObject) {
+        self.route = route
+        let selector = #selector(getter: AVAudioSessionRouteDescription.outputs)
+        if route.responds(to: selector), let outputs = route.perform(selector)?.takeUnretainedValue() as? NSArray,
+           outputs.count <= 32 { self.outputs = outputs }
+        else { outputs = nil }
     }
-}
-
-public enum PlaybackAudioSessionRecoveryFailureStage: String, Sendable, Equatable {
-    case mediaServicesResetConfiguration
-    case mediaServicesResetActivation
-    case interruptionReactivation
-}
-
-public enum PlaybackAudioSessionEvent: Sendable, Equatable {
-    case interruptionBegan
-    case interruptionEnded(shouldResume: Bool)
-    case explicitResumeSucceeded
-    case mediaServicesWereReset
-    case recoveryFailed(stage: PlaybackAudioSessionRecoveryFailureStage)
-}
-
-struct PlaybackAudioSessionDiagnostic: Equatable {
-    enum Stage: String, Equatable {
-        case longFormAudioCategory
-        case defaultCategory
-        case multichannelContent
-        case activation
-        case deactivation
-        case mediaServicesReset
-    }
-
-    let stage: Stage
-    let errorDomain: String
-    let errorCode: Int
-
-    init(stage: Stage, errorDomain: String, errorCode: Int) {
-        self.stage = stage
-        self.errorDomain = Self.sanitize(domain: errorDomain)
-        self.errorCode = min(Int(Int32.max), max(Int(Int32.min), errorCode))
-    }
-
-    private static func sanitize(domain: String) -> String {
-        let scalars = domain.unicodeScalars.prefix(64).map { scalar in
-            switch scalar.value {
-            case 45, 46, 48 ... 57, 65 ... 90, 95, 97 ... 122:
-                return Character(scalar)
-            default:
-                return "_"
-            }
+    var endpointCount: Int { outputs?.count ?? -1 }
+    func endpoint(at index: Int) -> AudioSessionRouteEndpoint {
+        guard let outputs, index >= 0, index < outputs.count,
+              let endpoint = outputs.object(at: index) as? NSObject,
+              let uid = Self.read(endpoint, #selector(getter: AVAudioSessionPortDescription.uid)) as? NSString,
+              let port = Self.read(endpoint, #selector(getter: AVAudioSessionPortDescription.portType)) as? NSString else {
+            return .init(uid: "", portType: "", dataSource: .invalid)
         }
-        let sanitized = String(scalars)
-        return sanitized.isEmpty ? "unknown" : sanitized
+        let dataSource: AudioSessionDataSourceEvidence
+        let sourceSelector = #selector(getter: AVAudioSessionPortDescription.selectedDataSource)
+        guard endpoint.responds(to: sourceSelector) else { return .init(uid: "", portType: "", dataSource: .invalid) }
+        if let source = Self.read(endpoint, sourceSelector) {
+            guard let source = source as? NSObject,
+                  let number = Self.read(source, #selector(getter: AVAudioSessionDataSourceDescription.dataSourceID)) as? NSNumber else {
+                return .init(uid: "", portType: "", dataSource: .invalid)
+            }
+            // 直接借原NSNumber做无损固定Int64转换；不分配第二个NSNumber作比较。
+            let type = CFGetTypeID(number)
+            if type == CFBooleanGetTypeID() {
+                dataSource = .integer(number.boolValue ? 1 : 0)
+            } else if type == CFNumberGetTypeID() {
+                // NSNumber的无符号64位桥接可回绕成CFNumber有符号值；先按公开类型编码检查原值。
+                // objCType为inner pointer，只在number强局部存活时借首字节，不扫描或构造String。
+                let encoding = number.objCType.pointee
+                let unsigned = encoding == 67 || encoding == 83 || encoding == 73 || encoding == 76 || encoding == 81 // C/S/I/L/Q
+                if unsigned && number.uint64Value > UInt64(Int64.max) { dataSource = .invalid }
+                else {
+                    let value = unsafeBitCast(number, to: CFNumber.self)
+                    var integer: Int64 = 0
+                    dataSource = CFNumberGetValue(value, .sInt64Type, &integer) ? .integer(integer) : .invalid
+                }
+            } else { dataSource = .invalid }
+        } else { dataSource = .missing }
+        return .init(uid: uid, portType: port, dataSource: dataSource)
+    }
+
+    /// selector仅来自此文件的编译期公开getter；+0返回先由强局部接管，原route/NSArray持续存活。
+    private static func read(_ object: NSObject, _ selector: Selector) -> AnyObject? {
+        guard object.responds(to: selector) else { return nil }
+        return object.perform(selector)?.takeUnretainedValue()
     }
 }
 
-@MainActor
-protocol PlaybackAudioSessionApplying: AnyObject {
-    func setPlaybackCategory(policy: AVAudioSession.RouteSharingPolicy) throws
-    func setSupportsMultichannelContent(_ enabled: Bool) throws
-    func setActive(_ active: Bool) throws
+enum AudioSessionCallStart: Sendable, Equatable { case started, parked, rejected }
+
+/// 接收已结清结果及准确原permit；不提供caller授权或读取current补票的能力。
+protocol PlaybackAudioSessionCompletionReceiving: AnyObject, Sendable {
+    func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit,
+        completion: AudioSessionBlockingCallCompletion)
 }
 
-protocol PlaybackAudioSessionOwning: AnyObject, Sendable {
-    @MainActor
-    func acquire(
-        eventHandler: @escaping @MainActor @Sendable (
-            PlaybackAudioSessionLease,
-            PlaybackAudioSessionEvent
-        ) -> Void
-    ) throws -> PlaybackAudioSessionLease
-
-    @MainActor
-    func release(_ lease: PlaybackAudioSessionLease)
-
-    @MainActor
-    func requestResume(for lease: PlaybackAudioSessionLease) -> Bool
-}
-
-@MainActor
-final class PlaybackAudioSessionOwner: PlaybackAudioSessionOwning {
-    typealias FailureReporter = @MainActor (PlaybackAudioSessionDiagnostic) -> Void
-    typealias EventDelivery = @MainActor (@escaping @MainActor () -> Void) -> Void
-    typealias EventHandler = @MainActor @Sendable (
-        PlaybackAudioSessionLease,
-        PlaybackAudioSessionEvent
-    ) -> Void
-
-    private let session: any PlaybackAudioSessionApplying
-    private let notificationCenter: NotificationCenter
-    private let reportFailure: FailureReporter
-    private let eventDelivery: EventDelivery
-    private var interruptionObserver: PlaybackAudioSessionNotificationToken?
-    private var mediaResetObserver: PlaybackAudioSessionNotificationToken?
-    private var handlers: [PlaybackAudioSessionLease: EventHandler] = [:]
-    private var nextLeaseID: UInt64 = 1
-    private var nextLeaseGeneration: UInt64 = 1
-    private var isConfigured = false
-    private var isInterrupted = false
-    private var sessionIsActive = false
-
-    convenience init() {
-        self.init(
-            session: SystemPlaybackAudioSessionAdapter(session: .sharedInstance()),
-            notificationCenter: .default
-        )
-    }
+class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unchecked Sendable {
+    let registry: ControlTaskRegistry
+    let monitor: SystemAudioEventMonitor
+    private let lane: AudioSessionBlockingCallLane
 
     init(
-        session: any PlaybackAudioSessionApplying,
-        notificationCenter: NotificationCenter,
-        eventDelivery: @escaping EventDelivery = { operation in operation() },
-        reportFailure: @escaping FailureReporter = { diagnostic in
-            playbackAudioSessionLogger.error(
-                "operation failed stage=\(diagnostic.stage.rawValue, privacy: .public) domain=\(diagnostic.errorDomain, privacy: .public) code=\(diagnostic.errorCode, privacy: .public)"
-            )
-        }
-    ) {
-        self.session = session
-        self.notificationCenter = notificationCenter
-        self.eventDelivery = eventDelivery
-        self.reportFailure = reportFailure
-        observeSessionEvents()
+        registry: ControlTaskRegistry = ControlTaskRegistry(),
+        sdk: (any PlaybackAudioSessionSDK)? = nil,
+        monitor: SystemAudioEventMonitor? = nil
+    ) throws {
+        let actualSdk = sdk ?? NullPlaybackAudioSessionSDK()
+        let lane = AudioSessionBlockingCallLane(sdk: actualSdk)
+        guard registry.bindAudioSessionLane(lane) else { throw ControlTaskRegistry.Failure.invalidGroup }
+        self.registry = registry
+        self.lane = lane
+        self.monitor = monitor ?? SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
     }
 
-    deinit {
-        interruptionObserver?.remove(from: notificationCenter)
-        mediaResetObserver?.remove(from: notificationCenter)
+    convenience init(registry: ControlTaskRegistry, sdk: any PlaybackAudioSessionSDK) throws {
+        try self.init(registry: registry, sdk: sdk, monitor: nil)
     }
 
-    func acquire(
-        eventHandler: @escaping EventHandler
-    ) throws -> PlaybackAudioSessionLease {
-        if !isConfigured {
-            try configureSession()
-        }
-        if !isInterrupted, !sessionIsActive {
-            do {
-                try session.setActive(true)
-                sessionIsActive = true
-            } catch {
-                report(error, at: .activation)
-                throw error
-            }
-        }
-
-        let lease = PlaybackAudioSessionLease(
-            id: nextLeaseID,
-            generation: nextLeaseGeneration,
-            isInterruptedAtAcquisition: isInterrupted
-        )
-        nextLeaseID &+= 1
-        nextLeaseGeneration &+= 1
-        handlers[lease] = eventHandler
-        return lease
-    }
-
-    func release(_ lease: PlaybackAudioSessionLease) {
-        guard handlers.removeValue(forKey: lease) != nil else { return }
-        guard handlers.isEmpty else { return }
-        sessionIsActive = false
-        do {
-            try session.setActive(false)
-        } catch {
-            report(error, at: .deactivation)
+    func startAcquisition(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) -> Bool {
+        switch dispatch(prepareAcquisition(ticket, receiver: receiver)) {
+        case .started, .parked: true
+        case .rejected: false
         }
     }
+
+    var isInterruptedAtAcquisition: Bool { false }
+
+    func releaseLease(_ lease: PlaybackAudioSessionLease) {}
 
     @discardableResult
     func requestResume(for lease: PlaybackAudioSessionLease) -> Bool {
-        guard newestLiveLease() == lease,
-              handlers[lease] != nil,
-              !isInterrupted else { return false }
-        sessionIsActive = false
-        do {
-            try session.setActive(true)
-            sessionIsActive = true
-            enqueue(.explicitResumeSucceeded)
-        } catch {
-            report(error, at: .activation)
-            enqueue(.recoveryFailed(stage: .interruptionReactivation))
-        }
-        return true
+        guard let ticket = registry.prepareExplicitResume(for: lease) else { return false }
+        return invoke(ticket, receiver: self) == .started
     }
 
-    var activeLeaseCountForTesting: Int { handlers.count }
-
-    private func configureSession() throws {
-        do {
-            try session.setPlaybackCategory(policy: .longFormAudio)
-        } catch {
-            report(error, at: .longFormAudioCategory)
-            do {
-                try session.setPlaybackCategory(policy: .default)
-            } catch {
-                report(error, at: .defaultCategory)
-                throw error
-            }
-        }
-
-        do {
-            try session.setSupportsMultichannelContent(true)
-        } catch {
-            report(error, at: .multichannelContent)
-        }
-        isConfigured = true
+    func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit,
+        completion: AudioSessionBlockingCallCompletion) {
+        guard permit.operation == .activate, completion.disposition == .accepted,
+              let receipt = completion.reactivationReceipt, receipt.sourceRecordNonce == permit.record.nonce,
+              let event = registry.recoveryCompletionEvent(receipt) else { return }
+        monitor.emitReactivationCompletion(receipt, event: event)
     }
 
-    private func observeSessionEvents() {
-        interruptionObserver = PlaybackAudioSessionNotificationToken(
-            notificationCenter.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            let rawType = Self.unsignedValue(
-                notification.userInfo?[AVAudioSessionInterruptionTypeKey]
-            )
-            let rawOptions = Self.unsignedValue(
-                notification.userInfo?[AVAudioSessionInterruptionOptionKey]
-            ) ?? 0
-            MainActor.assumeIsolated {
-                self?.receiveInterruption(type: rawType, options: rawOptions)
-            }
-        })
-        mediaResetObserver = PlaybackAudioSessionNotificationToken(
-            notificationCenter.addObserver(
-            forName: AVAudioSession.mediaServicesWereResetNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.receiveMediaServicesReset()
-            }
-        })
+    func emit(_ event: PlaybackAudioSessionEvent) {
+        monitor.emit(event)
     }
 
-    private func receiveInterruption(type: UInt?, options: UInt) {
-        switch type.flatMap(AVAudioSession.InterruptionType.init(rawValue:)) {
-        case .began:
-            isInterrupted = true
-            sessionIsActive = false
-            enqueue(.interruptionBegan)
-        case .ended:
-            guard isInterrupted else { return }
-            isInterrupted = false
-            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: options)
-                .contains(.shouldResume)
-            if shouldResume, !handlers.isEmpty {
-                do {
-                    try session.setActive(true)
-                    sessionIsActive = true
-                } catch {
-                    report(error, at: .activation)
-                    enqueue(.recoveryFailed(stage: .interruptionReactivation))
-                    return
+    /// 握手/配置准备和装箱完整返回后才enqueue；salt/registration/first不会跨入本次SDK投影。
+    private func prepareAcquisition(_ ticket: ControlTaskTicket,
+        receiver: any PlaybackAudioSessionCompletionReceiving) -> AudioSessionPreparedDelivery {
+        guard registry.claimStart(ticket) else { return .rejected }
+        guard let salt = lane.makeEndpointSalt() else {
+            _ = registry.completeOutputAcquisitionWithoutLease(ticket)
+            return .rejected
+        }
+        do {
+            guard let registration = try registry.registerAudioSessionLease(ticket, salt: salt) else {
+                _ = registry.completeOutputAcquisitionWithoutLease(ticket)
+                return .rejected
+            }
+            guard let first = try registry.beginRegisteredAudioSessionConfiguration(registration) else {
+                return registry.acquisitionIsParkedForPhysicalResume(registration) ? .parked : .rejected
+            }
+            return prepare(first, family: .audio, receiver: receiver)
+        } catch {
+            // checked注册失败没有产生lease；准确原票必须结清。若已安装lease，原入口明确拒绝而不伪造no-lease。
+            _ = registry.completeOutputAcquisitionWithoutLease(ticket)
+            return .rejected
+        }
+    }
+
+    /// Task7把底层通知源绑定此真实handle；它每次回调仍须通过同锁资源核验。
+    func registration(for acquisition: ControlTaskTicket) -> PlaybackAudioSessionRegistration? {
+        registry.audioSessionRegistration(for: acquisition)
+    }
+
+    func sample(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) -> AudioSessionCallStart {
+        dispatch(prepare(ticket, family: .sampler, receiver: receiver))
+    }
+
+    /// 音频固定步骤入口不能领取sampler；跨family后继由同一具名接收者取得准确结果。
+    @discardableResult
+    func invoke(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) -> AudioSessionCallStart {
+        dispatch(prepare(ticket, family: .audio, receiver: receiver))
+    }
+
+    /// 本函数完整返回后才enqueue；record/application/request准备栈不会与本次SDK投影并存。
+    private func prepare(_ ticket: ControlTaskTicket, family: AudioSessionCallFamily,
+        receiver: any PlaybackAudioSessionCompletionReceiving) -> AudioSessionPreparedDelivery {
+        switch registry.executor.performAudioSessionCall(.claim(ticket, lane: lane, family: family)) {
+        case .claimed(let request):
+            return .ready(.init(request: request, owner: self, receiver: receiver))
+        case .parked: return .parked
+        default: return .rejected
+        }
+    }
+
+    private func dispatch(_ prepared: AudioSessionPreparedDelivery) -> AudioSessionCallStart {
+        switch prepared {
+        case .ready(let delivery): lane.execute(delivery); return .started
+        case .parked: return .parked
+        case .rejected: return .rejected
+        }
+    }
+
+    func receive(_ result: AudioSessionBlockingCallResult, delivery: AudioSessionCallDelivery) {
+        registry.executor.sync {
+            guard case .completed(let completion, _, _, _) = registry.executor.performAudioSessionCall(
+                .complete(.init(permit: delivery.request.permit, result: result), lane: lane)) else { return }
+            // completion已离Cell锁；跨family后继也须用准确入口重新claim。
+            if let next = completion.followUp {
+                if delivery.request.permit.operation == .currentRoute {
+                    if completion.disposition == .settled {
+                        _ = sample(next, receiver: delivery.receiver)
+                    }
+                } else {
+                    _ = invoke(next, receiver: delivery.receiver)
                 }
             }
-            enqueue(.interruptionEnded(shouldResume: shouldResume))
-        case .none:
-            break
-        @unknown default:
-            break
-        }
-    }
-
-    private func receiveMediaServicesReset() {
-        isConfigured = false
-        isInterrupted = false
-        sessionIsActive = false
-        if !handlers.isEmpty {
-            do {
-                try configureSession()
-            } catch {
-                report(error, at: .mediaServicesReset)
-                enqueue(.recoveryFailed(stage: .mediaServicesResetConfiguration))
-                return
+            if let owner = completion.terminalOwner {
+                registry.startAudioSessionFailureCleanup(owner: owner)
             }
-            do {
-                try session.setActive(true)
-                sessionIsActive = true
-            } catch {
-                report(error, at: .mediaServicesReset)
-                enqueue(.recoveryFailed(stage: .mediaServicesResetActivation))
-                return
-            }
-        }
-        enqueue(.mediaServicesWereReset)
-    }
-
-    private func enqueue(_ event: PlaybackAudioSessionEvent) {
-        guard let lease = newestLiveLease() else { return }
-        eventDelivery { [weak self] in
-            guard let self,
-                  self.newestLiveLease() == lease,
-                  let handler = self.handlers[lease] else { return }
-            handler(lease, event)
-        }
-    }
-
-    private func newestLiveLease() -> PlaybackAudioSessionLease? {
-        handlers.keys.max { lhs, rhs in lhs.generation < rhs.generation }
-    }
-
-    private func report(_ error: Error, at stage: PlaybackAudioSessionDiagnostic.Stage) {
-        let nsError = error as NSError
-        reportFailure(PlaybackAudioSessionDiagnostic(
-            stage: stage,
-            errorDomain: nsError.domain,
-            errorCode: nsError.code
-        ))
-    }
-
-    nonisolated private static func unsignedValue(_ value: Any?) -> UInt? {
-        switch value {
-        case let value as UInt:
-            value
-        case let value as NSNumber:
-            value.uintValue
-        default:
-            nil
+            delivery.receiver.receiveAudioSessionCompletion(permit: delivery.request.permit, completion: completion)
         }
     }
 }
 
-@MainActor
-private final class SystemPlaybackAudioSessionAdapter: PlaybackAudioSessionApplying {
-    private let session: AVAudioSession
-
-    init(session: AVAudioSession) {
-        self.session = session
+final class NullPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
+    func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {}
+    func setSupportsMultichannelContent() throws {}
+    func activate() throws {}
+    func deactivate() throws {}
+    func currentRoute() -> any AudioSessionRouteSnapshot {
+        NullAudioSessionRouteSnapshot()
     }
-
-    func setPlaybackCategory(policy: AVAudioSession.RouteSharingPolicy) throws {
-        try session.setCategory(.playback, mode: .moviePlayback, policy: policy)
-    }
-
-    func setSupportsMultichannelContent(_ enabled: Bool) throws {
-        try session.setSupportsMultichannelContent(enabled)
-    }
-
-    func setActive(_ active: Bool) throws {
-        try session.setActive(active)
-    }
+    func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool { true }
 }
 
-private let playbackAudioSessionLogger = Logger(
-    subsystem: "com.vforce.vplayer",
-    category: "AudioSession"
-)
+final class NullAudioSessionRouteSnapshot: AudioSessionRouteSnapshot, @unchecked Sendable {
+    var endpointCount: Int { 0 }
+    func endpoint(at index: Int) -> AudioSessionRouteEndpoint {
+        .init(uid: "", portType: "", dataSource: .missing)
+    }
+}

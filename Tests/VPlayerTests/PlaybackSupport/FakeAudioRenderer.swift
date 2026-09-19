@@ -447,10 +447,24 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
 
         func push(_ bytes: Data, token: Int64) -> Int32 {
             guard !destroyed, let owner else { return FFmpegPCMAudioDecoder.destroyedErrorCode }
+            owner.beginNativeCall(blockNextPush: true)
+            defer { owner.endNativeCall() }
             return owner.push(bytes: bytes, token: token, receiver: receiver)
         }
 
-        func flush() { owner?.recordFlush() }
+        func drain() -> Int32 {
+            guard !destroyed, let owner else { return FFmpegPCMAudioDecoder.destroyedErrorCode }
+            owner.beginNativeCall(blockNextPush: false)
+            defer { owner.endNativeCall() }
+            return owner.drain(receiver: receiver)
+        }
+
+        func flush() {
+            guard let owner else { return }
+            owner.beginNativeCall(blockNextPush: false)
+            defer { owner.endNativeCall() }
+            owner.recordFlush()
+        }
 
         func destroy() {
             guard !destroyed else { return }
@@ -460,15 +474,29 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
     }
 
     var outputScripts: [[OutputScript]] = []
+    var drainOutputScripts: [[OutputScript]] = []
+    var onBeforeSynchronousCallback: (@Sendable () -> Void)?
     var overrideToken: Int64?
     var overrideABIVersion: UInt32?
     var overrideStructSize: UInt32?
     var pushResult: Int32 = 0
+    /// 仅用于并发 RED：阻塞下一次 native push，使第二个调用是否真的进入 handle 可观测。
+    var nextPushNativeBlocker: DispatchSemaphore?
+    var nativeEntrySignal: DispatchSemaphore?
+    /// 令 native destroy 在实际进入后停住，验证所有 close 调用都等待 teardown 完成。
+    var destroyEntrySignal: DispatchSemaphore?
+    var nextDestroyNativeBlocker: DispatchSemaphore?
     private let lock = NSLock()
     private var tokens: [Int64] = []
     private var allocated: [(UnsafeMutablePointer<Float>, Int)] = []
     private var flushes = 0
     private var destroys = 0
+    private var drains = 0
+    private var reachedEOF = false
+    private var callbacksInFlight = 0
+    private var destroyedDuringCallback = false
+    private var activeNativeCalls = 0
+    private var maximumConcurrentNativeCalls = 0
 
     deinit {
         for (pointer, _) in allocated { pointer.deallocate() }
@@ -477,10 +505,12 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
     func create(
         codec: VPlayerPlayback.AudioCodec,
         extradata: Data,
+        hlsCopyOwnership: HLSAudioCopyOwnership?,
         receiver: @escaping @Sendable (BorrowedFFmpegPCMFrame) -> Void
     ) throws -> any FFmpegAudioDecoderHandle {
         _ = codec
         _ = extradata
+        _ = hlsCopyOwnership
         return Handle(owner: self, receiver: receiver)
     }
 
@@ -503,6 +533,7 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
             lock.lock()
             allocated.append((pointer, script.samples.count))
             lock.unlock()
+            beginCallback()
             receiver(BorrowedFFmpegPCMFrame(
                 interleaved: UnsafePointer(pointer),
                 frameCount: script.frames,
@@ -516,8 +547,43 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
                 reserved: (0, 0, 0),
                 channelLayoutMask: script.mask ?? 0
             ))
+            endCallback()
         }
         return result
+    }
+
+    private func drain(receiver: @Sendable (BorrowedFFmpegPCMFrame) -> Void) -> Int32 {
+        lock.lock()
+        if reachedEOF { lock.unlock(); return -541_478_725 }
+        reachedEOF = true
+        drains += 1
+        let scripts = drainOutputScripts.isEmpty ? [] : drainOutputScripts.removeFirst()
+        let token = tokens.last ?? 0
+        lock.unlock()
+
+        for script in scripts {
+            let pointer = UnsafeMutablePointer<Float>.allocate(capacity: script.samples.count)
+            pointer.initialize(from: script.samples, count: script.samples.count)
+            lock.lock()
+            allocated.append((pointer, script.samples.count))
+            lock.unlock()
+            beginCallback()
+            receiver(BorrowedFFmpegPCMFrame(
+                interleaved: UnsafePointer(pointer),
+                frameCount: script.frames,
+                sampleRate: script.rate,
+                channels: script.channels,
+                token: token,
+                abiVersion: overrideABIVersion ?? VPFF_AUDIO_DECODER_ABI_VERSION,
+                structSize: overrideStructSize ?? UInt32(MemoryLayout<VPFFPCMFrame>.stride),
+                channelOrder: script.channelOrder,
+                hasChannelLayoutMask: script.mask == nil ? 0 : 1,
+                reserved: (0, 0, 0),
+                channelLayoutMask: script.mask ?? 0
+            ))
+            endCallback()
+        }
+        return -541_478_725
     }
 
     func mutateLastBorrowedMemory() {
@@ -530,10 +596,47 @@ final class FakeFFmpegAudioDecoderAPI: FFmpegAudioDecoderAPI, @unchecked Sendabl
     }
 
     fileprivate func recordFlush() { lock.lock(); flushes += 1; lock.unlock() }
-    fileprivate func recordDestroy() { lock.lock(); destroys += 1; lock.unlock() }
+    fileprivate func beginNativeCall(blockNextPush: Bool) {
+        let blocker: DispatchSemaphore?
+        let signal: DispatchSemaphore?
+        lock.lock()
+        activeNativeCalls += 1
+        maximumConcurrentNativeCalls = max(maximumConcurrentNativeCalls, activeNativeCalls)
+        blocker = blockNextPush ? nextPushNativeBlocker : nil
+        if blockNextPush { nextPushNativeBlocker = nil }
+        signal = nativeEntrySignal
+        lock.unlock()
+        signal?.signal()
+        blocker?.wait()
+    }
+    fileprivate func endNativeCall() { lock.withLock { activeNativeCalls -= 1 } }
+    fileprivate func recordDestroy() {
+        let signal: DispatchSemaphore?
+        let blocker: DispatchSemaphore?
+        lock.lock()
+        destroys += 1
+        signal = destroyEntrySignal
+        blocker = nextDestroyNativeBlocker
+        nextDestroyNativeBlocker = nil
+        destroyedDuringCallback = destroyedDuringCallback || callbacksInFlight > 0
+        lock.unlock()
+        signal?.signal()
+        blocker?.wait()
+    }
+    private func beginCallback() {
+        let hook = lock.withLock { () -> (@Sendable () -> Void)? in
+            callbacksInFlight += 1
+            return onBeforeSynchronousCallback
+        }
+        hook?()
+    }
+    private func endCallback() { lock.withLock { callbacksInFlight -= 1 } }
     var pushedTokens: [Int64] { lock.lock(); defer { lock.unlock() }; return tokens }
     var flushCount: Int { lock.lock(); defer { lock.unlock() }; return flushes }
     var destroyCount: Int { lock.lock(); defer { lock.unlock() }; return destroys }
+    var drainCount: Int { lock.lock(); defer { lock.unlock() }; return drains }
+    var destroyOccurredAfterCallbackReturned: Bool { lock.withLock { !destroyedDuringCallback } }
+    var maxConcurrentNativeCalls: Int { lock.withLock { maximumConcurrentNativeCalls } }
 }
 
 final class FakeAudioRouteMonitor: AudioRouteMonitoring, @unchecked Sendable {

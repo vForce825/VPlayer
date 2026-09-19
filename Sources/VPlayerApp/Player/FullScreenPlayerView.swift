@@ -145,11 +145,13 @@ struct FullScreenPlayerView: View {
     }
 
     @State private var model: FullScreenPlayerViewModel
+    @State private var presentationHostMount: PlaybackPresentationHostMount
     @State private var showsSettings = false
     @State private var isClosing = false
     @State private var controlsVisibility = PlayerControlsVisibilityState(mode: .pinned)
     #if DEBUG
     @State private var acceptanceMetricsJSON = "unavailable"
+    @State private var acceptanceDiagnostics = "init"
     #endif
     @FocusState private var failureFocus: FailureControl?
     private let channelPresentation: PlayerChannelPresentation
@@ -162,7 +164,8 @@ struct FullScreenPlayerView: View {
     init(
         channelPresentation: PlayerChannelPresentation,
         engine: any PlaybackEngine,
-        presentationProvider: @escaping FullScreenPlayerViewModel.PresentationProvider,
+        presentationController: (any PlaybackPresentationControlling)?,
+        presentationProvider: @escaping FullScreenPlayerViewModel.PresentationStreamProvider,
         mediaInformationProvider: @escaping FullScreenPlayerViewModel.MediaInformationProvider,
         metricsProvider: @escaping AppDependencies.PlaybackMetricsProvider,
         acceptanceMetricsEnabled: Bool,
@@ -170,14 +173,18 @@ struct FullScreenPlayerView: View {
         settings: PlaybackSettingsStore,
         onDismiss: @escaping () -> Void
     ) {
+        let presentationHostMount = PlaybackPresentationHostMount()
         self.channelPresentation = channelPresentation
         _model = State(initialValue: FullScreenPlayerViewModel(
             request: channelPresentation.request,
             engine: engine,
-            presentationProvider: presentationProvider,
+            presentationController: presentationController,
+            presentationStreamProvider: presentationProvider,
+            presentationMount: presentationHostMount,
             mediaInformationProvider: mediaInformationProvider,
             settings: settings
         ))
+        _presentationHostMount = State(initialValue: presentationHostMount)
         self.settings = settings
         self.metricsProvider = metricsProvider
         self.acceptanceMetricsEnabled = acceptanceMetricsEnabled
@@ -192,10 +199,7 @@ struct FullScreenPlayerView: View {
             // has no video content until the first frame is presented.
             Color.black.ignoresSafeArea()
 
-            if let context = model.presentationContext {
-                SampleBufferPlayerView(context: context)
-                    .ignoresSafeArea()
-            }
+            mountedPresentation
 
             Color.clear
                 .accessibilityElement(children: .ignore)
@@ -227,6 +231,13 @@ struct FullScreenPlayerView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityIdentifier("player-acceptance-metrics")
                     .accessibilityValue(acceptanceMetricsJSON)
+                    .allowsHitTesting(false)
+                    .focusable(false)
+
+                Color.clear
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityIdentifier("player-acceptance-diagnostics")
+                    .accessibilityValue(acceptanceDiagnostics)
                     .allowsHitTesting(false)
                     .focusable(false)
             }
@@ -286,6 +297,7 @@ struct FullScreenPlayerView: View {
                 isPresentingSettings: showsSettings
             ) else { return }
             UIApplication.shared.isIdleTimerDisabled = false
+            presentationHostMount.detachAll()
             Task { await model.stop() }
         }
         .onPlayPauseCommand {
@@ -298,6 +310,12 @@ struct FullScreenPlayerView: View {
         .sheet(isPresented: $showsSettings) {
             PlaybackSettingsView(settings: settings)
         }
+    }
+
+    @ViewBuilder
+    private var mountedPresentation: some View {
+        PlaybackPresentationHostView(mount: presentationHostMount)
+            .ignoresSafeArea()
     }
 
     @ViewBuilder
@@ -385,6 +403,7 @@ struct FullScreenPlayerView: View {
     private func close() {
         guard !isClosing else { return }
         isClosing = true
+        presentationHostMount.detachAll()
         // Return to the channel list immediately. Engine teardown continues in
         // the background (also driven by onDisappear) so a hung network stop
         // never makes the Back button feel frozen.
@@ -398,6 +417,7 @@ struct FullScreenPlayerView: View {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         while !Task.isCancelled {
+            acceptanceDiagnostics = PlaybackDiagnosticTracker.shared.recentHistory
             if let snapshot = await metricsProvider(.seconds(60)),
                let data = try? encoder.encode(snapshot),
                let json = String(data: data, encoding: .utf8) {

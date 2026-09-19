@@ -9,7 +9,7 @@ import XCTest
 final class PlaybackControllerTests: XCTestCase {
     func testPipelinePhaseUsesMatchingCycleAndReadyAloneEntersPlaying() async throws {
         let pipeline = FakeControllerPipeline()
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([pipeline])
         )
         let request = makeRequest(channelID: "phase-cycle")
@@ -61,7 +61,7 @@ final class PlaybackControllerTests: XCTestCase {
     func testPipelinePhaseCannotOverridePhysicalOrVetoSystemPause() async throws {
         let pipeline = FakeControllerPipeline()
         let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([pipeline]),
             audioSessionOwner: owner
         )
@@ -72,7 +72,7 @@ final class PlaybackControllerTests: XCTestCase {
             await controller.currentStateForTesting == .playing(request)
         }
 
-        await MainActor.run { owner.emit(.interruptionBegan) }
+        await MainActor.run { _ = owner.monitor.emit(.interruptionBegan) }
         try await eventually {
             let cycle = await controller.readinessCycleForTesting
             let state = await controller.currentStateForTesting
@@ -83,7 +83,7 @@ final class PlaybackControllerTests: XCTestCase {
         let physicallyPausedState = await controller.currentStateForTesting
         XCTAssertEqual(physicallyPausedState, .recovering(request))
 
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
+        await MainActor.run { _ = owner.monitor.emit(.interruptionEnded(shouldResume: false)) }
         try await eventually {
             await controller.currentStateForTesting == .paused(request)
         }
@@ -94,9 +94,9 @@ final class PlaybackControllerTests: XCTestCase {
         XCTAssertEqual(vetoedState, .paused(request))
     }
 
-    func testLifecycleEventStreamBoundsBacklogToEightLatestStates() async {
+    func testLifecycleEventStreamBoundsBacklogToTheNewestState() async {
         let pipelines = (0..<10).map { _ in FakeControllerPipeline() }
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory(pipelines)
         )
         let stream = await controller.events()
@@ -109,12 +109,9 @@ final class PlaybackControllerTests: XCTestCase {
         }
 
         var iterator = stream.makeAsyncIterator()
-        var bufferedStates: [PlaybackState] = []
-        for _ in 0..<8 {
-            if let state = await iterator.next() { bufferedStates.append(state) }
-        }
-        let expected = requests.suffix(8).map(PlaybackState.preparing)
-        XCTAssertEqual(bufferedStates, expected)
+        let latest = await iterator.next()
+        XCTAssertEqual(latest, .preparing(requests[9]), "慢订阅只保存最后一个状态，不积压旧session")
+        await controller.stop()
     }
 
     func testSessionRelayDeliversOneSessionEventsInFIFOOrder() async throws {
@@ -123,6 +120,8 @@ final class PlaybackControllerTests: XCTestCase {
         let relay = PlaybackSessionEventRelay(identity: identity) { identity, event in
             await recorder.receive(identity: identity, event: event)
         }
+
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
         let expected: [PlaybackPipelineEvent] = [
             .mediaInformation(nil),
             .ready(readinessCycle: 3),
@@ -145,6 +144,7 @@ final class PlaybackControllerTests: XCTestCase {
             await recorder.receive(identity: identity, event: event)
         }
 
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
         relay.send(.ready(readinessCycle: 0))
         try await eventually { gate.waiterCount == 1 }
         relay.send(.ready(readinessCycle: 1))
@@ -174,6 +174,7 @@ final class PlaybackControllerTests: XCTestCase {
             await recorder.receive(identity: identity, event: event)
         }
 
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: oldIdentity)
         relay.send(.ready(readinessCycle: 0))
         try await eventually { gate.waiterCount == 1 }
         await recorder.setCurrentIdentity(newIdentity)
@@ -189,14 +190,17 @@ final class PlaybackControllerTests: XCTestCase {
         let lease = PlaybackAudioSessionLease(id: 1, generation: 1)
         let gate = ManualControllerAsyncGate()
         let recorder = AudioSessionRelayStateRecorder(gate: gate)
-        let relay = PlaybackAudioSessionEventRelay(identity: identity) {
-            identity, lease, event in
-            await recorder.receive(identity: identity, lease: lease, event: event)
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+        let relay = PlaybackAudioSessionEventRelay(identity: identity, lease: lease) {
+            identity, lease, event, _ in
+            await recorder.receive(identity: identity, lease: lease, event: event.event)
         }
 
-        relay.send(lease: lease, event: .explicitResumeSucceeded)
+        try bindOwnedRelayForTesting(.audio(relay), identity: identity)
+        relay.send(lease: lease, event: try XCTUnwrap(monitor.emit(.explicitResumeSucceeded)))
         try await eventually { gate.waiterCount == 1 }
-        relay.send(lease: lease, event: .interruptionBegan)
+        relay.send(lease: lease, event: try XCTUnwrap(monitor.emit(.interruptionBegan)))
         for _ in 0..<100 { await Task.yield() }
         let blockedSnapshot = await recorder.snapshot
         XCTAssertEqual(blockedSnapshot.receiveCount, 1)
@@ -217,16 +221,19 @@ final class PlaybackControllerTests: XCTestCase {
         let lease = PlaybackAudioSessionLease(id: 2, generation: 2)
         let gate = ManualControllerAsyncGate()
         let recorder = AudioSessionRelayStateRecorder(gate: gate)
-        let relay = PlaybackAudioSessionEventRelay(identity: identity) {
-            identity, lease, event in
-            await recorder.receive(identity: identity, lease: lease, event: event)
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+        let relay = PlaybackAudioSessionEventRelay(identity: identity, lease: lease) {
+            identity, lease, event, _ in
+            await recorder.receive(identity: identity, lease: lease, event: event.event)
         }
 
-        relay.send(lease: lease, event: .explicitResumeSucceeded)
+        try bindOwnedRelayForTesting(.audio(relay), identity: identity)
+        relay.send(lease: lease, event: try XCTUnwrap(monitor.emit(.explicitResumeSucceeded)))
         try await eventually { gate.waiterCount == 1 }
-        relay.send(lease: lease, event: .interruptionBegan)
+        relay.send(lease: lease, event: try XCTUnwrap(monitor.emit(.interruptionBegan)))
         relay.deactivate()
-        relay.send(lease: lease, event: .mediaServicesWereReset)
+        relay.send(lease: lease, event: try XCTUnwrap(monitor.emit(.mediaServicesWereReset)))
         gate.open()
         try await eventually { await recorder.snapshot.events.count == 1 }
         for _ in 0..<100 { await Task.yield() }
@@ -240,65 +247,66 @@ final class PlaybackControllerTests: XCTestCase {
         let factory = SuspendedControllerPipelineFactory()
         let firstPipeline = FakeControllerPipeline()
         let secondPipeline = FakeControllerPipeline()
-        let controller = PlaybackController(factory: factory)
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
         let firstRequest = makeRequest(channelID: "first")
         let secondRequest = makeRequest(channelID: "second")
-
         let firstPlay = Task { await controller.play(firstRequest) }
         try await eventually { factory.isPending(callID: 1) }
         let secondPlay = Task { await controller.play(secondRequest) }
-        try await eventually { factory.isPending(callID: 2) }
-
-        factory.succeed(callID: 2, with: secondPipeline)
-        await secondPlay.value
+        try await eventually { await controller.currentStateForTesting == .preparing(secondRequest) }
+        XCTAssertFalse(factory.isPending(callID: 2), "原prepare尚未收敛不得创建新输出")
         factory.succeed(callID: 1, with: firstPipeline)
         await firstPlay.value
-
+        try await eventually { factory.isPending(callID: 2) }
+        factory.succeed(callID: 2, with: secondPipeline)
+        await secondPlay.value
         XCTAssertEqual(secondPipeline.snapshot().starts, [secondRequest.streamURL])
         XCTAssertTrue(firstPipeline.snapshot().starts.isEmpty)
-        XCTAssertEqual(firstPipeline.snapshot().stopCount, 1)
+        XCTAssertEqual(firstPipeline.snapshot().completedStopCount, 1)
         secondPipeline.emit(.ready(readinessCycle: 0))
-        try await eventually {
-            await controller.currentStateForTesting == .playing(secondRequest)
-        }
+        try await eventually { await controller.currentStateForTesting == .playing(secondRequest) }
+        await controller.stop()
     }
 
     func testLaterPlayIgnoresEarlierFactoryFailureArrivingLast() async throws {
         let factory = SuspendedControllerPipelineFactory()
         let secondPipeline = FakeControllerPipeline()
-        let controller = PlaybackController(factory: factory)
+        let controller = makeRoutedPlaybackController(factory: factory)
         let firstRequest = makeRequest(channelID: "first")
         let firstPlay = Task { await controller.play(firstRequest) }
         try await eventually { factory.isPending(callID: 1) }
         let secondRequest = makeRequest(channelID: "second")
         let secondPlay = Task { await controller.play(secondRequest) }
-        try await eventually { factory.isPending(callID: 2) }
-
-        factory.succeed(callID: 2, with: secondPipeline)
-        await secondPlay.value
+        try await eventually { await controller.currentStateForTesting == .preparing(secondRequest) }
+        XCTAssertFalse(factory.isPending(callID: 2))
         factory.fail(callID: 1, with: .demuxOpen(-71))
         await firstPlay.value
+        try await eventually { factory.isPending(callID: 2) }
+        factory.succeed(callID: 2, with: secondPipeline)
+        await secondPlay.value
         secondPipeline.emit(.ready(readinessCycle: 0))
-
-        try await eventually {
-            await controller.currentStateForTesting == .playing(secondRequest)
-        }
+        try await eventually { await controller.currentStateForTesting == .playing(secondRequest) }
+        await controller.stop()
     }
 
     func testStopWinsWhenSuspendedFactorySuccessArrivesLast() async throws {
         let factory = SuspendedControllerPipelineFactory()
         let pipeline = FakeControllerPipeline()
-        let controller = PlaybackController(factory: factory)
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
         let request = makeRequest(channelID: "first")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
-
-        await controller.stop()
+        let stop = Task { await controller.stop() }
+        try await eventually { owner.registry.outputResourceContextSnapshot()?.disposition == .releaseAfterTeardown }
         factory.succeed(callID: 1, with: pipeline)
         await play.value
-
+        await stop.value
         XCTAssertTrue(pipeline.snapshot().starts.isEmpty)
-        XCTAssertEqual(pipeline.snapshot().stopCount, 1)
+        XCTAssertEqual(pipeline.snapshot().completedStopCount, 1)
+        XCTAssertNil(owner.registry.outputResourceContextSnapshot())
+        XCTAssertNil(owner.registry.cleanupReservationSnapshot())
         let state = await controller.currentStateForTesting
         XCTAssertEqual(state, .stopped)
     }
@@ -309,11 +317,11 @@ final class PlaybackControllerTests: XCTestCase {
         let second = FakeControllerPipeline()
         let factory = FakeControllerPipelineFactory([first, second])
         let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(factory: factory, audioSessionOwner: owner)
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
         await controller.play(makeRequest(channelID: "first"))
 
         await MainActor.run {
-            owner.emit(.recoveryFailed(stage: .mediaServicesResetActivation))
+            _ = owner.monitor.emit(.recoveryFailed(stage: .mediaServicesResetActivation))
         }
         try await eventually { first.snapshot().isStopWaiting }
         let replacementRequest = makeRequest(channelID: "replacement")
@@ -335,119 +343,110 @@ final class PlaybackControllerTests: XCTestCase {
         }
     }
 
-    func testFactoryPendingInterruptionBeginsThenStartsInitiallyPaused() async throws {
+    func testPendingPrepareInterruptionRetiresOriginalBeforeResumingSuccessor() async throws {
         let factory = SuspendedControllerPipelineFactory()
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(factory: factory, audioSessionOwner: owner)
-        let request = makeRequest(channelID: "interrupted")
+        let first = FakeControllerPipeline()
+        let successor = FakeControllerPipeline()
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let request = makeRequest(channelID: "pending-prepare")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually {
-            await controller.currentStateForTesting == .recovering(request)
-        }
-        factory.succeed(callID: 1, with: pipeline)
+        _ = owner.monitor.emit(.interruptionBegan)
+        try await eventually { await controller.currentStateForTesting == .recovering(request) }
+        factory.succeed(callID: 1, with: first)
         await play.value
-
-        XCTAssertEqual(pipeline.snapshot().pauses.map(\.0), [true])
-        let state = await controller.currentStateForTesting
-        XCTAssertEqual(state, .recovering(request))
+        try await eventually { first.snapshot().completedStopCount == 1 }
+        XCTAssertTrue(first.snapshot().starts.isEmpty)
+        XCTAssertFalse(factory.isPending(callID: 2))
+        XCTAssertEqual(owner.sdk.activateCallCount, 1)
+        _ = owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        try await eventually { factory.isPending(callID: 2) }
+        factory.succeed(callID: 2, with: successor)
+        try await eventually { successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(successor.snapshot().startReadinessCycles, [1])
+        await controller.stop()
     }
 
-    func testFactoryPendingInterruptionEndsThenStartsNormally() async throws {
+    func testPendingPrepareBeganEndedWaitsForOriginalDrainBeforeSuccessor() async throws {
         let factory = SuspendedControllerPipelineFactory()
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run {
-            RecordingPlaybackAudioSessionOwner(interruptedAtAcquisition: true)
-        }
-        let controller = PlaybackController(factory: factory, audioSessionOwner: owner)
-        let request = makeRequest(channelID: "reactivated")
+        let first = FakeControllerPipeline()
+        let successor = FakeControllerPipeline()
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let request = makeRequest(channelID: "pending-prepare")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
-        let interrupted = await controller.audioSessionInterruptedForTesting
-        XCTAssertTrue(interrupted)
-
-        await MainActor.run {
-            owner.emit(.interruptionEnded(shouldResume: true))
-        }
-        try await eventually {
-            !(await controller.audioSessionInterruptedForTesting)
-        }
-        factory.succeed(callID: 1, with: pipeline)
+        _ = owner.monitor.emit(.interruptionBegan)
+        _ = owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        factory.succeed(callID: 1, with: first)
         await play.value
-
-        XCTAssertTrue(pipeline.snapshot().pauses.isEmpty)
-        XCTAssertEqual(pipeline.snapshot().startReadinessCycles, [1])
-        let state = await controller.currentStateForTesting
-        XCTAssertEqual(state, .preparing(request))
-        pipeline.emit(.ready(readinessCycle: 1))
-        try await eventually {
-            await controller.currentStateForTesting == .playing(request)
-        }
+        try await eventually { first.snapshot().completedStopCount == 1 }
+        try await eventually { factory.isPending(callID: 2) }
+        factory.succeed(callID: 2, with: successor)
+        try await eventually { successor.snapshot().starts.count == 1 }
+        XCTAssertTrue(first.snapshot().starts.isEmpty)
+        XCTAssertEqual(successor.snapshot().startReadinessCycles, [1])
+        successor.emit(.ready(readinessCycle: 1))
+        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        await controller.stop()
     }
 
-    func testFactoryPendingRecoveryFailureFailsAndStopsLatePipelineWithoutStart()
-        async throws {
+    func testPendingPrepareTerminalFailureWaitsForLatePipelineCleanup() async throws {
         let factory = SuspendedControllerPipelineFactory()
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(factory: factory, audioSessionOwner: owner)
-        let request = makeRequest(channelID: "failure")
+        let first = FakeControllerPipeline()
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let request = makeRequest(channelID: "pending-prepare")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
-        let lease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.last) }
-
-        await MainActor.run {
-            owner.emit(.recoveryFailed(stage: .mediaServicesResetConfiguration))
-        }
-        try await eventually {
-            guard case let .failed(failure) = await controller.currentStateForTesting else {
-                return false
-            }
-            return failure.code == "audio.session.activation"
-        }
-        factory.succeed(callID: 1, with: pipeline)
+        _ = owner.monitor.emit(.recoveryFailed(stage: .mediaServicesResetConfiguration))
+        try await eventually { owner.registry.outputResourceContextSnapshot()?.disposition == .releaseAfterTeardown }
+        factory.succeed(callID: 1, with: first)
         await play.value
-
-        XCTAssertTrue(pipeline.snapshot().starts.isEmpty)
-        XCTAssertEqual(pipeline.snapshot().stopCount, 1)
-        let ownerEvents = await MainActor.run { owner.events }
-        XCTAssertEqual(ownerEvents.filter { $0 == .release(lease) }.count, 1)
+        try await eventually {
+            guard case let .failed(failure) = await controller.currentStateForTesting else { return false }
+            return failure.code == "audio.session.activation" && first.snapshot().completedStopCount == 1
+        }
+        XCTAssertTrue(first.snapshot().starts.isEmpty)
+        XCTAssertFalse(factory.isPending(callID: 2))
+        XCTAssertNil(owner.registry.outputResourceContextSnapshot())
+        await controller.stop()
+        XCTAssertNil(owner.registry.cleanupReservationSnapshot(), "原terminal runner必须由外部stop准确join后退休")
     }
 
-    func testFactoryPendingMediaResetUsesNewReadinessCycleAndCompletes() async throws {
+    func testPendingPrepareResetRebuildsOnlyAfterOriginalPipelineRetires() async throws {
         let factory = SuspendedControllerPipelineFactory()
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(factory: factory, audioSessionOwner: owner)
-        let request = makeRequest(channelID: "reset")
+        let first = FakeControllerPipeline()
+        let successor = FakeControllerPipeline()
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let request = makeRequest(channelID: "pending-prepare")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
-
-        await MainActor.run { owner.emit(.mediaServicesWereReset) }
-        try await eventually {
-            await controller.currentStateForTesting == .recovering(request)
-        }
-        factory.succeed(callID: 1, with: pipeline)
+        _ = owner.monitor.emit(.mediaServicesWereReset)
+        try await eventually { await controller.currentStateForTesting == .recovering(request) }
+        XCTAssertEqual(owner.sdk.categoryCallCount, 1)
+        factory.succeed(callID: 1, with: first)
         await play.value
-
-        XCTAssertEqual(pipeline.snapshot().audioSessionResetRecoveries, [1])
-        pipeline.emit(.ready(readinessCycle: 0))
-        for _ in 0..<100 { await Task.yield() }
-        let staleState = await controller.currentStateForTesting
-        XCTAssertEqual(staleState, .recovering(request))
-        pipeline.emit(.ready(readinessCycle: 1))
-        try await eventually {
-            await controller.currentStateForTesting == .playing(request)
-        }
+        try await eventually { first.snapshot().completedStopCount == 1 }
+        try await eventually { factory.isPending(callID: 2) }
+        factory.succeed(callID: 2, with: successor)
+        try await eventually { successor.snapshot().starts.count == 1 }
+        XCTAssertTrue(first.snapshot().starts.isEmpty)
+        XCTAssertEqual(owner.sdk.categoryCallCount, 2)
+        XCTAssertEqual(owner.sdk.activateCallCount, 2)
+        XCTAssertEqual(successor.snapshot().startReadinessCycles, [1])
+        first.emit(.ready(readinessCycle: 0))
+        successor.emit(.ready(readinessCycle: 1))
+        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        await controller.stop()
     }
 
     func testFactoryPendingUserPauseStartsPausedAtCurrentReadinessCycle() async throws {
         let factory = SuspendedControllerPipelineFactory()
         let pipeline = FakeControllerPipeline()
-        let controller = PlaybackController(factory: factory)
+        let controller = makeRoutedPlaybackController(factory: factory)
         let request = makeRequest(channelID: "factory-user-pause")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
@@ -468,32 +467,29 @@ final class PlaybackControllerTests: XCTestCase {
         }
     }
 
-    func testFactoryPendingNonResumableInterruptionResetKeepsInitialSystemPause()
-        async throws {
+    func testPendingPrepareVetoResetRetiresOriginalAndKeepsSystemPause() async throws {
         let factory = SuspendedControllerPipelineFactory()
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(factory: factory, audioSessionOwner: owner)
-        let request = makeRequest(channelID: "factory-resume-veto")
+        let first = FakeControllerPipeline()
+        let successor = FakeControllerPipeline()
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let request = makeRequest(channelID: "pending-prepare")
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually { await controller.readinessCycleForTesting == 1 }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { !(await controller.audioSessionInterruptedForTesting) }
-        await MainActor.run { owner.emit(.mediaServicesWereReset) }
-        try await eventually { await controller.readinessCycleForTesting == 2 }
-        factory.succeed(callID: 1, with: pipeline)
+        _ = owner.monitor.emit(.interruptionBegan)
+        _ = owner.monitor.emit(.interruptionEnded(shouldResume: false))
+        _ = owner.monitor.emit(.mediaServicesWereReset)
+        factory.succeed(callID: 1, with: first)
         await play.value
-
-        XCTAssertEqual(pipeline.snapshot().startReadinessCycles, [2])
-        XCTAssertEqual(pipeline.snapshot().pauses.map(\.0), [true])
-        XCTAssertEqual(pipeline.snapshot().audioSessionResetRecoveries, [2])
-        pipeline.emit(.ready(readinessCycle: 2))
-        for _ in 0..<100 { await Task.yield() }
+        try await eventually { first.snapshot().completedStopCount == 1 }
+        try await eventually { owner.sdk.categoryCallCount == 2 }
+        XCTAssertTrue(first.snapshot().starts.isEmpty)
+        XCTAssertTrue(successor.snapshot().starts.isEmpty)
+        XCTAssertFalse(factory.isPending(callID: 2))
+        XCTAssertEqual(owner.sdk.activateCallCount, 1)
         let state = await controller.currentStateForTesting
         XCTAssertEqual(state, .paused(request))
+        await controller.stop()
     }
 
     func testFailureRetainsMetricsUntilNextPlayBegins() async throws {
@@ -504,7 +500,7 @@ final class PlaybackControllerTests: XCTestCase {
         )
         let firstPipeline = FakeControllerPipeline(metrics: terminalMetrics)
         let secondPipeline = FakeControllerPipeline()
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([firstPipeline, secondPipeline])
         )
 
@@ -529,7 +525,7 @@ final class PlaybackControllerTests: XCTestCase {
             residentMemoryProvider: { 202 }
         )
         let pipeline = FakeControllerPipeline(metrics: terminalMetrics)
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([pipeline])
         )
 
@@ -544,211 +540,177 @@ final class PlaybackControllerTests: XCTestCase {
         XCTAssertNil(stoppedSnapshot)
     }
 
-    func testChannelReplacementAcquiresNewAudioLeaseBeforeReleasingOldLease() async throws {
-        let firstPipeline = FakeControllerPipeline()
-        let replacementPipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([firstPipeline, replacementPipeline]),
-            audioSessionOwner: owner
-        )
-
-        await controller.play(makeRequest(channelID: "first"))
-        await controller.play(makeRequest(channelID: "replacement"))
-
-        let beforeStop = await MainActor.run { owner.events }
-        XCTAssertEqual(beforeStop, [
-            .acquire(PlaybackAudioSessionLease(id: 1, generation: 1)),
-            .acquire(PlaybackAudioSessionLease(id: 2, generation: 2)),
-            .release(PlaybackAudioSessionLease(id: 1, generation: 1)),
-        ])
-
-        await controller.stop()
-
-        let afterStop = await MainActor.run { owner.events }
-        XCTAssertEqual(afterStop.last, .release(PlaybackAudioSessionLease(id: 2, generation: 2)))
+    func testChannelReplacementReleasesRetiredAudioLeaseBeforeSuccessorAcquisition() async throws {
+        let f = ControllerRecoveryFixture(channelID: "first", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        let lease = try XCTUnwrap(f.owner.acquiredLeases.first)
+        let reservation = try XCTUnwrap(f.owner.registry.cleanupReservationSnapshot())
+        f.first.stopAutomaticallyCompletes = false
+        let deactivateEntered = expectation(description: "原lease真实deactivate")
+        let deactivateGate = DispatchSemaphore(value: 0)
+        f.owner.sdk.lock.withLock {
+            f.owner.sdk.onDeactivate = { deactivateEntered.fulfill(); deactivateGate.wait() }
+        }
+        let replacementRequest = makeRequest(channelID: "replacement")
+        let replacement = Task { await f.controller.play(replacementRequest) }
+        try await eventually { f.first.snapshot().isStopWaiting }
+        XCTAssertEqual(f.factory.makeCountSnapshot, 1)
+        XCTAssertEqual(f.owner.sdk.deactivateCallCount, 0)
+        XCTAssertEqual(f.owner.events, [.acquire(lease)])
+        f.first.completeStop()
+        await fulfillment(of: [deactivateEntered], timeout: 1)
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 1)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        deactivateGate.signal()
+        await replacement.value
+        let successorLease = try XCTUnwrap(f.owner.acquiredLeases.last)
+        XCTAssertNotEqual(successorLease, lease)
+        XCTAssertEqual(f.owner.events, [.acquire(lease), .acquire(successorLease)])
+        XCTAssertEqual(f.owner.predecessorRegistrationReleasedAtAcquisition, [true, true],
+            "后继acquisition入口之前原lease登记必须已被Authority释放")
+        XCTAssertEqual(f.owner.sdk.lock.withLock {
+            f.owner.sdk.calls.filter { $0 == .activate || $0 == .deactivate }
+        }, [.activate, .deactivate, .activate])
+        XCTAssertNil(f.owner.registry.phase(of: reservation.task(for: .owner)))
+        XCTAssertEqual(f.successor.snapshot().starts.count, 1)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        f.owner.sdk.lock.withLock { f.owner.sdk.onDeactivate = nil }
+        await f.controller.stop()
     }
 
     func testOldAudioLeaseEventCannotMutateReplacementRun() async throws {
-        let firstPipeline = FakeControllerPipeline()
-        let replacementPipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([firstPipeline, replacementPipeline]),
-            audioSessionOwner: owner
-        )
-        let firstRequest = makeRequest(channelID: "first")
-        let replacementRequest = makeRequest(channelID: "replacement")
-        await controller.play(firstRequest)
-        let oldLease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.first) }
-        await controller.play(replacementRequest)
-        replacementPipeline.emit(.ready(readinessCycle: 0))
-        try await eventually {
-            await controller.currentStateForTesting == .playing(replacementRequest)
-        }
-
-        await MainActor.run {
-            owner.emitEvenIfReleased(.interruptionBegan, for: oldLease)
-        }
+        let first = FakeControllerPipeline()
+        let successor = FakeControllerPipeline()
+        let owner = RecordingPlaybackAudioSessionOwner()
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([first, successor]), audioSessionOwner: owner)
+        await controller.play(makeRequest(channelID: "first"))
+        let oldRelay = try XCTUnwrap(owner.registry.executor.safetyIngress.currentOwnedAudioEventRelay())
+        let oldLease = try XCTUnwrap(owner.acquiredLeases.first)
+        let replacement = makeRequest(channelID: "replacement")
+        await controller.play(replacement)
+        successor.emit(.ready(readinessCycle: 0))
+        try await eventually { await controller.currentStateForTesting == .playing(replacement) }
+        oldRelay.send(lease: oldLease, event: .init(
+            event: .recoveryFailed(stage: .interruptionReactivation), systemReceipt: nil))
         for _ in 0..<100 { await Task.yield() }
-
         let state = await controller.currentStateForTesting
-        XCTAssertEqual(state, .playing(replacementRequest))
+        XCTAssertEqual(state, .playing(replacement))
+        XCTAssertEqual(successor.snapshot().stopCount, 0)
+        await controller.stop()
     }
 
     func testOwnerResumeAndResetEventsDoNotResumeUserPausedPlayback() async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "paused")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-        await controller.setPaused(true)
-
-        await MainActor.run {
-            owner.emit(.interruptionEnded(shouldResume: true))
-            owner.emit(.mediaServicesWereReset)
-        }
+        let f = ControllerRecoveryFixture(channelID: "paused", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        await f.controller.setPaused(true)
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        _ = f.owner.monitor.emit(.mediaServicesWereReset)
+        try await eventually { f.owner.sdk.categoryCallCount == 2 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        XCTAssertEqual(f.successor.playbackRate, 0)
+        f.successor.emit(.ready(readinessCycle: 2))
         for _ in 0..<100 { await Task.yield() }
-
-        let state = await controller.currentStateForTesting
-        XCTAssertEqual(state, .paused(request))
-        XCTAssertEqual(pipeline.snapshot().audioSessionResetRecoveries, [2])
+        let state = await f.controller.currentStateForTesting
+        XCTAssertEqual(state, .paused(f.request))
+        await f.controller.setPaused(false)
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        let cycle = await f.controller.readinessCycleForTesting
+        f.successor.emit(.ready(readinessCycle: cycle))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
-    func testPlayingMediaServicesResetRunsRecoveryAndMatchingReadyReturnsToPlaying()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "reset-recovery")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-
-        await MainActor.run { owner.emit(.mediaServicesWereReset) }
-        try await eventually {
-            let state = await controller.currentStateForTesting
-            return pipeline.snapshot().audioSessionResetRecoveries == [1]
-                && state == .recovering(request)
-        }
-        pipeline.emit(.ready(readinessCycle: 0))
+    func testPlayingMediaServicesResetRunsRecoveryAndMatchingReadyReturnsToPlaying() async throws {
+        let f = ControllerRecoveryFixture(channelID: "reset-recovery", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.mediaServicesWereReset)
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 2)
+        XCTAssertEqual(f.owner.sdk.categoryCallCount, 2)
+        f.first.emit(.ready(readinessCycle: 0))
+        f.successor.emit(.ready(readinessCycle: 0))
         for _ in 0..<100 { await Task.yield() }
-        let staleReadyState = await controller.currentStateForTesting
-        XCTAssertEqual(staleReadyState, .recovering(request))
-
-        pipeline.emit(.ready(readinessCycle: 1))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-        XCTAssertTrue(pipeline.snapshot().pauses.isEmpty)
+        let waiting = await f.controller.currentStateForTesting
+        XCTAssertEqual(waiting, .preparing(f.request))
+        f.successor.emit(.ready(readinessCycle: 1))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
-    func testMediaResetAfterInterruptionRecoversThenReleasesSystemPauseOnSameCycle()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "interruption-reset")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually {
-            pipeline.snapshot().audioLifecycleOperations == [.pause(true, 1)]
-        }
-        await MainActor.run { owner.emit(.mediaServicesWereReset) }
-        try await eventually {
-            pipeline.snapshot().audioLifecycleOperations == [
-                .pause(true, 1),
-                .reset(2),
-                .pause(false, 2),
-            ]
-        }
-
-        pipeline.emit(.ready(readinessCycle: 2))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
+    func testMediaResetAfterInterruptionRecoversThenReleasesSystemPauseOnSameCycle() async throws {
+        let f = ControllerRecoveryFixture(channelID: "interruption-reset", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.mediaServicesWereReset)
+        try await eventually { f.owner.sdk.categoryCallCount == 2 }
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1, "reset不能越过真实began")
+        XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        XCTAssertEqual(f.successor.snapshot().startReadinessCycles, [2])
+        f.successor.emit(.ready(readinessCycle: 2))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
-    func testNonResumableInterruptionResetRebuildsWithoutReleasingSystemPause()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "installed-resume-veto")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
+    func testNonResumableInterruptionResetConfiguresWithoutReleasingSystemPause() async throws {
+        let f = ControllerRecoveryFixture(channelID: "installed-resume-veto", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
         try await eventually {
-            pipeline.snapshot().audioLifecycleOperations == [.pause(true, 1)]
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
         }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { !(await controller.audioSessionInterruptedForTesting) }
-        await MainActor.run { owner.emit(.mediaServicesWereReset) }
-        try await eventually {
-            pipeline.snapshot().audioSessionResetRecoveries == [2]
-        }
-
-        XCTAssertEqual(pipeline.snapshot().audioLifecycleOperations, [
-            .pause(true, 1),
-            .reset(2),
-        ])
-        pipeline.emit(.phase(.recovering, readinessCycle: 2))
-        for _ in 0..<100 { await Task.yield() }
-        pipeline.emit(.ready(readinessCycle: 2))
-        for _ in 0..<100 { await Task.yield() }
-        let state = await controller.currentStateForTesting
-        XCTAssertEqual(state, .paused(request))
+        _ = f.owner.monitor.emit(.mediaServicesWereReset)
+        try await eventually { f.owner.sdk.categoryCallCount == 2 }
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        let state = await f.controller.currentStateForTesting
+        XCTAssertEqual(state, .paused(f.request))
+        await f.controller.stop()
     }
 
     func testExplicitResumeAfterVetoActivatesCurrentLeaseBeforeResuming() async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "explicit-resume")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-        let lease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.last) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually { await controller.readinessCycleForTesting == 1 }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
+        let f = ControllerRecoveryFixture(channelID: "explicit-resume", owner: RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true))
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
         try await eventually {
-            let interrupted = await controller.audioSessionInterruptedForTesting
-            let state = await controller.currentStateForTesting
-            return !interrupted && state == .paused(request)
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
         }
-        await MainActor.run { owner.emit(.mediaServicesWereReset) }
-        try await eventually {
-            pipeline.snapshot().audioSessionResetRecoveries == [2]
-        }
-        await controller.setPaused(false)
-
-        try await eventually {
-            let events = await MainActor.run { owner.events }
-            return events.contains(.requestResume(lease))
-                && pipeline.snapshot().audioLifecycleOperations.last == .pause(false, 2)
-        }
-        pipeline.emit(.ready(readinessCycle: 2))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        XCTAssertNotNil(f.owner.registry.registeredOutputDrainProof())
+        await f.controller.setPaused(false)
+        try await eventually { f.owner.sdk.activateCallCount == 2 }
+        XCTAssertEqual(f.factory.makeCountSnapshot, 1, "真实SDK返回前不得创建后继")
+        XCTAssertNil(f.owner.registry.outputResourceContextSnapshot()?.sessionReceipts?.active)
+        f.owner.completeDeferredExplicitResume()
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        let lease = try XCTUnwrap(f.owner.acquiredLeases.first)
+        XCTAssertEqual(f.owner.events.filter { $0 == .requestResume(lease) }.count, 1)
+        f.successor.emit(.ready(readinessCycle: 1))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
     func testExplicitResumeActivationFailureUsesTerminalRecoveryFailurePath()
@@ -757,7 +719,7 @@ final class PlaybackControllerTests: XCTestCase {
         let owner = await MainActor.run {
             RecordingPlaybackAudioSessionOwner(explicitResumeFails: true)
         }
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([pipeline]),
             audioSessionOwner: owner
         )
@@ -767,9 +729,9 @@ final class PlaybackControllerTests: XCTestCase {
         try await eventually { await controller.currentStateForTesting == .playing(request) }
         let lease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.last) }
 
-        await MainActor.run { owner.emit(.interruptionBegan) }
+        await MainActor.run { _ = owner.monitor.emit(.interruptionBegan) }
         try await eventually { await controller.readinessCycleForTesting == 1 }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
+        await MainActor.run { _ = owner.monitor.emit(.interruptionEnded(shouldResume: false)) }
         try await eventually {
             let interrupted = await controller.audioSessionInterruptedForTesting
             let state = await controller.currentStateForTesting
@@ -786,199 +748,158 @@ final class PlaybackControllerTests: XCTestCase {
         }
         let events = await MainActor.run { owner.events }
         XCTAssertEqual(events.filter { $0 == .requestResume(lease) }.count, 1)
-        XCTAssertEqual(events.filter { $0 == .release(lease) }.count, 1)
+        await owner.registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(owner.registry.ownedResourceSnapshot())
+        XCTAssertNil(owner.registry.cleanupReservationSnapshot())
+        XCTAssertNil(owner.registration(for: try XCTUnwrap(owner.acquisitions.first)))
+        XCTAssertEqual(owner.sdk.deactivateCallCount, 0,
+            "interruption drain与真实activation失败均证明inactive，不能伪造额外deactivate责任")
+        XCTAssertEqual(owner.sdk.activateCallCount, 2)
     }
 
-    func testRepeatedExplicitResumeWhileFirstRequestIsPendingActivatesOnlyOnce()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run {
-            RecordingPlaybackAudioSessionOwner(
-                deferFirstExplicitResume: true,
-                failAdditionalExplicitResume: true
-            )
-        }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "deduplicated-explicit-resume")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-        let lease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.last) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually { await controller.readinessCycleForTesting == 1 }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { await controller.currentStateForTesting == .paused(request) }
-
-        await controller.setPaused(false)
-        await controller.setPaused(false)
-        let requestCount = await MainActor.run {
-            owner.events.filter { $0 == .requestResume(lease) }.count
-        }
-        XCTAssertEqual(requestCount, 1)
-
-        await MainActor.run { owner.completeDeferredExplicitResume() }
+    func testRepeatedExplicitResumeWhileFirstRequestIsPendingActivatesOnlyOnce() async throws {
+        let f = ControllerRecoveryFixture(channelID: "deduplicated-explicit-resume", owner: RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true, failAdditionalExplicitResume: true))
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
         try await eventually {
-            pipeline.snapshot().audioLifecycleOperations.filter {
-                $0 == .pause(false, 1)
-            }.count == 1
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
         }
-        pipeline.emit(.ready(readinessCycle: 1))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        await f.controller.setPaused(false)
+        try await eventually { f.owner.sdk.activateCallCount == 2 }
+        await f.controller.setPaused(false)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 2)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 1)
+        let lease = try XCTUnwrap(f.owner.acquiredLeases.first)
+        XCTAssertEqual(f.owner.events.filter { $0 == .requestResume(lease) }.count, 1)
+        f.owner.completeDeferredExplicitResume()
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 2)
+        f.successor.emit(.ready(readinessCycle: 1))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
-    func testExplicitResumeSuccessThenNewInterruptionEndsSystemPausedInSourceOrder()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run {
-            RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true)
-        }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "resume-then-interrupt")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually { await controller.readinessCycleForTesting == 1 }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { await controller.currentStateForTesting == .paused(request) }
-        await controller.setPaused(false)
-
-        await MainActor.run {
-            owner.completeDeferredExplicitResume()
-            owner.emit(.interruptionBegan)
-        }
+    func testExplicitResumeSuccessThenNewInterruptionEndsSystemPausedInSourceOrder() async throws {
+        let f = ControllerRecoveryFixture(channelID: "resume-then-interrupt", owner: RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true))
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
         try await eventually {
-            let operations = pipeline.snapshot().audioLifecycleOperations
-            let state = await controller.currentStateForTesting
-            return operations.suffix(2) == [
-                .pause(false, 1),
-                .pause(true, 2),
-            ] && state == .recovering(request)
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
         }
-        pipeline.emit(.ready(readinessCycle: 1))
+        await f.controller.setPaused(false)
+        try await eventually { f.owner.sdk.activateCallCount == 2 }
+        f.owner.completeDeferredExplicitResume()
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        // 先观察真实completion已消费并建立后继，再注入新的物理began。
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.successor.snapshot().completedStopCount == 1 }
+        f.successor.emit(.ready(readinessCycle: 1))
         for _ in 0..<100 { await Task.yield() }
-        let finalState = await controller.currentStateForTesting
-        XCTAssertEqual(finalState, .recovering(request))
+        let state = await f.controller.currentStateForTesting
+        XCTAssertEqual(state, .recovering(f.request))
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        await f.controller.stop()
     }
 
-    func testExplicitResumeDuringNewPhysicalInterruptionDoesNotRequestOwner()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "resume-during-new-interruption")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-        let lease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.last) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually { await controller.readinessCycleForTesting == 1 }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { await controller.currentStateForTesting == .paused(request) }
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually { await controller.readinessCycleForTesting == 2 }
-
-        await controller.setPaused(false)
-        let activeRequestCount = await MainActor.run {
-            owner.events.filter { $0 == .requestResume(lease) }.count
-        }
-        XCTAssertEqual(activeRequestCount, 0)
-
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { !(await controller.audioSessionInterruptedForTesting) }
-        await controller.setPaused(false)
+    func testExplicitResumeDuringNewPhysicalInterruptionDoesNotRequestOwner() async throws {
+        let f = ControllerRecoveryFixture(channelID: "resume-during-new-interruption", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
         try await eventually {
-            let requestCount = await MainActor.run {
-                owner.events.filter { $0 == .requestResume(lease) }.count
-            }
-            return requestCount == 1
-                && pipeline.snapshot().audioLifecycleOperations.last == .pause(false, 2)
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
         }
-        pipeline.emit(.ready(readinessCycle: 2))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { await f.controller.readinessCycleForTesting == 2 }
+        await f.controller.setPaused(false)
+        let lease = try XCTUnwrap(f.owner.acquiredLeases.first)
+        XCTAssertEqual(f.owner.events.filter { $0 == .requestResume(lease) }.count, 0)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+        try await eventually {
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
+        }
+        await f.controller.setPaused(false)
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        XCTAssertEqual(f.owner.events.filter { $0 == .requestResume(lease) }.count, 1)
+        f.successor.emit(.ready(readinessCycle: 2))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
-    func testInterruptionEndedWithoutResumeAllowsNextInterruptionToCompleteRecovery()
-        async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "repeated-interruption")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
+    func testInterruptionEndedWithoutResumeAllowsNextInterruptionToCompleteRecovery() async throws {
+        let f = ControllerRecoveryFixture(channelID: "repeated-interruption", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
         try await eventually {
-            pipeline.snapshot().audioLifecycleOperations == [.pause(true, 1)]
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
         }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: false)) }
-        try await eventually { !(await controller.audioSessionInterruptedForTesting) }
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually {
-            pipeline.snapshot().audioLifecycleOperations == [
-                .pause(true, 1),
-                .pause(true, 2),
-            ]
-        }
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: true)) }
-        try await eventually {
-            pipeline.snapshot().audioLifecycleOperations.last == .pause(false, 2)
-        }
-        pipeline.emit(.ready(readinessCycle: 2))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { await f.controller.readinessCycleForTesting == 2 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 2)
+        f.successor.emit(.ready(readinessCycle: 2))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
     func testUserResumeDuringInterruptionKeepsSystemPauseUntilOwnerEndsIt() async throws {
-        let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "user-resume-during-interruption")
-        await controller.play(request)
-        pipeline.emit(.ready(readinessCycle: 0))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
-
-        await MainActor.run { owner.emit(.interruptionBegan) }
-        try await eventually {
-            pipeline.snapshot().audioLifecycleOperations == [.pause(true, 1)]
-        }
-        await controller.setPaused(true)
-        await controller.setPaused(false)
-
-        XCTAssertFalse(pipeline.snapshot().audioLifecycleOperations.contains(.pause(false, 3)))
-        let interruptedState = await controller.currentStateForTesting
-        XCTAssertEqual(interruptedState, .recovering(request))
-        await MainActor.run { owner.emit(.interruptionEnded(shouldResume: true)) }
-        try await eventually {
-            pipeline.snapshot().audioLifecycleOperations.last == .pause(false, 3)
-        }
-        pipeline.emit(.ready(readinessCycle: 3))
-        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        let f = ControllerRecoveryFixture(channelID: "user-resume-during-interruption", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        await f.controller.setPaused(true)
+        await f.controller.setPaused(false)
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
+        let interrupted = await f.controller.currentStateForTesting
+        XCTAssertEqual(interrupted, .recovering(f.request))
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        XCTAssertEqual(f.outputConcurrency.maximum, 1)
+        XCTAssertEqual(f.successor.snapshot().startReadinessCycles, [3])
+        f.successor.emit(.ready(readinessCycle: 3))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
     }
 
     func testCurrentAudioSessionRecoveryFailureStopsOnceReleasesLeaseAndIsRetryable()
         async throws {
         let pipeline = FakeControllerPipeline()
         let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([pipeline]),
             audioSessionOwner: owner
         )
@@ -986,7 +907,7 @@ final class PlaybackControllerTests: XCTestCase {
         let lease = try await MainActor.run { try XCTUnwrap(owner.acquiredLeases.last) }
 
         await MainActor.run {
-            owner.emit(.recoveryFailed(stage: .interruptionReactivation))
+            _ = owner.monitor.emit(.recoveryFailed(stage: .interruptionReactivation))
             owner.emitEvenIfReleased(
                 .recoveryFailed(stage: .mediaServicesResetActivation),
                 for: lease
@@ -1000,33 +921,37 @@ final class PlaybackControllerTests: XCTestCase {
             return failure.code == "audio.session.activation"
                 && pipeline.snapshot().completedStopCount == 1
         }
-        let ownerEvents = await MainActor.run { owner.events }
-        XCTAssertEqual(ownerEvents.filter { $0 == .release(lease) }.count, 1)
+        await owner.registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(owner.registry.ownedResourceSnapshot())
+        XCTAssertNil(owner.registry.cleanupReservationSnapshot())
+        XCTAssertNil(owner.registration(for: try XCTUnwrap(owner.acquisitions.first)))
+        XCTAssertEqual(owner.sdk.deactivateCallCount, 1)
         XCTAssertEqual(pipeline.snapshot().stopCount, 1)
     }
 
-    func testInterruptedLeaseClosesNewRunBeforePipelineStart() async {
+    func testInterruptedAcquisitionWaitsForPhysicalEndBeforeFactoryAndOutput() async throws {
         let pipeline = FakeControllerPipeline()
-        let owner = await MainActor.run {
-            RecordingPlaybackAudioSessionOwner(interruptedAtAcquisition: true)
-        }
-        let controller = PlaybackController(
-            factory: FakeControllerPipelineFactory([pipeline]),
-            audioSessionOwner: owner
-        )
-        let request = makeRequest(channelID: "interrupted-switch")
-
-        await controller.play(request)
-
-        XCTAssertEqual(pipeline.snapshot().pauses.map(\.0), [true])
-        XCTAssertEqual(pipeline.snapshot().starts, [request.streamURL])
-        let state = await controller.currentStateForTesting
-        XCTAssertEqual(state, .recovering(request))
+        let factory = FakeControllerPipelineFactory([pipeline])
+        let owner = RecordingPlaybackAudioSessionOwner()
+        _ = owner.monitor.emit(.interruptionBegan)
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let request = makeRequest(channelID: "interrupted-acquisition")
+        let play = Task { await controller.play(request) }
+        try await eventually { owner.registry.outputResourceContextSnapshot() != nil }
+        XCTAssertEqual(owner.sdk.activateCallCount, 0)
+        XCTAssertEqual(factory.makeCountSnapshot, 0)
+        _ = owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        await play.value
+        try await eventually { pipeline.snapshot().starts.count == 1 }
+        XCTAssertEqual(owner.sdk.activateCallCount, 1)
+        pipeline.emit(.ready(readinessCycle: 0))
+        try await eventually { await controller.currentStateForTesting == .playing(request) }
+        await controller.stop()
     }
 
     func testPipelineFactoryFailureReleasesTheAcquiredAudioLease() async {
         let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: FakeControllerPipelineFactory([]),
             audioSessionOwner: owner
         )
@@ -1037,7 +962,41 @@ final class PlaybackControllerTests: XCTestCase {
         guard let lease = result.0.first else {
             return XCTFail("创建 pipeline 前必须先取得音频会话 lease")
         }
-        XCTAssertEqual(result.1, [.acquire(lease), .release(lease)])
+        XCTAssertEqual(result.1, [.acquire(lease)])
+        await owner.registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(owner.registry.ownedResourceSnapshot())
+        XCTAssertNil(owner.registry.cleanupReservationSnapshot())
+        XCTAssertEqual(owner.sdk.deactivateCallCount, 1)
+        XCTAssertTrue(owner.acquisitions.allSatisfy { owner.registration(for: $0) == nil })
+    }
+
+    func testExplicitResumeAfterVetoAndResetRequiresOriginalResetProof() async throws {
+        let f = ControllerRecoveryFixture(channelID: "veto-reset-resume", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+        try await eventually {
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
+        }
+        _ = f.owner.monitor.emit(.mediaServicesWereReset)
+        try await eventually { f.owner.sdk.categoryCallCount == 2 }
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        await f.controller.setPaused(false)
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 2)
+        XCTAssertEqual(f.factory.makeCountSnapshot, 2)
+        f.successor.emit(.ready(readinessCycle: 2))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
+    }
+
+    private func start(_ fixture: ControllerRecoveryFixture) async throws {
+        await fixture.controller.play(fixture.request)
+        fixture.first.emit(.ready(readinessCycle: 0))
+        try await eventually { await fixture.controller.currentStateForTesting == .playing(fixture.request) }
     }
 
     private func makeRequest(channelID: String) -> PlaybackRequest {
@@ -1050,40 +1009,65 @@ final class PlaybackControllerTests: XCTestCase {
     }
 
     private func eventually(
-        attempts: Int = 10_000,
+        timeout: Duration = .seconds(2),
         file: StaticString = #filePath,
         line: UInt = #line,
         _ condition: @escaping () async -> Bool
     ) async throws {
-        for _ in 0..<attempts {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
             if await condition() { return }
             await Task.yield()
+            try? await Task.sleep(for: .milliseconds(2))
         }
         XCTFail("条件在限定调度轮次内未满足", file: file, line: line)
     }
 }
 
-@MainActor
-private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwning {
+private final class ControllerRecoveryFixture: @unchecked Sendable {
+    let owner: RecordingPlaybackAudioSessionOwner
+    let outputConcurrency = PipelineOutputConcurrency()
+    let first: FakeControllerPipeline
+    let successor: FakeControllerPipeline
+    let factory: FakeControllerPipelineFactory
+    let controller: PlaybackController
+    let request: PlaybackRequest
+    init(channelID: String, owner: RecordingPlaybackAudioSessionOwner) {
+        self.owner = owner
+        first = FakeControllerPipeline(outputConcurrency: outputConcurrency)
+        successor = FakeControllerPipeline(outputConcurrency: outputConcurrency)
+        factory = FakeControllerPipelineFactory([first, successor])
+        controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        request = PlaybackRequest(sourceProfileID: UUID(), channelID: channelID,
+            streamURL: URL(string: "https://example.invalid/stream")!, title: channelID)
+    }
+}
+
+private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwner, @unchecked Sendable {
     enum Event: Equatable {
         case acquire(PlaybackAudioSessionLease)
-        case release(PlaybackAudioSessionLease)
         case requestResume(PlaybackAudioSessionLease)
     }
 
-    private var nextID: UInt64 = 1
-    private var handlers: [PlaybackAudioSessionLease:
-        @MainActor @Sendable (PlaybackAudioSessionLease, PlaybackAudioSessionEvent) -> Void] = [:]
-    private(set) var events: [Event] = []
-    private(set) var acquiredLeases: [PlaybackAudioSessionLease] = []
-    private let interruptedAtAcquisition: Bool
+    private let lock = NSLock()
+    private var _events: [Event] = []
+    private var _acquiredLeases: [PlaybackAudioSessionLease] = []
+    private var _acquisitions: [ControlTaskTicket] = []
+    private var _predecessorRegistrationReleasedAtAcquisition: [Bool] = []
+    let sdk: FakeAudioSessionSDK
     private let explicitResumeFails: Bool
     private let deferFirstExplicitResume: Bool
     private let failAdditionalExplicitResume: Bool
-    private var deferredExplicitResume: (
-        PlaybackAudioSessionLease,
-        @MainActor @Sendable (PlaybackAudioSessionLease, PlaybackAudioSessionEvent) -> Void
-    )?
+    private let resumeGate = DispatchSemaphore(value: 0)
+    private var resumeRequests = 0
+
+    var events: [Event] { lock.withLock { _events } }
+    var acquiredLeases: [PlaybackAudioSessionLease] { lock.withLock { _acquiredLeases } }
+    var acquisitions: [ControlTaskTicket] { lock.withLock { _acquisitions } }
+    var predecessorRegistrationReleasedAtAcquisition: [Bool] {
+        lock.withLock { _predecessorRegistrationReleasedAtAcquisition }
+    }
 
     init(
         interruptedAtAcquisition: Bool = false,
@@ -1091,72 +1075,57 @@ private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwni
         deferFirstExplicitResume: Bool = false,
         failAdditionalExplicitResume: Bool = false
     ) {
-        self.interruptedAtAcquisition = interruptedAtAcquisition
         self.explicitResumeFails = explicitResumeFails
         self.deferFirstExplicitResume = deferFirstExplicitResume
         self.failAdditionalExplicitResume = failAdditionalExplicitResume
+        let reg = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        sdk = FakeAudioSessionSDK(initialPorts: [.hdmi])
+        try! super.init(registry: reg, sdk: sdk, monitor: nil)
+        if interruptedAtAcquisition { monitor.emit(.interruptionBegan) }
     }
 
-    func acquire(
-        eventHandler: @escaping @MainActor @Sendable (
-            PlaybackAudioSessionLease,
-            PlaybackAudioSessionEvent
-        ) -> Void
-    ) throws -> PlaybackAudioSessionLease {
-        let lease = PlaybackAudioSessionLease(
-            id: nextID,
-            generation: nextID,
-            isInterruptedAtAcquisition: interruptedAtAcquisition
-        )
-        nextID += 1
-        handlers[lease] = eventHandler
-        acquiredLeases.append(lease)
-        events.append(.acquire(lease))
-        return lease
-    }
-
-    func release(_ lease: PlaybackAudioSessionLease) {
-        events.append(.release(lease))
+    override func startAcquisition(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) -> Bool {
+        let previous = lock.withLock { _acquisitions.last }
+        let previousReleased = previous.map { registration(for: $0) == nil } ?? true
+        let started = super.startAcquisition(ticket, receiver: receiver)
+        // 只记录真实登记结果，不能预测lease序号或伪造acquisition成功。
+        if let registration = registration(for: ticket) {
+            let id = registration.identity.leaseID
+            let lease = PlaybackAudioSessionLease(id: id, generation: id,
+                isInterruptedAtAcquisition: registry.executor.safetyIngress.snapshot.interruptionState == .began)
+            lock.withLock {
+                _acquiredLeases.append(lease)
+                _acquisitions.append(ticket)
+                _predecessorRegistrationReleasedAtAcquisition.append(previousReleased)
+                _events.append(.acquire(lease))
+            }
+        }
+        return started
     }
 
     @discardableResult
-    func requestResume(for lease: PlaybackAudioSessionLease) -> Bool {
-        guard acquiredLeases.last == lease,
-              let handler = handlers[lease] else { return false }
-        events.append(.requestResume(lease))
-        if deferFirstExplicitResume, deferredExplicitResume == nil {
-            deferredExplicitResume = (lease, handler)
-            return true
+    override func requestResume(for lease: PlaybackAudioSessionLease) -> Bool {
+        let count = lock.withLock { () -> Int in
+            resumeRequests += 1
+            _events.append(.requestResume(lease))
+            return resumeRequests
         }
-        if failAdditionalExplicitResume {
-            handler(lease, .recoveryFailed(stage: .interruptionReactivation))
-            return true
+        let gate = resumeGate
+        sdk.lock.withLock {
+            sdk.shouldFailActivate = explicitResumeFails || (failAdditionalExplicitResume && count > 1)
+            if deferFirstExplicitResume && count == 1 { sdk.onActivate = { gate.wait() } }
+            else { sdk.onActivate = nil }
         }
-        if explicitResumeFails {
-            handler(lease, .recoveryFailed(stage: .interruptionReactivation))
-        } else {
-            handler(lease, .explicitResumeSucceeded)
-        }
-        return true
+        // 准入、原proof与真实SDK completion全部由基类/Registry完成。
+        return super.requestResume(for: lease)
     }
 
-    func completeDeferredExplicitResume() {
-        guard let (lease, handler) = deferredExplicitResume else { return }
-        deferredExplicitResume = nil
-        handler(lease, .explicitResumeSucceeded)
-    }
+    func completeDeferredExplicitResume() { resumeGate.signal() }
 
-    func emit(_ event: PlaybackAudioSessionEvent) {
-        guard let lease = acquiredLeases.last,
-              let handler = handlers[lease] else { return }
-        handler(lease, event)
-    }
-
-    func emitEvenIfReleased(
-        _ event: PlaybackAudioSessionEvent,
-        for lease: PlaybackAudioSessionLease
-    ) {
-        handlers[lease]?(lease, event)
+    func emitEvenIfReleased(_ event: PlaybackAudioSessionEvent, for lease: PlaybackAudioSessionLease) {
+        // 此接缝只用于当前lease重复终态；跨lease尾部测试直接保留原relay。
+        guard acquiredLeases.last == lease else { return }
+        monitor.emit(event)
     }
 }
 
@@ -1220,7 +1189,7 @@ private actor AudioSessionRelayStateRecorder {
              .mediaServicesWereReset,
              .recoveryFailed:
             break
-        case .explicitResumeSucceeded:
+        case .explicitResumeSucceeded, .resetConfigurationSucceeded:
             isSystemPaused = false
         }
     }

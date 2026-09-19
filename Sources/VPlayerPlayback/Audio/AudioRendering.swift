@@ -379,6 +379,7 @@ public enum AudioRouteChangeReason: Sendable, Equatable {
 }
 
 public struct AudioOutputRouteSnapshot: Sendable, Equatable {
+    public let ports: PlaybackRoutePorts?
     public let category: AudioOutputRouteCategory
     public let reason: AudioRouteChangeReason
     public let revision: UInt64
@@ -392,6 +393,23 @@ public struct AudioOutputRouteSnapshot: Sendable, Equatable {
         outputLatency: TimeInterval = 0,
         ioBufferDuration: TimeInterval = 0
     ) {
+        ports = nil
+        self.category = category
+        self.reason = reason
+        self.revision = revision
+        self.outputLatency = outputLatency
+        self.ioBufferDuration = ioBufferDuration
+    }
+
+    public init(
+        ports: PlaybackRoutePorts,
+        category: AudioOutputRouteCategory,
+        reason: AudioRouteChangeReason,
+        revision: UInt64,
+        outputLatency: TimeInterval = 0,
+        ioBufferDuration: TimeInterval = 0
+    ) {
+        self.ports = ports
         self.category = category
         self.reason = reason
         self.revision = revision
@@ -401,6 +419,7 @@ public struct AudioOutputRouteSnapshot: Sendable, Equatable {
 
     public static func == (lhs: AudioOutputRouteSnapshot, rhs: AudioOutputRouteSnapshot) -> Bool {
         lhs.category == rhs.category
+            && lhs.ports == rhs.ports
             && lhs.reason == rhs.reason
             && lhs.revision == rhs.revision
             && lhs.outputLatency == rhs.outputLatency

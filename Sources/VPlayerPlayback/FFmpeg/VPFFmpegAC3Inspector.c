@@ -18,6 +18,23 @@ typedef struct {
     size_t bit_offset;
 } VPFFAC3BitReader;
 
+static const int32_t vpff_ac3_sample_rates[VPFF_AC3_SUPPORTED_FSCOD_COUNT] = {
+    48000, 44100, 32000
+};
+
+int32_t vp_ffmpeg_ac3_supported_sample_rate_v1(uint8_t fscod, uint8_t bsid) {
+    if (fscod >= VPFF_AC3_SUPPORTED_FSCOD_COUNT ||
+        bsid < VPFF_AC3_SUPPORTED_BSID_MIN ||
+        bsid > VPFF_AC3_SUPPORTED_BSID_MAX) {
+        return -1;
+    }
+    const uint8_t sample_rate_shift =
+        bsid > 8
+            ? bsid - 8
+            : 0;
+    return vpff_ac3_sample_rates[fscod] >> sample_rate_shift;
+}
+
 static int vp_ffmpeg_ac3_read_bits(
     VPFFAC3BitReader *reader,
     uint8_t count,
@@ -51,7 +68,10 @@ int32_t vp_ffmpeg_inspect_ac3_frame_v1(
     uint16_t parsed_frame_size = 0;
     if (av_ac3_parse_header(
             bytes, size, &parsed_bsid, &parsed_frame_size
-        ) < 0 || parsed_bsid > 10 || size != parsed_frame_size) {
+        ) < 0 ||
+        parsed_bsid < VPFF_AC3_SUPPORTED_BSID_MIN ||
+        parsed_bsid > VPFF_AC3_SUPPORTED_BSID_MAX ||
+        size != parsed_frame_size) {
         return -1;
     }
 
@@ -71,10 +91,14 @@ int32_t vp_ffmpeg_inspect_ac3_frame_v1(
     uint32_t ignored = 0;
     if (vp_ffmpeg_ac3_read_bits(&reader, 16, &syncword) < 0 || syncword != 0x0B77 ||
         vp_ffmpeg_ac3_read_bits(&reader, 16, &crc1) < 0 ||
-        vp_ffmpeg_ac3_read_bits(&reader, 2, &fscod) < 0 || fscod > 2 ||
-        vp_ffmpeg_ac3_read_bits(&reader, 6, &frmsizecod) < 0 || frmsizecod > 37 ||
+        vp_ffmpeg_ac3_read_bits(&reader, 2, &fscod) < 0 ||
+        fscod >= VPFF_AC3_SUPPORTED_FSCOD_COUNT ||
+        vp_ffmpeg_ac3_read_bits(&reader, 6, &frmsizecod) < 0 ||
+        frmsizecod >= VPFF_AC3_SUPPORTED_FRMSIZECOD_COUNT ||
         vp_ffmpeg_ac3_read_bits(&reader, 5, &bsid) < 0 ||
-        bsid != parsed_bsid || bsid > 10 ||
+        bsid != parsed_bsid ||
+        bsid < VPFF_AC3_SUPPORTED_BSID_MIN ||
+        bsid > VPFF_AC3_SUPPORTED_BSID_MAX ||
         vp_ffmpeg_ac3_read_bits(&reader, 3, &bsmod) < 0 ||
         vp_ffmpeg_ac3_read_bits(&reader, 3, &acmod) < 0) {
         return -1;
@@ -99,16 +123,17 @@ int32_t vp_ffmpeg_inspect_ac3_frame_v1(
         return -1;
     }
 
-    static const int32_t sample_rates[3] = {48000, 44100, 32000};
     static const int32_t base_channels[8] = {2, 1, 2, 3, 3, 4, 4, 5};
-    const uint32_t sample_rate_shift = bsid > 8 ? bsid - 8 : 0;
 
     VPFFAC3FrameInfoV1 result;
     memset(&result, 0, sizeof(result));
     result.abi_version = VPFF_AC3_INSPECTOR_ABI_VERSION;
     result.struct_size = (uint32_t)sizeof(result);
     result.frame_size = parsed_frame_size;
-    result.sample_rate = sample_rates[fscod] >> sample_rate_shift;
+    result.sample_rate = vp_ffmpeg_ac3_supported_sample_rate_v1(
+        (uint8_t)fscod,
+        (uint8_t)bsid
+    );
     result.sample_count = 1536;
     result.channel_count = base_channels[acmod] + (int32_t)lfeon;
     result.fscod = (uint8_t)fscod;

@@ -32,6 +32,8 @@ struct VPFFParser {
     int64_t input_position;
     size_t bytes_without_output;
     bool drained;
+    VPFFParserAllocationCallbacks allocation_callbacks;
+    void *extradata_reservation;
 };
 
 static enum AVCodecID vpff_parser_codec_id(VPFFCodec codec) {
@@ -105,8 +107,36 @@ static bool vpff_parser_validate_config(const VPFFParserConfigV1 *config) {
     return __builtin_popcountll(config->channel_layout_mask) == config->channel_count;
 }
 
+static bool vpff_parser_valid_allocation_callbacks(
+    const VPFFParserAllocationCallbacks *callbacks
+) {
+    return (callbacks->reserve == NULL && callbacks->release == NULL) ||
+           (callbacks->reserve != NULL && callbacks->release != NULL);
+}
+
+static void *vpff_parser_reserve(
+    VPFFParser *owned,
+    VPFFParserAllocationKind kind,
+    size_t bytes
+) {
+    if (owned->allocation_callbacks.reserve == NULL) {
+        return (void *)owned;
+    }
+    return owned->allocation_callbacks.reserve(
+        owned->allocation_callbacks.context,
+        kind,
+        bytes
+    );
+}
+
+static void vpff_parser_release(VPFFParser *owned, void *reservation) {
+    if (owned->allocation_callbacks.release != NULL && reservation != NULL) {
+        owned->allocation_callbacks.release(owned->allocation_callbacks.context, reservation);
+    }
+}
+
 static int vpff_parser_copy_extradata(
-    AVCodecContext *codec_context,
+    VPFFParser *owned,
     const uint8_t *extradata,
     size_t extradata_size
 ) {
@@ -117,12 +147,23 @@ static int vpff_parser_copy_extradata(
         extradata_size > SIZE_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
         return AVERROR(EOVERFLOW);
     }
-    codec_context->extradata = av_mallocz(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (codec_context->extradata == NULL) {
+    size_t allocation_size = extradata_size + AV_INPUT_BUFFER_PADDING_SIZE;
+    void *reservation = vpff_parser_reserve(
+        owned,
+        VPFF_PARSER_ALLOCATION_EXTRADATA,
+        allocation_size
+    );
+    if (reservation == NULL) {
+        return AVERROR(EAGAIN);
+    }
+    owned->codec_context->extradata = av_mallocz(allocation_size);
+    if (owned->codec_context->extradata == NULL) {
+        vpff_parser_release(owned, reservation);
         return AVERROR(ENOMEM);
     }
-    memcpy(codec_context->extradata, extradata, extradata_size);
-    codec_context->extradata_size = (int)extradata_size;
+    owned->extradata_reservation = reservation;
+    memcpy(owned->codec_context->extradata, extradata, extradata_size);
+    owned->codec_context->extradata_size = (int)extradata_size;
     return 0;
 }
 
@@ -152,11 +193,12 @@ static int vpff_parser_configure_channel_layout(
     return 0;
 }
 
-int32_t vp_ffmpeg_parser_create_v1(
+static int32_t vpff_parser_create(
     const VPFFParserConfigV1 *config,
     VPFFParserCallback callback,
     void *context,
-    VPFFParser **out_parser
+    VPFFParser **out_parser,
+    const VPFFParserAllocationCallbacks *allocation_callbacks
 ) {
     if (out_parser == NULL) {
         return AVERROR(EINVAL);
@@ -170,6 +212,9 @@ int32_t vp_ffmpeg_parser_create_v1(
     VPFFParser *owned = calloc(1, sizeof(*owned));
     if (owned == NULL) {
         return AVERROR(ENOMEM);
+    }
+    if (allocation_callbacks != NULL) {
+        owned->allocation_callbacks = *allocation_callbacks;
     }
     owned->parser = av_parser_init(codec_id);
     owned->codec_context = avcodec_alloc_context3(NULL);
@@ -191,7 +236,7 @@ int32_t vp_ffmpeg_parser_create_v1(
     int result = vpff_parser_configure_channel_layout(owned->codec_context, config);
     if (result >= 0) {
         result = vpff_parser_copy_extradata(
-            owned->codec_context,
+            owned,
             config->extradata,
             config->extradata_size
         );
@@ -207,6 +252,50 @@ int32_t vp_ffmpeg_parser_create_v1(
     owned->time_base_den = config->time_base_den;
     *out_parser = owned;
     return 0;
+}
+
+int32_t vp_ffmpeg_parser_create_v1(
+    const VPFFParserConfigV1 *config,
+    VPFFParserCallback callback,
+    void *context,
+    VPFFParser **out_parser
+) {
+    return vpff_parser_create(config, callback, context, out_parser, NULL);
+}
+
+int32_t vp_ffmpeg_parser_create_v2(
+    const VPFFParserConfigV2 *config,
+    VPFFParserCallback callback,
+    void *context,
+    VPFFParser **out_parser
+) {
+    if (config == NULL || config->abi_version != VPFF_PARSER_ABI_VERSION_V2 ||
+        config->struct_size != sizeof(VPFFParserConfigV2) ||
+        !vpff_parser_valid_allocation_callbacks(&config->allocation_callbacks)) {
+        if (out_parser != NULL) { *out_parser = NULL; }
+        return AVERROR(EINVAL);
+    }
+    VPFFParserConfigV1 v1 = {
+        .abi_version = VPFF_PARSER_ABI_VERSION,
+        .struct_size = sizeof(VPFFParserConfigV1),
+        .codec = config->codec,
+        .time_base_num = config->time_base_num,
+        .time_base_den = config->time_base_den,
+        .sample_rate = config->sample_rate,
+        .channel_count = config->channel_count,
+        .channel_order = config->channel_order,
+        .has_channel_layout_mask = config->has_channel_layout_mask,
+        .channel_layout_mask = config->channel_layout_mask,
+        .extradata = config->extradata,
+        .extradata_size = config->extradata_size,
+    };
+    return vpff_parser_create(
+        &v1,
+        callback,
+        context,
+        out_parser,
+        &config->allocation_callbacks
+    );
 }
 
 int32_t vp_ffmpeg_parser_create(
@@ -368,6 +457,12 @@ static int vpff_parser_emit(
     frame.interlaced = vpff_parser_interlaced(&frame);
     frame.top_field_first = vpff_parser_top_field_first(&frame);
 
+    if (owned->codec_context->codec_id == AV_CODEC_ID_HEVC && frame.field_order == VPFF_FIELD_ORDER_UNKNOWN) {
+        frame.field_order = VPFF_FIELD_ORDER_PROGRESSIVE;
+        frame.picture_structure = VPFF_PICTURE_STRUCTURE_FRAME;
+        frame.interlaced = 0;
+    }
+
     if (owned->codec_context->codec_type == AVMEDIA_TYPE_AUDIO &&
         frame.frame_samples > 0 && frame.sample_rate > 0) {
         frame.duration_value = frame.frame_samples;
@@ -473,13 +568,24 @@ int32_t vp_ffmpeg_parser_push(
     }
     (void)duration;
 
-    uint8_t *copy = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+    size_t allocation_size = size + AV_INPUT_BUFFER_PADDING_SIZE;
+    void *reservation = vpff_parser_reserve(
+        owned,
+        VPFF_PARSER_ALLOCATION_PUSH_INPUT,
+        allocation_size
+    );
+    if (reservation == NULL) {
+        return AVERROR(EAGAIN);
+    }
+    uint8_t *copy = av_mallocz(allocation_size);
     if (copy == NULL) {
+        vpff_parser_release(owned, reservation);
         return AVERROR(ENOMEM);
     }
     memcpy(copy, bytes, size);
     int result = vpff_parser_parse_owned_input(owned, copy, size, pts, dts);
     av_free(copy);
+    vpff_parser_release(owned, reservation);
     if (result >= 0) {
         owned->input_position += (int64_t)size;
     }
@@ -529,5 +635,11 @@ void vp_ffmpeg_parser_destroy(VPFFParser *owned) {
     }
     av_parser_close(owned->parser);
     avcodec_free_context(&owned->codec_context);
+    vpff_parser_release(owned, owned->extradata_reservation);
+    owned->extradata_reservation = NULL;
     free(owned);
+}
+
+size_t vp_ffmpeg_parser_input_padding_bytes(void) {
+    return AV_INPUT_BUFFER_PADDING_SIZE;
 }

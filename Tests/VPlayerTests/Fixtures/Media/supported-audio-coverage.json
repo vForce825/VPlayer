@@ -1,0 +1,139 @@
+{
+  "schema": 1,
+  "generator": "Scripts/generate-playback-fixtures.sh",
+  "domain": {
+    "approvedCodecs": [
+      "aac",
+      "mp1",
+      "mp2",
+      "mp3",
+      "ac3",
+      "eac3"
+    ],
+    "aacIndexedSampleRates": [
+      96000,
+      88200,
+      64000,
+      48000,
+      44100,
+      32000,
+      24000,
+      22050,
+      16000,
+      12000,
+      11025,
+      8000,
+      7350
+    ],
+    "aacRawKinds": [
+      "aacLC",
+      "heAACv1",
+      "heAACv2"
+    ],
+    "mpegHeaderCount": 27,
+    "ac3HeaderCount": 1254,
+    "eac3HeaderCount": 15,
+    "channelTopologies": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ]
+  },
+  "fixtures": [
+    {
+      "id": "eac3-main-6x1block-5.1",
+      "path": "eac3-main-6x1block-5.1.eac3",
+      "codec": "eac3",
+      "profile": "eac3",
+      "framing": "eac3Aggregation",
+      "sampleRate": 48000,
+      "channelCount": 6,
+      "channelLayout": "5.1",
+      "decodedFramesPerAccessUnit": 1536,
+      "deliveryMode": "audioOnly",
+      "coveredDomainValues": [
+        "codec.eac3",
+        "profile.eac3",
+        "framing.eac3Aggregation",
+        "channels.6",
+        "layout.5.1",
+        "rate.48000",
+        "rate.eac3Primary",
+        "eac3.blockCount.1",
+        "eac3.aggregatedBlocks.6",
+        "mode.audioOnly"
+      ]
+    },
+    {
+      "id": "progressive-h264-aac",
+      "path": "progressive-h264-aac.ts",
+      "codec": "aac",
+      "profile": "aacLC",
+      "framing": "rawAAC",
+      "sampleRate": 48000,
+      "channelCount": 2,
+      "channelLayout": "stereo",
+      "decodedFramesPerAccessUnit": 1024,
+      "deliveryMode": "muxed",
+      "coveredDomainValues": [
+        "codec.aac",
+        "profile.aacLC",
+        "framing.rawAAC",
+        "channels.2",
+        "layout.stereo",
+        "rate.48000",
+        "rate.aacIndexed",
+        "mode.muxed"
+      ]
+    },
+    {
+      "id": "interlaced-h264-mp2",
+      "path": "interlaced-h264-mp2.ts",
+      "codec": "mp2",
+      "profile": "mpegLayer2",
+      "framing": "ffmpegParser",
+      "sampleRate": 48000,
+      "channelCount": 2,
+      "channelLayout": "stereo",
+      "decodedFramesPerAccessUnit": 1152,
+      "deliveryMode": "muxed",
+      "coveredDomainValues": [
+        "codec.mp2",
+        "profile.mpegLayer2",
+        "framing.ffmpegParser",
+        "channels.2",
+        "layout.stereo",
+        "rate.48000",
+        "rate.mpeg1",
+        "mode.muxed"
+      ]
+    },
+    {
+      "id": "ac3-48k-5point1",
+      "path": "ac3-48k-5point1.mov",
+      "codec": "ac3",
+      "profile": "ac3",
+      "framing": "ffmpegParser",
+      "sampleRate": 48000,
+      "channelCount": 6,
+      "channelLayout": "5.1",
+      "decodedFramesPerAccessUnit": 1536,
+      "deliveryMode": "audioOnly",
+      "coveredDomainValues": [
+        "codec.ac3",
+        "profile.ac3",
+        "framing.ffmpegParser",
+        "channels.6",
+        "layout.5.1",
+        "rate.48000",
+        "rate.ac3Primary",
+        "mode.audioOnly"
+      ]
+    }
+  ]
+}

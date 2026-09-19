@@ -32,6 +32,9 @@ enum VideoFormatMetadataReader {
         case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
             bitDepth = 10
             range = .video
+        case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            bitDepth = 10
+            range = .full
         default:
             throw VideoDecoderFailure.malfunction(kCVReturnInvalidPixelFormat)
         }
@@ -91,18 +94,65 @@ enum VideoFormatMetadataReader {
                 )
             ),
             hdrStaticMetadata: VideoFormatMetadata.HDRStaticMetadata(
-                masteringDisplayColorVolume: dataAttachment(
+                masteringDisplayColorVolume: try dataAttachment(
                     kCVImageBufferMasteringDisplayColorVolumeKey,
                     expectedLength: 24,
                     pixelBuffer: pixelBuffer
                 ),
-                contentLightLevelInfo: dataAttachment(
+                contentLightLevelInfo: try dataAttachment(
                     kCVImageBufferContentLightLevelInfoKey,
                     expectedLength: 4,
                     pixelBuffer: pixelBuffer
                 )
-            )
+            ),
+            sampleAspectRatio: try sampleAspectRatio(from: pixelBuffer)
         )
+    }
+
+    private static func sampleAspectRatio(
+        from pixelBuffer: CVPixelBuffer
+    ) throws -> MediaRational? {
+        guard let copied = CVBufferCopyAttachment(
+            pixelBuffer,
+            kCVImageBufferPixelAspectRatioKey,
+            nil
+        ) else {
+            return nil
+        }
+        guard CFGetTypeID(copied) == CFDictionaryGetTypeID(),
+              let dictionary = copied as? [String: Any] else {
+            throw VideoDecoderFailure.malfunction(kCVReturnInvalidArgument)
+        }
+        let horizontal = try positiveSpacing(
+            dictionary[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String]
+        )
+        let vertical = try positiveSpacing(
+            dictionary[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String]
+        )
+        guard let ratio = MediaRational(num: horizontal, den: vertical) else {
+            throw VideoDecoderFailure.malfunction(kCVReturnInvalidArgument)
+        }
+        return ratio
+    }
+
+    /// CoreVideo 把像素宽高比声明为整数 CFNumber。先按值验证精确 Int64，
+    /// 再收窄到协议使用的 Int32，避免浮点截断或溢出被静默接纳。
+    private static func positiveSpacing(_ rawValue: Any?) throws -> Int32 {
+        guard let rawValue else {
+            throw VideoDecoderFailure.malfunction(kCVReturnInvalidArgument)
+        }
+        let object = rawValue as AnyObject
+        guard CFGetTypeID(object) == CFNumberGetTypeID(),
+              let number = object as? NSNumber else {
+            throw VideoDecoderFailure.malfunction(kCVReturnInvalidArgument)
+        }
+        let signedValue = number.int64Value
+        guard number.compare(NSNumber(value: signedValue)) == .orderedSame,
+              signedValue > 0,
+              let spacing = Int32(exactly: signedValue) else {
+            throw VideoDecoderFailure.malfunction(kCVReturnInvalidArgument)
+        }
+        return spacing
     }
 
     private static func stringAttachment(
@@ -121,12 +171,15 @@ enum VideoFormatMetadataReader {
         _ key: CFString,
         expectedLength: Int,
         pixelBuffer: CVPixelBuffer
-    ) -> Data? {
-        guard let copied = CVBufferCopyAttachment(pixelBuffer, key, nil),
-              CFGetTypeID(copied) == CFDataGetTypeID(),
+    ) throws -> Data? {
+        guard let copied = CVBufferCopyAttachment(pixelBuffer, key, nil) else {
+            return nil
+        }
+        guard CFGetTypeID(copied) == CFDataGetTypeID(),
               let data = copied as? Data,
               data.count == expectedLength else {
-            return nil
+            // 显式存在但形状错误不能与“没有该附件”混为一谈，否则 HDR 会静默丢失。
+            throw VideoDecoderFailure.malfunction(kCVReturnInvalidArgument)
         }
         return data.withUnsafeBytes { bytes in
             Data(bytes)

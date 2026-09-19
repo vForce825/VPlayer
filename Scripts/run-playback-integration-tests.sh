@@ -269,7 +269,32 @@ if [[ ${1:-} == --self-test ]]; then
   exit 0
 fi
 
-[[ $# -eq 0 ]] || fail "unexpected argument: $1"
+destination_override=""
+test_selector="VPlayerTests/PlaybackFixtureIntegrationTests"
+external_fixture_server=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --destination)
+      [[ $# -ge 2 ]] || fail "option $1 requires an argument"
+      destination_override="$2"
+      shift 2
+      ;;
+    --only-testing)
+      [[ $# -ge 2 ]] || fail "option $1 requires an argument"
+      test_selector="$2"
+      shift 2
+      ;;
+    --fixture-server)
+      [[ $# -ge 2 ]] || fail "option $1 requires an argument"
+      external_fixture_server="$2"
+      shift 2
+      ;;
+    *)
+      fail "unexpected argument: $1"
+      ;;
+  esac
+done
 
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
 server_script="$root/Scripts/Support/fixture_server.py"
@@ -309,14 +334,18 @@ trap cleanup EXIT
 trap 'handle_signal 130' INT
 trap 'handle_signal 143' TERM
 
-port_file="$(mktemp "$temp_parent/vplayer-fixture-port.XXXXXX")"
-"$server_script" --root "$fixture_root" --port-file "$port_file" &
-server_pid=$!
-[[ "$server_pid" =~ ^[1-9][0-9]*$ ]] || fail 'invalid fixture server PID'
+if [[ -n "$external_fixture_server" ]]; then
+  port="$(sed -E 's|^https?://[^:/]+:([0-9]+).*|\1|' <<<"$external_fixture_server")"
+else
+  port_file="$(mktemp "$temp_parent/vplayer-fixture-port.XXXXXX")"
+  "$server_script" --root "$fixture_root" --port-file "$port_file" &
+  server_pid=$!
+  [[ "$server_pid" =~ ^[1-9][0-9]*$ ]] || fail 'invalid fixture server PID'
 
-wait_for_server || fail 'fixture server failed readiness or wrote an invalid port file'
+  wait_for_server || fail 'fixture server failed readiness or wrote an invalid port file'
+fi
 
-destination="${TVOS_TEST_DESTINATION:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}"
+destination="${destination_override:-${TVOS_TEST_DESTINATION:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}}"
 code_signing_allowed=NO
 if [[ "$destination" == platform=tvOS,id=* ]]; then
   code_signing_allowed=YES
@@ -373,7 +402,7 @@ VPLAYER_FIXTURE_BASE_URL="http://127.0.0.1:$port" \
     -xctestrun "$xctestrun_file" \
     -destination "$destination" \
     -resultBundlePath "$test_artifacts/PlaybackIntegration.xcresult" \
-    -only-testing:VPlayerTests/PlaybackFixtureIntegrationTests &
+    -only-testing:"$test_selector" &
 test_pid=$!
 
 set +e

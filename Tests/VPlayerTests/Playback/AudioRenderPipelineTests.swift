@@ -4268,43 +4268,6 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(compressed.snapshot.observationStartCount, 1)
     }
 
-    func testRouteMonitorEmitsSanitizedInitialAndRouteConfigurationSnapshots() {
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route")
-        let center = NotificationCenter()
-        let snapshots = LockedRouteSnapshots(executor: executor)
-        let monitor = AudioOutputRouteMonitor(
-            executor: executor,
-            notificationCenter: center,
-            snapshotProvider: { [.HDMI, .airPlay] },
-            latencyProvider: { (0, 0) }
-        )
-        monitor.start { snapshots.append($0) }
-
-        center.post(
-            name: AVAudioSession.routeChangeNotification,
-            object: "Living Room Apple TV secret UID",
-            userInfo: [
-                AVAudioSessionRouteChangeReasonKey:
-                    AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue,
-                "portName": "Do Not Capture",
-                "UID": "secret",
-            ]
-        )
-        drain(executor)
-
-        XCTAssertEqual(snapshots.snapshot, [
-            AudioOutputRouteSnapshot(category: .hdmi, reason: .initial, revision: 0),
-            AudioOutputRouteSnapshot(
-                category: .hdmi,
-                reason: .routeConfigurationChange,
-                revision: 1
-            ),
-        ])
-        XCTAssertEqual(snapshots.isolationSnapshot, [true, true])
-        XCTAssertFalse(String(describing: snapshots.snapshot).contains("Living Room"))
-        XCTAssertFalse(String(describing: snapshots.snapshot).contains("secret"))
-        monitor.stop()
-    }
 
     func testRouteSnapshotEqualityIncludesLatencyAndIOBufferDuration() {
         let baseline = AudioOutputRouteSnapshot(
@@ -4331,35 +4294,32 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         ))
     }
 
-    func testRouteNotificationResamplesFreshLatencyAndIOBufferDuration() {
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route-latency")
-        let center = NotificationCenter()
-        let latency = MutableRouteLatency(outputLatency: 0.100, ioBufferDuration: 0.010)
-        let snapshots = LockedRouteSnapshots(executor: executor)
-        let monitor = AudioOutputRouteMonitor(
-            executor: executor,
-            notificationCenter: center,
-            snapshotProvider: { [.airPlay] },
-            latencyProvider: latency.snapshot
+    func testLegacyRouteSnapshotMarksCompletePortsUnknownWhileExplicitEmptyIsKnownNone() {
+        let legacyAirPlay = AudioOutputRouteSnapshot(
+            category: .airPlay,
+            reason: .initial,
+            revision: 0
         )
-        monitor.start { snapshots.append($0) }
-        drain(executor)
-        latency.set(outputLatency: 0.300, ioBufferDuration: 0.030)
-
-        center.post(
-            name: AVAudioSession.routeChangeNotification,
-            object: nil,
-            userInfo: [
-                AVAudioSessionRouteChangeReasonKey:
-                    AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue,
-            ]
+        let legacyHDMI = AudioOutputRouteSnapshot(
+            category: .hdmi,
+            reason: .initial,
+            revision: 0
         )
-        drain(executor)
+        let knownNone = AudioOutputRouteSnapshot(
+            ports: [],
+            category: .none,
+            reason: .initial,
+            revision: 0
+        )
 
-        XCTAssertEqual(snapshots.snapshot.map(\.outputLatency), [0.100, 0.300])
-        XCTAssertEqual(snapshots.snapshot.map(\.ioBufferDuration), [0.010, 0.030])
-        monitor.stop()
+        XCTAssertNil(legacyAirPlay.ports)
+        XCTAssertEqual(legacyAirPlay.category, .airPlay)
+        XCTAssertNil(legacyHDMI.ports)
+        XCTAssertEqual(legacyHDMI.category, .hdmi)
+        XCTAssertEqual(knownNone.ports, [])
+        XCTAssertEqual(knownNone.category, .none)
     }
+
 
     func testOutputConfigurationChangeResamplesAndPublishesFreshRouteSnapshot() throws {
         let harness = try makeHarness(initialRouteCategory: .airPlay)
@@ -4760,110 +4720,6 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         ])
     }
 
-    func testRouteMonitorPreservesBufferedAndDrainBoundaryNotificationOrder() {
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route-start-race")
-        let center = RouteChangesDuringObserverInstallationNotificationCenter()
-        let snapshots = LockedRouteSnapshots(executor: executor)
-        let monitor = AudioOutputRouteMonitor(
-            executor: executor,
-            notificationCenter: center,
-            snapshotProvider: { [.airPlay] },
-            latencyProvider: { (0, 0) },
-            initialDrainBoundaryHook: {
-                center.post(
-                    name: AVAudioSession.routeChangeNotification,
-                    object: nil,
-                    userInfo: [
-                        AVAudioSessionRouteChangeReasonKey:
-                            AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue,
-                    ]
-                )
-            }
-        )
-
-        monitor.start { snapshots.append($0) }
-        drain(executor)
-
-        XCTAssertEqual(snapshots.snapshot, [
-            AudioOutputRouteSnapshot(category: .airPlay, reason: .initial, revision: 0),
-            AudioOutputRouteSnapshot(
-                category: .airPlay,
-                reason: .newDeviceAvailable,
-                revision: 1
-            ),
-            AudioOutputRouteSnapshot(
-                category: .airPlay,
-                reason: .oldDeviceUnavailable,
-                revision: 2
-            ),
-            AudioOutputRouteSnapshot(
-                category: .airPlay,
-                reason: .routeConfigurationChange,
-                revision: 3
-            ),
-        ])
-        monitor.stop()
-    }
-
-    func testRouteMonitorNormalizesEveryAppleReasonAndIncrementsEveryNotification() {
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route-reasons")
-        let center = NotificationCenter()
-        let snapshots = LockedRouteSnapshots(executor: executor)
-        let monitor = AudioOutputRouteMonitor(
-            executor: executor,
-            notificationCenter: center,
-            snapshotProvider: { [.airPlay] }
-        )
-        monitor.start { snapshots.append($0) }
-        let cases: [(AVAudioSession.RouteChangeReason, AudioRouteChangeReason)] = [
-            (.newDeviceAvailable, .newDeviceAvailable),
-            (.oldDeviceUnavailable, .oldDeviceUnavailable),
-            (.categoryChange, .categoryChange),
-            (.override, .override),
-            (.wakeFromSleep, .wakeFromSleep),
-            (.noSuitableRouteForCategory, .noSuitableRoute),
-            (.routeConfigurationChange, .routeConfigurationChange),
-            (.unknown, .unknown),
-        ]
-        for (reason, _) in cases {
-            center.post(
-                name: AVAudioSession.routeChangeNotification,
-                object: nil,
-                userInfo: [AVAudioSessionRouteChangeReasonKey: reason.rawValue]
-            )
-        }
-        drain(executor)
-
-        XCTAssertEqual(snapshots.snapshot.map(\.reason), [.initial] + cases.map(\.1))
-        XCTAssertEqual(snapshots.snapshot.map(\.revision), Array(0...UInt64(cases.count)))
-        XCTAssertEqual(snapshots.snapshot.map(\.category), Array(
-            repeating: AudioOutputRouteCategory.airPlay,
-            count: cases.count + 1
-        ))
-        monitor.stop()
-    }
-
-    func testRouteMonitorDropsNotificationQueuedBeforeStopAndRestart() {
-        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.route-stale")
-        let center = NotificationCenter()
-        let snapshots = LockedRouteSnapshots(executor: executor)
-        let monitor = AudioOutputRouteMonitor(
-            executor: executor,
-            notificationCenter: center,
-            snapshotProvider: { [.HDMI] },
-            latencyProvider: { (0, 0) }
-        )
-        monitor.start { _ in XCTFail("old handler must not run") }
-        center.post(name: AVAudioSession.routeChangeNotification, object: nil)
-        monitor.stop()
-        monitor.start { snapshots.append($0) }
-        drain(executor)
-
-        XCTAssertEqual(snapshots.snapshot, [
-            AudioOutputRouteSnapshot(category: .hdmi, reason: .initial, revision: 0),
-        ])
-        monitor.stop()
-    }
 
     func testPipelineRejectsRouteSnapshotRevisionRollback() throws {
         let harness = try makeHarness(initialRouteCategory: .airPlay)
@@ -5249,7 +5105,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
                 XCTAssertEqual(frame.pointee.reserved.0, 0)
                 XCTAssertEqual(frame.pointee.reserved.1, 0)
                 XCTAssertEqual(frame.pointee.reserved.2, 0)
-            }, nil, &decoder), 0)
+            }, nil, nil, &decoder), 0)
             let handle = try XCTUnwrap(decoder)
             var invalid: UInt8 = 0
             XCTAssertEqual(
@@ -5262,19 +5118,19 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
 
         var decoder: OpaquePointer?
-        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_H264, nil, 0, { _, _ in }, nil, &decoder), 0)
+        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_H264, nil, 0, { _, _ in }, nil, nil, &decoder), 0)
         XCTAssertNil(decoder)
-        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, nil, 1, { _, _ in }, nil, &decoder), 0)
-        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, nil, 0, nil, nil, &decoder), 0)
-        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, nil, 0, { _, _ in }, nil, nil), 0)
+        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, nil, 1, { _, _ in }, nil, nil, &decoder), 0)
+        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, nil, 0, nil, nil, nil, &decoder), 0)
+        XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, nil, 0, { _, _ in }, nil, nil, nil), 0)
         XCTAssertLessThan(vp_ffmpeg_audio_decoder_push(nil, nil, 0, 1), 0)
         var byte: UInt8 = 0
         XCTAssertLessThan(vp_ffmpeg_audio_decoder_create(
             VPFF_CODEC_AAC, &byte, 64 * 1_024 * 1_024 + 1,
-            { _, _ in }, nil, &decoder
+            { _, _ in }, nil, nil, &decoder
         ), 0)
         XCTAssertEqual(vp_ffmpeg_audio_decoder_create(
-            VPFF_CODEC_AAC, nil, 0, { _, _ in }, nil, &decoder
+            VPFF_CODEC_AAC, nil, 0, { _, _ in }, nil, nil, &decoder
         ), 0)
         let capped = try XCTUnwrap(decoder)
         XCTAssertLessThan(vp_ffmpeg_audio_decoder_push(
@@ -5284,6 +5140,589 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         vp_ffmpeg_audio_decoder_destroy(capped)
         vp_ffmpeg_audio_decoder_flush(nil)
         vp_ffmpeg_audio_decoder_destroy(nil)
+    }
+
+    func testTask22FSwiftNaturalDrainKeepsSilentPushTokenForThreeTailCallbacks() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: Data([0x12, 0x10]),
+            api: native
+        )
+        let start = CMTime(value: 90_000, timescale: 90_000)
+        native.outputScripts = [[]]
+        native.drainOutputScripts = [[
+            .stereo(frames: 2),
+            .stereo(frames: 2),
+            .stereo(frames: 2),
+        ]]
+
+        XCTAssertEqual(try decoder.push(makeSample(id: 1, pts: start)), [])
+        let tail = try decoder.drainForNaturalEOF()
+
+        XCTAssertEqual(native.drainCount, 1)
+        XCTAssertEqual(tail.count, 3)
+        XCTAssertEqual(tail.map(CMSampleBufferGetPresentationTimeStamp), [
+            start,
+            CMTimeAdd(start, CMTime(value: 2, timescale: 48_000)),
+            CMTimeAdd(start, CMTime(value: 4, timescale: 48_000)),
+        ])
+        XCTAssertEqual(try decoder.drainForNaturalEOF(), [])
+        XCTAssertEqual(native.drainCount, 1, "重复 drain 不得重发 native EOF 或发布尾帧")
+    }
+
+    func testTask22FStreamingDecoderReleasesCompletedTokensAcrossLongProgram() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = Array(repeating: [.stereo(frames: 2)], count: 128)
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: Data([0x12, 0x10]),
+            api: native,
+            hlsCopyOwnership: HLSAudioCopyOwnership(
+                maximumCompressedBytes: 128,
+                maximumPCMBytes: 128,
+                capacity: 2,
+                applicationLedger: HLSDeliveryApplicationChargeLedger()))
+
+        for id in 1...128 {
+            try decoder.pushStreamingForHLS(makeSample(id: UInt64(id))) { _ in }
+        }
+
+        XCTAssertEqual(native.pushedTokens.count, 128)
+    }
+
+    func testTask22FAudioCopyAdmissionKeepsPCMBlockChargeUntilLastSampleAliasReleases() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSAudioCopyOwnership(
+            maximumCompressedBytes: 128 * 1_024,
+            maximumPCMBytes: 128 * 1_024,
+            capacity: 8,
+            applicationLedger: ledger
+        )
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[.stereo(frames: 2)]]
+        var output: CMSampleBuffer? = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: Data([0x12, 0x10]),
+            api: native,
+            hlsCopyOwnership: ownership
+        ).push(makeSample(id: 1)).first
+
+        XCTAssertGreaterThan(ledger.chargedBytes, 0)
+        XCTAssertEqual(ownership.copyEvents.map(\.phase), [.compressedInput, .pcmData, .cmBlock])
+        XCTAssertTrue(ownership.copyEvents.allSatisfy(\.wasChargedBeforeCopy))
+        XCTAssertNotNil(output)
+        output = nil
+        XCTAssertEqual(ledger.chargedBytes, 0, "最终 CMBlock/sample alias 释放前不得退费")
+    }
+
+    func testTask22FADTSCarryAndRawAACAliasKeepFramingChargeUntilLastReceiverAlias() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSAudioCopyOwnership(
+            maximumCompressedBytes: 64 * 1_024,
+            maximumPCMBytes: 64 * 1_024,
+            capacity: 8,
+            applicationLedger: ledger
+        )
+        var adtsFrames: [FramedCompressedAudioFrame] = []
+        let adts = ADTSAudioFramingStrategy(sampleRate: 48_000, hlsCopyOwnership: ownership) {
+            adtsFrames.append($0)
+        }
+        // 13 bytes: 7-byte ADTS header + 6-byte payload. Split at the boundary
+        // so carry.append and frame extraction are both exercised by production code.
+        let complete = Data([0xFF, 0xF1, 0x4C, 0x80, 0x01, 0xBF, 0xFC, 1, 2, 3, 4, 5, 6])
+        try adts.push(.init(data: complete.prefix(5), presentationTimeStamp: .zero,
+                            pts: 0, dts: nil, duration: nil, containerMarkedCorrupt: false))
+        try adts.push(.init(data: complete.dropFirst(5), presentationTimeStamp: .zero,
+                            pts: 0, dts: nil, duration: nil, containerMarkedCorrupt: false))
+        XCTAssertEqual(adtsFrames.count, 1)
+        XCTAssertGreaterThan(ledger.chargedBytes, 0)
+        adtsFrames.removeAll()
+
+        var rawAlias: FramedCompressedAudioFrame? = nil
+        let raw = RawAACFramingStrategy(hlsCopyOwnership: ownership) { rawAlias = $0 }
+        try raw.push(.init(data: Data([1, 2, 3]), presentationTimeStamp: .zero,
+                           pts: 0, dts: nil, duration: nil, containerMarkedCorrupt: false))
+        XCTAssertEqual(rawAlias?.payload, Data([1, 2, 3]), "receiver 必须实际持有 raw AAC alias")
+        XCTAssertGreaterThan(ledger.chargedBytes, 0)
+        rawAlias = nil
+        raw.destroy()
+        adts.destroy()
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testTask22FCancelWakesBlockedAudioAdmissionBeforeNativeDestroyAndLeavesSiblingUsable() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let blockedOwnership = HLSAudioCopyOwnership(
+            maximumCompressedBytes: 64,
+            maximumPCMBytes: 64,
+            capacity: 1,
+            applicationLedger: ledger
+        )
+        let siblingOwnership = HLSAudioCopyOwnership(
+            maximumCompressedBytes: 64,
+            maximumPCMBytes: 64,
+            capacity: 1,
+            applicationLedger: ledger
+        )
+        let native = FakeFFmpegAudioDecoderAPI()
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac, extradata: Data([0x12, 0x10]), api: native,
+            hlsCopyOwnership: blockedOwnership
+        )
+        // fake 的同步 callback 在 PCM Data 拷贝前等待；必须预占同一真实域，
+        // 不能错误预占 compressed input。
+        let first = try XCTUnwrap(blockedOwnership.pcmTemporary.acquire(bytes: 16))
+        let enteredWait = expectation(description: "callback admission starts waiting")
+        native.outputScripts = [[.stereo(frames: 2)]]
+        native.onBeforeSynchronousCallback = { enteredWait.fulfill() }
+        let push = DispatchQueue(label: "org.vplayer.tests.task22f.cancel").asyncResult {
+            try decoder.push(self.makeSample(id: 1))
+        }
+        wait(for: [enteredWait], timeout: 1)
+        decoder.cancelHLSAdmission()
+        XCTAssertTrue(push.wait(timeout: .now() + 1))
+        XCTAssertEqual(native.destroyCount, 1)
+        XCTAssertTrue(native.destroyOccurredAfterCallbackReturned)
+        first.release()
+        XCTAssertNotNil(siblingOwnership.compressedInput.acquire(bytes: 32),
+                        "取消一个音频局部域不得毒化同账本 sibling")
+    }
+
+    func testTask22FSixApprovedCodecsUseLiveFFmpegCreateNotACodecFake() throws {
+        let api = LiveFFmpegAudioDecoderAPI()
+        for codec: VPlayerPlayback.AudioCodec in [.aac, .mp1, .mp2, .mp3, .ac3, .eac3] {
+            let handle = try api.create(codec: codec, extradata: Data()) { _ in }
+            handle.destroy()
+        }
+    }
+
+    func testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints() throws {
+        let probe = Task22FCAllocationProbe()
+        var admission = VPFFAudioAllocationAdmission()
+        admission.context = Unmanaged.passUnretained(probe).toOpaque()
+        admission.reserve = { context, bytes, role in
+            guard let context, bytes > 0 else { return nil }
+            let probe = Unmanaged<Task22FCAllocationProbe>.fromOpaque(context).takeUnretainedValue()
+            return probe.reserve(bytes: Int(bytes), role: role)
+        }
+        admission.release = { context, token in
+            guard let context, let token else { return }
+            let probe = Unmanaged<Task22FCAllocationProbe>.fromOpaque(context).takeUnretainedValue()
+            probe.release(token)
+        }
+        var decoder: OpaquePointer?
+        var extradata = [UInt8]([0x12, 0x10])
+        guard let rawFixtureBaseURL = ProcessInfo.processInfo.environment["VPLAYER_FIXTURE_BASE_URL"],
+              let fixtureBaseURL = URL(string: rawFixtureBaseURL),
+              fixtureBaseURL.scheme == "http",
+              fixtureBaseURL.host == "127.0.0.1",
+              fixtureBaseURL.port != nil else {
+            throw XCTSkip("需由 fixture HTTP runner 注入")
+        }
+        let fixtureURL = fixtureBaseURL.appending(path: "progressive-h264-aac.ts")
+        let recorder = DemuxEventRecorder()
+        let demuxer = FFmpegDemuxer()
+        try demuxer.start(url: fixtureURL, sink: recorder.record)
+        let events = recorder.waitForTerminal(timeout: 5)
+        let tracks = try XCTUnwrap(events.compactMap { event -> DemuxTrackSet? in
+            if case let .tracks(value) = event { return value }; return nil
+        }.first)
+        let audio = try XCTUnwrap(tracks.audio)
+        let packet = try XCTUnwrap(events.compactMap { event -> DemuxPacket? in
+            if case let .packet(value) = event, value.streamIndex == audio.streamIndex { return value }
+            return nil
+        }.first)
+        XCTAssertEqual(audio.codec, .aac)
+        XCTAssertEqual(vp_ffmpeg_audio_decoder_create(
+            VPFF_CODEC_AAC, &extradata, extradata.count, { context, frame in
+                guard let context, let frame, frame.pointee.frame_count > 0 else { return }
+                Unmanaged<Task22FCAllocationProbe>.fromOpaque(context).takeUnretainedValue().recordPCM()
+            }, Unmanaged.passUnretained(probe).toOpaque(), &admission, &decoder
+        ), 0)
+        let native = try XCTUnwrap(decoder)
+        let pushResult = packet.data.withUnsafeBytes { bytes in
+            vp_ffmpeg_audio_decoder_push(native, bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bytes.count, 1)
+        }
+        XCTAssertGreaterThanOrEqual(pushResult, 0)
+        XCTAssertEqual(vp_ffmpeg_audio_decoder_drain(native), -541_478_725,
+                       "natural drain 必须以 FFmpeg 的真实 AVERROR_EOF 终止")
+        XCTAssertGreaterThan(probe.pcmCallbackCount, 0)
+        XCTAssertEqual(vp_ffmpeg_audio_decoder_drain(native), -541_478_725,
+                       "重复 drain 只重申 EOF，不得重新发送或发布")
+        vp_ffmpeg_audio_decoder_destroy(native)
+
+        XCTAssertTrue(probe.events.contains { $0.role == VPFF_AUDIO_ALLOCATION_EXTRADATA })
+        XCTAssertTrue(probe.events.contains { $0.role == VPFF_AUDIO_ALLOCATION_PACKET })
+        XCTAssertTrue(probe.events.contains { $0.role == VPFF_AUDIO_ALLOCATION_TOKEN })
+        XCTAssertTrue(probe.events.contains { $0.role == VPFF_AUDIO_ALLOCATION_RESAMPLER })
+        XCTAssertEqual(probe.liveTokenCount, 0)
+        XCTAssertEqual(probe.releaseCount, probe.reserveCount)
+    }
+
+    func testTask22FThreePCMCallbacksUnderOneFrameHeadroomStreamWithoutReplayOrDeadlock() throws {
+        let ownership = HLSAudioCopyOwnership(
+            maximumCompressedBytes: 64, maximumPCMBytes: 16, capacity: 1,
+            applicationLedger: HLSDeliveryApplicationChargeLedger()
+        )
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[.stereo(frames: 2), .stereo(frames: 2), .stereo(frames: 2)]]
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]),
+                                                api: native, hlsCopyOwnership: ownership)
+        // 该受控 streaming API 必须在每个 callback 内完成可释放的最终交付，
+        // 而不是把三个带 pcm lease 的 frame 堆在 push 返回后的 collector 中。
+        var sampleCounts: [Int] = []
+        var timestamps: [CMTime] = []
+        try decoder.pushStreamingForHLS(makeSample(id: 22)) { sample in
+            sampleCounts.append(CMSampleBufferGetNumSamples(sample))
+            timestamps.append(CMSampleBufferGetPresentationTimeStamp(sample))
+            // 真实下游在 callback 内消费而非把三帧反压回同一 native push。
+        }
+        XCTAssertEqual(sampleCounts, [2, 2, 2])
+        XCTAssertEqual(Set(timestamps).count, 3)
+    }
+
+    func testTask22FADTSMultiFrameAndRemainingCarryKeepIndependentLastHolderCharges() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSAudioCopyOwnership(maximumCompressedBytes: 64 * 1_024,
+                                              maximumPCMBytes: 64 * 1_024, capacity: 8,
+                                              applicationLedger: ledger)
+        var frames: [FramedCompressedAudioFrame] = []
+        let strategy = ADTSAudioFramingStrategy(sampleRate: 48_000, hlsCopyOwnership: ownership) { frames.append($0) }
+        let frame = Data([0xFF, 0xF1, 0x4C, 0x80, 0x01, 0xBF, 0xFC, 1, 2, 3, 4, 5, 6])
+        var burst = Data()
+        burst.append(frame)
+        burst.append(frame)
+        burst.append(frame.prefix(5))
+        try strategy.push(.init(data: burst, presentationTimeStamp: .zero,
+                                pts: 0, dts: nil, duration: nil, containerMarkedCorrupt: false))
+        XCTAssertEqual(frames.count, 2)
+        frames.removeFirst()
+        XCTAssertGreaterThan(ledger.chargedBytes, 0, "第二帧与残余 carry 仍须各自保留费用")
+        frames.removeAll()
+        XCTAssertGreaterThan(ledger.chargedBytes, 0, "仅残余 carry 仍是最后 holder")
+        strategy.destroy()
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testTask22FADTSRejectsOver96SegmentsBeforeCopyOrAdmission() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSAudioCopyOwnership(maximumCompressedBytes: 64 * 1_024,
+                                              maximumPCMBytes: 64 * 1_024, capacity: 128,
+                                              applicationLedger: ledger)
+        var received = 0
+        let strategy = ADTSAudioFramingStrategy(sampleRate: 48_000, hlsCopyOwnership: ownership) { _ in received += 1 }
+        let minimumFrame = Data([0xFF, 0xF1, 0x4C, 0x80, 0x01, 0xBF, 0xFC, 1, 2, 3, 4, 5, 6])
+        var burst = Data()
+        for _ in 0...96 { burst.append(minimumFrame) }
+        XCTAssertThrowsError(try strategy.push(.init(data: burst, presentationTimeStamp: .zero,
+                                                      pts: 0, dts: nil, duration: nil,
+                                                      containerMarkedCorrupt: false)))
+        XCTAssertEqual(received, 0)
+        #if DEBUG
+        XCTAssertTrue(ownership.copyEvents.isEmpty,
+                      "超过 96 段必须在构造/admit 临时数组前拒绝")
+        #endif
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testTask22FDrainAdmissionCancelWaitsForDrainReturnBeforeDestroy() throws {
+        let ownership = HLSAudioCopyOwnership(maximumCompressedBytes: 64, maximumPCMBytes: 16,
+                                              capacity: 1, applicationLedger: HLSDeliveryApplicationChargeLedger())
+        let native = FakeFFmpegAudioDecoderAPI()
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]),
+                                                api: native, hlsCopyOwnership: ownership)
+        // fake 的 drain token 来自上一成功 push；先建立一个真实的 silent pending token，
+        // 避免 token=0 在 callback validation 前被拒绝而绕过 pcm admission。
+        native.outputScripts = [[]]
+        XCTAssertEqual(try decoder.push(makeSample(id: 71)), [])
+        native.drainOutputScripts = [[.stereo(frames: 2)]]
+        let held = try XCTUnwrap(ownership.pcmTemporary.acquire(bytes: 16))
+        let observation = decoder.debugDrainCancelOrderingProbe()
+        let drain = DispatchQueue(label: "org.vplayer.tests.task22f.drain").asyncResult {
+            try decoder.drainForNaturalEOF()
+        }
+        XCTAssertTrue(observation.waitUntilPCMAdmissionBlocked(timeout: 1))
+        decoder.cancelHLSAdmission()
+        XCTAssertTrue(drain.wait(timeout: .now() + 1))
+        guard let outcome = drain.outcome else {
+            return XCTFail("drain 必须返回受控 cancellation 结果")
+        }
+        switch outcome {
+        case .success:
+            XCTFail("取消唤醒 budget wait 后，drain 不得静默报告成功")
+        case let .failure(error):
+            XCTAssertEqual(error as? PlaybackCoreError,
+                           .audioFallbackDecode(FFmpegPCMAudioDecoder.overflowErrorCode))
+        }
+        XCTAssertTrue(observation.destroyOccurredAfterDrainReturned)
+        held.release()
+    }
+
+    func testTask22FNativeLaneSerializesConcurrentPushAndFlush() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[], []]
+        let entered = DispatchSemaphore(value: 0)
+        let releasePush = DispatchSemaphore(value: 0)
+        native.nativeEntrySignal = entered
+        native.nextPushNativeBlocker = releasePush
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]), api: native)
+        let push = DispatchQueue(label: "org.vplayer.tests.task22f.push-flush.push").asyncResult {
+            try decoder.push(self.makeSample(id: 81))
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let flushed = expectation(description: "flush 返回")
+        DispatchQueue(label: "org.vplayer.tests.task22f.push-flush.flush").async {
+            decoder.flush(); flushed.fulfill()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.2), .timedOut,
+                       "flush 不得在 push 尚占用 native lane 时进入 handle")
+        releasePush.signal()
+        XCTAssertTrue(push.wait(timeout: .now() + 1))
+        wait(for: [flushed], timeout: 1)
+        XCTAssertEqual(native.maxConcurrentNativeCalls, 1)
+        XCTAssertEqual(native.pushedTokens, [1])
+    }
+
+    func testTask22FNativeLaneSerializesConcurrentPushAndDrain() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[], []]
+        native.drainOutputScripts = [[]]
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]), api: native)
+        XCTAssertEqual(try decoder.push(makeSample(id: 82)), [])
+        let entered = DispatchSemaphore(value: 0)
+        let releasePush = DispatchSemaphore(value: 0)
+        native.nativeEntrySignal = entered
+        native.nextPushNativeBlocker = releasePush
+        let push = DispatchQueue(label: "org.vplayer.tests.task22f.push-drain.push").asyncResult {
+            try decoder.push(self.makeSample(id: 83))
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let drain = DispatchQueue(label: "org.vplayer.tests.task22f.push-drain.drain").asyncResult {
+            try decoder.drainForNaturalEOF()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.2), .timedOut,
+                       "drain 不得与 push 并发进入同一 native handle")
+        releasePush.signal()
+        XCTAssertTrue(push.wait(timeout: .now() + 1))
+        XCTAssertTrue(drain.wait(timeout: .now() + 1))
+        XCTAssertEqual(native.maxConcurrentNativeCalls, 1)
+        XCTAssertEqual(native.pushedTokens, [1, 2])
+    }
+
+    func testTask22FNativeLaneDoesNotMixStreamingCollectorWithOrdinaryPush() throws {
+        let ownership = HLSAudioCopyOwnership(maximumCompressedBytes: 128, maximumPCMBytes: 128,
+                                              capacity: 8, applicationLedger: HLSDeliveryApplicationChargeLedger())
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[.stereo(frames: 2)], [.stereo(frames: 2)]]
+        let entered = DispatchSemaphore(value: 0)
+        let releaseStreaming = DispatchSemaphore(value: 0)
+        native.nativeEntrySignal = entered
+        native.nextPushNativeBlocker = releaseStreaming
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]),
+                                                api: native, hlsCopyOwnership: ownership)
+        let streamed = Task22FPTSRecorder()
+        let streamingInputPTS = CMTime(value: 84_000, timescale: 48_000)
+        let ordinaryInputPTS = CMTime(value: 88_000, timescale: 48_000)
+        let streaming = DispatchQueue(label: "org.vplayer.tests.task22f.stream-normal.stream").asyncResult {
+            try decoder.pushStreamingForHLS(self.makeSample(id: 84, pts: streamingInputPTS)) { sample in
+                streamed.append(CMSampleBufferGetPresentationTimeStamp(sample))
+            }
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let ordinary = DispatchQueue(label: "org.vplayer.tests.task22f.stream-normal.ordinary").asyncResult {
+            try decoder.push(self.makeSample(id: 85, pts: ordinaryInputPTS))
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.2), .timedOut,
+                       "普通 push 不得在 streaming collector mode 存活时进入 native handle")
+        releaseStreaming.signal()
+        XCTAssertTrue(streaming.wait(timeout: .now() + 1))
+        XCTAssertTrue(ordinary.wait(timeout: .now() + 1))
+        guard let streamingOutcome = streaming.outcome,
+              case .success = streamingOutcome,
+              let ordinaryOutcome = ordinary.outcome,
+              case let .success(ordinarySamples) = ordinaryOutcome else {
+            return XCTFail("两个 receipt 都必须完整返回，不能由 collector mode 串线")
+        }
+        XCTAssertEqual(native.maxConcurrentNativeCalls, 1)
+        XCTAssertEqual(native.pushedTokens, [1, 2])
+        let streamedPTS = streamed.snapshot
+        XCTAssertEqual(streamedPTS.count, 1)
+        XCTAssertEqual(ordinarySamples.count, 1)
+        guard let streamedSamplePTS = streamedPTS.first, let ordinarySample = ordinarySamples.first else {
+            return XCTFail("失败诊断必须保留 receipt 计数，不能以数组索引终止进程")
+        }
+        let ordinarySamplePTS = CMSampleBufferGetPresentationTimeStamp(ordinarySample)
+        XCTAssertEqual(streamedSamplePTS, streamingInputPTS,
+                       "streaming receipt 必须保留其输入 PTS，不能接收 ordinary collector 的结果")
+        XCTAssertEqual(ordinarySamplePTS, ordinaryInputPTS,
+                       "ordinary receipt 必须保留其输入 PTS，不能接收 streaming collector 的结果")
+        XCTAssertNotEqual(streamingInputPTS, ordinaryInputPTS)
+    }
+
+    func testTask22FNativeLaneCancelRejectsQueuedWaiterWithoutEnteringHandle() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[], []]
+        let entered = DispatchSemaphore(value: 0)
+        let releaseFirst = DispatchSemaphore(value: 0)
+        native.nativeEntrySignal = entered
+        native.nextPushNativeBlocker = releaseFirst
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]), api: native)
+        let first = DispatchQueue(label: "org.vplayer.tests.task22f.cancel-waiter.first").asyncResult {
+            try decoder.push(self.makeSample(id: 86))
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let waiter = DispatchQueue(label: "org.vplayer.tests.task22f.cancel-waiter.waiter").asyncResult {
+            try decoder.push(self.makeSample(id: 87))
+        }
+        let cancelled = expectation(description: "cancel 返回")
+        DispatchQueue(label: "org.vplayer.tests.task22f.cancel-waiter.cancel").async {
+            decoder.cancelHLSAdmission(); cancelled.fulfill()
+        }
+        releaseFirst.signal()
+        XCTAssertTrue(first.wait(timeout: .now() + 1))
+        XCTAssertTrue(waiter.wait(timeout: .now() + 1))
+        wait(for: [cancelled], timeout: 1)
+        guard let waiterOutcome = waiter.outcome, case let .failure(error) = waiterOutcome else {
+            return XCTFail("cancel 后 queued native waiter 必须受控失败")
+        }
+        XCTAssertEqual(error as? PlaybackCoreError,
+                       .audioFallbackDecode(FFmpegPCMAudioDecoder.destroyedErrorCode))
+        XCTAssertEqual(native.maxConcurrentNativeCalls, 1)
+        XCTAssertEqual(native.pushedTokens, [1])
+    }
+
+    func testTask22FConcurrentCloseWaitsForNativeDestroyCompletion() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        let destroyEntered = DispatchSemaphore(value: 0)
+        let releaseDestroy = DispatchSemaphore(value: 0)
+        native.destroyEntrySignal = destroyEntered
+        native.nextDestroyNativeBlocker = releaseDestroy
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]), api: native)
+
+        let firstClose = DispatchQueue(label: "org.vplayer.tests.task22f.destroy.first").asyncResult {
+            decoder.destroy()
+        }
+        XCTAssertEqual(destroyEntered.wait(timeout: .now() + 1), .success,
+                       "第一个 close 必须已实际进入 native destroy")
+        let secondClose = DispatchQueue(label: "org.vplayer.tests.task22f.destroy.second").asyncResult {
+            decoder.cancelHLSAdmission()
+        }
+        XCTAssertFalse(secondClose.wait(timeout: .now() + 0.2),
+                       "native destroy 仍阻塞时，第二个 close 不得抢先报告 teardown 完成")
+
+        releaseDestroy.signal()
+        XCTAssertTrue(firstClose.wait(timeout: .now() + 1))
+        XCTAssertTrue(secondClose.wait(timeout: .now() + 1))
+        XCTAssertEqual(native.destroyCount, 1)
+    }
+
+    func testTask22FNativeLaneRejectsSameThreadCallbackReentry() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[.stereo(frames: 2)]]
+        let box = Task22FDecoderBox()
+        let recorder = Task22FErrorRecorder()
+        native.onBeforeSynchronousCallback = {
+            if let error = box.pushFromCallback() { recorder.append(error) }
+        }
+        let decoder = try FFmpegPCMAudioDecoder(codec: .aac, extradata: Data([0x12, 0x10]), api: native)
+        box.install(decoder, sample: try makeSample(id: 89))
+        _ = try decoder.push(makeSample(id: 88))
+        XCTAssertEqual(native.maxConcurrentNativeCalls, 1)
+        XCTAssertEqual(native.pushedTokens, [1])
+        XCTAssertEqual(recorder.snapshot,
+                       [.audioFallbackDecode(FFmpegPCMAudioDecoder.destroyedErrorCode)])
+    }
+
+    func testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail() throws {
+        guard let rawFixtureBaseURL = ProcessInfo.processInfo.environment["VPLAYER_FIXTURE_BASE_URL"],
+              let fixtureBaseURL = URL(string: rawFixtureBaseURL),
+              fixtureBaseURL.scheme == "http", fixtureBaseURL.host == "127.0.0.1",
+              fixtureBaseURL.port != nil else {
+            throw XCTSkip("需由 fixture HTTP runner 注入")
+        }
+        let recorder = DemuxEventRecorder()
+        let demuxer = FFmpegDemuxer()
+        try demuxer.start(url: fixtureBaseURL.appending(path: "progressive-h264-aac.ts"), sink: recorder.record)
+        let events = recorder.waitForTerminal(timeout: 5)
+        let tracks = try XCTUnwrap(events.compactMap { event -> DemuxTrackSet? in
+            if case let .tracks(value) = event { return value }
+            return nil
+        }.first)
+        let audio = try XCTUnwrap(tracks.audio)
+        let packet = try XCTUnwrap(events.compactMap { event -> DemuxPacket? in
+            if case let .packet(value) = event, value.streamIndex == audio.streamIndex { return value }
+            return nil
+        }.first)
+        let probe = Task22FCAllocationProbe()
+        var admission = VPFFAudioAllocationAdmission()
+        admission.context = Unmanaged.passUnretained(probe).toOpaque()
+        admission.reserve = { context, bytes, role in
+            guard let context, bytes > 0 else { return nil }
+            return Unmanaged<Task22FCAllocationProbe>.fromOpaque(context).takeUnretainedValue()
+                .reserve(bytes: Int(bytes), role: role)
+        }
+        admission.release = { context, token in
+            guard let context, let token else { return }
+            Unmanaged<Task22FCAllocationProbe>.fromOpaque(context).takeUnretainedValue().release(token)
+        }
+        var native: OpaquePointer?
+        var extradata = [UInt8]([0x12, 0x10])
+        XCTAssertEqual(vp_ffmpeg_audio_decoder_create(VPFF_CODEC_AAC, &extradata, extradata.count,
+            { context, frame in
+                guard let context, let frame else { return }
+                Unmanaged<Task22FCAllocationProbe>.fromOpaque(context).takeUnretainedValue().recordPCM(token: frame.pointee.pts)
+            }, Unmanaged.passUnretained(probe).toOpaque(), &admission, &native), 0)
+        let decoder = try XCTUnwrap(native)
+        let firstPush = packet.data.withUnsafeBytes {
+            vp_ffmpeg_audio_decoder_push(decoder, $0.baseAddress?.assumingMemoryBound(to: UInt8.self), $0.count, 1)
+        }
+        XCTAssertGreaterThanOrEqual(firstPush, 0, "fixture 的首 AAC packet 必须是真实成功来源")
+        probe.rejectFuture(role: VPFF_AUDIO_ALLOCATION_PACKET)
+        let failedPush = packet.data.withUnsafeBytes {
+            vp_ffmpeg_audio_decoder_push(decoder, $0.baseAddress?.assumingMemoryBound(to: UInt8.self), $0.count, 2)
+        }
+        XCTAssertLessThan(failedPush, 0, "失败必须来自真实 C packet reserve")
+        let drainStatus = vp_ffmpeg_audio_decoder_drain(decoder)
+        XCTAssertEqual(drainStatus, -541_478_725, "不得用先前失败覆盖真实 drain status")
+        XCTAssertTrue(probe.rejectedRoles.contains(VPFF_AUDIO_ALLOCATION_PACKET))
+        XCTAssertFalse(probe.pcmTokens.isEmpty, "fixture drain 必须实际交付最后成功 token 的 PCM")
+        XCTAssertTrue(probe.pcmTokens.allSatisfy { $0 == 1 }, "tail 只能沿用最后成功 token")
+        vp_ffmpeg_audio_decoder_destroy(decoder)
+        XCTAssertEqual(probe.liveTokenCount, 0)
+        XCTAssertEqual(probe.releaseCount, probe.reserveCount)
+    }
+
+    func testTask22FComponentInjectionCreatesLiveDecoderAndAssemblerFramerWithOneOwnership() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSAudioCopyOwnership(maximumCompressedBytes: 4_096,
+                                              maximumPCMBytes: 4_096, capacity: 8,
+                                              applicationLedger: ledger)
+        let factory = LivePCMAudioDecoderFactory(hlsCopyOwnership: ownership)
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data([0x11, 0x90]))
+        var assemblerEvents: [AudioAssemblerEvent] = []
+        let assembler = try CompressedAudioAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { assemblerEvents.append($0) },
+            formatState: AssemblyFormatState(trackSet: tracks),
+            hlsCopyOwnership: ownership
+        )
+        try assembler.push(AssemblerTestFixtures.audioPacket(data: Data([0x21, 0x22]), codec: .aac))
+        do {
+            let decoder = try factory.makeDecoder(codec: .aac, extradata: Data([0x12, 0x10]))
+            withExtendedLifetime(decoder) {
+                XCTAssertFalse(assemblerEvents.isEmpty, "assembler 必须实际创建并使用 injected framer")
+            }
+        }
+        #if DEBUG
+        let events = ownership.copyEvents
+        XCTAssertFalse(events.isEmpty, "DEBUG 组件接缝必须看到真实 admission")
+        XCTAssertTrue(events.allSatisfy(\.wasChargedBeforeCopy))
+        #else
+        XCTFail("该组件注入接缝证据必须在 DEBUG admission 观测下执行")
+        #endif
+        XCTAssertEqual(ledger.chargedBytes, 0)
     }
 
     func testTask7StaticScopeAndPrivacyGate() throws {
@@ -6109,6 +6548,19 @@ private final class LockedRouteSnapshots: @unchecked Sendable {
     var isolationSnapshot: [Bool] { lock.lock(); defer { lock.unlock() }; return isolation }
 }
 
+private final class LockedCallCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.withLock { count += 1 }
+    }
+
+    var value: Int {
+        lock.withLock { count }
+    }
+}
+
 private final class MutableRouteLatency: @unchecked Sendable {
     private let lock = NSLock()
     private var outputLatency: TimeInterval
@@ -6328,4 +6780,126 @@ private func framesPerPacket(for codec: VPlayerPlayback.AudioCodec) -> UInt32 {
     case .mp2: 1_152
     case .mp3: 0
     }
+}
+
+private final class Task22FAsyncResult<Value>: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var completed = false
+    private var result: Result<Value, Error>?
+
+    func finish(_ result: Result<Value, Error>) {
+        condition.lock()
+        self.result = result
+        completed = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait(timeout: DispatchTime) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        while !completed {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard timeout.uptimeNanoseconds > now else { return false }
+            let remaining = Double(timeout.uptimeNanoseconds - now) / 1_000_000_000
+            guard condition.wait(until: Date(timeIntervalSinceNow: remaining)) else {
+                return completed
+            }
+        }
+        return true
+    }
+
+    var outcome: Result<Value, Error>? {
+        condition.lock(); defer { condition.unlock() }
+        return result
+    }
+}
+
+private final class Task22FPTSRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [CMTime] = []
+    func append(_ value: CMTime) { lock.withLock { values.append(value) } }
+    var snapshot: [CMTime] { lock.withLock { values } }
+}
+
+private final class Task22FDecoderBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var decoder: FFmpegPCMAudioDecoder?
+    private var sample: CompressedAudioSample?
+    func install(_ decoder: FFmpegPCMAudioDecoder, sample: CompressedAudioSample) {
+        lock.withLock { self.decoder = decoder; self.sample = sample }
+    }
+    func pushFromCallback() -> Error? {
+        let values = lock.withLock { (decoder, sample) }
+        guard let decoder = values.0, let sample = values.1 else { return nil }
+        do { _ = try decoder.push(sample); return nil }
+        catch { return error }
+    }
+}
+
+private final class Task22FErrorRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var errors: [PlaybackCoreError] = []
+    func append(_ error: Error) { if let core = error as? PlaybackCoreError { lock.withLock { errors.append(core) } } }
+    var snapshot: [PlaybackCoreError] { lock.withLock { errors } }
+}
+
+private extension DispatchQueue {
+    func asyncResult<Value>(_ body: @escaping @Sendable () throws -> Value) -> Task22FAsyncResult<Value> {
+        let result = Task22FAsyncResult<Value>()
+        async { result.finish(Result(catching: body)) }
+        return result
+    }
+}
+
+private final class Task22FCAllocationProbe: @unchecked Sendable {
+    struct Event: Sendable {
+        let bytes: Int
+        let role: VPFFAudioAllocationRole
+    }
+
+    private final class Token {}
+    private let lock = NSLock()
+    private var storedEvents: [Event] = []
+    private var storedReleaseCount = 0
+    private var storedLiveTokens = 0
+    private var storedPCMCallbackCount = 0
+    private var rejectedRole: VPFFAudioAllocationRole?
+    private var storedRejectedRoles: [VPFFAudioAllocationRole] = []
+    private var storedPCMTokens: [Int64] = []
+
+    func reserve(bytes: Int, role: VPFFAudioAllocationRole) -> UnsafeMutableRawPointer? {
+        guard bytes > 0 else { return nil }
+        return lock.withLock { () -> UnsafeMutableRawPointer? in
+            if rejectedRole == role {
+                storedRejectedRoles.append(role)
+                return nil
+            }
+            storedEvents.append(.init(bytes: bytes, role: role))
+            storedLiveTokens += 1
+            return Unmanaged.passRetained(Token()).toOpaque()
+        }
+    }
+
+    func release(_ token: UnsafeMutableRawPointer) {
+        Unmanaged<Token>.fromOpaque(token).release()
+        lock.withLock {
+            storedReleaseCount += 1
+            storedLiveTokens -= 1
+        }
+    }
+
+    func recordPCM(token: Int64? = nil) { lock.withLock {
+        storedPCMCallbackCount += 1
+        if let token { storedPCMTokens.append(token) }
+    } }
+    func rejectFuture(role: VPFFAudioAllocationRole) { lock.withLock { rejectedRole = role } }
+
+    var events: [Event] { lock.withLock { storedEvents } }
+    var reserveCount: Int { lock.withLock { storedEvents.count } }
+    var releaseCount: Int { lock.withLock { storedReleaseCount } }
+    var liveTokenCount: Int { lock.withLock { storedLiveTokens } }
+    var pcmCallbackCount: Int { lock.withLock { storedPCMCallbackCount } }
+    var rejectedRoles: [VPFFAudioAllocationRole] { lock.withLock { storedRejectedRoles } }
+    var pcmTokens: [Int64] { lock.withLock { storedPCMTokens } }
 }

@@ -8,6 +8,27 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackMetricsTests: XCTestCase {
+    func testHLSMetricsDoNotFabricateMediaProgressFromWallClock() {
+        let clock = MetricsTestClock()
+        let metrics = PlaybackMetrics(
+            channelID: "live-hd",
+            now: { clock.value },
+            residentMemoryProvider: { 0 }
+        )
+
+        metrics.updateHLSPlaybackCounters(elapsedSeconds: 12, isInterlaced: true)
+        let first = metrics.snapshot(window: .seconds(60))
+        clock.value = 60
+        metrics.updateHLSPlaybackCounters(elapsedSeconds: 60, isInterlaced: true)
+        let second = metrics.snapshot(window: .seconds(60))
+
+        XCTAssertNil(first.clockTimeSeconds)
+        XCTAssertNil(second.clockTimeSeconds)
+        XCTAssertEqual(second.videoAccessUnitCount, first.videoAccessUnitCount)
+        XCTAssertEqual(second.videoRendererTotalFrameCount, first.videoRendererTotalFrameCount)
+        XCTAssertEqual(second.audioDurationSeconds, first.audioDurationSeconds)
+    }
+
     func testNativeRendererMetricsAccumulateDeltasAndRebaseWholeEpochOnRollback() {
         let metrics = PlaybackMetrics(channelID: "native-renderer", now: { 1 })
 

@@ -13,6 +13,8 @@ public struct VideoPresentationFrame: @unchecked Sendable {
     public let sequenceNumber: UInt64
     public let sourceAccessUnitID: UInt64
     public let formatMetadata: VideoFormatMetadata
+    let retentionTail: DecodedVideoFrameRetentionTail?
+    let outputBackingTail: VideoOutputBackingRetentionTail?
 
     public init(
         pixelBuffer: CVPixelBuffer,
@@ -21,7 +23,9 @@ public struct VideoPresentationFrame: @unchecked Sendable {
         generation: MediaGeneration,
         sequenceNumber: UInt64,
         sourceAccessUnitID: UInt64,
-        formatMetadata: VideoFormatMetadata
+        formatMetadata: VideoFormatMetadata,
+        retentionTail: DecodedVideoFrameRetentionTail? = nil,
+        outputBackingTail: VideoOutputBackingRetentionTail? = nil
     ) {
         self.pixelBuffer = pixelBuffer
         self.presentationTimeStamp = presentationTimeStamp
@@ -30,6 +34,8 @@ public struct VideoPresentationFrame: @unchecked Sendable {
         self.sequenceNumber = sequenceNumber
         self.sourceAccessUnitID = sourceAccessUnitID
         self.formatMetadata = formatMetadata
+        self.retentionTail = retentionTail
+        self.outputBackingTail = outputBackingTail
     }
 }
 

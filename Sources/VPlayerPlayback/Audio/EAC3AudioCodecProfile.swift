@@ -14,29 +14,29 @@ struct EAC3AudioCodecProfile: CompressedAudioCodecProfile {
         source: AudioTrackDescriptor
     ) throws -> InspectedCompressedAudioFrame {
         guard source.codec == .eac3,
-              frame.payload.count >= 4,
-              frame.payload[frame.payload.startIndex] == 0x0B,
-              frame.payload[frame.payload.index(after: frame.payload.startIndex)] == 0x77,
-              Self.headerFrameByteCount(frame.payload) == frame.payload.count,
-              let sampleCount = frame.parserSampleCount,
-              [256, 512, 768, 1_536].contains(sampleCount) else {
+              !frame.containerMarkedCorrupt else {
+            throw AudioCodecProfileValidation.error()
+        }
+        let header = try EAC3FrameInspector.inspect(frame.payload)
+        guard source.sampleRate == header.sampleRate,
+              source.channelLayout.channelCount == header.channelCount else {
             throw AudioCodecProfileValidation.error()
         }
         try AudioCodecProfileValidation.validateParserFacts(
             frame,
             source: source,
-            sampleCount: sampleCount
+            sampleCount: header.sampleCount
         )
         return InspectedCompressedAudioFrame(
             payload: frame.payload,
-            sampleCount: sampleCount,
+            sampleCount: header.sampleCount,
             decoderExtradata: source.extradata,
             systemFormat: SystemCompressedAudioFormat(
                 profileID: .eac3,
                 codec: .eac3,
                 formatID: kAudioFormatEnhancedAC3,
-                sampleRate: source.sampleRate,
-                channelCount: source.channelLayout.channelCount,
+                sampleRate: header.sampleRate,
+                channelCount: header.channelCount,
                 framesPerPacket: 0,
                 layout: try AudioCodecProfileValidation.layout(from: source.channelLayout),
                 magicCookie: nil
@@ -44,11 +44,4 @@ struct EAC3AudioCodecProfile: CompressedAudioCodecProfile {
         )
     }
 
-    private static func headerFrameByteCount(_ payload: Data) -> Int {
-        let highIndex = payload.index(payload.startIndex, offsetBy: 2)
-        let lowIndex = payload.index(after: highIndex)
-        let frameSizeCode = Int(payload[highIndex] & 0x07) << 8
-            | Int(payload[lowIndex])
-        return 2 * (frameSizeCode + 1)
-    }
 }

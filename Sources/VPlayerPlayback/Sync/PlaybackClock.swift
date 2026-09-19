@@ -8,4 +8,5 @@ public protocol PlaybackClock: AnyObject {
     var currentTime: CMTime { get }
     func pause()
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float)
+    func setRate(_ rate: Float)
 }

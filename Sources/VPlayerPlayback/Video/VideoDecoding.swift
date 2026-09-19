@@ -43,6 +43,7 @@ public struct VideoFormatMetadata: Sendable, Equatable {
     public let cleanAperture: CGRect?
     public let chromaLocation: ChromaLocation
     public let hdrStaticMetadata: HDRStaticMetadata
+    public let sampleAspectRatio: MediaRational?
 
     public init(
         dimensions: CMVideoDimensions,
@@ -53,7 +54,8 @@ public struct VideoFormatMetadata: Sendable, Equatable {
         primaries: Primaries,
         cleanAperture: CGRect?,
         chromaLocation: ChromaLocation,
-        hdrStaticMetadata: HDRStaticMetadata
+        hdrStaticMetadata: HDRStaticMetadata,
+        sampleAspectRatio: MediaRational? = nil
     ) {
         self.dimensions = dimensions
         self.bitDepth = bitDepth
@@ -64,6 +66,7 @@ public struct VideoFormatMetadata: Sendable, Equatable {
         self.cleanAperture = cleanAperture
         self.chromaLocation = chromaLocation
         self.hdrStaticMetadata = hdrStaticMetadata
+        self.sampleAspectRatio = sampleAspectRatio
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -77,7 +80,59 @@ public struct VideoFormatMetadata: Sendable, Equatable {
             && lhs.cleanAperture == rhs.cleanAperture
             && lhs.chromaLocation == rhs.chromaLocation
             && lhs.hdrStaticMetadata == rhs.hdrStaticMetadata
+            && lhs.sampleAspectRatio == rhs.sampleAspectRatio
     }
+}
+
+public final class DecodedVideoFrameRetentionTail: @unchecked Sendable {
+    private let onRelease: @Sendable () -> Void
+    /// HLS 专用：decoder 输入与未来 YADIF pair 的同一 conversion reservation。
+    /// 不附着到 CoreVideo attachment，避免被复制到不相同的 backing。
+    let outputBackingTail: VideoOutputBackingRetentionTail?
+    public init(
+        onRelease: @escaping @Sendable () -> Void,
+        outputBackingTail: VideoOutputBackingRetentionTail? = nil
+    ) {
+        self.onRelease = onRelease
+        self.outputBackingTail = outputBackingTail
+    }
+    deinit { onRelease() }
+}
+
+/// 原生 decoder 在把输出交给应用侧之前取得的 surface owner。
+///
+/// HLS 将实现安装在 VT/FFmpeg 的 submission callback lane；普通播放保持
+/// `nil`，因此不改变旧的 callback 或展示所有权。
+protocol DecodedVideoSurfaceAdmitting: AnyObject, Sendable {
+    /// 返回的 tail 必须随最终 `DecodedVideoFrame` 的最后一个 holder 存活。
+    /// `nil` 表示取消或永久拒绝，调用者不得捕获/复制该输出。
+    func admitSurface(bytes: Int) -> DecodedVideoFrameRetentionTail?
+    /// VT 已经给出真实 backing 时，HLS 可按真实输入和未来输出 pair 一起准入。
+    func admitSurface(pixelBuffer: CVPixelBuffer) -> DecodedVideoFrameRetentionTail?
+    /// 先关闭等待者，再由 caller 排 native invalidation，避免 stop 卡在 callback。
+    func cancelSurfaceAdmission()
+    /// 每个 native session 都有自己的 scope；永久拒绝必须带着该 session 的
+    /// identity 走 decoder 的既有 fatal 路径。取消仍只返回 nil，不触发此回调。
+    func makeSurfaceSessionScope(
+        permanentFailureSink: @escaping @Sendable () -> Void
+    ) -> any DecodedVideoSurfaceAdmitting
+    /// HLS 的 FFmpeg 输出可选择提供明确 backing 契约的 surface：费用先于
+    /// allocation，非 HLS 返回 nil 后保持既有 pool 行为。
+    func allocateAdmittedFFmpegSurface(
+        width: Int, height: Int, range: VideoFormatMetadata.Range
+    ) -> (pixelBuffer: CVPixelBuffer, tail: DecodedVideoFrameRetentionTail)?
+}
+
+extension DecodedVideoSurfaceAdmitting {
+    func admitSurface(pixelBuffer: CVPixelBuffer) -> DecodedVideoFrameRetentionTail? {
+        admitSurface(bytes: CVPixelBufferGetDataSize(pixelBuffer))
+    }
+    func makeSurfaceSessionScope(
+        permanentFailureSink _: @escaping @Sendable () -> Void = {}
+    ) -> any DecodedVideoSurfaceAdmitting { self }
+    func allocateAdmittedFFmpegSurface(
+        width _: Int, height _: Int, range _: VideoFormatMetadata.Range
+    ) -> (pixelBuffer: CVPixelBuffer, tail: DecodedVideoFrameRetentionTail)? { nil }
 }
 
 public struct DecodedVideoFrame: @unchecked Sendable {
@@ -88,6 +143,7 @@ public struct DecodedVideoFrame: @unchecked Sendable {
     public let generation: MediaGeneration
     public let parserMetadata: VideoParserMetadata
     public let formatMetadata: VideoFormatMetadata
+    let retentionTail: DecodedVideoFrameRetentionTail?
 
     public init(
         accessUnitID: UInt64,
@@ -96,7 +152,8 @@ public struct DecodedVideoFrame: @unchecked Sendable {
         duration: CMTime,
         generation: MediaGeneration,
         parserMetadata: VideoParserMetadata,
-        formatMetadata: VideoFormatMetadata
+        formatMetadata: VideoFormatMetadata,
+        retentionTail: DecodedVideoFrameRetentionTail? = nil
     ) {
         self.accessUnitID = accessUnitID
         self.pixelBuffer = pixelBuffer
@@ -105,6 +162,7 @@ public struct DecodedVideoFrame: @unchecked Sendable {
         self.generation = generation
         self.parserMetadata = parserMetadata
         self.formatMetadata = formatMetadata
+        self.retentionTail = retentionTail
     }
 }
 
@@ -140,6 +198,8 @@ public enum VideoDecoderTransition: @unchecked Sendable {
         format: CMVideoFormatDescription,
         generation: MediaGeneration
     )
+    /// 自然 EOF：排空 native 延迟帧，但保留当前 session 与事件 identity。
+    case drain(token: VideoDecoderTransitionToken)
     case drainAndInvalidate(token: VideoDecoderTransitionToken)
     case invalidate(token: VideoDecoderTransitionToken)
 }

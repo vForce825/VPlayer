@@ -853,6 +853,497 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         XCTAssertTrue(harness.host.failures.isEmpty)
     }
 
+    func testAtomicEncodingAcceptsEveryReliableFieldOrderEvidenceSource() throws {
+        enum Fixture: Equatable {
+            case parser
+            case formatDescription
+            case pixelBuffer
+            case stream
+        }
+        let cases: [(Fixture, FieldEvidenceSource)] = [
+            (.parser, .parser),
+            (.formatDescription, .formatDescription),
+            (.pixelBuffer, .pixelBuffer),
+            (.stream, .stream),
+        ]
+
+        for (fixture, expectedSource) in cases {
+            let recorder = CoordinatorAtomicEncodingRecorder()
+            let harness = makeHarness(atomicEncodingRecorder: recorder)
+            let format: CMVideoFormatDescription
+            if fixture == .formatDescription {
+                format = try VideoTestFactories.formatDescription(
+                    fieldCount: number(2),
+                    detail: kCVImageBufferFieldDetailTemporalTopFirst
+                )
+            } else {
+                format = try PlaybackFakeMedia.videoFormat()
+            }
+            harness.coordinator.replaceFormat(
+                format,
+                streamFieldOrder: fixture == .stream ? .tt : .unknown
+            )
+            let generation = harness.host.generation
+            XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+                id: 1,
+                generation: generation,
+                randomAccess: true
+            )))
+
+            for id in UInt64(10)...14 {
+                let parser: VideoParserMetadata
+                switch fixture {
+                case .parser:
+                    parser = interlacedParser(parity: .top, sourcePTS90k: id * 3_600)
+                case .formatDescription, .pixelBuffer:
+                    parser = unorderedInterlacedParser(sourcePTS90k: id * 3_600)
+                case .stream:
+                    parser = unknownParser(sourcePTS90k: id * 3_600)
+                }
+                let frame = try decodedFrame(id: id, generation: generation, parser: parser)
+                if fixture == .pixelBuffer {
+                    CVBufferSetAttachment(
+                        frame.pixelBuffer,
+                        kCVImageBufferFieldCountKey,
+                        number(2),
+                        .shouldPropagate
+                    )
+                    CVBufferSetAttachment(
+                        frame.pixelBuffer,
+                        kCVImageBufferFieldDetailKey,
+                        kCVImageBufferFieldDetailTemporalTopFirst,
+                        .shouldPropagate
+                    )
+                }
+                harness.coordinator.handle(decoder: harness.frameEvent(frame))
+            }
+
+            XCTAssertFalse(harness.yadif.submissions.isEmpty, "fixture: \(fixture)")
+            XCTAssertTrue(harness.yadif.submissions.allSatisfy {
+                $0.order.parity == .top
+                    && $0.order.confidence != .assumed
+                    && $0.order.source == expectedSource
+            }, "fixture: \(fixture)")
+            XCTAssertTrue(recorder.failures.isEmpty, "fixture: \(fixture)")
+        }
+    }
+
+    func testAtomicEncodingAdmissionRetryRetainsWholeYADIFPairAndReopensOnlyAfterAcceptance() throws {
+        let admission = CoordinatorAtomicAdmission(results: [.retry, .accepted])
+        let harness = makeHarness(atomicEncodingAdmission: admission)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        try startMetalAttempt(harness, generation: generation,
+                              randomAccessUnitID: 1, firstFrameID: 10)
+        let submitted = try XCTUnwrap(harness.yadif.submissions.first)
+        let first = VideoPresentationFrame(
+            pixelBuffer: submitted.frame.frame.pixelBuffer,
+            presentationTimeStamp: submitted.frame.presentationTimeStamp,
+            duration: submitted.frame.fieldDuration,
+            generation: generation,
+            sequenceNumber: 100,
+            sourceAccessUnitID: submitted.frame.frame.accessUnitID,
+            formatMetadata: submitted.frame.frame.formatMetadata
+        )
+        let second = VideoPresentationFrame(
+            pixelBuffer: submitted.frame.frame.pixelBuffer,
+            presentationTimeStamp: CMTimeAdd(submitted.frame.presentationTimeStamp,
+                                              submitted.frame.fieldDuration),
+            duration: submitted.frame.fieldDuration,
+            generation: generation,
+            sequenceNumber: 101,
+            sourceAccessUnitID: submitted.frame.frame.accessUnitID,
+            formatMetadata: submitted.frame.frame.formatMetadata
+        )
+
+        harness.yadif.completeFirst(with: .produced(.init(first: first, remaining: [second])))
+        XCTAssertEqual(admission.batchSequenceNumbers, [[100, 101]])
+        XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
+        XCTAssertEqual(harness.host.operations.suffix(1), ["close"])
+
+        XCTAssertTrue(harness.coordinator.retryPendingAtomicEncoding())
+        XCTAssertEqual(admission.batchSequenceNumbers, [[100, 101], [100, 101]],
+                       "retry 必须重交同一完整双场，不能只交第二场或重新消费一场")
+        XCTAssertEqual(harness.host.operations.suffix(1), ["open"])
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
+    func testAtomicEncodingRetryBlocksYADIFFIFOUntilBridgeAcceptsThenImmediatelyResumesIt() throws {
+        let admission = CoordinatorAtomicAdmission(results: [.retry, .accepted])
+        let ownerScheduler = SwitchableCoordinatorOwnerScheduler()
+        let harness = makeHarness(
+            atomicEncodingAdmission: admission,
+            hookScheduler: { ownerScheduler.schedule($0) }
+        )
+        harness.yadif.rejectSubmissionsWhilePaused = true
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        try startMetalAttempt(harness, generation: generation,
+                              randomAccessUnitID: 1, firstFrameID: 10)
+        let submitted = try XCTUnwrap(harness.yadif.submissions.first)
+        let first = VideoPresentationFrame(
+            pixelBuffer: submitted.frame.frame.pixelBuffer,
+            presentationTimeStamp: submitted.frame.presentationTimeStamp,
+            duration: submitted.frame.fieldDuration,
+            generation: generation,
+            sequenceNumber: 100,
+            sourceAccessUnitID: submitted.frame.frame.accessUnitID,
+            formatMetadata: submitted.frame.frame.formatMetadata
+        )
+        ownerScheduler.defersOperations = true
+        harness.yadif.completeFirst(with: .produced(.init(first: first)))
+        XCTAssertTrue(harness.yadif.isSubmissionSchedulingPaused,
+                      "GPU callback 返回前必须先暂停 YADIF，不能等待异步 owner lane")
+        XCTAssertTrue(admission.hasPendingWork,
+                      "原子 data-plane 准入必须在 GPU callback 返回前完成")
+        ownerScheduler.runAll()
+        XCTAssertTrue(admission.hasPendingWork)
+        XCTAssertTrue(harness.yadif.isSubmissionSchedulingPaused,
+                      "bridge 保留 retry batch 时必须同步暂停 YADIF ready-job 调度")
+
+        harness.yadif.nextTrySubmitResult = .retry
+        harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+            id: 20,
+            generation: generation,
+            parser: interlacedParser(parity: .top, sourcePTS90k: 72_000)
+        )))
+        let submissionCountBeforeWakeup = harness.yadif.submissions.count
+        harness.yadif.signalCapacityReleased()
+        ownerScheduler.runAll()
+        XCTAssertEqual(harness.yadif.submissions.count, submissionCountBeforeWakeup,
+                       "bridge 持有原子双场时，YADIF 容量唤醒不得越过它排空 FIFO")
+
+        XCTAssertTrue(harness.coordinator.retryPendingAtomicEncoding())
+        XCTAssertFalse(admission.hasPendingWork)
+        XCTAssertFalse(harness.yadif.isSubmissionSchedulingPaused,
+                       "bridge 接受重试后必须恢复 YADIF ready-job 调度")
+        XCTAssertEqual(harness.yadif.submissions.count, submissionCountBeforeWakeup + 1,
+                       "bridge 接受重试后必须立即推进已保留的 YADIF FIFO")
+        XCTAssertTrue(harness.host.failures.isEmpty)
+    }
+
+    func testInitialFormatLeavesRealHLSBridgeLiveForFirstYADIFBatch() throws {
+        let encoder = CoordinatorHLSBridgeEncoder()
+        let branch = HLSVideoTranscodeBranch(
+            generation: MediaGeneration(rawValue: 1),
+            inputFormat: CoordinatorHLSBridgeEncoder.inputFormat,
+            maximumPendingFrameCount: 2,
+            encoder: encoder,
+            outputSink: { _ in }
+        )
+        let bridge = HLSVideoAtomicBackpressureBridge(branch: branch)
+        let harness = makeHarness(atomicEncodingAdmission: bridge)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertEqual(generation, MediaGeneration(rawValue: 1))
+        try startMetalAttempt(harness, generation: generation,
+                              randomAccessUnitID: 1, firstFrameID: 10)
+        let submitted = try XCTUnwrap(harness.yadif.submissions.first)
+        let frame = VideoPresentationFrame(
+            pixelBuffer: submitted.frame.frame.pixelBuffer,
+            presentationTimeStamp: submitted.frame.presentationTimeStamp,
+            duration: submitted.frame.fieldDuration,
+            generation: generation,
+            sequenceNumber: 100,
+            sourceAccessUnitID: submitted.frame.frame.accessUnitID,
+            formatMetadata: submitted.frame.frame.formatMetadata
+        )
+        harness.yadif.completeFirst(with: .produced(.init(first: frame)))
+        XCTAssertTrue(encoder.waitForEncode())
+        XCTAssertEqual(encoder.encodeCount, 1,
+                       "首次 replaceFormat 不得预先取消真实 HLS bridge")
+        XCTAssertTrue(harness.host.failures.isEmpty)
+        harness.coordinator.stop(emergency: false)
+    }
+
+    func testAtomicEncodingAdmissionCancellationReleasesRetryAndDoesNotReopen() throws {
+        let admission = CoordinatorAtomicAdmission(results: [.retry])
+        let harness = makeHarness(atomicEncodingAdmission: admission)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        try startMetalAttempt(harness, generation: generation,
+                              randomAccessUnitID: 1, firstFrameID: 10)
+        let submitted = try XCTUnwrap(harness.yadif.submissions.first)
+        let frame = VideoPresentationFrame(
+            pixelBuffer: submitted.frame.frame.pixelBuffer,
+            presentationTimeStamp: submitted.frame.presentationTimeStamp,
+            duration: submitted.frame.fieldDuration,
+            generation: generation,
+            sequenceNumber: 100,
+            sourceAccessUnitID: submitted.frame.frame.accessUnitID,
+            formatMetadata: submitted.frame.frame.formatMetadata
+        )
+        harness.yadif.completeFirst(with: .produced(.init(first: frame)))
+        let cancellationsBeforeStop = admission.cancelCount
+        let opensBeforeStop = harness.host.operations.filter { $0 == "open" }.count
+        harness.coordinator.stop(emergency: false)
+
+        XCTAssertEqual(cancellationsBeforeStop, 0,
+                       "首次格式安装没有旧 HLS owner，不能取消将接收首个 batch 的 bridge")
+        XCTAssertEqual(admission.cancelCount, cancellationsBeforeStop + 1)
+        XCTAssertFalse(harness.coordinator.retryPendingAtomicEncoding())
+        XCTAssertEqual(harness.host.operations.filter { $0 == "open" }.count, opensBeforeStop,
+                       "停止后的 retry 不得重新打开上游 admission")
+    }
+
+    func testAtomicEncodingAdmissionRejectionFailsWithoutLegacyDelivery() throws {
+        let admission = CoordinatorAtomicAdmission(results: [.rejected])
+        let harness = makeHarness(atomicEncodingAdmission: admission)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        try startMetalAttempt(harness, generation: generation,
+                              randomAccessUnitID: 1, firstFrameID: 10)
+        let submitted = try XCTUnwrap(harness.yadif.submissions.first)
+        let frame = VideoPresentationFrame(
+            pixelBuffer: submitted.frame.frame.pixelBuffer,
+            presentationTimeStamp: submitted.frame.presentationTimeStamp,
+            duration: submitted.frame.fieldDuration,
+            generation: generation,
+            sequenceNumber: 100,
+            sourceAccessUnitID: submitted.frame.frame.accessUnitID,
+            formatMetadata: submitted.frame.frame.formatMetadata
+        )
+        harness.yadif.completeFirst(with: .produced(.init(first: frame)))
+
+        XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
+        XCTAssertEqual(harness.host.failures.map(\.0), [.metalCommand("hls.atomicEncoding.submit")])
+    }
+
+    func testAtomicEncodingRejectsPictureStructureWithoutDisplayOrderEvidence() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        for id in UInt64(10)...14 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: pictureOnlyParser(parity: .top, sourcePTS90k: id * 3_600)
+            )))
+        }
+
+        XCTAssertTrue(harness.yadif.submissions.isEmpty)
+        XCTAssertTrue(recorder.failures.contains {
+            $0.reason == .assumed && (10...14).contains($0.sourceAccessUnitID)
+        })
+    }
+
+    func testAtomicEncodingIgnoresOppositePictureIdentityWhenDisplayOrderIsReliable() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        for id in UInt64(10)...14 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: VideoParserMetadata(
+                    fieldOrder: .tt,
+                    pictureStructure: .bottomField,
+                    isInterlaced: true,
+                    repeatFirstField: false,
+                    topFieldFirst: true,
+                    sourcePTS90k: id * 3_600
+                )
+            )))
+        }
+
+        XCTAssertFalse(harness.yadif.submissions.isEmpty)
+        XCTAssertTrue(harness.yadif.submissions.allSatisfy {
+            $0.order.parity == .top && $0.order.source == .parser
+        })
+        XCTAssertTrue(recorder.failures.isEmpty)
+    }
+
+    func testAtomicEncodingRejectsPixelAndFormatDisplayOrderConflict() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        let format = try VideoTestFactories.formatDescription(
+            fieldCount: number(2),
+            detail: kCVImageBufferFieldDetailTemporalTopFirst
+        )
+        harness.coordinator.replaceFormat(format)
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        for id in UInt64(10)...14 {
+            let frame = try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: unorderedInterlacedParser(sourcePTS90k: id * 3_600)
+            )
+            CVBufferSetAttachment(
+                frame.pixelBuffer,
+                kCVImageBufferFieldCountKey,
+                number(2),
+                .shouldPropagate
+            )
+            CVBufferSetAttachment(
+                frame.pixelBuffer,
+                kCVImageBufferFieldDetailKey,
+                kCVImageBufferFieldDetailTemporalBottomFirst,
+                .shouldPropagate
+            )
+            harness.coordinator.handle(decoder: harness.frameEvent(frame))
+        }
+
+        XCTAssertTrue(harness.yadif.submissions.isEmpty)
+        XCTAssertTrue(recorder.failures.contains {
+            $0.reason == .conflicting && (10...14).contains($0.sourceAccessUnitID)
+        })
+    }
+
+    func testLegacyCoordinatorKeepsPixelDisplayOrderOverride() throws {
+        let harness = makeHarness()
+        let format = try VideoTestFactories.formatDescription(
+            fieldCount: number(2),
+            detail: kCVImageBufferFieldDetailTemporalTopFirst
+        )
+        harness.coordinator.replaceFormat(format)
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        for id in UInt64(10)...14 {
+            let frame = try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: unorderedInterlacedParser(sourcePTS90k: id * 3_600)
+            )
+            CVBufferSetAttachment(
+                frame.pixelBuffer,
+                kCVImageBufferFieldCountKey,
+                number(2),
+                .shouldPropagate
+            )
+            CVBufferSetAttachment(
+                frame.pixelBuffer,
+                kCVImageBufferFieldDetailKey,
+                kCVImageBufferFieldDetailTemporalBottomFirst,
+                .shouldPropagate
+            )
+            harness.coordinator.handle(decoder: harness.frameEvent(frame))
+        }
+
+        XCTAssertFalse(harness.yadif.submissions.isEmpty)
+        XCTAssertTrue(harness.yadif.submissions.allSatisfy {
+            $0.order.parity == .bottom && $0.order.source == .pixelBuffer
+        })
+    }
+
+    func testAtomicEncodingRejectsAssumedFieldOrderBeforeYADIFSubmission() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        for id in UInt64(10)...14 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: unorderedInterlacedParser(sourcePTS90k: id * 3_600)
+            )))
+        }
+
+        XCTAssertTrue(harness.yadif.submissions.isEmpty)
+        XCTAssertFalse(recorder.failures.isEmpty)
+        XCTAssertTrue(recorder.failures.allSatisfy { $0.reason == .assumed })
+        XCTAssertTrue(recorder.batches.isEmpty)
+    }
+
+    func testAtomicEncodingRejectsMissingCurrentFrameOrderInsteadOfUsingStickyOrder() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        for id in UInt64(10)...14 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: interlacedParser(parity: .top, sourcePTS90k: id * 3_600)
+            )))
+        }
+        XCTAssertFalse(harness.yadif.submissions.isEmpty)
+
+        for id in UInt64(20)...24 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: unorderedInterlacedParser(sourcePTS90k: id * 3_600)
+            )))
+        }
+
+        XCTAssertFalse(harness.yadif.submissions.contains {
+            (20...24).contains($0.frame.frame.accessUnitID)
+        })
+        XCTAssertTrue(recorder.failures.contains {
+            $0.reason == .missing && (20...24).contains($0.sourceAccessUnitID)
+        })
+    }
+
+    func testAtomicEncodingRejectsConflictingCurrentFrameOrderBeforeYADIFSubmission() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        for id in UInt64(10)...14 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: interlacedParser(parity: .top, sourcePTS90k: id * 3_600)
+            )))
+        }
+
+        for id in UInt64(20)...24 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: conflictingInterlacedParser(sourcePTS90k: id * 3_600)
+            )))
+        }
+
+        XCTAssertFalse(harness.yadif.submissions.contains {
+            (20...24).contains($0.frame.frame.accessUnitID)
+        })
+        XCTAssertTrue(recorder.failures.contains {
+            $0.reason == .conflicting && (20...24).contains($0.sourceAccessUnitID)
+        })
+    }
+
     func testFormatLevelFieldOrderFeedsYADIFWhenPixelAttachmentsAreAbsent() throws {
         let harness = makeHarness()
         let format = try VideoTestFactories.formatDescription(
@@ -1347,6 +1838,86 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         ])
     }
 
+    func testAtomicEncodingFloorRejectsWholePairAndNeverFallsBackToLegacyDelivery() throws {
+        let recorder = CoordinatorAtomicEncodingRecorder()
+        let harness = makeHarness(atomicEncodingRecorder: recorder)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: generation,
+            randomAccess: true
+        )))
+        harness.passthrough.setAutomaticallyCompletes(false)
+        harness.coordinator.installProcessingAdmissionFloor(
+            generation: generation,
+            minimumAccessUnitID: 20,
+            minimumOutputPTS: CMTime(value: 41, timescale: 50)
+        )
+        // 重排器保留末尾两帧；需要四个输入才能让 20、21 都进入处理器。
+        for id in UInt64(20)...23 {
+            harness.coordinator.handle(decoder: harness.frameEvent(try decodedFrame(
+                id: id,
+                generation: generation,
+                parser: unknownParser(sourcePTS90k: id * 3_600)
+            )))
+        }
+        let source = try decodedFrame(
+            id: 20,
+            generation: generation,
+            parser: unknownParser(sourcePTS90k: 72_000)
+        )
+        let firstField = presentationFrame(
+            from: source,
+            sourceAccessUnitID: 20,
+            presentationTimeStamp: CMTime(value: 40, timescale: 50)
+        )
+        let secondField = presentationFrame(
+            from: source,
+            sourceAccessUnitID: 20,
+            presentationTimeStamp: CMTime(value: 42, timescale: 50)
+        )
+
+        harness.passthrough.completePending(
+            accessUnitID: 20,
+            with: .produced(VideoProcessingFrameBatch(
+                first: firstField,
+                remaining: [secondField]
+            ))
+        )
+
+        XCTAssertTrue(recorder.batches.isEmpty)
+        XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
+
+        let nextSource = try decodedFrame(
+            id: 21,
+            generation: generation,
+            parser: unknownParser(sourcePTS90k: 75_600)
+        )
+        let admittedFirst = presentationFrame(
+            from: nextSource,
+            sourceAccessUnitID: 21,
+            presentationTimeStamp: CMTime(value: 42, timescale: 50)
+        )
+        let admittedSecond = presentationFrame(
+            from: nextSource,
+            sourceAccessUnitID: 21,
+            presentationTimeStamp: CMTime(value: 43, timescale: 50)
+        )
+        harness.passthrough.completePending(
+            accessUnitID: 21,
+            with: .produced(VideoProcessingFrameBatch(
+                first: admittedFirst,
+                remaining: [admittedSecond]
+            ))
+        )
+
+        XCTAssertEqual(recorder.batches.count, 1)
+        XCTAssertEqual(recorder.batches[0].frames.map(\.sourceAccessUnitID), [21, 21])
+        XCTAssertEqual(recorder.batches[0].outputs.map(\.origin), [.raw, .raw])
+        XCTAssertTrue(harness.host.deliveredFrames.isEmpty)
+    }
+
     func testProcessingAdmissionFloorSurvivesRouteChangeIsReplacedAndClearsOnGeneration()
         throws {
         let harness = makeHarness()
@@ -1776,7 +2347,10 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             exitInterlacedConfirmationFrames: 1
         ),
         automaticallyCompletesTransitions: Bool = true,
-        transitionDeadlineScheduler: VideoPipelineCoordinator.DecoderTransitionDeadlineScheduler? = nil
+        transitionDeadlineScheduler: VideoPipelineCoordinator.DecoderTransitionDeadlineScheduler? = nil,
+        atomicEncodingRecorder: CoordinatorAtomicEncodingRecorder? = nil,
+        atomicEncodingAdmission: (any VideoAtomicEncodingAdmitting)? = nil,
+        hookScheduler: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil
     ) -> CoordinatorHarness {
         let trace = CoordinatorTrace()
         let decoder = RecordingCoordinatorDecoder(
@@ -1792,6 +2366,14 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             now: { 60 },
             residentMemoryProvider: { 1 }
         )
+        let atomicEncodingSink: VideoAtomicEncodingSink?
+        if let atomicEncodingRecorder {
+            atomicEncodingSink = { event, generation in
+                atomicEncodingRecorder.record(event, generation: generation)
+            }
+        } else {
+            atomicEncodingSink = nil
+        }
         let coordinator = VideoPipelineCoordinator(
             decoder: decoder,
             passthrough: passthrough,
@@ -1801,7 +2383,9 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             classifierConfiguration: classifierConfiguration,
             decoderTransitionDeadlineScheduler: transitionDeadlineScheduler,
             metrics: metrics,
-            hooks: host.hooks
+            atomicEncodingSink: atomicEncodingSink,
+            atomicEncodingAdmission: atomicEncodingAdmission,
+            hooks: host.hooks(schedule: hookScheduler)
         )
         decoder.installTransitionEventSink { [weak coordinator] event in
             coordinator?.handle(decoder: event)
@@ -1904,9 +2488,168 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         )
     }
 
+    private func unorderedInterlacedParser(sourcePTS90k: UInt64?) -> VideoParserMetadata {
+        VideoParserMetadata(
+            fieldOrder: nil,
+            pictureStructure: .frame,
+            isInterlaced: true,
+            repeatFirstField: false,
+            topFieldFirst: nil,
+            sourcePTS90k: sourcePTS90k
+        )
+    }
+
+    private func pictureOnlyParser(
+        parity: FieldParity,
+        sourcePTS90k: UInt64?
+    ) -> VideoParserMetadata {
+        VideoParserMetadata(
+            fieldOrder: nil,
+            pictureStructure: parity == .top ? .topField : .bottomField,
+            isInterlaced: true,
+            repeatFirstField: false,
+            topFieldFirst: nil,
+            sourcePTS90k: sourcePTS90k
+        )
+    }
+
+    private func conflictingInterlacedParser(sourcePTS90k: UInt64?) -> VideoParserMetadata {
+        VideoParserMetadata(
+            fieldOrder: .tt,
+            pictureStructure: .frame,
+            isInterlaced: true,
+            repeatFirstField: false,
+            topFieldFirst: false,
+            sourcePTS90k: sourcePTS90k
+        )
+    }
+
     private func number(_ value: Int32) -> CFNumber {
         var value = value
         return CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &value)
+    }
+}
+
+private final class CoordinatorAtomicEncodingRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [(VideoAtomicEncodingEvent, MediaGeneration)] = []
+
+    func record(_ event: VideoAtomicEncodingEvent, generation: MediaGeneration) {
+        lock.withLock { events.append((event, generation)) }
+    }
+
+    var batches: [VideoProcessingFrameBatch] {
+        lock.withLock {
+            events.compactMap { event, _ in
+                guard case let .batch(batch) = event else { return nil }
+                return batch
+            }
+        }
+    }
+
+    var failures: [VideoAtomicEncodingFailure] {
+        lock.withLock {
+            events.compactMap { event, _ in
+                guard case let .failure(failure) = event else { return nil }
+                return failure
+            }
+        }
+    }
+}
+
+private final class CoordinatorHLSBridgeEncoder: HLSVideoEncoding, @unchecked Sendable {
+    static let inputFormat = VideoEncodingInputFormatSignature(
+        pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        width: 16,
+        height: 16,
+        bitDepth: 8,
+        range: .video,
+        primaries: .bt709,
+        transfer: .bt709,
+        matrix: .bt709,
+        cleanAperture: nil,
+        sampleAspectRatio: nil,
+        chromaLocation: .init(topField: nil, bottomField: nil),
+        masteringDisplayColorVolume: nil,
+        contentLightLevelInfo: nil
+    )
+
+    private let lock = NSLock()
+    private let encoded = DispatchSemaphore(value: 0)
+    private var count = 0
+    private var cancelled = false
+
+    var encodeCount: Int { lock.withLock { count } }
+    func waitForEncode(timeout: TimeInterval = 2) -> Bool {
+        encoded.wait(timeout: .now() + timeout) == .success
+    }
+    var terminal: HLSVideoEncoderTerminal? {
+        lock.withLock { cancelled ? .cancelled : nil }
+    }
+
+    func encode(frame: VideoEncodingFrame,
+                completion _: @escaping @Sendable (Result<HLSVideoEncodedOutput,
+                                                         VTVideoEncoderFailure>) -> Void) {
+        lock.withLock { count += 1 }
+        encoded.signal()
+        // 本测试只验证首个真实 bridge 是否可达；故意不完成 native callback，
+        // 随后的 coordinator.stop 会通过 branch.cancel 回收 surface lease。
+        _ = frame
+    }
+
+    func finish(completion _: @escaping @Sendable (Result<HLSVideoEncoderFinishReceipt,
+                                                           VTVideoEncoderFailure>) -> Void) {}
+
+    func cancel(completion: @escaping @Sendable (Bool) -> Void) {
+        // 此 fake 没有 native worker；同一临界区完成其唯一取消动作后才给 receipt。
+        lock.withLock { cancelled = true }
+        completion(true)
+    }
+}
+
+private final class CoordinatorAtomicAdmission: VideoAtomicEncodingAdmitting,
+    @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [VideoAtomicEncodingAdmissionResult]
+    private var storedBatches: [[UInt64]] = []
+    private var pendingEvent: VideoAtomicEncodingEvent?
+    private(set) var cancelCount = 0
+
+    init(results: [VideoAtomicEncodingAdmissionResult]) {
+        self.results = results
+    }
+
+    var batchSequenceNumbers: [[UInt64]] { lock.withLock { storedBatches } }
+    var hasPendingWork: Bool { lock.withLock { pendingEvent != nil } }
+
+    func submit(_ event: VideoAtomicEncodingEvent,
+                generation _: MediaGeneration) -> VideoAtomicEncodingAdmissionResult {
+        lock.withLock {
+            record(event)
+            let result = nextResult()
+            if result == .retry { pendingEvent = event }
+            return result
+        }
+    }
+
+    func retryPending() -> VideoAtomicEncodingAdmissionResult { lock.withLock {
+        guard let pendingEvent else { return .rejected }
+        record(pendingEvent)
+        let result = nextResult()
+        if result != .retry { self.pendingEvent = nil }
+        return result
+    } }
+
+    func cancel() { lock.withLock { cancelCount += 1 } }
+
+    private func nextResult() -> VideoAtomicEncodingAdmissionResult {
+        results.isEmpty ? .accepted : results.removeFirst()
+    }
+
+    private func record(_ event: VideoAtomicEncodingEvent) {
+        if case let .batch(batch) = event {
+            storedBatches.append(batch.outputs.map(\.frame.sequenceNumber))
+        }
     }
 }
 
@@ -1952,7 +2695,9 @@ private final class CoordinatorHost: @unchecked Sendable {
         self.trace = trace
     }
 
-    var hooks: VideoPipelineCoordinatorHooks {
+    func hooks(
+        schedule: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil
+    ) -> VideoPipelineCoordinatorHooks {
         VideoPipelineCoordinatorHooks(
             closeAdmission: { [weak self] in
                 self?.operations.append("close")
@@ -1987,8 +2732,30 @@ private final class CoordinatorHost: @unchecked Sendable {
             fail: { [weak self] failure, generation in
                 self?.failures.append((failure, generation))
             },
-            schedule: { operation in operation() }
+            schedule: schedule ?? { operation in operation() }
         )
+    }
+}
+
+private final class SwitchableCoordinatorOwnerScheduler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [@Sendable () -> Void] = []
+    var defersOperations = false
+
+    func schedule(_ operation: @escaping @Sendable () -> Void) {
+        let deferOperation = lock.withLock { () -> Bool in
+            if defersOperations { pending.append(operation) }
+            return defersOperations
+        }
+        if !deferOperation { operation() }
+    }
+
+    func runAll() {
+        while true {
+            let operation = lock.withLock { pending.isEmpty ? nil : pending.removeFirst() }
+            guard let operation else { return }
+            operation()
+        }
     }
 }
 
@@ -2059,6 +2826,11 @@ private final class RecordingCoordinatorDecoder: VideoDecoding, @unchecked Senda
             }
             trace.append("decoder.transition.configure:\(generation.rawValue)")
             completion = (transitionToken, .completed)
+        case let .drain(transitionToken):
+            lock.withLock { operations.append(.transitionDrainAndInvalidate(transitionToken)) }
+            trace.append("decoder.transition.drain")
+            completion = (transitionToken, nextDrainOutcome)
+            nextDrainOutcome = .completed
         case let .drainAndInvalidate(transitionToken):
             lock.withLock {
                 operations.append(.transitionDrainAndInvalidate(transitionToken))
@@ -2156,6 +2928,10 @@ private final class FakeCoordinatorYADIFProcessor: YADIFFrameProcessing, @unchec
     private(set) var resets: [MediaGeneration] = []
     private(set) var submissions: [Submission] = []
     private var pendingCompletions: [Pending] = []
+    var nextTrySubmitResult: YADIFFrameAdmission?
+    private var capacityReleaseSink: (@Sendable () -> Void)?
+    private(set) var isSubmissionSchedulingPaused = false
+    var rejectSubmissionsWhilePaused = false
     var pendingCompletionCount: Int { pendingCompletions.count }
     func pendingCompletionCount(for generation: MediaGeneration) -> Int {
         pendingCompletions.count { $0.frame.frame.generation == generation }
@@ -2173,6 +2949,33 @@ private final class FakeCoordinatorYADIFProcessor: YADIFFrameProcessing, @unchec
     ) {
         submissions.append(Submission(frame: frame, order: order))
         pendingCompletions.append(Pending(frame: frame, completion: completion))
+    }
+
+    func trySubmit(
+        normalized frame: NormalizedDecodedFrame,
+        order: ResolvedFieldOrder,
+        discontinuity _: Bool,
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
+    ) -> YADIFFrameAdmission {
+        if let result = nextTrySubmitResult {
+            nextTrySubmitResult = nil
+            if result == .retry { return .retry }
+        }
+        if rejectSubmissionsWhilePaused, isSubmissionSchedulingPaused {
+            return .retry
+        }
+        submit(normalized: frame, order: order, discontinuity: false, completion: completion)
+        return .accepted
+    }
+
+    func installCapacityReleaseSink(_ sink: @escaping @Sendable () -> Void) {
+        capacityReleaseSink = sink
+    }
+
+    func signalCapacityReleased() { capacityReleaseSink?() }
+
+    func setSubmissionSchedulingPaused(_ paused: Bool) {
+        isSubmissionSchedulingPaused = paused
     }
 
     func drain(completion: @escaping @Sendable () -> Void) { completion() }

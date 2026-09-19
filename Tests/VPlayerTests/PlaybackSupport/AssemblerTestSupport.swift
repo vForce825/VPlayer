@@ -209,7 +209,8 @@ enum AssemblerTestFixtures {
         codec: VideoCodec = .h264,
         streamIndex: Int32 = 0,
         audio: AudioTrackDescriptor? = nil,
-        extradata: Data = Data()
+        extradata: Data = Data(),
+        frameRate: MediaRational? = nil
     ) throws -> DemuxTrackSet {
         let timeBase = try XCTUnwrap(MediaRational(num: 1, den: 90_000))
         return DemuxTrackSet(
@@ -221,7 +222,8 @@ enum AssemblerTestFixtures {
                 width: 1_920,
                 height: 1_080,
                 videoDelay: 1,
-                extradata: extradata
+                extradata: extradata,
+                frameRate: frameRate
             ),
             audio: audio
         )

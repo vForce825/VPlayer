@@ -12,3 +12,5 @@ xcuserdata/
 # Reproducible FFmpeg build outputs
 /Vendor/FFmpeg/Work/
 /Vendor/FFmpeg/Artifacts/
+build/
+*.log

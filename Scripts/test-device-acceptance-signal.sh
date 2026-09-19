@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+if [[ "${VPLAYER_SIGNAL_RESET:-0}" != "1" ]]; then
+    export VPLAYER_SIGNAL_RESET=1
+    exec python3 -c "import signal, os, sys; signal.signal(signal.SIGHUP, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])" "$0" "$@"
+fi
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 test_directory="$(mktemp -d "${TMPDIR:-/tmp}/vplayer-acceptance-signal.XXXXXX")"
 pid_file="$test_directory/child.pid"

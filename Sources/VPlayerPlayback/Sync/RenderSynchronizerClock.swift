@@ -42,4 +42,8 @@ public final class RenderSynchronizerClock: PlaybackClock, @unchecked Sendable {
     public func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         anchorAction(mediaTime, hostTime, rate)
     }
+
+    public func setRate(_ rate: Float) {
+        synchronizer.rate = rate
+    }
 }

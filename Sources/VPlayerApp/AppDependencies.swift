@@ -413,7 +413,7 @@ final class LiveAppBootstrap {
 struct AppDependencies {
     typealias Refresh = AppModel.Refresh
     typealias Prepare = @Sendable () async throws -> Void
-    typealias PlaybackPresentationProvider = @Sendable () async -> PlaybackPresentationContext?
+    typealias PlaybackPresentationProvider = @Sendable () async throws -> AsyncStream<PlaybackPresentationReplacement>
     typealias PlaybackMediaInformationProvider = @Sendable () async -> AsyncStream<PlaybackMediaInformation?>
     typealias PlaybackMetricsProvider = @Sendable (Duration) async -> PlaybackMetricsSnapshot?
 
@@ -423,6 +423,7 @@ struct AppDependencies {
     let playbackSettings: PlaybackSettingsStore
     let channelBrowsingSettings: ChannelBrowsingSettingsStore
     let playbackEngine: any PlaybackEngine
+    let playbackPresentationController: (any PlaybackPresentationControlling)?
     let playbackPresentationProvider: PlaybackPresentationProvider
     let playbackMediaInformationProvider: PlaybackMediaInformationProvider
     let playbackMetricsProvider: PlaybackMetricsProvider
@@ -466,7 +467,14 @@ struct AppDependencies {
         let resolvedPlaybackEngine: any PlaybackEngine
         if let playbackEngine {
             resolvedPlaybackEngine = playbackEngine
-            self.playbackPresentationProvider = playbackPresentationProvider ?? { nil }
+            let presentationController = playbackEngine as? any PlaybackPresentationControlling
+            self.playbackPresentationController = presentationController
+            self.playbackPresentationProvider = playbackPresentationProvider ?? {
+                guard let presentationController else {
+                    return AsyncStream { continuation in continuation.finish() }
+                }
+                return try await presentationController.presentations()
+            }
             self.playbackMediaInformationProvider = playbackMediaInformationProvider ?? {
                 AsyncStream<PlaybackMediaInformation?> { continuation in
                     continuation.finish()
@@ -476,8 +484,9 @@ struct AppDependencies {
         } else {
             let controller = PlaybackController()
             resolvedPlaybackEngine = controller
+            self.playbackPresentationController = controller
             self.playbackPresentationProvider = {
-                await controller.presentationContext()
+                try await controller.presentations()
             }
             self.playbackMediaInformationProvider = {
                 await controller.playbackMediaInformation()
@@ -672,7 +681,9 @@ struct AppDependencies {
                     await seeder.seed()
                 },
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
-                playbackPresentationProvider: { nil },
+                playbackPresentationProvider: {
+                    AsyncStream { continuation in continuation.finish() }
+                },
                 playbackMediaInformationProvider: uiTestMediaInformationProvider(
                     for: playbackFixture
                 ),
@@ -700,7 +711,9 @@ struct AppDependencies {
                 repository: repository,
                 refresh: refresh,
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
-                playbackPresentationProvider: { nil },
+                playbackPresentationProvider: {
+                    AsyncStream { continuation in continuation.finish() }
+                },
                 playbackMediaInformationProvider: uiTestMediaInformationProvider(
                     for: playbackFixture
                 ),

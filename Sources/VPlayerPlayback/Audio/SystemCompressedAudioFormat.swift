@@ -68,13 +68,26 @@ enum CompressedAudioFramingKind: Sendable, Hashable {
     case ffmpegParser
 }
 
-struct FramedCompressedAudioFrame: Sendable {
+struct FramedCompressedAudioFrame: @unchecked Sendable {
     let payload: Data
     let presentationTimeStamp: CMTime
     let parserSampleCount: Int32?
     let parserSampleRate: Int32?
     let parserChannelLayout: AudioChannelLayout?
     let containerMarkedCorrupt: Bool
+    let hlsCopyTail: HLSAudioCopyTail?
+
+    init(payload: Data, presentationTimeStamp: CMTime, parserSampleCount: Int32?,
+         parserSampleRate: Int32?, parserChannelLayout: AudioChannelLayout?,
+         containerMarkedCorrupt: Bool, hlsCopyTail: HLSAudioCopyTail? = nil) {
+        self.payload = payload
+        self.presentationTimeStamp = presentationTimeStamp
+        self.parserSampleCount = parserSampleCount
+        self.parserSampleRate = parserSampleRate
+        self.parserChannelLayout = parserChannelLayout
+        self.containerMarkedCorrupt = containerMarkedCorrupt
+        self.hlsCopyTail = hlsCopyTail
+    }
 }
 
 struct InspectedCompressedAudioFrame: Sendable {

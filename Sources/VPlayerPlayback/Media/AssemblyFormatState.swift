@@ -81,32 +81,69 @@ final class AssemblyFormatState: @unchecked Sendable {
     private let lock = NSLock()
     let trackSet: DemuxTrackSet
     private var videoParameterSets: [Data]
+    private var hlsVideoParameterSetOwner: HLSVideoParameterSetRetention?
     private var audioSystemFormat: AudioSystemFormatFingerprintComponent?
 
     init(
         trackSet: DemuxTrackSet,
         videoParameterSets: [Data] = [],
+        hlsVideoParameterSetOwner: HLSVideoParameterSetRetention? = nil,
         audioSystemFormat: AudioSystemFormatFingerprintComponent? = nil
     ) {
         self.trackSet = trackSet
         self.videoParameterSets = videoParameterSets
+        self.hlsVideoParameterSetOwner = hlsVideoParameterSetOwner
         self.audioSystemFormat = audioSystemFormat
     }
 
     func commitVideoParameterSets(_ parameterSets: [Data]) {
-        lock.withLock { videoParameterSets = parameterSets }
+        lock.withLock { videoParameterSets = parameterSets; hlsVideoParameterSetOwner = nil }
+    }
+
+    func commitHLSVideoParameterSets(_ owner: HLSVideoParameterSetRetention) {
+        lock.withLock { videoParameterSets = []; hlsVideoParameterSetOwner = owner }
     }
 
     func commitAudioSystemFormat(_ format: AudioSystemFormatFingerprintComponent?) {
         lock.withLock { audioSystemFormat = format }
     }
 
+    func snapshot() -> AssemblyFormatSnapshot {
+        lock.withLock {
+            AssemblyFormatSnapshot(
+                videoParameterSets: videoParameterSets,
+                hlsVideoParameterSetOwner: hlsVideoParameterSetOwner,
+                audioSystemFormat: audioSystemFormat
+            )
+        }
+    }
+
     func fingerprint() throws -> MediaFormatFingerprint {
-        let snapshot = lock.withLock { (videoParameterSets, audioSystemFormat) }
+        let snapshot = snapshot()
+        if let owner = snapshot.hlsVideoParameterSetOwner {
+            return try MediaFormatFingerprint(
+                trackSet: trackSet,
+                hlsVideoParameterSetOwner: owner,
+                audioSystemFormat: snapshot.audioSystemFormat
+            )
+        }
         return try MediaFormatFingerprint(
             trackSet: trackSet,
-            videoParameterSets: snapshot.0,
-            audioSystemFormat: snapshot.1
+            videoParameterSets: snapshot.videoParameterSets,
+            audioSystemFormat: snapshot.audioSystemFormat
         )
+    }
+}
+
+struct AssemblyFormatSnapshot: Sendable {
+    let videoParameterSets: [Data]
+    let hlsVideoParameterSetOwner: HLSVideoParameterSetRetention?
+    let audioSystemFormat: AudioSystemFormatFingerprintComponent?
+
+    init(videoParameterSets: [Data], hlsVideoParameterSetOwner: HLSVideoParameterSetRetention? = nil,
+         audioSystemFormat: AudioSystemFormatFingerprintComponent?) {
+        self.videoParameterSets = videoParameterSets
+        self.hlsVideoParameterSetOwner = hlsVideoParameterSetOwner
+        self.audioSystemFormat = audioSystemFormat
     }
 }

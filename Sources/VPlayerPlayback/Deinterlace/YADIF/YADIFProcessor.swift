@@ -8,8 +8,19 @@ import Foundation
 import Metal
 
 typealias YADIFOutputAllocator = @Sendable (
-    _ source: CVPixelBuffer
-) throws(YADIFFailure) -> (first: CVPixelBuffer, second: CVPixelBuffer)
+    _ source: DecodedVideoFrame
+) throws(YADIFFailure) -> YADIFAllocatedOutputs
+
+struct YADIFAllocatedOutputs: @unchecked Sendable {
+    let first: CVPixelBuffer
+    let second: CVPixelBuffer
+    let outputBackingTail: VideoOutputBackingRetentionTail?
+
+    init(first: CVPixelBuffer, second: CVPixelBuffer,
+         outputBackingTail: VideoOutputBackingRetentionTail? = nil) {
+        self.first = first; self.second = second; self.outputBackingTail = outputBackingTail
+    }
+}
 
 public enum YADIFDropReason: UInt8, Sendable, Equatable {
     case gpuQueueFull
@@ -145,7 +156,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
 
     private struct InFlightJob: @unchecked Sendable {
         let ready: ReadyJob
-        let outputs: (first: CVPixelBuffer, second: CVPixelBuffer)
+        let outputs: YADIFAllocatedOutputs
         let signpostLifetime: PlaybackSignpostLifetime
     }
 
@@ -191,7 +202,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private let lock = NSLock()
     private let commandSubmitter: any YADIFCommandSubmitting
     private let surfacePool: ProgressiveSurfacePool
-    private let outputAllocator: YADIFOutputAllocator
+    private var outputAllocator: YADIFOutputAllocator
     private let clock: any PlaybackClock
     private let maximumInFlight: Int
     private var maximumPendingFrames: Int
@@ -216,6 +227,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private var schedulerIsRunning = false
     private var pendingUserActions: [UserAction] = []
     private var userActionPumpIsRunning = false
+    private var submissionSchedulingPaused = false
+    // HLS installs this after it has an owner lane. It is deliberately only a
+    // wake-up: admission is rechecked atomically by `trySubmit`.
+    private var capacityReleaseSink: (@Sendable () -> Void)?
 
     public convenience init(
         device: any MTLDevice,
@@ -301,7 +316,8 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             self.outputAllocator = outputAllocator
         } else {
             let defaultOutputAllocator: YADIFOutputAllocator = { source in
-                try surfacePool.allocatePair(matching: source)
+                let pair = try surfacePool.allocatePair(matching: source.pixelBuffer)
+                return YADIFAllocatedOutputs(first: pair.first, second: pair.second)
             }
             self.outputAllocator = defaultOutputAllocator
         }
@@ -426,6 +442,76 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         driveScheduler()
     }
 
+    /// Atomically reserves the next reference-window/ready-job slot for HLS.
+    /// The ordinary rendering path retains its historic submit-and-shed policy;
+    /// HLS must stop upstream before an additional frame can make that policy
+    /// discard a ready YADIF job.
+    func trySubmit(
+        normalized frame: NormalizedDecodedFrame,
+        order: ResolvedFieldOrder,
+        discontinuity: Bool = false,
+        completion: @escaping @Sendable (VideoProcessingResult) -> Void
+    ) -> YADIFFrameAdmission {
+        var actions: [UserAction] = []
+        lock.lock()
+        guard !isDraining,
+              frame.frame.generation >= generation else {
+            if isDraining {
+                actions.append(.complete(completion, .cancelled(.draining)))
+            } else {
+                counters.staleGenerationDrops &+= 1
+                metrics?.recordStaleGenerationDrop()
+                actions.append(.complete(completion, .cancelled(.staleGeneration)))
+            }
+            enqueueUserActionsLocked(actions)
+            lock.unlock()
+            driveUserActions()
+            return .accepted
+        }
+
+        // A submit can add the next unemitted reference or ready job. Check
+        // before changing either collection, while holding the same lock used
+        // by the scheduler and command completion retirement.
+        if readyJobs.count + window.unemittedCount >= maximumPendingFrames,
+           submissionSchedulingPaused
+            || occupiedSubmissionSlotCountLocked >= maximumInFlight
+            || !readyJobs.isEmpty {
+            lock.unlock()
+            return .retry
+        }
+
+        if frame.frame.generation > generation {
+            resetLocked(to: frame.frame.generation, actions: &actions)
+        }
+        pendingCompletions[InputKey(frame), default: []].append(completion)
+        let transition = window.push(frame, order: order, discontinuity: discontinuity)
+        consumeLocked(transition, actions: &actions)
+        // The admission check above makes a queue-pressure shed unreachable
+        // for HLS work. Keep the normal invariant checker for all other paths.
+        enforcePendingBoundLocked(actions: &actions)
+        finishDrainIfPossibleLocked(actions: &actions)
+        recordDepthsLocked()
+        enqueueUserActionsLocked(actions)
+        lock.unlock()
+        driveUserActions()
+        driveScheduler()
+        return .accepted
+    }
+
+    func installCapacityReleaseSink(_ sink: @escaping @Sendable () -> Void) {
+        lock.lock()
+        capacityReleaseSink = sink
+        lock.unlock()
+    }
+
+    func setSubmissionSchedulingPaused(_ paused: Bool) {
+        lock.lock()
+        let shouldDrive = submissionSchedulingPaused && !paused
+        submissionSchedulingPaused = paused
+        lock.unlock()
+        if shouldDrive { driveScheduler() }
+    }
+
     public func drain(
         completion: @escaping @Sendable () -> Void
     ) {
@@ -533,7 +619,9 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         while true {
             var actions: [UserAction] = []
             lock.lock()
-            if occupiedSubmissionSlotCountLocked < maximumInFlight, !readyJobs.isEmpty {
+            if !submissionSchedulingPaused,
+               occupiedSubmissionSlotCountLocked < maximumInFlight,
+               !readyJobs.isEmpty {
                 let identifier = nextInFlightIdentifier
                 nextInFlightIdentifier &+= 1
                 submissionAttempts[identifier] = SubmissionAttempt(
@@ -563,10 +651,10 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         }
         lock.unlock()
 
-        var allocatedOutputs: (first: CVPixelBuffer, second: CVPixelBuffer)?
+        var allocatedOutputs: YADIFAllocatedOutputs?
         do {
             allocatedOutputs = try outputAllocator(
-                selected.ready.job.current.frame.pixelBuffer
+                selected.ready.job.current.frame
             )
         } catch let failure {
             var actions: [UserAction] = []
@@ -639,7 +727,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         do {
             try commandSubmitter.submit(
                 job: attempt.ready.job,
-                outputs: allocatedOutputs!
+                outputs: (allocatedOutputs!.first, allocatedOutputs!.second)
             ) { completion in
                 self.commandCompleted(identifier: identifier, completion: completion)
             }
@@ -713,6 +801,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         completion: YADIFCommandCompletion
     ) {
         var actions: [UserAction] = []
+        var releaseSink: (@Sendable () -> Void)?
         lock.lock()
         var completed = inFlightJobs.removeValue(forKey: identifier)
         guard completed != nil else {
@@ -754,9 +843,14 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         finishDrainIfPossibleLocked(actions: &actions)
         recordDepthsLocked()
         enqueueUserActionsLocked(actions)
+        releaseSink = capacityReleaseSink
         lock.unlock()
         driveUserActions()
         driveScheduler()
+        // Never call into the owner under the processor lock. The recipient
+        // rechecks capacity in `trySubmit`, so coalesced/spurious wake-ups are
+        // safe and a release cannot race into over-admission.
+        releaseSink?()
     }
 
     private func resetLocked(
@@ -859,16 +953,17 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         for completed: InFlightJob
     ) -> VideoProcessingFrameBatch {
         let normalized = completed.ready.job.current
-        let first = VideoPresentationFrame(
+        let firstFrame = VideoPresentationFrame(
             pixelBuffer: completed.outputs.first,
             presentationTimeStamp: normalized.presentationTimeStamp,
             duration: normalized.fieldDuration,
             generation: normalized.frame.generation,
             sequenceNumber: completed.ready.firstSequenceNumber,
             sourceAccessUnitID: normalized.frame.accessUnitID,
-            formatMetadata: normalized.frame.formatMetadata
+            formatMetadata: normalized.frame.formatMetadata,
+            outputBackingTail: completed.outputs.outputBackingTail
         )
-        let second = VideoPresentationFrame(
+        let secondFrame = VideoPresentationFrame(
             pixelBuffer: completed.outputs.second,
             presentationTimeStamp: CMTimeAdd(
                 normalized.presentationTimeStamp,
@@ -878,9 +973,23 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             generation: normalized.frame.generation,
             sequenceNumber: completed.ready.firstSequenceNumber + 1,
             sourceAccessUnitID: normalized.frame.accessUnitID,
-            formatMetadata: normalized.frame.formatMetadata
+            formatMetadata: normalized.frame.formatMetadata,
+            outputBackingTail: completed.outputs.outputBackingTail
         )
-        return VideoProcessingFrameBatch(first: first, remaining: [second])
+        let order = completed.ready.job.order
+        let secondParity: FieldParity = order.parity == .top ? .bottom : .top
+        return VideoProcessingFrameBatch(
+            first: VideoProcessingOutputFrame(
+                frame: firstFrame,
+                origin: .metalYADIF(field: order.parity),
+                resolvedFieldOrder: order
+            ),
+            remaining: [VideoProcessingOutputFrame(
+                frame: secondFrame,
+                origin: .metalYADIF(field: secondParity),
+                resolvedFieldOrder: order
+            )]
+        )
     }
 
     private static func processingResult(for failure: YADIFFailure) -> VideoProcessingResult {

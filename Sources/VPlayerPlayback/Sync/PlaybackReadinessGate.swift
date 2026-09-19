@@ -166,7 +166,7 @@ public final class PlaybackReadinessGate {
             anchorLeadTime
         )
         guard anchorHostTime.isNumeric else { return false }
-        clock.anchor(mediaTime: anchorPTS, atHostTime: anchorHostTime, rate: 1)
+        clock.anchor(mediaTime: anchorPTS, atHostTime: anchorHostTime, rate: 0)
         minimumRecoveryAnchorPTS = nil
         audioOnlyOpen = true
         isOpen = true
@@ -287,7 +287,7 @@ public final class PlaybackReadinessGate {
             anchorLeadTime
         )
         guard anchorHostTime.isNumeric else { return false }
-        clock.anchor(mediaTime: commonPTS, atHostTime: anchorHostTime, rate: 1)
+        clock.anchor(mediaTime: commonPTS, atHostTime: anchorHostTime, rate: 0)
         minimumRecoveryAnchorPTS = nil
         audioOnlyOpen = false
         isOpen = true

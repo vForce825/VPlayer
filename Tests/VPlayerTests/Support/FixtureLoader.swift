@@ -5,15 +5,28 @@
 import Foundation
 
 enum FixtureLoader {
-    static func data(_ relativePath: String, file: StaticString = #filePath) throws -> Data {
+    static func url(_ relativePath: String, file: StaticString = #filePath) throws -> URL {
         let bundle = Bundle(for: BundleToken.self)
         let parts = relativePath.split(separator: "/").map(String.init)
-        let filename = parts.last!
-        let directory = parts.dropLast().joined(separator: "/")
-        guard let url = bundle.url(forResource: filename, withExtension: nil, subdirectory: directory) else {
+        guard let filename = parts.last else {
             throw NSError(domain: "FixtureLoader", code: 1, userInfo: [NSLocalizedDescriptionKey: relativePath])
         }
-        return try Data(contentsOf: url)
+        let directory = parts.dropLast().joined(separator: "/")
+        if let bundleURL = bundle.url(forResource: filename, withExtension: nil, subdirectory: directory.isEmpty ? nil : directory) {
+            return bundleURL
+        }
+        let thisFile = URL(fileURLWithPath: "\(file)")
+        let mediaDir = thisFile.deletingLastPathComponent().deletingLastPathComponent().appending(component: "Fixtures").appending(component: "Media")
+        let sourceURL = mediaDir.appending(path: relativePath)
+        if FileManager.default.fileExists(atPath: sourceURL.path) {
+            return sourceURL
+        }
+        throw NSError(domain: "FixtureLoader", code: 1, userInfo: [NSLocalizedDescriptionKey: "Fixture not found: \(relativePath)"])
+    }
+
+    static func data(_ relativePath: String, file: StaticString = #filePath) throws -> Data {
+        let u = try url(relativePath, file: file)
+        return try Data(contentsOf: u)
     }
 }
 

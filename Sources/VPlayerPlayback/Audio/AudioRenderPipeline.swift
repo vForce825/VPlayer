@@ -269,6 +269,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     convenience init(
         synchronizer: AVSampleBufferRenderSynchronizer,
         executor: PlaybackSerialExecutor,
+        routeMonitor: any AudioRouteMonitoring,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void,
         clockMode: AudioClockMode = .standalone,
         readinessSink: (@Sendable (AudioRenderReadinessChange, MediaGeneration) -> Void)? = nil
@@ -279,7 +280,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             failureSink: failureSink,
             rendererFactory: SystemAudioRendererFactory(),
             decoderFactory: LivePCMAudioDecoderFactory(),
-            routeMonitor: AudioOutputRouteMonitor(executor: executor),
+            routeMonitor: routeMonitor,
             decodeCapabilityChecker: CoreAudioDecodeCapabilityChecker(),
             pcmOutputValidator: PCMOutputFormatValidator(),
             clockMode: clockMode,

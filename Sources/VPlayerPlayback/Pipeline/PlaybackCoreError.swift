@@ -23,6 +23,7 @@ enum PlaybackCoreError: Error, Sendable, Equatable {
     case renderTextureMapping
     case metalCommand(String)
     case cancelled
+    case controlEventCapacityExceeded
 }
 
 extension PlaybackCoreError {
@@ -37,7 +38,7 @@ extension PlaybackCoreError {
              .videoSampleBuffer, .videoRendererFailed, .audioRendererFailed,
              .renderTextureMapping, .metalCommand:
             .retrySameRequest
-        case .cancelled:
+        case .cancelled, .controlEventCapacityExceeded:
             .doNotRetry
         }
     }

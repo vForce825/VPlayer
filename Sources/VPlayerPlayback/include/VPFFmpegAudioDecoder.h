@@ -17,6 +17,22 @@ extern "C" {
 
 typedef struct VPFFAudioDecoder VPFFAudioDecoder;
 
+typedef enum {
+    VPFF_AUDIO_ALLOCATION_EXTRADATA = 0,
+    VPFF_AUDIO_ALLOCATION_PACKET = 1,
+    VPFF_AUDIO_ALLOCATION_TOKEN = 2,
+    VPFF_AUDIO_ALLOCATION_RESAMPLER = 3,
+} VPFFAudioAllocationRole;
+
+typedef void *(*VPFFAudioAllocationReserve)(void *context, size_t bytes,
+                                             VPFFAudioAllocationRole role);
+typedef void (*VPFFAudioAllocationRelease)(void *context, void *token);
+typedef struct {
+    void *context;
+    VPFFAudioAllocationReserve reserve;
+    VPFFAudioAllocationRelease release;
+} VPFFAudioAllocationAdmission;
+
 typedef struct {
     /* Borrowed only until the synchronous callback returns. */
     const float *interleaved;
@@ -43,6 +59,7 @@ int32_t vp_ffmpeg_audio_decoder_create(
     size_t extradata_size,
     VPFFPCMCallback callback,
     void *context,
+    const VPFFAudioAllocationAdmission *admission,
     VPFFAudioDecoder **out_decoder
 );
 
@@ -53,6 +70,9 @@ int32_t vp_ffmpeg_audio_decoder_push(
     size_t size,
     int64_t pts
 );
+
+/* Sends a real NULL packet, emits decoder and swr tails, and returns AVERROR_EOF. */
+int32_t vp_ffmpeg_audio_decoder_drain(VPFFAudioDecoder *decoder);
 
 void vp_ffmpeg_audio_decoder_flush(VPFFAudioDecoder *decoder);
 void vp_ffmpeg_audio_decoder_destroy(VPFFAudioDecoder *decoder);

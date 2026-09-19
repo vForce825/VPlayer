@@ -81,6 +81,14 @@ public extension PlaybackEngine {
     func setTuning(_ tuning: PlaybackTuning) async {}
 }
 
+/// 只有共享同一呈现Relay与身份Authority的引擎才能提供该能力。
+public protocol PlaybackPresentationControlling: PlaybackEngine {
+    func presentations() throws -> AsyncStream<PlaybackPresentationReplacement>
+    func claimPresentationMountOwnership(for replacement: PlaybackPresentationReplacement)
+        -> PlaybackPresentationMountClaimResult
+    func failPresentationControl()
+}
+
 /// The buffering knobs that decide how much slack the pipeline keeps between the
 /// decoder and the display.
 ///

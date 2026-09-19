@@ -13,10 +13,12 @@ import XCTest
 final class PlaybackFixtureIntegrationTests: XCTestCase {
     private static let expectedFixturePaths: Set<String> = [
         "ac3-48k-5point1.mov",
+        "eac3-main-6x1block-5.1.eac3",
         "hls/master.m3u8",
         "hls/segment0.ts",
         "interlaced-h264-mp2.ts",
         "progressive-h264-aac.ts",
+        "supported-audio-coverage.json",
     ]
 
     func testFixtureManifestStrictlyCoversCommittedHTTPMedia() throws {
@@ -253,7 +255,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
                 executor: executor,
                 eventSink: { event in
                 switch event {
-                case let .frame(frame):
+                case let .frame(frame, _):
                     processor.submit(frame) { decoded.record($0) }
                 case let .recoverableFailure(failure, _),
                      let .fatalFailure(failure, _):

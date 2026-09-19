@@ -9,6 +9,18 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class EAC3AudioCodecProfileTests: XCTestCase {
+    func testInspectorFollowsFFmpegStereoInfoMetadataOrderForJOCHeader() throws {
+        let frame = Data([
+            0x0B, 0x77, 0x00, 0x07, 0x34, 0x80, 0x08, 0x40,
+            0x82, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ])
+
+        let inspected = try EAC3FrameInspector.inspect(frame)
+
+        XCTAssertEqual(inspected.bsmod, 0)
+        XCTAssertEqual(inspected.hasJOC, true)
+    }
+
     func testEAC3Retains256512768And1536SampleBlockCounts() throws {
         let source = AudioTrackDescriptor(
             streamIndex: 1,
@@ -22,7 +34,7 @@ final class EAC3AudioCodecProfileTests: XCTestCase {
 
         for samples: Int32 in [256, 512, 768, 1_536] {
             let inspected = try profile.inspect(FramedCompressedAudioFrame(
-                payload: makeEAC3Frame(byteCount: 8),
+                payload: makeEAC3Frame(blockCount: Int(samples / 256), channels: 6),
                 presentationTimeStamp: .zero,
                 parserSampleCount: samples,
                 parserSampleRate: 48_000,
@@ -37,7 +49,7 @@ final class EAC3AudioCodecProfileTests: XCTestCase {
         }
 
         XCTAssertThrowsError(try profile.inspect(FramedCompressedAudioFrame(
-            payload: makeEAC3Frame(byteCount: 8),
+            payload: makeEAC3Frame(blockCount: 6, channels: 6),
             presentationTimeStamp: .zero,
             parserSampleCount: 1_024,
             parserSampleRate: 48_000,
@@ -56,7 +68,7 @@ final class EAC3AudioCodecProfileTests: XCTestCase {
             extradata: Data()
         )
         let profile = EAC3AudioCodecProfile()
-        let valid = makeEAC3Frame(byteCount: 8)
+        let valid = makeEAC3Frame(blockCount: 6, channels: 2)
         let parsed: (Data) -> FramedCompressedAudioFrame = { payload in
             FramedCompressedAudioFrame(
                 payload: payload,
@@ -73,14 +85,18 @@ final class EAC3AudioCodecProfileTests: XCTestCase {
         XCTAssertThrowsError(try profile.inspect(parsed(valid + Data([0x00])), source: source))
     }
 
-    private func makeEAC3Frame(byteCount: Int) -> Data {
-        precondition(byteCount >= 4 && byteCount <= 4_096 && byteCount.isMultiple(of: 2))
-        let frameSizeCode = byteCount / 2 - 1
-        return Data([
-            0x0B,
-            0x77,
-            UInt8((frameSizeCode >> 8) & 0x07),
-            UInt8(frameSizeCode & 0xFF),
-        ]) + Data(repeating: 0xA5, count: byteCount - 4)
+    private func makeEAC3Frame(blockCount: Int, channels: Int32) -> Data {
+        EAC3SemanticFixture.make(
+            sampleRate: 48_000,
+            blockCount: blockCount,
+            streamType: 0,
+            substreamID: 0,
+            bsid: 16,
+            bsmod: 0,
+            audioCodingMode: channels == 6 ? 7 : 2,
+            hasLFE: channels == 6,
+            hasInfoMetadata: true,
+            hasJOC: false
+        )
     }
 }

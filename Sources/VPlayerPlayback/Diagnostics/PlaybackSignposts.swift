@@ -12,6 +12,10 @@ enum PlaybackSignpostSpan: Sendable {
     case renderDraw
     case modeSwitch
     case reanchor
+    case hlsSegmentWrite
+    case hlsPlaylistPublish
+    case hlsWatchdogCheck
+    case hlsRecoveryTransaction
 }
 
 struct PlaybackSignpostToken: @unchecked Sendable {
@@ -102,6 +106,30 @@ final class PlaybackSignposts: @unchecked Sendable {
                 id: identifier,
                 "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
             )
+        case .hlsSegmentWrite:
+            state = signposter.beginInterval(
+                "HLS segment write",
+                id: identifier,
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
+            )
+        case .hlsPlaylistPublish:
+            state = signposter.beginInterval(
+                "HLS playlist publish",
+                id: identifier,
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
+            )
+        case .hlsWatchdogCheck:
+            state = signposter.beginInterval(
+                "HLS watchdog check",
+                id: identifier,
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
+            )
+        case .hlsRecoveryTransaction:
+            state = signposter.beginInterval(
+                "HLS recovery transaction",
+                id: identifier,
+                "channel=\(channel, privacy: .public) correlation=\(boundedCorrelation, privacy: .public)"
+            )
         }
         return PlaybackSignpostToken(span: span, state: state)
     }
@@ -120,6 +148,14 @@ final class PlaybackSignposts: @unchecked Sendable {
             signposter.endInterval("Mode switch", token.state)
         case .reanchor:
             signposter.endInterval("Reanchor", token.state)
+        case .hlsSegmentWrite:
+            signposter.endInterval("HLS segment write", token.state)
+        case .hlsPlaylistPublish:
+            signposter.endInterval("HLS playlist publish", token.state)
+        case .hlsWatchdogCheck:
+            signposter.endInterval("HLS watchdog check", token.state)
+        case .hlsRecoveryTransaction:
+            signposter.endInterval("HLS recovery transaction", token.state)
         }
     }
 }

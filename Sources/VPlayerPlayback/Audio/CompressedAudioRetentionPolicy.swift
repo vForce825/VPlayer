@@ -55,6 +55,9 @@ enum CompressedAudioRetentionPolicy {
         maximumCount: 96,
         maximumOwnedBytes: 4 * 1_024 * 1_024
     )
+    /// pending lane 的硬包络由两个可恢复软窗口组成；AudioService 的 proof
+    /// 索引引用同一 typed limit，不能另抄裸常数。
+    static let pendingHardCount = pending.maximumCount * 2
     static let continuity = CompressedAudioRetentionLimits.production(
         maximumCount: 512,
         maximumOwnedBytes: 8 * 1_024 * 1_024

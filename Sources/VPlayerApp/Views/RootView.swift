@@ -99,6 +99,7 @@ struct RootView: View {
             FullScreenPlayerView(
                 channelPresentation: playerChannelPresentation(for: request),
                 engine: dependencies.playbackEngine,
+                presentationController: dependencies.playbackPresentationController,
                 presentationProvider: dependencies.playbackPresentationProvider,
                 mediaInformationProvider: dependencies.playbackMediaInformationProvider,
                 metricsProvider: dependencies.playbackMetricsProvider,

@@ -9,6 +9,325 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class FFmpegDemuxerTests: XCTestCase {
+    func testUnknownExplicitRoleIsCopiedAsUnclassifiableRatherThanAbsent() throws {
+        for scenario in [VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_TOKEN,
+                         VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_COMMENT,
+                         VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_DUB] {
+            let bridge = Task11ProductionExtrasDemuxBridge(scenario: scenario)
+            let demuxer = FFmpegDemuxer(bridge: bridge)
+            let received = expectation(description: "tracks \(scenario.rawValue)")
+            let tracks = Task22LockedValue<DemuxTrackSet?>(nil)
+            try demuxer.start(url: URL(string: "https://example.invalid/source.ts")!) { event in
+                if case let .tracks(value) = event {
+                    tracks.set(value)
+                    received.fulfill()
+                }
+            }
+            wait(for: [received], timeout: 1)
+            XCTAssertEqual(tracks.value?.audio?.metadata.roleEvidence, .unclassifiable)
+            XCTAssertNil(tracks.value?.audio?.metadata.role)
+        }
+    }
+
+    func testPrimaryReceiptIsRebuiltOrRejectedByProductionRefresh() {
+        var competing = VPFFPrimaryRefreshDebugResult()
+        XCTAssertEqual(vp_ffmpeg_demuxer_debug_refresh_audio_primary(
+            VPFF_PRIMARY_REFRESH_DEBUG_COMPETING_AUDIO, &competing), 0)
+        XCTAssertEqual(competing.initial_audio_count, 1)
+        XCTAssertEqual(competing.refreshed_audio_count, 2)
+        XCTAssertEqual(competing.refreshed_basis, VPFF_AUDIO_PRIMARY_NONE)
+        XCTAssertEqual(competing.discontinuity_count, 1)
+
+        var defaults = VPFFPrimaryRefreshDebugResult()
+        XCTAssertEqual(vp_ffmpeg_demuxer_debug_refresh_audio_primary(
+            VPFF_PRIMARY_REFRESH_DEBUG_DEFAULT_DRIFT, &defaults), 0)
+        XCTAssertEqual(defaults.initial_basis, VPFF_AUDIO_PRIMARY_UNIQUE_DEFAULT)
+        XCTAssertEqual(defaults.refreshed_basis, VPFF_AUDIO_PRIMARY_NONE)
+        XCTAssertEqual(defaults.discontinuity_count, 1)
+
+        var role = VPFFPrimaryRefreshDebugResult()
+        XCTAssertEqual(vp_ffmpeg_demuxer_debug_refresh_audio_primary(
+            VPFF_PRIMARY_REFRESH_DEBUG_ROLE_DRIFT, &role), 0)
+        XCTAssertEqual(role.initial_basis, VPFF_AUDIO_PRIMARY_UNIQUE_DEFAULT)
+        XCTAssertEqual(role.refreshed_basis, VPFF_AUDIO_PRIMARY_NONE)
+        XCTAssertEqual(role.discontinuity_count, 1)
+
+        var removed = VPFFPrimaryRefreshDebugResult()
+        XCTAssertLessThan(vp_ffmpeg_demuxer_debug_refresh_audio_primary(
+            VPFF_PRIMARY_REFRESH_DEBUG_SELECTED_REMOVED, &removed), 0)
+    }
+    func testAdmittedDemuxWaitsBeforeSecondBorrowedCopyUntilLastAliasReleases() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 8,
+            applicationLedger: ledger
+        )
+        let admissionProbe = DemuxAdmissionGateProbe(admission)
+        let firstCallbackReturned = DispatchSemaphore(value: 0)
+        let secondCallbackReturned = DispatchSemaphore(value: 0)
+        let callbackReturnCount = DemuxTestCounter()
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([1, 2])))
+            callbackReturnCount.increment()
+            firstCallbackReturned.signal()
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([3, 4])))
+            callbackReturnCount.increment()
+            secondCallbackReturned.signal()
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+        let retained = AdmittedDemuxEventRecorder()
+        let firstOwnerReceived = DispatchSemaphore(value: 0)
+        let terminal = expectation(description: "admitted demux terminal")
+        let subject = FFmpegDemuxer(bridge: bridge, capacity: 4)
+
+        try subject.start(url: try httpURL(), admission: admissionProbe) { envelope in
+            if envelope.isTerminal { terminal.fulfill() }
+            else {
+                retained.append(envelope)
+                firstOwnerReceived.signal()
+            }
+        }
+
+        XCTAssertEqual(firstCallbackReturned.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(admissionProbe.waitUntilAttemptCount(2),
+                      "producer must reach the real second admission gate")
+        XCTAssertEqual(firstOwnerReceived.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(callbackReturnCount.value, 1,
+                       "second borrowed callback cannot return through the occupied gate")
+        retained.assertPacketData([Data([1, 2])])
+        XCTAssertEqual(admission.usage, .init(count: 1, bytes: 2, cancelled: false))
+        XCTAssertGreaterThan(ledger.chargedBytes, 2)
+
+        retained.assertFirstPacketBorrowSupportsSmallDataSliceAndCOW()
+        XCTAssertEqual(callbackReturnCount.value, 1)
+        XCTAssertEqual(admission.usage.count, 1, "retained owner is the final alias")
+        retained.removeFirstOwner()
+        XCTAssertEqual(secondCallbackReturned.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(callbackReturnCount.value, 2)
+        wait(for: [terminal], timeout: 2)
+        retained.assertPacketData([Data([3, 4])])
+        XCTAssertEqual(admission.usage.count, 1)
+        retained.removeAll()
+        XCTAssertEqual(admission.usage, .init(count: 0, bytes: 0, cancelled: false))
+        XCTAssertEqual(ledger.chargedBytes, 0)
+        XCTAssertEqual(waitForDestroy(bridge.handle), 1)
+    }
+
+    func testAdmittedDemuxCancelWakesDemandWaitAndReentrantSinkDeliversOneTerminal() throws {
+        let admission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 8,
+            applicationLedger: HLSDeliveryApplicationChargeLedger()
+        )
+        let secondCallbackEntered = DispatchSemaphore(value: 0)
+        let producerReturned = DispatchSemaphore(value: 0)
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([1])))
+            secondCallbackEntered.signal()
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([2])))
+            producerReturned.signal()
+            handle.emitTerminal(VPFF_EVENT_CANCELLED)
+            return 0
+        }
+        let retained = AdmittedDemuxEventRecorder()
+        let events = LockedEventList()
+        let terminal = expectation(description: "single cancellation terminal")
+        let subject = FFmpegDemuxer(bridge: bridge)
+        let cancelBox = DemuxerCancelBox(subject)
+        try subject.start(url: try httpURL(), admission: admission) { envelope in
+            if envelope.isTerminal {
+                envelope.withBorrowedEvent(events.append)
+                terminal.fulfill()
+            } else {
+                retained.append(envelope)
+                cancelBox.cancel()
+            }
+        }
+
+        XCTAssertEqual(secondCallbackEntered.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(producerReturned.wait(timeout: .now() + 2), .success)
+        wait(for: [terminal], timeout: 2)
+        XCTAssertEqual(events.snapshot.filter(\.isTerminal), [.cancelled])
+        XCTAssertEqual(waitForDestroy(bridge.handle), 1)
+        XCTAssertEqual(admission.usage.count, 1, "external alias owns the final charge")
+        retained.removeAll()
+        XCTAssertEqual(admission.usage.count, 0)
+    }
+
+    func testAdmittedDemuxRejectsOversizedBorrowedSpanBeforeApplicationReservation() throws {
+        let scripts: [FakeFFmpegDemuxBridge.RunScript] = [
+            { handle in handle.emitOversizedPacketSize(); return 0 },
+            { handle in handle.emitOversizedTrackExtradata(); return 0 },
+        ]
+        for script in scripts {
+            let ledger = HLSDeliveryApplicationChargeLedger()
+            let admission = HLSDataPlaneAdmission(
+                capacity: 1,
+                maximumBytes: HLSDeliveryApplicationChargeLedger.documentedApplicationHardBytes,
+                applicationLedger: ledger
+            )
+            let bridge = FakeFFmpegDemuxBridge(runScript: script)
+            let terminal = expectation(description: "oversized terminal")
+            let capture = AdmittedDemuxPayloadCapture()
+            let subject = FFmpegDemuxer(bridge: bridge)
+
+            try subject.start(url: try httpURL(), admission: admission) { envelope in
+                envelope.withBorrowedEvent(capture.record)
+                if envelope.isTerminal { terminal.fulfill() }
+            }
+
+            wait(for: [terminal], timeout: 2)
+            XCTAssertEqual(
+                capture.event,
+                .failure(.demuxRead(FFmpegDemuxer.malformedEventErrorCode))
+            )
+            XCTAssertEqual(admission.usage, .init(count: 0, bytes: 0, cancelled: false))
+            XCTAssertEqual(
+                ledger.maximumChargedBytes,
+                0,
+                "invalid raw length must fail before reserve/copy"
+            )
+        }
+    }
+
+    func testAdmittedDemuxPermanentlyRejectsLegalPacketAboveAdmissionLimitBeforeCopy() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 1,
+            applicationLedger: ledger
+        )
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([1, 2])))
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+        let events = LockedEventList()
+        let unexpectedNonterminalCount = DemuxTestCounter()
+        let terminal = expectation(description: "permanent admission failure")
+        let subject = FFmpegDemuxer(bridge: bridge)
+
+        try subject.start(url: try httpURL(), admission: admission) { envelope in
+            if envelope.isTerminal {
+                envelope.withBorrowedEvent(events.append)
+                terminal.fulfill()
+            } else {
+                unexpectedNonterminalCount.increment()
+            }
+        }
+
+        wait(for: [terminal], timeout: 2)
+        XCTAssertEqual(
+            events.snapshot,
+            [.failure(.demuxRead(FFmpegDemuxer.oversizedValueErrorCode))],
+            "permanent admission rejection must win over the later native EOS"
+        )
+        XCTAssertEqual(bridge.handle?.cancelCount, 1)
+        XCTAssertEqual(unexpectedNonterminalCount.value, 0,
+                       "failure-path test must not retain a naked media payload")
+        XCTAssertEqual(admission.usage, .init(count: 0, bytes: 0, cancelled: false))
+        XCTAssertEqual(ledger.maximumChargedBytes, 0,
+                       "permanent rejection must precede copy and reservation")
+        XCTAssertEqual(waitForDestroy(bridge.handle), 1)
+    }
+
+    func testExternallyCancelledAdmissionConvergesDemuxToSingleCancelledTerminal() throws {
+        let admission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 8,
+            applicationLedger: HLSDeliveryApplicationChargeLedger()
+        )
+        admission.cancel()
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data([1, 2])))
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+        let events = LockedEventList()
+        let unexpectedNonterminalCount = DemuxTestCounter()
+        let terminal = expectation(description: "external admission cancellation")
+        let subject = FFmpegDemuxer(bridge: bridge)
+
+        try subject.start(url: try httpURL(), admission: admission) { envelope in
+            if envelope.isTerminal {
+                envelope.withBorrowedEvent(events.append)
+                terminal.fulfill()
+            } else {
+                unexpectedNonterminalCount.increment()
+            }
+        }
+
+        wait(for: [terminal], timeout: 2)
+        XCTAssertEqual(events.snapshot, [.cancelled])
+        XCTAssertEqual(unexpectedNonterminalCount.value, 0)
+        XCTAssertEqual(bridge.handle?.cancelCount, 1)
+        XCTAssertEqual(waitForDestroy(bridge.handle), 1)
+    }
+
+    func testAdmittedTrackExtradataStayInBorrowScopeUntilOwnerReleases() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 32,
+            applicationLedger: ledger
+        )
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitTracks(
+                video: .h264(extradata: Data([1, 2, 3])),
+                audio: .aac(extradata: Data([4, 5]))
+            )
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+        let terminal = expectation(description: "track terminal")
+        let retained = AdmittedDemuxEventRecorder()
+        let subject = FFmpegDemuxer(bridge: bridge)
+
+        try subject.start(url: try httpURL(), admission: admission) { envelope in
+            if envelope.isTerminal { terminal.fulfill() }
+            else { retained.append(envelope) }
+        }
+
+        wait(for: [terminal], timeout: 2)
+        retained.assertFirstTrackExtradata(video: Data([1, 2, 3]), audio: Data([4, 5]))
+        XCTAssertEqual(admission.usage.count, 1)
+        retained.removeAll()
+        XCTAssertEqual(admission.usage.count, 0)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testAdmittedEmptyPacketRemainsBorrowedUntilOwnerReleaseAndChargesTailPeak() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 1,
+            applicationLedger: ledger
+        )
+        let bridge = FakeFFmpegDemuxBridge { handle in
+            handle.emitPacket(.init(codec: VPFF_CODEC_H264, data: Data()))
+            handle.emitTerminal(VPFF_EVENT_END)
+            return 0
+        }
+        let terminal = expectation(description: "empty packet terminal")
+        let retained = AdmittedDemuxEventRecorder()
+        let subject = FFmpegDemuxer(bridge: bridge)
+
+        try subject.start(url: try httpURL(), admission: admission) { envelope in
+            if envelope.isTerminal { terminal.fulfill() }
+            else { retained.append(envelope) }
+        }
+
+        wait(for: [terminal], timeout: 2)
+        retained.assertFirstPacketData(Data())
+        XCTAssertEqual(admission.usage.count, 1, "zero-byte work still has an owner")
+        XCTAssertGreaterThan(ledger.maximumChargedBytes, 0, "tail/envelope peak is still charged")
+        retained.removeAll()
+        XCTAssertEqual(admission.usage.count, 0)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
     func testDemuxDiscontinuityRequiresExplicitTypedReasonWithoutDefault() throws {
         let source = try repositorySource("Sources/VPlayerPlayback/Demux/DemuxTypes.swift")
         XCTAssertNotNil(
@@ -687,6 +1006,440 @@ final class FFmpegDemuxerTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.size, 256)
     }
 
+    func testVersionedTrackExtrasPreserveLegacyABIAndUseStableOffsets() {
+        XCTAssertEqual(MemoryLayout<VPFFTrack>.size, 80)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEvent>.size, 256)
+        XCTAssertEqual(VPFF_DEMUX_EVENT_EXTRAS_VERSION_1, 1)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtras>.size, 16)
+        XCTAssertEqual(MemoryLayout<VPFFTrackExtrasV1>.size, 152)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV1>.offset(of: \.header), 0)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV1>.offset(of: \.video), 16)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV1>.offset(of: \.audio), 168)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV1>.size, 320)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV2>.offset(of: \.header), 0)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV2>.offset(of: \.video), 16)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV2>.offset(of: \.audio), 168)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV2>.offset(of: \.has_audio_primary_evidence), 320)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV2>.offset(of: \.audio_primary_evidence), 324)
+        XCTAssertEqual(MemoryLayout<VPFFAudioPrimaryEvidenceV1>.size, 40)
+        XCTAssertEqual(MemoryLayout<VPFFDemuxEventExtrasV2>.size, 368)
+    }
+
+    func testRejectsMalformedV2PrimaryEvidenceBeforeCopyingReceipt() throws {
+        // 若复制器接受未知 V2、截断 V2 或不自洽的 receipt，容器外部输入即可伪造主服务依据。
+        for malformed in Task22MalformedV2PrimaryEvidence.allCases {
+            let bridge = Task11ExtrasDemuxBridge { handle in
+                handle.emitMalformedV2PrimaryEvidence(malformed)
+                return 0
+            }
+            let events = try run(extrasBridge: bridge)
+            guard case let .failure(.demuxRead(code)) = events.last else {
+                XCTFail("\(malformed) 未被拒绝")
+                continue
+            }
+            XCTAssertLessThan(code, 0, "\(malformed) 必须作为 malformed event 终止")
+            XCTAssertEqual(events.count, 1, "\(malformed) 不得先发布 tracks")
+        }
+    }
+
+    func testMasteringDisplayConstructorRequiresEveryChromaticityPairInsideUnitTriangle() {
+        let nearOne = DemuxHDRRational(num: Int32.max - 1, den: Int32.max)!
+        let nearZero = DemuxHDRRational(num: 1, den: Int32.max)!
+        let validPairs: [(x: DemuxHDRRational, y: DemuxHDRRational)] = [
+            (nearOne, nearZero),
+            (DemuxHDRRational(num: 13, den: 50)!, DemuxHDRRational(num: 69, den: 100)!),
+            (DemuxHDRRational(num: 3, den: 20)!, DemuxHDRRational(num: 3, den: 50)!),
+            (DemuxHDRRational(num: 3_127, den: 10_000)!, DemuxHDRRational(num: 329, den: 1_000)!),
+        ]
+        func metadata(
+            _ pairs: [(x: DemuxHDRRational, y: DemuxHDRRational)]
+        ) -> DemuxMasteringDisplayMetadata? {
+            DemuxMasteringDisplayMetadata(
+                redX: pairs[0].x,
+                redY: pairs[0].y,
+                greenX: pairs[1].x,
+                greenY: pairs[1].y,
+                blueX: pairs[2].x,
+                blueY: pairs[2].y,
+                whitePointX: pairs[3].x,
+                whitePointY: pairs[3].y,
+                minimumLuminance: DemuxHDRRational(num: 0, den: 1)!,
+                maximumLuminance: DemuxHDRRational(num: 1_000, den: 1)!
+            )
+        }
+
+        XCTAssertNotNil(metadata(validPairs), "精确落在单位三角形边界应合法")
+        for (index, label) in ["red", "green", "blue", "white point"].enumerated() {
+            var invalidPairs = validPairs
+            invalidPairs[index] = (
+                DemuxHDRRational(num: 3, den: 5)!,
+                DemuxHDRRational(num: 1, den: 2)!
+            )
+            XCTAssertNil(metadata(invalidPairs), "\(label) 的 x+y>1 应被拒绝")
+        }
+    }
+
+    func testCopiesAllBorrowedTrackExtrasAndCarriesMetadataDriftOnFormatChange() throws {
+        let bridge = Task11ExtrasDemuxBridge { handle in
+            handle.emitTracks(
+                video: true,
+                audio: true,
+                videoLanguage: Array("zh-Hant".utf8),
+                audioLanguage: Array("en".utf8)
+            ) { extras in
+                extras.video.presence = 0xFFF
+                extras.video.role = VPFF_TRACK_ROLE_MAIN
+                extras.video.service = VPFF_TRACK_SERVICE_INDEPENDENT_MAIN
+                extras.video.dispositions = 0x3
+                extras.video.sample_aspect_ratio = .init(num: 4, den: 3)
+                extras.video.color_range = VPFF_COLOR_RANGE_FULL
+                extras.video.color_primaries = VPFF_COLOR_PRIMARIES_BT2020
+                extras.video.color_transfer = VPFF_COLOR_TRANSFER_PQ
+                extras.video.color_matrix = VPFF_COLOR_MATRIX_BT2020_NONCONSTANT
+                extras.video.chroma_location = VPFF_CHROMA_LOCATION_TOP_LEFT
+                Task11ExtrasDemuxHandle.fillMasteringDisplay(&extras.video)
+                extras.video.maximum_content_light_level = 1_000
+                extras.video.maximum_frame_average_light_level = 400
+
+                extras.audio.presence = 0xF
+                extras.audio.role = VPFF_TRACK_ROLE_ALTERNATE
+                extras.audio.service = VPFF_TRACK_SERVICE_ASSOCIATED
+                extras.audio.dispositions = 0x30
+            }
+            handle.emitTracks(
+                video: true,
+                audio: true,
+                kind: VPFF_EVENT_DISCONTINUITY,
+                reason: VPFF_DISCONTINUITY_FORMAT_CHANGE,
+                videoLanguage: Array("zh-Hant".utf8),
+                audioLanguage: Array("en".utf8)
+            ) { extras in
+                extras.video.presence = 0xFFF
+                extras.video.role = VPFF_TRACK_ROLE_MAIN
+                extras.video.service = VPFF_TRACK_SERVICE_INDEPENDENT_MAIN
+                extras.video.dispositions = 0x3
+                extras.video.sample_aspect_ratio = .init(num: 4, den: 3)
+                extras.video.color_range = VPFF_COLOR_RANGE_FULL
+                extras.video.color_primaries = VPFF_COLOR_PRIMARIES_BT2020
+                extras.video.color_transfer = VPFF_COLOR_TRANSFER_PQ
+                extras.video.color_matrix = VPFF_COLOR_MATRIX_BT2020_NONCONSTANT
+                extras.video.chroma_location = VPFF_CHROMA_LOCATION_TOP_LEFT
+                Task11ExtrasDemuxHandle.fillMasteringDisplay(&extras.video)
+                extras.video.maximum_content_light_level = 2_000
+                extras.video.maximum_frame_average_light_level = 800
+
+                extras.audio.presence = 0xF
+                extras.audio.role = VPFF_TRACK_ROLE_ALTERNATE
+                extras.audio.service = VPFF_TRACK_SERVICE_ASSOCIATED
+                extras.audio.dispositions = 0x30
+            }
+            handle.emitTerminal()
+            return 0
+        }
+
+        let events = try run(extrasBridge: bridge)
+        guard case let .tracks(first) = events[0],
+              case let .discontinuity(second, reason) = events[1] else {
+            return XCTFail("缺少扩展轨道事件")
+        }
+        XCTAssertEqual(reason, .formatChange)
+        XCTAssertEqual(first.video?.metadata.role, .main)
+        XCTAssertEqual(first.video?.metadata.language, "zh-Hant")
+        XCTAssertEqual(first.video?.metadata.service, .independentMain)
+        XCTAssertEqual(first.video?.metadata.dispositions, [.default, .forced])
+        XCTAssertEqual(first.audio?.metadata.role, .alternate)
+        XCTAssertEqual(first.audio?.metadata.language, "en")
+        XCTAssertEqual(first.audio?.metadata.service, .associated)
+        XCTAssertEqual(first.audio?.metadata.dispositions, [.commentary, .dependent])
+        XCTAssertEqual(first.video?.videoMetadata.sampleAspectRatio, MediaRational(num: 4, den: 3))
+        XCTAssertEqual(first.video?.videoMetadata.range, .full)
+        XCTAssertEqual(first.video?.videoMetadata.primaries, .bt2020)
+        XCTAssertEqual(first.video?.videoMetadata.transfer, .pq)
+        XCTAssertEqual(first.video?.videoMetadata.matrix, .bt2020Nonconstant)
+        XCTAssertEqual(first.video?.videoMetadata.chromaLocation, .topLeft)
+        XCTAssertEqual(first.video?.videoMetadata.masteringDisplay?.displayPrimariesX, [
+            DemuxHDRRational(num: 17, den: 50)!,
+            DemuxHDRRational(num: 13, den: 50)!,
+            DemuxHDRRational(num: 3, den: 20)!,
+        ])
+        XCTAssertEqual(first.video?.videoMetadata.masteringDisplay?.maximumLuminance, DemuxHDRRational(num: 1_000, den: 1))
+        XCTAssertEqual(first.video?.videoMetadata.contentLightLevel, .init(
+            maximumContentLightLevel: 1_000,
+            maximumFrameAverageLightLevel: 400
+        ))
+        XCTAssertEqual(second.video?.videoMetadata.contentLightLevel, .init(
+            maximumContentLightLevel: 2_000,
+            maximumFrameAverageLightLevel: 800
+        ))
+    }
+
+    func testMissingExtrasStayUnknownAndDefaultDispositionDoesNotInventMainRole() throws {
+        let bridge = Task11ExtrasDemuxBridge { handle in
+            handle.emitTracks(video: true, audio: true) { extras in
+                extras.audio.presence = 1 << 3
+                extras.audio.dispositions = 1
+            }
+            handle.emitTerminal()
+            return 0
+        }
+
+        let events = try run(extrasBridge: bridge)
+        guard case let .tracks(tracks) = events[0] else { return XCTFail("缺少轨道事件") }
+        XCTAssertNil(tracks.audio?.metadata.role)
+        XCTAssertNil(tracks.audio?.metadata.language)
+        XCTAssertNil(tracks.audio?.metadata.service)
+        XCTAssertEqual(tracks.audio?.metadata.dispositions, [.default])
+        XCTAssertEqual(tracks.video?.metadata, DemuxTrackMetadata())
+        XCTAssertEqual(tracks.video?.videoMetadata, DemuxVideoMetadata())
+    }
+
+    func testRejectsMalformedVersionSizeOffsetPresenceUTF8AndRationals() throws {
+        let cases: [(String, Task11MalformedExtras)] = [
+            ("version", .version),
+            ("size", .size),
+            ("offset", .offset),
+            ("presence", .presence),
+            ("utf8", .utf8),
+            ("sample aspect ratio", .sampleAspectRatio),
+            ("mastering display", .masteringDisplay),
+            ("mastering chromaticity", .masteringChromaticity),
+            ("content light level", .contentLightLevel),
+        ]
+
+        for (label, malformed) in cases {
+            let bridge = Task11ExtrasDemuxBridge { handle in
+                handle.emitMalformedTracks(malformed)
+                return 0
+            }
+            XCTAssertEqual(
+                try run(extrasBridge: bridge).last,
+                .failure(.demuxRead(FFmpegDemuxer.malformedEventErrorCode)),
+                label
+            )
+            XCTAssertEqual(waitForDestroy(bridge.handle), 1, label)
+            XCTAssertEqual(bridge.handle?.cancelCount, 1, label)
+        }
+    }
+
+#if DEBUG
+    func testPrimaryEvidenceFromProductionSelectionCoversProgramAndFormatScopes() throws {
+        let cases: [(VPFFTrackExtrasDebugScenario, DemuxTrackSet.AudioPrimaryScope, Int, Int, DemuxTrackSet.AudioPrimaryBasis?)] = [
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_SOLE, .avProgram(index: 0, id: 1), 1, 0, .soleAudio),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MAIN, .avProgram(index: 0, id: 1), 2, 0, .explicitMain),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_UNIQUE_DEFAULT, .avProgram(index: 0, id: 1), 2, 1, .uniqueDefault),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_AMBIGUOUS, .avProgram(index: 0, id: 1), 2, 0, nil),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MULTI_DEFAULT, .avProgram(index: 0, id: 1), 2, 2, nil),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MAIN_DEFAULT_COMPETITION, .avProgram(index: 0, id: 1), 2, 1, nil),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_UNKNOWN_OR_AUXILIARY, .avProgram(index: 0, id: 1), 2, 0, nil),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_FORMAT_SCOPE, .formatStreamTableWithoutProgram, 2, 1, .uniqueDefault),
+        ]
+        for (scenario, scope, audioCount, defaultCount, basis) in cases {
+            let events = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(scenario: scenario))
+            guard case let .tracks(tracks) = events.first,
+                  let evidence = tracks.audioPrimaryEvidence else {
+                return XCTFail("\\(scenario.rawValue) 未从真实 C selection 事件复制 primary receipt")
+            }
+            XCTAssertEqual(tracks.audio?.streamIndex, evidence.selectedStreamIndex, "选中 stream 必须绑定 receipt")
+            XCTAssertEqual(tracks.selectedProgramID, scope == .formatStreamTableWithoutProgram ? nil : 1)
+            XCTAssertEqual(evidence.scope, scope)
+            XCTAssertEqual(evidence.audioStreamCount, UInt32(audioCount), "不支持 codec 也必须留在 scope")
+            XCTAssertEqual(evidence.defaultAudioStreamCount, UInt32(defaultCount))
+            XCTAssertEqual(evidence.primaryBasis, basis)
+        }
+    }
+
+    func testProductionSelectionReceiptDrivesAudioServiceSemanticAcrossEightScopes() throws {
+        let cases: [(VPFFTrackExtrasDebugScenario, AudioServiceSemantic)] = [
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_SOLE, .independentMain),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MAIN, .independentMain),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_UNIQUE_DEFAULT, .independentMain),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_AMBIGUOUS, .unknown),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MULTI_DEFAULT, .unknown),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MAIN_DEFAULT_COMPETITION, .unknown),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_UNKNOWN_OR_AUXILIARY, .unknown),
+            (VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_FORMAT_SCOPE, .independentMain),
+        ]
+        for (scenario, expectedSemantic) in cases {
+            let events = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(scenario: scenario))
+            guard case let .tracks(tracks) = events.first,
+                  let audio = tracks.audio,
+                  let evidence = tracks.audioPrimaryEvidence else {
+                XCTFail("\(scenario.rawValue) 未从 C selection 取得 audio receipt")
+                continue
+            }
+            let header: AudioServiceInputUnit?
+            if audio.codec == .ac3 {
+                let headerBytes = AssemblerTestFixtures.syntheticAC3Frame(bsmod: 0)
+                header = try AudioServiceInputUnit(
+                    identity: .init(rawValue: UInt64(scenario.rawValue)),
+                    backing: .init(identity: .init(rawValue: UInt64(scenario.rawValue) + 100), bytes: headerBytes),
+                    byteRange: .init(offset: 0, length: headerBytes.count)!,
+                    presentationTimeStamp: .zero,
+                    parserSampleCount: 1_536,
+                    parserSampleRate: audio.sampleRate,
+                    parserChannelLayout: audio.channelLayout,
+                    containerMarkedCorrupt: false
+                )
+            } else {
+                XCTAssertEqual(audio.codec, .aac, "\(scenario.rawValue) selection 不应伪造未知 codec")
+                header = nil
+            }
+            let coordinator = AudioServiceSemanticCoordinator(
+                source: audio,
+                sourceTrackIdentity: .init(streamIndex: audio.streamIndex, trackNonce: UInt64(scenario.rawValue)),
+                inputFormatGeneration: .init(rawValue: 1),
+                allocator: PlaybackIdentityAllocator(),
+                applicationLedger: HLSDeliveryApplicationChargeLedger()
+            )
+            let receipt = try coordinator.establishReceipt(
+                selectedProgramID: tracks.selectedProgramID,
+                firstInputUnit: header,
+                audioPrimaryEvidence: evidence
+            )
+            XCTAssertEqual(receipt.semantic, expectedSemantic, "\(scenario.rawValue) 必须由 C receipt 裁决")
+        }
+    }
+
+    func testProductionMapperExportsEvidenceRejectsDefaultInferenceAndDetectsMetadataDrift() throws {
+        let full = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_FULL_EVIDENCE
+        ))
+        guard case let .tracks(fullTracks) = full.first else {
+            return XCTFail("真实 C mapper 未产出轨道事件")
+        }
+        XCTAssertEqual(fullTracks.video?.metadata.role, .main)
+        XCTAssertEqual(fullTracks.video?.metadata.language, "zh-Hant")
+        XCTAssertEqual(fullTracks.video?.metadata.service, .independentMain)
+        XCTAssertEqual(fullTracks.video?.metadata.dispositions, [.default, .forced])
+        XCTAssertEqual(fullTracks.video?.videoMetadata.sampleAspectRatio, MediaRational(num: 4, den: 3))
+        XCTAssertEqual(fullTracks.video?.videoMetadata.range, .full)
+        XCTAssertEqual(fullTracks.video?.videoMetadata.primaries, .bt2020)
+        XCTAssertEqual(fullTracks.video?.videoMetadata.transfer, .pq)
+        XCTAssertEqual(fullTracks.video?.videoMetadata.matrix, .bt2020Nonconstant)
+        XCTAssertEqual(fullTracks.video?.videoMetadata.chromaLocation, .topLeft)
+        XCTAssertEqual(fullTracks.video?.videoMetadata.masteringDisplay, DemuxMasteringDisplayMetadata(
+            redX: DemuxHDRRational(num: 17, den: 50)!,
+            redY: DemuxHDRRational(num: 33, den: 100)!,
+            greenX: DemuxHDRRational(num: 13, den: 50)!,
+            greenY: DemuxHDRRational(num: 69, den: 100)!,
+            blueX: DemuxHDRRational(num: 3, den: 20)!,
+            blueY: DemuxHDRRational(num: 3, den: 50)!,
+            whitePointX: DemuxHDRRational(num: 3_127, den: 10_000)!,
+            whitePointY: DemuxHDRRational(num: 329, den: 1_000)!,
+            minimumLuminance: DemuxHDRRational(num: 1, den: 10_000)!,
+            maximumLuminance: DemuxHDRRational(num: 1_000, den: 1)!
+        ))
+        XCTAssertEqual(fullTracks.video?.videoMetadata.contentLightLevel, .init(
+            maximumContentLightLevel: 1_000,
+            maximumFrameAverageLightLevel: 400
+        ))
+        XCTAssertEqual(fullTracks.audio?.metadata.role, .commentary)
+        XCTAssertEqual(fullTracks.audio?.metadata.language, "en")
+        XCTAssertEqual(fullTracks.audio?.metadata.service, .associated)
+        XCTAssertEqual(fullTracks.audio?.metadata.dispositions, [.commentary])
+
+        let defaultOnly = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_DEFAULT_ONLY
+        ))
+        guard case let .tracks(defaultTracks) = defaultOnly.first else {
+            return XCTFail("default-only 场景未产出轨道事件")
+        }
+        XCTAssertNil(defaultTracks.audio?.metadata.role)
+        XCTAssertNil(defaultTracks.audio?.metadata.language)
+        XCTAssertNil(defaultTracks.audio?.metadata.service)
+        XCTAssertEqual(defaultTracks.audio?.metadata.dispositions, [.default])
+
+        let audioServiceMain = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_AUDIO_SERVICE_MAIN
+        ))
+        guard case let .tracks(mainServiceTracks) = audioServiceMain.first else {
+            return XCTFail("audio-service MAIN 场景未产出轨道事件")
+        }
+        XCTAssertNil(mainServiceTracks.audio?.metadata.role, "service MAIN 不是 primary track role 证据")
+        XCTAssertEqual(mainServiceTracks.audio?.metadata.service, .independentMain)
+
+        let conflict = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_SERVICE_CONFLICT
+        ))
+        guard case let .tracks(conflictTracks) = conflict.first else {
+            return XCTFail("多来源冲突场景未产出轨道事件")
+        }
+        XCTAssertNil(conflictTracks.audio?.metadata.role)
+        XCTAssertNil(conflictTracks.audio?.metadata.service, "冲突证据不得按优先级吞掉")
+        XCTAssertEqual(conflictTracks.audio?.metadata.serviceEvidence, .unclassifiable)
+        XCTAssertEqual(conflictTracks.audio?.metadata.dispositions, [.dependent])
+
+        for (label, scenario) in [
+            ("未知metadata service", VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_SERVICE_TOKEN),
+            ("Karaoke side-data", VPFF_TRACK_EXTRAS_DEBUG_KARAOKE_SERVICE),
+        ] {
+            let events = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+                scenario: scenario
+            ))
+            guard case let .tracks(tracks) = events.first else {
+                XCTFail("\(label) 场景未产出轨道事件")
+                continue
+            }
+            XCTAssertEqual(tracks.audio?.metadata.role, .main, label)
+            XCTAssertNil(tracks.audio?.metadata.service, label)
+            XCTAssertEqual(tracks.audio?.metadata.serviceEvidence, .unclassifiable, label)
+        }
+
+        let malformedAudioService = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_MALFORMED_AUDIO_SERVICE
+        ))
+        guard case let .failure(.demuxRead(code)) = malformedAudioService.last else {
+            return XCTFail("损坏audio-service side-data未被拒绝")
+        }
+        XCTAssertLessThan(code, 0)
+        XCTAssertEqual(malformedAudioService.count, 1)
+
+        let zeroMinimum = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_ZERO_MIN_LUMINANCE
+        ))
+        guard case let .tracks(zeroMinimumTracks) = zeroMinimum.first else {
+            return XCTFail("零最小亮度应是合法 MDCV")
+        }
+        XCTAssertEqual(
+            zeroMinimumTracks.video?.videoMetadata.masteringDisplay?.minimumLuminance,
+            DemuxHDRRational(num: 0, den: 1)
+        )
+
+        for (label, scenario) in [
+            ("MDCV", VPFF_TRACK_EXTRAS_DEBUG_INVALID_MASTERING_DISPLAY),
+            ("MDCV unit triangle", VPFF_TRACK_EXTRAS_DEBUG_INVALID_MASTERING_DISPLAY_SUM),
+            ("CLLI", VPFF_TRACK_EXTRAS_DEBUG_INVALID_CONTENT_LIGHT_LEVEL),
+        ] {
+            let events = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+                scenario: scenario
+            ))
+            guard case let .failure(.demuxRead(code)) = events.last else {
+                XCTFail("非自洽 \(label) 未被生产 mapper 拒绝")
+                continue
+            }
+            XCTAssertLessThan(code, 0, label)
+            XCTAssertEqual(events.count, 1, label)
+        }
+
+        let drift = try run(productionExtrasBridge: Task11ProductionExtrasDemuxBridge(
+            scenario: VPFF_TRACK_EXTRAS_DEBUG_FORMAT_DRIFT
+        ))
+        guard case let .tracks(initial) = drift.first,
+              case let .discontinuity(changed, reason) = drift.dropFirst().first else {
+            return XCTFail("元数据漂移未产出 format-change discontinuity")
+        }
+        XCTAssertEqual(reason, .formatChange)
+        XCTAssertEqual(initial.video?.videoMetadata.contentLightLevel, .init(
+            maximumContentLightLevel: 1_000,
+            maximumFrameAverageLightLevel: 400
+        ))
+        XCTAssertEqual(changed.video?.videoMetadata.contentLightLevel, .init(
+            maximumContentLightLevel: 2_000,
+            maximumFrameAverageLightLevel: 800
+        ))
+    }
+#endif
+
     func testCapacityFourBlocksFifthProducerUntilOneEventIsConsumed() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.demux.blocked-drain")
         let unblockDrain = DispatchSemaphore(value: 0)
@@ -1156,6 +1909,24 @@ final class FFmpegDemuxerTests: XCTestCase {
         return recorder.waitForTerminal()
     }
 
+    private func run(extrasBridge: Task11ExtrasDemuxBridge) throws -> [DemuxEvent] {
+        let recorder = DemuxEventRecorder()
+        let subject = FFmpegDemuxer(bridge: extrasBridge)
+        try subject.start(url: try httpURL(), sink: recorder.record)
+        return recorder.waitForTerminal()
+    }
+
+#if DEBUG
+    private func run(
+        productionExtrasBridge: Task11ProductionExtrasDemuxBridge
+    ) throws -> [DemuxEvent] {
+        let recorder = DemuxEventRecorder()
+        let subject = FFmpegDemuxer(bridge: productionExtrasBridge)
+        try subject.start(url: try httpURL(), sink: recorder.record)
+        return recorder.waitForTerminal()
+    }
+#endif
+
     private func httpURL() throws -> URL {
         try XCTUnwrap(URL(string: "https://example.invalid/live.ts"))
     }
@@ -1167,6 +1938,152 @@ final class FFmpegDemuxerTests: XCTestCase {
         }
         return handle?.destroyCount ?? 0
     }
+
+    private func waitForDestroy(_ handle: Task11ExtrasDemuxHandle?, timeout: TimeInterval = 5) -> Int {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline, handle?.destroyCount == 0 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.001))
+        }
+        return handle?.destroyCount ?? 0
+    }
+}
+
+private final class Task22LockedValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+    init(_ value: Value) { stored = value }
+    func set(_ value: Value) { lock.withLock { stored = value } }
+    var value: Value { lock.withLock { stored } }
+}
+
+private final class AdmittedDemuxEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [AdmittedDemuxEvent] = []
+
+    func append(_ value: AdmittedDemuxEvent) {
+        lock.withLock { values.append(value) }
+    }
+
+    func assertPacketData(
+        _ expected: [Data],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        lock.withLock {
+            let actual = values.compactMap { envelope in
+                var data: Data?
+                envelope.withBorrowedEvent { data = $0.packet?.data }
+                return data
+            }
+            XCTAssertEqual(actual, expected, file: file, line: line)
+        }
+    }
+
+    func assertFirstPacketBorrowSupportsSmallDataSliceAndCOW(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        lock.withLock {
+            guard let first = values.first else { return XCTFail("missing owner", file: file, line: line) }
+            first.withBorrowedEvent { event in
+                guard var data = event.packet?.data else {
+                    return XCTFail("missing packet", file: file, line: line)
+                }
+                XCTAssertEqual(data, Data([1, 2]), file: file, line: line)
+                XCTAssertEqual(data[0..<1], Data([1]), file: file, line: line)
+                data[0] = 9
+                XCTAssertEqual(data, Data([9, 2]), file: file, line: line)
+            }
+        }
+    }
+
+    func assertFirstPacketData(
+        _ expected: Data,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        lock.withLock {
+            guard let first = values.first else { return XCTFail("missing owner", file: file, line: line) }
+            first.withBorrowedEvent {
+                XCTAssertEqual($0.packet?.data, expected, file: file, line: line)
+            }
+        }
+    }
+
+    func assertFirstTrackExtradata(
+        video: Data,
+        audio: Data,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        lock.withLock {
+            guard let first = values.first else { return XCTFail("missing owner", file: file, line: line) }
+            first.withBorrowedEvent { event in
+                guard case let .tracks(tracks) = event else {
+                    return XCTFail("missing tracks", file: file, line: line)
+                }
+                XCTAssertEqual(tracks.video?.extradata, video, file: file, line: line)
+                XCTAssertEqual(tracks.audio?.extradata, audio, file: file, line: line)
+            }
+        }
+    }
+
+    func removeFirstOwner() { lock.withLock { _ = values.removeFirst() } }
+
+    func removeAll() {
+        lock.withLock { values.removeAll(keepingCapacity: false) }
+    }
+}
+
+private final class AdmittedDemuxPayloadCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedEvent: DemuxEvent?
+
+    var event: DemuxEvent? { lock.withLock { storedEvent } }
+
+    func record(_ event: DemuxEvent) { lock.withLock { storedEvent = event } }
+}
+
+private final class DemuxerCancelBox: @unchecked Sendable {
+    private weak var subject: FFmpegDemuxer?
+
+    init(_ subject: FFmpegDemuxer) { self.subject = subject }
+    func cancel() { subject?.cancel() }
+}
+
+private final class DemuxTestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int { lock.withLock { storedValue } }
+    func increment() { lock.withLock { storedValue += 1 } }
+}
+
+private final class DemuxAdmissionGateProbe: DemuxDataPlaneAdmitting, @unchecked Sendable {
+    private let condition = NSCondition()
+    private let base: HLSDataPlaneAdmission
+    private var attemptCount = 0
+
+    init(_ base: HLSDataPlaneAdmission) { self.base = base }
+
+    func waitForAdmission(bytes: Int, applicationBytes: Int)
+        -> DemuxDataPlaneAdmissionResult {
+        condition.withLock {
+            attemptCount += 1
+            condition.broadcast()
+        }
+        return base.waitForAdmission(bytes: bytes, applicationBytes: applicationBytes)
+    }
+
+    func cancel() { base.cancel() }
+
+    func waitUntilAttemptCount(_ expected: Int, timeout: TimeInterval = 2) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while attemptCount < expected, condition.wait(until: deadline) {}
+        return attemptCount >= expected
+    }
 }
 
 #if DEBUG
@@ -1177,7 +2094,362 @@ private func runBootstrapDebugScenario(
     let status = vp_ffmpeg_demuxer_debug_run_bootstrap(scenario, &details)
     return (status, details)
 }
+
+private final class Task11ProductionExtrasDemuxBridge: FFmpegDemuxBridging, @unchecked Sendable {
+    private let scenario: VPFFTrackExtrasDebugScenario
+
+    init(scenario: VPFFTrackExtrasDebugScenario) {
+        self.scenario = scenario
+    }
+
+    func create(
+        urlBytes _: Data,
+        timeoutUS _: Int64,
+        receiver _: @escaping RawFFmpegDemuxReceiver
+    ) -> FFmpegDemuxCreateResult {
+        .failure(-11)
+    }
+
+    func createV2(
+        urlBytes _: Data,
+        timeoutUS _: Int64,
+        receiver: @escaping RawFFmpegDemuxReceiverV2
+    ) -> FFmpegDemuxCreateResult {
+        .success(Task11ProductionExtrasDemuxHandle(scenario: scenario, receiver: receiver))
+    }
+}
+
+private final class Task11ProductionExtrasDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
+    let scenario: VPFFTrackExtrasDebugScenario
+    let receiver: RawFFmpegDemuxReceiverV2
+
+    init(scenario: VPFFTrackExtrasDebugScenario, receiver: @escaping RawFFmpegDemuxReceiverV2) {
+        self.scenario = scenario
+        self.receiver = receiver
+    }
+
+    func run() -> Int32 {
+        vp_ffmpeg_demuxer_debug_emit_track_extras(
+            scenario,
+            task11ProductionExtrasCallback,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+    }
+
+    func cancel() {}
+    func destroy() {}
+}
+
+private func task11ProductionExtrasCallback(
+    _ context: UnsafeMutableRawPointer?,
+    _ event: UnsafePointer<VPFFDemuxEvent>?,
+    _ extras: UnsafePointer<VPFFDemuxEventExtras>?
+) {
+    guard let context, let event else { return }
+    Unmanaged<Task11ProductionExtrasDemuxHandle>
+        .fromOpaque(context)
+        .takeUnretainedValue()
+        .receiver(event, extras)
+}
 #endif
+
+private enum Task11MalformedExtras: Sendable, Equatable {
+    case version
+    case size
+    case offset
+    case presence
+    case utf8
+    case sampleAspectRatio
+    case masteringDisplay
+    case masteringChromaticity
+    case contentLightLevel
+}
+
+private enum Task22MalformedV2PrimaryEvidence: String, CaseIterable, Sendable {
+    case unknownVersion
+    case shortSize
+    case nonBooleanPresence
+    case mismatchedSelectedStream
+    case mismatchedProgramIdentity
+    case inconsistentCounts
+}
+
+private final class Task11ExtrasDemuxBridge: FFmpegDemuxBridging, @unchecked Sendable {
+    typealias RunScript = @Sendable (Task11ExtrasDemuxHandle) -> Int32
+
+    private let lock = NSLock()
+    private let runScript: RunScript
+    private var storedHandle: Task11ExtrasDemuxHandle?
+
+    init(runScript: @escaping RunScript) {
+        self.runScript = runScript
+    }
+
+    func create(
+        urlBytes _: Data,
+        timeoutUS _: Int64,
+        receiver _: @escaping RawFFmpegDemuxReceiver
+    ) -> FFmpegDemuxCreateResult {
+        .failure(-11)
+    }
+
+    func createV2(
+        urlBytes _: Data,
+        timeoutUS _: Int64,
+        receiver: @escaping RawFFmpegDemuxReceiverV2
+    ) -> FFmpegDemuxCreateResult {
+        let handle = Task11ExtrasDemuxHandle(receiver: receiver, runScript: runScript)
+        lock.withLock { storedHandle = handle }
+        return .success(handle)
+    }
+
+    var handle: Task11ExtrasDemuxHandle? {
+        lock.withLock { storedHandle }
+    }
+}
+
+private final class Task11ExtrasDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
+    private let lock = NSLock()
+    private let receiver: RawFFmpegDemuxReceiverV2
+    private let runScript: Task11ExtrasDemuxBridge.RunScript
+    private var storedCancelCount = 0
+    private var storedDestroyCount = 0
+
+    init(
+        receiver: @escaping RawFFmpegDemuxReceiverV2,
+        runScript: @escaping Task11ExtrasDemuxBridge.RunScript
+    ) {
+        self.receiver = receiver
+        self.runScript = runScript
+    }
+
+    func run() -> Int32 { runScript(self) }
+    func cancel() { lock.withLock { storedCancelCount += 1 } }
+    func destroy() { lock.withLock { storedDestroyCount += 1 } }
+
+    var cancelCount: Int { lock.withLock { storedCancelCount } }
+    var destroyCount: Int { lock.withLock { storedDestroyCount } }
+
+    func emitTracks(
+        video: Bool,
+        audio: Bool,
+        kind: VPFFDemuxEventKind = VPFF_EVENT_TRACKS,
+        reason: VPFFDemuxDiscontinuityReason = VPFF_DISCONTINUITY_NONE,
+        videoLanguage: [UInt8] = [],
+        audioLanguage: [UInt8] = [],
+        configure: (inout VPFFDemuxEventExtrasV1) -> Void
+    ) {
+        emitTracks(
+            video: video,
+            audio: audio,
+            kind: kind,
+            reason: reason,
+            videoLanguage: videoLanguage,
+            audioLanguage: audioLanguage,
+            malformed: nil,
+            configure: configure
+        )
+    }
+
+    func emitMalformedTracks(_ malformed: Task11MalformedExtras) {
+        emitTracks(
+            video: true,
+            audio: false,
+            videoLanguage: malformed == .utf8 ? [0xC0, 0xAF] : [],
+            malformed: malformed
+        ) { extras in
+            switch malformed {
+            case .presence:
+                extras.video.presence = 1 << 63
+            case .utf8:
+                extras.video.presence = 1 << 1
+            case .sampleAspectRatio:
+                extras.video.presence = 1 << 4
+                extras.video.sample_aspect_ratio = .init(num: 4, den: 0)
+            case .masteringDisplay:
+                extras.video.presence = 1 << 10
+                Self.fillMasteringDisplay(&extras.video)
+                extras.video.mastering_display_maximum_luminance.den = 0
+            case .masteringChromaticity:
+                extras.video.presence = 1 << 10
+                Self.fillMasteringDisplay(&extras.video)
+                extras.video.mastering_display_red_x = .init(num: 2, den: 1)
+            case .contentLightLevel:
+                extras.video.presence = 1 << 11
+                extras.video.maximum_content_light_level = 400
+                extras.video.maximum_frame_average_light_level = 1_000
+            case .version, .size, .offset:
+                break
+            }
+        }
+    }
+
+    func emitMalformedV2PrimaryEvidence(_ malformed: Task22MalformedV2PrimaryEvidence) {
+        var event = VPFFDemuxEvent()
+        event.kind = VPFF_EVENT_TRACKS
+        event.has_program_id = 1
+        event.selected_program_id = 1
+        event.audio = Self.audioTrack(present: true)
+
+        var extras = VPFFDemuxEventExtrasV2()
+        extras.header.version = 2
+        extras.header.size = UInt32(MemoryLayout<VPFFDemuxEventExtrasV2>.size)
+        extras.header.audio_track_offset = UInt32(MemoryLayout<VPFFDemuxEventExtrasV1>.offset(of: \.audio)!)
+        extras.has_audio_primary_evidence = 1
+        extras.audio_primary_evidence.version = 1
+        extras.audio_primary_evidence.scope = VPFF_AUDIO_PRIMARY_SCOPE_PROGRAM
+        extras.audio_primary_evidence.program_index = 0
+        extras.audio_primary_evidence.program_id = 1
+        extras.audio_primary_evidence.selected_stream_index = 8
+        extras.audio_primary_evidence.audio_stream_count = 2
+        extras.audio_primary_evidence.default_audio_stream_count = 0
+        extras.audio_primary_evidence.explicit_main_stream_count = 1
+        extras.audio_primary_evidence.unclassifiable_role_stream_count = 0
+        extras.audio_primary_evidence.primary_basis = VPFF_AUDIO_PRIMARY_EXPLICIT_MAIN
+
+        switch malformed {
+        case .unknownVersion:
+            extras.header.version = 3
+        case .shortSize:
+            extras.header.size -= 1
+        case .nonBooleanPresence:
+            extras.has_audio_primary_evidence = 2
+        case .mismatchedSelectedStream:
+            extras.audio_primary_evidence.selected_stream_index = 9
+        case .mismatchedProgramIdentity:
+            extras.audio_primary_evidence.program_id = 2
+        case .inconsistentCounts:
+            extras.audio_primary_evidence.default_audio_stream_count = 3
+        }
+
+        withUnsafePointer(to: &event) { eventPointer in
+            withUnsafePointer(to: &extras.header) { extrasPointer in
+                receiver(eventPointer, extrasPointer)
+            }
+        }
+    }
+
+    func emitTerminal() {
+        var event = VPFFDemuxEvent()
+        event.kind = VPFF_EVENT_END
+        withUnsafePointer(to: &event) { receiver($0, nil) }
+    }
+
+    static func fillMasteringDisplay(_ track: inout VPFFTrackExtrasV1) {
+        track.mastering_display_red_x = .init(num: 17, den: 50)
+        track.mastering_display_red_y = .init(num: 33, den: 100)
+        track.mastering_display_green_x = .init(num: 13, den: 50)
+        track.mastering_display_green_y = .init(num: 69, den: 100)
+        track.mastering_display_blue_x = .init(num: 3, den: 20)
+        track.mastering_display_blue_y = .init(num: 3, den: 50)
+        track.mastering_display_white_point_x = .init(num: 3127, den: 10_000)
+        track.mastering_display_white_point_y = .init(num: 329, den: 1_000)
+        track.mastering_display_minimum_luminance = .init(num: 1, den: 10_000)
+        track.mastering_display_maximum_luminance = .init(num: 1_000, den: 1)
+    }
+
+    private func emitTracks(
+        video: Bool,
+        audio: Bool,
+        kind: VPFFDemuxEventKind = VPFF_EVENT_TRACKS,
+        reason: VPFFDemuxDiscontinuityReason = VPFF_DISCONTINUITY_NONE,
+        videoLanguage: [UInt8] = [],
+        audioLanguage: [UInt8] = [],
+        malformed: Task11MalformedExtras?,
+        configure: (inout VPFFDemuxEventExtrasV1) -> Void
+    ) {
+        var mutableVideoLanguage = videoLanguage
+        var mutableAudioLanguage = audioLanguage
+        mutableVideoLanguage.withUnsafeBufferPointer { videoBytes in
+            mutableAudioLanguage.withUnsafeBufferPointer { audioBytes in
+                emitTracks(
+                    video: video,
+                    audio: audio,
+                    kind: kind,
+                    reason: reason,
+                    videoLanguage: videoBytes,
+                    audioLanguage: audioBytes,
+                    malformed: malformed,
+                    configure: configure
+                )
+            }
+        }
+        mutableVideoLanguage.indices.forEach { mutableVideoLanguage[$0] = 0xEE }
+        mutableAudioLanguage.indices.forEach { mutableAudioLanguage[$0] = 0xEE }
+    }
+
+    private func emitTracks(
+        video: Bool,
+        audio: Bool,
+        kind: VPFFDemuxEventKind,
+        reason: VPFFDemuxDiscontinuityReason,
+        videoLanguage: UnsafeBufferPointer<UInt8>,
+        audioLanguage: UnsafeBufferPointer<UInt8>,
+        malformed: Task11MalformedExtras?,
+        configure: (inout VPFFDemuxEventExtrasV1) -> Void
+    ) {
+        var event = VPFFDemuxEvent()
+        event.kind = kind
+        event.video = Self.videoTrack(present: video)
+        event.audio = Self.audioTrack(present: audio)
+        event.discontinuity_reason = reason
+
+        var extras = VPFFDemuxEventExtrasV1()
+        extras.header.version = VPFF_DEMUX_EVENT_EXTRAS_VERSION_1
+        extras.header.size = 320
+        extras.header.video_track_offset = video ? 16 : 0
+        extras.header.audio_track_offset = audio ? 168 : 0
+        configure(&extras)
+        extras.video.language = videoLanguage.isEmpty ? nil : videoLanguage.baseAddress
+        extras.video.language_size = videoLanguage.count
+        extras.audio.language = audioLanguage.isEmpty ? nil : audioLanguage.baseAddress
+        extras.audio.language_size = audioLanguage.count
+
+        switch malformed {
+        case .version: extras.header.version = 99
+        case .size: extras.header.size = 319
+        case .offset: extras.header.video_track_offset = 17
+        case .presence, .utf8, .sampleAspectRatio, .masteringDisplay,
+             .masteringChromaticity, .contentLightLevel, nil:
+            break
+        }
+
+        withUnsafePointer(to: &event) { eventPointer in
+            withUnsafePointer(to: &extras.header) { extrasPointer in
+                receiver(eventPointer, extrasPointer)
+            }
+        }
+    }
+
+    private static func videoTrack(present: Bool) -> VPFFTrack {
+        var track = VPFFTrack()
+        guard present else { return track }
+        track.present = 1
+        track.stream_index = 7
+        track.codec = VPFF_CODEC_H264
+        track.time_base_num = 1
+        track.time_base_den = 90_000
+        track.width = 1_920
+        track.height = 1_080
+        return track
+    }
+
+    private static func audioTrack(present: Bool) -> VPFFTrack {
+        var track = VPFFTrack()
+        guard present else { return track }
+        track.present = 1
+        track.stream_index = 8
+        track.codec = VPFF_CODEC_AAC
+        track.time_base_num = 1
+        track.time_base_den = 48_000
+        track.sample_rate = 48_000
+        track.channel_count = 2
+        track.channel_order = VPFF_CHANNEL_ORDER_NATIVE
+        track.has_channel_layout_mask = 1
+        track.channel_layout_mask = 3
+        return track
+    }
+}
 
 private final class WeakDemuxerBox: @unchecked Sendable {
     weak var value: FFmpegDemuxer?

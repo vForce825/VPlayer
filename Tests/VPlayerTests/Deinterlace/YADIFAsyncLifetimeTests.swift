@@ -196,6 +196,37 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         XCTAssertTrue(try pixelBuffer(from: frames[1]) === submission.outputs.second)
     }
 
+    func testProducedBatchBindsExactFieldOriginsAndReliableOrderToEachOutput() throws {
+        for (order, expectedOrigins) in [
+            (
+                top,
+                [PresentationOrigin.metalYADIF(field: .top), .metalYADIF(field: .bottom)]
+            ),
+            (
+                bottom,
+                [PresentationOrigin.metalYADIF(field: .bottom), .metalYADIF(field: .top)]
+            ),
+        ] {
+            let harness = try makeHarness(maximumInFlight: 1)
+            submit(try normalized(id: 1), order: order, to: harness)
+            submit(try normalized(id: 2), order: order, to: harness)
+
+            harness.queue.completeNext(.completed)
+
+            let batch = try producedBatch(harness.results.singleResult(for: 1))
+            XCTAssertEqual(batch.outputs.map(\.origin), expectedOrigins)
+            XCTAssertEqual(batch.outputs.map(\.resolvedFieldOrder), [order, order])
+            XCTAssertEqual(batch.outputs.map(\.frame.presentationTimeStamp), [
+                CMTime.zero,
+                CMTime(value: 1, timescale: 50),
+            ])
+            XCTAssertEqual(batch.outputs.map(\.frame.duration), [
+                CMTime(value: 1, timescale: 50),
+                CMTime(value: 1, timescale: 50),
+            ])
+        }
+    }
+
     func testMaximumThreeInflightJobsAndArbitraryCompletionResumeFIFOReadyWorkWithoutWait() throws {
         let harness = try makeHarness(
             maximumInFlight: 3,
@@ -258,6 +289,94 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         )
         XCTAssertEqual(harness.queue.submittedSourceAccessUnitIDs, [1, 2, 3, 5])
         XCTAssertFalse(harness.queue.submittedSourceAccessUnitIDs.contains(4))
+    }
+
+    func testHLSTrySubmitRefusesBeforeQueuePressureAndAdmitsAfterGPUCompletion() throws {
+        let harness = try makeHarness(maximumInFlight: 1, maximumPendingFrames: 1)
+        let capacityReleased = expectation(description: "YADIF 容量已释放")
+        harness.processor.installCapacityReleaseSink { capacityReleased.fulfill() }
+
+        for id in 1...2 {
+            XCTAssertEqual(
+                harness.processor.trySubmit(normalized: try normalized(id: UInt64(id)), order: top) {
+                    harness.results.record(id: UInt64(id), result: $0)
+                },
+                .accepted
+            )
+        }
+
+        XCTAssertEqual(
+            harness.processor.trySubmit(normalized: try normalized(id: 3), order: top) {
+                harness.results.record(id: 3, result: $0)
+            },
+            .retry
+        )
+        XCTAssertTrue(harness.drops.snapshot.isEmpty)
+
+        XCTAssertEqual(harness.queue.pendingSubmissionCount, 1)
+        harness.queue.completeNext(.completed)
+        wait(for: [capacityReleased], timeout: 2)
+
+        XCTAssertEqual(
+            harness.processor.trySubmit(normalized: try normalized(id: 3), order: top) {
+                harness.results.record(id: 3, result: $0)
+            },
+            .accepted
+        )
+        XCTAssertTrue(harness.drops.snapshot.isEmpty)
+    }
+
+    func testHLSTrySubmitTreatsPausedSchedulerAsBackpressureWithoutDroppingFIFO() throws {
+        let harness = try makeHarness(maximumInFlight: 1, maximumPendingFrames: 2)
+        harness.processor.setSubmissionSchedulingPaused(true)
+
+        for id in UInt64(1)...2 {
+            XCTAssertEqual(
+                harness.processor.trySubmit(normalized: try normalized(id: id), order: top) {
+                    harness.results.record(id: id, result: $0)
+                },
+                .accepted
+            )
+        }
+        XCTAssertEqual(harness.queue.pendingSubmissionCount, 0)
+        XCTAssertEqual(
+            harness.processor.trySubmit(normalized: try normalized(id: 3), order: top) {
+                harness.results.record(id: 3, result: $0)
+            },
+            .retry,
+            "原子编码桥暂停 YADIF 时，HLS 必须把完整 FIFO 留给上游重试"
+        )
+        XCTAssertTrue(harness.drops.snapshot.isEmpty)
+
+        harness.processor.setSubmissionSchedulingPaused(false)
+        XCTAssertEqual(harness.queue.pendingSubmissionCount, 1)
+        harness.queue.completeNext(.completed)
+        XCTAssertTrue(harness.drops.snapshot.isEmpty)
+    }
+
+    func testHLSTrySubmitRefusesWhenPendingCapacityIsReachedEvenIfGPUHasAvailableSlot() throws {
+        let harness = try makeHarness(maximumInFlight: 1, maximumPendingFrames: 2)
+
+        for id in 1...3 {
+            XCTAssertEqual(
+                harness.processor.trySubmit(normalized: try normalized(id: UInt64(id)), order: top) {
+                    harness.results.record(id: UInt64(id), result: $0)
+                },
+                .accepted
+            )
+        }
+        // At this point: Job 1 is on GPU (occupied = 1).
+        // Job 2 is in readyJobs (readyJobs = 1, unemitted reference in window = 1 -> sum = 2 == maximumPendingFrames).
+        // With maximumPendingFrames == 2, the pending queue is now full.
+        // trySubmit must refuse Frame 4 because pending capacity has reached maximumPendingFrames.
+        XCTAssertEqual(
+            harness.processor.trySubmit(normalized: try normalized(id: 4), order: top) {
+                harness.results.record(id: 4, result: $0)
+            },
+            .retry,
+            "待处理帧数达到上限且已有 readyJob 时，必须返回 retry 施加背压"
+        )
+        XCTAssertTrue(harness.drops.snapshot.isEmpty)
     }
 
     // Raising the bound from the settings sheet has to help the stream already
@@ -366,7 +485,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         let results = YADIFProcessorResultRecorder()
         let drops = YADIFDropRecorder()
         let outputAllocator: YADIFOutputAllocator = { source in
-            try allocator.allocate(matching: source)
+            let pair = try allocator.allocate(matching: source.pixelBuffer)
+            return YADIFAllocatedOutputs(first: pair.first, second: pair.second)
         }
         let processor = try YADIFProcessor(
             commandSubmitter: queue,
@@ -773,7 +893,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         let queue = FakeMetalCommandQueue()
         let allocator = BlockingYADIFOutputAllocator()
         let outputAllocator: YADIFOutputAllocator = { source in
-            try allocator.allocate(matching: source)
+            let pair = try allocator.allocate(matching: source.pixelBuffer)
+            return YADIFAllocatedOutputs(first: pair.first, second: pair.second)
         }
         let results = YADIFProcessorResultRecorder()
         let processor = try YADIFProcessor(
@@ -818,7 +939,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         let queue = FakeMetalCommandQueue()
         let allocator = BlockingYADIFOutputAllocator()
         let outputAllocator: YADIFOutputAllocator = { source in
-            try allocator.allocate(matching: source)
+            let pair = try allocator.allocate(matching: source.pixelBuffer)
+            return YADIFAllocatedOutputs(first: pair.first, second: pair.second)
         }
         let results = YADIFProcessorResultRecorder()
         let barriers = YADIFDrainBarrierRecorder()
@@ -880,7 +1002,8 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         let events = YADIFLifecycleEventRecorder()
         let results = YADIFProcessorResultRecorder()
         let outputAllocator: YADIFOutputAllocator = { source in
-            try allocator.allocate(matching: source)
+            let pair = try allocator.allocate(matching: source.pixelBuffer)
+            return YADIFAllocatedOutputs(first: pair.first, second: pair.second)
         }
         let processor = try YADIFProcessor(
             commandSubmitter: queue,
@@ -1125,6 +1248,46 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         )
     }
 
+    func testDrainKeepsNaturalEOFTailWhenGPUIsFull() throws {
+        let harness = try makeHarness(maximumInFlight: 1, maximumPendingFrames: 1)
+        let barriers = YADIFDrainBarrierRecorder()
+        for id in UInt64(1)...2 { submit(try normalized(id: id), to: harness) }
+        XCTAssertEqual(harness.queue.pendingSubmissionCount, 1)
+        let third = try normalized(id: 3)
+        let thirdAdmission = harness.processor.trySubmit(
+            normalized: third, order: top, discontinuity: false
+        ) { harness.results.record(id: third.frame.accessUnitID, result: $0) }
+        XCTAssertEqual(thirdAdmission, .retry,
+                       "GPU 满时 HLS 必须让上游保留已付费尾，而不是产生 transient drop")
+
+        XCTAssertEqual(harness.queue.pendingSubmissionCount, 1)
+        harness.queue.completeNext(.completed)
+        XCTAssertEqual(
+            harness.processor.trySubmit(
+                normalized: third, order: top, discontinuity: false
+            ) { harness.results.record(id: third.frame.accessUnitID, result: $0) },
+            .accepted
+        )
+        harness.processor.drain { barriers.record(id: 1) }
+        for completionIndex in 0..<2 {
+            XCTAssertEqual(harness.queue.pendingSubmissionCount, 1,
+                           "每次自然 drain GPU 完成前都必须有且仅有一个实际待完成 job")
+            harness.queue.completeNext(.completed)
+            if completionIndex == 0 {
+                let nextDeadline = Date().addingTimeInterval(1)
+                while harness.queue.pendingSubmissionCount == 0, Date() < nextDeadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+                }
+            }
+        }
+        XCTAssertEqual(try producedFrames(harness.results.singleResult(for: 1)).count, 2)
+        XCTAssertEqual(try producedFrames(harness.results.singleResult(for: 2)).count, 2)
+        XCTAssertEqual(try producedFrames(harness.results.singleResult(for: 3)).count, 2,
+                       "GPU 满时 natural drain 仍须交付最后一个双场 batch")
+        XCTAssertEqual(barriers.count(for: 1), 1,
+                       "drain completion 只能在最后一个已接纳 GPU job 实际完成后触发")
+    }
+
     private func submit(
         _ frame: NormalizedDecodedFrame,
         order: ResolvedFieldOrder? = nil,
@@ -1233,6 +1396,21 @@ final class YADIFAsyncLifetimeTests: XCTestCase {
         return batch.frames
     }
 
+    private func producedBatch(
+        _ result: VideoProcessingResult,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> VideoProcessingFrameBatch {
+        guard case let .produced(batch) = result else {
+            XCTFail("expected a produced frame batch, got \(result)", file: file, line: line)
+            throw PlaybackFailure(
+                code: "unexpected-processing-result",
+                userMessage: "expected produced batch"
+            )
+        }
+        return batch
+    }
+
     private func assertCancelled(
         _ result: VideoProcessingResult,
         reason: VideoProcessingCancellationReason,
@@ -1293,6 +1471,7 @@ private final class TestYADIFClock: PlaybackClock, @unchecked Sendable {
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         set(mediaTime)
     }
+    func setRate(_ rate: Float) {}
     func set(_ time: CMTime) { lock.withLock { storedTime = time } }
 }
 

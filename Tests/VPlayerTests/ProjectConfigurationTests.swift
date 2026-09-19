@@ -7,6 +7,52 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class ProjectConfigurationTests: XCTestCase {
+    func testAVPlayerPreparationPrimesMediaBeforeWaitingForHTTPSelection() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerPlayback/HLS/AVPlayerItemCoordinator.swift"
+            ),
+            encoding: .utf8
+        )
+        let body = try XCTUnwrap(
+            source.components(separatedBy: "func prepareCurrentItem() async throws")
+                .dropFirst().first?
+                .components(separatedBy: "private struct PreparationSeekContext").first
+        )
+        let prime = try XCTUnwrap(body.range(of: "driver.primeMediaData(item: request.item)"))
+        let publication = try XCTUnwrap(body.range(
+            of: "awaitCompletedPublicationBinding(for: request)"
+        ))
+        XCTAssertLessThan(prime.lowerBound, publication.lowerBound)
+    }
+
+    func testAVPlayerPreparationSelectsAudibleMediaBeforePriming() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/VPlayerPlayback/HLS/AVPlayerItemCoordinator.swift"
+            ),
+            encoding: .utf8
+        )
+        let body = try XCTUnwrap(
+            source.components(separatedBy: "func prepareCurrentItem() async throws")
+                .dropFirst().first?
+                .components(separatedBy: "private struct PreparationSeekContext").first
+        )
+        let select = try XCTUnwrap(body.range(
+            of: "driver.selectAudibleMedia(item: request.item)"
+        ))
+        let prime = try XCTUnwrap(body.range(of: "driver.primeMediaData(item: request.item)"))
+        XCTAssertLessThan(select.lowerBound, prime.lowerBound)
+    }
+
     func testDeadPlaybackNoticeContractAndBannerAreAbsent() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -345,7 +391,7 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertFalse(runner.contains("echo \"$VPLAYER_ACCEPTANCE_EPG_URL"))
         XCTAssertTrue(runner.contains("devicectl device info details --device \"$device_udid\""))
         XCTAssertTrue(runner.contains("productType: AppleTV14,1"))
-        XCTAssertTrue(runner.contains("• udid:"))
+        XCTAssertTrue(runner.contains("udid:[[:space:]]*([A-Fa-f0-9-]+)"))
         XCTAssertTrue(runner.contains("-destination \"platform=tvOS,id=$destination_udid\""))
         XCTAssertFalse(runner.contains("-destination \"platform=tvOS,id=$device_udid\""))
         XCTAssertTrue(runner.contains("acceptance.xcconfig"))
@@ -648,6 +694,8 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertFalse(acceptanceTest.contains("app.staticTexts[\"刷新成功\"]"))
         XCTAssertTrue(acceptanceTest.contains("AcceptanceRefreshOutcomeGuard.activate("))
         XCTAssertTrue(acceptanceTest.contains("AcceptanceRefreshOutcomeGuard.classify("))
-        XCTAssertFalse(acceptanceTest.contains("element.hasFocus"))
+        XCTAssertTrue(acceptanceTest.contains("private func waitForFocus("))
+        XCTAssertTrue(acceptanceTest.contains("while clock.now < deadline"))
+        XCTAssertTrue(acceptanceTest.contains("clock.sleep(for: .milliseconds(100))"))
     }
 }

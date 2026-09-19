@@ -393,7 +393,18 @@ final class CompressedAudioAssemblerTests: XCTestCase {
 
         for (index, count) in counts.enumerated() {
             try subject.push(AssemblerTestFixtures.audioPacket(
-                data: Data([0x0B, 0x77, 0x00, 0x03, UInt8(index), 0xA5, 0xA5, 0xA5]),
+                data: EAC3SemanticFixture.make(
+                    sampleRate: 48_000,
+                    blockCount: Int(count / 256),
+                    streamType: 0,
+                    substreamID: 0,
+                    bsid: 16,
+                    bsmod: 0,
+                    audioCodingMode: 2,
+                    hasLFE: false,
+                    hasInfoMetadata: true,
+                    hasJOC: false
+                ),
                 codec: .eac3,
                 pts: CMTime(value: Int64(index), timescale: 1)
             ))
