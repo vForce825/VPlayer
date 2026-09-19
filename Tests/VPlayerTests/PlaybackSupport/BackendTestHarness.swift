@@ -31,15 +31,15 @@ final class BackendTestHarness: @unchecked Sendable {
             url: URL(string: "http://test")!, readinessCycle: 1,
             initiallyPaused: initiallyPaused)
         if initiallyPaused {
-            fakePipeline.setPlaybackRate(0, readinessCycle: 1)
+            fakePipeline.setPlaybackRate(0)
         }
     }
     
     func activateCurrentPermit() async {
-        fakePipeline.setPlaybackRate(1.0, readinessCycle: 1)
+        fakePipeline.setPlaybackRate(1.0)
     }
     
     func suspendAndConfirm() async {
-        fakePipeline.setPlaybackRate(0.0, readinessCycle: 1)
+        fakePipeline.setPlaybackRate(0.0)
     }
 }

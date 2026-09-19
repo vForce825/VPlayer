@@ -92,8 +92,20 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
     }
     
     func addSubscriber(_ handler: @escaping @Sendable (AudioOutputRouteSnapshot) -> Void) {
-        lock.withLock {
-            self.subscriber = handler
+        registry.executor.sync {
+            let registration = lock.withLock {
+                self.subscriber = handler
+                return sessionRegistration
+            }
+            guard let registration,
+                  case .open(let authority)? = registry.outputRouteObservationSnapshot(),
+                  authority.sessionIdentity == registration.identity.sessionIdentity,
+                  authority.monitorLifecycle == registration.identity.monitorLifecycle,
+                  let commit = registry.stableRouteCommitSnapshot(),
+                  commit.exactlyMatches(authority, observationGateOpen: true) else { return }
+            let committedSnapshot = Self.snapshot(for: commit.authority,
+                revision: lock.withLock { revision })
+            handler(committedSnapshot)
         }
     }
     
@@ -186,18 +198,25 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         registry.notifyPlaybackProgress()
         let commitHandler = lock.withLock { routeCommitHandler }
         commitHandler?(commit)
+        let (subscriberCopy, snapshot) = lock.withLock {
+            revision += 1
+            return (subscriber, Self.snapshot(for: commit.authority, revision: revision))
+        }
+        subscriberCopy?(snapshot)
+    }
+
+    private static func snapshot(
+        for authority: PlaybackRouteAuthorityIdentity,
+        revision: UInt64
+    ) -> AudioOutputRouteSnapshot {
+        let ports = authority.semanticIdentity?.ports ?? []
         let category: AudioOutputRouteCategory
-        let ports = commit.authority.semanticIdentity?.ports ?? []
         if ports.contains(.airPlay) { category = .airPlay }
         else if ports.contains(.hdmi) { category = .hdmi }
         else if ports.contains(.bluetooth) { category = .bluetooth }
         else if ports.isEmpty { category = .none }
         else { category = .other }
-        let (subscriberCopy, snapshot) = lock.withLock {
-            revision += 1
-            return (subscriber, AudioOutputRouteSnapshot(ports: ports, category: category,
-                reason: .initial, revision: revision, outputLatency: 0, ioBufferDuration: 0))
-        }
-        subscriberCopy?(snapshot)
+        return AudioOutputRouteSnapshot(ports: ports, category: category,
+            reason: .initial, revision: revision, outputLatency: 0, ioBufferDuration: 0)
     }
 }

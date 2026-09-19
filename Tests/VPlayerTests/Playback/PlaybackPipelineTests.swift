@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFoundation
 import CoreMedia
 import Foundation
 import Metal
@@ -10,6 +11,149 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackPipelineTests: XCTestCase {
+    func testOutputRateActivationKeepsControllerReadinessCycle() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.pipeline.setPlaybackRate(1)
+        _ = await harness.pipeline.debugSnapshot()
+
+        try await openInitialSharedTimeline(harness, generation: generation)
+
+        XCTAssertTrue(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
+        XCTAssertFalse(harness.events.snapshot().contains(.ready(readinessCycle: 99)))
+    }
+
+    func testOutputSuspensionKeepsControllerReadinessCycle() async throws {
+        let clock = RenderSynchronizerClock(
+            synchronizer: AVSampleBufferRenderSynchronizer()
+        )
+        let harness = makeHarness(clockOverride: clock)
+        harness.pipeline.start(url: makeRequest().streamURL)
+        try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
+        harness.demux.emit(.tracks(PlaybackFakeMedia.audioOnlyTracks()))
+        try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
+
+        let fingerprint = MediaFormatFingerprint(bytes: Data([0xA4]))
+        harness.pipeline.receive(audio: .format(
+            try PlaybackFakeMedia.audioConfiguration(fingerprint: fingerprint)
+        ))
+        try await eventually {
+            (await harness.pipeline.debugSnapshot()).generation == MediaGeneration(rawValue: 1)
+        }
+        let generation = await harness.pipeline.debugSnapshot().generation
+        let observedRate = await harness.pipeline.setRateZeroAndReadBack()
+        XCTAssertEqual(observedRate, 0)
+
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+        try await eventually {
+            harness.events.snapshot().contains {
+                if case .ready = $0 { return true }
+                return false
+            }
+        }
+        XCTAssertTrue(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
+    }
+
+    func testAuthorizedOutputRateStartsAfterSharedAnchor() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.pipeline.setPlaybackRate(1)
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+
+        try await openInitialSharedTimeline(harness, generation: generation)
+
+        XCTAssertEqual(harness.clock.snapshot().anchors.first?.2, 0)
+        XCTAssertEqual(harness.clock.snapshot().rate, 1)
+    }
+
+    func testAuthorizedOutputRateStartsAfterAudioOnlyAnchor() async throws {
+        let harness = makeHarness()
+        harness.pipeline.start(url: makeRequest().streamURL)
+        try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
+        harness.demux.emit(.tracks(PlaybackFakeMedia.audioOnlyTracks()))
+        try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
+
+        let fingerprint = MediaFormatFingerprint(bytes: Data([0xA3]))
+        harness.pipeline.receive(audio: .format(
+            try PlaybackFakeMedia.audioConfiguration(fingerprint: fingerprint)
+        ))
+        try await eventually {
+            (await harness.pipeline.debugSnapshot()).generation == MediaGeneration(rawValue: 1)
+        }
+        let generation = await harness.pipeline.debugSnapshot().generation
+        harness.pipeline.setPlaybackRate(1)
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
+            id: 1,
+            generation: generation,
+            pts: .zero,
+            duration: CMTime(value: 1, timescale: 2)
+        )))
+
+        try await eventually {
+            harness.events.snapshot().contains(.ready(readinessCycle: 0))
+        }
+        XCTAssertEqual(harness.clock.snapshot().anchors.first?.2, 0)
+        XCTAssertEqual(harness.clock.snapshot().rate, 1)
+    }
+
+    func testAuthorizedOutputRateResumesAfterDisplayReanchor() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.pipeline.setPlaybackRate(1)
+        try await openInitialSharedTimeline(harness, generation: generation)
+
+        harness.pipeline.displayModeSwitchStarted()
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+
+        harness.pipeline.displayModeSwitchEnded()
+        try await eventually { harness.clock.snapshot().anchors.count == 2 }
+        XCTAssertEqual(harness.clock.snapshot().rate, 1)
+    }
+
+    func testRevokedOutputRateStaysZeroAfterDisplayReanchor() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.pipeline.setPlaybackRate(1)
+        try await openInitialSharedTimeline(harness, generation: generation)
+
+        harness.pipeline.setPlaybackRate(0)
+        harness.pipeline.displayModeSwitchStarted()
+        _ = await harness.pipeline.debugSnapshot()
+        harness.pipeline.displayModeSwitchEnded()
+
+        try await eventually { harness.clock.snapshot().anchors.count == 2 }
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+    }
+
+    func testOutputRouteLossCannotReusePreviousRateGrant() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.pipeline.setPlaybackRate(1)
+        try await openInitialSharedTimeline(harness, generation: generation)
+
+        harness.pipeline.receive(audioReadiness: .outputRouteUnavailable,
+            generation: generation)
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+
+        harness.pipeline.receive(audioReadiness: .outputRouteAvailable,
+            generation: generation)
+        try await eventually { harness.clock.snapshot().anchors.count == 2 }
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+    }
+
     func testStartPublishesInitialBufferingPhaseExactlyOnce() async {
         let harness = makeHarness()
 
@@ -7690,7 +7834,8 @@ final class PlaybackPipelineTests: XCTestCase {
         pendingTrackAudioRetentionLimits: CompressedAudioRetentionLimits =
             CompressedAudioRetentionPolicy.pending,
         audioContinuityRetentionLimits: CompressedAudioRetentionLimits =
-            CompressedAudioRetentionPolicy.continuity
+            CompressedAudioRetentionPolicy.continuity,
+        clockOverride: RenderSynchronizerClock? = nil
     ) -> Harness {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.pipeline")
         let demux = FakePipelineDemuxer()
@@ -7763,7 +7908,7 @@ final class PlaybackPipelineTests: XCTestCase {
             audioContinuityRetentionLimits: audioContinuityRetentionLimits,
             renderer: renderer,
             audio: pipelineAudio,
-            clock: clock,
+            clock: clockOverride ?? clock,
             display: display,
             eventSink: { event in
                 events.append(event)

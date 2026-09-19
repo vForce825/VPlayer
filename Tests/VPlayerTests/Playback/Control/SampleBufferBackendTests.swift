@@ -164,13 +164,13 @@ private final class FinalRatePipeline: PlaybackPipelineProtocol,
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? { nil }
     func start(url: URL, readinessCycle: UInt64, initiallyPaused: Bool) {}
     func setPaused(_ paused: Bool, readinessCycle: UInt64) {}
-    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64) {
+    func setPlaybackRate(_ rate: Float) {
         lock.withLock {
             if rate > 0 || honorsRateZero { storedRate = rate }
         }
     }
-    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float? {
-        setPlaybackRate(0, readinessCycle: readinessCycle)
+    func setRateZeroAndReadBack() async -> Float? {
+        setPlaybackRate(0)
         return rate
     }
     func recoverFromAudioSessionReset(readinessCycle: UInt64) {}
