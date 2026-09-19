@@ -227,7 +227,7 @@ final class ProjectConfigurationTests: XCTestCase {
         }
     }
 
-    func testPlaybackMetalAndFutureVideoFixturesHaveExplicitTargetConfiguration() throws {
+    func testPlaybackUsesPrecompiledMetalLibrariesAndFutureVideoFixturesHaveExplicitTargetConfiguration() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -243,7 +243,14 @@ final class ProjectConfigurationTests: XCTestCase {
 
         XCTAssertTrue(
             projectYAML.contains("- path: Sources/VPlayerPlayback"),
-            "the recursive playback source root must keep future .metal files in the target"
+            "the recursive playback source root must remain in the target"
+        )
+        XCTAssertTrue(projectYAML.contains("- Deinterlace/YADIF/YADIF.metal"))
+        XCTAssertTrue(projectYAML.contains("- Scan/ScanProbe.metal"))
+        XCTAssertTrue(
+            projectYAML.contains(
+                "- path: Sources/VPlayerPlayback/Resources\n        buildPhase: resources"
+            )
         )
         XCTAssertTrue(
             projectYAML.contains(
@@ -251,8 +258,10 @@ final class ProjectConfigurationTests: XCTestCase {
             ),
             "future video fixtures must be copied as a folder resource when introduced"
         )
-        XCTAssertTrue(generatedProject.contains("YADIF.metal in Sources"))
-        XCTAssertTrue(generatedProject.contains("ScanProbe.metal in Sources"))
+        XCTAssertFalse(generatedProject.contains("YADIF.metal in Sources"))
+        XCTAssertFalse(generatedProject.contains("ScanProbe.metal in Sources"))
+        XCTAssertTrue(generatedProject.contains("VPlayerPlayback-tvos.metallib in Resources"))
+        XCTAssertTrue(generatedProject.contains("VPlayerPlayback-tvsimulator.metallib in Resources"))
         XCTAssertTrue(generatedProject.contains("Video in Resources"))
     }
 

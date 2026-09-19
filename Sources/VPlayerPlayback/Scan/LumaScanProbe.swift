@@ -390,7 +390,10 @@ private final class SystemLumaScanProbeBackend: LumaScanProbeBackend, @unchecked
 
         let library: any MTLLibrary
         do {
-            library = try device.makeDefaultLibrary(bundle: Self.shaderBundle)
+            library = try PlaybackMetalLibrary.makeLibrary(
+                device: device,
+                bundle: Self.shaderBundle
+            )
         } catch {
             throw .shaderLibraryUnavailable
         }

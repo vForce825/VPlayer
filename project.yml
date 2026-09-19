@@ -35,8 +35,13 @@ targets:
       - path: Sources/VPlayerPlayback
         excludes:
           - include
+          - Resources
+          - Deinterlace/YADIF/YADIF.metal
+          - Scan/ScanProbe.metal
       - path: Sources/VPlayerPlayback/include
         headerVisibility: public
+      - path: Sources/VPlayerPlayback/Resources
+        buildPhase: resources
     dependencies:
       - target: VPlayerCore
       - framework: Vendor/FFmpeg/Artifacts/FFmpeg.xcframework
