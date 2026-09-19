@@ -602,16 +602,13 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
                 // 只能在本 callback 内丢弃，绝不能回退投递未收费的原对象。
                 guard let self, let claim = outputGate.claimCallback() else { return }
                 let captured = self.captureCompressedOutput(output)
-                let enqueueCaptured = {
-                    self.workQueue.async { [weak self] in
-                        self?.handleIsolated(captured, expected: identity)
-                    }
-                }
                 switch claim {
                 case .beforeSubmissionReturns:
-                    if outputGate.finishSynchronousCapture(captured) { enqueueCaptured() }
+                    if outputGate.finishSynchronousCapture(captured) {
+                        self.enqueueCapturedOutput(captured, expected: identity)
+                    }
                 case .afterSubmissionReturns:
-                    enqueueCaptured()
+                    self.enqueueCapturedOutput(captured, expected: identity)
                 }
             }
             let synchronousOutputs = outputGate.closeSubmission()
@@ -633,6 +630,15 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         }
         if case .finishing = state, waiting.isEmpty, active.isEmpty {
             finishIsolated()
+        }
+    }
+
+    private func enqueueCapturedOutput(
+        _ output: VTCompressionOutput,
+        expected identity: VideoEncodingFrameIdentity
+    ) {
+        workQueue.async { [weak self] in
+            self?.handleIsolated(output, expected: identity)
         }
     }
 
