@@ -401,7 +401,10 @@ final class YADIFNV12Kernel: @unchecked Sendable {
             if let libraryFactory {
                 library = try libraryFactory(device, Self.shaderBundle)
             } else {
-                library = try device.makeDefaultLibrary(bundle: Self.shaderBundle)
+                library = try PlaybackMetalLibrary.makeLibrary(
+                    device: device,
+                    bundle: Self.shaderBundle
+                )
             }
         } catch {
             throw .shaderLibraryUnavailable
