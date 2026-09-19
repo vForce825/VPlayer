@@ -111,14 +111,14 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, SampleBufferPlayba
         }
     }
 
-    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64) {
+    func setPlaybackRate(_ rate: Float) {
         lock.withLock {
             playbackRate = rate
             outputConcurrency?.record(self, rate: rate)
         }
     }
 
-    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float? {
+    func setRateZeroAndReadBack() async -> Float? {
         lock.withLock {
             playbackRate = 0.0
             outputConcurrency?.record(self, rate: 0.0)
@@ -824,21 +824,28 @@ final class FakePipelineAudio: AudioRenderPipelineProtocol, @unchecked Sendable 
 final class FakePipelineClock: PlaybackClock, @unchecked Sendable {
     private let lock = NSLock()
     private var storedTime = CMTime.zero
+    private var storedRate: Float = 0
     private(set) var pauses = 0
     private(set) var anchors: [(CMTime, CMTime, Float)] = []
 
     var currentTime: CMTime { lock.withLock { storedTime } }
-    func pause() { lock.withLock { pauses += 1 } }
+    func pause() {
+        lock.withLock {
+            pauses += 1
+            storedRate = 0
+        }
+    }
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         lock.withLock {
             storedTime = mediaTime
+            storedRate = rate
             anchors.append((mediaTime, hostTime, rate))
         }
     }
     func setTime(_ time: CMTime) { lock.withLock { storedTime = time } }
-    func setRate(_ rate: Float) {}
-    func snapshot() -> (pauses: Int, anchors: [(CMTime, CMTime, Float)]) {
-        lock.withLock { (pauses, anchors) }
+    func setRate(_ rate: Float) { lock.withLock { storedRate = rate } }
+    func snapshot() -> (pauses: Int, anchors: [(CMTime, CMTime, Float)], rate: Float) {
+        lock.withLock { (pauses, anchors, storedRate) }
     }
 }
 

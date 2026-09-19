@@ -6,6 +6,48 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackAudioRouteServiceTests: XCTestCase {
+    func testLateSubscriberReceivesCommittedBluetoothRoute() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+        XCTAssertEqual(harness.committedBackend, .sampleBuffer)
+
+        let received = RouteSnapshotRecorder()
+        harness.service.addSubscriber { snapshot in received.append(snapshot) }
+
+        let snapshot = try XCTUnwrap(received.last)
+        XCTAssertEqual(snapshot.category, .bluetooth)
+        XCTAssertEqual(snapshot.ports, [.bluetooth])
+        XCTAssertGreaterThan(snapshot.revision, 0)
+    }
+
+    func testLateSubscriberReplayIsSerializedWithRouteCommits() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+
+        let received = RouteSnapshotRecorder()
+        let executor = harness.registry.executor
+        harness.service.addSubscriber { snapshot in
+            received.append(snapshot, onControlExecutor: executor.isIsolated)
+        }
+
+        XCTAssertEqual(received.last?.category, .bluetooth)
+        XCTAssertEqual(received.lastDeliveryOnControlExecutor, true)
+    }
+
+    func testRebindingDoesNotReplayPreviousSessionRoute() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+        harness.service.unbindSession()
+
+        let received = RouteSnapshotRecorder()
+        harness.service.addSubscriber { snapshot in received.append(snapshot) }
+
+        XCTAssertNil(received.last)
+    }
+
     func testStabilityArmsAndSessionRebindingReuseOneFixedHandler() async throws {
         let harness = RouteServiceTestHarness(initialPorts: .airPlay)
         XCTAssertEqual(harness.clock.deadlineTimerHandlerInstallationCount, 1,
@@ -213,6 +255,27 @@ final class PlaybackAudioRouteServiceTests: XCTestCase {
             harness.registry.executor.submit { continuation.resume() }
         }
         XCTAssertNil(harness.committedBackend) // Because session was unbound
+    }
+}
+
+private final class RouteSnapshotRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshots: [AudioOutputRouteSnapshot] = []
+    private var deliveryContexts: [Bool] = []
+
+    func append(_ snapshot: AudioOutputRouteSnapshot, onControlExecutor: Bool = false) {
+        lock.withLock {
+            snapshots.append(snapshot)
+            deliveryContexts.append(onControlExecutor)
+        }
+    }
+
+    var last: AudioOutputRouteSnapshot? {
+        lock.withLock { snapshots.last }
+    }
+
+    var lastDeliveryOnControlExecutor: Bool? {
+        lock.withLock { deliveryContexts.last }
     }
 }
 

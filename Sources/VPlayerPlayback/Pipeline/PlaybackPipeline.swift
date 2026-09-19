@@ -31,10 +31,8 @@ protocol PlaybackPipelineProtocol: AnyObject, Sendable {
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot?
     func start(url: URL, readinessCycle: UInt64, initiallyPaused: Bool)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
-    /// Sets the playback clock rate for the given readiness cycle.
-    /// Starting or readying the pipeline does not internally set rate 1; positive rate (1.0)
-    /// must be driven via this permit interface by the controller or backend upon activation.
-    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64)
+    /// 控制器授权输出速率；共享时钟完成锚定后才应用正速率。
+    func setPlaybackRate(_ rate: Float)
     func recoverFromAudioSessionReset(readinessCycle: UInt64)
     func setTuning(_ tuning: PlaybackTuning)
     func stop() async
@@ -43,7 +41,7 @@ protocol PlaybackPipelineProtocol: AnyObject, Sendable {
 /// SampleBuffer 后端的静止证明只能来自真实 rate owner 所在的串行 lane。
 /// 普通 pipeline double 若未显式实现该协议，只能走 fail-closed retirement。
 protocol SampleBufferPlaybackRateOwner: AnyObject, Sendable {
-    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float?
+    func setRateZeroAndReadBack() async -> Float?
 }
 
 extension PlaybackPipelineProtocol {
@@ -426,6 +424,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private var displayResumedCycle: UInt64?
     private var hasOpenedReadinessForCurrentMedia = false
     private var readinessCycle: UInt64 = 0
+    private var permittedOutputRate: Float = 0
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
     private var pendingTrackVideo = CompressedVideoReservoir(
@@ -594,13 +593,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         }
     }
 
-    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64) {
+    func setPlaybackRate(_ rate: Float) {
         executor.submit { [weak self] in
-            self?.setPlaybackRateIsolated(rate, readinessCycle: readinessCycle)
+            self?.setPlaybackRateIsolated(rate)
         }
     }
 
-    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float? {
+    func setRateZeroAndReadBack() async -> Float? {
         await withCheckedContinuation { continuation in
             executor.submit { [weak self] in
                 guard let self, started, !terminal,
@@ -608,7 +607,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                     continuation.resume(returning: nil)
                     return
                 }
-                self.readinessCycle = readinessCycle
+                permittedOutputRate = 0
                 systemClock.setRate(0)
                 continuation.resume(returning: systemClock.synchronizer.rate)
             }
@@ -759,6 +758,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 pendingAnchorTimingRecoveryRevision = nil
                 updateReadinessIsolated()
             case .outputRouteUnavailable:
+                permittedOutputRate = 0
                 beginAudioRouteRecoveryIsolated(timingRevision: nil)
             case let .anchorTimingChanged(routeRevision):
                 guard audio.currentRouteSnapshot?.revision == routeRevision,
@@ -789,6 +789,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         assertIsolated()
         guard started, !terminal else { return }
         self.readinessCycle = readinessCycle
+        permittedOutputRate = 0
         beginAudioRouteRecoveryIsolated(timingRevision: nil)
         guard audioResourcesConfigured else {
             pendingAudioSessionReset = true
@@ -2388,13 +2389,25 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         display.pauseSubmission()
     }
 
-    /// Drives the playback clock rate. Starting and readying the pipeline does not internally
-    /// set rate 1; positive rate (1.0) must be driven via this permit interface upon activation.
-    private func setPlaybackRateIsolated(_ rate: Float, readinessCycle: UInt64) {
+    /// 保存控制器的输出授权，并在共享时钟就绪后应用正速率。
+    private func setPlaybackRateIsolated(_ rate: Float) {
         assertIsolated()
         guard started, !terminal else { return }
-        self.readinessCycle = readinessCycle
-        clock.setRate(rate)
+        permittedOutputRate = rate
+        if rate <= 0 {
+            clock.setRate(rate)
+        } else {
+            applyPermittedOutputRateIsolated()
+        }
+    }
+
+    private func applyPermittedOutputRateIsolated() {
+        assertIsolated()
+        guard permittedOutputRate > 0,
+              !paused,
+              readiness?.isOpen == true,
+              audio.isOutputRouteReadyForSharedAnchor else { return }
+        clock.setRate(permittedOutputRate)
     }
 
     private func setPausedIsolated(_ shouldPause: Bool, readinessCycle: UInt64) {
@@ -2404,6 +2417,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         paused = shouldPause
         if shouldPause {
             invalidateVideoDecodeStallWatchdogIsolated()
+            permittedOutputRate = 0
             clock.pause()
             readiness?.close(.pause)
             readyPublished = false
@@ -2666,6 +2680,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                     && mediaInformation != nil
                     && mediaInformationGeneration == generationController.current) else { return }
         setSharedTimelineOpenedIsolated(true)
+        applyPermittedOutputRateIsolated()
         pendingVideoRecoveryAnchor = nil
         drainPendingVideoDecodeIsolated()
         if pendingDisplayTimingReset {
@@ -2747,6 +2762,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             readiness.minimumRecoveryAnchorPTS
         ) else { return }
         setSharedTimelineOpenedIsolated(true)
+        applyPermittedOutputRateIsolated()
         guard !readyPublished, !paused, !terminal else { return }
         publishReadyIsolated()
     }

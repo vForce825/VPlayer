@@ -57,19 +57,18 @@ final class SampleBufferPlaybackBackend: PlaybackBackend,
         #endif
         pipeline?.start(url: url, readinessCycle: readinessCycle, initiallyPaused: initiallyPaused)
         if initiallyPaused {
-            pipeline?.setPlaybackRate(0.0, readinessCycle: readinessCycle)
+            pipeline?.setPlaybackRate(0.0)
         }
     }
     
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
         _ = invocation.ticket
-        pipeline?.setPlaybackRate(0.0, readinessCycle: 0)
+        pipeline?.setPlaybackRate(0.0)
     }
     
     func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
         guard invocation.performPositiveRateSideEffect({
-            pipeline?.setPlaybackRate(1.0,
-                                      readinessCycle: invocation.activation.activationNonce)
+            pipeline?.setPlaybackRate(1.0)
         }) else {
             throw PlaybackCoreError.demuxOpen(-1)
         }
@@ -83,8 +82,7 @@ final class SampleBufferPlaybackBackend: PlaybackBackend,
     
     func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async -> BackendSuspendResult {
         guard let rateOwner = pipeline as? any SampleBufferPlaybackRateOwner,
-              let observedRate = await rateOwner.setRateZeroAndReadBack(
-                readinessCycle: invocation.lifecycle.outputNonce),
+              let observedRate = await rateOwner.setRateZeroAndReadBack(),
               let issuer = quiescenceLock.withLock({ quiescenceIssuer }),
               let proof = issuer.issue(
                 backendIdentity: identity,
