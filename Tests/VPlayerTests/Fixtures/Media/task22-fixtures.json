@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "generator": "Scripts/generate-task22-fixtures.sh",
+  "fixtures": [
+    {"path": "task22-progressive-h264-aac-16s.ts", "durationSeconds": 16, "video": "h264-progressive", "audio": "aac"},
+    {"path": "task22-interlaced-h264-mp2-16s.ts", "durationSeconds": 16, "video": "h264-interlaced-tff", "audio": "mp2"},
+    {"path": "task22-progressive-h264-aac-15.4s-eof.ts", "durationSeconds": 15.4, "video": "h264-progressive", "audio": "aac"},
+    {"path": "task22-progressive-h264-aac-0.8s-short.ts", "durationSeconds": 0.8, "video": "h264-progressive", "audio": "aac"}
+  ]
+}

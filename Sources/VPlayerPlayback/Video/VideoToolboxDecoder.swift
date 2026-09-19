@@ -8,26 +8,45 @@ import Foundation
 import OSLog
 import VideoToolbox
 
+/// 解码提交的拥塞策略。普通播放允许跳到下一个随机访问点以控制实时延迟；
+/// 离线 HLS 图已由外层固定信用做有界背压，因此已接纳 AU 不能在这里再次丢弃。
+enum VideoDecodeSubmissionPolicy: Sendable {
+    case realtimeDropping
+    case externallyBoundedLossless
+}
+
 private final class DecodeSubmissionWindow: @unchecked Sendable {
     private let condition = NSCondition()
     private let capacity: Int
     private let waitInterval: TimeInterval
     private var counts: [VTSessionID: Int] = [:]
+    private var retiredSessions: Set<VTSessionID> = []
 
     init(capacity: Int, waitInterval: TimeInterval) {
         self.capacity = max(1, capacity)
         self.waitInterval = max(0, waitInterval)
     }
 
-    func claim(sessionID: VTSessionID) -> Bool {
+    func claim(sessionID: VTSessionID, policy: VideoDecodeSubmissionPolicy) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date(timeIntervalSinceNow: waitInterval)
         while counts[sessionID, default: 0] >= capacity {
-            guard condition.wait(until: deadline) else { return false }
+            guard !retiredSessions.contains(sessionID) else { return false }
+            switch policy {
+            case .realtimeDropping:
+                guard condition.wait(until: deadline) else { return false }
+            case .externallyBoundedLossless:
+                condition.wait()
+            }
         }
+        guard !retiredSessions.contains(sessionID) else { return false }
         counts[sessionID, default: 0] += 1
         return true
+    }
+
+    func activate(sessionID: VTSessionID) {
+        _ = condition.withLock { retiredSessions.remove(sessionID) }
     }
 
     func release(sessionID: VTSessionID) {
@@ -44,6 +63,7 @@ private final class DecodeSubmissionWindow: @unchecked Sendable {
     func reset(sessionID: VTSessionID) {
         condition.lock()
         counts.removeValue(forKey: sessionID)
+        retiredSessions.insert(sessionID)
         condition.broadcast()
         condition.unlock()
     }
@@ -65,17 +85,27 @@ final class DecodeSubmissionBacklog: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let policy: VideoDecodeSubmissionPolicy
     private var depth: Int
     private var pending = 0
     private var skipping = false
     private var maximumPending = 0
 
-    init(depth: Int) {
+    init(
+        depth: Int,
+        policy: VideoDecodeSubmissionPolicy = .realtimeDropping
+    ) {
         self.depth = max(1, depth)
+        self.policy = policy
     }
 
     func admit(isRandomAccess: Bool) -> Admission {
         lock.withLock {
+            if policy == .externallyBoundedLossless {
+                pending += 1
+                maximumPending = max(maximumPending, pending)
+                return .submit
+            }
             if skipping {
                 // Resume only once the decoder has actually caught up; resuming
                 // at the bound just overflows again on the next unit.
@@ -285,6 +315,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let session: any VideoToolboxSession
         let id: VTSessionID
         let identity: VideoDecoderEventIdentity
+        let surfaceScope: (any DecodedVideoSurfaceAdmitting)?
     }
 
     private struct DecodeToken: @unchecked Sendable {
@@ -315,8 +346,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private let api: any VideoToolboxAPI
     private let compatibilityCheck: PixelBufferCompatibilityCheck
     private let submissionWindow: DecodeSubmissionWindow
+    private let submissionPolicy: VideoDecodeSubmissionPolicy
     private let metrics: PlaybackMetrics?
     private let signposts: PlaybackSignposts?
+    private let surfaceAdmission: (any DecodedVideoSurfaceAdmitting)?
 
     /// Everything below is confined to `submissionQueue`.
     ///
@@ -331,6 +364,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
 
     private let submissionEpoch: SubmissionEpoch
     private let sessionIdentity = SessionIdentityBox()
+    private let surfaceScopeLock = NSLock()
+    private var currentSurfaceScope: (any DecodedVideoSurfaceAdmitting)?
     private let completionRegistry = DecodeCompletionRegistry()
     private let backlog: DecodeSubmissionBacklog
     private let tuningBox = TuningBox()
@@ -353,6 +388,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         executor: PlaybackSerialExecutor,
         tuning: PlaybackTuning,
         diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
+        submissionPolicy: VideoDecodeSubmissionPolicy = .realtimeDropping,
+        surfaceAdmission: (any DecodedVideoSurfaceAdmitting)? = nil,
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
     ) {
         self.init(
@@ -361,6 +398,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             api: SystemVideoToolboxAPI(),
             compatibilityCheck: VideoFormatMetadataReader.systemCompatibilityCheck,
             tuning: tuning,
+            submissionPolicy: submissionPolicy,
+            surfaceAdmission: surfaceAdmission,
             metrics: diagnostics.metrics,
             signposts: diagnostics.signposts
         )
@@ -374,11 +413,13 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         maximumInFlightDecodeCount: Int = 8,
         inFlightWaitInterval: TimeInterval = 0.25,
         tuning: PlaybackTuning = .default,
+        submissionPolicy: VideoDecodeSubmissionPolicy = .realtimeDropping,
         submissionQueue: DispatchQueue = DispatchQueue(
             label: "org.vplayer.playback.decode.submit",
             qos: .userInitiated
         ),
         submissionEpoch: SubmissionEpoch = SubmissionEpoch(),
+        surfaceAdmission: (any DecodedVideoSurfaceAdmitting)? = nil,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil
     ) {
@@ -387,12 +428,17 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         self.eventSink = eventSink
         self.api = api
         self.compatibilityCheck = compatibilityCheck
+        self.submissionPolicy = submissionPolicy
         submissionWindow = DecodeSubmissionWindow(
             capacity: maximumInFlightDecodeCount,
             waitInterval: inFlightWaitInterval
         )
-        backlog = DecodeSubmissionBacklog(depth: tuning.decodeSubmissionQueueDepth)
+        backlog = DecodeSubmissionBacklog(
+            depth: tuning.decodeSubmissionQueueDepth,
+            policy: submissionPolicy
+        )
         self.submissionEpoch = submissionEpoch
+        self.surfaceAdmission = surfaceAdmission
         tuningBox.value = tuning
         self.metrics = metrics
         self.signposts = signposts
@@ -409,9 +455,25 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     /// queue. Fencing is applied before enqueue so already queued submissions
     /// and callbacks cannot cross into the replacement session.
     public func transition(_ transition: VideoDecoderTransition) {
+        if case let .drain(token) = transition {
+            submissionQueue.async { [self] in
+                let outcome = drainIsolated()
+                executor.submit { [eventSink] in
+                    eventSink(.transitionCompleted(token: token, outcome: outcome))
+                }
+            }
+            return
+        }
+        // stop/format 的 caller 可能正在等待 callback surface；必须在把
+        // invalidation 排入 native lane 前同步唤醒它。
         let transitionRevision = submissionEpoch.bump()
         backlog.resumeAfterSessionChange()
         sessionIdentity.clear()
+        // 必须先推进 fence，再取得当前 scope。这样正在落地的旧 configure
+        // 无法在此快照之后安装一个仍可等待的 scope；同路由 configure 替换
+        // 与 invalidate 都会同步唤醒旧 callback，随后才排 native 工作。
+        let retiringScope = surfaceScopeLock.withLock { currentSurfaceScope }
+        retiringScope?.cancelSurfaceAdmission()
 
         submissionQueue.async { [self] in
             let token: VideoDecoderTransitionToken
@@ -440,6 +502,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     }
                     outcome = .failed(.sessionCreate(kVTVideoDecoderMalfunctionErr))
                 }
+            case let .drain(drainToken):
+                token = drainToken
+                outcome = drainIsolated()
             case let .drainAndInvalidate(drainToken):
                 token = drainToken
                 outcome = drainAndInvalidateIsolated()
@@ -455,6 +520,14 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     }
 
     private func drainAndInvalidateIsolated() -> VideoDecoderTransitionOutcome {
+        let outcome = drainIsolated()
+        invalidateIsolated()
+        return outcome
+    }
+
+    /// EOF drain 不得推进 submission fence 或清除 `sessionIdentity`：finish
+    /// 触发的 delayed callback 仍必须以原 session identity 送到 owner。
+    private func drainIsolated() -> VideoDecoderTransitionOutcome {
         guard let current = active else { return .completed }
         var failure: VideoDecoderFailure?
         let finishStatus = api.finishDelayedFrames(current.session)
@@ -465,7 +538,6 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         if waitStatus != noErr, failure == nil {
             failure = Self.classify(waitStatus).failure
         }
-        invalidateIsolated()
         return failure.map(VideoDecoderTransitionOutcome.failed) ?? .completed
     }
 
@@ -483,6 +555,9 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
 
         let selection = try makeSession(format: format)
+        let surfaceScope = surfaceAdmission?.makeSurfaceSessionScope { [weak self] in
+            self?.emitPermanentSurfaceFailure(identity: identity)
+        }
         let candidate = selection.session
         let tuning = tuningBox.value
         let outputPoolFloor = tuning.decoderOutputPoolFloor(
@@ -555,8 +630,10 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             active = ActiveSession(
                 session: candidate,
                 id: candidate.id,
-                identity: identity
+                identity: identity,
+                surfaceScope: surfaceScope
             )
+            surfaceScopeLock.withLock { currentSurfaceScope = surfaceScope }
             sessionIdentity.set(id: candidate.id, event: identity)
         }
         guard installed else {
@@ -580,6 +657,12 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             submissionWindow.reset(sessionID: previous.id)
             api.invalidate(previous.session)
         }
+        submissionWindow.activate(sessionID: candidate.id)
+    }
+
+    private func emitPermanentSurfaceFailure(identity: VideoDecoderEventIdentity) {
+        guard sessionIdentity.event(for: identity.generation) == identity else { return }
+        eventSink(.fatalFailure(.malfunction(kCVReturnError), identity: identity))
     }
 
     private struct SessionSelection {
@@ -749,8 +832,13 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             parserMetadata: accessUnit.parserMetadata
         )
         let sessionID = active.id
+        let surfaceScope = active.surfaceScope
         sampleFramesBeingDecoded(active)
-        guard submissionWindow.claim(sessionID: sessionID) else {
+        guard submissionWindow.claim(sessionID: sessionID, policy: submissionPolicy) else {
+            if submissionPolicy == .externallyBoundedLossless {
+                completion.schedule(.cancelled)
+                return
+            }
             report(
                 .backpressureTimeout,
                 accessUnitID: accessUnit.id,
@@ -796,13 +884,24 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
             )
             metrics?.recordDecoderCallback()
             signpostLifetime.finish()
+            // VideoToolbox 的 imageBuffer 属于 callback。先在 callback lane
+            // 收费，才允许把它 capture 到 owner executor。
+            let surfaceTail: DecodedVideoFrameRetentionTail?
+            if output.status == noErr, let imageBuffer = output.imageBuffer,
+               let admission = surfaceScope {
+                guard let admitted = admission.admitSurface(pixelBuffer: imageBuffer) else {
+                    completion.schedule(.cancelled); return
+                }
+                surfaceTail = admitted
+            } else { surfaceTail = nil }
             metrics?.recordDecoderOutputQueued(outstanding: outstandingOutputs.enter())
             executor.submit { [weak self] in
                 outstandingOutputs.leave()
                 let disposition = self?.handle(
                     output: output,
                     token: token,
-                    sessionID: sessionID
+                    sessionID: sessionID,
+                    surfaceTail: surfaceTail
                 ) ?? .cancelled
                 completion.deliverIsolated(disposition)
             }
@@ -869,6 +968,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         sessionIdentity.clear()
         guard let current = active else { return }
         active = nil
+        surfaceScopeLock.withLock { currentSurfaceScope = nil }
+        current.surfaceScope?.cancelSurfaceAdmission()
         completionRegistry.completeAll(sessionID: current.id)
         submissionWindow.reset(sessionID: current.id)
         api.invalidate(current.session)
@@ -923,7 +1024,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     private func handle(
         output: VTDecodeOutput,
         token: DecodeToken,
-        sessionID: VTSessionID
+        sessionID: VTSessionID,
+        surfaceTail: DecodedVideoFrameRetentionTail?
     ) -> VideoDecoderSubmissionDisposition {
         guard sessionIdentity.matches(id: sessionID, event: token.identity) else {
             metrics?.recordStaleGenerationDrop()
@@ -966,7 +1068,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     duration: output.duration,
                     generation: token.identity.generation,
                     parserMetadata: token.parserMetadata,
-                    formatMetadata: formatMetadata
+                    formatMetadata: formatMetadata,
+                    retentionTail: surfaceTail
                 ),
                 identity: token.identity
             ))

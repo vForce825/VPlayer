@@ -622,6 +622,7 @@ final class PlaybackMetrics: @unchecked Sendable {
     private let now: Now
     private let residentMemoryProvider: ResidentMemoryProvider
     let channelIdentifier: PlaybackDiagnosticsChannelID
+    private let channelName: String
     private let startedAt: TimeInterval
     private var state: State
 
@@ -633,6 +634,7 @@ final class PlaybackMetrics: @unchecked Sendable {
         self.now = now
         self.residentMemoryProvider = residentMemoryProvider
         channelIdentifier = PlaybackDiagnosticsChannelID(rawValue: channelID)
+        self.channelName = channelID
         let startedAt = now()
         self.startedAt = startedAt
         state = State(startedAt: startedAt)
@@ -640,6 +642,14 @@ final class PlaybackMetrics: @unchecked Sendable {
 
     func update(scanType: ScanType) {
         lock.withLock { state.scanType = Self.name(for: scanType) }
+    }
+
+    func updateHLSPlaybackCounters(elapsedSeconds: Double, isInterlaced: Bool) {
+        // HLS/AVPlayer 的媒体进度必须来自真实 player 采样；墙上时间不能证明
+        // 画面、音频或本地 HLS 发布仍在推进。保留这个旧入口为无副作用过渡，
+        // 避免任何调用方重新引入合成帧数。
+        _ = elapsedSeconds
+        _ = isInterlaced
     }
 
     func update(activeRoute: DeinterlaceRoute) {
@@ -1158,3 +1168,144 @@ final class PlaybackMetrics: @unchecked Sendable {
         #endif
     }
 }
+
+#if DEBUG
+public final class PlaybackDiagnosticTracker: @unchecked Sendable {
+    public static let shared = PlaybackDiagnosticTracker()
+    private let lock = NSLock()
+    private let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+    private var stage = "init"
+    private var history: [String] = []
+
+    public func set(_ newStage: String) {
+        lock.withLock {
+            if stage == newStage { return }
+            stage = newStage
+            let now = DispatchTime.now().uptimeNanoseconds
+            let elapsedMilliseconds = now >= startedAtNanoseconds
+                ? (now - startedAtNanoseconds) / 1_000_000 : 0
+            history.append("\(elapsedMilliseconds)ms:\(newStage)")
+            if history.count > 250 {
+                history.removeFirst()
+            }
+        }
+    }
+
+    public func append(_ newStage: String) {
+        set(newStage)
+    }
+
+    public var current: String {
+        lock.withLock { stage }
+    }
+
+    public var recentHistory: String {
+        lock.withLock { history.suffix(120).joined(separator: ">") }
+    }
+}
+#else
+/// Release 构建保留同一调用面但不记录调试轨迹，避免诊断插桩进入热路径。
+public final class PlaybackDiagnosticTracker: @unchecked Sendable {
+    public static let shared = PlaybackDiagnosticTracker()
+    private init() {}
+    public func set(_ newStage: String) {}
+    public func append(_ newStage: String) {}
+    public var current: String { "" }
+    public var recentHistory: String { "" }
+}
+#endif
+
+#if DEBUG
+public extension PlaybackMetricsSnapshot {
+    static func diagnosticPlaceholder(stage: String? = nil) -> PlaybackMetricsSnapshot {
+        let currentStage = stage ?? PlaybackDiagnosticTracker.shared.recentHistory
+        let metrics = PlaybackMetrics(channelID: "acceptance-diag")
+        metrics.update(activeRoute: .bypass)
+        let snapshot = metrics.snapshot(window: .seconds(1))
+        return PlaybackMetricsSnapshot(
+            scanType: "diag:\(currentStage)",
+            activeRoute: "diag:\(currentStage)",
+            decoderCallbacksPerSecond: snapshot.decoderCallbacksPerSecond,
+            yadifKernelDispatchCount: snapshot.yadifKernelDispatchCount,
+            staleGenerationDropCount: snapshot.staleGenerationDropCount,
+            droppedVideoFrames: snapshot.droppedVideoFrames,
+            videoDropCountsBySource: snapshot.videoDropCountsBySource,
+            lastVideoDecodeFailure: snapshot.lastVideoDecodeFailure,
+            maximumYADIFInFlightCount: snapshot.maximumYADIFInFlightCount,
+            maximumYADIFInputDepth: snapshot.maximumYADIFInputDepth,
+            gpuDurationP95Milliseconds: snapshot.gpuDurationP95Milliseconds,
+            yadifCPUEncodeP95Milliseconds: snapshot.yadifCPUEncodeP95Milliseconds,
+            residentMemoryBytes: snapshot.residentMemoryBytes,
+            elapsedSeconds: snapshot.elapsedSeconds,
+            windowDurationSeconds: snapshot.windowDurationSeconds,
+            audioRoute: "diag:\(currentStage)",
+            audioReady: snapshot.audioReady,
+            readinessOpen: snapshot.readinessOpen,
+            retainedAudioCount: snapshot.retainedAudioCount,
+            retainedVideoCount: snapshot.retainedVideoCount,
+            audioContinuityDropCountsByReason: snapshot.audioContinuityDropCountsByReason,
+            audioShortGapCount: snapshot.audioShortGapCount,
+            audioLargeGapCount: snapshot.audioLargeGapCount,
+            audioContinuityIslandSwitchCount: snapshot.audioContinuityIslandSwitchCount,
+            audioFirstPTSSeconds: snapshot.audioFirstPTSSeconds,
+            audioDurationSeconds: snapshot.audioDurationSeconds,
+            videoFirstPTSSeconds: snapshot.videoFirstPTSSeconds,
+            videoLatestPTSSeconds: snapshot.videoLatestPTSSeconds,
+            audioRelativeVideoPruneCount: snapshot.audioRelativeVideoPruneCount,
+            readinessCycleID: snapshot.readinessCycleID,
+            readinessCloseReasonCounts: snapshot.readinessCloseReasonCounts,
+            displayResumeCount: snapshot.displayResumeCount,
+            videoRendererMetricsSampleCount: snapshot.videoRendererMetricsSampleCount,
+            videoRendererMetricsEpochCount: snapshot.videoRendererMetricsEpochCount,
+            videoRendererTotalFrameCount: snapshot.videoRendererTotalFrameCount,
+            videoRendererDroppedFrameCount: snapshot.videoRendererDroppedFrameCount,
+            videoRendererCorruptedFrameCount: snapshot.videoRendererCorruptedFrameCount,
+            videoRendererOptimizedFrameCount: snapshot.videoRendererOptimizedFrameCount,
+            videoRendererAccumulatedFrameDelayMilliseconds: snapshot.videoRendererAccumulatedFrameDelayMilliseconds,
+            clockTimeSeconds: snapshot.clockTimeSeconds,
+            videoResyncCount: snapshot.videoResyncCount,
+            audioRecoveryCount: snapshot.audioRecoveryCount,
+            audioAutomaticFlushTriggerCount: snapshot.audioAutomaticFlushTriggerCount,
+            audioOutputConfigurationTriggerCount: snapshot.audioOutputConfigurationTriggerCount,
+            audioRouteChangeTriggerCount: snapshot.audioRouteChangeTriggerCount,
+            audioRecoveryTransactionCount: snapshot.audioRecoveryTransactionCount,
+            audioSuppressedCorrelatedTriggerCount: snapshot.audioSuppressedCorrelatedTriggerCount,
+            audioCompressedRendererRetryCount: snapshot.audioCompressedRendererRetryCount,
+            audioPCMFallbackCount: snapshot.audioPCMFallbackCount,
+            audioLastFallbackReason: snapshot.audioLastFallbackReason,
+            audioStartupWaitingSeconds: snapshot.audioStartupWaitingSeconds,
+            audioRendererReady: snapshot.audioRendererReady,
+            audioRendererSufficient: snapshot.audioRendererSufficient,
+            audioActiveCodec: snapshot.audioActiveCodec,
+            audioFormatFingerprint: snapshot.audioFormatFingerprint,
+            audioOutputCategory: snapshot.audioOutputCategory,
+            audioRouteRevision: snapshot.audioRouteRevision,
+            audioMediaGeneration: snapshot.audioMediaGeneration,
+            audioLastCompressedRendererFailure: snapshot.audioLastCompressedRendererFailure,
+            audioAcceptedCompressedMediaDurationSeconds: snapshot.audioAcceptedCompressedMediaDurationSeconds,
+            audioPendingSampleCount: snapshot.audioPendingSampleCount,
+            audioRendererRequestArmed: snapshot.audioRendererRequestArmed,
+            audioRendererBackpressureCount: snapshot.audioRendererBackpressureCount,
+            audioRendererRequestRearmCount: snapshot.audioRendererRequestRearmCount,
+            audioAutomaticFlushNoProgressCount: snapshot.audioAutomaticFlushNoProgressCount,
+            audioLastAcceptedPTSSeconds: snapshot.audioLastAcceptedPTSSeconds,
+            audioLastRendererProgressAgeSeconds: snapshot.audioLastRendererProgressAgeSeconds,
+            demuxQueueFullWaitSeconds: snapshot.demuxQueueFullWaitSeconds,
+            demuxAdmitWaitSeconds: snapshot.demuxAdmitWaitSeconds,
+            playbackExecutorBusySeconds: snapshot.playbackExecutorBusySeconds,
+            demuxPacketCount: snapshot.demuxPacketCount,
+            videoAccessUnitCount: snapshot.videoAccessUnitCount,
+            audioSampleCount: snapshot.audioSampleCount,
+            videoDecodeSubmissionCount: snapshot.videoDecodeSubmissionCount,
+            maximumVideoDecodeSubmissionMilliseconds: snapshot.maximumVideoDecodeSubmissionMilliseconds,
+            totalVideoDecodeSubmissionMilliseconds: snapshot.totalVideoDecodeSubmissionMilliseconds,
+            maximumOutstandingDecoderOutputs: snapshot.maximumOutstandingDecoderOutputs,
+            maximumDecodeSubmissionDepth: snapshot.maximumDecodeSubmissionDepth,
+            maximumFramesBeingDecoded: snapshot.maximumFramesBeingDecoded,
+            decoderSessionSummary: snapshot.decoderSessionSummary,
+            decodeCallbackLatencyP95Milliseconds: snapshot.decodeCallbackLatencyP95Milliseconds,
+            videoDecodeSubmissionP95Milliseconds: snapshot.videoDecodeSubmissionP95Milliseconds
+        )
+    }
+}
+#endif

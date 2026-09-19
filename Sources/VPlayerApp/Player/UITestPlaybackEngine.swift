@@ -6,11 +6,12 @@ import Foundation
 import VPlayerPlayback
 
 #if DEBUG
-actor UITestPlaybackEngine: PlaybackEngine {
+actor UITestPlaybackEngine: PlaybackEngine, PlaybackPresentationControlling {
     private let fixture: String?
     private var state: PlaybackState = .idle
     private var request: PlaybackRequest?
     private var eventContinuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
+    private var presentationMountNonce: UInt64 = 0
 
     init(fixture: String?) {
         self.fixture = fixture
@@ -82,6 +83,32 @@ actor UITestPlaybackEngine: PlaybackEngine {
     func stop() async {
         request = nil
         publish(.stopped)
+    }
+
+    func presentations() throws -> AsyncStream<PlaybackPresentationReplacement> {
+        AsyncStream { continuation in continuation.finish() }
+    }
+
+    func claimPresentationMountOwnership(
+        for replacement: PlaybackPresentationReplacement
+    ) -> PlaybackPresentationMountClaimResult {
+        let (next, overflow) = presentationMountNonce.addingReportingOverflow(1)
+        guard !overflow else { return .exhausted }
+        presentationMountNonce = next
+        return .claimed(.init(
+            subscriptionGeneration: replacement.subscriptionGeneration,
+            presentationIdentity: replacement.desired?.identity,
+            mountNonce: next
+        ))
+    }
+
+    func failPresentationControl() {
+        request = nil
+        publish(.failed(.init(
+            code: "presentation.identity.exhausted",
+            userMessage: "播放器呈现身份已耗尽。",
+            retryDisposition: .doNotRetry
+        )))
     }
 
     private func publish(_ state: PlaybackState) {

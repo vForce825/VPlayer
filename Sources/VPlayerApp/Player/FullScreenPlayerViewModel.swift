@@ -2,9 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import Darwin
 import Foundation
+import ObjectiveC
 import Observation
 import VPlayerPlayback
+
+@MainActor
+protocol PlaybackPresentationMounting: AnyObject {
+    func attach(_ presentation: IdentifiedPlaybackPresentation)
+    func detach(_ presentation: IdentifiedPlaybackPresentation)
+}
+
+@MainActor
+final class DefaultPlaybackPresentationMount: PlaybackPresentationMounting {
+    func attach(_: IdentifiedPlaybackPresentation) {}
+    func detach(_ presentation: IdentifiedPlaybackPresentation) {
+        switch presentation.presentation {
+        case let .sampleBuffer(context):
+            context.detach()
+        case let .avPlayer(context):
+            context.detach()
+        }
+    }
+}
 
 @MainActor
 @Observable
@@ -14,23 +35,47 @@ final class FullScreenPlayerViewModel {
         let target: Bool
     }
 
-    typealias PresentationProvider = @Sendable () async -> PlaybackPresentationContext?
+    private struct PendingPresentationIntent {
+        let consumerGeneration: UInt64
+        let lifecycle: UInt64
+        let playback: UInt64
+    }
+
+    @MainActor
+    private final class PresentationConsumerOwner {
+        weak var model: FullScreenPlayerViewModel?
+
+        init(_ model: FullScreenPlayerViewModel) {
+            self.model = model
+        }
+    }
+
+    typealias PresentationStreamProvider = @Sendable () async throws -> AsyncStream<PlaybackPresentationReplacement>
     typealias MediaInformationProvider = @Sendable () async -> AsyncStream<PlaybackMediaInformation?>
 
     let request: PlaybackRequest
     private let engine: any PlaybackEngine
-    private let presentationProvider: PresentationProvider
+    private let presentationController: (any PlaybackPresentationControlling)?
+    private let presentationStreamProvider: PresentationStreamProvider
+    private let presentationMount: any PlaybackPresentationMounting
     private let mediaInformationProvider: MediaInformationProvider
     private let settings: PlaybackSettingsStore
     private var stateTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
+    private var presentationWorkerGeneration: UInt64?
+    private var activePresentationConsumerGeneration: UInt64?
+    private var pendingPresentationIntent: PendingPresentationIntent?
+    private var presentationSuccessorPending = false
     private var mediaInformationProviderTask: Task<Void, Never>?
     private var mediaInformationTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
+    private var presentationConsumerGeneration: UInt64 = 0
+    private var activePresentationSubscriptionGeneration: UInt64?
+    private var latestPresentationRevision: UInt64?
     private var desiredPaused = false
     private var pendingPauseCommands: [PendingPauseCommand] = []
     private var awaitingAuthoritativePause: Bool?
@@ -39,25 +84,68 @@ final class FullScreenPlayerViewModel {
     private var stopped = false
 
     private(set) var state: PlaybackState = .idle
-    private(set) var presentationContext: PlaybackPresentationContext?
+    private(set) var presentation: IdentifiedPlaybackPresentation?
+    private(set) var presentationMountOwnership: PresentationMountOwnership?
     private(set) var mediaInformation: PlaybackMediaInformation?
+    var presentationHostMount: PlaybackPresentationHostMount {
+        guard let hostMount = presentationMount as? PlaybackPresentationHostMount else {
+            preconditionFailure("测试mount不具备生产UIKit host")
+        }
+        return hostMount
+    }
+
+    #if DEBUG
+    /// 仅供生命周期测试观测，不改变 consumer 的所有权或取消语义。
+    var presentationConsumerIsActiveForTesting: Bool {
+        presentationTask != nil || presentationWorkerGeneration != nil ||
+            activePresentationConsumerGeneration != nil
+    }
+
+    var presentationConsumerTaskForTesting: Task<Void, Never>? {
+        presentationTask
+    }
+
+    static var presentationConsumerOwnerObjectAllocationForTesting: Int {
+        malloc_good_size(class_getInstanceSize(PresentationConsumerOwner.self))
+    }
+
+    /// 仅供代际交接测试制造真实 AsyncStream cancellation/termination。
+    func cancelPresentationConsumerForTesting() {
+        presentationTask?.cancel()
+    }
+    #endif
 
     init(
         request: PlaybackRequest,
         engine: any PlaybackEngine,
-        presentationProvider: @escaping PresentationProvider,
+        presentationController: (any PlaybackPresentationControlling)? = nil,
+        presentationStreamProvider: @escaping PresentationStreamProvider,
+        presentationMount: (any PlaybackPresentationMounting)? = nil,
         mediaInformationProvider: @escaping MediaInformationProvider = {
-            AsyncStream<PlaybackMediaInformation?> { continuation in
-                continuation.finish()
-            }
+            AsyncStream<PlaybackMediaInformation?> { continuation in continuation.finish() }
         },
-        settings: PlaybackSettingsStore
+        settings: PlaybackSettingsStore,
+        initialPresentationConsumerGeneration: UInt64 = 0
     ) {
         self.request = request
         self.engine = engine
-        self.presentationProvider = presentationProvider
+        self.presentationController = presentationController
+            ?? (engine as? any PlaybackPresentationControlling)
+        self.presentationStreamProvider = presentationStreamProvider
+        self.presentationMount = presentationMount ?? PlaybackPresentationHostMount()
         self.mediaInformationProvider = mediaInformationProvider
         self.settings = settings
+        presentationConsumerGeneration = initialPresentationConsumerGeneration
+    }
+
+    func detachPresentationIfOwned(_ expected: PresentationMountOwnership) {
+        guard presentationMountOwnership?.subscriptionGeneration == expected.subscriptionGeneration,
+              presentationMountOwnership?.mountNonce == expected.mountNonce else { return }
+        if let presentation {
+            presentationMount.detach(presentation)
+        }
+        presentation = nil
+        presentationMountOwnership = nil
     }
 
     var isPaused: Bool {
@@ -91,7 +179,7 @@ final class FullScreenPlayerViewModel {
                 lifecycle: lifecycle,
                 playback: playback
             )
-            beginPresentationLookup(lifecycle: lifecycle, playback: playback)
+            await beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
     }
 
@@ -129,6 +217,7 @@ final class FullScreenPlayerViewModel {
               case let .failed(failure) = state,
               failure.retryDisposition == .retrySameRequest else { return }
         resetMediaInformation()
+        presentationSuccessorPending = presentationController != nil
         playbackGeneration &+= 1
         resetPauseIntent()
         let lifecycle = lifecycleGeneration
@@ -156,7 +245,7 @@ final class FullScreenPlayerViewModel {
                 lifecycle: lifecycle,
                 playback: playback
             )
-            beginPresentationLookup(lifecycle: lifecycle, playback: playback)
+            await beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
     }
 
@@ -178,6 +267,10 @@ final class FullScreenPlayerViewModel {
         let mediaInformation = mediaInformationTask
         playback?.cancel()
         presentation?.cancel()
+        pendingPresentationIntent = nil
+        presentationSuccessorPending = false
+        presentationWorkerGeneration = nil
+        activePresentationConsumerGeneration = nil
         mediaInformationProvider?.cancel()
         mediaInformation?.cancel()
         pause?.cancel()
@@ -190,8 +283,11 @@ final class FullScreenPlayerViewModel {
         stateTask = nil
         self.mediaInformation = nil
         state = .stopped
-        presentationContext?.detach()
-        presentationContext = nil
+        if let ownership = presentationMountOwnership {
+            detachPresentationIfOwned(ownership)
+        }
+        activePresentationSubscriptionGeneration = nil
+        latestPresentationRevision = nil
 
         let engine = engine
         let task = Task {
@@ -205,16 +301,287 @@ final class FullScreenPlayerViewModel {
         await task.value
     }
 
-    private func beginPresentationLookup(lifecycle: UInt64, playback: UInt64) {
-        presentationTask?.cancel()
-        let provider = presentationProvider
-        presentationTask = Task { @MainActor [weak self] in
-            let context = await provider()
-            guard let self,
-                  isCurrent(lifecycle: lifecycle, playback: playback) else {
+    private func beginPresentationLookup(lifecycle: UInt64, playback: UInt64) async {
+        guard let presentationController else {
+            presentationSuccessorPending = false
+            return
+        }
+        let (consumerGeneration, overflow) = presentationConsumerGeneration.addingReportingOverflow(1)
+        guard !overflow else {
+            presentationSuccessorPending = false
+            await presentationController.failPresentationControl()
+            if let ownership = presentationMountOwnership {
+                detachPresentationIfOwned(ownership)
+            }
+            return
+        }
+        presentationConsumerGeneration = consumerGeneration
+        let intent = PendingPresentationIntent(
+            consumerGeneration: consumerGeneration,
+            lifecycle: lifecycle,
+            playback: playback
+        )
+        presentationSuccessorPending = false
+        guard presentationTask == nil else {
+            pendingPresentationIntent = intent
+            return
+        }
+        pendingPresentationIntent = intent
+        startPresentationWorker(startingWith: consumerGeneration)
+    }
+
+    private func startPresentationWorker(startingWith workerGeneration: UInt64) {
+        let provider = presentationStreamProvider
+        let owner = PresentationConsumerOwner(self)
+        presentationWorkerGeneration = workerGeneration
+        presentationTask = Task { @MainActor in
+            await Self.runPresentationWorker(
+                owner: owner,
+                provider: provider,
+                workerGeneration: workerGeneration
+            )
+        }
+    }
+
+    private static func runPresentationWorker(
+        owner: PresentationConsumerOwner,
+        provider: PresentationStreamProvider,
+        workerGeneration: UInt64
+    ) async {
+        defer { owner.model?.finishPresentationWorker(workerGeneration) }
+        while !Task.isCancelled,
+              let intent = takePendingPresentationIntent(
+                owner: owner,
+                workerGeneration: workerGeneration
+              ) {
+            await consumePresentationStream(
+                for: intent,
+                provider: provider,
+                workerGeneration: workerGeneration,
+                owner: owner
+            )
+        }
+    }
+
+    /// 强引用只存在于这个同步栈帧，不跨越provider或iterator.next的等待点。
+    private static func takePendingPresentationIntent(
+        owner: PresentationConsumerOwner,
+        workerGeneration: UInt64
+    ) -> PendingPresentationIntent? {
+        guard let model = owner.model,
+              model.presentationWorkerGeneration == workerGeneration else { return nil }
+        return model.takePendingPresentationIntent()
+    }
+
+    private func takePendingPresentationIntent() -> PendingPresentationIntent? {
+        guard let pending = pendingPresentationIntent else { return nil }
+        pendingPresentationIntent = nil
+        activePresentationConsumerGeneration = pending.consumerGeneration
+        return pending
+    }
+
+    private static func consumePresentationStream(
+        for intent: PendingPresentationIntent,
+        provider: PresentationStreamProvider,
+        workerGeneration: UInt64,
+        owner: PresentationConsumerOwner
+    ) async {
+        var streamSubscriptionGeneration: UInt64?
+        let stream: AsyncStream<PlaybackPresentationReplacement>
+        do {
+            stream = try await provider()
+        } catch {
+            return
+        }
+
+        guard presentationConsumerIsCurrent(
+            owner: owner,
+            intent: intent,
+            workerGeneration: workerGeneration
+        ) else { return }
+        var iterator = stream.makeAsyncIterator()
+        while !Task.isCancelled {
+            // iterator可以不响应cancel；这个await栈不得持有VM或mount。
+            guard let replacement = await iterator.next() else {
+                finishPresentationStream(
+                    owner: owner,
+                    intent: intent,
+                    workerGeneration: workerGeneration
+                )
                 return
             }
-            presentationContext = context
+            guard presentationConsumerCanConsume(
+                owner: owner,
+                intent: intent,
+                workerGeneration: workerGeneration
+            ) else { return }
+            if let expected = streamSubscriptionGeneration {
+                guard replacement.subscriptionGeneration == expected else { continue }
+            } else {
+                streamSubscriptionGeneration = replacement.subscriptionGeneration
+            }
+            await consumePresentationReplacement(
+                replacement,
+                intent: intent,
+                workerGeneration: workerGeneration,
+                owner: owner
+            )
+        }
+    }
+
+    private static func presentationConsumerIsCurrent(
+        owner: PresentationConsumerOwner,
+        intent: PendingPresentationIntent,
+        workerGeneration: UInt64
+    ) -> Bool {
+        guard !Task.isCancelled, let model = owner.model else { return false }
+        return model.presentationWorkerGeneration == workerGeneration &&
+            model.activePresentationConsumerGeneration == intent.consumerGeneration &&
+            model.pendingPresentationIntent == nil &&
+            model.isCurrent(lifecycle: intent.lifecycle, playback: intent.playback)
+    }
+
+    private static func presentationConsumerCanConsume(
+        owner: PresentationConsumerOwner,
+        intent: PendingPresentationIntent,
+        workerGeneration: UInt64
+    ) -> Bool {
+        guard !Task.isCancelled, let model = owner.model,
+              model.presentationWorkerGeneration == workerGeneration,
+              model.activePresentationConsumerGeneration == intent.consumerGeneration,
+              model.pendingPresentationIntent == nil,
+              model.isCurrent(lifecycle: intent.lifecycle) else { return false }
+        // retry已经预留G2后，G1的nil只结束旧stream，不先拆host；
+        // G2完整目标到达时再同步决定同context换owner或异context拆A装B。
+        return model.playbackGeneration == intent.playback
+    }
+
+    private static func consumePresentationReplacement(
+        _ replacement: PlaybackPresentationReplacement,
+        intent: PendingPresentationIntent,
+        workerGeneration: UInt64,
+        owner: PresentationConsumerOwner
+    ) async {
+        guard let model = owner.model else { return }
+        await model.consumePresentationReplacement(
+            replacement,
+            intent: intent,
+            workerGeneration: workerGeneration
+        )
+    }
+
+    private static func finishPresentationStream(
+        owner: PresentationConsumerOwner,
+        intent: PendingPresentationIntent,
+        workerGeneration: UInt64
+    ) {
+        guard let model = owner.model,
+              model.pendingPresentationIntent == nil,
+              !model.presentationSuccessorPending,
+              model.presentationWorkerGeneration == workerGeneration,
+              model.activePresentationConsumerGeneration == intent.consumerGeneration else { return }
+        if let ownership = model.presentationMountOwnership {
+            model.detachPresentationIfOwned(ownership)
+        }
+        model.activePresentationSubscriptionGeneration = nil
+        model.latestPresentationRevision = nil
+    }
+
+    private func finishPresentationWorker(_ workerGeneration: UInt64) {
+        guard presentationWorkerGeneration == workerGeneration else { return }
+        activePresentationConsumerGeneration = nil
+        presentationWorkerGeneration = nil
+        presentationTask = nil
+        if pendingPresentationIntent == nil, !presentationSuccessorPending,
+           let ownership = presentationMountOwnership {
+            detachPresentationIfOwned(ownership)
+        }
+    }
+
+    private func consumePresentationReplacement(
+        _ replacement: PlaybackPresentationReplacement,
+        intent: PendingPresentationIntent,
+        workerGeneration: UInt64
+    ) async {
+        guard isPresentationIntentCurrent(intent, workerGeneration: workerGeneration),
+              let presentationController else { return }
+        let changesSubscription = activePresentationSubscriptionGeneration !=
+            replacement.subscriptionGeneration
+        if !changesSubscription {
+            guard latestPresentationRevision.map({ replacement.revision > $0 }) ?? true else {
+                return
+            }
+        }
+
+        let claim = await presentationController.claimPresentationMountOwnership(for: replacement)
+        // claim会跨actor suspension；返回时必须复验完整intent，不能只比较consumer编号。
+        guard isPresentationIntentCurrent(intent, workerGeneration: workerGeneration) else { return }
+        let preparedOwnership: PresentationMountOwnership
+        switch claim {
+        case .claimed(let ownership):
+            preparedOwnership = ownership
+        case .stale:
+            return
+        case .exhausted:
+            await presentationController.failPresentationControl()
+            guard isPresentationIntentCurrent(
+                intent,
+                workerGeneration: workerGeneration
+            ) else { return }
+            if let ownership = presentationMountOwnership {
+                detachPresentationIfOwned(ownership)
+            }
+            activePresentationSubscriptionGeneration = nil
+            latestPresentationRevision = nil
+            return
+        }
+
+        activePresentationSubscriptionGeneration = replacement.subscriptionGeneration
+        latestPresentationRevision = replacement.revision
+        if !Self.samePresentation(presentation, replacement.desired) {
+            if let presentation {
+                presentationMount.detach(presentation)
+            }
+            presentation = nil
+            if let desired = replacement.desired {
+                presentationMount.attach(desired)
+                presentation = desired
+            }
+        }
+        presentationMountOwnership = replacement.desired == nil ? nil : preparedOwnership
+    }
+
+    private func isPresentationIntentCurrent(
+        _ intent: PendingPresentationIntent,
+        workerGeneration: UInt64
+    ) -> Bool {
+        !Task.isCancelled &&
+            presentationWorkerGeneration == workerGeneration &&
+            activePresentationConsumerGeneration == intent.consumerGeneration &&
+            pendingPresentationIntent == nil &&
+            !presentationSuccessorPending &&
+            isCurrent(lifecycle: intent.lifecycle, playback: intent.playback)
+    }
+
+    private static func samePresentation(
+        _ lhs: IdentifiedPlaybackPresentation?,
+        _ rhs: IdentifiedPlaybackPresentation?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            guard lhs.identity == rhs.identity else { return false }
+            switch (lhs.presentation, rhs.presentation) {
+            case let (.sampleBuffer(left), .sampleBuffer(right)):
+                return left === right
+            case let (.avPlayer(left), .avPlayer(right)):
+                return left === right
+            default:
+                return false
+            }
+        default:
+            return false
         }
     }
 

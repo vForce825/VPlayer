@@ -242,10 +242,15 @@ final class VPlayerAppStartupTests: XCTestCase {
         )
     }
 
-    func testLaunchArgumentsSelectOnlyTheExactSeededFixturePair() {
+    func testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds() {
+        #if DEBUG
+        let expectedSeededMode: AppLaunchMode = .seededFixture
+        #else
+        let expectedSeededMode: AppLaunchMode = .live
+        #endif
         XCTAssertEqual(
             AppLaunchConfiguration(arguments: ["VPlayer", "-ui-fixture", "seeded"]).mode,
-            .seededFixture
+            expectedSeededMode
         )
         XCTAssertEqual(
             AppLaunchConfiguration(arguments: ["VPlayer", "-ui-testing"]).mode,

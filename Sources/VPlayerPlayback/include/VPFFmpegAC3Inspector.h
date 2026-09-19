@@ -12,6 +12,10 @@ extern "C" {
 #endif
 
 #define VPFF_AC3_INSPECTOR_ABI_VERSION ((uint32_t)1)
+#define VPFF_AC3_SUPPORTED_FSCOD_COUNT ((uint8_t)3)
+#define VPFF_AC3_SUPPORTED_BSID_MIN ((uint8_t)0)
+#define VPFF_AC3_SUPPORTED_BSID_MAX ((uint8_t)10)
+#define VPFF_AC3_SUPPORTED_FRMSIZECOD_COUNT ((uint8_t)38)
 
 typedef struct {
     uint32_t abi_version;
@@ -29,12 +33,17 @@ typedef struct {
     uint8_t reserved[2];
 } VPFFAC3FrameInfoV1;
 
-/* Input bytes are borrowed only for this call. A successful result represents
-   exactly one complete, classic AC-3 syncframe with a valid full-frame CRC. */
+/* 输入字节只在本次调用中借用；成功结果严格对应一个完整且CRC有效的经典AC-3 syncframe。 */
 int32_t vp_ffmpeg_inspect_ac3_frame_v1(
     const uint8_t *bytes,
     size_t size,
     VPFFAC3FrameInfoV1 *out_info
+);
+
+/* 返回真实header parser对fscod/bsid组合采用的采样率；非法组合返回负值。 */
+int32_t vp_ffmpeg_ac3_supported_sample_rate_v1(
+    uint8_t fscod,
+    uint8_t bsid
 );
 
 #ifdef __cplusplus

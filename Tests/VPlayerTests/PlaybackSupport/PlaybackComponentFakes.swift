@@ -9,7 +9,55 @@ import Foundation
 import VideoToolbox
 @testable import VPlayerPlayback
 
-final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
+/// 仅替换底层系统 SDK；配置、稳定 route、completion 与资源权限均走同一真实 Registry。
+func makeRoutedPlaybackController(
+    factory: any PlaybackPipelineFactory,
+    audioSessionOwner: PlaybackAudioSessionOwner? = nil
+) -> PlaybackController {
+    makeRoutedPlaybackController(
+        backendFactory: SystemPlaybackBackendFactory(pipelineFactory: factory),
+        audioSessionOwner: audioSessionOwner
+    )
+}
+
+func makeRoutedPlaybackController(
+    backendFactory: any PlaybackBackendFactory,
+    audioSessionOwner: PlaybackAudioSessionOwner? = nil
+) -> PlaybackController {
+    let registry = audioSessionOwner?.registry
+        ?? ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+    let owner = audioSessionOwner ?? (try! PlaybackAudioSessionOwner(
+        registry: registry, sdk: FakeAudioSessionSDK(initialPorts: [.hdmi])
+    ))
+    let routeService = PlaybackAudioRouteService(registry: registry, owner: owner)
+    return PlaybackController(registry: registry, audioSessionOwner: owner,
+        routeService: routeService, audioEventMonitor: owner.monitor,
+        backendFactory: backendFactory, allocator: registry.allocator)
+}
+
+/// 测试消费真实 stream；每一步用有界条件等待，失败时取消 collector，避免无界 next。
+final class PlaybackStreamRecorder<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Value] = []
+    func append(_ value: Value) { lock.withLock { values.append(value) } }
+    var snapshot: [Value] { lock.withLock { values } }
+}
+
+final class PipelineOutputConcurrency: @unchecked Sendable {
+    private let lock = NSLock()
+    private var audible: Set<ObjectIdentifier> = []
+    private var peak = 0
+    func record(_ object: AnyObject, rate: Float) {
+        lock.withLock {
+            if rate > 0 { audible.insert(ObjectIdentifier(object)) }
+            else { audible.remove(ObjectIdentifier(object)) }
+            peak = max(peak, audible.count)
+        }
+    }
+    var maximum: Int { lock.withLock { peak } }
+}
+
+final class FakeControllerPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRateOwner, @unchecked Sendable {
     enum AudioLifecycleOperation: Equatable {
         case pause(Bool, UInt64)
         case reset(UInt64)
@@ -24,18 +72,22 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
     private(set) var audioLifecycleOperations: [AudioLifecycleOperation] = []
     private(set) var stopCount = 0
     private(set) var completedStopCount = 0
+    private(set) var playbackRate: Float = 0.0
     private(set) var tunings: [PlaybackTuning] = []
     var stopAutomaticallyCompletes = true
     private var stopContinuation: CheckedContinuation<Void, Never>?
     let presentationContext: PlaybackPresentationContext?
     let metrics: PlaybackMetrics?
+    private let outputConcurrency: PipelineOutputConcurrency?
 
     init(
-        presentationContext: PlaybackPresentationContext? = nil,
-        metrics: PlaybackMetrics? = nil
+        presentationContext: PlaybackPresentationContext? = PlaybackPresentationContext(),
+        metrics: PlaybackMetrics? = nil,
+        outputConcurrency: PipelineOutputConcurrency? = nil
     ) {
         self.presentationContext = presentationContext
         self.metrics = metrics
+        self.outputConcurrency = outputConcurrency
     }
 
     func install(_ sink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) {
@@ -56,6 +108,21 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
         lock.withLock {
             pauses.append((paused, readinessCycle))
             audioLifecycleOperations.append(.pause(paused, readinessCycle))
+        }
+    }
+
+    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64) {
+        lock.withLock {
+            playbackRate = rate
+            outputConcurrency?.record(self, rate: rate)
+        }
+    }
+
+    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float? {
+        lock.withLock {
+            playbackRate = 0.0
+            outputConcurrency?.record(self, rate: 0.0)
+            return playbackRate
         }
     }
 
@@ -86,7 +153,10 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, @unchecked Sendabl
                 lock.withLock { stopContinuation = continuation }
             }
         }
-        lock.withLock { completedStopCount += 1 }
+        lock.withLock {
+            completedStopCount += 1
+            outputConcurrency?.record(self, rate: 0)
+        }
     }
 
     func completeStop() {
@@ -211,51 +281,32 @@ final class SuspendedControllerPipelineFactory: PlaybackPipelineFactory, @unchec
     }
 }
 
-final class FakePlaybackAudioSessionOwner: PlaybackAudioSessionOwning,
-    @unchecked Sendable {
-    private let lock = NSLock()
-    private let error: (any Error)?
-    private let onAcquire: @Sendable () -> Void
-    private var callCount = 0
-    private var nextID: UInt64 = 1
+final class FakePlaybackAudioSessionOwner: @unchecked Sendable {
+    let realOwner: PlaybackAudioSessionOwner
+    let sdk: FakeAudioSessionSDK
+    let registry: ControlTaskRegistry
 
     init(
         error: (any Error)? = nil,
         onAcquire: @escaping @Sendable () -> Void = {}
     ) {
-        self.error = error
-        self.onAcquire = onAcquire
+        // 每个独立SDK夹具拥有同一runtime内唯一的allocator；不能把另一Registry的配置域带入新Authority。
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let sdk = FakeAudioSessionSDK(initialPorts: [.hdmi])
+        sdk.activateError = error
+        sdk.onActivate = onAcquire
+        self.registry = registry
+        self.sdk = sdk
+        self.realOwner = try! PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
     }
 
-    @MainActor
-    func acquire(
-        eventHandler _: @escaping @MainActor @Sendable (
-            PlaybackAudioSessionLease,
-            PlaybackAudioSessionEvent
-        ) -> Void
-    ) throws -> PlaybackAudioSessionLease {
-        let id = lock.withLock { () -> UInt64 in
-            callCount += 1
-            defer { nextID += 1 }
-            return nextID
-        }
-        onAcquire()
-        if let error { throw error }
-        return PlaybackAudioSessionLease(id: id, generation: id)
-    }
-
-    @MainActor
-    func release(_: PlaybackAudioSessionLease) {}
-
-    @MainActor
-    func requestResume(for _: PlaybackAudioSessionLease) -> Bool { false }
-
-    var callCountSnapshot: Int { lock.withLock { callCount } }
+    var callCountSnapshot: Int { sdk.activateCallCount }
 }
 
 enum FakePlaybackAudioSessionOwnerError: Error {
     case activation
 }
+
 
 final class LockedControllerStartupTrace: @unchecked Sendable {
     enum Event: Equatable {
@@ -785,6 +836,7 @@ final class FakePipelineClock: PlaybackClock, @unchecked Sendable {
         }
     }
     func setTime(_ time: CMTime) { lock.withLock { storedTime = time } }
+    func setRate(_ rate: Float) {}
     func snapshot() -> (pauses: Int, anchors: [(CMTime, CMTime, Float)]) {
         lock.withLock { (pauses, anchors) }
     }
@@ -1161,12 +1213,21 @@ enum PlaybackFakeMedia {
             duration: duration ?? CMTime(value: 1, timescale: 25),
             isRandomAccess: randomAccess
         )
-        return CompressedVideoAccessUnit(
+        let backing = try VideoAccessUnitBacking(
+            identity: VideoAccessUnitBackingIdentity(
+                generation: generation,
+                accessUnitID: id
+            ),
+            bytes: data
+        )
+        return try CompressedVideoAccessUnit(
             id: id,
             sampleBuffer: buffer,
             generation: generation,
             isRandomAccess: randomAccess,
-            parserMetadata: parserMetadata(interlaced: false)
+            parserMetadata: parserMetadata(interlaced: false),
+            sourceBacking: backing,
+            sourceByteRange: backing.wholeRange
         )
     }
 

@@ -62,17 +62,27 @@ struct MPEGAudioCodecProfile: CompressedAudioCodecProfile {
     }
 }
 
-private struct MPEGHeader {
-    enum Version {
-        case mpeg1
-        case mpeg2
-        case mpeg25
+struct MPEGHeaderInputDomainEntry: Sendable, Hashable {
+    let codec: AudioCodec
+    let versionBits: UInt32
+    let layerBits: UInt32
+    let sampleRateIndex: UInt32
+    let sampleRate: Int32
+    let sampleCount: Int32
+    let referenceBitrate: Int
+}
+
+struct MPEGHeader {
+    enum Version: UInt32, Sendable, Hashable, CaseIterable {
+        case mpeg25 = 0
+        case mpeg2 = 2
+        case mpeg1 = 3
     }
 
-    enum Layer {
-        case layer1
-        case layer2
-        case layer3
+    enum Layer: UInt32, Sendable, Hashable, CaseIterable {
+        case layer3 = 1
+        case layer2 = 2
+        case layer1 = 3
     }
 
     private static let mpeg1Layer1Bitrates = [
@@ -90,11 +100,49 @@ private struct MPEGHeader {
     private static let mpeg2Layer23Bitrates = [
         8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
     ]
+    private static let baseSampleRates = [44_100, 48_000, 32_000]
 
     let layer: Layer
     let sampleRate: Int32
     let channelCount: Int32
     let sampleCount: Int32
+
+    static var supportedInputDomain: [MPEGHeaderInputDomainEntry] {
+        Version.allCases.flatMap { version in
+            Layer.allCases.flatMap { layer in
+                (0..<3).map { sampleRateIndex in
+                    let divisor: Int
+                    switch version {
+                    case .mpeg1: divisor = 1
+                    case .mpeg2: divisor = 2
+                    case .mpeg25: divisor = 4
+                    }
+                    let codec: AudioCodec
+                    let sampleCount: Int32
+                    switch layer {
+                    case .layer1:
+                        codec = .mp1
+                        sampleCount = 384
+                    case .layer2:
+                        codec = .mp2
+                        sampleCount = 1_152
+                    case .layer3:
+                        codec = .mp3
+                        sampleCount = version == .mpeg1 ? 1_152 : 576
+                    }
+                    return MPEGHeaderInputDomainEntry(
+                        codec: codec,
+                        versionBits: version.rawValue,
+                        layerBits: layer.rawValue,
+                        sampleRateIndex: UInt32(sampleRateIndex),
+                        sampleRate: Int32(baseSampleRates[sampleRateIndex] / divisor),
+                        sampleCount: sampleCount,
+                        referenceBitrate: bitrate(version: version, layer: layer, index: 0) * 1_000
+                    )
+                }
+            }
+        }
+    }
 
     static func parse(_ data: Data) throws -> MPEGHeader {
         guard data.count >= 4 else { throw AudioCodecProfileValidation.error() }
@@ -105,37 +153,32 @@ private struct MPEGHeader {
             | UInt32(bytes[3])
         guard raw >> 21 == 0x7FF else { throw AudioCodecProfileValidation.error() }
         let version: Version
-        switch (raw >> 19) & 3 {
-        case 3: version = .mpeg1
-        case 2: version = .mpeg2
-        case 0: version = .mpeg25
-        default: throw AudioCodecProfileValidation.error()
+        guard let parsedVersion = Version(rawValue: (raw >> 19) & 3) else {
+            throw AudioCodecProfileValidation.error()
         }
+        version = parsedVersion
         let layer: Layer
-        switch (raw >> 17) & 3 {
-        case 3: layer = .layer1
-        case 2: layer = .layer2
-        case 1: layer = .layer3
-        default: throw AudioCodecProfileValidation.error()
+        guard let parsedLayer = Layer(rawValue: (raw >> 17) & 3) else {
+            throw AudioCodecProfileValidation.error()
         }
+        layer = parsedLayer
         let bitrateIndex = Int((raw >> 12) & 0xF)
         let sampleRateIndex = Int((raw >> 10) & 3)
         guard bitrateIndex > 0, bitrateIndex < 15, sampleRateIndex < 3 else {
             throw AudioCodecProfileValidation.error()
         }
-        let bitrate = try bitrate(
+        let bitrate = bitrate(
             version: version,
             layer: layer,
             index: bitrateIndex - 1
         ) * 1_000
-        let baseRates = [44_100, 48_000, 32_000]
         let divisor: Int
         switch version {
         case .mpeg1: divisor = 1
         case .mpeg2: divisor = 2
         case .mpeg25: divisor = 4
         }
-        let sampleRate = baseRates[sampleRateIndex] / divisor
+        let sampleRate = baseSampleRates[sampleRateIndex] / divisor
         let padding = Int((raw >> 9) & 1)
         let expectedLength: Int
         switch layer {
@@ -169,7 +212,7 @@ private struct MPEGHeader {
         version: Version,
         layer: Layer,
         index: Int
-    ) throws -> Int {
+    ) -> Int {
         switch (version, layer) {
         case (.mpeg1, .layer1): return mpeg1Layer1Bitrates[index]
         case (.mpeg1, .layer2): return mpeg1Layer2Bitrates[index]

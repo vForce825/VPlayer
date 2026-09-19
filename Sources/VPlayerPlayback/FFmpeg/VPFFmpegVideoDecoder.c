@@ -262,10 +262,24 @@ int32_t vp_ffmpeg_video_decoder_push(
         decoder->codec_context,
         size > 0 ? decoder->packet : NULL
     );
+    // send/receive 的 EAGAIN 表示 packet 尚未被消费；必须先取走可用帧，
+    // 再重送同一个 packet。只 drain 而不重送会在并行解码饱和时静默丢 AU。
+    if (result == AVERROR(EAGAIN) && size > 0) {
+        int32_t drain_result = drain(
+            decoder,
+            out_failure_token,
+            out_has_failure_token
+        );
+        if (drain_result != 0) {
+            av_packet_unref(decoder->packet);
+            return drain_result;
+        }
+        result = avcodec_send_packet(decoder->codec_context, decoder->packet);
+    }
     av_packet_unref(decoder->packet);
     // A frame the decoder cannot use is not a session failure: the reference it
     // wanted was dropped upstream, and the next random-access unit recovers.
-    if (result < 0 && result != AVERROR(EAGAIN) && result != AVERROR_INVALIDDATA) {
+    if (result < 0 && result != AVERROR_INVALIDDATA) {
         return (int32_t)result;
     }
     return drain(decoder, out_failure_token, out_has_failure_token);

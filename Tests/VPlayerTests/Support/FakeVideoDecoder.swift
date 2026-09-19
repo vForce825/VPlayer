@@ -10,6 +10,7 @@ import VideoToolbox
 final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
     enum Operation: Equatable {
         case transitionConfigure(VideoDecoderTransitionToken, MediaGeneration)
+        case transitionDrain(VideoDecoderTransitionToken)
         case transitionDrainAndInvalidate(VideoDecoderTransitionToken)
         case transitionInvalidate(VideoDecoderTransitionToken)
         case decode(UInt64, MediaGeneration, VTDecodeFrameFlags)
@@ -17,6 +18,7 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
 
     private let lock = NSLock()
     private(set) var operations: [Operation] = []
+    private var decodedAccessUnits: [CompressedVideoAccessUnit] = []
     private var submissionCompletionSink: (@Sendable (
         UInt64,
         VideoDecoderEventIdentity,
@@ -51,6 +53,9 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
                 )
                 configuredIdentities[generation] = pendingConfigureIdentities[token]
                 storedActiveIdentity = nil
+            case let .drain(token):
+                transitionToken = token
+                operations.append(.transitionDrain(token))
             case let .drainAndInvalidate(token):
                 transitionToken = token
                 operations.append(.transitionDrainAndInvalidate(token))
@@ -64,6 +69,8 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
             let outcome = switch transition {
             case .configure:
                 configureTransitionOutcome
+            case .drain:
+                drainTransitionOutcome
             case .drainAndInvalidate:
                 drainTransitionOutcome
             case .invalidate:
@@ -83,6 +90,7 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
         if let decodeError { throw decodeError }
         let completion = lock.withLock {
             operations.append(.decode(accessUnit.id, accessUnit.generation, flags))
+            decodedAccessUnits.append(accessUnit)
             return (submissionCompletionSink, storedActiveIdentity)
         }
         if let sink = completion.0,
@@ -181,6 +189,10 @@ final class FakeVideoDecoder: VideoDecoding, @unchecked Sendable {
                 return id
             }
         }
+    }
+
+    var decodedAccessUnitsSnapshot: [CompressedVideoAccessUnit] {
+        lock.withLock { decodedAccessUnits }
     }
 
     func snapshot() -> [Operation] { lock.withLock { operations } }

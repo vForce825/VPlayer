@@ -171,7 +171,7 @@ final class PlaybackPipelineTests: XCTestCase {
             mutableAudioDiagnostics: audioDiagnostics,
             eventForwarder: eventForwarder
         )
-        let controller = PlaybackController(factory: InstalledPlaybackPipelineFactory(
+        let controller = makeRoutedPlaybackController(factory: InstalledPlaybackPipelineFactory(
             pipeline: harness.pipeline,
             eventForwarder: eventForwarder
         ))
@@ -1155,11 +1155,15 @@ final class PlaybackPipelineTests: XCTestCase {
     func testControllerClearsMediaInformationAcrossReplacementAndFailure() async throws {
         let first = FakeControllerPipeline()
         let second = FakeControllerPipeline()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([first, second]))
-        var info = await controller.playbackMediaInformation().makeAsyncIterator()
-        let initial = await info.next()
-        let initialInformation = try XCTUnwrap(initial)
-        XCTAssertNil(initialInformation)
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([first, second]))
+        let stream = await controller.playbackMediaInformation()
+        let info = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+        let collector = Task {
+            for await value in stream { info.append(value) }
+        }
+        defer { collector.cancel() }
+        try await eventually { info.snapshot.count == 1 }
+        XCTAssertNil(try XCTUnwrap(info.snapshot.first))
 
         await controller.play(makeRequest(title: "first"))
         first.emit(.mediaInformation(PlaybackMediaInformation(
@@ -1170,14 +1174,13 @@ final class PlaybackPipelineTests: XCTestCase {
             outputFrameRate: 50,
             isSmoothMotionEnhanced: true
         )))
-        let publishedEvent = await info.next()
-        let published = try XCTUnwrap(publishedEvent.flatMap { $0 })
+        try await eventually { info.snapshot.count == 2 }
+        let published = try XCTUnwrap(info.snapshot.last.flatMap { $0 })
         XCTAssertEqual(published.width, 1_920)
 
         await controller.play(makeRequest(title: "second"))
-        let cleared = await info.next()
-        let clearedInformation = try XCTUnwrap(cleared)
-        XCTAssertNil(clearedInformation)
+        try await eventually { info.snapshot.count == 3 }
+        XCTAssertNil(try XCTUnwrap(info.snapshot.last))
 
         second.emit(.mediaInformation(PlaybackMediaInformation(
             width: 1_280,
@@ -1187,13 +1190,16 @@ final class PlaybackPipelineTests: XCTestCase {
             outputFrameRate: 30,
             isSmoothMotionEnhanced: false
         )))
-        let secondPublishedEvent = await info.next()
-        _ = try XCTUnwrap(secondPublishedEvent.flatMap { $0 })
+        try await eventually { info.snapshot.count == 4 }
+        let secondPublished = try XCTUnwrap(info.snapshot.last.flatMap { $0 })
+        XCTAssertEqual(secondPublished.width, 1_280)
 
         second.emit(.failed(.demuxRead(-1)))
-        let clearedOnFailure = await info.next()
-        let failureInformation = try XCTUnwrap(clearedOnFailure)
-        XCTAssertNil(failureInformation)
+        try await eventually { info.snapshot.count == 5 }
+        XCTAssertNil(try XCTUnwrap(info.snapshot.last))
+        await controller.stop()
+        collector.cancel()
+        await collector.value
     }
 
     func testVideoReadinessWaitsForClassificationAndMediaInformation() async throws {
@@ -1375,7 +1381,7 @@ final class PlaybackPipelineTests: XCTestCase {
         }
         let openingAnchor = try XCTUnwrap(harness.clock.snapshot().anchors.first)
         XCTAssertEqual(CMTimeCompare(openingAnchor.0, .zero), 0)
-        XCTAssertEqual(openingAnchor.2, 1)
+        XCTAssertEqual(openingAnchor.2, 0)
 
         let pausesBeforePause = harness.clock.snapshot().pauses
         harness.pipeline.setPaused(true, readinessCycle: 1)
@@ -1389,7 +1395,7 @@ final class PlaybackPipelineTests: XCTestCase {
         }
         let resumedAnchor = try XCTUnwrap(harness.clock.snapshot().anchors.last)
         XCTAssertEqual(CMTimeCompare(resumedAnchor.0, .zero), 0)
-        XCTAssertEqual(resumedAnchor.2, 1)
+        XCTAssertEqual(resumedAnchor.2, 0)
     }
 
     func testAudioOnlyResumeNeverReanchorsBeforeRecoveryFloor() async throws {
@@ -1685,24 +1691,109 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertFalse(resolvedInformation.isSmoothMotionEnhanced)
     }
 
-    func testControllerPublishesOnlyCurrentSessionPresentationContextAndClearsItOnFailure() async throws {
-        let context = PlaybackPresentationContext()
-        let first = FakeControllerPipeline(presentationContext: context)
-        let second = FakeControllerPipeline()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([first, second]))
-
-        let contextBeforePlay = await controller.presentationContext()
-        XCTAssertNil(contextBeforePlay)
+    func testControllerReplacesPresentationSubscriptionAndFinishesTerminalWithNil() async throws {
+        let firstContext = PlaybackPresentationContext()
+        let secondContext = PlaybackPresentationContext()
+        let first = FakeControllerPipeline(presentationContext: firstContext)
+        let second = FakeControllerPipeline(presentationContext: secondContext)
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([first, second]))
         await controller.play(makeRequest(title: "first"))
-        let firstContext = await controller.presentationContext()
-        XCTAssertTrue(firstContext === context)
+        let firstPresentations = try await controller.presentations()
+        var firstIterator = firstPresentations.makeAsyncIterator()
+
+        let firstReplacement = await firstIterator.next()
+        XCTAssertEqual(
+            firstReplacement?.desired?.identity.backendIdentity,
+            firstReplacement?.desired?.identity.outputLifecycleEpoch.backendIdentity
+        )
+        guard case let .sampleBuffer(streamContext)? = firstReplacement?.desired?.presentation else {
+            return XCTFail("controller没有发布sample buffer presentation")
+        }
+        XCTAssertTrue(streamContext === firstContext)
+
         await controller.play(makeRequest(title: "second"))
-        let secondContext = await controller.presentationContext()
-        XCTAssertNil(secondContext)
+        let firstTerminal = await firstIterator.next()
+        XCTAssertNil(firstTerminal?.desired)
+        let afterFirstTerminal = await firstIterator.next()
+        XCTAssertNil(afterFirstTerminal)
+
+        let secondPresentations = try await controller.presentations()
+        var secondIterator = secondPresentations.makeAsyncIterator()
+        let nextSecondReplacement = await secondIterator.next()
+        let secondReplacement = try XCTUnwrap(nextSecondReplacement)
+        guard case let .sampleBuffer(replacementContext)? = secondReplacement.desired?.presentation else {
+            return XCTFail("controller没有发布第二个sample buffer presentation")
+        }
+        XCTAssertTrue(replacementContext === secondContext)
+        XCTAssertNotEqual(
+            firstReplacement?.desired?.identity,
+            secondReplacement.desired?.identity
+        )
+
         second.emit(.failed(.demuxRead(-1)))
-        try await Task.sleep(for: .milliseconds(20))
-        let failedContext = await controller.presentationContext()
-        XCTAssertNil(failedContext)
+        let nextTerminal = await secondIterator.next()
+        let terminal = try XCTUnwrap(nextTerminal)
+        XCTAssertNil(terminal.desired)
+        let afterTerminal = await secondIterator.next()
+        XCTAssertNil(afterTerminal)
+    }
+
+    func testControllerStopFinishesPresentationSubscriptionWithNil() async throws {
+        let pipeline = FakeControllerPipeline(presentationContext: PlaybackPresentationContext())
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([pipeline]))
+        await controller.play(makeRequest())
+        let presentations = try await controller.presentations()
+        var iterator = presentations.makeAsyncIterator()
+        let prepared = await iterator.next()
+        XCTAssertNotNil(prepared?.desired)
+
+        await controller.stop()
+
+        let terminal = await iterator.next()
+        XCTAssertNil(terminal?.desired)
+        let afterTerminal = await iterator.next()
+        XCTAssertNil(afterTerminal)
+    }
+
+    func testReplacementPlayFinishesPresentationBeforeBlockedPredecessorTeardown() async throws {
+        let first = FakeControllerPipeline(presentationContext: PlaybackPresentationContext())
+        first.stopAutomaticallyCompletes = false
+        let second = FakeControllerPipeline(presentationContext: PlaybackPresentationContext())
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([first, second])
+        )
+        await controller.play(makeRequest(title: "first"))
+        let presentations = try await controller.presentations()
+        let capture = PresentationReplacementCapture()
+        let receivedMounted = expectation(description: "收到首个presentation")
+        let receivedTerminal = expectation(description: "旧presentation订阅先于前驱teardown结束")
+        let consumer = Task {
+            var iterator = presentations.makeAsyncIterator()
+            let mounted = await iterator.next()
+            await capture.store(mounted)
+            receivedMounted.fulfill()
+            let terminal = await iterator.next()
+            await capture.store(terminal)
+            receivedTerminal.fulfill()
+        }
+        await fulfillment(of: [receivedMounted], timeout: 0.5)
+        let mounted = await capture.value
+        XCTAssertNotNil(mounted?.desired)
+
+        let secondRequest = makeRequest(title: "second")
+        let replacementPlay = Task { await controller.play(secondRequest) }
+        try await eventually { first.snapshot().isStopWaiting }
+        XCTAssertEqual(first.snapshot().completedStopCount, 0)
+
+        await fulfillment(of: [receivedTerminal], timeout: 0.5)
+        let terminal = await capture.value
+        XCTAssertNil(terminal?.desired)
+        XCTAssertEqual(first.snapshot().completedStopCount, 0)
+
+        first.completeStop()
+        await replacementPlay.value
+        await consumer.value
+        await controller.stop()
     }
 
     func testControllerMetricsProviderRetainsFailedSessionCollectorUntilExplicitStop() async throws {
@@ -1719,7 +1810,7 @@ final class PlaybackPipelineTests: XCTestCase {
         )
         let first = FakeControllerPipeline(metrics: firstMetrics)
         let second = FakeControllerPipeline(metrics: secondMetrics)
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([first, second]))
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([first, second]))
 
         let idleSnapshot = await controller.playbackMetricsSnapshot(window: .seconds(60))
         XCTAssertNil(idleSnapshot)
@@ -1752,14 +1843,21 @@ final class PlaybackPipelineTests: XCTestCase {
             [pipeline],
             onMakePipeline: { trace.append(.pipelineFactoryCalled) }
         )
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: factory,
-            audioSessionOwner: owner
+            audioSessionOwner: owner.realOwner
         )
         let request = makeRequest()
 
         await controller.play(request)
 
+        if factory.makeCountSnapshot == 0 {
+            let safety = owner.registry.executor.safetyIngress.snapshot
+            let context = owner.registry.outputResourceContextSnapshot()
+            let attachment = XCTAttachment(string: "启动失败安全快照：\(safety)；资源阶段：\(String(describing: context?.phase))；是否仍有acquisition票：\(context?.sourceTask != nil)")
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
         XCTAssertEqual(owner.callCountSnapshot, 1)
         XCTAssertEqual(trace.snapshot, [.activated, .pipelineFactoryCalled])
         XCTAssertEqual(factory.makeCountSnapshot, 1)
@@ -1772,9 +1870,9 @@ final class PlaybackPipelineTests: XCTestCase {
         let owner = FakePlaybackAudioSessionOwner(
             error: FakePlaybackAudioSessionOwnerError.activation
         )
-        let controller = PlaybackController(
+        let controller = makeRoutedPlaybackController(
             factory: factory,
-            audioSessionOwner: owner
+            audioSessionOwner: owner.realOwner
         )
 
         await controller.play(makeRequest())
@@ -1791,7 +1889,7 @@ final class PlaybackPipelineTests: XCTestCase {
 
     func testControllerPublishesIdlePreparingPlayingPauseResumeAndStopped() async throws {
         let fake = FakeControllerPipeline()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([fake]))
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([fake]))
         var events = await controller.events().makeAsyncIterator()
         let request = makeRequest()
 
@@ -1829,7 +1927,7 @@ final class PlaybackPipelineTests: XCTestCase {
     func testControllerMapsPipelineRecoveringPhaseButPreservesUserPause() async throws {
         let fake = FakeControllerPipeline()
         let request = makeRequest()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([fake]))
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([fake]))
         await controller.play(request)
         fake.emit(.ready(readinessCycle: 0))
         try await eventually { await controller.currentStateForTesting == .playing(request) }
@@ -1847,7 +1945,7 @@ final class PlaybackPipelineTests: XCTestCase {
     func testReplacementAndExplicitCancellationNeverPublishCancelledFailure() async throws {
         let first = FakeControllerPipeline()
         let second = FakeControllerPipeline()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([first, second]))
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([first, second]))
         var events = await controller.events().makeAsyncIterator()
         _ = await events.next()
 
@@ -1863,6 +1961,7 @@ final class PlaybackPipelineTests: XCTestCase {
 
         first.emit(.failed(.cancelled))
         second.emit(.ready(readinessCycle: 0))
+        try await eventually { await controller.currentStateForTesting == .playing(request2) }
         let playing2 = await events.next()
         XCTAssertEqual(playing2, .playing(request2))
         await controller.stop()
@@ -1879,7 +1978,7 @@ final class PlaybackPipelineTests: XCTestCase {
         first.stopAutomaticallyCompletes = false
         let second = FakeControllerPipeline()
         let factory = FakeControllerPipelineFactory([first, second])
-        let controller = PlaybackController(factory: factory)
+        let controller = makeRoutedPlaybackController(factory: factory)
         let firstRequest = makeRequest(title: "first")
         let secondRequest = makeRequest(title: "second")
         await controller.play(firstRequest)
@@ -1919,7 +2018,7 @@ final class PlaybackPipelineTests: XCTestCase {
         first.stopAutomaticallyCompletes = false
         let second = FakeControllerPipeline()
         let factory = FakeControllerPipelineFactory([first, second])
-        let controller = PlaybackController(factory: factory)
+        let controller = makeRoutedPlaybackController(factory: factory)
         await controller.play(makeRequest(title: "first"))
         let replacementRequest = makeRequest(title: "replacement")
 
@@ -1951,7 +2050,7 @@ final class PlaybackPipelineTests: XCTestCase {
 
     func testPauseCycleRejectsDelayedReadyAndRedundantLifecycleOperationsAreNoOps() async throws {
         let fake = FakeControllerPipeline()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([fake]))
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([fake]))
         let request = makeRequest()
         await controller.play(request)
         fake.emit(.ready(readinessCycle: 0))
@@ -1990,7 +2089,7 @@ final class PlaybackPipelineTests: XCTestCase {
 
     func testTerminalFailureIsStableAndNeverEscapesTheActor() async throws {
         let fake = FakeControllerPipeline()
-        let controller = PlaybackController(factory: FakeControllerPipelineFactory([fake]))
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([fake]))
         var events = await controller.events().makeAsyncIterator()
         _ = await events.next()
         await controller.play(makeRequest())
@@ -2016,7 +2115,7 @@ final class PlaybackPipelineTests: XCTestCase {
         let first = FakeControllerPipeline()
         let second = FakeControllerPipeline()
         let factory = FakeControllerPipelineFactory([first, second])
-        let controller = PlaybackController(factory: factory)
+        let controller = makeRoutedPlaybackController(factory: factory)
         let long = PlaybackTuning(videoBufferSeconds: 4, deinterlaceBufferFrames: 16)
 
         // Set before playing: the pipeline has to be built with it, otherwise a
@@ -2709,6 +2808,103 @@ final class PlaybackPipelineTests: XCTestCase {
             harness.decoder.snapshot().configurationGenerations,
             [initial, afterVideo, afterAudio]
         )
+    }
+
+    func testPendingTrackReplayRebindsAllVideoEvidenceIntoFreshGeneration() async throws {
+        let harness = makeHarness()
+        harness.pipeline.start(url: makeRequest().streamURL)
+        try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
+        harness.demux.emit(.tracks(PlaybackFakeMedia.tracks()))
+        try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
+
+        let sourceGeneration = (await harness.pipeline.debugSnapshot()).generation
+        let accessUnitID: UInt64 = 71
+        let presentationTimeStamp = CMTime(value: 101, timescale: 1_000)
+        let decodeTimeStamp = CMTime(value: 91, timescale: 1_000)
+        let duration = CMTime(value: 40, timescale: 1_000)
+        let sampleBuffer = try SampleBufferBuilder.makeVideo(
+            data: Data([0, 0, 0, 1]),
+            formatDescription: try PlaybackFakeMedia.videoFormat(),
+            presentationTimeStamp: presentationTimeStamp,
+            decodeTimeStamp: decodeTimeStamp,
+            duration: duration,
+            isRandomAccess: true
+        )
+        let parserMetadata = VideoParserMetadata(
+            fieldOrder: .tt,
+            pictureStructure: .topField,
+            isInterlaced: true,
+            repeatFirstField: true,
+            topFieldFirst: true,
+            sourcePTS90k: 9_090
+        )
+        let sourceBytes = Data([0xAA, 0xBB, 0, 0, 0, 1, 0x65, 0x88])
+        let sourceBacking = try VideoAccessUnitBacking(
+            identity: VideoAccessUnitBackingIdentity(
+                generation: sourceGeneration,
+                accessUnitID: accessUnitID
+            ),
+            bytes: sourceBytes
+        )
+        let sourceRange = try XCTUnwrap(VideoAccessUnitByteRange(offset: 2, length: 6))
+        let original = try CompressedVideoAccessUnit(
+            id: accessUnitID,
+            sampleBuffer: sampleBuffer,
+            generation: sourceGeneration,
+            isRandomAccess: true,
+            randomAccessKind: .h264IDR,
+            scanClassification: .interlaced,
+            parserMetadata: parserMetadata,
+            sourceBacking: sourceBacking,
+            sourceByteRange: sourceRange
+        )
+
+        harness.pipeline.receive(video: .format(
+            try PlaybackFakeMedia.videoFormat(),
+            MediaFormatFingerprint(bytes: Data([0x81]))
+        ))
+        harness.pipeline.receive(video: .accessUnit(original))
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertFalse(harness.decoder.decodedAccessUnitsSnapshot.contains { $0.id == accessUnitID })
+
+        harness.pipeline.receive(audio: .format(try PlaybackFakeMedia.audioConfiguration(
+            fingerprint: MediaFormatFingerprint(bytes: Data([0x82]))
+        )))
+        let expectedGeneration = MediaGeneration(rawValue: sourceGeneration.rawValue + 1)
+        try await eventually {
+            harness.decoder.decodedAccessUnitsSnapshot.contains {
+                $0.id == accessUnitID && $0.generation == expectedGeneration
+            }
+        }
+
+        let replayed = try XCTUnwrap(harness.decoder.decodedAccessUnitsSnapshot.last(where: {
+            $0.id == accessUnitID
+        }))
+        let replayedBacking = try XCTUnwrap(replayed.sourceBacking)
+        let replayedRange = try XCTUnwrap(replayed.sourceByteRange)
+        XCTAssertEqual(replayed.id, original.id)
+        XCTAssertEqual(replayed.generation, expectedGeneration)
+        XCTAssertEqual(replayed.isRandomAccess, original.isRandomAccess)
+        XCTAssertEqual(replayed.randomAccessKind, original.randomAccessKind)
+        XCTAssertEqual(replayed.scanClassification, original.scanClassification)
+        XCTAssertEqual(replayed.parserMetadata, original.parserMetadata)
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(replayed.sampleBuffer), presentationTimeStamp)
+        XCTAssertEqual(CMSampleBufferGetDecodeTimeStamp(replayed.sampleBuffer), decodeTimeStamp)
+        XCTAssertEqual(CMSampleBufferGetDuration(replayed.sampleBuffer), duration)
+        XCTAssertEqual(replayedRange, sourceRange)
+        XCTAssertEqual(replayed.sourceSHA256, original.sourceSHA256)
+        XCTAssertEqual(replayedBacking.identity, VideoAccessUnitBackingIdentity(
+            generation: expectedGeneration,
+            accessUnitID: accessUnitID
+        ))
+        XCTAssertFalse(replayedBacking.ownerIdentity === sourceBacking.ownerIdentity)
+        XCTAssertEqual(
+            try replayedBacking.withBytes(in: replayedBacking.wholeRange) {
+                $0.withUnsafeBytes { Data($0) }
+            },
+            sourceBytes
+        )
+        XCTAssertEqual(sourceBacking.identity.generation, sourceGeneration)
     }
 
     func testChangedTrackAndDiscontinuityEpochsReplayNegotiationMediaIntoFreshGeneration() async throws {
@@ -5402,14 +5598,19 @@ final class PlaybackPipelineTests: XCTestCase {
 
         harness.audio.setReady(true)
         harness.pipeline.receive(audioReadiness: .available, generation: generation)
-        try receiveAndReleaseNormalizedFrames(try (0..<8).map { index in
-            try PlaybackFakeMedia.decodedFrame(
-                id: UInt64(7_000 + index),
-                generation: generation,
-                pts: CMTime(value: Int64(1_200 + index * 20), timescale: 1_000),
-                interlaced: false
-            )
-        }, in: harness)
+        do {
+            let normalizedFrames: [DecodedVideoFrame] = try (0..<8).map { (index: Int) throws -> DecodedVideoFrame in
+                let frameID = UInt64(7_000 + index)
+                let framePTS = CMTime(value: Int64(1_200 + index * 20), timescale: 1_000)
+                return try PlaybackFakeMedia.decodedFrame(
+                    id: frameID,
+                    generation: generation,
+                    pts: framePTS,
+                    interlaced: false
+                )
+            }
+            try receiveAndReleaseNormalizedFrames(normalizedFrames, in: harness)
+        }
         for index in 0..<8 {
             harness.pipeline.receive(decoder: harness.submissionCompletedEvent(
                 accessUnitID: UInt64(7_000 + index),
@@ -7995,6 +8196,14 @@ private final class LockedFlag: @unchecked Sendable {
     private var stored = false
     var value: Bool { lock.withLock { stored } }
     func set() { lock.withLock { stored = true } }
+}
+
+private actor PresentationReplacementCapture {
+    private(set) var value: PlaybackPresentationReplacement?
+
+    func store(_ value: PlaybackPresentationReplacement?) {
+        self.value = value
+    }
 }
 
 private struct SeededGenerator: RandomNumberGenerator {

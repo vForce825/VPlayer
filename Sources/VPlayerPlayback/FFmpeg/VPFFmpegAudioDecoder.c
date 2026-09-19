@@ -39,8 +39,46 @@ struct VPFFAudioDecoder {
     uint64_t output_mask;
     VPFFPCMCallback callback;
     void *callback_context;
+    VPFFAudioAllocationAdmission admission;
+    void *extradata_charge;
+    int64_t last_token;
     bool reached_eof;
 };
+
+static void *vpff_reserve(VPFFAudioDecoder *owned, size_t bytes,
+                          VPFFAudioAllocationRole role) {
+    if (owned->admission.reserve == NULL) return (void *)owned;
+    return owned->admission.reserve(owned->admission.context, bytes, role);
+}
+static void vpff_release(VPFFAudioDecoder *owned, void *token) {
+    if (owned->admission.release != NULL && token != NULL) {
+        owned->admission.release(owned->admission.context, token);
+    }
+}
+typedef struct { VPFFAudioDecoder *owned; void *charge; } VPFFChargeFree;
+static void vpff_charge_buffer_free(void *opaque, uint8_t *data) {
+    VPFFChargeFree *free_context = opaque;
+    if (free_context != NULL) {
+        vpff_release(free_context->owned, free_context->charge);
+        av_free(free_context);
+    }
+    av_free(data);
+}
+static AVBufferRef *vpff_charged_buffer(VPFFAudioDecoder *owned, size_t bytes,
+                                        VPFFAudioAllocationRole role) {
+    void *charge = vpff_reserve(owned, bytes, role);
+    if (charge == NULL) return NULL;
+    uint8_t *data = av_malloc(bytes);
+    VPFFChargeFree *free_context = av_mallocz(sizeof(*free_context));
+    if (data == NULL || free_context == NULL) {
+        av_free(data); av_free(free_context); vpff_release(owned, charge); return NULL;
+    }
+    free_context->owned = owned; free_context->charge = charge;
+    AVBufferRef *buffer = av_buffer_create(data, bytes, vpff_charge_buffer_free,
+                                           free_context, 0);
+    if (buffer == NULL) { vpff_charge_buffer_free(free_context, data); }
+    return buffer;
+}
 
 static bool vpff_valid_pointer_size(const void *pointer, size_t size) {
     return (pointer == NULL) == (size == 0);
@@ -69,7 +107,7 @@ static enum AVCodecID vpff_audio_codec_id(VPFFCodec codec) {
 }
 
 static int vpff_copy_extradata(
-    AVCodecContext *context,
+    VPFFAudioDecoder *owned,
     const uint8_t *extradata,
     size_t size
 ) {
@@ -80,12 +118,17 @@ static int vpff_copy_extradata(
         size > SIZE_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
         return AVERROR(EOVERFLOW);
     }
-    context->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (context->extradata == NULL) {
+    void *charge = vpff_reserve(owned, size + AV_INPUT_BUFFER_PADDING_SIZE,
+                                VPFF_AUDIO_ALLOCATION_EXTRADATA);
+    if (charge == NULL) return AVERROR(ENOMEM);
+    owned->codec_context->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (owned->codec_context->extradata == NULL) {
+        vpff_release(owned, charge);
         return AVERROR(ENOMEM);
     }
-    memcpy(context->extradata, extradata, size);
-    context->extradata_size = (int)size;
+    owned->extradata_charge = charge;
+    memcpy(owned->codec_context->extradata, extradata, size);
+    owned->codec_context->extradata_size = (int)size;
     return 0;
 }
 
@@ -95,6 +138,7 @@ int32_t vp_ffmpeg_audio_decoder_create(
     size_t extradata_size,
     VPFFPCMCallback callback,
     void *context,
+    const VPFFAudioAllocationAdmission *admission,
     VPFFAudioDecoder **out_decoder
 ) {
     if (out_decoder == NULL) {
@@ -116,6 +160,7 @@ int32_t vp_ffmpeg_audio_decoder_create(
     if (owned == NULL) {
         return AVERROR(ENOMEM);
     }
+    if (admission != NULL) owned->admission = *admission;
     owned->codec_context = avcodec_alloc_context3(decoder);
     owned->packet = av_packet_alloc();
     owned->frame = av_frame_alloc();
@@ -125,7 +170,7 @@ int32_t vp_ffmpeg_audio_decoder_create(
         return AVERROR(ENOMEM);
     }
     owned->codec_context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
-    int result = vpff_copy_extradata(owned->codec_context, extradata, extradata_size);
+    int result = vpff_copy_extradata(owned, extradata, extradata_size);
     if (result >= 0) {
         result = avcodec_open2(owned->codec_context, decoder, NULL);
     }
@@ -297,8 +342,11 @@ static int vpff_emit_frame(
     if (result < 0) {
         return result;
     }
+    void *charge = vpff_reserve(owned, allocation_bytes, VPFF_AUDIO_ALLOCATION_RESAMPLER);
+    if (charge == NULL) return AVERROR(ENOMEM);
     float *output = av_malloc(allocation_bytes);
     if (output == NULL) {
+        vpff_release(owned, charge);
         return AVERROR(ENOMEM);
     }
     uint8_t *output_planes[1] = {(uint8_t *)output};
@@ -311,12 +359,14 @@ static int vpff_emit_frame(
     );
     if (converted <= 0) {
         av_free(output);
+        vpff_release(owned, charge);
         return converted < 0 ? converted : AVERROR_INVALIDDATA;
     }
     size_t exact_bytes = 0;
     result = vpff_checked_output_bytes(converted, channels, &exact_bytes);
     if (result < 0 || *cumulative_bytes > VPFF_MAX_AUDIO_BYTES - exact_bytes) {
         av_free(output);
+        vpff_release(owned, charge);
         return result < 0 ? result : AVERROR(EOVERFLOW);
     }
     *cumulative_bytes += exact_bytes;
@@ -334,6 +384,7 @@ static int vpff_emit_frame(
     frame.channel_layout_mask = owned->output_mask;
     owned->callback(owned->callback_context, &frame);
     av_free(output);
+    vpff_release(owned, charge);
     return 0;
 }
 
@@ -404,12 +455,17 @@ int32_t vp_ffmpeg_audio_decoder_push(
     }
 
     av_packet_unref(owned->packet);
-    int result = av_new_packet(owned->packet, (int)size);
-    if (result < 0) {
-        return result;
-    }
+    AVBufferRef *packet_buffer = vpff_charged_buffer(owned,
+        size + AV_INPUT_BUFFER_PADDING_SIZE, VPFF_AUDIO_ALLOCATION_PACKET);
+    if (packet_buffer == NULL) return AVERROR(ENOMEM);
+    int result = 0;
+    owned->packet->buf = packet_buffer;
+    owned->packet->data = packet_buffer->data;
+    owned->packet->size = (int)size;
     memcpy(owned->packet->data, bytes, size);
-    owned->packet->opaque_ref = av_buffer_alloc(sizeof(int64_t));
+    memset(owned->packet->data + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    owned->packet->opaque_ref = vpff_charged_buffer(owned, sizeof(int64_t),
+                                                     VPFF_AUDIO_ALLOCATION_TOKEN);
     if (owned->packet->opaque_ref == NULL) {
         av_packet_unref(owned->packet);
         return AVERROR(ENOMEM);
@@ -446,6 +502,7 @@ int32_t vp_ffmpeg_audio_decoder_push(
         result = vpff_normalize_packet_decode_error(result);
     }
     if (result >= 0) {
+        owned->last_token = pts;
         bool progressed = false;
         int receive_result = vpff_receive_available(owned, &cumulative_bytes, &progressed);
         if (receive_result == AVERROR(EAGAIN)) {
@@ -457,6 +514,47 @@ int32_t vp_ffmpeg_audio_decoder_push(
         }
     }
     av_packet_unref(owned->packet);
+    return result;
+}
+
+int32_t vp_ffmpeg_audio_decoder_drain(VPFFAudioDecoder *owned) {
+    if (owned == NULL) return AVERROR(EINVAL);
+    if (owned->reached_eof) return AVERROR_EOF;
+    size_t bytes = 0; bool progressed = false;
+    int result = avcodec_send_packet(owned->codec_context, NULL);
+    if (result < 0 && result != AVERROR_EOF) return result;
+    result = vpff_receive_available(owned, &bytes, &progressed);
+    if (result == AVERROR_EOF && owned->resampler != NULL && owned->last_token > 0) {
+        int channels = owned->output_layout.nb_channels;
+        int64_t delay = swr_get_delay(owned->resampler, owned->input_sample_rate);
+        int capacity = delay > 0 && delay <= INT_MAX ? (int)delay : 0;
+        if (capacity > 0) {
+            size_t byte_count = 0;
+            int checked = vpff_checked_output_bytes(capacity, channels, &byte_count);
+            if (checked < 0) return checked;
+            void *charge = vpff_reserve(owned, byte_count, VPFF_AUDIO_ALLOCATION_RESAMPLER);
+            if (charge == NULL) return AVERROR(ENOMEM);
+            float *output = av_malloc(byte_count);
+            if (output != NULL) {
+                uint8_t *planes[1] = {(uint8_t *)output};
+                int converted = swr_convert(owned->resampler, planes, capacity, NULL, 0);
+                if (converted > 0) {
+                    VPFFPCMFrame frame = {0}; frame.interleaved = output; frame.frame_count = converted;
+                    frame.sample_rate = owned->input_sample_rate; frame.channels = channels; frame.pts = owned->last_token;
+                    frame.abi_version = VPFF_AUDIO_DECODER_ABI_VERSION; frame.struct_size = sizeof(frame);
+                    frame.channel_order = owned->output_order; frame.has_channel_layout_mask = owned->output_order == VPFF_CHANNEL_ORDER_NATIVE;
+                    frame.channel_layout_mask = owned->output_mask; owned->callback(owned->callback_context, &frame);
+                }
+                av_free(output);
+                vpff_release(owned, charge);
+                if (converted <= 0) return converted < 0 ? converted : AVERROR_INVALIDDATA;
+            } else if (charge != NULL) {
+                vpff_release(owned, charge);
+                return AVERROR(ENOMEM);
+            }
+        }
+        return AVERROR_EOF;
+    }
     return result;
 }
 
@@ -487,5 +585,6 @@ void vp_ffmpeg_audio_decoder_destroy(VPFFAudioDecoder *owned) {
     av_packet_free(&owned->packet);
     av_frame_free(&owned->frame);
     avcodec_free_context(&owned->codec_context);
+    vpff_release(owned, owned->extradata_charge);
     free(owned);
 }

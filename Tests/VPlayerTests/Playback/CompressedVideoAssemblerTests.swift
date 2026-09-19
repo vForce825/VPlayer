@@ -9,6 +9,177 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class CompressedVideoAssemblerTests: XCTestCase {
+    func testMissingParserDurationFallsBackToFrozenTrackFrameRate() throws {
+        let expectedFrameRate = try XCTUnwrap(MediaRational(num: 30_000, den: 1_001))
+        let tracks = try AssemblerTestFixtures.videoTracks(frameRate: expectedFrameRate)
+        var accessUnit: CompressedVideoAccessUnit?
+        let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                bytes: AssemblerTestFixtures.h264AccessUnit(), duration: .invalid))
+        }
+        let subject = try CompressedVideoAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { if case let .accessUnit(value) = $0 { accessUnit = value } },
+            parserFactory: factory,
+            formatState: AssemblyFormatState(trackSet: tracks))
+
+        try subject.push(AssemblerTestFixtures.videoPacket())
+
+        XCTAssertEqual(
+            CMSampleBufferGetDuration(try XCTUnwrap(accessUnit).sampleBuffer),
+            CMTime(value: Int64(expectedFrameRate.den), timescale: expectedFrameRate.num))
+    }
+
+    func testHLSAssemblerChargesLengthPrefixedOwnedBlockBeforeCopyAndKeepsItAtSampleAlias() throws {
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSVideoCopyOwnership(
+            maximumPayloadBytes: 4_096,
+            applicationLedger: ledger
+        )
+        func makeIndependentAlias() throws -> CMSampleBuffer {
+            var accessUnit: CompressedVideoAccessUnit?
+            let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+                try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                    bytes: AssemblerTestFixtures.h264AccessUnit()
+                ))
+            }
+            let formatState = AssemblyFormatState(trackSet: tracks)
+            let subject = try CompressedVideoAssembler(
+                trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) },
+                eventSink: { event in
+                    if case let .accessUnit(value) = event { accessUnit = value }
+                },
+                parserFactory: factory,
+                formatState: formatState,
+                hlsCopyOwnership: ownership
+            )
+            try subject.push(AssemblerTestFixtures.videoPacket())
+            return try XCTUnwrap(accessUnit).sampleBuffer
+        }
+
+        var alias: CMSampleBuffer? = try makeIndependentAlias()
+        let expectedPayload = CMSampleBufferGetTotalSampleSize(try XCTUnwrap(alias))
+        XCTAssertGreaterThan(ledger.chargedBytes, expectedPayload,
+                             "复制前必须连同独立 block 的 owner 元数据一起收费")
+        XCTAssertGreaterThan(ledger.chargedBytes, 0,
+                             "原 AU 释放后，CM sample alias 仍是最后允许持有者")
+        alias = nil
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testAnnexBMeasurementAccountsForThreeByteStartCodeGrowth() throws {
+        let data = Data([0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xCE])
+        let envelope = try AnnexBScanner.measureLengthPrefixedOutput(data.span, codec: .h264)
+        XCTAssertEqual(envelope.lengthPrefixedBytes, 12)
+        XCTAssertEqual(envelope.parameterSetBytes, 4)
+        XCTAssertEqual(envelope.parameterSetCount, 2)
+    }
+
+    func testHLSOwnedParameterSetsBuildH264AndHEVCFormatsWithLegacyFingerprint() throws {
+        try assertHLSOwnedParameterSetsMatchLegacy(
+            codec: .h264,
+            parameterSets: [AssemblerTestFixtures.h264SPS, AssemblerTestFixtures.h264PPS]
+        )
+        try assertHLSOwnedParameterSetsMatchLegacy(
+            codec: .hevc,
+            parameterSets: [
+                AssemblerTestFixtures.hevcVPS,
+                AssemblerTestFixtures.hevcSPS,
+                AssemblerTestFixtures.hevcPPS,
+            ]
+        )
+    }
+
+    func testHLSParameterUpdatesReuseUnchangedEntriesAndKeepOldSnapshotAlive() throws {
+        var changedSPS = AssemblerTestFixtures.h264SPS
+        changedSPS[3] = 0x20
+        let frames = [
+            AssemblerTestFixtures.h264AccessUnit(),
+            AssemblerTestFixtures.h264AccessUnit(sps: changedSPS),
+            AssemblerTestFixtures.h264AccessUnit(sps: changedSPS),
+        ]
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSVideoCopyOwnership(maximumPayloadBytes: 4_096, applicationLedger: ledger)
+        let tracks = try AssemblerTestFixtures.videoTracks(extradata: Data())
+        let state = AssemblyFormatState(trackSet: tracks)
+        let factory = ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: frames[index]))
+        }
+        let subject = try CompressedVideoAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { _ in },
+            parserFactory: factory,
+            formatState: state,
+            hlsCopyOwnership: ownership
+        )
+
+        try subject.push(AssemblerTestFixtures.videoPacket())
+        let oldSnapshot = state.snapshot()
+        let oldOwner = try XCTUnwrap(oldSnapshot.hlsVideoParameterSetOwner)
+        try subject.push(AssemblerTestFixtures.videoPacket())
+        let changedOwner = try XCTUnwrap(state.snapshot().hlsVideoParameterSetOwner)
+        XCTAssertFalse(oldOwner.entries[0] === changedOwner.entries[0])
+        XCTAssertTrue(oldOwner.entries[1] === changedOwner.entries[1])
+        XCTAssertGreaterThan(ledger.chargedBytes, 0,
+                             "旧 snapshot 仍持有被替换参数集的 owner lease")
+
+        try subject.push(AssemblerTestFixtures.videoPacket())
+        let repeatedOwner = try XCTUnwrap(state.snapshot().hlsVideoParameterSetOwner)
+        XCTAssertTrue(changedOwner.entries[0] === repeatedOwner.entries[0])
+        XCTAssertTrue(changedOwner.entries[1] === repeatedOwner.entries[1])
+    }
+
+    #if DEBUG
+    func testSmallParameterDomainAdmitsCurrentAndCandidateWithoutSelfWaiting() throws {
+        let ownership = HLSVideoCopyOwnership(
+            maximumPayloadBytes: 64,
+            parameterSetSnapshotMaximumCount: 2,
+            parameterSetSnapshotMaximumBytes: 16,
+            applicationLedger: HLSDeliveryApplicationChargeLedger()
+        )
+        let current = try [Data([0x67, 1]), Data([0x68, 2])].map(ownership.makeParameterSetEntry)
+        let candidate = try [Data([0x67, 3]), Data([0x68, 4])].map(ownership.makeParameterSetEntry)
+        XCTAssertEqual(current.count, 2)
+        XCTAssertEqual(candidate.count, 2,
+                       "合法 current 与 candidate 的重叠必须在有限 aggregate 域内一次通过")
+        XCTAssertEqual(ownership.parameterSetAdmissionWaitingCount, 0)
+    }
+
+    func testSmallParameterDomainWaitsForExternalOldSnapshotThenProgresses() throws {
+        let ownership = HLSVideoCopyOwnership(
+            maximumPayloadBytes: 64,
+            parameterSetSnapshotMaximumCount: 2,
+            parameterSetSnapshotMaximumBytes: 16,
+            applicationLedger: HLSDeliveryApplicationChargeLedger()
+        )
+        var current: HLSVideoParameterSetRetention? = try ownership.makeParameterSetOwner(
+            entries: try [Data([0x67, 1]), Data([0x68, 2])].map(ownership.makeParameterSetEntry))
+        var externalOldSnapshot = current
+        current = try ownership.makeParameterSetOwner(
+            entries: try [Data([0x67, 3]), Data([0x68, 4])].map(ownership.makeParameterSetEntry))
+        let completion = DispatchSemaphore(value: 0)
+        let result = ParameterSetEntryResult()
+        DispatchQueue.global().async {
+            do { result.record(try ownership.makeParameterSetEntry(Data([0x67, 5]))) }
+            catch { result.record(error) }
+            completion.signal()
+        }
+        XCTAssertTrue(ownership.waitUntilParameterSetAdmissionWaits(1),
+                      "满 aggregate 时只能等待外部旧 snapshot，不能丢弃其 lease")
+        withExtendedLifetime(externalOldSnapshot) {}
+        externalOldSnapshot = nil
+        XCTAssertEqual(completion.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(result.error)
+        XCTAssertNotNil(result.entry)
+        withExtendedLifetime(current) {}
+        current = nil
+    }
+    #endif
+
     func testGenerationRebindDropsLateParserCallbackAndRebuildsAtNextPush() throws {
         let factory = ScriptedFFmpegParserFactory()
         let tracks = try AssemblerTestFixtures.videoTracks()
@@ -444,15 +615,16 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         firstInput.resetBytes(in: firstInput.indices)
         try handle.push(secondInput, pts: nil, dts: nil, duration: nil)
         XCTAssertEqual(received.count, 1, "the second push must synchronously emit the first AU")
-        let copiedBeforeNativeReuse = try XCTUnwrap(received.first?.bytes)
+        let copiedBeforeNativeReuse = try XCTUnwrap(received.first).withBorrowedBytes(copiedData)
         secondInput.resetBytes(in: secondInput.indices)
         try handle.drain()
 
         XCTAssertEqual(received.count, 2)
         XCTAssertEqual(received.map(\.pts), [-90_000, nil])
         XCTAssertEqual(received.map(\.dts), [nil, nil])
-        XCTAssertEqual(received[0].bytes, copiedBeforeNativeReuse)
-        XCTAssertFalse(received[0].bytes.allSatisfy { $0 == 0 })
+        let firstCopiedBytes = received[0].withBorrowedBytes(copiedData)
+        XCTAssertEqual(firstCopiedBytes, copiedBeforeNativeReuse)
+        XCTAssertFalse(firstCopiedBytes.allSatisfy { $0 == 0 })
 
         let collisionHandle = try LiveFFmpegParserHandle(
             configuration: FFmpegParserConfiguration(video: descriptor),
@@ -473,6 +645,288 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             )
         }
     }
+
+    func testAdmittedNativeParserChargesBorrowedFrameBeforeCopyAndReleasesAtLastFrameAlias() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks(
+            extradata: AssemblerTestFixtures.annexBParameterSets([
+                AssemblerTestFixtures.h264SPS,
+                AssemblerTestFixtures.h264PPS,
+            ])
+        ).video)
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let copyAdmission = FFmpegParserCopyAdmission(
+            capacity: 3,
+            maximumBytes: 4_096,
+            applicationLedger: ledger
+        )
+        let padding = Int(vp_ffmpeg_parser_input_padding_bytes())
+        let extraCharge = descriptor.extradata.count + padding
+            + HLSDataPlaneAdmission.applicationLeaseOverheadBytes
+        let rejectedLedger = HLSDeliveryApplicationChargeLedger()
+        let rejectedAdmission = FFmpegParserCopyAdmission(
+            capacity: 1,
+            maximumBytes: extraCharge - HLSDataPlaneAdmission.applicationLeaseOverheadBytes - 1,
+            applicationLedger: rejectedLedger
+        )
+        XCTAssertThrowsError(try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            copyAdmission: rejectedAdmission
+        ) { _ in }) { error in
+            XCTAssertEqual(error as? PlaybackCoreError,
+                           .videoDecode(LiveFFmpegParserHandle.malformedFrameErrorCode))
+        }
+        XCTAssertEqual(rejectedLedger.chargedBytes, 0,
+                       "永久放不下 extradata+padded tail 时必须在 native 分配前拒绝")
+        let first = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true, nal: Data([0x65, 0x88, 0x84])
+        )
+        let second = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9A, 0x22])
+        )
+        var retained: [FFmpegParsedFrame] = []
+        let handle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            copyAdmission: copyAdmission
+        ) { frame in
+            let frameCharge = frame.withBorrowedBytes { $0.count }
+                + HLSDataPlaneAdmission.applicationLeaseOverheadBytes
+            XCTAssertEqual(
+                ledger.chargedBytes,
+                extraCharge + second.count + padding
+                    + HLSDataPlaneAdmission.applicationLeaseOverheadBytes + frameCharge,
+                "callback 进入时必须同时持有 extradata、native padded input 和 copied frame"
+            )
+            retained.append(frame)
+        }
+        try handle.push(first, pts: 90_000, dts: nil, duration: nil)
+        XCTAssertEqual(ledger.chargedBytes, extraCharge)
+        try handle.push(second, pts: 93_000, dts: nil, duration: nil)
+        XCTAssertEqual(retained.count, 1)
+        let retainedCharge = try XCTUnwrap(retained.first).withBorrowedBytes { $0.count }
+            + HLSDataPlaneAdmission.applicationLeaseOverheadBytes
+        XCTAssertEqual(ledger.chargedBytes, extraCharge + retainedCharge,
+                       "native push 返回后 padded input 必须已归还，frame reservation 仍在")
+        retained.removeAll()
+        XCTAssertEqual(ledger.chargedBytes, extraCharge,
+                       "最后 frame alias 释放后仅 native extradata 可留存")
+        handle.destroy()
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testAdmittedNativeParserCopiesThreeSynchronousFramesFromOnePushAndDrain() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks().video)
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let copyAdmission = FFmpegParserCopyAdmission(
+            capacity: 3,
+            maximumBytes: 16_384,
+            applicationLedger: ledger
+        )
+        var received: [Data] = []
+        let handle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            copyAdmission: copyAdmission
+        ) { frame in
+            received.append(frame.withBorrowedBytes(copiedData))
+        }
+        let first = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true, nal: Data([0x65, 0x88, 0x84])
+        )
+        let second = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9A, 0x22])
+        )
+        let third = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9B, 0x23])
+        )
+
+        try handle.push(first + second + third, pts: 90_000, dts: nil, duration: nil)
+        try handle.drain()
+
+        XCTAssertEqual(received.count, 3)
+        XCTAssertEqual(received.map(\.last), [0x84, 0x22, 0x23])
+        XCTAssertEqual(ledger.chargedBytes, 0,
+                       "同步 receiver 返回后，input 和每个 borrowed frame reservation 均须归还")
+    }
+
+    func testAdmittedNativeParserDefersReceiverDestroyUntilNativeReturnAndKeepsVideoBackingCharge() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks(
+            extradata: AssemblerTestFixtures.annexBParameterSets([
+                AssemblerTestFixtures.h264SPS,
+                AssemblerTestFixtures.h264PPS,
+            ])
+        ).video)
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let copyAdmission = FFmpegParserCopyAdmission(
+            capacity: 4,
+            maximumBytes: 16_384,
+            applicationLedger: ledger
+        )
+        let first = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true, nal: Data([0x65, 0x88, 0x84])
+        )
+        let second = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9A, 0x22])
+        )
+        let third = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9B, 0x23])
+        )
+        var handle: LiveFFmpegParserHandle?
+        var retainedBacking: VideoAccessUnitBacking?
+        var callbackCount = 0
+        handle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            copyAdmission: copyAdmission
+        ) { frame in
+            callbackCount += 1
+            retainedBacking = try frame.makeVideoBacking(identity: .init(
+                generation: MediaGeneration(rawValue: 1), accessUnitID: 1
+            ))
+            XCTAssertThrowsError(try XCTUnwrap(handle).push(
+                Data([0x00]), pts: 96_000, dts: nil, duration: nil
+            )) { error in
+                XCTAssertEqual(error as? PlaybackCoreError,
+                               .videoDecode(LiveFFmpegParserHandle.malformedFrameErrorCode))
+            }
+            XCTAssertThrowsError(try XCTUnwrap(handle).drain()) { error in
+                XCTAssertEqual(error as? PlaybackCoreError,
+                               .videoDecode(LiveFFmpegParserHandle.malformedFrameErrorCode))
+            }
+            handle?.destroy()
+        }
+        try handle?.push(first, pts: 90_000, dts: nil, duration: nil)
+        try handle?.push(second + third, pts: 93_000, dts: nil, duration: nil)
+
+        XCTAssertNotNil(retainedBacking)
+        XCTAssertEqual(callbackCount, 1)
+        XCTAssertGreaterThan(ledger.chargedBytes, 0,
+                             "parser native allocation 已归还后，VideoAccessUnitBacking 仍须强持 frame 费用")
+        retainedBacking = nil
+        handle = nil
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testAdmittedNativeParserFactoryCreatesFreshCancelDomainAfterDestroy() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks().video)
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let factory = LiveFFmpegParserFactory(copyAdmissionConfiguration: .init(
+            capacity: 3, maximumBytes: 16_384, applicationLedger: ledger
+        ))
+        let first = try factory.makeParser(configuration: .init(video: descriptor)) { _ in }
+        first.destroy()
+        let received = ParserReceivedCount()
+        let second = try factory.makeParser(configuration: .init(video: descriptor)) { _ in
+            received.increment()
+        }
+        try second.push(AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true, nal: Data([0x65, 0x88, 0x84])
+        ), pts: 90_000, dts: nil, duration: nil)
+        try second.push(AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9A, 0x22])
+        ), pts: 93_000, dts: nil, duration: nil)
+        try second.drain()
+        XCTAssertEqual(received.value, 2)
+        second.destroy()
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    #if DEBUG
+    func testAdmittedNativeParserCancelsRealBorrowedCallbackWaitWithoutCancellingSiblingAdmission() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks().video)
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let copyAdmission = FFmpegParserCopyAdmission(
+            capacity: 1, maximumBytes: 16_384, applicationLedger: ledger
+        )
+        let siblingAdmission = HLSDataPlaneAdmission(
+            capacity: 1, maximumBytes: 16_384, applicationLedger: ledger
+        )
+        let received = ParserReceivedCount()
+        let handle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            copyAdmission: copyAdmission
+        ) { _ in
+            received.increment()
+        }
+        let first = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true, nal: Data([0x65, 0x88, 0x84])
+        )
+        let second = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9A, 0x22])
+        )
+        try handle.push(first, pts: 90_000, dts: nil, duration: nil)
+
+        let returned = DispatchSemaphore(value: 0)
+        let pushResult = ParserPushResult()
+        let pushBox = NativeParserPushBox(handle: handle)
+        DispatchQueue.global().async {
+            do { try pushBox.push(second, pts: 93_000, dts: nil, duration: nil) }
+            catch { pushResult.record(error) }
+            returned.signal()
+        }
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while copyAdmission.waitingCount == 0, Date() < deadline {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        XCTAssertEqual(copyAdmission.waitingCount, 1,
+                       "计数仅在真实 temporarilyUnavailable 的 condition.wait 前递增")
+        let siblingLease = try XCTUnwrap(siblingAdmission.acquire(bytes: 1))
+        handle.destroy()
+        XCTAssertEqual(returned.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(pushResult.error as? PlaybackCoreError,
+                       .videoDecode(LiveFFmpegParserHandle.malformedFrameErrorCode))
+        XCTAssertEqual(received.value, 0)
+        siblingLease.release()
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+    #endif
+
+    #if DEBUG
+    func testAdmittedNativeParserResumesSamePushAfterSharedLedgerHeadroomReleases() throws {
+        let descriptor = try XCTUnwrap(AssemblerTestFixtures.videoTracks().video)
+        let fixedBytes = HLSDeliveryApplicationChargeLedger.documentedApplicationSoftBytes - 512
+        let ledger = HLSDeliveryApplicationChargeLedger(fixedBookkeepingChargeBytes: fixedBytes)
+        let heldAdmission = HLSDataPlaneAdmission(
+            capacity: 1, maximumBytes: 512, applicationLedger: ledger
+        )
+        let copyAdmission = FFmpegParserCopyAdmission(
+            capacity: 3, maximumBytes: 16_384, applicationLedger: ledger
+        )
+        let received = ParserReceivedData()
+        let handle = try LiveFFmpegParserHandle(
+            configuration: FFmpegParserConfiguration(video: descriptor),
+            copyAdmission: copyAdmission
+        ) { frame in
+            received.append(frame.withBorrowedBytes(copiedData))
+        }
+        let first = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true, nal: Data([0x65, 0x88, 0x84])
+        )
+        let second = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false, nal: Data([0x41, 0x9A, 0x22])
+        )
+        try handle.push(first, pts: 90_000, dts: nil, duration: nil)
+        let heldLease = try XCTUnwrap(heldAdmission.acquire(bytes: 512))
+        let returned = DispatchSemaphore(value: 0)
+        let pushResult = ParserPushResult()
+        let pushBox = NativeParserPushBox(handle: handle)
+        DispatchQueue.global().async {
+            do { try pushBox.push(second, pts: 93_000, dts: nil, duration: nil) }
+            catch { pushResult.record(error) }
+            returned.signal()
+        }
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while copyAdmission.waitingCount == 0, Date() < deadline {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        XCTAssertEqual(copyAdmission.waitingCount, 1)
+        heldLease.release()
+        XCTAssertEqual(returned.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(pushResult.error)
+        XCTAssertEqual(received.values.count, 1)
+        XCTAssertEqual(try XCTUnwrap(received.values.first).last, 0x84,
+                       "释放 headroom 后必须完成同一次 native push，不能重推原 packet")
+        handle.destroy()
+        XCTAssertEqual(ledger.chargedBytes, fixedBytes)
+    }
+    #endif
 
     #if DEBUG
     func testNativeParserTopFieldFirstUsesDisplayedFieldOrder() {
@@ -668,6 +1122,31 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         )
     }
 
+    private func assertHLSOwnedParameterSetsMatchLegacy(
+        codec: VideoCodec,
+        parameterSets: [Data]
+    ) throws {
+        let tracks = try AssemblerTestFixtures.videoTracks(codec: codec)
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSVideoCopyOwnership(maximumPayloadBytes: 16_384, applicationLedger: ledger)
+        let entries = try parameterSets.map(ownership.makeParameterSetEntry)
+        let owner = try ownership.makeParameterSetOwner(entries: entries)
+        let legacyFormat = try VideoFormatDescriptionBuilder.make(codec: codec, parameterSets: parameterSets)
+        let ownedFormat = try VideoFormatDescriptionBuilder.make(codec: codec, parameterSetOwner: owner)
+        XCTAssertTrue(CMFormatDescriptionEqual(legacyFormat, otherFormatDescription: ownedFormat))
+
+        let state = AssemblyFormatState(trackSet: tracks)
+        state.commitHLSVideoParameterSets(owner)
+        XCTAssertEqual(
+            try state.fingerprint(),
+            try MediaFormatFingerprint(
+                trackSet: tracks,
+                videoParameterSets: parameterSets,
+                audioSystemFormat: nil
+            )
+        )
+    }
+
     private func notSyncAttachment(_ sampleBuffer: CMSampleBuffer) throws -> Bool {
         guard let rawAttachments = CMSampleBufferGetSampleAttachmentsArray(
             sampleBuffer,
@@ -700,6 +1179,49 @@ final class CompressedVideoAssemblerTests: XCTestCase {
             magicCookie: magicCookie
         )
     }
+    func testMonotonicDTSClampingAndExtrapolation() throws {
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        var emittedAUs: [CompressedVideoAccessUnit] = []
+        let assembler = try CompressedVideoAssembler(
+            trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) },
+            eventSink: { event in
+                if case let .accessUnit(au) = event {
+                    emittedAUs.append(au)
+                }
+            },
+            formatState: AssemblyFormatState(trackSet: tracks)
+        )
+        let firstInput = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: true,
+            nal: Data([0x65, 0x88, 0x84])
+        )
+        let secondInput = AssemblerTestFixtures.h264ParserAccessUnit(
+            includeParameterSets: false,
+            nal: Data([0x41, 0x9A, 0x22])
+        )
+        try assembler.push(AssemblerTestFixtures.videoPacket(
+            data: firstInput,
+            pts: CMTime(value: 93_000, timescale: 90_000),
+            dts: CMTime(value: 90_000, timescale: 90_000)
+        ))
+        try assembler.push(AssemblerTestFixtures.videoPacket(
+            data: secondInput,
+            pts: CMTime(value: 96_000, timescale: 90_000),
+            dts: CMTime(value: 90_000, timescale: 90_000)
+        ))
+        try assembler.drain()
+        XCTAssertGreaterThanOrEqual(emittedAUs.count, 2)
+        if emittedAUs.count >= 2 {
+            var timing0 = CMSampleTimingInfo()
+            var timing1 = CMSampleTimingInfo()
+            XCTAssertEqual(CMSampleBufferGetSampleTimingInfoArray(emittedAUs[0].sampleBuffer, entryCount: 1, arrayToFill: &timing0, entriesNeededOut: nil), noErr)
+            XCTAssertEqual(CMSampleBufferGetSampleTimingInfoArray(emittedAUs[1].sampleBuffer, entryCount: 1, arrayToFill: &timing1, entriesNeededOut: nil), noErr)
+            XCTAssertTrue(timing0.decodeTimeStamp.isValid)
+            XCTAssertTrue(timing1.decodeTimeStamp.isValid)
+            XCTAssertEqual(CMTimeCompare(timing1.decodeTimeStamp, timing0.decodeTimeStamp), 1, "DTS of second AU must be strictly greater than first AU even if source DTS was duplicate")
+        }
+    }
 }
 
 private extension VideoAssemblerEvent {
@@ -712,6 +1234,64 @@ private extension VideoAssemblerEvent {
         guard case let .format(_, value) = self else { return nil }
         return value
     }
+}
+
+private final class ParserPushResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedError: Error?
+
+    func record(_ error: Error) { lock.withLock { storedError = error } }
+    var error: Error? { lock.withLock { storedError } }
+}
+
+/// 仅 C/D 跨线程测试桥。被调对象的 nativeCallLock 串行 push/destroy，callback 的
+/// 可变断言状态分别由下列锁槽保护；本盒不向生产 API 宣称任意 receiver 都可 Sendable。
+private final class NativeParserPushBox: @unchecked Sendable {
+    private let handle: LiveFFmpegParserHandle
+
+    init(handle: LiveFFmpegParserHandle) { self.handle = handle }
+
+    func push(_ bytes: Data, pts: Int64?, dts: Int64?, duration: Int64?) throws {
+        try handle.push(bytes, pts: pts, dts: dts, duration: duration)
+    }
+}
+
+private final class ParserReceivedCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    func increment() { lock.withLock { storedValue += 1 } }
+    var value: Int { lock.withLock { storedValue } }
+}
+
+private final class ParserReceivedData: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [Data] = []
+
+    func append(_ value: Data) { lock.withLock { storedValues.append(value) } }
+    var values: [Data] { lock.withLock { storedValues } }
+}
+
+private final class ParameterSetEntryResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedEntry: HLSVideoParameterSetRetention.Entry?
+    private var storedError: Error?
+
+    func record(_ entry: HLSVideoParameterSetRetention.Entry) {
+        lock.withLock { storedEntry = entry }
+    }
+
+    func record(_ error: Error) { lock.withLock { storedError = error } }
+    var entry: HLSVideoParameterSetRetention.Entry? { lock.withLock { storedEntry } }
+    var error: Error? { lock.withLock { storedError } }
+}
+
+/// Span 不可直接构造 Data；此 helper 在测试中逐字节复制，且只在借用闭包内读取。
+private func copiedData(_ bytes: borrowing Span<UInt8>) -> Data {
+    var copied = Data()
+    copied.reserveCapacity(bytes.count)
+    for index in 0..<bytes.count { copied.append(bytes[index]) }
+    return copied
 }
 
 private extension AudioAssemblerEvent {

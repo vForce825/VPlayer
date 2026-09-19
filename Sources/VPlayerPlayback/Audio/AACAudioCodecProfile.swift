@@ -6,12 +6,6 @@ import AudioToolbox
 import Foundation
 
 struct AACAudioCodecProfile: CompressedAudioCodecProfile {
-    private static let sampleRates: [Int32] = [
-        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000,
-        22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
-    ]
-    private static let channelCounts: [Int32] = [0, 1, 2, 3, 4, 5, 6, 8]
-
     let codec: AudioCodec = .aac
     let framing: CompressedAudioFramingKind
 
@@ -117,11 +111,11 @@ struct AACAudioCodecProfile: CompressedAudioCodecProfile {
         }
         let frequencyIndex = Int((bytes[2] >> 2) & 0x0F)
         let channelConfiguration = Int(((bytes[2] & 1) << 2) | (bytes[3] >> 6))
-        guard frequencyIndex < Self.sampleRates.count,
+        guard frequencyIndex < AudioSpecificConfig.indexedSampleRates.count,
               channelConfiguration > 0,
-              channelConfiguration < Self.channelCounts.count,
-              Self.sampleRates[frequencyIndex] == source.sampleRate,
-              Self.channelCounts[channelConfiguration] == source.channelLayout.channelCount,
+              channelConfiguration < AudioSpecificConfig.channelCounts.count,
+              AudioSpecificConfig.indexedSampleRates[frequencyIndex] == source.sampleRate,
+              AudioSpecificConfig.channelCounts[channelConfiguration] == source.channelLayout.channelCount,
               bytes[6] & 3 == 0 else {
             throw AudioCodecProfileValidation.error()
         }

@@ -256,6 +256,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         let identity: VideoDecoderEventIdentity
         let epoch: UInt64
         let colorAttachments: [CFString: Any]
+        let surfaceScope: (any DecodedVideoSurfaceAdmitting)?
     }
 
     /// CMBlockBuffer is a CoreFoundation type with no Sendable conformance, and
@@ -289,6 +290,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     private let submissionStartSink: (@Sendable (UInt64) -> Void)?
     private let metrics: PlaybackMetrics?
     private let sessionTransitionSink: (@Sendable (UInt64) -> Void)?
+    private let surfaceAdmission: (any DecodedVideoSurfaceAdmitting)?
 
     private let stateLock = NSLock()
     private var active: ActiveSession?
@@ -297,6 +299,10 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     private var pending: [Int64: PendingUnit] = [:]
     private var nextToken: Int64 = 1
     private var sessionEpoch: UInt64 = 0
+    /// 成功的自然 EOF drain 会保留 native handle，供随后正式 retirement 销毁。
+    /// 记录同一 epoch，避免 retirement 再次发送 NULL packet；FFmpeg 对第二次
+    /// `avcodec_send_packet(NULL)` 返回 AVERROR_EOF，不能把它伪装成首轮 drain 成功。
+    private var naturallyDrainedEpoch: UInt64?
     private var activePushTracker: (epoch: UInt64, tracker: FFmpegPushProductionTracker)?
     /// `deliver` removes a token from `pending` before posting the frame to the
     /// playback executor. Track that exact hand-off so a native push failure can
@@ -319,6 +325,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             qos: .userInitiated
         ),
         submissionStartSink: (@Sendable (UInt64) -> Void)? = nil,
+        surfaceAdmission: (any DecodedVideoSurfaceAdmitting)? = nil,
         metrics: PlaybackMetrics? = nil,
         sessionTransitionSink: (@Sendable (UInt64) -> Void)? = nil
     ) {
@@ -328,6 +335,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         self.surfacePool = surfacePool
         self.submissionQueue = submissionQueue
         self.submissionStartSink = submissionStartSink
+        self.surfaceAdmission = surfaceAdmission
         self.metrics = metrics
         self.sessionTransitionSink = sessionTransitionSink
     }
@@ -339,7 +347,10 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 generation: generation,
                 transitionToken: token
             )
-            let (replacementEpoch, previous) = beginTransition()
+            let (replacementEpoch, previous, _) = beginTransition()
+            // epoch 已先推进，旧 callback 即使已进入 admission 等待也不会
+            // 再发布；在 native replacement 入队前同步唤醒它。
+            previous?.surfaceScope?.cancelSurfaceAdmission()
             submissionQueue.async { [self] in
                 let outcome: VideoDecoderTransitionOutcome
                 do {
@@ -358,25 +369,57 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 completeTransition(token: token, outcome: outcome)
             }
         case let .drainAndInvalidate(token):
-            let (_, previous) = beginTransition()
+            let (_, previous, previousWasNaturallyDrained) = beginTransition()
+            previous?.surfaceScope?.cancelSurfaceAdmission()
             submissionQueue.async { [self] in
                 let outcome: VideoDecoderTransitionOutcome
                 if let previous {
-                    let result = previous.handle.push(
-                        UnsafeRawBufferPointer(start: nil, count: 0),
-                        token: 0
-                    )
-                    outcome = result.status == 0
-                        ? .completed
-                        : .failed(Self.failure(forNativeStatus: result.status))
+                    if previousWasNaturallyDrained {
+                        outcome = .completed
+                    } else {
+                        let result = previous.handle.push(
+                            UnsafeRawBufferPointer(start: nil, count: 0),
+                            token: 0
+                        )
+                        outcome = result.status == 0
+                            ? .completed
+                            : .failed(Self.failure(forNativeStatus: result.status))
+                    }
                     previous.handle.destroy()
                 } else {
                     outcome = .completed
                 }
                 completeTransition(token: token, outcome: outcome)
             }
+        case let .drain(token):
+            submissionQueue.async { [self] in
+                let outcome: VideoDecoderTransitionOutcome
+                // 在 native lane 决定 active，保证前序 configure 已安装的 session
+                // 会被同一 EOF drain 排空，而非调用线程过早读到 nil。
+                let previous = stateLock.withLock { active }
+                if let previous {
+                    let result = previous.handle.push(
+                        UnsafeRawBufferPointer(start: nil, count: 0),
+                        token: 0
+                    )
+                    if result.status == 0 {
+                        stateLock.withLock {
+                            if active?.epoch == previous.epoch {
+                                naturallyDrainedEpoch = previous.epoch
+                            }
+                        }
+                    }
+                    outcome = result.status == 0
+                        ? .completed
+                        : .failed(Self.failure(forNativeStatus: result.status))
+                } else {
+                    outcome = .completed
+                }
+                completeTransition(token: token, outcome: outcome)
+            }
         case let .invalidate(token):
-            let (_, previous) = beginTransition()
+            let (_, previous, _) = beginTransition()
+            previous?.surfaceScope?.cancelSurfaceAdmission()
             submissionQueue.async { [self] in
                 previous?.handle.destroy()
                 completeTransition(token: token, outcome: .completed)
@@ -384,17 +427,26 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         }
     }
 
-    private func beginTransition() -> (epoch: UInt64, previous: ActiveSession?) {
-        let transition = stateLock.withLock { () -> (UInt64, ActiveSession?) in
+    private func beginTransition() -> (
+        epoch: UInt64,
+        previous: ActiveSession?,
+        previousWasNaturallyDrained: Bool
+    ) {
+        let transition = stateLock.withLock {
+            () -> (UInt64, ActiveSession?, Bool) in
             sessionEpoch &+= 1
             let previous = active
+            let previousWasNaturallyDrained = previous.map {
+                naturallyDrainedEpoch == $0.epoch
+            } ?? false
             active = nil
+            naturallyDrainedEpoch = nil
             pending.removeAll(keepingCapacity: true)
             activePushTracker = nil
             claimedFrameDeliveries.removeAll(keepingCapacity: true)
             nativeFailureDeliveryPermits.removeAll(keepingCapacity: true)
             retiredCancellationIdentity = nil
-            return (sessionEpoch, previous)
+            return (sessionEpoch, previous, previousWasNaturallyDrained)
         }
         sessionTransitionSink?(transition.0)
         return transition
@@ -434,13 +486,17 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 self?.deliver(frame)
             }
         )
+        let surfaceScope = surfaceAdmission?.makeSurfaceSessionScope { [weak self] in
+            self?.emitPermanentSurfaceFailure(identity: identity)
+        }
         let installed = stateLock.withLock { () -> Bool in
             guard sessionEpoch == replacementEpoch, active == nil else { return false }
             active = ActiveSession(
                 handle: handle,
                 identity: identity,
                 epoch: replacementEpoch,
-                colorAttachments: attachments
+                colorAttachments: attachments,
+                surfaceScope: surfaceScope
             )
             return true
         }
@@ -453,6 +509,11 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             summary: "codec=avc1 \(dimensions.width)x\(dimensions.height) route=ffmpeg"
                 + " threads=\(ProcessInfo.processInfo.activeProcessorCount)"
         )
+    }
+
+    private func emitPermanentSurfaceFailure(identity: VideoDecoderEventIdentity) {
+        guard stateLock.withLock({ active?.identity == identity }) else { return }
+        eventSink(.fatalFailure(.malfunction(kCVReturnError), identity: identity))
     }
 
     func decode(_ accessUnit: CompressedVideoAccessUnit, flags: VTDecodeFrameFlags) throws {
@@ -648,6 +709,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             : []
         sessionEpoch &+= 1
         self.active = nil
+        active.surfaceScope?.cancelSurfaceAdmission()
         retiredCancellationIdentity = active.identity
         pending.removeAll(keepingCapacity: true)
         activePushTracker = nil
@@ -703,16 +765,36 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         }
         guard let (unit, session, production, claim) = state else { return }
 
+        // FFmpeg 的三个平面只在 native callback 借用期间有效。先取得 pool
+        // 实际分配的 CVPixelBuffer（含 stride/padding），再在写入任何字节前按
+        // `CVPixelBufferGetDataSize` 预费；不能用 w*h*1.5 猜测 backing。
+        let surfaceTail: DecodedVideoFrameRetentionTail?
+        let allocated: CVPixelBuffer
+        if let surfaceAdmission = session.surfaceScope {
+            guard let admitted = surfaceAdmission.allocateAdmittedFFmpegSurface(
+                width: frame.width, height: frame.height, range: frame.range
+            ) else {
+                cancelClaimedFrameDelivery(claim)
+                return
+            }
+            allocated = admitted.pixelBuffer
+            surfaceTail = admitted.tail
+        } else {
+            guard let fallback = allocatePixelBuffer(
+                width: frame.width, height: frame.height, range: frame.range
+            ) else { cancelClaimedFrameDelivery(claim); return }
+            allocated = fallback
+            surfaceTail = nil
+        }
+
         guard let pixelBuffer = makePixelBuffer(
-            width: frame.width,
-            height: frame.height,
+            allocated,
             luma: luma,
             lumaStride: frame.lumaStride,
             chromaB: chromaB,
             chromaBStride: frame.chromaBStride,
             chromaR: chromaR,
             chromaRStride: frame.chromaRStride,
-            range: frame.range,
             attachments: session.colorAttachments
         ) else {
             cancelClaimedFrameDelivery(claim)
@@ -732,7 +814,8 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             duration: unit.duration,
             generation: session.identity.generation,
             parserMetadata: Self.merged(unit.parserMetadata, with: frame),
-            formatMetadata: formatMetadata
+            formatMetadata: formatMetadata,
+            retentionTail: surfaceTail
         )
         metrics?.recordDecoderCallback()
         let expectedEpoch = session.epoch
@@ -771,28 +854,17 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
     /// and rather than here, because a per-byte loop over half a million pixels
     /// costs more than the decode it is serving.
     private func makePixelBuffer(
-        width: Int,
-        height: Int,
+        _ output: CVPixelBuffer,
         luma: UnsafePointer<UInt8>,
         lumaStride: Int,
         chromaB: UnsafePointer<UInt8>,
         chromaBStride: Int,
         chromaR: UnsafePointer<UInt8>,
         chromaRStride: Int,
-        range: VideoFormatMetadata.Range,
         attachments: [CFString: Any]
     ) -> CVPixelBuffer? {
-        guard width >= 2, height >= 2, width.isMultiple(of: 2), height.isMultiple(of: 2) else {
-            return nil
-        }
-        let pixelFormat = range == .full
-            ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        guard let output = try? surfacePool.allocate(
-            width: width,
-            height: height,
-            pixelFormat: pixelFormat
-        ) else { return nil }
+        let width = CVPixelBufferGetWidth(output)
+        let height = CVPixelBufferGetHeight(output)
 
         // The decoder reports colour through the stream's own signalling, which
         // the format description already carries; the reader downstream expects
@@ -820,6 +892,18 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             Int32(height)
         )
         return output
+    }
+
+    private func allocatePixelBuffer(
+        width: Int, height: Int, range: VideoFormatMetadata.Range
+    ) -> CVPixelBuffer? {
+        guard width >= 2, height >= 2, width.isMultiple(of: 2), height.isMultiple(of: 2) else {
+            return nil
+        }
+        let pixelFormat = range == .full
+            ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        return try? surfacePool.allocate(width: width, height: height, pixelFormat: pixelFormat)
     }
 
     private static func merged(
@@ -916,6 +1000,7 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
     private let lock = NSLock()
     private var active: Session?
     private var pendingTransition: PendingTransition?
+    private var pendingNaturalDrain: (route: Route, token: VideoDecoderTransitionToken)?
     private var format: CMVideoFormatDescription?
     private var generation = MediaGeneration(rawValue: 0)
     private var requestedRoute: Route?
@@ -923,10 +1008,12 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
     init(
         videoToolbox: any VideoDecoding,
         ffmpeg: any VideoDecoding,
+        initialRoute: Route? = nil,
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
     ) {
         self.videoToolbox = videoToolbox
         self.ffmpeg = ffmpeg
+        requestedRoute = initialRoute
         self.eventSink = eventSink
     }
 
@@ -965,6 +1052,9 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
             let stale = lock.withLock {
                 () -> [(route: Route, decoder: any VideoDecoding)] in
                 var stale: [(Route, any VideoDecoding)] = []
+                // 新 session 取代 EOF drain 的所有权。旧 native drain 仍可在
+                // 自己的 lane 完成，但它的 token 绝不能确认这个 replacement。
+                pendingNaturalDrain = nil
                 if let active, active.route != route {
                     stale.append((active.route, active.decoder))
                 }
@@ -989,6 +1079,29 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
                 ))
             }
             selected.transition(transition)
+        case let .drain(token):
+            let selection = lock.withLock {
+                () -> (target: (Route, any VideoDecoding)?, isDuplicate: Bool) in
+                guard pendingNaturalDrain == nil else { return (nil, true) }
+                let target = pendingTransition.map { ($0.route, $0.decoder) }
+                    ?? active.map { ($0.route, $0.decoder) }
+                if let target { pendingNaturalDrain = (target.0, token) }
+                return (target, false)
+            }
+            if selection.isDuplicate {
+                // 一个 route 同时只允许一个自然 drain owner。第二个 token
+                // 必须明确失败，不能伪造 completed 让上层误以为它排空了尾帧。
+                eventSink(.transitionCompleted(
+                    token: token,
+                    outcome: .failed(.malfunction(kVTInvalidSessionErr))
+                ))
+                return
+            }
+            guard let target = selection.target else {
+                eventSink(.transitionCompleted(token: token, outcome: .completed))
+                return
+            }
+            target.1.transition(transition)
         case let .drainAndInvalidate(token), let .invalidate(token):
             let target = lock.withLock {
                 () -> (route: Route, decoder: any VideoDecoding)? in
@@ -1000,6 +1113,9 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
                 } else {
                     target = nil
                 }
+                // 取消/退休将关闭自然 EOF 的确认通道；迟到完成只能被 receive
+                // 丢弃，不能越过新的 identity 或误确认当前生命周期。
+                pendingNaturalDrain = nil
                 active = nil
                 if let target {
                     pendingTransition = PendingTransition(
@@ -1044,6 +1160,11 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
         switch event {
         case let .transitionCompleted(token, outcome):
             let shouldForward = lock.withLock { () -> Bool in
+                if let natural = pendingNaturalDrain,
+                   natural.route == route, natural.token == token {
+                    pendingNaturalDrain = nil
+                    return true
+                }
                 guard let pendingTransition,
                       pendingTransition.route == route,
                       pendingTransition.token == token else { return false }

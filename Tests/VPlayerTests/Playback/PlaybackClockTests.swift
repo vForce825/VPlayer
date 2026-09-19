@@ -209,7 +209,8 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(order.suffix(2), ["prepare", "anchor"])
         XCTAssertEqual(clock.anchors.first?.mediaTime, CMTime(value: 10_001, timescale: 1_000))
         XCTAssertEqual(clock.anchors.first?.hostTime, CMTime(value: 100_100, timescale: 1_000))
-        XCTAssertEqual(clock.anchors.first?.rate, 1)
+        // readiness只准备共同时间锚；正rate由backend的显式activation许可驱动。
+        XCTAssertEqual(clock.anchors.first?.rate, 0)
     }
 
     func testGateRequiresACommonIntervalWithFullPostIntersectionReadiness() {
@@ -572,5 +573,9 @@ private final class FakePlaybackClock: PlaybackClock {
     func anchor(mediaTime: CMTime, atHostTime hostTime: CMTime, rate: Float) {
         order?("anchor")
         anchors.append(.init(mediaTime: mediaTime, hostTime: hostTime, rate: rate))
+    }
+
+    func setRate(_ rate: Float) {
+        // Mock setRate
     }
 }

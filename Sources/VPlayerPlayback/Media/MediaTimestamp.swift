@@ -10,8 +10,9 @@ public struct MediaRational: Sendable, Hashable {
 
     public init?(num: Int32, den: Int32) {
         guard num > 0, den > 0 else { return nil }
-        self.num = num
-        self.den = den
+        let divisor = greatestCommonDivisor(UInt64(num), UInt64(den))
+        self.num = num / Int32(divisor)
+        self.den = den / Int32(divisor)
     }
 
     public func cmTime(forFFmpegValue value: Int64) -> CMTime {

@@ -14,6 +14,7 @@ extern "C" {
 #endif
 
 #define VPFF_PARSER_ABI_VERSION ((uint32_t)1)
+#define VPFF_PARSER_ABI_VERSION_V2 ((uint32_t)2)
 
 typedef struct VPFFParser VPFFParser;
 
@@ -52,6 +53,29 @@ typedef struct {
 /* The frame and every borrowed pointer are valid only during this synchronous call. */
 typedef void (*VPFFParserCallback)(void *context, const VPFFParsedFrame *frame);
 
+typedef enum {
+    VPFF_PARSER_ALLOCATION_EXTRADATA = 1,
+    VPFF_PARSER_ALLOCATION_PUSH_INPUT = 2,
+} VPFFParserAllocationKind;
+
+/*
+ * HLS 可选的原生副本接管钩子。reserve 必须在对应 av_mallocz 前返回非 NULL
+ * token；release 只在该 backing 已由原生层实际释放后调用一次。token 的所有权
+ * 完全属于调用方，C 层不检查或释放它。
+ */
+typedef void *(*VPFFParserAllocationReserveCallback)(
+    void *context,
+    VPFFParserAllocationKind kind,
+    size_t bytes
+);
+typedef void (*VPFFParserAllocationReleaseCallback)(void *context, void *token);
+
+typedef struct {
+    VPFFParserAllocationReserveCallback reserve;
+    VPFFParserAllocationReleaseCallback release;
+    void *context;
+} VPFFParserAllocationCallbacks;
+
 typedef struct {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -67,6 +91,22 @@ typedef struct {
     const uint8_t *extradata;
     size_t extradata_size;
 } VPFFParserConfigV1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    VPFFCodec codec;
+    int32_t time_base_num;
+    int32_t time_base_den;
+    int32_t sample_rate;
+    int32_t channel_count;
+    VPFFChannelOrder channel_order;
+    uint8_t has_channel_layout_mask;
+    uint64_t channel_layout_mask;
+    const uint8_t *extradata;
+    size_t extradata_size;
+    VPFFParserAllocationCallbacks allocation_callbacks;
+} VPFFParserConfigV2;
 
 /*
  * Compatibility entry point. Because the original ABI has no time base or
@@ -90,6 +130,14 @@ int32_t vp_ffmpeg_parser_create_v1(
     VPFFParser **out_parser
 );
 
+/* v2 仅增加可选的原生 allocation 接管回调；未提供回调时保持 v1 语义。 */
+int32_t vp_ffmpeg_parser_create_v2(
+    const VPFFParserConfigV2 *config,
+    VPFFParserCallback callback,
+    void *context,
+    VPFFParser **out_parser
+);
+
 /* Input bytes are borrowed only for this call and are NULL iff size is zero. */
 int32_t vp_ffmpeg_parser_push(
     VPFFParser *parser,
@@ -102,6 +150,9 @@ int32_t vp_ffmpeg_parser_push(
 
 int32_t vp_ffmpeg_parser_drain(VPFFParser *parser);
 void vp_ffmpeg_parser_destroy(VPFFParser *parser);
+
+/* 供 Swift 定向测试核对 native av_mallocz 预留的实际输入尾 padding。 */
+size_t vp_ffmpeg_parser_input_padding_bytes(void);
 
 #if DEBUG
 /* 仅供测试校验 AVFieldOrder 的显示场序映射。 */

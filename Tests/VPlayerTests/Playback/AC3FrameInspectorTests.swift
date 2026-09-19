@@ -53,6 +53,27 @@ final class AC3FrameInspectorTests: XCTestCase {
         XCTAssertEqual(bsidTen.channel_count, 2)
     }
 
+    func testInspectorPreservesLegacyBsidZeroThroughTen() throws {
+        for bsid in UInt8(0)...UInt8(10) {
+            let inspected = try inspect(AssemblerTestFixtures.syntheticAC3Frame(
+                fscod: 0,
+                frmsizecod: 20,
+                bsid: bsid,
+                bsmod: 0,
+                acmod: 2,
+                lfeon: false
+            ))
+            let expectedRate: Int32 = switch bsid {
+            case 10: 12_000
+            case 9: 24_000
+            default: 48_000
+            }
+            XCTAssertEqual(inspected.bsid, bsid)
+            XCTAssertEqual(inspected.sample_rate, expectedRate, "bsid=\(bsid)")
+        }
+    }
+
+
     func testInspectorRejectsBadSyncSizeBsidAboveTenAndCRC() {
         let valid = AssemblerTestFixtures.syntheticAC3Frame()
         var badSync = valid

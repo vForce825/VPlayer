@@ -1324,6 +1324,7 @@ private final class TracePlaybackClock: PlaybackClock, @unchecked Sendable {
     func anchor(mediaTime: CMTime, atHostTime _: CMTime, rate _: Float) {
         currentTime = mediaTime
     }
+    func setRate(_ rate: Float) {}
 }
 
 private final class FailingTraceCommandSubmitter: YADIFCommandSubmitting, @unchecked Sendable {
@@ -1451,7 +1452,7 @@ private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable 
                 return eventSink
             }
             event = .transitionCompleted(token: token, outcome: .completed)
-        case let .drainAndInvalidate(token), let .invalidate(token):
+        case let .drain(token), let .drainAndInvalidate(token), let .invalidate(token):
             sink = lock.withLock { eventSink }
             event = .transitionCompleted(token: token, outcome: .completed)
         }

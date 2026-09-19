@@ -31,9 +31,19 @@ protocol PlaybackPipelineProtocol: AnyObject, Sendable {
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot?
     func start(url: URL, readinessCycle: UInt64, initiallyPaused: Bool)
     func setPaused(_ paused: Bool, readinessCycle: UInt64)
+    /// Sets the playback clock rate for the given readiness cycle.
+    /// Starting or readying the pipeline does not internally set rate 1; positive rate (1.0)
+    /// must be driven via this permit interface by the controller or backend upon activation.
+    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64)
     func recoverFromAudioSessionReset(readinessCycle: UInt64)
     func setTuning(_ tuning: PlaybackTuning)
     func stop() async
+}
+
+/// SampleBuffer 后端的静止证明只能来自真实 rate owner 所在的串行 lane。
+/// 普通 pipeline double 若未显式实现该协议，只能走 fail-closed retirement。
+protocol SampleBufferPlaybackRateOwner: AnyObject, Sendable {
+    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float?
 }
 
 extension PlaybackPipelineProtocol {
@@ -177,7 +187,7 @@ struct PlaybackPipelineSnapshot: Sendable {
     let audioGapVideoEvidenceRecordCount: Int
 }
 
-final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
+final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRateOwner, @unchecked Sendable {
     typealias VideoDecodeStallScheduler = @Sendable (
         DispatchTimeInterval,
         @escaping @Sendable () -> Void
@@ -563,7 +573,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     }
 
     func start(url: URL, readinessCycle: UInt64, initiallyPaused: Bool) {
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("pipeline_start_submitted")
+        #endif
         executor.submit { [weak self] in
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_start_executing")
+            #endif
             self?.startIsolated(
                 url: url,
                 readinessCycle: readinessCycle,
@@ -575,6 +591,27 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
     func setPaused(_ paused: Bool, readinessCycle: UInt64) {
         executor.submit { [weak self] in
             self?.setPausedIsolated(paused, readinessCycle: readinessCycle)
+        }
+    }
+
+    func setPlaybackRate(_ rate: Float, readinessCycle: UInt64) {
+        executor.submit { [weak self] in
+            self?.setPlaybackRateIsolated(rate, readinessCycle: readinessCycle)
+        }
+    }
+
+    func setRateZeroAndReadBack(readinessCycle: UInt64) async -> Float? {
+        await withCheckedContinuation { continuation in
+            executor.submit { [weak self] in
+                guard let self, started, !terminal,
+                      let systemClock = clock as? RenderSynchronizerClock else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                self.readinessCycle = readinessCycle
+                systemClock.setRate(0)
+                continuation.resume(returning: systemClock.synchronizer.rate)
+            }
         }
     }
 
@@ -863,21 +900,39 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         beginInitialBufferingPhaseWindowIsolated()
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_unsupported_scheme_\(scheme)")
+            #endif
             failIsolated(.unsupportedProtocol(scheme))
             return
         }
         do {
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_calling_demuxer_start")
+            #endif
             try demuxer.start(url: url) { [weak self] event in
                 self?.admit(event)
             }
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_demuxer_start_returned")
+            #endif
         } catch let error as PlaybackCoreError {
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_demuxer_failed_\(error)")
+            #endif
             failIsolated(error)
         } catch {
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_demuxer_failed_other_\(error)")
+            #endif
             failIsolated(.demuxOpen(-1))
         }
     }
 
     private func admit(_ event: DemuxEvent) {
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("pipeline_admit_event")
+        #endif
         let acknowledgement = DispatchSemaphore(value: 0)
         if executor.isIsolated {
             handleDemux(event, acknowledgement: acknowledgement)
@@ -1217,13 +1272,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         }
 
         for accessUnit in video where !terminal {
-            admitVideoAccessUnitIsolated(CompressedVideoAccessUnit(
-                id: accessUnit.id,
-                sampleBuffer: accessUnit.sampleBuffer,
-                generation: generation,
-                isRandomAccess: accessUnit.isRandomAccess,
-                parserMetadata: accessUnit.parserMetadata
-            ))
+            admitVideoAccessUnitIsolated(try accessUnit.rebindingSourceEvidence(to: generation))
         }
         for frame in audioFrames where !terminal {
             try admitAudioFrameIsolated(CompressedAudioFrame(
@@ -2339,6 +2388,15 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, @unchecked Sendable {
         display.pauseSubmission()
     }
 
+    /// Drives the playback clock rate. Starting and readying the pipeline does not internally
+    /// set rate 1; positive rate (1.0) must be driven via this permit interface upon activation.
+    private func setPlaybackRateIsolated(_ rate: Float, readinessCycle: UInt64) {
+        assertIsolated()
+        guard started, !terminal else { return }
+        self.readinessCycle = readinessCycle
+        clock.setRate(rate)
+    }
+
     private func setPausedIsolated(_ shouldPause: Bool, readinessCycle: UInt64) {
         assertIsolated()
         guard started, !terminal, paused != shouldPause else { return }
@@ -3354,7 +3412,13 @@ private final class VisibleVideoRendererReference: @unchecked Sendable {
     }
 }
 
-struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
+final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked Sendable {
+    private let routeMonitor: any AudioRouteMonitoring
+
+    init(routeMonitor: any AudioRouteMonitoring = DefaultAudioRouteMonitor()) {
+        self.routeMonitor = routeMonitor
+    }
+
     static func makeSynchronizer() -> AVSampleBufferRenderSynchronizer {
         let synchronizer = AVSampleBufferRenderSynchronizer()
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
@@ -3390,6 +3454,9 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             eventSink: { relay.decoder($0) }
         )
         decoderRelay.install(decoder)
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_start")
+        #endif
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw PlaybackCoreError.metalCommand("device.unavailable")
         }
@@ -3411,9 +3478,15 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             switchStarted: { relay.displayModeSwitchStarted() },
             switchEnded: { relay.displayModeSwitchEnded() }
         )
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_before_mainactor")
+        #endif
         let videoRendererReference = await MainActor.run {
             VisibleVideoRendererReference(presentationContext.videoRenderer)
         }
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_after_mainactor")
+        #endif
         let videoRenderer = videoRendererReference.renderer
         // This exact object belongs to the visible AVSampleBufferDisplayLayer.
         // Attach it before the output adapter exists, so no video sample can be
@@ -3421,6 +3494,9 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         synchronizer.addRenderer(videoRenderer)
         let recommendedPixelBufferAttributes = videoRenderer
             .recommendedPixelBufferAttributes
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_before_yadif")
+        #endif
         let yadif: YADIFProcessor
         do {
             yadif = try YADIFProcessor(
@@ -3435,12 +3511,18 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         } catch {
             throw PlaybackCoreError.metalCommand("yadif.setup")
         }
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_before_probe")
+        #endif
         let probe: LumaScanProbe
         do {
             probe = try LumaScanProbe(commandQueue: commandQueue, maximumFrames: 12)
         } catch {
             throw PlaybackCoreError.metalCommand("scan-probe.setup")
         }
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_before_pipeline_alloc")
+        #endif
         let surfaceLedger = VideoSurfaceBudgetLedger()
         let renderer = SystemVideoOutput(
             renderer: videoRenderer,
@@ -3454,6 +3536,7 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
         let audio = AudioRenderPipeline(
             synchronizer: synchronizer,
             executor: executor,
+            routeMonitor: routeMonitor,
             failureSink: { relay.failure($0, generation: $1) },
             clockMode: .externallyManaged,
             readinessSink: { relay.audioReadiness($0, generation: $1) }
@@ -3478,6 +3561,9 @@ struct SystemPlaybackPipelineFactory: PlaybackPipelineFactory {
             signposts: signposts
         )
         relay.install(pipeline)
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.set("makepipeline_done")
+        #endif
         return pipeline
     }
 }

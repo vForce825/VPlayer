@@ -16,6 +16,7 @@ final class CompressedAudioAssembler {
     private let formatState: AssemblyFormatState
     private let descriptor: AudioTrackDescriptor
     private let profile: any CompressedAudioCodecProfile
+    private let hlsCopyOwnership: HLSAudioCopyOwnership?
     private var framer: (any CompressedAudioFramingStrategy)?
     private var nextID: UInt64?
     private var systemFormat: SystemCompressedAudioFormat?
@@ -34,7 +35,8 @@ final class CompressedAudioAssembler {
         parserFactory: any FFmpegParserFactory = LiveFFmpegParserFactory(),
         formatState: AssemblyFormatState,
         binding: AssemblyEpochBinding = .standalone(),
-        startingID: UInt64 = 1
+        startingID: UInt64 = 1,
+        hlsCopyOwnership: HLSAudioCopyOwnership? = nil
     ) throws {
         guard let descriptor = trackSet.audio else { throw Self.validationError() }
         self.descriptor = descriptor
@@ -44,6 +46,7 @@ final class CompressedAudioAssembler {
         self.parserFactory = parserFactory
         self.formatState = formatState
         self.binding = binding
+        self.hlsCopyOwnership = hlsCopyOwnership
         nextID = startingID
         try configureProfileAndFramer()
     }
@@ -118,16 +121,18 @@ final class CompressedAudioAssembler {
         }
         switch profile.framing {
         case .rawAAC:
-            return RawAACFramingStrategy(receiver: receiver)
+            return RawAACFramingStrategy(hlsCopyOwnership: hlsCopyOwnership, receiver: receiver)
         case .adts:
             return ADTSAudioFramingStrategy(
                 sampleRate: descriptor.sampleRate,
+                hlsCopyOwnership: hlsCopyOwnership,
                 receiver: receiver
             )
         case .ffmpegParser:
             return try FFmpegCompressedAudioFramingStrategy(
                 source: descriptor,
                 parserFactory: parserFactory,
+                hlsCopyOwnership: hlsCopyOwnership,
                 receiver: receiver
             )
         }

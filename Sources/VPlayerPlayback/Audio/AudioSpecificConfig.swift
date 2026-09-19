@@ -5,17 +5,18 @@
 import Foundation
 
 struct AudioSpecificConfig: Sendable, Hashable {
-    enum Kind: Sendable, Hashable {
+    enum Kind: Sendable, Hashable, CaseIterable {
         case aacLC
         case heAACv1
         case heAACv2
     }
 
-    private static let sampleRates: [Int32] = [
+    static let indexedSampleRates: [Int32] = [
         96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000,
         22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
     ]
-    private static let channelCounts: [Int32] = [0, 1, 2, 3, 4, 5, 6, 8]
+    static let channelCounts: [Int32] = [0, 1, 2, 3, 4, 5, 6, 8]
+    static let explicitSampleRateRange: ClosedRange<Int32> = 1...0xFF_FFFF
     private static let maximumBytes = 64
 
     let kind: Kind
@@ -126,15 +127,16 @@ struct AudioSpecificConfig: Sendable, Hashable {
         let index = try reader.read(4)
         if index == 15 {
             let explicit = try reader.read(24)
-            guard explicit > 0, let result = Int32(exactly: explicit) else {
+            guard let result = Int32(exactly: explicit),
+                  explicitSampleRateRange.contains(result) else {
                 throw AudioCodecProfileValidation.error()
             }
             return result
         }
-        guard index < sampleRates.count else {
+        guard index < indexedSampleRates.count else {
             throw AudioCodecProfileValidation.error()
         }
-        return sampleRates[index]
+        return indexedSampleRates[index]
     }
 }
 

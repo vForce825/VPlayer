@@ -19,7 +19,6 @@ extern int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
     VPFFVideoFrameCallback callback,
     void *context
 );
-#endif
 
 static void vpff_record_validation_callback(void *context, const VPFFVideoFrame *frame) {
     NSUInteger *count = context;
@@ -32,7 +31,6 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
 @implementation VPFFmpegVideoDecoderNativeValidationTests
 
 - (void)testSyntheticFrameValidationRejectsEachInvalidLayoutIndependently {
-#if DEBUG
     uint8_t luma[16 * 16] = {0};
     uint8_t chroma_b[8 * 8] = {0};
     uint8_t chroma_r[8 * 8] = {0};
@@ -89,13 +87,9 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
         XCTAssertEqual(status, unsupported, @"%s", value.name);
         XCTAssertEqual(callback_count, 0u, @"%s", value.name);
     }
-#else
-    XCTFail(@"native validation tests require a Debug build");
-#endif
 }
 
 - (void)testSyntheticFrameValidationAcceptsExactBoundaryStrides {
-#if DEBUG
     uint8_t luma[16 * 16] = {0};
     uint8_t chroma_b[8 * 8] = {0};
     uint8_t chroma_r[8 * 8] = {0};
@@ -116,9 +110,8 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
 
     XCTAssertEqual(status, 0);
     XCTAssertEqual(callback_count, 1u);
-#else
-    XCTFail(@"native validation tests require a Debug build");
-#endif
 }
 
 @end
+
+#endif

@@ -75,6 +75,66 @@ private final class CapturedReceiver: @unchecked Sendable {
     }
 }
 
+private final class FFmpegSurfaceAdmissionProbe: DecodedVideoSurfaceAdmitting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests = 0
+    private var cancellations = 0
+    private var releases = 0
+
+    func admitSurface(bytes _: Int) -> DecodedVideoFrameRetentionTail? { nil }
+
+    func allocateAdmittedFFmpegSurface(
+        width: Int, height: Int, range: VideoFormatMetadata.Range
+    ) -> (pixelBuffer: CVPixelBuffer, tail: DecodedVideoFrameRetentionTail)? {
+        lock.withLock { requests += 1 }
+        let format = range == .full
+            ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        var buffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(nil, width, height, format, [
+            kCVPixelBufferIOSurfacePropertiesKey as CFString: [:],
+            kCVPixelBufferMetalCompatibilityKey as CFString: true,
+        ] as CFDictionary, &buffer) == kCVReturnSuccess, let buffer else { return nil }
+        return (buffer, DecodedVideoFrameRetentionTail { [weak self] in
+            self?.lock.withLock { self?.releases += 1 }
+        })
+    }
+
+    func cancelSurfaceAdmission() { lock.withLock { cancellations += 1 } }
+    var allocationRequests: Int { lock.withLock { requests } }
+    var releaseCount: Int { lock.withLock { releases } }
+}
+
+private final class DeferredFFmpegPermanentSurfaceAdmission: DecodedVideoSurfaceAdmitting, @unchecked Sendable {
+    private final class Scope: DecodedVideoSurfaceAdmitting, @unchecked Sendable {
+        private let permanentFailureSink: @Sendable () -> Void
+        init(permanentFailureSink: @escaping @Sendable () -> Void) {
+            self.permanentFailureSink = permanentFailureSink
+        }
+        func admitSurface(bytes _: Int) -> DecodedVideoFrameRetentionTail? { nil }
+        func cancelSurfaceAdmission() {}
+        func makeSurfaceSessionScope(
+            permanentFailureSink _: @escaping @Sendable () -> Void
+        ) -> any DecodedVideoSurfaceAdmitting { self }
+        func reportLatePermanentFailure() { permanentFailureSink() }
+    }
+
+    private let lock = NSLock()
+    private var scopes: [Scope] = []
+    func admitSurface(bytes _: Int) -> DecodedVideoFrameRetentionTail? { nil }
+    func cancelSurfaceAdmission() {}
+    func makeSurfaceSessionScope(
+        permanentFailureSink: @escaping @Sendable () -> Void
+    ) -> any DecodedVideoSurfaceAdmitting {
+        let scope = Scope(permanentFailureSink: permanentFailureSink)
+        lock.withLock { scopes.append(scope) }
+        return scope
+    }
+    func reportLatePermanentFailure(scope: Int) {
+        lock.withLock { scopes.indices.contains(scope) ? scopes[scope] : nil }?.reportLatePermanentFailure()
+    }
+}
+
 private final class FakeFFmpegVideoDecoderHandle: FFmpegVideoDecoderHandle, @unchecked Sendable {
     private let condition = NSCondition()
     private var pushedTokens: [Int64] = []
@@ -232,6 +292,89 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         XCTAssertNil(decoded.parserMetadata.topFieldFirst)
     }
 
+    func testHLSSurfaceProviderAllocatesBeforeFFmpegCopyAndTailReleasesWithLastFrame() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.hls-surface")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.hls-surface.submit")
+        let frames = FrameRecorder()
+        let provider = FFmpegSurfaceAdmissionProbe()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { frames.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue,
+            surfaceAdmission: provider
+        )
+        try configure(decoder, format: makeFormat(fieldCount: 1), queue: queue, executor: executor)
+        try decoder.decode(makeAccessUnit(id: 91), flags: [])
+        queue.sync {}
+        deliverTestFrame(token: try XCTUnwrap(handle.tokens.first), to: captured.receiver,
+                         isInterlaced: false, topFieldFirst: false)
+        var frame: DecodedVideoFrame? = try XCTUnwrap(frames.wait(timeout: 2))
+        XCTAssertNotNil(frame?.retentionTail)
+        XCTAssertEqual(provider.allocationRequests, 1)
+        XCTAssertEqual(provider.releaseCount, 0)
+        frame = nil
+        XCTAssertEqual(provider.releaseCount, 1)
+    }
+
+    func testHLSPermanentSurfaceAdmissionRejectionEmitsFatalForCurrentSession() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.hls-surface-permanent")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.hls-surface-permanent.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let provider = HLSDecodedSurfaceAdmission(
+            admission: HLSDataPlaneAdmission(capacity: 1, maximumBytes: 1)
+        )
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue,
+            surfaceAdmission: provider
+        )
+        try configure(decoder, format: makeFormat(fieldCount: 1), queue: queue, executor: executor)
+        try decoder.decode(makeAccessUnit(id: 92), flags: [])
+        queue.sync {}
+        deliverTestFrame(token: try XCTUnwrap(handle.tokens.first), to: captured.receiver,
+                         isInterlaced: false, topFieldFirst: false)
+        drain(executor)
+
+        XCTAssertTrue(events.events.contains { event in
+            guard case let .fatalFailure(failure, identity) = event else { return false }
+            return failure == .malfunction(kCVReturnError)
+                && identity.generation == generation
+        })
+    }
+
+    func testRetiredHLSScopeLatePermanentFailureDoesNotFailReplacementSession() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.hls-surface-retired")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.hls-surface-retired.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let provider = DeferredFFmpegPermanentSurfaceAdmission()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue,
+            surfaceAdmission: provider
+        )
+        try configure(decoder, format: makeFormat(fieldCount: 1), queue: queue, executor: executor)
+        // 同 generation 的真实 session replacement 仍生成新 identity；旧 scope 已退休。
+        try configure(decoder, format: makeFormat(fieldCount: 1), queue: queue, executor: executor)
+        provider.reportLatePermanentFailure(scope: 0)
+        drain(executor)
+
+        XCTAssertFalse(events.events.contains { event in
+            if case .fatalFailure = event { return true }
+            return false
+        }, "旧 FFmpeg scope 的迟到永久失败不得击穿后继 identity")
+    }
+
     func testFFmpegConfigureTransitionReturnsWhileNativeQueueIsBlocked() throws {
         let captured = CapturedReceiver()
         let handle = FakeFFmpegVideoDecoderHandle()
@@ -327,6 +470,103 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             return false
         }, [
             .transition(token: token, outcome: .completed),
+        ])
+    }
+
+    func testFFmpegNaturalDrainDeliversDelayedFrameWithoutDestroyingConfiguredSession() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.natural-drain")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.natural-drain.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue
+        )
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation
+        ))
+        queue.sync {}
+        drain(executor)
+        try decoder.decode(makeAccessUnit(id: 95), flags: [])
+        queue.sync {}
+        let delayedToken = try XCTUnwrap(handle.tokens.last)
+        handle.handlePush { token in
+            if token == 0 {
+                deliverTestFrame(
+                    token: delayedToken,
+                    to: captured.receiver,
+                    isInterlaced: false,
+                    topFieldFirst: false
+                )
+            }
+            return .success
+        }
+
+        let drainToken = VideoDecoderTransitionToken()
+        decoder.transition(.drain(token: drainToken))
+        queue.sync {}
+        drain(executor)
+
+        let identity = VideoDecoderEventIdentity(
+            generation: generation,
+            transitionToken: configurationToken
+        )
+        XCTAssertEqual(events.events, [
+            .transition(token: configurationToken, outcome: .completed),
+            // FFmpeg 已复制 compressed AU 后即可释放输入 admission；空包
+            // drain 的重排序尾帧仍必须以该 AU 的原 identity 交付，二者
+            // 不能绑成“等 frame 才完成”，否则连续无输出输入会堵住 HLS。
+            .completed(accessUnitID: 95, identity: identity, disposition: .noFrame),
+            .frame(accessUnitID: 95, identity: identity),
+            .transition(token: drainToken, outcome: .completed),
+        ])
+        XCTAssertEqual(handle.tokens.suffix(1), [0])
+        XCTAssertEqual(handle.destroyCount, 0)
+    }
+
+    func testFFmpegRetirementAfterNaturalDrainDestroysWithoutSendingSecondEOF() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(
+            label: "org.vplayer.tests.ffmpeg.natural-drain-retirement")
+        let queue = DispatchQueue(
+            label: "org.vplayer.tests.ffmpeg.natural-drain-retirement.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle),
+            submissionQueue: queue)
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 2),
+            generation: generation))
+        queue.sync {}
+        drain(executor)
+
+        let drainToken = VideoDecoderTransitionToken()
+        decoder.transition(.drain(token: drainToken))
+        queue.sync {}
+        drain(executor)
+
+        let retirementToken = VideoDecoderTransitionToken()
+        decoder.transition(.drainAndInvalidate(token: retirementToken))
+        queue.sync {}
+        drain(executor)
+
+        XCTAssertEqual(handle.tokens, [0],
+                       "自然 EOF 已发送过空包，退休只能销毁 native handle，不能重复发送 EOF")
+        XCTAssertEqual(handle.destroyCount, 1)
+        XCTAssertEqual(events.events.suffix(2), [
+            .transition(token: drainToken, outcome: .completed),
+            .transition(token: retirementToken, outcome: .completed),
         ])
     }
 
@@ -1533,6 +1773,98 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         }
     }
 
+    func testRoutingInvalidateCancelsOldRealScopeButNewRouteUsesSharedProvider() throws {
+        let provider = HLSDecodedSurfaceAdmission(
+            admission: HLSDataPlaneAdmission(capacity: 1, maximumBytes: 1_000_000)
+        )
+        let heldScope = provider.makeSurfaceSessionScope()
+        var heldTail: DecodedVideoFrameRetentionTail? = try XCTUnwrap(heldScope.admitSurface(bytes: 1))
+        XCTAssertNotNil(heldTail)
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.routing.scope.executor")
+        let vtQueue = DispatchQueue(label: "org.vplayer.tests.routing.scope.vt")
+        let ffQueue = DispatchQueue(label: "org.vplayer.tests.routing.scope.ff")
+        let vtAPI = FakeVideoToolboxAPI()
+        let captured = CapturedReceiver()
+        let ffHandle = FakeFFmpegVideoDecoderHandle()
+        let frames = FrameRecorder()
+        let events = DetailedFFmpegEventRecorder()
+        let relay = RoutingVideoDecoderChildRelay()
+        let vt = VideoToolboxDecoder(
+            executor: executor,
+            eventSink: { relay.receive($0, from: .videoToolbox) },
+            api: vtAPI,
+            maximumInFlightDecodeCount: 8,
+            inFlightWaitInterval: 0.25,
+            tuning: .default,
+            submissionQueue: vtQueue,
+            surfaceAdmission: provider
+        )
+        let ff = FFmpegVideoDecoder(
+            executor: executor,
+            eventSink: { relay.receive($0, from: .ffmpeg) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: ffHandle),
+            submissionQueue: ffQueue,
+            surfaceAdmission: provider
+        )
+        let routing = RoutingVideoDecoder(videoToolbox: vt, ffmpeg: ff, eventSink: {
+            frames.record($0)
+            events.record($0)
+        })
+        relay.install(routing)
+
+        let vtToken = VideoDecoderTransitionToken()
+        routing.transition(.configure(token: vtToken, format: try makeFormat(fieldCount: 1), generation: generation))
+        vtQueue.sync {}; drain(executor)
+        try routing.decode(makeAccessUnit(id: 701), flags: [])
+        vtQueue.sync {}
+        let oldCallbackReturned = expectation(description: "old VT scope cancelled by routing invalidate")
+        vtAPI.deliver(index: 0, output: VTDecodeOutput(
+            status: noErr, infoFlags: [], imageBuffer: try VideoTestFactories.pixelBuffer(
+                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            ), presentationTimeStamp: .zero, duration: CMTime(value: 1, timescale: 25)
+        ), on: vtQueue)
+        XCTAssertTrue(eventually { provider.waitingScopeCount == 1 },
+                      "切路前旧 VT callback 必须已在实际 scope admission 等待")
+
+        let ffToken = VideoDecoderTransitionToken()
+        routing.transition(.configure(token: ffToken, format: try makeFormat(fieldCount: 2), generation: generation))
+        vtQueue.async { oldCallbackReturned.fulfill() }
+        wait(for: [oldCallbackReturned], timeout: 2)
+        vtQueue.sync {}; ffQueue.sync {}; drain(executor)
+        XCTAssertNil(frames.wait(timeout: 0.05), "old route frame must not revive after invalidate")
+
+        heldTail = nil
+        try routing.decode(makeAccessUnit(id: 702), flags: [])
+        ffQueue.sync {}
+        deliverTestFrame(token: try XCTUnwrap(ffHandle.tokens.last), to: captured.receiver,
+                         isInterlaced: false, topFieldFirst: false)
+        XCTAssertEqual(try XCTUnwrap(frames.wait(timeout: 2)).accessUnitID, 702)
+
+        let ffHeldScope = provider.makeSurfaceSessionScope()
+        var ffHeldTail: DecodedVideoFrameRetentionTail? = try XCTUnwrap(ffHeldScope.admitSurface(bytes: 1))
+        XCTAssertNotNil(ffHeldTail)
+        try routing.decode(makeAccessUnit(id: 703), flags: [])
+        ffQueue.sync {}
+        let ffCallbackQueue = DispatchQueue(label: "org.vplayer.tests.routing.scope.ff.callback")
+        deliverTestFrame(token: try XCTUnwrap(ffHandle.tokens.last), to: { frame in
+            ffCallbackQueue.async { captured.receiver?(frame) }
+        }, isInterlaced: false, topFieldFirst: false)
+        XCTAssertTrue(eventually { provider.waitingScopeCount == 1 },
+                      "FFmpeg callback 必须先在当前 route scope admission 等待")
+        let invalidateToken = VideoDecoderTransitionToken()
+        routing.transition(.invalidate(token: invalidateToken))
+        let ffCallbackReturned = expectation(description: "blocked FFmpeg callback cancelled by invalidate")
+        ffCallbackQueue.async { ffCallbackReturned.fulfill() }
+        wait(for: [ffCallbackReturned], timeout: 2)
+        ffQueue.sync {}; drain(executor)
+        XCTAssertNil(frames.wait(timeout: 0.05), "已取消 FFmpeg scope 的旧 frame 不得发布")
+        XCTAssertFalse(events.events.contains { event in
+            if case .fatalFailure = event { return true }
+            return false
+        }, "VT 与 FFmpeg 的实际取消 callback 都只能取消，不能伪报 fatal")
+        ffHeldTail = nil
+    }
+
     func testRoutingChildRelayActivatesSelectedRouteWithoutManualReceive() throws {
         let childRelay = RoutingVideoDecoderChildRelay()
         let videoToolbox = FakeVideoDecoder()
@@ -1566,6 +1898,38 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         ])
     }
 
+    func testRoutingInitialRouteKeepsKnownInterlacedHLSOffVideoToolboxFromFirstFrame()
+        throws {
+        let childRelay = RoutingVideoDecoderChildRelay()
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            initialRoute: .ffmpeg,
+            eventSink: { _ in }
+        )
+        childRelay.install(decoder)
+        ffmpeg.setTransitionEventSink(automaticallyCompletes: false) {
+            childRelay.receive($0, from: .ffmpeg)
+        }
+
+        let token = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: token,
+            // 容器 format 尚未携带 FieldCount 时，HLS probe 的既有结论仍须生效。
+            format: try makeFormat(fieldCount: nil),
+            generation: generation
+        ))
+        XCTAssertTrue(videoToolbox.snapshot().isEmpty)
+        XCTAssertEqual(ffmpeg.snapshot(), [.transitionConfigure(token, generation)])
+
+        ffmpeg.completeTransition(token: token, outcome: .completed)
+        try decoder.decode(makeAccessUnit(id: 31), flags: [])
+        XCTAssertEqual(ffmpeg.decodedAccessUnitIDs(generation: generation), [31])
+        XCTAssertTrue(videoToolbox.decodedAccessUnitIDs(generation: generation).isEmpty)
+    }
+
     func testRoutingRouteRemainsInactiveUntilMatchingChildTransitionCompletes() throws {
         let videoToolbox = FakeVideoDecoder()
         let ffmpeg = FakeVideoDecoder()
@@ -1596,6 +1960,94 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         XCTAssertNoThrow(try decoder.decode(makeAccessUnit(id: 30), flags: []))
         XCTAssertEqual(events.events, [
             .transition(token: token, outcome: .completed),
+        ])
+    }
+
+    func testRoutingNaturalDrainCompletionFromSupersededSessionCannotConfirmReplacement() throws {
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { events.record($0) }
+        )
+        let firstToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: firstToken,
+            format: try makeFormat(fieldCount: 1),
+            generation: generation
+        ))
+        decoder.receive(
+            .transitionCompleted(token: firstToken, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        let drainToken = VideoDecoderTransitionToken()
+        decoder.transition(.drain(token: drainToken))
+
+        let replacementToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: replacementToken,
+            format: try makeFormat(fieldCount: 1),
+            generation: generation
+        ))
+        decoder.receive(
+            .transitionCompleted(token: replacementToken, outcome: .completed),
+            from: .videoToolbox
+        )
+        decoder.receive(
+            .transitionCompleted(token: drainToken, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        XCTAssertEqual(events.events, [
+            .transition(token: firstToken, outcome: .completed),
+            .transition(token: replacementToken, outcome: .completed),
+        ])
+        XCTAssertNoThrow(try decoder.decode(makeAccessUnit(id: 91), flags: []))
+    }
+
+    func testRoutingRejectsSecondNaturalDrainWhileFirstStillOwnsTheRoute() throws {
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { events.record($0) }
+        )
+        let configurationToken = VideoDecoderTransitionToken()
+        decoder.transition(.configure(
+            token: configurationToken,
+            format: try makeFormat(fieldCount: 1),
+            generation: generation
+        ))
+        decoder.receive(
+            .transitionCompleted(token: configurationToken, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        let firstDrainToken = VideoDecoderTransitionToken()
+        let secondDrainToken = VideoDecoderTransitionToken()
+        decoder.transition(.drain(token: firstDrainToken))
+        decoder.transition(.drain(token: secondDrainToken))
+        decoder.receive(
+            .transitionCompleted(token: firstDrainToken, outcome: .completed),
+            from: .videoToolbox
+        )
+
+        XCTAssertEqual(videoToolbox.snapshot().filter {
+            if case .transitionDrain = $0 { return true }
+            return false
+        }.count, 1)
+        XCTAssertEqual(events.events, [
+            .transition(token: configurationToken, outcome: .completed),
+            .transition(
+                token: secondDrainToken,
+                outcome: .failed(.malfunction(kVTInvalidSessionErr))
+            ),
+            .transition(token: firstDrainToken, outcome: .completed),
         ])
     }
 
@@ -2134,6 +2586,15 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         wait(for: [completed], timeout: 2)
     }
 
+    private func eventually(timeout: TimeInterval = 2, _ condition: @escaping () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        return condition()
+    }
+
     private func configure(
         _ decoder: FFmpegVideoDecoder,
         format: CMVideoFormatDescription,
@@ -2213,6 +2674,7 @@ private enum DetailedFFmpegDecoderEvent: Sendable, Equatable {
     )
     case frame(accessUnitID: UInt64, identity: VideoDecoderEventIdentity)
     case submissionFailure(VideoDecoderFailure, identity: VideoDecoderEventIdentity)
+    case fatalFailure(VideoDecoderFailure, identity: VideoDecoderEventIdentity)
     case completed(
         accessUnitID: UInt64,
         identity: VideoDecoderEventIdentity,
@@ -2233,13 +2695,15 @@ private final class DetailedFFmpegEventRecorder: @unchecked Sendable {
             recorded = .frame(accessUnitID: frame.accessUnitID, identity: identity)
         case let .submissionFailure(_, failure, identity):
             recorded = .submissionFailure(failure, identity: identity)
+        case let .fatalFailure(failure, identity):
+            recorded = .fatalFailure(failure, identity: identity)
         case let .submissionCompleted(accessUnitID, identity, disposition):
             recorded = .completed(
                 accessUnitID: accessUnitID,
                 identity: identity,
                 disposition: disposition
             )
-        case .recoverableFailure, .fatalFailure:
+        case .recoverableFailure:
             recorded = nil
         }
         guard let recorded else { return }

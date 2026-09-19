@@ -25,6 +25,7 @@
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/mem.h>
 #include <libavutil/time.h>
 #pragma clang diagnostic pop
@@ -34,6 +35,7 @@
 #define VPFF_MAX_PACKET_BYTES ((size_t)64 * 1024 * 1024)
 #define VPFF_MAX_CODED_SIDE_DATA_ENTRIES 64
 #define VPFF_MAX_CODED_SIDE_DATA_BYTES ((size_t)1 * 1024 * 1024)
+#define VPFF_MAX_LANGUAGE_BYTES ((size_t)1024)
 #define VPFF_MAX_CHANNELS 64
 #define VPFF_PROTOCOL_WHITELIST "http,https,tcp,tls,crypto,data"
 #define VPFF_BOOTSTRAP_MAX_PACKETS 64
@@ -41,12 +43,16 @@
 
 typedef struct {
     VPFFTrack value;
+    VPFFTrackExtrasV1 extras;
     uint8_t *extradata;
+    uint8_t *language;
 } VPFFOwnedTrack;
 
 typedef struct {
     uint8_t has_program_id;
     int32_t selected_program_id;
+    uint8_t has_audio_primary_evidence;
+    VPFFAudioPrimaryEvidenceV1 audio_primary_evidence;
     VPFFOwnedTrack video;
     VPFFOwnedTrack audio;
 } VPFFOwnedTrackSet;
@@ -89,6 +95,8 @@ typedef struct {
 typedef struct {
     bool has_program_id;
     int32_t program_id;
+    uint8_t has_audio_primary_evidence;
+    VPFFAudioPrimaryEvidenceV1 audio_primary_evidence;
     int video_stream_index;
     int audio_stream_index;
 } VPFFSelection;
@@ -145,6 +153,7 @@ struct VPDemuxer {
     char *url;
     int64_t timeout_us;
     VPFFDemuxCallback callback;
+    VPFFDemuxCallbackV2 callback_v2;
     void *context;
     atomic_bool cancelled;
     atomic_bool run_claimed;
@@ -467,6 +476,18 @@ static void vpff_clear_deadline(VPDemuxer *demuxer) {
     atomic_store_explicit(&demuxer->deadline_us, 0, memory_order_release);
 }
 
+static void vpff_emit_event(
+    VPDemuxer *demuxer,
+    const VPFFDemuxEvent *event,
+    const VPFFDemuxEventExtras *extras
+) {
+    if (demuxer->callback_v2 != NULL) {
+        demuxer->callback_v2(demuxer->context, event, extras);
+    } else {
+        demuxer->callback(demuxer->context, event);
+    }
+}
+
 static void vpff_emit_terminal(
     VPDemuxer *demuxer,
     VPFFDemuxEventKind kind,
@@ -479,7 +500,7 @@ static void vpff_emit_terminal(
     event.error_kind = error_kind;
     event.error_stage = error_stage;
     event.ffmpeg_error = (int32_t)error_code;
-    demuxer->callback(demuxer->context, &event);
+    vpff_emit_event(demuxer, &event, NULL);
 }
 
 static void vpff_emit_tracks(
@@ -495,7 +516,29 @@ static void vpff_emit_tracks(
     event.selected_program_id = tracks->selected_program_id;
     event.video = tracks->video.value;
     event.audio = tracks->audio.value;
-    demuxer->callback(demuxer->context, &event);
+
+    VPFFDemuxEventExtrasV2 extras = {0};
+    extras.header.version = tracks->has_audio_primary_evidence ? 2 : VPFF_DEMUX_EVENT_EXTRAS_VERSION_1;
+    extras.header.size = tracks->has_audio_primary_evidence
+        ? (uint32_t)sizeof(VPFFDemuxEventExtrasV2)
+        : (uint32_t)sizeof(VPFFDemuxEventExtrasV1);
+    if (event.video.present) {
+        extras.header.video_track_offset = (uint32_t)offsetof(
+            VPFFDemuxEventExtrasV1,
+            video
+        );
+        extras.video = tracks->video.extras;
+    }
+    if (event.audio.present) {
+        extras.header.audio_track_offset = (uint32_t)offsetof(
+            VPFFDemuxEventExtrasV1,
+            audio
+        );
+        extras.audio = tracks->audio.extras;
+    }
+    extras.has_audio_primary_evidence = tracks->has_audio_primary_evidence;
+    extras.audio_primary_evidence = tracks->audio_primary_evidence;
+    vpff_emit_event(demuxer, &event, &extras.header);
 }
 
 static VPFFCodec vpff_codec(enum AVCodecID codec_id) {
@@ -827,6 +870,123 @@ static VPFFProgramScore vpff_score_program(
     return score;
 }
 
+static const AVDictionaryEntry *vpff_stream_metadata(const AVStream *stream, const char *key);
+static bool vpff_map_role_metadata(const AVStream *stream, VPFFTrackRole *role);
+
+static int vpff_build_audio_primary_evidence(
+    AVFormatContext *format,
+    const VPFFProgramScore *best,
+    VPFFSelection *selection
+) {
+    if (format == NULL || best == NULL || selection == NULL ||
+        selection->audio_stream_index < 0) {
+        return AVERROR_INVALIDDATA;
+    }
+    VPFFAudioPrimaryEvidenceV1 evidence = {
+        .version = 1,
+        .scope = format->nb_programs > 0
+            ? VPFF_AUDIO_PRIMARY_SCOPE_PROGRAM
+            : VPFF_AUDIO_PRIMARY_SCOPE_FORMAT_STREAM_TABLE,
+        .program_index = format->nb_programs > 0 ? (int32_t)best->program_index : -1,
+        .program_id = format->nb_programs > 0 ? (int32_t)best->program_id : 0,
+        .selected_stream_index = selection->audio_stream_index,
+    };
+    for (unsigned int table_index = 0; table_index < format->nb_streams; table_index += 1) {
+        bool in_scope = format->nb_programs == 0;
+        if (!in_scope) {
+            AVProgram *program = format->programs[best->program_index];
+            if (program == NULL || program->stream_index == NULL) return AVERROR_INVALIDDATA;
+            for (unsigned int member = 0; member < program->nb_stream_indexes; member += 1) {
+                if (program->stream_index[member] == table_index) { in_scope = true; break; }
+            }
+        }
+        AVStream *stream = format->streams[table_index];
+        if (!in_scope || stream == NULL || stream->codecpar == NULL ||
+            stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+        if (evidence.audio_stream_count == UINT32_MAX) return AVERROR_INVALIDDATA;
+        evidence.audio_stream_count += 1;
+        if ((stream->disposition & AV_DISPOSITION_DEFAULT) != 0) {
+            if (evidence.default_audio_stream_count == UINT32_MAX) return AVERROR_INVALIDDATA;
+            evidence.default_audio_stream_count += 1;
+        }
+        VPFFTrackRole role = VPFF_TRACK_ROLE_UNKNOWN;
+        if (vpff_map_role_metadata(stream, &role)) {
+            if (role == VPFF_TRACK_ROLE_MAIN) {
+                if (evidence.explicit_main_stream_count == UINT32_MAX) return AVERROR_INVALIDDATA;
+                evidence.explicit_main_stream_count += 1;
+            }
+        } else if (vpff_stream_metadata(stream, "role") != NULL) {
+            if (evidence.unclassifiable_role_stream_count == UINT32_MAX) return AVERROR_INVALIDDATA;
+            evidence.unclassifiable_role_stream_count += 1;
+        }
+    }
+    if (evidence.audio_stream_count == 0) return AVERROR_INVALIDDATA;
+    AVStream *selected = format->streams[selection->audio_stream_index];
+    if (selected == NULL || selected->codecpar == NULL ||
+        selected->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) return AVERROR_INVALIDDATA;
+    if (format->nb_programs > 0) {
+        AVProgram *program = format->programs[best->program_index];
+        bool selected_is_member = false;
+        if (program == NULL || program->stream_index == NULL) return AVERROR_INVALIDDATA;
+        for (unsigned int member = 0; member < program->nb_stream_indexes; member += 1) {
+            if (program->stream_index[member] == (unsigned int)selection->audio_stream_index) {
+                selected_is_member = true;
+                break;
+            }
+        }
+        if (!selected_is_member) return AVERROR_INVALIDDATA;
+    }
+    VPFFTrackRole selected_role = VPFF_TRACK_ROLE_UNKNOWN;
+    bool selected_main = vpff_map_role_metadata(selected, &selected_role) &&
+        selected_role == VPFF_TRACK_ROLE_MAIN;
+    bool selected_default = (selected->disposition & AV_DISPOSITION_DEFAULT) != 0;
+    if (evidence.unclassifiable_role_stream_count == 0 && selected_main &&
+        evidence.explicit_main_stream_count == 1 &&
+        (evidence.default_audio_stream_count == 0 ||
+         (selected_default && evidence.default_audio_stream_count == 1))) {
+        evidence.primary_basis = VPFF_AUDIO_PRIMARY_EXPLICIT_MAIN;
+    } else if (evidence.unclassifiable_role_stream_count == 0 && !selected_main &&
+               evidence.audio_stream_count == 1) {
+        evidence.primary_basis = VPFF_AUDIO_PRIMARY_SOLE_AUDIO;
+    } else if (evidence.unclassifiable_role_stream_count == 0 && !selected_main &&
+               selected_default && evidence.default_audio_stream_count == 1 &&
+               evidence.explicit_main_stream_count == 0) {
+        evidence.primary_basis = VPFF_AUDIO_PRIMARY_UNIQUE_DEFAULT;
+    }
+    selection->has_audio_primary_evidence = 1;
+    selection->audio_primary_evidence = evidence;
+    return 0;
+}
+
+/* 刷新不重新选轨；只用原始 program/stream 身份在当前容器表复验 receipt。 */
+static int vpff_refresh_audio_primary_evidence(
+    AVFormatContext *format, const VPFFSelection *selection, VPFFSelection *refreshed
+) {
+    if (format == NULL || selection == NULL || refreshed == NULL) return AVERROR_INVALIDDATA;
+    *refreshed = *selection;
+    if (!selection->has_audio_primary_evidence) return 0;
+    if (selection->audio_stream_index < 0 ||
+        (unsigned int)selection->audio_stream_index >= format->nb_streams) return AVERROR_INVALIDDATA;
+    VPFFProgramScore scope = {0};
+    if (selection->has_program_id) {
+        if (format->nb_programs == 0) return AVERROR_INVALIDDATA;
+        bool found = false;
+        for (unsigned int index = 0; index < format->nb_programs; index += 1) {
+            AVProgram *program = format->programs[index];
+            if (program != NULL && program->id == selection->program_id) {
+                if (found) return AVERROR_INVALIDDATA;
+                found = true;
+                scope.program_index = index;
+                scope.program_id = program->id;
+            }
+        }
+        if (!found) return AVERROR_INVALIDDATA;
+    } else if (format->nb_programs != 0) {
+        return AVERROR_INVALIDDATA;
+    }
+    return vpff_build_audio_primary_evidence(format, &scope, refreshed);
+}
+
 static int vpff_select_streams(
     AVFormatContext *format,
     VPFFSelection *selection,
@@ -875,6 +1035,15 @@ static int vpff_select_streams(
     selection->program_id = (int32_t)best.program_id;
     selection->video_stream_index = best.video.valid ? best.video.stream_index : -1;
     selection->audio_stream_index = best.audio.valid ? best.audio.stream_index : -1;
+    if (selection->audio_stream_index >= 0) {
+        result = vpff_build_audio_primary_evidence(format, &best, selection);
+        if (result < 0) {
+            failure->kind = VPFF_DEMUX_ERROR_READ;
+            failure->stage = VPFF_DEMUX_STAGE_SELECTION;
+            failure->code = result;
+            return result;
+        }
+    }
 
     for (unsigned int index = 0; index < format->nb_programs; index += 1) {
         format->programs[index]->discard = index == best.program_index
@@ -1798,100 +1967,644 @@ static int vpff_video_filter_build(
     return 0;
 }
 
+static bool vpff_metadata_token_equal(const char *value, const char *expected) {
+    if (value == NULL || expected == NULL) {
+        return false;
+    }
+    size_t value_size = 0;
+    size_t expected_size = strlen(expected);
+    if (!vpff_bounded_c_string_size(value, 64, &value_size) ||
+        value_size != expected_size) {
+        return false;
+    }
+    for (size_t index = 0; index < value_size; index += 1) {
+        unsigned char actual = (unsigned char)value[index];
+        unsigned char wanted = (unsigned char)expected[index];
+        if (actual >= 'A' && actual <= 'Z') {
+            actual = (unsigned char)(actual + ('a' - 'A'));
+        }
+        if (actual == '-' || actual == ' ') {
+            actual = '_';
+        }
+        if (actual != wanted) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const AVDictionaryEntry *vpff_stream_metadata(
+    const AVStream *stream,
+    const char *key
+) {
+    return stream == NULL ? NULL : av_dict_get(stream->metadata, key, NULL, 0);
+}
+
+static bool vpff_map_role_metadata(const AVStream *stream, VPFFTrackRole *role) {
+    const AVDictionaryEntry *entry = vpff_stream_metadata(stream, "role");
+    if (entry == NULL) {
+        return false;
+    }
+    if (vpff_metadata_token_equal(entry->value, "main")) {
+        *role = VPFF_TRACK_ROLE_MAIN;
+        return true;
+    }
+    if (vpff_metadata_token_equal(entry->value, "alternate")) {
+        *role = VPFF_TRACK_ROLE_ALTERNATE;
+        return true;
+    }
+    if (vpff_metadata_token_equal(entry->value, "commentary")) {
+        *role = VPFF_TRACK_ROLE_COMMENTARY;
+        return true;
+    }
+    return false;
+}
+
+static bool vpff_map_service_metadata(
+    const AVStream *stream,
+    const char *key,
+    VPFFTrackService *service
+) {
+    const AVDictionaryEntry *entry = vpff_stream_metadata(stream, key);
+    if (entry == NULL) {
+        return false;
+    }
+    if (vpff_metadata_token_equal(entry->value, "independent_main")) {
+        *service = VPFF_TRACK_SERVICE_INDEPENDENT_MAIN;
+        return true;
+    }
+    if (vpff_metadata_token_equal(entry->value, "associated")) {
+        *service = VPFF_TRACK_SERVICE_ASSOCIATED;
+        return true;
+    }
+    if (vpff_metadata_token_equal(entry->value, "dvs")) {
+        *service = VPFF_TRACK_SERVICE_DVS;
+        return true;
+    }
+    if (vpff_metadata_token_equal(entry->value, "dependent")) {
+        *service = VPFF_TRACK_SERVICE_DEPENDENT;
+        return true;
+    }
+    if (vpff_metadata_token_equal(entry->value, "joc")) {
+        *service = VPFF_TRACK_SERVICE_JOC;
+        return true;
+    }
+    return false;
+}
+
+typedef struct {
+    bool has_value;
+    bool conflicts;
+    VPFFTrackService value;
+} VPFFServiceEvidence;
+
+static void vpff_add_service_evidence(
+    VPFFServiceEvidence *evidence,
+    VPFFTrackService value
+) {
+    if (!evidence->has_value) {
+        evidence->has_value = true;
+        evidence->value = value;
+    } else if (evidence->value != value) {
+        evidence->conflicts = true;
+    }
+}
+
+static bool vpff_map_audio_service(
+    enum AVAudioServiceType source,
+    VPFFTrackService *service
+) {
+    switch (source) {
+    case AV_AUDIO_SERVICE_TYPE_MAIN:
+        *service = VPFF_TRACK_SERVICE_INDEPENDENT_MAIN;
+        return true;
+    case AV_AUDIO_SERVICE_TYPE_VISUALLY_IMPAIRED:
+        *service = VPFF_TRACK_SERVICE_DVS;
+        return true;
+    case AV_AUDIO_SERVICE_TYPE_EFFECTS:
+    case AV_AUDIO_SERVICE_TYPE_HEARING_IMPAIRED:
+    case AV_AUDIO_SERVICE_TYPE_DIALOGUE:
+    case AV_AUDIO_SERVICE_TYPE_COMMENTARY:
+    case AV_AUDIO_SERVICE_TYPE_EMERGENCY:
+    case AV_AUDIO_SERVICE_TYPE_VOICE_OVER:
+        *service = VPFF_TRACK_SERVICE_ASSOCIATED;
+        return true;
+    case AV_AUDIO_SERVICE_TYPE_KARAOKE:
+    case AV_AUDIO_SERVICE_TYPE_NB:
+        return false;
+    }
+    return false;
+}
+
+static int vpff_read_audio_service_type(
+    const AVCodecParameters *parameters,
+    enum AVAudioServiceType *service_type,
+    bool *present
+) {
+    if (parameters == NULL || service_type == NULL || present == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    *present = false;
+    const AVPacketSideData *side_data = av_packet_side_data_get(
+        parameters->coded_side_data,
+        parameters->nb_coded_side_data,
+        AV_PKT_DATA_AUDIO_SERVICE_TYPE
+    );
+    if (side_data == NULL) {
+        return 0;
+    }
+    if (side_data->data == NULL || side_data->size < sizeof(*service_type)) {
+        return AVERROR_INVALIDDATA;
+    }
+    memcpy(service_type, side_data->data, sizeof(*service_type));
+    if (*service_type < AV_AUDIO_SERVICE_TYPE_MAIN ||
+        *service_type >= AV_AUDIO_SERVICE_TYPE_NB) {
+        return AVERROR_INVALIDDATA;
+    }
+    *present = true;
+    return 0;
+}
+
+static VPFFTrackDispositionFlags vpff_map_dispositions(int dispositions) {
+    VPFFTrackDispositionFlags mapped = 0;
+    if ((dispositions & AV_DISPOSITION_DEFAULT) != 0) {
+        mapped |= VPFF_TRACK_DISPOSITION_DEFAULT;
+    }
+    if ((dispositions & AV_DISPOSITION_FORCED) != 0) {
+        mapped |= VPFF_TRACK_DISPOSITION_FORCED;
+    }
+    if ((dispositions & AV_DISPOSITION_HEARING_IMPAIRED) != 0) {
+        mapped |= VPFF_TRACK_DISPOSITION_HEARING_IMPAIRED;
+    }
+    if ((dispositions & AV_DISPOSITION_VISUAL_IMPAIRED) != 0) {
+        mapped |= VPFF_TRACK_DISPOSITION_VISUAL_IMPAIRED;
+    }
+    if ((dispositions & AV_DISPOSITION_COMMENT) != 0) {
+        mapped |= VPFF_TRACK_DISPOSITION_COMMENTARY;
+    }
+    if ((dispositions & AV_DISPOSITION_DEPENDENT) != 0) {
+        mapped |= VPFF_TRACK_DISPOSITION_DEPENDENT;
+    }
+    return mapped;
+}
+
+static void vpff_map_color_range(
+    enum AVColorRange value,
+    VPFFTrackExtrasV1 *extras
+) {
+    if (value == AVCOL_RANGE_MPEG) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_RANGE;
+        extras->color_range = VPFF_COLOR_RANGE_LIMITED;
+    } else if (value == AVCOL_RANGE_JPEG) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_RANGE;
+        extras->color_range = VPFF_COLOR_RANGE_FULL;
+    }
+}
+
+static void vpff_map_color_primaries(
+    enum AVColorPrimaries value,
+    VPFFTrackExtrasV1 *extras
+) {
+    if (value == AVCOL_PRI_BT709) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_PRIMARIES;
+        extras->color_primaries = VPFF_COLOR_PRIMARIES_BT709;
+    } else if (value == AVCOL_PRI_BT2020) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_PRIMARIES;
+        extras->color_primaries = VPFF_COLOR_PRIMARIES_BT2020;
+    }
+}
+
+static void vpff_map_color_transfer(
+    enum AVColorTransferCharacteristic value,
+    VPFFTrackExtrasV1 *extras
+) {
+    if (value == AVCOL_TRC_BT709) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_TRANSFER;
+        extras->color_transfer = VPFF_COLOR_TRANSFER_BT709;
+    } else if (value == AVCOL_TRC_BT2020_10) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_TRANSFER;
+        extras->color_transfer = VPFF_COLOR_TRANSFER_BT2020;
+    } else if (value == AVCOL_TRC_BT2020_12) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_TRANSFER;
+        extras->color_transfer = VPFF_COLOR_TRANSFER_BT2020_12;
+    } else if (value == AVCOL_TRC_SMPTE2084) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_TRANSFER;
+        extras->color_transfer = VPFF_COLOR_TRANSFER_PQ;
+    } else if (value == AVCOL_TRC_ARIB_STD_B67) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_TRANSFER;
+        extras->color_transfer = VPFF_COLOR_TRANSFER_HLG;
+    }
+}
+
+static void vpff_map_color_matrix(
+    enum AVColorSpace value,
+    VPFFTrackExtrasV1 *extras
+) {
+    if (value == AVCOL_SPC_BT709) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_MATRIX;
+        extras->color_matrix = VPFF_COLOR_MATRIX_BT709;
+    } else if (value == AVCOL_SPC_BT2020_NCL) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_COLOR_MATRIX;
+        extras->color_matrix = VPFF_COLOR_MATRIX_BT2020_NONCONSTANT;
+    }
+}
+
+static void vpff_map_chroma_location(
+    enum AVChromaLocation value,
+    VPFFTrackExtrasV1 *extras
+) {
+    if (value == AVCHROMA_LOC_LEFT) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_CHROMA_LOCATION;
+        extras->chroma_location = VPFF_CHROMA_LOCATION_LEFT;
+    } else if (value == AVCHROMA_LOC_CENTER) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_CHROMA_LOCATION;
+        extras->chroma_location = VPFF_CHROMA_LOCATION_CENTER;
+    } else if (value == AVCHROMA_LOC_TOPLEFT) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_CHROMA_LOCATION;
+        extras->chroma_location = VPFF_CHROMA_LOCATION_TOP_LEFT;
+    }
+}
+
+static bool vpff_rational_is_nonnegative(AVRational value) {
+    return value.num >= 0 && value.den > 0;
+}
+
+static bool vpff_chromaticity_pair_is_valid(AVRational x, AVRational y) {
+    if (!vpff_rational_is_nonnegative(x) ||
+        !vpff_rational_is_nonnegative(y) ||
+        x.num > x.den || y.num > y.den) {
+        return false;
+    }
+    int64_t scaled_x;
+    int64_t scaled_y;
+    int64_t scaled_unit;
+    int64_t sum;
+    return !__builtin_mul_overflow((int64_t)x.num, (int64_t)y.den, &scaled_x) &&
+           !__builtin_mul_overflow((int64_t)y.num, (int64_t)x.den, &scaled_y) &&
+           !__builtin_mul_overflow((int64_t)x.den, (int64_t)y.den, &scaled_unit) &&
+           !__builtin_add_overflow(scaled_x, scaled_y, &sum) &&
+           sum <= scaled_unit;
+}
+
+static VPFFRational vpff_public_rational(AVRational value) {
+    return (VPFFRational){.num = value.num, .den = value.den};
+}
+
+static int vpff_map_mastering_display(
+    const AVCodecParameters *parameters,
+    VPFFTrackExtrasV1 *extras
+) {
+    const AVPacketSideData *side_data = av_packet_side_data_get(
+        parameters->coded_side_data,
+        parameters->nb_coded_side_data,
+        AV_PKT_DATA_MASTERING_DISPLAY_METADATA
+    );
+    if (side_data == NULL) {
+        return 0;
+    }
+    if (side_data->data == NULL ||
+        side_data->size < sizeof(AVMasteringDisplayMetadata)) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    AVMasteringDisplayMetadata metadata;
+    memcpy(&metadata, side_data->data, sizeof(metadata));
+    if ((metadata.has_primaries != 0 && metadata.has_primaries != 1) ||
+        (metadata.has_luminance != 0 && metadata.has_luminance != 1)) {
+        return AVERROR_INVALIDDATA;
+    }
+    if (!metadata.has_primaries || !metadata.has_luminance) {
+        return 0;
+    }
+    const AVRational chromaticities[] = {
+        metadata.display_primaries[0][0], metadata.display_primaries[0][1],
+        metadata.display_primaries[1][0], metadata.display_primaries[1][1],
+        metadata.display_primaries[2][0], metadata.display_primaries[2][1],
+        metadata.white_point[0], metadata.white_point[1],
+    };
+    for (size_t index = 0;
+         index < sizeof(chromaticities) / sizeof(chromaticities[0]);
+         index += 2) {
+        if (!vpff_chromaticity_pair_is_valid(
+                chromaticities[index],
+                chromaticities[index + 1]
+            )) {
+            return AVERROR_INVALIDDATA;
+        }
+    }
+    if (!vpff_rational_is_nonnegative(metadata.min_luminance) ||
+        !vpff_rational_is_nonnegative(metadata.max_luminance) ||
+        metadata.max_luminance.num <= 0 ||
+        av_cmp_q(metadata.min_luminance, metadata.max_luminance) > 0) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    extras->presence |= VPFF_TRACK_EXTRAS_HAS_MASTERING_DISPLAY;
+    extras->mastering_display_red_x = vpff_public_rational(chromaticities[0]);
+    extras->mastering_display_red_y = vpff_public_rational(chromaticities[1]);
+    extras->mastering_display_green_x = vpff_public_rational(chromaticities[2]);
+    extras->mastering_display_green_y = vpff_public_rational(chromaticities[3]);
+    extras->mastering_display_blue_x = vpff_public_rational(chromaticities[4]);
+    extras->mastering_display_blue_y = vpff_public_rational(chromaticities[5]);
+    extras->mastering_display_white_point_x = vpff_public_rational(chromaticities[6]);
+    extras->mastering_display_white_point_y = vpff_public_rational(chromaticities[7]);
+    extras->mastering_display_minimum_luminance = vpff_public_rational(
+        metadata.min_luminance
+    );
+    extras->mastering_display_maximum_luminance = vpff_public_rational(
+        metadata.max_luminance
+    );
+    return 0;
+}
+
+static int vpff_map_content_light_level(
+    const AVCodecParameters *parameters,
+    VPFFTrackExtrasV1 *extras
+) {
+    const AVPacketSideData *side_data = av_packet_side_data_get(
+        parameters->coded_side_data,
+        parameters->nb_coded_side_data,
+        AV_PKT_DATA_CONTENT_LIGHT_LEVEL
+    );
+    if (side_data == NULL) {
+        return 0;
+    }
+    if (side_data->data == NULL || side_data->size < sizeof(AVContentLightMetadata)) {
+        return AVERROR_INVALIDDATA;
+    }
+    AVContentLightMetadata metadata;
+    memcpy(&metadata, side_data->data, sizeof(metadata));
+    if (metadata.MaxCLL > UINT16_MAX || metadata.MaxFALL > UINT16_MAX ||
+        metadata.MaxFALL > metadata.MaxCLL) {
+        return AVERROR_INVALIDDATA;
+    }
+    extras->presence |= VPFF_TRACK_EXTRAS_HAS_CONTENT_LIGHT_LEVEL;
+    extras->maximum_content_light_level = (uint16_t)metadata.MaxCLL;
+    extras->maximum_frame_average_light_level = (uint16_t)metadata.MaxFALL;
+    return 0;
+}
+
+static int vpff_map_track_extras(
+    VPFFTrackExtrasV1 *extras,
+    const AVStream *stream,
+    const AVCodecParameters *parameters
+) {
+    if (extras == NULL || stream == NULL || parameters == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    memset(extras, 0, sizeof(*extras));
+    extras->presence = VPFF_TRACK_EXTRAS_HAS_DISPOSITIONS;
+    extras->dispositions = vpff_map_dispositions(stream->disposition);
+
+    const AVDictionaryEntry *language = vpff_stream_metadata(stream, "language");
+    if (language != NULL && language->value != NULL && language->value[0] != '\0') {
+        size_t language_size = 0;
+        if (!vpff_bounded_c_string_size(
+                language->value,
+                VPFF_MAX_LANGUAGE_BYTES,
+                &language_size
+            ) ||
+            !vpff_utf8_is_valid((const uint8_t *)language->value, language_size)) {
+            return AVERROR_INVALIDDATA;
+        }
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_LANGUAGE;
+        extras->language = (const uint8_t *)language->value;
+        extras->language_size = language_size;
+    }
+
+    bool has_role = vpff_map_role_metadata(stream, &extras->role);
+    if (!has_role && vpff_stream_metadata(stream, "role") != NULL) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_ROLE_CONFLICT;
+    }
+    VPFFServiceEvidence service_evidence = {0};
+    VPFFTrackService metadata_service = VPFF_TRACK_SERVICE_UNKNOWN;
+    bool has_service_metadata = vpff_stream_metadata(stream, "service") != NULL;
+    if (vpff_map_service_metadata(stream, "service", &metadata_service)) {
+        vpff_add_service_evidence(&service_evidence, metadata_service);
+    } else if (has_service_metadata) {
+        // 元数据明确存在但token未知，必须保留为不可分类，不能折叠成absent。
+        service_evidence.conflicts = true;
+    }
+    bool has_service_type_metadata =
+        vpff_stream_metadata(stream, "service_type") != NULL;
+    if (vpff_map_service_metadata(stream, "service_type", &metadata_service)) {
+        vpff_add_service_evidence(&service_evidence, metadata_service);
+    } else if (has_service_type_metadata) {
+        service_evidence.conflicts = true;
+    }
+    if (!has_role && (extras->presence & VPFF_TRACK_EXTRAS_HAS_ROLE_CONFLICT) == 0 &&
+        (stream->disposition & AV_DISPOSITION_COMMENT) != 0) {
+        extras->role = VPFF_TRACK_ROLE_COMMENTARY;
+        has_role = true;
+    } else if (!has_role && (extras->presence & VPFF_TRACK_EXTRAS_HAS_ROLE_CONFLICT) == 0 &&
+        (stream->disposition & AV_DISPOSITION_DUB) != 0) {
+        extras->role = VPFF_TRACK_ROLE_ALTERNATE;
+        has_role = true;
+    }
+
+    if (parameters->codec_type == AVMEDIA_TYPE_AUDIO) {
+        enum AVAudioServiceType audio_service = AV_AUDIO_SERVICE_TYPE_MAIN;
+        bool has_audio_service = false;
+        int result = vpff_read_audio_service_type(
+            parameters,
+            &audio_service,
+            &has_audio_service
+        );
+        if (result < 0) {
+            return result;
+        }
+        if (has_audio_service) {
+            if (!has_role && (extras->presence & VPFF_TRACK_EXTRAS_HAS_ROLE_CONFLICT) == 0 &&
+                audio_service == AV_AUDIO_SERVICE_TYPE_COMMENTARY) {
+                extras->role = VPFF_TRACK_ROLE_COMMENTARY;
+                has_role = true;
+            }
+            VPFFTrackService audio_service_evidence = VPFF_TRACK_SERVICE_UNKNOWN;
+            if (vpff_map_audio_service(audio_service, &audio_service_evidence)) {
+                vpff_add_service_evidence(
+                    &service_evidence,
+                    audio_service_evidence
+                );
+            } else {
+                // Karaoke等合法但当前不支持的服务类型是不可分类证据。
+                service_evidence.conflicts = true;
+            }
+        }
+        if (parameters->codec_id == AV_CODEC_ID_EAC3 &&
+            parameters->profile == AV_PROFILE_EAC3_DDP_ATMOS) {
+            vpff_add_service_evidence(&service_evidence, VPFF_TRACK_SERVICE_JOC);
+        }
+        if ((stream->disposition & AV_DISPOSITION_DEPENDENT) != 0) {
+            vpff_add_service_evidence(
+                &service_evidence,
+                VPFF_TRACK_SERVICE_DEPENDENT
+            );
+        }
+    }
+    if (has_role) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_ROLE;
+    }
+    if (service_evidence.has_value && !service_evidence.conflicts) {
+        extras->service = service_evidence.value;
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_SERVICE;
+    } else if (service_evidence.conflicts) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_SERVICE_CONFLICT;
+    }
+
+    if (parameters->codec_type != AVMEDIA_TYPE_VIDEO) {
+        return 0;
+    }
+    if (parameters->sample_aspect_ratio.num > 0 &&
+        parameters->sample_aspect_ratio.den > 0) {
+        extras->presence |= VPFF_TRACK_EXTRAS_HAS_SAMPLE_ASPECT_RATIO;
+        extras->sample_aspect_ratio = vpff_public_rational(
+            parameters->sample_aspect_ratio
+        );
+    }
+    vpff_map_color_range(parameters->color_range, extras);
+    vpff_map_color_primaries(parameters->color_primaries, extras);
+    vpff_map_color_transfer(parameters->color_trc, extras);
+    vpff_map_color_matrix(parameters->color_space, extras);
+    vpff_map_chroma_location(parameters->chroma_location, extras);
+    int result = vpff_map_mastering_display(parameters, extras);
+    return result < 0 ? result : vpff_map_content_light_level(parameters, extras);
+}
+
 static void vpff_owned_track_clear(VPFFOwnedTrack *track) {
+    if (track == NULL) {
+        return;
+    }
     free(track->extradata);
+    free(track->language);
     memset(track, 0, sizeof(*track));
 }
 
 static void vpff_owned_track_set_clear(VPFFOwnedTrackSet *tracks) {
+    if (tracks == NULL) {
+        return;
+    }
     vpff_owned_track_clear(&tracks->video);
     vpff_owned_track_clear(&tracks->audio);
     tracks->has_program_id = 0;
     tracks->selected_program_id = 0;
 }
 
-static int vpff_copy_public_extradata(
-    VPFFOwnedTrack *track,
-    const AVCodecParameters *parameters
+static int vpff_copy_borrowed_track(
+    VPFFOwnedTrack *destination,
+    const VPFFOwnedTrack *source
 ) {
-    if (!vpff_extradata_is_valid(parameters->extradata, parameters->extradata_size)) {
+    if (destination == NULL || source == NULL) {
         return AVERROR_INVALIDDATA;
     }
-    if (parameters->extradata_size == 0) {
-        track->value.extradata = NULL;
-        track->value.extradata_size = 0;
-        return 0;
+    VPFFOwnedTrack built = {
+        .value = source->value,
+        .extras = source->extras,
+    };
+    built.value.extradata = NULL;
+    built.extras.language = NULL;
+
+    if (source->value.extradata_size > 0) {
+        if (source->value.extradata == NULL ||
+            source->value.extradata_size > VPFF_MAX_EXTRADATA_BYTES) {
+            return AVERROR_INVALIDDATA;
+        }
+        built.extradata = malloc(source->value.extradata_size);
+        if (built.extradata == NULL) {
+            return AVERROR(ENOMEM);
+        }
+        memcpy(
+            built.extradata,
+            source->value.extradata,
+            source->value.extradata_size
+        );
+        built.value.extradata = built.extradata;
     }
-    track->extradata = malloc((size_t)parameters->extradata_size);
-    if (track->extradata == NULL) {
-        return AVERROR(ENOMEM);
+    if ((source->extras.presence & VPFF_TRACK_EXTRAS_HAS_LANGUAGE) != 0) {
+        if (source->extras.language == NULL || source->extras.language_size == 0 ||
+            source->extras.language_size > VPFF_MAX_LANGUAGE_BYTES) {
+            vpff_owned_track_clear(&built);
+            return AVERROR_INVALIDDATA;
+        }
+        built.language = malloc(source->extras.language_size);
+        if (built.language == NULL) {
+            vpff_owned_track_clear(&built);
+            return AVERROR(ENOMEM);
+        }
+        memcpy(
+            built.language,
+            source->extras.language,
+            source->extras.language_size
+        );
+        built.extras.language = built.language;
+    } else if (source->extras.language != NULL || source->extras.language_size != 0) {
+        vpff_owned_track_clear(&built);
+        return AVERROR_INVALIDDATA;
     }
-    memcpy(
-        track->extradata,
-        parameters->extradata,
-        (size_t)parameters->extradata_size
-    );
-    track->value.extradata = track->extradata;
-    track->value.extradata_size = (size_t)parameters->extradata_size;
+    *destination = built;
     return 0;
 }
 
-static int vpff_make_video_track(
+static int vpff_fill_video_track(
     VPFFOwnedTrack *track,
-    int stream_index,
+    const AVStream *stream,
     const AVCodecParameters *parameters,
-    enum AVFieldOrder stream_field_order,
     AVRational time_base,
     AVRational frame_rate
 ) {
-    if (!vpff_is_supported_video(parameters) || !vpff_time_base_is_valid(time_base) ||
-        stream_index < 0 || parameters->width <= 0 || parameters->height <= 0 ||
-        parameters->video_delay < 0) {
+    if (track == NULL || stream == NULL || stream->codecpar == NULL ||
+        !vpff_is_supported_video(parameters) ||
+        !vpff_time_base_is_valid(time_base) || stream->index < 0 ||
+        parameters->width <= 0 || parameters->height <= 0 ||
+        parameters->video_delay < 0 ||
+        !vpff_parameters_are_bounded(parameters)) {
         return AVERROR_INVALIDDATA;
     }
 
     VPFFOwnedTrack built = {0};
     built.value.present = 1;
-    built.value.stream_index = (int32_t)stream_index;
+    built.value.stream_index = (int32_t)stream->index;
     built.value.codec = vpff_codec(parameters->codec_id);
     built.value.time_base_num = time_base.num;
     built.value.time_base_den = time_base.den;
-    if (frame_rate.num > 0 && frame_rate.den > 0 &&
-        (int64_t)frame_rate.num <= INT32_MAX &&
-        (int64_t)frame_rate.den <= INT32_MAX) {
+    if (frame_rate.num > 0 && frame_rate.den > 0) {
         built.value.frame_rate_num = frame_rate.num;
         built.value.frame_rate_den = frame_rate.den;
     }
     built.value.width = parameters->width;
     built.value.height = parameters->height;
     built.value.video_delay = parameters->video_delay;
-    int result = vpff_map_field_order(stream_field_order, &built.value.field_order);
+    built.value.extradata = parameters->extradata_size == 0
+        ? NULL
+        : parameters->extradata;
+    built.value.extradata_size = (size_t)parameters->extradata_size;
+    int result = vpff_map_field_order(stream->codecpar->field_order, &built.value.field_order);
     if (result >= 0) {
-        result = vpff_copy_public_extradata(&built, parameters);
+        result = vpff_map_track_extras(&built.extras, stream, parameters);
     }
     if (result < 0) {
-        vpff_owned_track_clear(&built);
         return result;
     }
     *track = built;
     return 0;
 }
 
-static int vpff_make_audio_track(
+static int vpff_fill_audio_track(
     VPFFOwnedTrack *track,
-    int stream_index,
+    const AVStream *stream,
     const AVCodecParameters *parameters,
     AVRational time_base
 ) {
-    if (!vpff_is_supported_audio(parameters) || !vpff_time_base_is_valid(time_base) ||
-        stream_index < 0 || parameters->sample_rate <= 0 ||
-        parameters->ch_layout.nb_channels <= 0) {
+    if (track == NULL || stream == NULL || stream->codecpar == NULL ||
+        !vpff_is_supported_audio(parameters) ||
+        !vpff_time_base_is_valid(time_base) || stream->index < 0 ||
+        parameters->sample_rate <= 0 || parameters->ch_layout.nb_channels <= 0 ||
+        !vpff_parameters_are_bounded(parameters)) {
         return AVERROR_INVALIDDATA;
     }
 
     VPFFOwnedTrack built = {0};
     built.value.present = 1;
-    built.value.stream_index = (int32_t)stream_index;
+    built.value.stream_index = (int32_t)stream->index;
     built.value.codec = vpff_codec(parameters->codec_id);
     built.value.time_base_num = time_base.num;
     built.value.time_base_den = time_base.den;
@@ -1904,13 +2617,75 @@ static int vpff_make_audio_track(
     } else {
         built.value.channel_order = VPFF_CHANNEL_ORDER_UNSPECIFIED;
     }
-
-    int result = vpff_copy_public_extradata(&built, parameters);
+    built.value.extradata = parameters->extradata_size == 0
+        ? NULL
+        : parameters->extradata;
+    built.value.extradata_size = (size_t)parameters->extradata_size;
+    int result = vpff_map_track_extras(&built.extras, stream, parameters);
     if (result < 0) {
-        vpff_owned_track_clear(&built);
         return result;
     }
     *track = built;
+    return 0;
+}
+
+static int vpff_fill_borrowed_track_set(
+    VPFFOwnedTrackSet *tracks,
+    AVFormatContext *format,
+    const VPFFSelection *selection,
+    const VPFFVideoFilter *video_filter,
+    const AVCodecParameters *audio_parameters,
+    AVRational audio_time_base
+) {
+    if (tracks == NULL || format == NULL || selection == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    VPFFSelection refreshed = {0};
+    int refresh_result = vpff_refresh_audio_primary_evidence(format, selection, &refreshed);
+    if (refresh_result < 0) return refresh_result;
+    VPFFOwnedTrackSet built = {0};
+    built.has_program_id = refreshed.has_program_id ? 1 : 0;
+    built.selected_program_id = refreshed.program_id;
+    built.has_audio_primary_evidence = refreshed.has_audio_primary_evidence;
+    built.audio_primary_evidence = refreshed.audio_primary_evidence;
+
+    int result = 0;
+    if (selection->video_stream_index >= 0) {
+        if (video_filter == NULL || video_filter->context == NULL ||
+            (unsigned int)selection->video_stream_index >= format->nb_streams) {
+            result = AVERROR_INVALIDDATA;
+        } else {
+            AVStream *stream = format->streams[selection->video_stream_index];
+            result = stream == NULL || stream->codecpar == NULL
+                ? AVERROR_INVALIDDATA
+                : vpff_fill_video_track(
+                    &built.video,
+                    stream,
+                    video_filter->context->par_out,
+                    video_filter->context->time_base_out,
+                    vpff_guess_frame_rate(format, stream)
+                );
+        }
+    }
+    if (result >= 0 && selection->audio_stream_index >= 0) {
+        if ((unsigned int)selection->audio_stream_index >= format->nb_streams) {
+            result = AVERROR_INVALIDDATA;
+        } else {
+            AVStream *stream = format->streams[selection->audio_stream_index];
+            result = stream == NULL || stream->codecpar == NULL
+                ? AVERROR_INVALIDDATA
+                : vpff_fill_audio_track(
+                    &built.audio,
+                    stream,
+                    audio_parameters,
+                    audio_time_base
+                );
+        }
+    }
+    if (result < 0) {
+        return result;
+    }
+    *tracks = built;
     return 0;
 }
 
@@ -1922,40 +2697,30 @@ static int vpff_make_track_set(
     const AVCodecParameters *audio_parameters,
     AVRational audio_time_base
 ) {
-    VPFFOwnedTrackSet built = {0};
-    built.has_program_id = selection->has_program_id ? 1 : 0;
-    built.selected_program_id = selection->program_id;
-
-    int result = 0;
-    if (selection->video_stream_index >= 0) {
-        if (video_filter == NULL || video_filter->context == NULL) {
-            result = AVERROR_INVALIDDATA;
-        } else {
-            AVStream *video_stream = format == NULL ||
-                (unsigned int)selection->video_stream_index >= format->nb_streams
-                ? NULL
-                : format->streams[selection->video_stream_index];
-            if (video_stream == NULL || video_stream->codecpar == NULL) {
-                result = AVERROR_INVALIDDATA;
-            } else {
-                result = vpff_make_video_track(
-                    &built.video,
-                    selection->video_stream_index,
-                    video_filter->context->par_out,
-                    video_stream->codecpar->field_order,
-                    video_filter->context->time_base_out,
-                    vpff_guess_frame_rate(format, video_stream)
-                );
-            }
-        }
+    VPFFOwnedTrackSet borrowed = {0};
+    int result = vpff_fill_borrowed_track_set(
+        &borrowed,
+        format,
+        selection,
+        video_filter,
+        audio_parameters,
+        audio_time_base
+    );
+    if (result < 0) {
+        return result;
     }
-    if (result >= 0 && selection->audio_stream_index >= 0) {
-        result = vpff_make_audio_track(
-            &built.audio,
-            selection->audio_stream_index,
-            audio_parameters,
-            audio_time_base
-        );
+
+    VPFFOwnedTrackSet built = {
+        .has_program_id = borrowed.has_program_id,
+        .selected_program_id = borrowed.selected_program_id,
+        .has_audio_primary_evidence = borrowed.has_audio_primary_evidence,
+        .audio_primary_evidence = borrowed.audio_primary_evidence,
+    };
+    if (borrowed.video.value.present) {
+        result = vpff_copy_borrowed_track(&built.video, &borrowed.video);
+    }
+    if (result >= 0 && borrowed.audio.value.present) {
+        result = vpff_copy_borrowed_track(&built.audio, &borrowed.audio);
     }
     if (result < 0) {
         vpff_owned_track_set_clear(&built);
@@ -1963,6 +2728,87 @@ static int vpff_make_track_set(
     }
     *tracks = built;
     return 0;
+}
+
+static bool vpff_rationals_equal(VPFFRational left, VPFFRational right) {
+    if (left.num == right.num && left.den == right.den) {
+        return true;
+    }
+    if (left.den <= 0 || right.den <= 0) {
+        return false;
+    }
+    return av_cmp_q(
+        (AVRational){left.num, left.den},
+        (AVRational){right.num, right.den}
+    ) == 0;
+}
+
+static bool vpff_track_extras_equal(
+    const VPFFTrackExtrasV1 *left,
+    const VPFFTrackExtrasV1 *right
+) {
+    return left->presence == right->presence &&
+           left->dispositions == right->dispositions &&
+           vpff_bytes_equal(
+               left->language,
+               left->language_size,
+               right->language,
+               right->language_size
+           ) &&
+           left->role == right->role &&
+           left->service == right->service &&
+           vpff_rationals_equal(
+               left->sample_aspect_ratio,
+               right->sample_aspect_ratio
+           ) &&
+           left->color_range == right->color_range &&
+           left->color_primaries == right->color_primaries &&
+           left->color_transfer == right->color_transfer &&
+           left->color_matrix == right->color_matrix &&
+           left->chroma_location == right->chroma_location &&
+           vpff_rationals_equal(
+               left->mastering_display_red_x,
+               right->mastering_display_red_x
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_red_y,
+               right->mastering_display_red_y
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_green_x,
+               right->mastering_display_green_x
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_green_y,
+               right->mastering_display_green_y
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_blue_x,
+               right->mastering_display_blue_x
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_blue_y,
+               right->mastering_display_blue_y
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_white_point_x,
+               right->mastering_display_white_point_x
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_white_point_y,
+               right->mastering_display_white_point_y
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_minimum_luminance,
+               right->mastering_display_minimum_luminance
+           ) &&
+           vpff_rationals_equal(
+               left->mastering_display_maximum_luminance,
+               right->mastering_display_maximum_luminance
+           ) &&
+           left->maximum_content_light_level == right->maximum_content_light_level &&
+           left->maximum_frame_average_light_level ==
+               right->maximum_frame_average_light_level;
 }
 
 static bool vpff_public_tracks_equal(
@@ -1992,7 +2838,8 @@ static bool vpff_public_tracks_equal(
                a->extradata_size,
                b->extradata,
                b->extradata_size
-           );
+           ) &&
+           vpff_track_extras_equal(&left->extras, &right->extras);
 }
 
 static bool vpff_track_sets_equal(
@@ -2001,6 +2848,9 @@ static bool vpff_track_sets_equal(
 ) {
     return left->has_program_id == right->has_program_id &&
            left->selected_program_id == right->selected_program_id &&
+           left->has_audio_primary_evidence == right->has_audio_primary_evidence &&
+           memcmp(&left->audio_primary_evidence, &right->audio_primary_evidence,
+                  sizeof(left->audio_primary_evidence)) == 0 &&
            vpff_public_tracks_equal(&left->video, &right->video) &&
            vpff_public_tracks_equal(&left->audio, &right->audio);
 }
@@ -2251,7 +3101,7 @@ static int vpff_update_selected_tracks(
     VPDemuxer *demuxer,
     VPFFFailure *failure
 ) {
-    bool changed = false;
+    bool codec_parameters_changed = false;
     int result = 0;
     if (selection->video_stream_index >= 0) {
         AVStream *video_stream = format->streams[selection->video_stream_index];
@@ -2263,7 +3113,7 @@ static int vpff_update_selected_tracks(
             video_stream,
             side_data,
             video_filter,
-            &changed,
+            &codec_parameters_changed,
             failure
         );
     }
@@ -2279,15 +3129,34 @@ static int vpff_update_selected_tracks(
             audio_key,
             audio_source_key,
             audio_time_base,
-            &changed,
+            &codec_parameters_changed,
             failure
         );
     }
-    if (result < 0 || !changed) {
+    if (result < 0) {
         return result;
     }
     if (vpff_is_cancelled(demuxer)) {
         return AVERROR_EXIT;
+    }
+
+    VPFFOwnedTrackSet borrowed = {0};
+    result = vpff_fill_borrowed_track_set(
+        &borrowed,
+        format,
+        selection,
+        video_filter,
+        *audio_key,
+        *audio_time_base
+    );
+    if (result < 0) {
+        failure->kind = VPFF_DEMUX_ERROR_READ;
+        failure->stage = VPFF_DEMUX_STAGE_READ;
+        failure->code = result;
+        return result;
+    }
+    if (vpff_track_sets_equal(current_tracks, &borrowed)) {
+        return 0;
     }
 
     VPFFOwnedTrackSet replacement = {0};
@@ -2356,7 +3225,7 @@ static int vpff_emit_packet(
     event.packet.time_base_den = time_base.den;
     event.packet.is_key = (packet->flags & AV_PKT_FLAG_KEY) != 0;
     event.packet.is_corrupt = (packet->flags & AV_PKT_FLAG_CORRUPT) != 0;
-    demuxer->callback(demuxer->context, &event);
+    vpff_emit_event(demuxer, &event, NULL);
     return vpff_is_cancelled(demuxer) ? AVERROR_EXIT : 0;
 }
 
@@ -2663,11 +3532,12 @@ static void vpff_choose_terminal(
     }
 }
 
-int32_t vp_ffmpeg_demuxer_create(
+static int32_t vpff_demuxer_create_common(
     const uint8_t *url_bytes,
     size_t url_size,
     int64_t timeout_us,
     VPFFDemuxCallback callback,
+    VPFFDemuxCallbackV2 callback_v2,
     void *context,
     VPDemuxer **out_demuxer
 ) {
@@ -2676,7 +3546,8 @@ int32_t vp_ffmpeg_demuxer_create(
     }
     *out_demuxer = NULL;
     if (url_bytes == NULL || url_size == 0 || url_size > VPFF_MAX_URL_BYTES ||
-        timeout_us <= 0 || callback == NULL || memchr(url_bytes, 0, url_size) != NULL ||
+        timeout_us <= 0 || (callback == NULL) == (callback_v2 == NULL) ||
+        memchr(url_bytes, 0, url_size) != NULL ||
         !vpff_utf8_is_valid(url_bytes, url_size) ||
         !vpff_has_http_scheme(url_bytes, url_size) || url_size == SIZE_MAX) {
         return -EINVAL;
@@ -2700,12 +3571,51 @@ int32_t vp_ffmpeg_demuxer_create(
     }
     demuxer->timeout_us = timeout_us;
     demuxer->callback = callback;
+    demuxer->callback_v2 = callback_v2;
     demuxer->context = context;
     atomic_init(&demuxer->cancelled, false);
     atomic_init(&demuxer->run_claimed, false);
     atomic_init(&demuxer->deadline_us, 0);
     *out_demuxer = demuxer;
     return 0;
+}
+
+int32_t vp_ffmpeg_demuxer_create(
+    const uint8_t *url_bytes,
+    size_t url_size,
+    int64_t timeout_us,
+    VPFFDemuxCallback callback,
+    void *context,
+    VPDemuxer **out_demuxer
+) {
+    return vpff_demuxer_create_common(
+        url_bytes,
+        url_size,
+        timeout_us,
+        callback,
+        NULL,
+        context,
+        out_demuxer
+    );
+}
+
+int32_t vp_ffmpeg_demuxer_create_v2(
+    const uint8_t *url_bytes,
+    size_t url_size,
+    int64_t timeout_us,
+    VPFFDemuxCallbackV2 callback,
+    void *context,
+    VPDemuxer **out_demuxer
+) {
+    return vpff_demuxer_create_common(
+        url_bytes,
+        url_size,
+        timeout_us,
+        NULL,
+        callback,
+        context,
+        out_demuxer
+    );
 }
 
 int32_t vp_ffmpeg_demuxer_run(VPDemuxer *demuxer) {
@@ -3432,5 +4342,567 @@ finish:
     av_packet_free(&input);
     avformat_free_context(format);
     return (int32_t)result;
+}
+
+static int vpff_debug_add_side_data(
+    AVCodecParameters *parameters,
+    enum AVPacketSideDataType type,
+    const void *value,
+    size_t size
+) {
+    AVPacketSideData *side_data = av_packet_side_data_new(
+        &parameters->coded_side_data,
+        &parameters->nb_coded_side_data,
+        type,
+        size,
+        0
+    );
+    if (side_data == NULL) {
+        return AVERROR(ENOMEM);
+    }
+    memcpy(side_data->data, value, size);
+    return 0;
+}
+
+static int vpff_debug_configure_full_track_evidence(AVFormatContext *format) {
+    AVStream *video = format->streams[0];
+    AVStream *audio = format->streams[1];
+    int result = av_dict_set(&video->metadata, "language", "zh-Hant", 0);
+    if (result >= 0) {
+        result = av_dict_set(&video->metadata, "role", "main", 0);
+    }
+    if (result >= 0) {
+        result = av_dict_set(
+            &video->metadata,
+            "service",
+            "independent-main",
+            0
+        );
+    }
+    if (result >= 0) {
+        result = av_dict_set(&audio->metadata, "language", "en", 0);
+    }
+    if (result >= 0) {
+        result = av_dict_set(&audio->metadata, "service", "associated", 0);
+    }
+    if (result < 0) {
+        return result;
+    }
+
+    video->disposition = AV_DISPOSITION_DEFAULT | AV_DISPOSITION_FORCED;
+    video->codecpar->sample_aspect_ratio = (AVRational){4, 3};
+    video->codecpar->color_range = AVCOL_RANGE_JPEG;
+    video->codecpar->color_primaries = AVCOL_PRI_BT2020;
+    video->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+    video->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+    video->codecpar->chroma_location = AVCHROMA_LOC_TOPLEFT;
+
+    AVMasteringDisplayMetadata mastering = {0};
+    mastering.has_primaries = 1;
+    mastering.has_luminance = 1;
+    mastering.display_primaries[0][0] = (AVRational){17, 50};
+    mastering.display_primaries[0][1] = (AVRational){33, 100};
+    mastering.display_primaries[1][0] = (AVRational){13, 50};
+    mastering.display_primaries[1][1] = (AVRational){69, 100};
+    mastering.display_primaries[2][0] = (AVRational){3, 20};
+    mastering.display_primaries[2][1] = (AVRational){3, 50};
+    mastering.white_point[0] = (AVRational){3127, 10000};
+    mastering.white_point[1] = (AVRational){329, 1000};
+    mastering.min_luminance = (AVRational){1, 10000};
+    mastering.max_luminance = (AVRational){1000, 1};
+    result = vpff_debug_add_side_data(
+        video->codecpar,
+        AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+        &mastering,
+        sizeof(mastering)
+    );
+    AVContentLightMetadata light = {.MaxCLL = 1000, .MaxFALL = 400};
+    if (result >= 0) {
+        result = vpff_debug_add_side_data(
+            video->codecpar,
+            AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+            &light,
+            sizeof(light)
+        );
+    }
+
+    audio->disposition = AV_DISPOSITION_COMMENT;
+    enum AVAudioServiceType service = AV_AUDIO_SERVICE_TYPE_COMMENTARY;
+    if (result >= 0) {
+        result = vpff_debug_add_side_data(
+            audio->codecpar,
+            AV_PKT_DATA_AUDIO_SERVICE_TYPE,
+            &service,
+            sizeof(service)
+        );
+    }
+    return result;
+}
+
+static int vpff_debug_set_audio_service(
+    AVCodecParameters *parameters,
+    enum AVAudioServiceType service
+) {
+    return vpff_debug_add_side_data(
+        parameters,
+        AV_PKT_DATA_AUDIO_SERVICE_TYPE,
+        &service,
+        sizeof(service)
+    );
+}
+
+static int vpff_debug_update_mastering_display(
+    AVCodecParameters *parameters,
+    bool use_zero_minimum,
+    bool use_invalid_chromaticity,
+    bool use_invalid_chromaticity_sum
+) {
+    const AVPacketSideData *side_data = av_packet_side_data_get(
+        parameters->coded_side_data,
+        parameters->nb_coded_side_data,
+        AV_PKT_DATA_MASTERING_DISPLAY_METADATA
+    );
+    if (side_data == NULL || side_data->data == NULL ||
+        side_data->size < sizeof(AVMasteringDisplayMetadata)) {
+        return AVERROR_INVALIDDATA;
+    }
+    AVMasteringDisplayMetadata metadata;
+    memcpy(&metadata, side_data->data, sizeof(metadata));
+    if (use_zero_minimum) {
+        metadata.min_luminance = (AVRational){0, 1};
+    }
+    if (use_invalid_chromaticity) {
+        metadata.display_primaries[0][0] = (AVRational){2, 1};
+    }
+    if (use_invalid_chromaticity_sum) {
+        metadata.display_primaries[0][0] = (AVRational){3, 5};
+        metadata.display_primaries[0][1] = (AVRational){1, 2};
+    }
+    memcpy(side_data->data, &metadata, sizeof(metadata));
+    return 0;
+}
+
+static int vpff_debug_update_content_light(
+    AVCodecParameters *parameters,
+    unsigned maximum_content_light_level,
+    unsigned maximum_frame_average_light_level
+) {
+    const AVPacketSideData *side_data = av_packet_side_data_get(
+        parameters->coded_side_data,
+        parameters->nb_coded_side_data,
+        AV_PKT_DATA_CONTENT_LIGHT_LEVEL
+    );
+    if (side_data == NULL || side_data->data == NULL ||
+        side_data->size < sizeof(AVContentLightMetadata)) {
+        return AVERROR_INVALIDDATA;
+    }
+    AVContentLightMetadata metadata = {
+        .MaxCLL = maximum_content_light_level,
+        .MaxFALL = maximum_frame_average_light_level,
+    };
+    memcpy(side_data->data, &metadata, sizeof(metadata));
+    return 0;
+}
+
+static int vpff_debug_fill_track_set(
+    AVFormatContext *format,
+    bool has_video,
+    bool has_audio,
+    VPFFOwnedTrackSet *tracks
+) {
+    VPFFOwnedTrackSet borrowed = {0};
+    int result = has_video
+        ? vpff_fill_video_track(
+            &borrowed.video,
+            format->streams[0],
+            format->streams[0]->codecpar,
+            format->streams[0]->time_base,
+            (AVRational){30000, 1001}
+        )
+        : 0;
+    if (result >= 0 && has_audio) {
+        result = vpff_fill_audio_track(
+            &borrowed.audio,
+            format->streams[1],
+            format->streams[1]->codecpar,
+            format->streams[1]->time_base
+        );
+    }
+    if (result >= 0 && has_video) {
+        result = vpff_copy_borrowed_track(&tracks->video, &borrowed.video);
+    }
+    if (result >= 0 && has_audio) {
+        result = vpff_copy_borrowed_track(&tracks->audio, &borrowed.audio);
+    }
+    if (result < 0) {
+        vpff_owned_track_set_clear(tracks);
+    }
+    return result;
+}
+
+static int vpff_debug_add_audio_stream(AVFormatContext *format, int codec_id) {
+    AVStream *audio = avformat_new_stream(format, NULL);
+    if (audio == NULL) return AVERROR(ENOMEM);
+    audio->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    audio->codecpar->codec_id = codec_id;
+    audio->codecpar->sample_rate = 48000;
+    audio->time_base = (AVRational){1, 48000};
+    return av_channel_layout_from_mask(&audio->codecpar->ch_layout, AV_CH_LAYOUT_STEREO);
+}
+
+static int vpff_debug_add_program_members(AVFormatContext *format) {
+    AVProgram *program = av_new_program(format, 1);
+    if (program == NULL) return AVERROR(ENOMEM);
+    for (unsigned int index = 0; index < format->nb_streams; index += 1) {
+        av_program_add_stream_index(format, program->id, index);
+    }
+    return 0;
+}
+
+static bool vpff_debug_is_primary_scenario(VPFFTrackExtrasDebugScenario scenario) {
+    return scenario >= VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_SOLE &&
+           scenario <= VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_FORMAT_SCOPE;
+}
+
+int32_t vp_ffmpeg_demuxer_debug_emit_track_extras(
+    VPFFTrackExtrasDebugScenario scenario,
+    VPFFDemuxCallbackV2 callback,
+    void *context
+) {
+    if (callback == NULL) {
+        return AVERROR(EINVAL);
+    }
+    AVFormatContext *format = vpff_bootstrap_debug_format();
+    if (format == NULL) {
+        return AVERROR(ENOMEM);
+    }
+    format->streams[0]->codecpar->width = 1920;
+    format->streams[0]->codecpar->height = 1080;
+
+    bool has_video = false;
+    bool has_audio = false;
+    int result = 0;
+    switch (scenario) {
+    case VPFF_TRACK_EXTRAS_DEBUG_FULL_EVIDENCE:
+        has_video = true;
+        has_audio = true;
+        result = vpff_debug_configure_full_track_evidence(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_DEFAULT_ONLY:
+        has_audio = true;
+        format->streams[1]->disposition = AV_DISPOSITION_DEFAULT;
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_FORMAT_DRIFT:
+        has_video = true;
+        result = vpff_debug_configure_full_track_evidence(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_AUDIO_SERVICE_MAIN:
+        has_audio = true;
+        result = vpff_debug_set_audio_service(
+            format->streams[1]->codecpar,
+            AV_AUDIO_SERVICE_TYPE_MAIN
+        );
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_SERVICE_CONFLICT:
+        has_audio = true;
+        format->streams[1]->codecpar->codec_id = AV_CODEC_ID_EAC3;
+        format->streams[1]->codecpar->profile = AV_PROFILE_EAC3_DDP_ATMOS;
+        result = av_dict_set(
+            &format->streams[1]->metadata,
+            "service",
+            "associated",
+            0
+        );
+        if (result >= 0) {
+            result = vpff_debug_set_audio_service(
+                format->streams[1]->codecpar,
+                AV_AUDIO_SERVICE_TYPE_MAIN
+            );
+        }
+        if (result >= 0) {
+            format->streams[1]->disposition = AV_DISPOSITION_DEPENDENT;
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_SERVICE_TOKEN:
+        has_audio = true;
+        result = av_dict_set(&format->streams[1]->metadata, "role", "main", 0);
+        if (result >= 0) {
+            result = av_dict_set(
+                &format->streams[1]->metadata,
+                "service",
+                "future_service_value",
+                0
+            );
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_TOKEN:
+        has_audio = true;
+        result = av_dict_set(&format->streams[1]->metadata, "role",
+                             "future_primary_role", 0);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_COMMENT:
+        has_audio = true;
+        result = av_dict_set(&format->streams[1]->metadata, "role",
+                             "future_primary_role", 0);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_COMMENT;
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_DUB:
+        has_audio = true;
+        result = av_dict_set(&format->streams[1]->metadata, "role",
+                             "future_primary_role", 0);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_DUB;
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_KARAOKE_SERVICE:
+        has_audio = true;
+        result = av_dict_set(&format->streams[1]->metadata, "role", "main", 0);
+        if (result >= 0) {
+            result = vpff_debug_set_audio_service(
+                format->streams[1]->codecpar,
+                AV_AUDIO_SERVICE_TYPE_KARAOKE
+            );
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_MALFORMED_AUDIO_SERVICE: {
+        has_audio = true;
+        uint8_t malformed_service = 0;
+        result = vpff_debug_add_side_data(
+            format->streams[1]->codecpar,
+            AV_PKT_DATA_AUDIO_SERVICE_TYPE,
+            &malformed_service,
+            sizeof(malformed_service)
+        );
+        break;
+    }
+    case VPFF_TRACK_EXTRAS_DEBUG_ZERO_MIN_LUMINANCE:
+        has_video = true;
+        result = vpff_debug_configure_full_track_evidence(format);
+        if (result >= 0) {
+            result = vpff_debug_update_mastering_display(
+                format->streams[0]->codecpar,
+                true,
+                false,
+                false
+            );
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_INVALID_MASTERING_DISPLAY:
+        has_video = true;
+        result = vpff_debug_configure_full_track_evidence(format);
+        if (result >= 0) {
+            result = vpff_debug_update_mastering_display(
+                format->streams[0]->codecpar,
+                false,
+                true,
+                false
+            );
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_INVALID_CONTENT_LIGHT_LEVEL:
+        has_video = true;
+        result = vpff_debug_configure_full_track_evidence(format);
+        if (result >= 0) {
+            result = vpff_debug_update_content_light(
+                format->streams[0]->codecpar,
+                400,
+                1000
+            );
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_INVALID_MASTERING_DISPLAY_SUM:
+        has_video = true;
+        result = vpff_debug_configure_full_track_evidence(format);
+        if (result >= 0) {
+            result = vpff_debug_update_mastering_display(
+                format->streams[0]->codecpar,
+                false,
+                false,
+                true
+            );
+        }
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_SOLE:
+        has_audio = true;
+        result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MAIN:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_PCM_S16LE);
+        if (result >= 0) result = av_dict_set(&format->streams[1]->metadata, "role", "main", 0);
+        if (result >= 0) result = av_dict_set(&format->streams[2]->metadata, "role", "alternate", 0);
+        if (result >= 0) result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_UNIQUE_DEFAULT:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_DEFAULT;
+        if (result >= 0) result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_AMBIGUOUS:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MULTI_DEFAULT:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_DEFAULT;
+        if (result >= 0) format->streams[2]->disposition = AV_DISPOSITION_DEFAULT;
+        if (result >= 0) result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_MAIN_DEFAULT_COMPETITION:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) result = av_dict_set(&format->streams[1]->metadata, "role", "main", 0);
+        if (result >= 0) format->streams[2]->disposition = AV_DISPOSITION_DEFAULT;
+        if (result >= 0) result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_PROGRAM_UNKNOWN_OR_AUXILIARY:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) result = av_dict_set(&format->streams[1]->metadata, "role", "future_role", 0);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_COMMENT;
+        if (result >= 0) result = vpff_debug_add_program_members(format);
+        break;
+    case VPFF_TRACK_EXTRAS_DEBUG_PRIMARY_FORMAT_SCOPE:
+        has_audio = true;
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_DEFAULT;
+        break;
+    default:
+        result = AVERROR(EINVAL);
+        break;
+    }
+
+    VPFFOwnedTrackSet first = {0};
+    if (result >= 0 && vpff_debug_is_primary_scenario(scenario)) {
+        /* 此 debug probe 只校验音频 scope；避免为未使用的视频 remux 构造伪 filter。 */
+        format->streams[0]->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+        VPFFSelection selection = {0};
+        VPFFFailure selection_failure = {0};
+        result = vpff_select_streams(format, &selection, &selection_failure);
+        if (result >= 0) {
+            result = vpff_make_track_set(&first, format, &selection, NULL,
+                                         format->streams[selection.audio_stream_index]->codecpar,
+                                         format->streams[selection.audio_stream_index]->time_base);
+        }
+    } else if (result >= 0) {
+        result = vpff_debug_fill_track_set(format, has_video, has_audio, &first);
+    }
+    VPDemuxer demuxer = {
+        .callback_v2 = callback,
+        .context = context,
+    };
+    if (result >= 0) {
+        vpff_emit_tracks(
+            &demuxer,
+            VPFF_EVENT_TRACKS,
+            VPFF_DISCONTINUITY_NONE,
+            &first
+        );
+    }
+
+    VPFFOwnedTrackSet second = {0};
+    if (result >= 0 && scenario == VPFF_TRACK_EXTRAS_DEBUG_FORMAT_DRIFT) {
+        result = vpff_debug_update_content_light(
+            format->streams[0]->codecpar,
+            2000,
+            800
+        );
+        if (result >= 0) {
+            result = vpff_debug_fill_track_set(format, true, false, &second);
+        }
+        if (result >= 0 && vpff_track_sets_equal(&first, &second)) {
+            result = AVERROR_BUG;
+        }
+        if (result >= 0) {
+            vpff_emit_tracks(
+                &demuxer,
+                VPFF_EVENT_DISCONTINUITY,
+                VPFF_DISCONTINUITY_FORMAT_CHANGE,
+                &second
+            );
+        }
+    }
+
+    vpff_owned_track_set_clear(&second);
+    vpff_owned_track_set_clear(&first);
+    avformat_free_context(format);
+    return (int32_t)result;
+}
+
+typedef struct { uint32_t discontinuity_count; } VPFFPrimaryRefreshDebugObserver;
+
+static void vpff_debug_refresh_callback(
+    void *context, const VPFFDemuxEvent *event, const VPFFDemuxEventExtras *extras
+) {
+    (void)extras;
+    VPFFPrimaryRefreshDebugObserver *observer = context;
+    if (observer != NULL && event != NULL && event->kind == VPFF_EVENT_DISCONTINUITY) {
+        observer->discontinuity_count += 1;
+    }
+}
+
+int32_t vp_ffmpeg_demuxer_debug_refresh_audio_primary(
+    VPFFPrimaryRefreshDebugScenario scenario,
+    VPFFPrimaryRefreshDebugResult *out_result
+) {
+    if (out_result == NULL) return AVERROR(EINVAL);
+    memset(out_result, 0, sizeof(*out_result));
+    AVFormatContext *format = vpff_bootstrap_debug_format();
+    VPFFOwnedTrackSet current = {0};
+    AVCodecParameters *audio_key = NULL;
+    AVCodecParameters *audio_source_key = NULL;
+    int result = format == NULL ? AVERROR(ENOMEM) : vpff_debug_add_program_members(format);
+    if (result >= 0 && (scenario == VPFF_PRIMARY_REFRESH_DEBUG_DEFAULT_DRIFT ||
+                        scenario == VPFF_PRIMARY_REFRESH_DEBUG_ROLE_DRIFT)) {
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) format->streams[1]->disposition = AV_DISPOSITION_DEFAULT;
+        if (result >= 0) av_program_add_stream_index(format, 1, 2);
+    }
+    format->streams[0]->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+    VPFFSelection selection = {0};
+    VPFFFailure failure = {0};
+    if (result >= 0) result = vpff_select_streams(format, &selection, &failure);
+    if (result >= 0) result = vpff_make_track_set(&current, format, &selection, NULL,
+        format->streams[selection.audio_stream_index]->codecpar,
+        format->streams[selection.audio_stream_index]->time_base);
+    if (result >= 0) {
+        out_result->initial_audio_count = current.audio_primary_evidence.audio_stream_count;
+        out_result->initial_basis = current.audio_primary_evidence.primary_basis;
+        result = vpff_copy_effective_parameters(&audio_key,
+            format->streams[selection.audio_stream_index]->codecpar, NULL);
+    }
+    if (result >= 0) result = vpff_copy_effective_parameters(&audio_source_key,
+        format->streams[selection.audio_stream_index]->codecpar, NULL);
+    if (result >= 0 && scenario == VPFF_PRIMARY_REFRESH_DEBUG_COMPETING_AUDIO) {
+        result = vpff_debug_add_audio_stream(format, AV_CODEC_ID_AC3);
+        if (result >= 0) av_program_add_stream_index(format, 1, 2);
+    } else if (result >= 0 && scenario == VPFF_PRIMARY_REFRESH_DEBUG_DEFAULT_DRIFT) {
+        format->streams[2]->disposition = AV_DISPOSITION_DEFAULT;
+        if (av_dict_set(&format->streams[2]->metadata, "role", "alternate", 0) < 0) {
+            result = AVERROR(ENOMEM);
+        }
+    } else if (result >= 0 && scenario == VPFF_PRIMARY_REFRESH_DEBUG_ROLE_DRIFT) {
+        if (av_dict_set(&format->streams[2]->metadata, "role", "main", 0) < 0) {
+            result = AVERROR(ENOMEM);
+        }
+    } else if (result >= 0 && scenario == VPFF_PRIMARY_REFRESH_DEBUG_SELECTED_REMOVED) {
+        format->programs[0]->nb_stream_indexes = 1;
+    }
+    AVPacket packet = { .stream_index = selection.audio_stream_index };
+    AVRational audio_time_base = format->streams[selection.audio_stream_index]->time_base;
+    VPFFPrimaryRefreshDebugObserver observer = {0};
+    VPDemuxer demuxer = { .callback_v2 = vpff_debug_refresh_callback, .context = &observer };
+    if (result >= 0) result = vpff_update_selected_tracks(format, &selection, &packet, NULL,
+        &audio_key, &audio_source_key, &audio_time_base, &current, &demuxer, &failure);
+    out_result->status = result;
+    out_result->refreshed_audio_count = current.audio_primary_evidence.audio_stream_count;
+    out_result->refreshed_basis = current.audio_primary_evidence.primary_basis;
+    out_result->discontinuity_count = observer.discontinuity_count;
+    avcodec_parameters_free(&audio_key);
+    avcodec_parameters_free(&audio_source_key);
+    vpff_owned_track_set_clear(&current);
+    avformat_free_context(format);
+    return result;
 }
 #endif

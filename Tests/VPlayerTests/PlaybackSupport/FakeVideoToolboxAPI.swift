@@ -91,6 +91,7 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
     )
     private var decodeStatuses: [OSStatus] = []
     private var finishStatuses: [OSStatus] = []
+    private var finishHook: (@Sendable () -> Void)?
     private var waitStatuses: [OSStatus] = []
     private var operations: [String] = []
     private var creates: [CreateRecord] = []
@@ -133,6 +134,13 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
 
     func enqueueFinishStatus(_ status: OSStatus) {
         withLock { finishStatuses.append(status) }
+    }
+
+    /// 受控模拟 native drain 在 `finishDelayedFrames` 中交付重排序尾帧。
+    /// hook 在 fake 的锁外调用，避免测试把 callback 的真实 executor 路径
+    /// 伪装成同步锁内行为。
+    func handleFinish(with hook: @escaping @Sendable () -> Void) {
+        withLock { finishHook = hook }
     }
 
     func enqueueWaitStatus(_ status: OSStatus) {
@@ -280,11 +288,14 @@ final class FakeVideoToolboxAPI: VideoToolboxAPI, @unchecked Sendable {
     }
 
     func finishDelayedFrames(_ session: any VideoToolboxSession) -> OSStatus {
-        withLock {
+        let result: (OSStatus, (@Sendable () -> Void)?) = withLock {
             operations.append("finish")
             finishedSessionIDs.append(session.id)
-            return finishStatuses.isEmpty ? noErr : finishStatuses.removeFirst()
+            let status = finishStatuses.isEmpty ? noErr : finishStatuses.removeFirst()
+            return (status, finishHook)
         }
+        result.1?()
+        return result.0
     }
 
     func waitForAsynchronousFrames(_ session: any VideoToolboxSession) -> OSStatus {

@@ -63,69 +63,151 @@ public struct MediaFormatFingerprint: Hashable, Sendable {
         videoParameterSets: [Data],
         audioSystemFormat: AudioSystemFormatFingerprintComponent?
     ) throws {
-        var canonical = Data("VPlayer.MediaFormatFingerprint.v2".utf8)
-        canonical.append(UInt8(0))
-
-        canonical.appendOptional(trackSet.selectedProgramID) { data, programID in
-            data.append(programID)
-        }
-        try canonical.appendOptional(trackSet.video) { data, video in
-            data.append(video.streamIndex)
-            data.append(video.codec.rawValue)
-            data.append(video.width)
-            data.append(video.height)
-            data.appendOptional(video.frameRate) { nestedData, frameRate in
-                nestedData.append(frameRate.num)
-                nestedData.append(frameRate.den)
-            }
-            try data.appendLengthPrefixed(video.extradata)
-        }
-
-        canonical.append(try Self.checkedCanonicalCount(videoParameterSets.count))
-        for parameterSet in videoParameterSets {
-            try canonical.appendLengthPrefixed(parameterSet)
-        }
-
-        try canonical.appendOptional(trackSet.audio) { data, audio in
-            data.append(audio.streamIndex)
-            data.append(audio.codec.rawValue)
-            data.append(audio.sampleRate)
-            data.append(audio.channelLayout.channelCount)
-            data.appendOptional(audio.channelLayout.nativeMask) { nestedData, mask in
-                nestedData.append(mask)
-            }
-            try data.appendLengthPrefixed(audio.extradata)
-        }
-        try canonical.appendOptional(audioSystemFormat) { data, format in
-            data.append(format.profileID.rawValue)
-            data.append(format.formatID)
-            data.append(format.sampleRate)
-            data.append(format.channelCount)
-            data.append(format.framesPerPacket)
-            switch format.layout {
-            case let .tag(tag, equivalentBitmap):
-                data.append(UInt8(0))
-                data.append(tag)
-                data.append(equivalentBitmap.rawValue)
-            case let .bitmap(bitmap):
-                data.append(UInt8(1))
-                data.append(bitmap.rawValue)
-            case let .discrete(count):
-                data.append(UInt8(2))
-                data.append(count)
-            }
-            try data.appendOptional(format.magicCookie) { nestedData, cookie in
-                try nestedData.appendLengthPrefixed(cookie)
-            }
-        }
-
+        var canonical = Data()
+        try Self.appendCanonical(
+            to: &canonical,
+            trackSet: trackSet,
+            parameterSetCount: videoParameterSets.count,
+            appendParameterSets: { data in
+                for parameterSet in videoParameterSets {
+                    try data.appendLengthPrefixed(parameterSet)
+                }
+            },
+            audioSystemFormat: audioSystemFormat
+        )
         bytes = Data(SHA256.hash(data: canonical))
+    }
+
+    init(
+        trackSet: DemuxTrackSet,
+        hlsVideoParameterSetOwner: HLSVideoParameterSetRetention,
+        audioSystemFormat: AudioSystemFormatFingerprintComponent?
+    ) throws {
+        let entries = hlsVideoParameterSetOwner.entries
+        let canonicalBytes = try Self.canonicalByteCount(
+            trackSet: trackSet,
+            parameterSetEntries: entries,
+            audioSystemFormat: audioSystemFormat
+        )
+        bytes = try hlsVideoParameterSetOwner.withTemporaryCanonicalWorkspace(
+            bytes: canonicalBytes
+        ) {
+            var canonical = Data()
+            canonical.reserveCapacity(canonicalBytes)
+            try Self.appendCanonical(
+                to: &canonical,
+                trackSet: trackSet,
+                parameterSetCount: entries.count,
+                appendParameterSets: { data in
+                    for entry in entries {
+                        try entry.withBytes { bytes in
+                            try data.appendLengthPrefixed(bytes)
+                        }
+                    }
+                },
+                audioSystemFormat: audioSystemFormat
+            )
+            guard canonical.count == canonicalBytes else {
+                throw MediaFormatFingerprintError.valueExceedsUInt32
+            }
+            return Data(SHA256.hash(data: canonical))
+        }
     }
 
     static func checkedCanonicalCount(_ value: Int) throws -> UInt32 {
         guard let count = UInt32(exactly: value) else {
             throw MediaFormatFingerprintError.valueExceedsUInt32
         }
+        return count
+    }
+
+    private static func appendCanonical(
+        to canonical: inout Data,
+        trackSet: DemuxTrackSet,
+        parameterSetCount: Int,
+        appendParameterSets: (inout Data) throws -> Void,
+        audioSystemFormat: AudioSystemFormatFingerprintComponent?
+    ) throws {
+        canonical.append(contentsOf: "VPlayer.MediaFormatFingerprint.v2".utf8)
+        canonical.append(UInt8(0))
+        canonical.appendOptional(trackSet.selectedProgramID) { data, programID in data.append(programID) }
+        try canonical.appendOptional(trackSet.video) { data, video in
+            data.append(video.streamIndex); data.append(video.codec.rawValue)
+            data.append(video.width); data.append(video.height)
+            data.appendOptional(video.frameRate) { nested, frameRate in
+                nested.append(frameRate.num); nested.append(frameRate.den)
+            }
+            try data.appendLengthPrefixed(video.extradata)
+        }
+        canonical.append(try checkedCanonicalCount(parameterSetCount))
+        try appendParameterSets(&canonical)
+        try canonical.appendOptional(trackSet.audio) { data, audio in
+            data.append(audio.streamIndex); data.append(audio.codec.rawValue)
+            data.append(audio.sampleRate); data.append(audio.channelLayout.channelCount)
+            data.appendOptional(audio.channelLayout.nativeMask) { nested, mask in nested.append(mask) }
+            try data.appendLengthPrefixed(audio.extradata)
+        }
+        try canonical.appendOptional(audioSystemFormat) { data, format in
+            data.append(format.profileID.rawValue); data.append(format.formatID)
+            data.append(format.sampleRate); data.append(format.channelCount); data.append(format.framesPerPacket)
+            switch format.layout {
+            case let .tag(tag, equivalentBitmap): data.append(UInt8(0)); data.append(tag); data.append(equivalentBitmap.rawValue)
+            case let .bitmap(bitmap): data.append(UInt8(1)); data.append(bitmap.rawValue)
+            case let .discrete(count): data.append(UInt8(2)); data.append(count)
+            }
+            try data.appendOptional(format.magicCookie) { nested, cookie in try nested.appendLengthPrefixed(cookie) }
+        }
+    }
+
+    private static func canonicalByteCount(
+        trackSet: DemuxTrackSet,
+        parameterSetEntries: [HLSVideoParameterSetRetention.Entry],
+        audioSystemFormat: AudioSystemFormatFingerprintComponent?
+    ) throws -> Int {
+        var count = "VPlayer.MediaFormatFingerprint.v2".utf8.count + 1
+        func add(_ value: Int) throws { let result = count.addingReportingOverflow(value); guard !result.overflow else { throw MediaFormatFingerprintError.valueExceedsUInt32 }; count = result.partialValue }
+        try add(trackSet.selectedProgramID == nil ? 1 : 5)
+        if let video = trackSet.video { try add(1 + 4 + 1 + 4 + 4 + (video.frameRate == nil ? 1 : 9)); try add(4); try add(video.extradata.count) } else { try add(1) }
+        try add(4)
+        for entry in parameterSetEntries { try add(4); try add(entry.byteCount) }
+        if let audio = trackSet.audio { try add(1 + 4 + 1 + 4 + 4 + (audio.channelLayout.nativeMask == nil ? 1 : 9) + 4); try add(audio.extradata.count) } else { try add(1) }
+        guard let audioSystemFormat else { try add(1); return count }
+        try add(1 + 1 + 4 + 4 + 4 + 4)
+        switch audioSystemFormat.layout { case .tag: try add(1 + 4 + 4); case .bitmap, .discrete: try add(1 + 4) }
+        if let cookie = audioSystemFormat.magicCookie { try add(1 + 4); try add(cookie.count) } else { try add(1) }
+        return count
+    }
+
+    private static func canonicalByteCount(
+        trackSet: DemuxTrackSet,
+        parameterSetSizes: [Int],
+        audioSystemFormat: AudioSystemFormatFingerprintComponent?
+    ) throws -> Int {
+        var count = "VPlayer.MediaFormatFingerprint.v2".utf8.count + 1
+        func add(_ value: Int) throws {
+            let result = count.addingReportingOverflow(value)
+            guard !result.overflow else { throw MediaFormatFingerprintError.valueExceedsUInt32 }
+            count = result.partialValue
+        }
+        try add(trackSet.selectedProgramID == nil ? 1 : 5)
+        if let video = trackSet.video {
+            try add(1 + 4 + 1 + 4 + 4 + (video.frameRate == nil ? 1 : 9))
+            try add(4); try add(video.extradata.count)
+        } else { try add(1) }
+        try add(4)
+        for size in parameterSetSizes { try add(4); try add(size) }
+        if let audio = trackSet.audio {
+            try add(1 + 4 + 1 + 4 + 4 + (audio.channelLayout.nativeMask == nil ? 1 : 9) + 4)
+            try add(audio.extradata.count)
+        } else { try add(1) }
+        guard let audioSystemFormat else { try add(1); return count }
+        try add(1 + 1 + 4 + 4 + 4 + 4)
+        switch audioSystemFormat.layout {
+        case .tag: try add(1 + 4 + 4)
+        case .bitmap, .discrete: try add(1 + 4)
+        }
+        if let cookie = audioSystemFormat.magicCookie { try add(1 + 4); try add(cookie.count) }
+        else { try add(1) }
         return count
     }
 }
@@ -172,6 +254,11 @@ private extension Data {
     mutating func appendLengthPrefixed(_ value: Data) throws {
         append(try MediaFormatFingerprint.checkedCanonicalCount(value.count))
         append(value)
+    }
+
+    mutating func appendLengthPrefixed(_ value: borrowing Span<UInt8>) throws {
+        append(try MediaFormatFingerprint.checkedCanonicalCount(value.count))
+        value.withUnsafeBytes { append(contentsOf: $0) }
     }
 
     mutating func appendOptional<Value>(

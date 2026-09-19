@@ -9,6 +9,220 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SampleBufferBuilderTests: XCTestCase {
+    func testHLSOwnedBlockChargesBeforeCopyAndRetainsChargeWhileInputOverlaps() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let inputAdmission = HLSDataPlaneAdmission(
+            capacity: 1,
+            maximumBytes: 32,
+            applicationLedger: ledger
+        )
+        let admission = HLSOwnedBlockAdmission(
+            maximumPayloadBytes: 32,
+            capacity: 1,
+            applicationLedger: ledger
+        )
+        let input = Data([0x10, 0x20, 0x30, 0x40])
+        let inputLease = try XCTUnwrap(inputAdmission.acquire(
+            units: 1,
+            bytes: input.count,
+            applicationBytes: input.count
+        ))
+
+        let block = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+            copying: input.span,
+            admission: admission
+        )
+
+        let blockCharge = input.count + HLSOwnedBlockAdmission.fixedOwnerMetadataBytes
+        XCTAssertEqual(admission.debugAllocationChargeSnapshot, input.count + blockCharge)
+        XCTAssertEqual(ledger.chargedBytes, input.count + blockCharge)
+        XCTAssertEqual(try copiedBlockData(block), input)
+        XCTAssertEqual(input, Data([0x10, 0x20, 0x30, 0x40]))
+        inputLease.release()
+        XCTAssertEqual(ledger.chargedBytes, blockCharge)
+    }
+
+    func testHLSOwnedBlockKeepsChargeUntilLastBufferReferenceAfterSampleRelease() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSOwnedBlockAdmission(
+            maximumPayloadBytes: 32,
+            applicationLedger: ledger
+        )
+        let expectedCharge = 4 + HLSOwnedBlockAdmission.fixedOwnerMetadataBytes
+        let input = Data([0xAB, 0xCD, 0xEF, 0x01])
+        var reference: CMBlockBuffer? = try makeHLSBufferReferenceAlias(
+            input: input,
+            admission: admission
+        )
+
+        XCTAssertEqual(ledger.chargedBytes, expectedCharge)
+        XCTAssertEqual(try copiedBlockData(try XCTUnwrap(reference)), Data([0xAB, 0xCD, 0xEF, 0x01]))
+
+        reference = nil
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
+    func testHLSOwnedBlockFailureSeamsReleaseAdmissionExactlyOnce() throws {
+        for mode in HLSOwnedBlockAdmission.ConstructionMode.allCases where mode != .normal {
+            let ledger = HLSDeliveryApplicationChargeLedger()
+            let admission = HLSOwnedBlockAdmission(
+                maximumPayloadBytes: 32,
+                applicationLedger: ledger,
+                constructionMode: mode
+            )
+            let input = Data([0x01, 0x02, 0x03, 0x04])
+
+            var didThrow = false
+            do {
+                _ = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+                    copying: input.span,
+                    admission: admission
+                )
+            } catch {
+                didThrow = true
+            }
+            XCTAssertTrue(didThrow, "构造接缝 \(mode) 必须失败")
+            XCTAssertEqual(ledger.chargedBytes, 0, "\(mode) 不得遗留 application charge")
+            XCTAssertEqual(admission.usage.count, 0, "\(mode) 不得遗留 local lease")
+            switch mode {
+            case .normal:
+                XCTFail("normal 不属于失败接缝")
+            case .failBeforeAllocation:
+                XCTAssertEqual(admission.allocationAttemptCount, 0)
+                XCTAssertEqual(admission.freeBlockCount, 0)
+            case .failAllocation:
+                XCTAssertEqual(admission.allocationAttemptCount, 1, "必须实际调用 AllocateBlock")
+                XCTAssertEqual(admission.freeBlockCount, 0, "未提供 block 时 SDK 不得调用 FreeBlock")
+            case .failAfterAllocation,
+                 .failAfterAllocationFreeBeforeReturn,
+                 .failAfterAllocationFreeDuringFailureCleanup:
+                XCTAssertEqual(admission.allocationAttemptCount, 1, "已分配失败必须真的进入 AllocateBlock")
+                XCTAssertEqual(admission.freeBlockCount, 1, "已提供 block 后必须由唯一 FreeBlock 释放")
+                if mode == .failAfterAllocationFreeBeforeReturn {
+                    XCTAssertEqual(admission.debugFreeBlockCountBeforeFailureCleanup, 1)
+                }
+                if mode == .failAfterAllocationFreeDuringFailureCleanup {
+                    XCTAssertEqual(admission.debugFreeBlockCountBeforeFailureCleanup, 0)
+                }
+            }
+            XCTAssertEqual(admission.refConReleaseCount, 1, "每个失败分支只能消费一次 refCon")
+        }
+    }
+
+    func testHLSOwnedBlockPermanentRejectionDoesNotAllocateOrCharge() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSOwnedBlockAdmission(
+            maximumPayloadBytes: 3,
+            applicationLedger: ledger
+        )
+
+        let input = Data([0x01, 0x02, 0x03, 0x04])
+        var didThrow = false
+        do {
+            _ = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+                copying: input.span,
+                admission: admission
+            )
+        } catch {
+            didThrow = true
+        }
+        XCTAssertTrue(didThrow)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+        XCTAssertEqual(admission.usage.count, 0)
+    }
+
+    func testHLSOwnedBlockWaiterAdvancesAfterAliasReleaseAndLocalCancellationIsIndependent() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = HLSOwnedBlockAdmission(
+            maximumPayloadBytes: 32,
+            capacity: 1,
+            applicationLedger: ledger
+        )
+        let input = Data([0x01, 0x02, 0x03, 0x04])
+        var block: CMBlockBuffer? = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+            copying: input.span,
+            admission: admission
+        )
+        var alias: CMBlockBuffer?
+        XCTAssertEqual(
+            CMBlockBufferCreateWithBufferReference(
+                allocator: kCFAllocatorDefault,
+                referenceBuffer: try XCTUnwrap(block),
+                offsetToData: 0,
+                dataLength: input.count,
+                flags: 0,
+                blockBufferOut: &alias
+            ),
+            noErr
+        )
+        block = nil
+
+        let completed = expectation(description: "外部 alias 释放后 waiter 获得真实 local slot")
+        let releasedWaiter = WorkerOutcome()
+        DispatchQueue.global().async {
+            defer { completed.fulfill() }
+            let payload = Data([0x05, 0x06, 0x07, 0x08])
+            do {
+                _ = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+                    copying: payload.span,
+                    admission: admission
+                )
+                releasedWaiter.set(true)
+            } catch {
+                releasedWaiter.set(false)
+            }
+        }
+        XCTAssertTrue(admission.waitUntilWaitingCount(1), "第二个 producer 必须实际等待 local admission")
+        alias = nil
+        wait(for: [completed], timeout: 2)
+        XCTAssertTrue(releasedWaiter.value)
+
+        let held = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+            copying: input.span,
+            admission: admission
+        )
+        let cancelled = expectation(description: "等待中的 local admission 被 cancel 唤醒")
+        let observedExpectedCancellation = WorkerOutcome()
+        DispatchQueue.global().async {
+            defer { cancelled.fulfill() }
+            let payload = Data([0x09, 0x0A, 0x0B, 0x0C])
+            do {
+                _ = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+                    copying: payload.span,
+                    admission: admission
+                )
+            } catch let error as HLSOwnedBlockAdmissionError {
+                observedExpectedCancellation.set(error == .cancelled)
+            } catch {
+                observedExpectedCancellation.set(false)
+            }
+        }
+        XCTAssertTrue(admission.waitUntilWaitingCount(1), "cancel 前第二个 producer 必须已进入真实等待")
+        admission.cancel()
+        wait(for: [cancelled], timeout: 2)
+        XCTAssertTrue(observedExpectedCancellation.value)
+        XCTAssertEqual(
+            ledger.chargedBytes,
+            input.count + HLSOwnedBlockAdmission.fixedOwnerMetadataBytes,
+            "cancel 只关闭 local admission，已持有原 block 的费用仍在"
+        )
+        let sibling = HLSOwnedBlockAdmission(
+            maximumPayloadBytes: 32,
+            applicationLedger: ledger
+        )
+        var siblingError: Error?
+        do {
+            _ = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+                copying: input.span,
+                admission: sibling
+            )
+        } catch {
+            siblingError = error
+        }
+        XCTAssertNil(siblingError)
+        _ = held
+    }
+
     func testCompressedAudioOwnedByteCountEqualsCopiedBlockAndTotalSampleSize() throws {
         let payload = Data([0xDE, 0xAD, 0xBE, 0xEF, 0x42])
         let sampleBuffer = try SampleBufferBuilder.makeAudio(
@@ -287,6 +501,88 @@ final class SampleBufferBuilderTests: XCTestCase {
         ), noErr)
         XCTAssertEqual(size, MemoryLayout<AudioStreamPacketDescription>.size)
         return try XCTUnwrap(pointer?.pointee)
+    }
+
+    private func copiedBlockData(_ block: CMBlockBuffer) throws -> Data {
+        let length = CMBlockBufferGetDataLength(block)
+        var data = Data(count: length)
+        let status = data.withUnsafeMutableBytes { destination in
+            guard let baseAddress = destination.baseAddress else {
+                return kCMBlockBufferBadPointerParameterErr
+            }
+            return CMBlockBufferCopyDataBytes(
+                block,
+                atOffset: 0,
+                dataLength: length,
+                destination: baseAddress
+            )
+        }
+        XCTAssertEqual(status, noErr)
+        return data
+    }
+
+    private func makeReadySample(dataBuffer: CMBlockBuffer) throws -> CMSampleBuffer {
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+        var sampleSize = CMBlockBufferGetDataLength(dataBuffer)
+        var sample: CMSampleBuffer?
+        XCTAssertEqual(
+            CMSampleBufferCreateReady(
+                allocator: kCFAllocatorDefault,
+                dataBuffer: dataBuffer,
+                formatDescription: nil,
+                sampleCount: 1,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleSizeEntryCount: 1,
+                sampleSizeArray: &sampleSize,
+                sampleBufferOut: &sample
+            ),
+            noErr
+        )
+        return try XCTUnwrap(sample)
+    }
+
+    private func makeHLSBufferReferenceAlias(
+        input: Data,
+        admission: HLSOwnedBlockAdmission
+    ) throws -> CMBlockBuffer {
+        var block: CMBlockBuffer? = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
+            copying: input.span,
+            admission: admission
+        )
+        var sample: CMSampleBuffer? = try makeReadySample(dataBuffer: try XCTUnwrap(block))
+        var reference: CMBlockBuffer?
+        XCTAssertEqual(
+            CMBlockBufferCreateWithBufferReference(
+                allocator: kCFAllocatorDefault,
+                referenceBuffer: try XCTUnwrap(CMSampleBufferGetDataBuffer(try XCTUnwrap(sample))),
+                offsetToData: 0,
+                dataLength: input.count,
+                flags: 0,
+                blockBufferOut: &reference
+            ),
+            noErr
+        )
+        sample = nil
+        block = nil
+        return try XCTUnwrap(reference)
+    }
+
+    private final class WorkerOutcome: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = false
+
+        var value: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+
+        func set(_ value: Bool) {
+            lock.lock()
+            storage = value
+            lock.unlock()
+        }
     }
 }
 
