@@ -17,7 +17,9 @@ extern int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
     int32_t width,
     int32_t height,
     VPFFVideoFrameCallback callback,
-    void *context
+    void *context,
+    int32_t frame_flags,
+    int32_t decode_error_flags
 );
 
 static void vpff_record_validation_callback(void *context, const VPFFVideoFrame *frame) {
@@ -82,7 +84,9 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
             value.width,
             value.height,
             vpff_record_validation_callback,
-            &callback_count
+            &callback_count,
+            0,
+            0
         );
         XCTAssertEqual(status, unsupported, @"%s", value.name);
         XCTAssertEqual(callback_count, 0u, @"%s", value.name);
@@ -105,11 +109,38 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
         16,
         16,
         vpff_record_validation_callback,
-        &callback_count
+        &callback_count,
+        0,
+        0
     );
 
     XCTAssertEqual(status, 0);
     XCTAssertEqual(callback_count, 1u);
+}
+
+- (void)testCorruptDecodedFramesDoNotReachTheVideoCallback {
+    uint8_t luma[16 * 16] = {0};
+    uint8_t chroma_b[8 * 8] = {0};
+    uint8_t chroma_r[8 * 8] = {0};
+    const struct {
+        int32_t frame_flags;
+        int32_t decode_error_flags;
+    } cases[] = {
+        {25, 0}, // AV_FRAME_FLAG_CORRUPT | AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST
+        {0, 1}, // FF_DECODE_ERROR_INVALID_BITSTREAM
+        {0, 2}, // FF_DECODE_ERROR_MISSING_REFERENCE
+    };
+
+    for (NSUInteger index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        NSUInteger callback_count = 0;
+        const int32_t status = vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
+            0, luma, 16, chroma_b, 8, chroma_r, 8, 16, 16,
+            vpff_record_validation_callback, &callback_count,
+            cases[index].frame_flags, cases[index].decode_error_flags
+        );
+        XCTAssertEqual(status, 0, @"case %lu", (unsigned long)index);
+        XCTAssertEqual(callback_count, 0u, @"case %lu", (unsigned long)index);
+    }
 }
 
 @end
