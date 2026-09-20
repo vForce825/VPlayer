@@ -6100,7 +6100,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
 
         XCTAssertFalse(harness.pipeline.isReadyForPlayback)
 
-        for id in 1...15 {
+        for id in 1...5 {
             try perform(on: harness.executor) {
                 try harness.pipeline.enqueue(try self.makeSample(
                     id: UInt64(id),
@@ -6112,7 +6112,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
         drain(harness.executor)
 
-        XCTAssertEqual(compressed.snapshot.enqueuedPTS.count, 15)
+        XCTAssertEqual(compressed.snapshot.enqueuedPTS.count, 5)
         XCTAssertFalse(harness.pipeline.isReadyForPlayback)
 
         compressed.emit(.outputConfigurationChanged)
@@ -6127,11 +6127,80 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         compressed.configureReadiness(ready: true, sufficient: true)
         try perform(on: harness.executor) {
             try harness.pipeline.enqueue(try self.makeSample(
-                id: 16,
+                id: 6,
                 codec: .ac3,
-                pts: CMTime(value: 450, timescale: 1_000),
+                pts: CMTime(value: 150, timescale: 1_000),
                 duration: CMTime(value: 30, timescale: 1_000)
             ))
+        }
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+    }
+
+    func testCompressedRouteBecomesReadyWhenMinimumCompressedPrerollIsEnqueuedEvenIfSufficientFlagIsFalse() throws {
+        let harness = try makeHarness(codec: .ac3)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: false)
+
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        for id in 1...10 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    codec: .ac3,
+                    pts: CMTime(value: Int64((id - 1) * 30), timescale: 1_000),
+                    duration: CMTime(value: 30, timescale: 1_000)
+                ))
+            }
+        }
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+    }
+
+    func testCompressedRoutePrerollAdaptsToBluetoothOutputLatency() throws {
+        let harness = try makeHarness(codec: .ac3)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        compressed.configureReadiness(ready: true, sufficient: false)
+
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .bluetooth,
+            reason: .routeConfigurationChange,
+            revision: 1,
+            outputLatency: 0.20,
+            ioBufferDuration: 0.01
+        ))
+        drain(harness.executor)
+
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        // 10 samples * 30ms = 300ms < required (200ms + 10ms + 250ms = 460ms)
+        for id in 1...10 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    codec: .ac3,
+                    pts: CMTime(value: Int64((id - 1) * 30), timescale: 1_000),
+                    duration: CMTime(value: 30, timescale: 1_000)
+                ))
+            }
+        }
+        drain(harness.executor)
+
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+
+        // 6 more samples: total 16 * 30ms = 480ms >= 460ms
+        for id in 11...16 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(id),
+                    codec: .ac3,
+                    pts: CMTime(value: Int64((id - 1) * 30), timescale: 1_000),
+                    duration: CMTime(value: 30, timescale: 1_000)
+                ))
+            }
         }
         drain(harness.executor)
 

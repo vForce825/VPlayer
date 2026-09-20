@@ -3437,7 +3437,7 @@ final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked S
 
     static func makeSynchronizer() -> AVSampleBufferRenderSynchronizer {
         let synchronizer = AVSampleBufferRenderSynchronizer()
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
         return synchronizer
     }
 
