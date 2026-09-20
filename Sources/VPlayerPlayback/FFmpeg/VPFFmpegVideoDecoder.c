@@ -30,6 +30,10 @@ struct VPFFVideoDecoder {
 };
 
 static int32_t deliver_frame(VPFFVideoDecoder *decoder, const AVFrame *frame) {
+    // 损坏帧可能含有缺失参考帧造成的马赛克；等待后续完整帧，不中断解码会话。
+    if ((frame->flags & AV_FRAME_FLAG_CORRUPT) != 0 || frame->decode_error_flags != 0) {
+        return 0;
+    }
     // Only the one planar layout this pipeline can turn into NV12. A decoder
     // that produced anything else would otherwise be read as 4:2:0 and torn.
     if (frame->format != AV_PIX_FMT_YUV420P) {
@@ -94,7 +98,9 @@ int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
     int32_t width,
     int32_t height,
     VPFFVideoFrameCallback callback,
-    void *context
+    void *context,
+    int32_t frame_flags,
+    int32_t decode_error_flags
 );
 
 int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
@@ -108,7 +114,9 @@ int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
     int32_t width,
     int32_t height,
     VPFFVideoFrameCallback callback,
-    void *context
+    void *context,
+    int32_t frame_flags,
+    int32_t decode_error_flags
 ) {
     AVFrame frame = {0};
     frame.format = format;
@@ -120,6 +128,8 @@ int32_t vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
     frame.linesize[2] = chroma_r_stride;
     frame.width = width;
     frame.height = height;
+    frame.flags = frame_flags;
+    frame.decode_error_flags = decode_error_flags;
 
     VPFFVideoDecoder decoder = {
         .callback = callback,
@@ -208,9 +218,7 @@ int32_t vp_ffmpeg_video_decoder_create(
     // slice well, but successive frames pipeline across cores.
     owned->codec_context->thread_count = thread_count > 0 ? thread_count : 0;
     owned->codec_context->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    owned->codec_context->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
-    owned->codec_context->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
-
+    // 保持默认的关键帧门控，避免输出首个完整关键帧前的画面。
     int result = avcodec_open2(owned->codec_context, codec, NULL);
     if (result < 0) {
         vp_ffmpeg_video_decoder_destroy(owned);
