@@ -918,15 +918,8 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
     public func playbackMetricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? {
-        if let real = registry.metricsProjection(window: window)
-            ?? terminalMetricsProvider?.snapshot(window: window) {
-            return real
-        }
-        #if DEBUG
-        return PlaybackMetricsSnapshot.diagnosticPlaceholder()
-        #else
-        return nil
-        #endif
+        registry.metricsProjection(window: window)
+            ?? terminalMetricsProvider?.snapshot(window: window)
     }
 
     func publishRouteRecovering(request: PlaybackRequest) {

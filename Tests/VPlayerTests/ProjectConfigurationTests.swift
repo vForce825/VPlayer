@@ -143,17 +143,17 @@ final class ProjectConfigurationTests: XCTestCase {
 
         XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
         XCTAssertEqual(
-            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.5\"").count - 1,
+            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.6\"").count - 1,
             3,
             "the app and both embedded frameworks need a marketing version"
         )
-        XCTAssertFalse(projectYAML.contains("MARKETING_VERSION: \"1.4\""))
+        XCTAssertFalse(projectYAML.contains("MARKETING_VERSION: \"1.5\""))
         XCTAssertEqual(
-            generatedProject.components(separatedBy: "MARKETING_VERSION = 1.5;").count - 1,
+            generatedProject.components(separatedBy: "MARKETING_VERSION = 1.6;").count - 1,
             6,
-            "Debug and Release for the app and both embedded frameworks need version 1.5"
+            "Debug and Release for the app and both embedded frameworks need version 1.6"
         )
-        XCTAssertFalse(generatedProject.contains("MARKETING_VERSION = 1.4;"))
+        XCTAssertFalse(generatedProject.contains("MARKETING_VERSION = 1.5;"))
         XCTAssertEqual(
             projectYAML.components(separatedBy: "CURRENT_PROJECT_VERSION: \"1\"").count - 1,
             3,

@@ -346,10 +346,10 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(snapshot.audioRendererBackpressureCount, 50)
     }
 
-    func testSystemFactorySynchronizerDelaysRateChangesUntilMediaIsSufficient() {
+    func testSystemFactorySynchronizerDoesNotDelayRateChangesForMediaReadiness() {
         let synchronizer = SystemPlaybackPipelineFactory.makeSynchronizer()
 
-        XCTAssertTrue(synchronizer.delaysRateChangeUntilHasSufficientMediaData)
+        XCTAssertFalse(synchronizer.delaysRateChangeUntilHasSufficientMediaData)
     }
 
     func testCompressedRetryBeforeSharedGateOpenRequiresReplacementAudioPreroll() async throws {

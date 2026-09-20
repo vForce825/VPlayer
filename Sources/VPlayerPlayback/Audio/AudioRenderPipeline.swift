@@ -63,6 +63,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     // reservoir, which is governed by CompressedAudioRetentionPolicy.
     private static let pendingPCMCapacity = 96
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
+    private static let compressedStartupPrerollDuration = CMTime(value: 1, timescale: 4)
     private static let progressDeadlineDelay: DispatchTimeInterval = .seconds(1)
     private static let noOutputRouteDeadlineDelay: DispatchTimeInterval = .seconds(3)
     private static let noOutputRouteError = "audio.output-route.unavailable"
@@ -239,6 +240,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private var needsDecoderResetBeforeNextCompressedEnqueue = false
     private var pcmPrerollStart: CMTime?
     private var pcmPrerollEnd: CMTime?
+    private var compressedPrerollStart: CMTime?
+    private var compressedPrerollEnd: CMTime?
     private var acceptedCompressedRunStart: CMTime?
     private var acceptedCompressedRunEnd: CMTime?
     private var consecutiveInvalidPacketCount = 0
@@ -1784,6 +1787,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             replay[index].sentCompressed = true
             if !replay[index].acceptedCompressed {
                 replay[index].acceptedCompressed = true
+                recordCompressedPreroll(sample)
                 recordAcceptedCompressedMedia(sample)
             }
             beginStartupWaitIfNeeded()
@@ -2068,7 +2072,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             renderer?.hasSufficientMediaDataForReliablePlaybackStart == true
         if !startupPrerollSatisfied {
             let pcmHasPreroll = route == .ffmpegPCM && hasMinimumPCMPreroll
-            startupPrerollSatisfied = rendererSufficient || pcmHasPreroll
+            let compressedHasPreroll = route == .systemCompressed && hasMinimumCompressedPreroll
+            startupPrerollSatisfied = rendererSufficient || pcmHasPreroll || compressedHasPreroll
         }
         if startupPrerollSatisfied {
             freezeStartupWaitIfNeeded()
@@ -2079,6 +2084,26 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             rendererReady: rendererReady,
             rendererSufficient: rendererSufficient
         )
+    }
+
+    private var requiredCompressedStartupPrerollDuration: CMTime {
+        guard let lastRouteSnapshot else { return Self.compressedStartupPrerollDuration }
+        let latency = max(0, lastRouteSnapshot.outputLatency) + max(0, lastRouteSnapshot.ioBufferDuration)
+        if latency > 0.05 {
+            let dynamicPreroll = CMTime(seconds: latency + 0.25, preferredTimescale: 1_000)
+            return CMTimeCompare(dynamicPreroll, Self.compressedStartupPrerollDuration) > 0
+                ? dynamicPreroll
+                : Self.compressedStartupPrerollDuration
+        }
+        return Self.compressedStartupPrerollDuration
+    }
+
+    private var hasMinimumCompressedPreroll: Bool {
+        guard let start = compressedPrerollStart,
+              let end = compressedPrerollEnd else { return false }
+        let duration = CMTimeSubtract(end, start)
+        return duration.isNumeric &&
+            CMTimeCompare(duration, requiredCompressedStartupPrerollDuration) > 0
     }
 
     private var hasMinimumPCMPreroll: Bool {
@@ -2124,9 +2149,41 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
+    private func recordCompressedPreroll(_ sample: CompressedAudioSample) {
+        let pts = sample.presentationTimeStamp
+        let duration = sample.duration
+        let end = CMTimeAdd(pts, duration)
+        guard pts.isNumeric,
+              duration.isNumeric,
+              CMTimeCompare(duration, .zero) > 0,
+              end.isNumeric else { return }
+
+        guard let currentStart = compressedPrerollStart,
+              let currentEnd = compressedPrerollEnd else {
+            compressedPrerollStart = pts
+            compressedPrerollEnd = end
+            return
+        }
+        guard CMTimeCompare(pts, currentStart) >= 0,
+              CMTimeCompare(pts, currentEnd) <= 0 else {
+            compressedPrerollStart = pts
+            compressedPrerollEnd = end
+            return
+        }
+        if CMTimeCompare(end, currentEnd) > 0 {
+            compressedPrerollEnd = end
+        }
+    }
+
+    private func resetCompressedPreroll() {
+        compressedPrerollStart = nil
+        compressedPrerollEnd = nil
+    }
+
     private func resetPCMPreroll() {
         pcmPrerollStart = nil
         pcmPrerollEnd = nil
+        resetCompressedPreroll()
     }
 
     private func recordAcceptedCompressedMedia(_ sample: CompressedAudioSample) {
