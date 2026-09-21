@@ -221,8 +221,11 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         admissionReferences -= 1
     }
 
-    static func make(player: AVPlayer? = nil,
-                     deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)? = nil) throws -> SystemAVPlayerDriver {
+    static func make(
+        player: AVPlayer? = nil,
+        deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)? = nil,
+        preferredForwardBufferDuration: TimeInterval = 3
+    ) throws -> SystemAVPlayerDriver {
         let resourceReservation = try PlaybackResourceContextLedger.shared.reserve(
             allocationIdentity: .stable(UUID()), bytes: 8 * 1_024)
         var resourceTransferred = false
@@ -247,6 +250,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard player?.currentItem == nil else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         let driver = try SystemAVPlayerDriver(player: player ?? AVPlayer(),
             deadlineScheduler: deadlineScheduler, admission: admission,
+            preferredForwardBufferDuration: preferredForwardBufferDuration,
             resourceContextReservation: resourceReservation)
         transferred = true
         try PlaybackResourceContextLedger.shared.rebind(
@@ -255,6 +259,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         return driver
     }
     let player: AVPlayer
+    let preferredForwardBufferDuration: TimeInterval
     private var item: AVPlayerItem?
     private(set) var currentItemIdentity: AVPlayerItemInstanceIdentity?
     let prepareWait = AVPlayerPrepareWaitSlot()
@@ -279,9 +284,11 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     private init(player: AVPlayer, deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)?,
                  admission: AVPlayerDriverAdmission,
+                 preferredForwardBufferDuration: TimeInterval,
                  resourceContextReservation: PlaybackResourceContextReservation) throws {
         self.player = player
         self.deadlineScheduler = deadlineScheduler
+        self.preferredForwardBufferDuration = preferredForwardBufferDuration
         self.resourceContextReservation = resourceContextReservation
         eventHub = try AVPlayerDriverEventHub.make(
             admission: admission, resourceContextReservation: resourceContextReservation)
@@ -313,7 +320,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         player.pause()
         player.automaticallyWaitsToMinimizeStalling = true
         let installed = AVPlayerItem(url: url)
-        installed.preferredForwardBufferDuration = 3
+        installed.preferredForwardBufferDuration = preferredForwardBufferDuration
         installed.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         player.replaceCurrentItem(with: installed)
         item = installed

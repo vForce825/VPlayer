@@ -2508,7 +2508,8 @@ final class LongPlaybackAcceptanceTests: XCTestCase {
 
         XCTAssertGreaterThan(snapshot.residentMemoryBytes, 0)
         XCTAssertLessThanOrEqual(snapshot.maximumYADIFInFlightCount, 3)
-        XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 4)
+        // 验收启动会重置为 8 帧容量；参考窗口可在调度前短暂持有下一帧。
+        XCTAssertLessThanOrEqual(snapshot.maximumYADIFInputDepth, 9)
         XCTAssertEqual(snapshot.audioContinuityDropCountsByReason.count, 5)
         XCTAssertGreaterThanOrEqual(snapshot.audioPendingSampleCount, 0)
         XCTAssertLessThanOrEqual(snapshot.audioPendingSampleCount, 1_120)

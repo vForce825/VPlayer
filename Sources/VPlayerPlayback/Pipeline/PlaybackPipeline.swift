@@ -435,6 +435,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private var pendingVideoDecode = CompressedVideoReservoir(
         limits: PlaybackPipeline.pendingDecodeVideoRetentionLimits
     )
+    private var interlacedStartupPrerollGeneration: MediaGeneration?
+    private var interlacedStartupRandomAccessCount = 0
+    private var interlacedStartupSecondRandomAccessPTS: CMTime?
+    private var interlacedStartupLatestEndPTS: CMTime?
     private var pendingVideoDrainScheduled = false
     private var pendingVideoDrainToken: UInt64 = 0
     private var pendingVideoRecoveryAnchor: CMTime?
@@ -1291,6 +1295,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private func admitVideoAccessUnitIsolated(_ accessUnit: CompressedVideoAccessUnit) {
         assertIsolated()
         guard generationController.accepts(accessUnit.generation) else { return }
+        observeInterlacedStartupPrerollIsolated(accessUnit)
         pendingVideoDecode.removeAll {
             !generationController.accepts($0.generation)
         }
@@ -1537,6 +1542,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         _ accessUnit: CompressedVideoAccessUnit
     ) -> Bool {
         assertIsolated()
+        if retainedVideo.isEmpty,
+           interlacedStartupPrerollGeneration == accessUnit.generation,
+           !hasInterlacedStartupPrerollIsolated() {
+            return true
+        }
         guard !retainedVideo.isEmpty else { return false }
         // A provisional raw frame cannot satisfy video readiness while scan
         // classification is unresolved. Keep feeding the bounded decoder/probe
@@ -1590,6 +1600,60 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         // The intervals overlap but the selected route still needs more frames
         // (for example the two field-rate outputs required by YADIF).
         return false
+    }
+
+    private func hasInterlacedStartupPrerollIsolated() -> Bool {
+        assertIsolated()
+        guard let start = interlacedStartupSecondRandomAccessPTS,
+              let latestEnd = interlacedStartupLatestEndPTS else { return false }
+        let duration = CMTimeSubtract(latestEnd, start)
+        // 菜单中的“视频缓冲”同时定义起播前实际积累的媒体时长；
+        // 隔行转 50p 只增加输出帧数，不改变这里比较的媒体时间。
+        return duration.isNumeric
+            && CMTimeCompare(duration, tuning.videoBufferHorizon) >= 0
+    }
+
+    private func observeInterlacedStartupPrerollIsolated(
+        _ accessUnit: CompressedVideoAccessUnit
+    ) {
+        assertIsolated()
+        guard !hasOpenedReadinessForCurrentMedia else { return }
+        if interlacedStartupPrerollGeneration != accessUnit.generation {
+            resetInterlacedStartupPrerollIsolated()
+        }
+        if interlacedStartupPrerollGeneration == nil {
+            guard accessUnit.parserMetadata.isInterlaced == true else { return }
+            interlacedStartupPrerollGeneration = accessUnit.generation
+        }
+
+        if accessUnit.isRandomAccess, interlacedStartupRandomAccessCount < 2 {
+            interlacedStartupRandomAccessCount += 1
+            if interlacedStartupRandomAccessCount == 2 {
+                let pts = CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer)
+                guard pts.isNumeric else { return }
+                interlacedStartupSecondRandomAccessPTS = pts
+                interlacedStartupLatestEndPTS = pts
+            }
+        }
+        guard let start = interlacedStartupSecondRandomAccessPTS else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer)
+        guard pts.isNumeric, CMTimeCompare(pts, start) >= 0 else { return }
+        let duration = CMSampleBufferGetDuration(accessUnit.sampleBuffer)
+        let end = duration.isNumeric && CMTimeCompare(duration, .zero) > 0
+            ? CMTimeAdd(pts, duration)
+            : pts
+        if end.isNumeric,
+           interlacedStartupLatestEndPTS.map({ CMTimeCompare(end, $0) > 0 }) ?? true {
+            interlacedStartupLatestEndPTS = end
+        }
+    }
+
+    private func resetInterlacedStartupPrerollIsolated() {
+        assertIsolated()
+        interlacedStartupPrerollGeneration = nil
+        interlacedStartupRandomAccessCount = 0
+        interlacedStartupSecondRandomAccessPTS = nil
+        interlacedStartupLatestEndPTS = nil
     }
 
     // Decode order and presentation order differ for B-frame streams. A future
@@ -3367,6 +3431,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private func setSharedTimelineOpenedIsolated(_ opened: Bool) {
         assertIsolated()
         hasOpenedReadinessForCurrentMedia = opened
+        resetInterlacedStartupPrerollIsolated()
         audio.setSharedTimelineOpened(opened)
     }
 
