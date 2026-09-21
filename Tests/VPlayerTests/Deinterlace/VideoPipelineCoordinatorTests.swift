@@ -256,6 +256,104 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
         XCTAssertTrue(harness.yadif.submissions.isEmpty)
     }
 
+    func testInitialRandomAccessPreparesDecoderBeforeConfiguration() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        harness.trace.removeAll()
+        let generation = harness.host.generation
+
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try PlaybackFakeMedia.accessUnit(
+            id: 3,
+            generation: generation,
+            randomAccess: true
+        )))
+
+        let trace = harness.trace.values
+        let preparation = try XCTUnwrap(trace.firstIndex(of: "decoder.prepare:3"))
+        let configuration = try XCTUnwrap(trace.firstIndex(
+            of: "decoder.transition.configure:\(generation.rawValue)"
+        ))
+        XCTAssertLessThan(preparation, configuration)
+    }
+
+    func testInterlacedStartupWaitsForSecondRandomAccessGOP() throws {
+        let harness = makeHarness()
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+
+        func interlacedUnit(id: UInt64, randomAccess: Bool) throws
+            -> CompressedVideoAccessUnit {
+            let base = try PlaybackFakeMedia.accessUnit(
+                id: id,
+                generation: generation,
+                randomAccess: randomAccess
+            )
+            return CompressedVideoAccessUnit(
+                id: base.id,
+                sampleBuffer: base.sampleBuffer,
+                generation: base.generation,
+                isRandomAccess: randomAccess,
+                parserMetadata: VideoParserMetadata(
+                    fieldOrder: .tt,
+                    pictureStructure: .frame,
+                    isInterlaced: true,
+                    repeatFirstField: false,
+                    topFieldFirst: true,
+                    sourcePTS90k: nil
+                )
+            )
+        }
+
+        XCTAssertFalse(harness.coordinator.handle(accessUnit: try interlacedUnit(
+            id: 10, randomAccess: true
+        )))
+        XCTAssertFalse(harness.coordinator.handle(accessUnit: try interlacedUnit(
+            id: 11, randomAccess: false
+        )))
+        XCTAssertFalse(harness.decoder.snapshot().contains { operation in
+            if case .transitionConfigure = operation { return true }
+            return false
+        })
+
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: try interlacedUnit(
+            id: 12, randomAccess: true
+        )))
+        XCTAssertTrue(harness.decoder.snapshot().contains(
+            .decode(12, generation, ._EnableAsynchronousDecompression)
+        ))
+    }
+
+    func testHLSInterlacedStartupKeepsFirstRandomAccessGOP() throws {
+        let admission = CoordinatorAtomicAdmission(results: [])
+        let harness = makeHarness(atomicEncodingAdmission: admission)
+        harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
+        let generation = harness.host.generation
+        let base = try PlaybackFakeMedia.accessUnit(
+            id: 13,
+            generation: generation,
+            randomAccess: true
+        )
+        let firstRandomAccess = CompressedVideoAccessUnit(
+            id: base.id,
+            sampleBuffer: base.sampleBuffer,
+            generation: base.generation,
+            isRandomAccess: true,
+            parserMetadata: VideoParserMetadata(
+                fieldOrder: .tt,
+                pictureStructure: .frame,
+                isInterlaced: true,
+                repeatFirstField: false,
+                topFieldFirst: true,
+                sourcePTS90k: nil
+            )
+        )
+
+        XCTAssertTrue(harness.coordinator.handle(accessUnit: firstRandomAccess))
+        XCTAssertTrue(harness.decoder.snapshot().contains(
+            .decode(13, generation, ._EnableAsynchronousDecompression)
+        ))
+    }
+
     func testConfigureTransitionRetainsTriggeringRandomAccessUntilMatchingCompletion() throws {
         let harness = makeHarness(automaticallyCompletesTransitions: false)
         harness.coordinator.replaceFormat(try PlaybackFakeMedia.videoFormat())
@@ -2815,6 +2913,13 @@ private final class RecordingCoordinatorDecoder: VideoDecoding, @unchecked Senda
         _ sink: @escaping @Sendable (VideoDecoderEvent) -> Void
     ) {
         transitionEventSink = sink
+    }
+
+    func prepareConfiguration(
+        for accessUnit: CompressedVideoAccessUnit,
+        format _: CMVideoFormatDescription
+    ) {
+        trace.append("decoder.prepare:\(accessUnit.id)")
     }
 
     func transition(_ transition: VideoDecoderTransition) {

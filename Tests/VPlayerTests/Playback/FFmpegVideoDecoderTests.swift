@@ -2124,6 +2124,39 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         XCTAssertEqual(ffmpeg.snapshot().first, .transitionConfigure(ffmpegToken, generation))
     }
 
+    func testRoutingSelectsFFmpegForFirstInterlacedRandomAccess() throws {
+        let videoToolbox = FakeVideoDecoder()
+        let ffmpeg = FakeVideoDecoder()
+        let decoder = RoutingVideoDecoder(
+            videoToolbox: videoToolbox,
+            ffmpeg: ffmpeg,
+            eventSink: { _ in }
+        )
+        let format = try makeFormat(fieldCount: 1)
+        let base = makeAccessUnit(id: 39)
+        let firstRandomAccess = CompressedVideoAccessUnit(
+            id: base.id,
+            sampleBuffer: base.sampleBuffer,
+            generation: base.generation,
+            isRandomAccess: true,
+            parserMetadata: VideoParserMetadata(
+                fieldOrder: .tt,
+                pictureStructure: .frame,
+                isInterlaced: true,
+                repeatFirstField: false,
+                topFieldFirst: true,
+                sourcePTS90k: nil
+            )
+        )
+
+        decoder.prepareConfiguration(for: firstRandomAccess, format: format)
+        let token = VideoDecoderTransitionToken()
+        decoder.transition(.configure(token: token, format: format, generation: generation))
+
+        XCTAssertEqual(ffmpeg.snapshot().first, .transitionConfigure(token, generation))
+        XCTAssertTrue(videoToolbox.snapshot().isEmpty)
+    }
+
     func testRoutingParserRequiresFFmpegTransitionOnlyAtInterlacedRandomAccess() throws {
         let videoToolbox = FakeVideoDecoder()
         let ffmpeg = FakeVideoDecoder()

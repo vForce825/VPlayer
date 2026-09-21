@@ -263,6 +263,10 @@ public enum VideoDecoderEvent: @unchecked Sendable {
 }
 
 public protocol VideoDecoding: AnyObject {
+    func prepareConfiguration(
+        for accessUnit: CompressedVideoAccessUnit,
+        format: CMVideoFormatDescription
+    )
     func transition(_ transition: VideoDecoderTransition)
     func transitionRequirement(
         for accessUnit: CompressedVideoAccessUnit
@@ -278,6 +282,11 @@ public protocol VideoDecoding: AnyObject {
 }
 
 public extension VideoDecoding {
+    func prepareConfiguration(
+        for _: CompressedVideoAccessUnit,
+        format _: CMVideoFormatDescription
+    ) {}
+
     func transitionRequirement(
         for _: CompressedVideoAccessUnit
     ) -> VideoDecoderTransitionRequirement? { nil }
