@@ -266,6 +266,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var activeProbeSignpostLifetime: PlaybackSignpostLifetime?
     private var decoderConfigured = false
     private var waitingForRandomAccess = true
+    private var hasSkippedInitialInterlacedGOP = false
     private var activeDecoderIdentity: VideoDecoderEventIdentity?
     private var pendingDecoderConfiguration: PendingDecoderConfiguration?
     private var pendingDecoderInvalidation: PendingDecoderInvalidation?
@@ -435,6 +436,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         videoFormat = format
         decoderConfigured = false
         waitingForRandomAccess = true
+        hasSkippedInitialInterlacedGOP = false
         activeDecoderIdentity = nil
         pendingDecoderConfiguration = nil
         pendingDecoderInvalidation?.reopenAdmission = true
@@ -495,6 +497,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         videoFormat = format
         decoderConfigured = false
         waitingForRandomAccess = true
+        hasSkippedInitialInterlacedGOP = false
         activeDecoderIdentity = nil
         pendingDecoderConfiguration = nil
         recoveryBudget.beginMediaEpoch()
@@ -536,6 +539,14 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         if waitingForRandomAccess {
             guard accessUnit.isRandomAccess, let videoFormat else {
                 recordHLSIDRRejection(accessUnit, reason: "awaitingRandomAccess")
+                return false
+            }
+            if !hasSkippedInitialInterlacedGOP,
+               atomicEncodingAdmission == nil,
+               accessUnit.parserMetadata.isInterlaced == true,
+               CMFormatDescriptionGetMediaSubType(videoFormat) == kCMVideoCodecType_H264 {
+                // 实机观察到首个隔行 GOP 偶发块状损坏；等下一个随机访问点再呈现。
+                hasSkippedInitialInterlacedGOP = true
                 return false
             }
             beginDecoderConfiguration(
@@ -600,6 +611,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             accessUnit: accessUnit
         )
         let deadlineRevision = armDecoderTransitionDeadline()
+        decoder.prepareConfiguration(for: accessUnit, format: format)
         decoder.transition(.configure(
             token: token,
             format: format,

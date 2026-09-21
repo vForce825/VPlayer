@@ -1017,14 +1017,7 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
         self.eventSink = eventSink
     }
 
-    /// A field count above one is the format description stating that the coded
-    /// pictures are fields — the one case VideoToolbox has no hardware path for.
-    ///
-    /// Streams frequently do not say so here, and the parser learns it from the
-    /// pictures instead. Routing on *that* is not wired up, and must not be until
-    /// the planar-to-biplanar conversion below stops costing more than it saves:
-    /// measured on device, the FFmpeg route spent 104 ms a frame against
-    /// VideoToolbox's 35 ms, almost all of it in the scalar chroma interleave.
+    /// 格式描述若明确标出多个场，直接使用 FFmpeg；未标出的流由首个随机访问帧的解析结果决定。
     static func prefersFFmpeg(for format: CMVideoFormatDescription) -> Bool {
         guard CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264 else {
             return false
@@ -1034,6 +1027,21 @@ final class RoutingVideoDecoder: VideoDecoding, @unchecked Sendable {
             extensionKey: kCMFormatDescriptionExtension_FieldCount
         ) as? NSNumber
         return (fieldCount?.intValue ?? 1) > 1
+    }
+
+    func prepareConfiguration(
+        for accessUnit: CompressedVideoAccessUnit,
+        format: CMVideoFormatDescription
+    ) {
+        guard accessUnit.isRandomAccess,
+              accessUnit.parserMetadata.isInterlaced == true,
+              CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264 else {
+            return
+        }
+        lock.withLock {
+            guard pendingTransition == nil else { return }
+            requestedRoute = .ffmpeg
+        }
     }
 
     func transition(_ transition: VideoDecoderTransition) {
