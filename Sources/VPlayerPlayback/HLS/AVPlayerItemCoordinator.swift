@@ -42,6 +42,15 @@ struct AVPlayerDirectState: Sendable, Equatable {
     let timeControlStatus: AVPlayer.TimeControlStatus
 }
 
+enum AVPlayerStartupBufferPolicy {
+    static func coverageDuration(seconds: TimeInterval) -> ExactMediaTime {
+        ExactMediaTime(
+            value: Int64((seconds * 1_000).rounded()),
+            timescale: 1_000
+        )
+    }
+}
+
 enum AVPlayerPreparationFence: String, Sendable, CaseIterable {
     case coverage, seek, loadedTimeRanges, preroll, preparedCAS, positiveRateAdmission
 }
@@ -50,6 +59,7 @@ enum AVPlayerPreparationFence: String, Sendable, CaseIterable {
 protocol AVPlayerDriving: AnyObject {
     var rate: Float { get }
     var timeControlStatus: AVPlayer.TimeControlStatus { get }
+    var preferredForwardBufferDuration: TimeInterval { get }
     var currentItemIdentity: AVPlayerItemInstanceIdentity? { get }
     var activeWaiterCount: Int { get }
     var fixedTimerCount: Int { get }
@@ -105,6 +115,7 @@ protocol AVPlayerDriving: AnyObject {
 extension AVPlayerDriving {
     var activeWaiterCount: Int { 0 }
     var fixedTimerCount: Int { 0 }
+    var preferredForwardBufferDuration: TimeInterval { 3 }
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws {}
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws {}
     func retainInstallationResourceContext(_ reservation: PlaybackResourceContextReservation) {}
@@ -1445,7 +1456,10 @@ final class AVPlayerItemCoordinator {
                 || timeline.renditionIdentity == selectedRenditions.first else {
             throw AVPlayerItemCoordinatorFailure.invalidTimeline
         }
-        let lead = ExactMediaTime(value: 3, timescale: 1)
+        // HomePod 使用 HLS/AVPlayer 后端，起播覆盖时长与菜单“视频缓冲”保持一致。
+        let lead = AVPlayerStartupBufferPolicy.coverageDuration(
+            seconds: driver.preferredForwardBufferDuration
+        )
         let limit = try timeline.effectivePlaybackHorizon.subtracting(lead)
         guard let boundary = timeline.commonSampleBoundaries.lazy
             .filter({ Self.compare($0, limit) <= 0 })

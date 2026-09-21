@@ -77,7 +77,11 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
             } else {
                 builder = try SystemHLSOutputItemBundleBuilder(sourceURL: url)
             }
-            let driver = try await MainActor.run { try SystemAVPlayerDriver.make() }
+            let driver = try await MainActor.run {
+                try SystemAVPlayerDriver.make(
+                    preferredForwardBufferDuration: tuning.videoBufferSeconds
+                )
+            }
             let presentation = await MainActor.run {
                 AVPlayerPresentationContext(player: driver.player)
             }

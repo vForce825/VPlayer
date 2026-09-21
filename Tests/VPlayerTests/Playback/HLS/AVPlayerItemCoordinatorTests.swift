@@ -98,6 +98,39 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed) }
     }
 
+    func testSystemDriverUsesConfiguredStartupBufferForHomePodHLS() throws {
+        let player = AVPlayer()
+        let driver = try SystemAVPlayerDriver.make(
+            player: player,
+            preferredForwardBufferDuration: 2
+        )
+        let item = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 24_102),
+            itemGeneration: 1
+        )
+
+        try driver.install(
+            url: URL(string: "http://127.0.0.1:1/configured-buffer.m3u8")!,
+            identity: item
+        )
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+
+        XCTAssertEqual(driver.preferredForwardBufferDuration, 2)
+        XCTAssertEqual(player.currentItem?.preferredForwardBufferDuration, 2)
+    }
+
+    func testHomePodStartupCoveragePreservesEveryVideoBufferChoice() {
+        for seconds in PlaybackTuning.videoBufferSecondsChoices {
+            XCTAssertEqual(
+                AVPlayerStartupBufferPolicy.coverageDuration(seconds: seconds),
+                ExactMediaTime(
+                    value: Int64((seconds * 1_000).rounded()),
+                    timescale: 1_000
+                )
+            )
+        }
+    }
+
     func testSDKFixedStopReplaysExactFailureAndMeasuresObjects() async throws {
         for failure in [AVPlayerItemCoordinatorFailure.staleIdentity, .directPauseNotConfirmed, .itemFailed] {
             let harness = try await Task21Harness()
