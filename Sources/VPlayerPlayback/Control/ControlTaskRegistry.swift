@@ -1155,6 +1155,17 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }
         }
 
+        private func recoveryFailureStage(
+            for purpose: AudioSessionCompletionPurpose
+        ) -> PlaybackAudioSessionRecoveryFailureStage? {
+            switch purpose {
+            case .retainedConfiguration: .mediaServicesResetConfiguration
+            case .resetActivation: .mediaServicesResetActivation
+            case .reactivation: .interruptionReactivation
+            default: nil
+            }
+        }
+
         /// 只在本次completion的同锁调用链消费；大context在分类返回时结束，不携出授权。
         private func audioSessionFailureTransitionContext(purpose: AudioSessionCompletionPurpose,
             result: AudioSessionBlockingCallResult) -> UInt64? {
@@ -1392,7 +1403,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     }
                     snapshot.output = output
                     return .completed(.init(disposition: accepted ? .accepted : .settled, followUp: followUp, failure: nil,
-                        reactivationReceipt: reactivationReceipt, terminalOwner: terminalOwner),
+                        reactivationReceipt: reactivationReceipt, terminalOwner: terminalOwner,
+                        terminalRecoveryFailureStage: terminalOwner == nil ? nil : recoveryFailureStage(for: purpose)),
                         output, freezeGeneration: snapshot.freezeGeneration, audioAdmissionFenceRevision: snapshot.audioAdmissionFenceRevision)
                 } catch {
                     // 已归还permit和真实terminal不回滚；尤其success不能因后继耗尽而遗失deactivate责任。
@@ -3620,7 +3632,13 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 // 登记barrier可能刚消费terminal；先公开/启动原owner再交还caller。
                 // stale/第二waiter本身不制造终态，唯一入口仍核对真实poisoned context。
                 reconcilePlaybackRuntime()
-                if let owner = acquisitionFailureOwner { startAudioSessionFailureCleanup(owner: owner) }
+                if let owner = acquisitionFailureOwner {
+                    startAudioSessionFailureCleanup(owner: owner, failure: .init(
+                        code: "audio.session.acquire",
+                        userMessage: "音频会话获取过程中状态失效，请重新选择频道。",
+                        diagnosticCode: "audio.session.acquire.state-invalid"
+                    ))
+                }
                 continuation.resume(returning: false)
             }
         }
@@ -4428,34 +4446,35 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// 真实SDK失败在同锁completion签发terminal owner；只借原图relay中的接收者，不能投到新session。
-    func startAudioSessionFailureCleanup(owner: OutputTransitionOwnerTicket) {
-        let receiver: (any PlaybackOwnedCleanupReceiving)? = try? transaction { _ in
-            guard let context = authority.outputContext, context.owner == owner,
-                  owner.reason.releasesLease else { return nil }
-            for record in authority.commands {
-                guard let record, record.slot == .systemEventRelay,
-                      case .eventDrain(let runner) = record.payload,
-                      case .audio(let relay) = runner.relay else { continue }
-                return relay.terminalReceiver
-            }
-            return nil
-        }
-        guard let receiver else { return }
-        let failure = PlaybackState.failed(.init(code: "audio.session.activation",
-            userMessage: "无法启用音频播放，请检查播放设备后重试。"))
+    func startAudioSessionFailureCleanup(owner: OutputTransitionOwnerTicket, failure: PlaybackFailure) {
         executor.sync {
-            _ = startOwnedTerminalCleanup(owner: owner, receiver: receiver, terminalState: failure)
+            let receiver: (any PlaybackOwnedCleanupReceiving)? = try? transaction { _ in
+                guard let context = authority.outputContext, context.owner == owner,
+                      owner.reason.releasesLease else { return nil }
+                for record in authority.commands {
+                    guard let record, record.slot == .systemEventRelay,
+                          case .eventDrain(let runner) = record.payload,
+                          case .audio(let relay) = runner.relay else { continue }
+                    return relay.terminalReceiver
+                }
+                return nil
+            }
+            // SDK 可能先于 relay 绑定完成；先保留真实错误，稍后由控制器领取原 owner 清理。
             let subscription: PlaybackStateSubscription? = try? transaction { _ in
                 guard let context = authority.outputContext, context.owner == owner,
-                      context.disposition == .releaseAfterTeardown, !context.poisoned,
-                      authority.runningCleanupOwner(context.reservation) == owner else { return nil }
+                      context.disposition == .releaseAfterTeardown, !context.poisoned else { return nil }
                 if case .coldStart(let admission) = authority.playbackRequestAdmission,
                    admission.identity.sessionIdentity != context.sessionIdentity { return nil }
-                guard authority.publicState != failure else { return nil }
-                authority.publicState = failure
+                // 同一个 terminal owner 只能确定一次用户可见原因；进展检查不得覆盖真实 SDK 错误。
+                if case .failed = authority.publicState { return nil }
+                authority.publicState = .failed(failure)
                 return authority.stateSubscription
             }
-            subscription?.continuation.yield(failure)
+            subscription?.continuation.yield(.failed(failure))
+            if let receiver, case let .failed(currentFailure) = playbackStateSnapshot() {
+                _ = startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+                    terminalState: .failed(currentFailure))
+            }
         }
     }
 

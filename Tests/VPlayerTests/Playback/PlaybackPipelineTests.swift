@@ -2076,8 +2076,9 @@ final class PlaybackPipelineTests: XCTestCase {
         guard case let .failed(failure) = await controller.currentStateForTesting else {
             return XCTFail("激活失败必须发布 failed 状态")
         }
-        XCTAssertEqual(failure.code, "audio.session.activation")
-        XCTAssertNil(failure.diagnosticCode)
+        XCTAssertEqual(failure.code, "audio.session.activate")
+        XCTAssertNotNil(failure.diagnosticCode)
+        XCTAssertTrue(failure.userMessage.contains("音频会话激活失败"))
         XCTAssertEqual(owner.callCountSnapshot, 1)
         XCTAssertEqual(factory.makeCountSnapshot, 0)
         XCTAssertTrue(pipeline.snapshot().starts.isEmpty)

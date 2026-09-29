@@ -224,7 +224,13 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
                 }
             }
             if let owner = completion.terminalOwner {
-                registry.startAudioSessionFailureCleanup(owner: owner)
+                registry.startAudioSessionFailureCleanup(
+                    owner: owner,
+                    failure: AudioSessionFailurePresentation.failure(
+                        operation: delivery.request.permit.operation, result: result,
+                        recoveryStage: completion.terminalRecoveryFailureStage
+                    )
+                )
             }
             delivery.receiver.receiveAudioSessionCompletion(permit: delivery.request.permit, completion: completion)
         }

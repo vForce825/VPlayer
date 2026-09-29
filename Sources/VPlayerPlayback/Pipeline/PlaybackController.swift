@@ -56,10 +56,55 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
     private var tuning = PlaybackTuning.default
 
-    private static let audioSessionActivationFailure = PlaybackFailure(
-        code: "audio.session.activation",
-        userMessage: "无法启用音频播放，请检查播放设备后重试。"
-    )
+    private enum StartupFailure: String {
+        case admission, acquisition, acquisitionStart, registration
+        case relayPreparation, relayBinding, acquisitionToken, acquisitionCommit, acquisitionHandoff
+        case stableRoute, successorContext, successorOwner, resetReceipt, successorNonce
+        case outputCycle, outputRebase, factoryClaim, factoryStart, outputReprepare, unexpected
+
+        var playbackFailure: PlaybackFailure {
+            let message = switch self {
+            case .admission: "无法建立本次播放请求，请重新选择频道。"
+            case .acquisition: "无法创建音频会话获取任务，播放尚未开始。"
+            case .acquisitionStart: "音频会话获取任务未能启动，设备配置尚未执行。"
+            case .registration: "音频会话登记无效，无法确认本次播放设备。"
+            case .relayPreparation: "音频设备事件监听准备失败，播放已停止。"
+            case .relayBinding: "音频设备事件监听绑定失败，播放已停止。"
+            case .acquisitionToken: "音频会话配置完成，但未取得播放接管凭证。"
+            case .acquisitionCommit: "音频会话接管被拒绝，播放未能启动。"
+            case .acquisitionHandoff: "音频会话接管多次重试后仍未完成。"
+            case .stableRoute: "无法确认稳定的音频输出路由，播放已停止。"
+            case .successorContext: "音频输出资源在切换时丢失，播放已停止。"
+            case .successorOwner: "音频输出资源的控制权已变化，播放已停止。"
+            case .resetReceipt: "音频服务恢复凭证不匹配，播放已停止。"
+            case .successorNonce: "音频输出切换凭证已失效，播放已停止。"
+            case .outputCycle: "音频输出周期更新失败，播放已停止。"
+            case .outputRebase: "音频输出资源交接失败，播放已停止。"
+            case .factoryClaim: "播放器创建任务领取失败，播放已停止。"
+            case .factoryStart: "播放器创建任务或事件监听启动失败，播放已停止。"
+            case .outputReprepare: "播放器恢复准备失败，播放已停止。"
+            case .unexpected: "播放启动时遇到未预期的控制流程错误，请重试。"
+            }
+            return .init(code: "playback.startup.\(rawValue)", userMessage: message)
+        }
+    }
+
+    private static func recoveryFailure(for stage: PlaybackAudioSessionRecoveryFailureStage) -> PlaybackFailure {
+        switch stage {
+        case .mediaServicesResetConfiguration:
+            .init(code: "audio.session.recovery.configuration",
+                userMessage: "音频服务重置后，播放设备的音频会话重新配置失败，请重试。")
+        case .mediaServicesResetActivation:
+            .init(code: "audio.session.recovery.activation",
+                userMessage: "音频服务重置后，播放设备的音频会话重新激活失败，请重试。")
+        case .interruptionReactivation:
+            .init(code: "audio.session.recovery.reactivation",
+                userMessage: "音频中断结束后，播放设备的音频会话重新激活失败，请重试。")
+        case .eventRelayCapacity:
+            .init(code: "audio.session.recovery.event-relay",
+                userMessage: "音频设备事件过多，无法可靠恢复播放，请重试。")
+        }
+    }
 
     static let routeUnavailableFailure = PlaybackFailure(
         code: "route.unavailable",
@@ -266,7 +311,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             sessionIdentity = budget.identity.sessionIdentity
         } catch {
             diagnosticStage = "admit_failed"
-            publish(.failed(Self.audioSessionActivationFailure))
+            publish(.failed(StartupFailure.admission.playbackFailure))
             return
         }
         invalidateSession()
@@ -295,14 +340,14 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 resetRecoveryMandatorySuffix: 3_000_000_000
             ) else {
                 diagnosticStage = "beginOutputAcquisition_failed"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.acquisition.playbackFailure
             }
             
             let receiver = routeService ?? defaultReceiver
             guard audioSessionOwner.startAcquisition(acquisition, receiver: receiver) else {
                 diagnosticStage = "startAcquisition_failed"
                 _ = registry.cancelAcquisitionSession()
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.acquisitionStart.playbackFailure
             }
             
             interruptionActive = registry.executor.safetyIngress.snapshot.interruptionState == .began
@@ -311,7 +356,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                   let resource = registry.outputResourceContextSnapshot(), resource.sessionIdentity == sessionIdentity
             else {
                 diagnosticStage = "registration_lookup_failed"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.registration.playbackFailure
             }
             let audioGroup = try registry.createGroup(
                 resource: .monitor(session: sessionIdentity, lifecycle: reg.identity.monitorLifecycle),
@@ -332,11 +377,11 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             guard registry.prepareAudioEventRelayBinding(audioRelay, to: audioDrain)
             else {
                 diagnosticStage = "prepareAudioEventRelayBinding_failed"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.relayPreparation.playbackFailure
             }
             guard registry.bindEventRelay(audioRelay, to: audioDrain) else {
                 diagnosticStage = "bindEventRelay_failed"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.relayBinding.playbackFailure
             }
             let initialSafety = registry.executor.safetyIngress.snapshot
             resumeVetoRequired = initialSafety.interruptionVeto && initialSafety.interruptionState != .began
@@ -369,7 +414,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             guard let validToken = token else {
                 diagnosticStage = "validToken_nil"
                 _ = registry.cancelAcquisitionSession()
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.acquisitionToken.playbackFailure
             }
             
             var handoff: OutputAcquisitionHandoff?
@@ -389,7 +434,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 case .rejected:
                     diagnosticStage = "commitAcquisition_rejected"
                     _ = registry.cancelAcquisitionSession()
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.acquisitionCommit.playbackFailure
                 }
                 if handoff != nil { break }
             }
@@ -397,7 +442,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             guard let finalHandoff = handoff else {
                 diagnosticStage = "finalHandoff_nil"
                 _ = registry.cancelAcquisitionSession()
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.acquisitionHandoff.playbackFailure
             }
             committedHandoff = finalHandoff
             
@@ -417,9 +462,20 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 await registry.joinOwnedTerminalCleanup(session: sessionIdentity)
                 return
             }
+            let failure: PlaybackFailure
+            if case let .failed(original) = registry.playbackStateSnapshot() { failure = original }
+            else if let typed = error as? PlaybackFailure { failure = typed }
+            else if let core = error as? PlaybackCoreError { failure = Self.failure(for: core) }
+            else { failure = StartupFailure.unexpected.playbackFailure }
             registry.deactivateOutputEventRelays(session: sessionIdentity)
             routeService?.unbindSession()
-            publish(.failed(Self.audioSessionActivationFailure))
+            if let context = registry.outputResourceContextSnapshot(), context.sessionIdentity == sessionIdentity,
+               let owner = context.owner, owner.reason.releasesLease {
+                _ = registry.startOwnedTerminalCleanup(owner: owner, receiver: self, terminalState: .failed(failure))
+                await registry.joinOwnedTerminalCleanup(session: sessionIdentity)
+            } else {
+                publish(.failed(failure))
+            }
             return
         }
         
@@ -458,16 +514,16 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             }
             guard let stableCommit else {
                 diagnosticStage = "stableCommit_nil"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.stableRoute.playbackFailure
             }
             diagnosticStage = "stable_commit_obtained"
             guard let successor = registry.outputResourceContextSnapshot() else {
                 diagnosticStage = "successor_snapshot_nil"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.successorContext.playbackFailure
             }
             guard successor.owner == owner else {
                 diagnosticStage = "successor_owner_mismatch"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.successorOwner.playbackFailure
             }
             let successorNonce: UInt64
             if let resetActivationNonce {
@@ -477,13 +533,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                       successor.retainedRebase?.stableCommit == stableCommit,
                       successor.retainedRebase?.contextNonce == successor.contextNonce else {
                     diagnosticStage = "resetActivationNonce_mismatch"
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.resetReceipt.playbackFailure
                 }
                 successorNonce = successor.contextNonce
             } else {
                 guard successor.contextNonce == contextNonce else {
                     diagnosticStage = "successorNonce_mismatch"
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.successorNonce.playbackFailure
                 }
                 successorNonce = contextNonce
             }
@@ -492,12 +548,12 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                       registry.seal(successor.reservation.workGroup),
                       try registry.renewOutputCycle(contextNonce: successorNonce) != nil else {
                     diagnosticStage = "seal_or_renewOutputCycle_failed"
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.outputCycle.playbackFailure
                 }
             }
             guard let rebase = try registry.rebaseRetainedOutput(contextNonce: successorNonce, stableCommit: stableCommit, owner: owner) else {
                 diagnosticStage = "rebaseRetainedOutput_nil"
-                throw Self.audioSessionActivationFailure
+                throw StartupFailure.outputRebase.playbackFailure
             }
 
             let backendIdentity: PlaybackBackendIdentity
@@ -509,7 +565,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                       let candidateID = creation.candidateBackendIdentity,
                       let kind = creation.desiredBackendKind else {
                     diagnosticStage = "claimOutputSuccessor_guards_failed"
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.factoryClaim.playbackFailure
                 }
                 backendIdentity = candidateID
                 let relay = PlaybackSessionEventRelay(identity: runIdentity) { [weak self] identity, event in
@@ -522,7 +578,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                         kind: kind, identity: candidateID, request: request, tuning: tuning, relay: relay))
                 else {
                     diagnosticStage = "bind_or_startOutputFactory_failed"
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.factoryStart.playbackFailure
                 }
                 diagnosticStage = "joining_factory"
                 switch await registry.joinOutputBackendOperation(factoryTicket) {
@@ -540,7 +596,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                       let installed = registry.outputResourceContextSnapshot(),
                       let candidateID = installed.candidateBackendIdentity else {
                     diagnosticStage = "reprepareQuiescentOutput_failed"
-                    throw Self.audioSessionActivationFailure
+                    throw StartupFailure.outputReprepare.playbackFailure
                 }
                 backendIdentity = candidateID
             }
@@ -615,28 +671,21 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 recoveryCoordinator.resetRecovery.resetFinished()
             }
 
-        } catch let error as PlaybackCoreError {
-            guard isCurrent(runIdentity) else { return }
-            if fromEventRelay {
-                if let context = registry.outputResourceContextSnapshot() {
-                    beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
-                }
-                return
-            }
-            registry.deactivateOutputEventRelays(session: sessionIdentity)
-            finishPresentation(for: sessionIdentity)
-            await joinOwnedSessionCleanup(reason: .terminal, terminalState: .failed(Self.failure(for: error)))
         } catch {
             guard isCurrent(runIdentity) else { return }
+            let failure: PlaybackFailure
+            if let typed = error as? PlaybackFailure { failure = typed }
+            else if let core = error as? PlaybackCoreError { failure = Self.failure(for: core) }
+            else { failure = StartupFailure.unexpected.playbackFailure }
             if fromEventRelay {
                 if let context = registry.outputResourceContextSnapshot() {
-                    beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: .demuxOpen(-1))))
+                    beginOwnedBackendTerminal(context: context, terminalState: .failed(failure))
                 }
                 return
             }
             registry.deactivateOutputEventRelays(session: sessionIdentity)
             finishPresentation(for: sessionIdentity)
-            await joinOwnedSessionCleanup(reason: .terminal, terminalState: .failed(Self.failure(for: .demuxOpen(-1))))
+            await joinOwnedSessionCleanup(reason: .terminal, terminalState: .failed(failure))
         }
     }
 
@@ -729,9 +778,9 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             switch await registry.joinOutputBackendOperation(activation) {
             case .succeeded:
                 await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds, hasObservedProgress: true)
-            case .failed:
+            case .failed(let error):
                 if let context = registry.outputResourceContextSnapshot() {
-                    beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.audioSessionActivationFailure))
+                    beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
                 }
                 return
             case .canceled: return
@@ -1254,7 +1303,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             await prepareSuccessor(request: request, runIdentity: run, contextNonce: context.contextNonce,
                 owner: context.owner, fromEventRelay: true,
                 resetActivationNonce: event == .resetConfigurationSucceeded ? envelope.reactivationReceipt?.activationNonce : nil)
-        case .recoveryFailed:
+        case .recoveryFailed(let stage):
             guard let original = registry.outputResourceContextSnapshot() else { return }
             // recovery runner只join pipeline；先等它归还原SDK责任，不能改其owner。
             // 已有release runner则由它join本receiver，绝不反向等待形成环。
@@ -1265,7 +1314,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             guard isCurrent(identity), let context = registry.outputResourceContextSnapshot(),
                   context.contextNonce == original.contextNonce, context.owner == original.owner else { return }
             terminalMetricsProvider = registry.terminalMetricsProjection(backendIdentity: original.candidateBackendIdentity)
-            beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.audioSessionActivationFailure))
+            beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.recoveryFailure(for: stage)))
         }
     }
 

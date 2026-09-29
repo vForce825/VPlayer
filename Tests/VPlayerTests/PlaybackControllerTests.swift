@@ -7,6 +7,61 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackControllerTests: XCTestCase {
+    func testColdStartReportsBothCategoryFailuresWithSystemCode() async throws {
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let sdk = AudioSessionSDKSpy(
+            categoryResults: [.failure, .failure], multichannelFails: false,
+            executor: registry.executor,
+            categoryFailure: NSError(domain: NSOSStatusErrorDomain, code: -42)
+        )
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([]), audioSessionOwner: owner
+        )
+
+        await controller.play(makeRequest(channelID: "category-failure"))
+        try await eventually {
+            if case .failed = await controller.currentStateForTesting { return true }
+            return false
+        }
+        guard case let .failed(failure) = await controller.currentStateForTesting else {
+            return XCTFail("配置失败必须产生终态")
+        }
+        XCTAssertEqual(failure.code, "audio.session.category")
+        XCTAssertTrue(failure.userMessage.contains("音频会话配置"))
+        XCTAssertTrue(failure.userMessage.contains("系统返回码 -42"))
+        XCTAssertEqual(failure.diagnosticCode, "audio.session.category.osStatus.-42")
+        XCTAssertEqual(sdk.events, [.category(.longFormAudio), .category(.default)])
+        await registry.joinOwnedTerminalCleanup()
+    }
+
+    func testColdStartReportsActivationFailureSeparatelyFromCategory() async throws {
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let sdk = FakeAudioSessionSDK(initialPorts: [.airPlay])
+        sdk.activateError = NSError(domain: NSOSStatusErrorDomain, code: -50)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([]), audioSessionOwner: owner
+        )
+
+        await controller.play(makeRequest(channelID: "activation-failure"))
+        try await eventually {
+            if case .failed = await controller.currentStateForTesting { return true }
+            return false
+        }
+        guard case let .failed(failure) = await controller.currentStateForTesting else {
+            return XCTFail("激活失败必须产生终态")
+        }
+        XCTAssertEqual(failure.code, "audio.session.activate")
+        XCTAssertTrue(failure.userMessage.contains("激活"))
+        XCTAssertTrue(failure.userMessage.contains("系统返回码 -50"))
+        XCTAssertEqual(failure.diagnosticCode, "audio.session.activate.osStatus.-50")
+        XCTAssertEqual(sdk.lock.withLock { sdk.calls }, [
+            .category(.longFormAudio), .multichannel, .activate
+        ])
+        await registry.joinOwnedTerminalCleanup()
+    }
+
     func testPipelinePhaseUsesMatchingCycleAndReadyAloneEntersPlaying() async throws {
         let pipeline = FakeControllerPipeline()
         let controller = makeRoutedPlaybackController(
@@ -406,7 +461,7 @@ final class PlaybackControllerTests: XCTestCase {
         await play.value
         try await eventually {
             guard case let .failed(failure) = await controller.currentStateForTesting else { return false }
-            return failure.code == "audio.session.activation" && first.snapshot().completedStopCount == 1
+            return failure.code == "audio.session.recovery.configuration" && first.snapshot().completedStopCount == 1
         }
         XCTAssertTrue(first.snapshot().starts.isEmpty)
         XCTAssertFalse(factory.isPending(callID: 2))
@@ -743,9 +798,14 @@ final class PlaybackControllerTests: XCTestCase {
             guard case let .failed(failure) = await controller.currentStateForTesting else {
                 return false
             }
-            return failure.code == "audio.session.activation"
+            return failure.code == "audio.session.recovery.reactivation"
                 && pipeline.snapshot().completedStopCount == 1
         }
+        guard case let .failed(failure) = await controller.currentStateForTesting else {
+            return XCTFail("中断后激活失败必须产生终态")
+        }
+        XCTAssertTrue(failure.userMessage.contains("音频中断结束后"))
+        XCTAssertTrue(failure.userMessage.contains("系统返回码 -1"))
         let events = await MainActor.run { owner.events }
         XCTAssertEqual(events.filter { $0 == .requestResume(lease) }.count, 1)
         await owner.registry.joinOwnedTerminalCleanup()
@@ -918,7 +978,7 @@ final class PlaybackControllerTests: XCTestCase {
             guard case let .failed(failure) = await controller.currentStateForTesting else {
                 return false
             }
-            return failure.code == "audio.session.activation"
+            return failure.code == "audio.session.recovery.reactivation"
                 && pipeline.snapshot().completedStopCount == 1
         }
         await owner.registry.joinOwnedTerminalCleanup()

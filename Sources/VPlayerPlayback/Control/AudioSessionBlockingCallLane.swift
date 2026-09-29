@@ -32,6 +32,65 @@ enum AudioSessionBlockingCallResult: Sendable, Equatable {
     case route(AudioSessionRouteSampleEvidence)
 }
 
+enum AudioSessionFailurePresentation {
+    static func failure(
+        operation: AudioSessionBlockingCallOperation,
+        result: AudioSessionBlockingCallResult,
+        recoveryStage: PlaybackAudioSessionRecoveryFailureStage?
+    ) -> PlaybackFailure {
+        let code: String
+        let message: String
+        let detail: AudioSessionFixedFailure?
+        switch recoveryStage {
+        case .mediaServicesResetConfiguration:
+            code = "audio.session.recovery.configuration"
+            message = "音频服务重置后，播放设备的音频会话重新配置失败"
+        case .mediaServicesResetActivation:
+            code = "audio.session.recovery.activation"
+            message = "音频服务重置后，播放设备的音频会话重新激活失败"
+        case .interruptionReactivation:
+            code = "audio.session.recovery.reactivation"
+            message = "音频中断结束后，播放设备的音频会话重新激活失败"
+        case .eventRelayCapacity:
+            code = "audio.session.recovery.event-relay"
+            message = "音频设备事件过多，无法可靠恢复播放"
+        case nil:
+            switch operation {
+            case .defaultCategory:
+                code = "audio.session.category"
+                message = "音频会话配置失败：长音频与默认播放策略均被系统拒绝"
+            case .activate:
+                code = "audio.session.activate"
+                message = "音频会话激活失败：当前播放设备未能启用音频"
+            default:
+                code = "audio.session.call"
+                message = "音频会话调用失败"
+            }
+        }
+        switch (operation, result) {
+        case (.defaultCategory, .configuration(.failed(let failure))):
+            detail = failure
+        case (.activate, .activation(.some(let failure))):
+            detail = failure
+        default:
+            detail = nil
+        }
+        guard let detail else {
+            return .init(code: code, userMessage: "\(message)，请重试。", diagnosticCode: code)
+        }
+        let domain = switch detail.domain {
+        case .audioSession: "audioSession"
+        case .osStatus: "osStatus"
+        case .unknown: "unknown"
+        }
+        return .init(
+            code: code,
+            userMessage: "\(message)（系统返回码 \(detail.code)），请检查音频输出后重试。",
+            diagnosticCode: "\(code).\(domain).\(detail.code)"
+        )
+    }
+}
+
 struct AudioSessionBlockingCallReturned: Sendable, Equatable {
     let permit: AudioSessionBlockingCallPermit
     let result: AudioSessionBlockingCallResult
@@ -51,6 +110,7 @@ struct AudioSessionBlockingCallCompletion: Sendable, Equatable {
     let failure: PlaybackSafetyFailure?
     var reactivationReceipt: AudioSessionReactivationCompletionReceipt? = nil
     var terminalOwner: OutputTransitionOwnerTicket? = nil
+    var terminalRecoveryFailureStage: PlaybackAudioSessionRecoveryFailureStage? = nil
 }
 
 /// 唯一Authority在真实SDK activation完成CAS中签发；不能用当前快照补造成功。
