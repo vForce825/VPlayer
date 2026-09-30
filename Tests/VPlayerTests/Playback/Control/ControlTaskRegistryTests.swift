@@ -5,9 +5,52 @@
 import Dispatch
 import Foundation
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 final class ControlTaskRegistryTests: XCTestCase {
+    func testFrozenActivationProofPreservesEveryRetiredResourceCombination() throws {
+        let fixture = try AudioPhaseFixture(ownsResources: false)
+        let phase = fixture.phase.identity
+        let task = ControlTaskTicket(group: fixture.group, nonce: 850)
+        let independent = PlaybackSessionIdentity(sessionID: 851, requestID: UUID())
+        let retired = OutputLifecycleEpoch(backendIdentity: .init(sessionIdentity: independent,
+            backendGeneration: 852), outputNonce: 853)
+        let retained = RetainedAudioSessionResourceShape(sessionIdentity: phase.sessionIdentity,
+            leaseID: 854, monitorLifecycle: 855, contextNonce: 856)
+        let backend = PlaybackBackendIdentity(sessionIdentity: independent, backendGeneration: 857)
+        let invocation = try AudioSessionActivationInvocationIdentity(allocator: PlaybackIdentityAllocator())
+        let shapes: [InterruptionDrainedResourceShape] = [.noResources, .retainedSuccessor(retained),
+            .quiescentBackend(backend, retained)]
+        for lifecycle in [nil, retired] {
+            for shape in shapes {
+                // 旧 proof 的 context/epoch/backend 与当前 phase 各自独立，不能投影成当前值。
+                let proof = AudioSessionReactivationProof.interruption(.init(sessionIdentity: phase.sessionIdentity,
+                    configuredGeneration: 858, interruptionEpoch: 859, contextNonce: 856,
+                    retiredOutputLifecycleEpoch: lifecycle, resultingResourceShape: shape, proofNonce: 860))
+                let policy = AudioSessionPhasePolicy.activate(purpose: .reactivateConfiguredGeneration(
+                    sessionIdentity: phase.sessionIdentity, configurationTransitionIdentity: nil,
+                    committedGeneration: 861, reactivationAttempt: .init(reactivationBudgetIdentity: .init(
+                        sessionIdentity: phase.sessionIdentity, recoveryLineageIdentity: 862, budgetNonce: 863),
+                        reactivationProof: proof, interruptionEpoch: 864,
+                        retainedContextNonce: phase.contextNonce, attemptNonce: invocation)),
+                    interruptionEpoch: 864, audioAdmissionFenceRevision: 865, invocationIdentity: invocation)
+                let command = try OwnedPostIngressControlCommand(controlTaskTicket: task, slot: .audioSessionRecovery,
+                    safetySnapshot: .cleanupOwnership, gatePolicy: .audioSession,
+                    audioPhaseIdentity: phase, audioPolicy: policy)
+                XCTAssertEqual(command.audioPolicy, policy)
+            }
+        }
+        let acquisition = AcquisitionConfiguredLeaseOwnershipProof(acquisitionTicket: task,
+            sessionIdentity: independent, leaseID: 866, contextNonce: 867, ownershipNonce: 868)
+        let policy = AudioSessionPhasePolicy.activate(purpose: .activateAcquiredConfiguredGeneration(
+            sessionIdentity: phase.sessionIdentity, committedGeneration: 869, acquisitionOwnershipProof: acquisition),
+            interruptionEpoch: 870, audioAdmissionFenceRevision: 871, invocationIdentity: invocation)
+        let command = try OwnedPostIngressControlCommand(controlTaskTicket: task, slot: .audioSessionRecovery,
+            safetySnapshot: .cleanupOwnership, gatePolicy: .audioSession, audioPhaseIdentity: phase, audioPolicy: policy)
+        XCTAssertEqual(command.audioPolicy, policy, "独立 acquisition 原票必须完整往返")
+    }
+
     func testFrozenReactivationRejectsOnlyDeletedDuplicatesBeforeInstallingRecord() throws {
         let fixture = try AudioPhaseFixture(ownsResources: false)
         let phase = fixture.phase.identity
@@ -212,7 +255,8 @@ final class ControlTaskRegistryTests: XCTestCase {
         let oldPhase = AudioSessionPhaseIdentity(owner: work.ownerTicket, sessionIdentity: session,
             leaseID: 702, contextNonce: 709, mediaServicesEpoch: 710, phaseNonce: 711)
         let oldCall = AudioSessionCallIdentity(record: task, phaseIdentity: oldPhase)
-        let failure = AudioSessionFixedFailure(domain: .osStatus, code: -712)
+        let failure = AudioSessionFixedFailure(domain: .osStatus, code: -712,
+            diagnostic: .init(typeName: "AudioSession.TestFailure", code: "-712", message: "原始音频异常说明"))
         let proof = AcquisitionConfiguredLeaseOwnershipProof(acquisitionTicket: task,
             sessionIdentity: session, leaseID: 702, contextNonce: 709, ownershipNonce: 713)
         let interruption = InterruptionDrainProof(sessionIdentity: session, configuredGeneration: 714,

@@ -13,6 +13,13 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioSessionLifecycleTests: XCTestCase {
+    func testControlCommandBackingFitsTVOSXzoneSixteenKiBBin() {
+        // tvOS xzone 的下一档是 24 KiB；必须包含原生 Array 的 32 字节头。
+        let requested = 32 + ControlTaskRegistry.commandBackingCapacity * MemoryLayout<OwnedPostIngressControlCommand?>.stride
+        XCTAssertLessThanOrEqual(requested, 16 * 1_024,
+            "控制命令 backing 跨过 16 KiB 后，tvOS 取整会使启动预算超限：\(requested)B")
+    }
+
     func testFrozenPayloadUsesSmallerRealCommandBackingWithoutBorrowingErrorReserve() throws {
         let registry = ControlTaskRegistry()
         var observation: Result<(UInt, UInt, Int), Error>?

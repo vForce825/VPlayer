@@ -183,3 +183,26 @@ schemes:
       targets:
         - name: VPlayerReleaseBoundaryTests
           parallelizable: false
+  VPlayerReleaseStartupTests:
+    build:
+      targets:
+        VPlayerCore: all
+        VPlayerPlayback: all
+        VPlayer: all
+        VPlayerUITests: [test]
+    test:
+      config: Release
+      gatherCoverageData: false
+      targets:
+        - name: VPlayerUITests
+          parallelizable: false
+          selectedTests:
+            - LiveStartupUITests
+    run:
+      config: Release
+    profile:
+      config: Release
+    analyze:
+      config: Release
+    archive:
+      config: Release

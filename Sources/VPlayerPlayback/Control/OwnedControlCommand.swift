@@ -209,44 +209,63 @@ struct FrozenCommandAcquisitionProof: Sendable {
 struct FrozenCommandInterruptionProof: Sendable {
     private enum Shape: Sendable {
         case none
+        case noneRetired(OutputLifecycleEpoch)
         case retained(lease: UInt64, monitor: UInt64)
+        case retainedRetired(OutputLifecycleEpoch, lease: UInt64, monitor: UInt64)
         case quiescent(PlaybackBackendIdentity, lease: UInt64, monitor: UInt64)
+        case quiescentRetired(OutputLifecycleEpoch, PlaybackBackendIdentity, lease: UInt64, monitor: UInt64)
     }
     private let session: PlaybackSessionIdentity
     private let generation: UInt64
     private let epoch: UInt64
     private let context: UInt64
-    private let retired: OutputLifecycleEpoch?
-    private let shape: Shape
     private let nonce: UInt64
+    // 可选旧 lifecycle 与资源 shape 共用一个标签；所有独立身份仍完整保存。
+    private let shape: Shape
     fileprivate init(_ value: InterruptionDrainProof) throws {
         session = value.sessionIdentity; generation = value.configuredGeneration
         epoch = value.interruptionEpoch; context = value.contextNonce
-        retired = value.retiredOutputLifecycleEpoch; nonce = value.proofNonce
+        nonce = value.proofNonce
         switch value.resultingResourceShape {
-        case .noResources: shape = .none
+        case .noResources:
+            shape = value.retiredOutputLifecycleEpoch.map { .noneRetired($0) } ?? .none
         case .retainedSuccessor(let retained):
             guard retained.sessionIdentity == session, retained.contextNonce == context else {
                 throw ControlTaskRegistry.Failure.invalidGroup
             }
-            shape = .retained(lease: retained.leaseID, monitor: retained.monitorLifecycle)
+            if let retired = value.retiredOutputLifecycleEpoch {
+                shape = .retainedRetired(retired, lease: retained.leaseID, monitor: retained.monitorLifecycle)
+            } else {
+                shape = .retained(lease: retained.leaseID, monitor: retained.monitorLifecycle)
+            }
         case .quiescentBackend(let backend, let retained):
             guard retained.sessionIdentity == session, retained.contextNonce == context else {
                 throw ControlTaskRegistry.Failure.invalidGroup
             }
-            shape = .quiescent(backend, lease: retained.leaseID, monitor: retained.monitorLifecycle)
+            if let retired = value.retiredOutputLifecycleEpoch {
+                shape = .quiescentRetired(retired, backend, lease: retained.leaseID, monitor: retained.monitorLifecycle)
+            } else {
+                shape = .quiescent(backend, lease: retained.leaseID, monitor: retained.monitorLifecycle)
+            }
         }
     }
     fileprivate var value: InterruptionDrainProof {
         let result: InterruptionDrainedResourceShape
+        let retired: OutputLifecycleEpoch?
         switch shape {
-        case .none: result = .noResources
-        case .retained(let lease, let monitor):
+        case .none, .noneRetired:
+            result = .noResources
+        case .retained(let lease, let monitor), .retainedRetired(_, let lease, let monitor):
             result = .retainedSuccessor(.init(sessionIdentity: session, leaseID: lease,
                 monitorLifecycle: monitor, contextNonce: context))
-        case .quiescent(let backend, let lease, let monitor):
+        case .quiescent(let backend, let lease, let monitor), .quiescentRetired(_, let backend, let lease, let monitor):
             result = .quiescentBackend(backend, .init(sessionIdentity: session, leaseID: lease,
                 monitorLifecycle: monitor, contextNonce: context))
+        }
+        switch shape {
+        case .none, .retained, .quiescent: retired = nil
+        case .noneRetired(let value), .retainedRetired(let value, _, _), .quiescentRetired(let value, _, _, _):
+            retired = value
         }
         return .init(sessionIdentity: session, configuredGeneration: generation, interruptionEpoch: epoch,
             contextNonce: context, retiredOutputLifecycleEpoch: retired, resultingResourceShape: result, proofNonce: nonce)
@@ -415,19 +434,38 @@ struct FrozenCommandDeactivation: Sendable {
     }
 }
 
+enum FrozenCommandReactivationProof: Sendable {
+    case interruption(FrozenCommandInterruptionProof)
+    case resetPostConfiguration(ResetPostConfigurationProof)
+
+    fileprivate init(_ value: AudioSessionReactivationProof) throws {
+        switch value {
+        case .interruption(let proof): self = .interruption(try .init(proof))
+        case .resetPostConfiguration(let proof): self = .resetPostConfiguration(proof)
+        }
+    }
+
+    fileprivate var value: AudioSessionReactivationProof {
+        switch self {
+        case .interruption(let proof): .interruption(proof.value)
+        case .resetPostConfiguration(let proof): .resetPostConfiguration(proof)
+        }
+    }
+}
+
 /// 只删除 reactivation 与本 command phase/policy 中已完整比对的重复字段。
 /// proof 自带的旧 epoch、context、独立 backend 等字段仍原样保存，不扩成当前性校验。
 enum FrozenCommandActivationPurpose: Sendable {
-    case acquired(PlaybackSessionIdentity, UInt64, AcquisitionConfiguredLeaseOwnershipProof)
+    case acquired(PlaybackSessionIdentity, UInt64, FrozenCommandAcquisitionProof)
     case reset(SystemRecoveryIncarnation.Identity, UInt64, InactiveAudioSessionConfigurationReceipt.Identity)
     case reactivation(ConfigurationTransitionIdentity?, generation: UInt64,
-        recoveryLineage: UInt64, budgetNonce: UInt64, AudioSessionReactivationProof)
+        recoveryLineage: UInt64, budgetNonce: UInt64, FrozenCommandReactivationProof)
 
     fileprivate init(_ purpose: AudioSessionActivationPurpose, phase: AudioSessionPhaseIdentity,
                      epoch: UInt64, invocation: AudioSessionActivationInvocationIdentity) throws {
         switch purpose {
         case .activateAcquiredConfiguredGeneration(let session, let generation, let proof):
-            self = .acquired(session, generation, proof)
+            self = .acquired(session, generation, try .init(proof))
         case .commitResetConfiguration(let incarnation, let generation, let receipt):
             self = .reset(incarnation, generation, receipt)
         case .reactivateConfiguredGeneration(let session, let transition, let generation, let attempt):
@@ -439,7 +477,7 @@ enum FrozenCommandActivationPurpose: Sendable {
             }
             self = .reactivation(transition, generation: generation,
                 recoveryLineage: attempt.reactivationBudgetIdentity.recoveryLineageIdentity,
-                budgetNonce: attempt.reactivationBudgetIdentity.budgetNonce, attempt.reactivationProof)
+                budgetNonce: attempt.reactivationBudgetIdentity.budgetNonce, try .init(attempt.reactivationProof))
         }
     }
     fileprivate func value(phase: AudioSessionPhaseIdentity, epoch: UInt64,
@@ -447,14 +485,14 @@ enum FrozenCommandActivationPurpose: Sendable {
         switch self {
         case .acquired(let session, let generation, let proof):
             .activateAcquiredConfiguredGeneration(sessionIdentity: session, committedGeneration: generation,
-                acquisitionOwnershipProof: proof)
+                acquisitionOwnershipProof: proof.value)
         case .reset(let incarnation, let generation, let receipt):
             .commitResetConfiguration(incarnation: incarnation, baseGeneration: generation, receiptIdentity: receipt)
         case .reactivation(let transition, let generation, let lineage, let nonce, let proof):
             .reactivateConfiguredGeneration(sessionIdentity: phase.sessionIdentity,
                 configurationTransitionIdentity: transition, committedGeneration: generation,
                 reactivationAttempt: .init(reactivationBudgetIdentity: .init(sessionIdentity: phase.sessionIdentity,
-                    recoveryLineageIdentity: lineage, budgetNonce: nonce), reactivationProof: proof,
+                    recoveryLineageIdentity: lineage, budgetNonce: nonce), reactivationProof: proof.value,
                     interruptionEpoch: epoch, retainedContextNonce: phase.contextNonce, attemptNonce: invocation))
         }
     }
