@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import VPlayerCore
+
 enum AudioSessionActualPolicy: Sendable, Equatable { case longFormAudio, `default` }
 enum PreferredAudioSessionConfigurationPlan: Sendable, Equatable {
     // 固定playback/moviePlayback；只有准确long-form失败才允许default。
@@ -14,6 +16,13 @@ struct AudioSessionFixedFailure: Sendable, Equatable {
     enum Domain: Sendable, Equatable { case audioSession, osStatus, unknown }
     let domain: Domain
     let code: Int32
+    let diagnostic: ErrorDiagnosticSnapshot?
+
+    init(domain: Domain, code: Int32, diagnostic: ErrorDiagnosticSnapshot? = nil) {
+        self.domain = domain
+        self.code = code
+        self.diagnostic = diagnostic
+    }
 }
 struct AudioSessionConfigurationAttempt: Sendable, Equatable {
     let nonce: UInt64

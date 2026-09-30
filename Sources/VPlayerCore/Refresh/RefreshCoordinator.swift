@@ -519,31 +519,57 @@ public actor RefreshCoordinator {
             reason = "找不到源配置。"
         case LibraryRepositoryError.sourceConfigurationChanged:
             reason = "源配置已更改。"
-        case is M3UParserError, is PlaylistTextDecodingError:
-            reason = "M3U 内容格式无效。"
-        case is XMLTVParserError, LibraryRepositoryError.epgHasNoChannels:
-            reason = "EPG 格式无效。"
+        case M3UParserError.missingHeader:
+            reason = "M3U 内容缺少 #EXTM3U 标头。"
+        case M3UParserError.noChannels:
+            reason = "M3U 内容中没有可用频道。"
+        case PlaylistTextDecodingError.unsupportedEncoding:
+            reason = "M3U 文本编码不受支持。"
+        case XMLTVParserError.malformed:
+            reason = "EPG 的 XML 结构无效。"
+        case let XMLTVParserError.parserFailure(line, column, diagnostic):
+            return String("刷新 EPG 失败：XML 第 \(line) 行、第 \(column) 列解析失败。\n\(diagnostic.summary)".prefix(240))
+        case XMLTVParserError.entityDeclarationForbidden:
+            reason = "EPG 包含禁止的 XML 实体声明。"
+        case XMLTVParserError.excessiveDepth:
+            reason = "EPG 的 XML 嵌套层级超过限制。"
+        case XMLTVParserError.excessiveText:
+            reason = "EPG 的文本长度超过限制。"
+        case XMLTVParserError.excessiveChannels:
+            reason = "EPG 的频道数量超过限制。"
+        case XMLTVParserError.excessiveProgrammes:
+            reason = "EPG 的节目数量超过限制。"
+        case XMLTVParserError.excessiveEvents:
+            reason = "EPG 的 XML 事件数量超过限制。"
+        case XMLTVParserError.invalidProgramme:
+            reason = "EPG 包含无效节目数据。"
+        case LibraryRepositoryError.epgHasNoChannels:
+            reason = "EPG 中没有频道数据。"
+        case LibraryRepositoryError.invalidChannelProfile:
+            reason = "频道所属的源配置与本次刷新不一致。"
+        case LibraryRepositoryError.duplicatePlaylistChannel:
+            reason = "频道列表包含重复频道。"
+        case LibraryRepositoryError.corruptPersistedValue:
+            reason = "资料库中的持久化数据损坏。"
+        case let LibraryRepositoryError.corruptPersistedField(field):
+            reason = "资料库的 \(field) 字段无效。"
+        case let LibraryRepositoryError.persistedValueDecodingFailed(field, diagnostic):
+            let resourceName = resource == .playlist ? "频道列表" : "EPG"
+            return String("刷新\(resourceName)失败：资料库的 \(field) 数据解码失败。\n\(diagnostic.summary)".prefix(240))
+        case EPGPersistenceSinkError.duplicateChannelID:
+            reason = "EPG 包含重复频道标识。"
         default:
-            if let url, isNetworkError(error) {
-                reason = NetworkFailureMapper.map(error, for: url).message
+            if let url, NetworkFailureMapper.isNetworkError(error) {
+                let resourceName = resource == .playlist ? "频道列表" : "EPG"
+                return String("刷新\(resourceName)失败：\(NetworkFailureMapper.map(error, for: url).message)".prefix(240))
             } else {
-                reason = "资源处理失败。"
+                reason = "资源处理发生未识别错误。"
             }
         }
 
         let resourceName = resource == .playlist ? "频道列表" : "EPG"
-        let summary = "刷新\(resourceName)失败：\(reason)"
+        let summary = "刷新\(resourceName)失败：\(reason)\n\(ErrorDiagnosticSnapshot(error).summary)"
         return String(summary.prefix(240))
-    }
-
-    private nonisolated static func isNetworkError(_ error: any Error) -> Bool {
-        let nsError = error as NSError
-        if error is URLError
-            || nsError.domain == NSURLErrorDomain
-            || nsError.domain == NSPOSIXErrorDomain {
-            return true
-        }
-        return nsError.userInfo[NSUnderlyingErrorKey] != nil
     }
 
     private nonisolated static func isRemoteHTTPURL(_ url: URL) -> Bool {

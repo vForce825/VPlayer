@@ -74,7 +74,7 @@ final class RouteServiceTestHarness: @unchecked Sendable {
         let acquisition = try registry.beginOutputAcquisition(session: session, parent: parent, resetRecoveryMandatorySuffix: 3_000_000_000)!
         self.currentAcquisitionTicket = acquisition
         
-        let _ = owner.startAcquisition(acquisition, receiver: service)
+        let _ = try owner.startAcquisition(acquisition, receiver: service)
         
         do {
             try await flushCommits()

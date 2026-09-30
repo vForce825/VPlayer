@@ -3,11 +3,74 @@
 
 import XCTest
 import Network
+import VPlayerCore
 @testable import VPlayerPlayback
 
 /// Task22-F 的 production 装配边界。整图 fixture 由 root runner 在模拟器上执行；这里先
 /// 固定系统 builder 不能接受第二条 source 或脱离同一 lifecycle 的 graph authority。
 final class HLSAVPlayerBackendTests: XCTestCase {
+    func testNestedTranscodeFailuresKeepOriginalDiagnosticWithoutRewrapping() {
+        let original = ErrorDiagnosticSnapshot(NSError(domain: "HLS.Transcode.Native", code: -93,
+            userInfo: [NSLocalizedDescriptionKey: String(repeating: "原始原因", count: 80)]))
+        let failures: [any Error] = [
+            HLSVideoTranscodeBranchFailure.encoder(.unexpected(original)),
+            HLSVideoTranscodeBranchFailure.invalidFrame(.unexpected(original)),
+            HLSVideoTranscodeBranchFailure.decoder(.unexpected(original)),
+            PlaybackCoreError.videoDecoderFailure(.unexpected(original))
+        ]
+        for failure in failures {
+            XCTAssertEqual(PlaybackErrorDiagnostics.snapshot(failure), original)
+        }
+    }
+
+    func testKnownTranscodeFailureWrappersRemainDistinct() {
+        let encoder = PlaybackErrorDiagnostics.snapshot(HLSVideoTranscodeBranchFailure.encoder(.arithmeticOverflow))
+        let frame = PlaybackErrorDiagnostics.snapshot(HLSVideoTranscodeBranchFailure.invalidFrame(.arithmeticOverflow))
+        XCTAssertNotEqual(encoder, frame)
+        XCTAssertTrue(encoder.summary.contains("encoder("), encoder.summary)
+        XCTAssertTrue(frame.summary.contains("invalidFrame("), frame.summary)
+    }
+
+    func testPublicationFirstFailureRetainsDiagnosticsWithoutRetainingOriginalError() throws {
+        let publication = try SystemHLSPublicationGraph(itemGeneration: 99)
+        weak var originalReference: NSError?
+        autoreleasepool {
+            let original = NSError(domain: "HLS.Publication.Native", code: -12,
+                userInfo: [NSLocalizedDescriptionKey: "首个发布异常"])
+            originalReference = original
+            publication.recordFailure(original)
+        }
+        XCTAssertNil(originalReference, "发布持久终态只能保存固定容量快照")
+        publication.recordFailure(NSError(domain: "HLS.Secondary", code: -13,
+            userInfo: [NSLocalizedDescriptionKey: "清理期间后继异常"]))
+        XCTAssertThrowsError(try publication.waitForVisible(until: Date())) { error in
+            let description = String(reflecting: error)
+            XCTAssertTrue(description.contains("HLS.Publication.Native"), description)
+            XCTAssertTrue(description.contains("-12"), description)
+            XCTAssertTrue(description.contains("首个发布异常"), description)
+            XCTAssertFalse(description.contains("HLS.Secondary"), description)
+        }
+    }
+
+    func testPrefixFailurePreservesOriginalGraphErrorAfterRetirement() async throws {
+        let authority = ErrorReportingHLSGraphAuthority()
+        let assembler = HLSMediaGraphAssembler(
+            sourceURL: URL(string: "http://example.test/source.ts")!,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(bridge: EmptyHLSFailureDemuxBridge()),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            XCTFail("媒体图失败不能签发可播前缀")
+        } catch {
+            let description = String(reflecting: error)
+            XCTAssertTrue(description.contains("HLS.AudioCalibration"), description)
+            XCTAssertTrue(description.contains("-50"), description)
+            XCTAssertTrue(description.contains("AAC 校准首错"), description)
+        }
+        XCTAssertEqual(assembler.currentPhase, .retired)
+    }
+
     func testSystemLoopbackClockPreservesMonotonicNanoseconds() {
         XCTAssertEqual(
             SystemHLSLoopbackClock.nanoseconds(uptimeNanoseconds: 1_234_567_890),
@@ -254,9 +317,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             _ = try await assembler.startUntilPlayablePrefix()
             XCTFail("不足三秒的媒体不应签发 replacement item")
         } catch {
-            XCTAssertEqual(
-                error as? AVPlayerItemCoordinatorFailure,
-                .insufficientCoverage)
+            let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot, String(reflecting: error))
+            XCTAssertTrue(diagnostic.summary.contains("videoSampleBuffer"), diagnostic.summary)
+            XCTAssertTrue(diagnostic.summary.contains("noEligibleOrigin"), diagnostic.summary)
         }
         XCTAssertEqual(assembler.currentPhase, .retired)
     }
@@ -287,9 +350,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             _ = try await assembler.startUntilPlayablePrefix()
             XCTFail("模拟器不能签发真实 VT 硬件编码证明")
         } catch {
-            XCTAssertEqual(
-                error as? AVPlayerItemCoordinatorFailure,
-                .insufficientCoverage)
+            let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot, String(reflecting: error))
+            XCTAssertTrue(diagnostic.summary.contains("VTVideoEncoderFailure"), diagnostic.summary)
+            XCTAssertEqual(diagnostic, authority.failureDiagnostic)
         }
         XCTAssertNotNil(authority.failureDescriptionForDiagnostics)
         XCTAssertEqual(assembler.currentPhase, .retired)
@@ -361,6 +424,32 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         ] ?? "http://127.0.0.1:19022"
         return URL(string: rawBase)!.appending(path: name)
     }
+}
+
+private final class ErrorReportingHLSGraphAuthority: SystemHLSDeliveryGraphAuthority, @unchecked Sendable {
+    var originalError: NSError? = NSError(domain: "HLS.AudioCalibration", code: -50,
+        userInfo: [NSLocalizedDescriptionKey: "AAC 校准首错"])
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { originalError.map(ErrorDiagnosticSnapshot.init) }
+    func append(_ event: AdmittedDemuxEvent) {}
+    func awaitAllTrackPlayablePrefix(minimumSeconds: Int) async -> AVPlayerItemReplacementBundle? { nil }
+    func finishAllTracksAtNaturalEOF() async -> Bool { false }
+    func retireAllResourcesAndAwaitReceipt() async -> Bool {
+        originalError = nil
+        return true
+    }
+}
+
+private struct EmptyHLSFailureDemuxBridge: FFmpegDemuxBridging {
+    func create(urlBytes: Data, timeoutUS: Int64,
+        receiver: @escaping RawFFmpegDemuxReceiver) -> FFmpegDemuxCreateResult {
+        .success(EmptyHLSFailureDemuxHandle())
+    }
+}
+
+private final class EmptyHLSFailureDemuxHandle: FFmpegDemuxHandle, @unchecked Sendable {
+    func run() -> Int32 { 0 }
+    func cancel() {}
+    func destroy() {}
 }
 
 #if !targetEnvironment(simulator)

@@ -4,9 +4,31 @@
 
 import XCTest
 import VideoToolbox
+import VPlayerCore
 @testable import VPlayerPlayback
 
 final class PlaybackErrorMappingTests: XCTestCase {
+    func testAssociatedFailureDetailsAreVisibleAndDistinguishDifferentCauses() {
+        let pairs: [(PlaybackCoreError, PlaybackCoreError, String, String)] = [
+            (.demuxOpen(-100), .demuxOpen(-200), "-100", "-200"),
+            (.demuxRead(-101), .demuxRead(-201), "-101", "-201"),
+            (.videoFormatDescription(-102), .videoFormatDescription(-202), "-102", "-202"),
+            (.audioFormatDescription(-103), .audioFormatDescription(-203), "-103", "-203"),
+            (.videoDecode(-104), .videoDecode(-204), "-104", "-204"),
+            (.audioFallbackDecode(-105), .audioFallbackDecode(-205), "-105", "-205"),
+            (.videoRendererFailed("显示器失效"), .videoRendererFailed("帧提交失败"), "显示器失效", "帧提交失败"),
+            (.audioRendererFailed("音频设备失效"), .audioRendererFailed("音频排队失败"), "音频设备失效", "音频排队失败"),
+            (.metalCommand("命令提交失败"), .metalCommand("纹理转换失败"), "命令提交失败", "纹理转换失败"),
+        ]
+        for (first, second, firstDetail, secondDetail) in pairs {
+            let a = PlaybackController.failure(for: first)
+            let b = PlaybackController.failure(for: second)
+            XCTAssertNotEqual(a.userMessage, b.userMessage)
+            XCTAssertTrue(a.userMessage.contains(firstDetail), a.userMessage)
+            XCTAssertTrue(b.userMessage.contains(secondDetail), b.userMessage)
+        }
+    }
+
     func testPlaybackFailureInitializerRemainsSourceCompatibleAndDiagnosticDefaultsToNil() {
         let failure = PlaybackFailure(
             code: "video.decode",
@@ -19,12 +41,13 @@ final class PlaybackErrorMappingTests: XCTestCase {
         XCTAssertEqual(failure.retryDisposition, .retrySameRequest)
     }
 
-    func testVideoDecodeMappingPreservesSignedStatusOnlyInDiagnosticCode() {
+    func testVideoDecodeMappingDisplaysSignedStatusAndKeepsMachineDiagnostic() {
         let secret = "https://user:password@example.test/live?token=secret"
         let failure = PlaybackController.failure(for: .videoDecode(-12_909))
 
         XCTAssertEqual(failure.code, "video.decode")
-        XCTAssertEqual(failure.userMessage, "视频解码失败，请尝试其他频道。")
+        XCTAssertTrue(failure.userMessage.contains("视频解码失败"))
+        XCTAssertTrue(failure.userMessage.contains("-12909"))
         XCTAssertEqual(failure.diagnosticCode, "video.decode.status.-12909")
         XCTAssertFalse(failure.diagnosticCode?.contains(secret) == true)
     }
@@ -80,7 +103,7 @@ final class PlaybackErrorMappingTests: XCTestCase {
         for (core, code, message) in cases {
             let failure = PlaybackController.failure(for: core)
             XCTAssertEqual(failure.code, code)
-            XCTAssertEqual(failure.userMessage, message)
+            XCTAssertTrue(failure.userMessage.hasPrefix(String(message.split(separator: "，")[0])), failure.userMessage)
         }
     }
 
@@ -116,13 +139,36 @@ final class PlaybackErrorMappingTests: XCTestCase {
     }
 
     func testVideoDecoderFailuresRetainRequiredDistinctionsAtPipelineBoundary() {
-        XCTAssertEqual(PlaybackPipeline.coreError(for: .sessionCreate(-7)), .videoDecode(-7))
-        XCTAssertEqual(PlaybackPipeline.coreError(for: .softwareDecoder), .hardwareDecoderUnavailable)
-        XCTAssertEqual(PlaybackPipeline.coreError(for: .badData(-8)), .videoDecode(-8))
-        XCTAssertEqual(PlaybackPipeline.coreError(for: .malfunction(-9)), .videoDecode(-9))
+        XCTAssertEqual(PlaybackPipeline.coreError(for: .sessionCreate(-7)), .videoDecoderFailure(.sessionCreate(-7)))
+        XCTAssertEqual(PlaybackPipeline.coreError(for: .softwareDecoder), .videoDecoderFailure(.softwareDecoder))
+        XCTAssertEqual(PlaybackPipeline.coreError(for: .badData(-8)), .videoDecoderFailure(.badData(-8)))
+        XCTAssertEqual(PlaybackPipeline.coreError(for: .malfunction(-9)), .videoDecoderFailure(.malfunction(-9)))
         XCTAssertEqual(
             PlaybackPipeline.coreError(for: .backpressureTimeout),
-            .videoDecode(kVTVideoDecoderNotAvailableNowErr)
+            .videoDecoderFailure(.backpressureTimeout)
         )
+    }
+
+    func testVideoDecoderCausesRemainDistinctWithTheSameSystemStatus() {
+        let causes: [VideoDecoderFailure] = [.sessionCreate(-17), .badData(-17), .malfunction(-17)]
+        let messages = causes.map { PlaybackController.failure(for: PlaybackPipeline.coreError(for: $0)).userMessage }
+        XCTAssertEqual(Set(messages).count, 3)
+        XCTAssertTrue(messages[0].contains("sessionCreate"))
+        XCTAssertTrue(messages[1].contains("badData"))
+        XCTAssertTrue(messages[2].contains("malfunction"))
+    }
+
+    func testUnknownDecodeFailuresKeepTheirPreviousRetryDisposition() {
+        let diagnostic = ErrorDiagnosticSnapshot(typeName: "ForeignDecodeError", message: "原始未知失败")
+        let stages = ["video.assembly", "audio.pcm-output", "audio.renderer.replay-prune",
+                      "audio.recovery.replay-prune", "audio.recovery.replay", "audio.renderer.configure",
+                      "audio.renderer.retry-replay", "audio.renderer.reset", "audio.renderer.reset-pcm",
+                      "audio.renderer.fallback", "audio.renderer.drive"]
+        for stage in stages {
+            let error = PlaybackCoreError.unexpected(stage: stage, diagnostic: diagnostic)
+            XCTAssertEqual(PlaybackController.failure(for: error).retryDisposition, .chooseAnotherChannel, stage)
+        }
+        let outputError = PlaybackCoreError.unexpected(stage: "audio.renderer", diagnostic: diagnostic)
+        XCTAssertEqual(PlaybackController.failure(for: outputError).retryDisposition, .retrySameRequest)
     }
 }

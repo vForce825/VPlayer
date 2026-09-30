@@ -54,7 +54,7 @@ final class SystemAudioSessionConfiguratorTests: XCTestCase {
     func testAcquisitionActivationFailureDoesNotProduceReadyReceipt() async throws {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success], activationFailures: 1)
         let ticket = try harness.prepareAcquisition()
-        XCTAssertTrue(harness.owner.startAcquisition(ticket, receiver: harness.receiver))
+        XCTAssertTrue(try harness.owner.startAcquisition(ticket, receiver: harness.receiver))
         for _ in 0..<50 { try await Task.sleep(for: .milliseconds(2)) }
         XCTAssertNil(harness.registry.outputAcquisitionCommitSnapshot())
     }
@@ -65,8 +65,10 @@ final class SystemAudioSessionConfiguratorTests: XCTestCase {
             categoryFailure: NSError(domain: NSOSStatusErrorDomain, code: 42)
         )
         let handoff = try await harness.acquire()
-        let reason = harness.registry.processAudioSessionReceiptSnapshot()?.preferredFailureReason
-        XCTAssertEqual(reason, .init(domain: .osStatus, code: 42))
+        let reason = try XCTUnwrap(harness.registry.processAudioSessionReceiptSnapshot()?.preferredFailureReason)
+        XCTAssertEqual(reason.domain, .osStatus)
+        XCTAssertEqual(reason.code, 42)
+        XCTAssertTrue(reason.diagnostic?.summary.contains("NSOSStatusErrorDomain(42)") == true)
         try await harness.release(handoff)
     }
 

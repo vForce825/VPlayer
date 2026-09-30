@@ -6,6 +6,7 @@ import AVFoundation
 import CoreMedia
 import CryptoKit
 import Foundation
+import VPlayerCore
 
 struct AudioAutomaticFlushProgressOriginTracker: Sendable {
     private var currentTicket: AudioRendererProgressTicket?
@@ -972,32 +973,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
               !terminal else { return }
         switch event {
         case let .failed(reason):
-            if replacing { return }
-            guard route == .systemCompressed,
-                  renderer?.mediaKind == .compressed,
-                  let attemptKey = currentCompressedAttemptKey else {
-                emitTerminal(.audioRendererFailed(reason))
-                return
-            }
-            recordCompressedRendererFailure(reason)
-            do {
-                try pruneExpired(at: synchronizer.currentTime())
-            } catch {
-                classifyAndEmitDecode(error)
-                return
-            }
-            let actions = progressMonitor.rendererFailed(
-                key: attemptKey,
-                hasReplay: !replay.isEmpty
-            )
-            guard !actions.isEmpty else {
-                emitTerminal(.audioRendererFailed(reason))
-                return
-            }
-            processProgressActions(
-                actions,
-                fallbackReason: .repeatedCompressedRendererFailure
-            )
+            handleRendererFailure(reason: reason, diagnostic: nil)
+        case let .failedWithDiagnostic(reason, diagnostic):
+            handleRendererFailure(reason: reason, diagnostic: diagnostic)
         case .automaticFlush:
             if replacing { return }
             fenceRendererQueueMutation(
@@ -1010,6 +988,34 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             routeMonitor.resample(reason: .routeConfigurationChange)
             ingestRecovery(.outputConfigurationChanged)
         }
+    }
+
+    private func handleRendererFailure(reason: String, diagnostic: ErrorDiagnosticSnapshot?) {
+        if replacing { return }
+        let terminalError: PlaybackCoreError = diagnostic.map {
+            .unexpected(stage: "audio.renderer", diagnostic: $0)
+        } ?? .audioRendererFailed(reason)
+        guard route == .systemCompressed,
+              renderer?.mediaKind == .compressed,
+              let attemptKey = currentCompressedAttemptKey else {
+            emitTerminal(terminalError)
+            return
+        }
+        recordCompressedRendererFailure(reason)
+        do {
+            try pruneExpired(at: synchronizer.currentTime())
+        } catch {
+            classifyAndEmitDecode(error, stage: "audio.renderer.replay-prune")
+            return
+        }
+        let actions = progressMonitor.rendererFailed(
+            key: attemptKey, hasReplay: !replay.isEmpty
+        )
+        guard !actions.isEmpty else {
+            emitTerminal(terminalError)
+            return
+        }
+        processProgressActions(actions, fallbackReason: .repeatedCompressedRendererFailure)
     }
 
     private func handleRoute(
@@ -1325,7 +1331,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             do {
                 try pruneExpired(at: recoveryTime)
             } catch {
-                classifyAndEmitDecode(error)
+                classifyAndEmitDecode(error, stage: "audio.recovery.replay-prune")
                 return
             }
             guard let token = currentProgressToken else { return }
@@ -1373,7 +1379,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             try pruneExpired(at: recoveryTime)
             recoverPreprunedReplay(at: recoveryTime)
         } catch {
-            classifyAndEmitDecode(error)
+            classifyAndEmitDecode(error, stage: "audio.recovery.replay")
         }
     }
 
@@ -1537,7 +1543,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             do {
                 try activateConfiguredRenderer()
             } catch {
-                classifyAndEmitDecode(error)
+                classifyAndEmitDecode(error, stage: "audio.renderer.configure")
             }
         case .compressedRetry:
             completeCompressedRetryAfterRemoval()
@@ -1580,7 +1586,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         do {
             try pruneExpired(at: synchronizer.currentTime())
         } catch {
-            classifyAndEmitDecode(error)
+            classifyAndEmitDecode(error, stage: "audio.renderer.retry-replay")
             return
         }
         replacing = false
@@ -1616,7 +1622,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 try synchronizer.attach(replacement)
             } catch {
                 replacementCleanupAfterFailedAttachment()
-                classifyAndEmitDecode(error)
+                classifyAndEmitDecode(error, stage: "audio.renderer.reset")
                 return
             }
             rendererAttached = true
@@ -1636,7 +1642,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             do {
                 try activatePCMRenderer()
             } catch {
-                classifyAndEmitDecode(error)
+                classifyAndEmitDecode(error, stage: "audio.renderer.reset-pcm")
             }
         }
     }
@@ -1677,7 +1683,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 ingestRecovery(.routeChanged)
             }
         } catch {
-            classifyAndEmitDecode(error)
+            classifyAndEmitDecode(error, stage: "audio.renderer.fallback")
         }
     }
 
@@ -1744,7 +1750,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 try enqueuePCMUntilBackpressured()
             }
         } catch {
-            classifyAndEmitDecode(error)
+            classifyAndEmitDecode(error, stage: "audio.renderer.drive")
             return
         }
         reconcileRendererRequest(hasPendingWork: pendingRendererSampleCount > 0)
@@ -2027,16 +2033,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func replayRetentionFailure(from error: any Error) -> PlaybackCoreError {
-        guard let core = error as? PlaybackCoreError else {
-            return replayAccountingFailure()
-        }
-        switch core {
-        case .audioRendererFailed(CompressedAudioRetentionPolicy.replayCapacityError),
-             .audioRendererFailed(CompressedAudioRetentionPolicy.accountingError):
-            return core
-        default:
-            return replayAccountingFailure()
-        }
+        (error as? PlaybackCoreError) ?? .unexpected(stage: "audio.replay-retention", diagnostic: .init(error))
     }
 
     private func isCurrent(
@@ -2279,23 +2276,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         }
     }
 
-    private func classifyAndEmitDecode(_ error: any Error) {
-        if let error = error as? PlaybackCoreError {
-            switch error {
-            case .audioFallbackDecode:
-                emitTerminal(error)
-            case let .audioRendererFailed(reason):
-                if route == .ffmpegPCM {
-                    emitTerminal(.audioRendererFailed(reason))
-                } else {
-                    emitTerminal(error)
-                }
-            default:
-                emitTerminal(.audioFallbackDecode(FFmpegPCMAudioDecoder.invalidCallbackErrorCode))
-            }
-        } else {
-            emitTerminal(.audioFallbackDecode(FFmpegPCMAudioDecoder.invalidCallbackErrorCode))
-        }
+    private func classifyAndEmitDecode(_ error: any Error, stage: String) {
+        emitTerminal((error as? PlaybackCoreError) ?? .unexpected(stage: stage, diagnostic: .init(error)))
     }
 
     private func emitTerminal(_ error: PlaybackCoreError) {

@@ -9,6 +9,92 @@ import XCTest
 
 @MainActor
 final class SwiftDataLibraryStoreTests: XCTestCase {
+    func testCorruptChannelAttributesPreserveDecodingCaseAndReason() async throws {
+        let fixtures: [(String, String, String)] = [
+            ("{", "dataCorrupted", "not valid JSON"),
+            (#"{"tvg-id":42}"#, "typeMismatch", "Expected to decode String"),
+            (#"{"tvg-id":null}"#, "valueNotFound", "null value")
+        ]
+        for (json, expectedCase, expectedReason) in fixtures {
+            let (container, store) = try makeStore()
+            let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+            try await store.installPlaylist(
+                profileID: profile.id,
+                channels: [channel(profileID: profile.id, name: "Live", path: "live")],
+                fetchedAt: date(20)
+            )
+            let context = ModelContext(container)
+            let record = try XCTUnwrap(try context.fetch(FetchDescriptor<ChannelRecord>()).first)
+            record.attributesJSON = Data(json.utf8)
+            try context.save()
+            let reopened = SwiftDataLibraryStore(modelContainer: container)
+
+            do {
+                _ = try await reopened.channels(profileID: profile.id)
+                XCTFail("损坏的频道属性应读取失败")
+            } catch {
+                let shown = String(reflecting: error)
+                XCTAssertTrue(shown.contains("attributesJSON"), shown)
+                XCTAssertTrue(shown.contains("DecodingError"), shown)
+                XCTAssertTrue(shown.contains(expectedCase), shown)
+                XCTAssertTrue(shown.localizedCaseInsensitiveContains(expectedReason), shown)
+            }
+        }
+    }
+
+    func testCorruptProfileFieldsIdentifyTheInvalidField() async throws {
+        let mutations: [(String, (SourceProfileRecord) -> Void)] = [
+            ("m3uURLString", { $0.m3uURLString = "http://[" }),
+            ("epgURLString", { $0.epgURLString = "http://[" }),
+            ("m3uRefreshIntervalRaw", { $0.m3uRefreshIntervalRaw = -1 }),
+            ("epgRefreshIntervalRaw", { $0.epgRefreshIntervalRaw = -1 }),
+            ("m3uStateRaw", { $0.m3uStateRaw = "unknown" }),
+            ("epgStateRaw", { $0.epgStateRaw = "unknown" })
+        ]
+        for (field, mutate) in mutations {
+            let (container, store) = try makeStore()
+            _ = try await store.createProfile(input(name: "Home"), now: date(10))
+            let context = ModelContext(container)
+            let record = try XCTUnwrap(try context.fetch(FetchDescriptor<SourceProfileRecord>()).first)
+            mutate(record)
+            try context.save()
+            let reopened = SwiftDataLibraryStore(modelContainer: container)
+
+            do {
+                _ = try await reopened.profiles()
+                XCTFail("损坏的源配置应读取失败")
+            } catch {
+                let shown = String(reflecting: error)
+                XCTAssertTrue(shown.contains(field), shown)
+                XCTAssertFalse(shown.contains("http://["), shown)
+            }
+        }
+    }
+
+    func testCorruptChannelURLIdentifiesTheInvalidField() async throws {
+        let (container, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Home"), now: date(10))
+        try await store.installPlaylist(
+            profileID: profile.id,
+            channels: [channel(profileID: profile.id, name: "Live", path: "live")],
+            fetchedAt: date(20)
+        )
+        let context = ModelContext(container)
+        let record = try XCTUnwrap(try context.fetch(FetchDescriptor<ChannelRecord>()).first)
+        record.streamURLString = "http://["
+        try context.save()
+        let reopened = SwiftDataLibraryStore(modelContainer: container)
+
+        do {
+            _ = try await reopened.channels(profileID: profile.id)
+            XCTFail("损坏的频道地址应读取失败")
+        } catch {
+            let shown = String(reflecting: error)
+            XCTAssertTrue(shown.contains("streamURLString"), shown)
+            XCTAssertFalse(shown.contains("http://["), shown)
+        }
+    }
+
     func testCreatingProfilesSelectsFirstAndKeepsProfileChannelsIsolated() async throws {
         let (_, store) = try makeStore()
         let first = try await store.createProfile(input(name: "First"), now: date(10))

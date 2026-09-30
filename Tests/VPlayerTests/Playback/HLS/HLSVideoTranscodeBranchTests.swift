@@ -8,6 +8,7 @@ import Foundation
 import IOSurface
 import Metal
 import VideoToolbox
+import VPlayerCore
 import XCTest
 @testable import VPlayerPlayback
 
@@ -655,9 +656,14 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
             yadif: yadif,
             failureSink: { error, observedGeneration in
                 XCTAssertEqual(observedGeneration, generation)
-                guard case .metalCommand = error else {
-                    return XCTFail("应保留为 HLS 编码分支失败，实际为 \(error)")
+                let message = PlaybackController.failure(for: error).userMessage
+                XCTAssertTrue(message.contains("HLS.Encoder.Native"), message)
+                XCTAssertTrue(message.contains("-22"), message)
+                XCTAssertTrue(message.contains("原始编码器异常"), message)
+                guard case .unexpected(_, let diagnostic) = error else {
+                    return XCTFail("HLS 分支应保留原始类型快照，实际为 \(error)")
                 }
+                XCTAssertEqual(diagnostic.typeName, String(reflecting: NSError.self))
                 failureObserved.fulfill()
             }
         )
@@ -689,7 +695,10 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
             !encoder.submittedFrames.isEmpty
         })
 
-        encoder.completeFirst(with: .failure(.callback(-22)))
+        encoder.completeFirst(with: .failure(.unexpected(ErrorDiagnosticSnapshot(
+            NSError(domain: "HLS.Encoder.Native", code: -22,
+                userInfo: [NSLocalizedDescriptionKey: "原始编码器异常"])
+        ))))
 
         wait(for: [failureObserved], timeout: 2)
         XCTAssertFalse(owner.hasOpenInputAdmission)

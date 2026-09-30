@@ -152,8 +152,9 @@ actor LibraryStartup {
     typealias Maintenance = @Sendable () async throws -> Void
 
     private let maintenance: Maintenance
-    private var runningTask: Task<Bool, Never>?
+    private var runningTask: Task<ErrorDiagnosticSnapshot?, Never>?
     private var isCompleted = false
+    private(set) var lastFailure: ErrorDiagnosticSnapshot?
 
     init(maintenance: @escaping Maintenance) {
         self.maintenance = maintenance
@@ -164,24 +165,28 @@ actor LibraryStartup {
             return .alreadyCompleted
         }
         if let runningTask {
-            return await runningTask.value ? .alreadyCompleted : .failed
+            return await runningTask.value == nil ? .alreadyCompleted : .failed
         }
 
         let maintenance = maintenance
-        let task = Task {
+        let task = Task<ErrorDiagnosticSnapshot?, Never> {
             do {
                 try await maintenance()
-                return true
+                return nil
             } catch {
-                return false
+                return .init(error)
             }
         }
         runningTask = task
-        let succeeded = await task.value
+        let failure = await task.value
         runningTask = nil
-        if succeeded {
+        lastFailure = failure
+        if failure == nil {
             isCompleted = true
             return .completed
+        }
+        if let failure {
+            logger.error("资料库维护失败（\(failure.typeName, privacy: .public)；\(failure.summary, privacy: .private)）。")
         }
         return .failed
     }
@@ -359,9 +364,7 @@ final class LiveAppBootstrap {
                 let runtime = try await runtimeLoader.load()
                 return await runtime.refresh(profileID, resources, trigger)
             } catch {
-                return resources.map {
-                    RefreshOutcome(resource: $0, succeeded: false, message: nil)
-                }
+                return libraryFailureOutcomes(resources: resources, diagnostic: .init(error))
             }
         }
         foregroundRefreshDriver = ForegroundRefreshDriver(
@@ -433,6 +436,7 @@ struct AppDependencies {
     /// repository call then fails, so the UI shows a dedicated explanation
     /// instead of a generic "try again later" alert on every screen.
     let isLibraryAvailable: Bool
+    let libraryUnavailableDiagnostic: ErrorDiagnosticSnapshot?
     let libraryChanges: LibraryChangeSignal
     let libraryStartup: LibraryStartup
     let foregroundRefreshDriver: ForegroundRefreshDriver
@@ -444,7 +448,10 @@ struct AppDependencies {
         backgroundRefreshRegistrar: BackgroundRefreshRegistrar,
         repository: any LibraryRepository = UnavailableLibraryRepository(),
         refresh: @escaping Refresh = { _, resources, _ in
-            resources.map { RefreshOutcome(resource: $0, succeeded: false, message: nil) }
+            libraryFailureOutcomes(
+                resources: resources,
+                diagnostic: .init(ProductionDependencyError.libraryUnavailable)
+            )
         },
         prepare: @escaping Prepare = {},
         playbackSettings: PlaybackSettingsStore = PlaybackSettingsStore(),
@@ -456,9 +463,11 @@ struct AppDependencies {
         exposesAcceptanceMetrics: Bool = false,
         exposesAcceptanceState: Bool = false,
         isLibraryAvailable: Bool = true,
+        libraryUnavailableDiagnostic: ErrorDiagnosticSnapshot? = nil,
         libraryChanges: LibraryChangeSignal = LibraryChangeSignal()
     ) {
         self.isLibraryAvailable = isLibraryAvailable
+        self.libraryUnavailableDiagnostic = libraryUnavailableDiagnostic
         self.repository = repository
         self.refresh = refresh
         self.prepare = prepare
@@ -542,20 +551,20 @@ struct AppDependencies {
                 prepare: runtime.prepare
             )
         } catch {
-            // The UI can only say "storage is unavailable"; without this the
-            // real reason never leaves the process and the failure is
-            // undiagnosable on a device.
+            let diagnostic = ErrorDiagnosticSnapshot(error)
             logger.error(
-                "Persistent library store unavailable (\(String(describing: type(of: error)), privacy: .public))."
+                "本地资料库不可用（\(diagnostic.typeName, privacy: .public)；\(diagnostic.summary, privacy: .private)）。"
             )
-            let repository = UnavailableLibraryRepository()
+            let repository = UnavailableLibraryRepository(diagnostic: diagnostic)
             let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
-                throw ProductionDependencyError.libraryUnavailable
+                throw diagnostic
             }
-            let refresh: ForegroundRefreshDriver.Refresh = { _, _, _ in [] }
+            let refresh: ForegroundRefreshDriver.Refresh = { _, resources, _ in
+                libraryFailureOutcomes(resources: resources, diagnostic: diagnostic)
+            }
             return Self(
                 libraryStartup: LibraryStartup {
-                    throw ProductionDependencyError.libraryUnavailable
+                    throw diagnostic
                 },
                 foregroundRefreshDriver: ForegroundRefreshDriver(
                     loadProfiles: loadProfiles,
@@ -569,7 +578,8 @@ struct AppDependencies {
                 ),
                 repository: repository,
                 refresh: refresh,
-                isLibraryAvailable: false
+                isLibraryAvailable: false,
+                libraryUnavailableDiagnostic: diagnostic
             )
         }
     }
@@ -624,7 +634,7 @@ struct AppDependencies {
         } catch {
             // Acceptance runs must never silently fall back to the on-disk
             // production store; fail loudly instead so the harness surfaces it.
-            fatalError("Acceptance dependencies require an in-memory store; container creation failed: \(error)")
+            fatalError("验收依赖需要内存资料库；容器创建失败：\(ErrorDiagnosticSnapshot(error).summary)")
         }
     }
 
@@ -678,7 +688,7 @@ struct AppDependencies {
                 repository: repository,
                 refresh: refresh,
                 prepare: {
-                    await seeder.seed()
+                    try await seeder.seed()
                 },
                 playbackEngine: UITestPlaybackEngine(fixture: playbackFixture),
                 playbackPresentationProvider: {
@@ -691,9 +701,10 @@ struct AppDependencies {
                 libraryChanges: libraryChanges
             )
         } catch {
-            let repository = UnavailableLibraryRepository()
+            let diagnostic = ErrorDiagnosticSnapshot(error)
+            let repository = UnavailableLibraryRepository(diagnostic: diagnostic)
             let refresh: Refresh = { _, resources, _ in
-                resources.map { RefreshOutcome(resource: $0, succeeded: false, message: nil) }
+                libraryFailureOutcomes(resources: resources, diagnostic: diagnostic)
             }
             return Self(
                 libraryStartup: LibraryStartup {},
@@ -717,7 +728,9 @@ struct AppDependencies {
                 playbackMediaInformationProvider: uiTestMediaInformationProvider(
                     for: playbackFixture
                 ),
-                exposesAcceptanceState: true
+                exposesAcceptanceState: true,
+                isLibraryAvailable: false,
+                libraryUnavailableDiagnostic: diagnostic
             )
         }
     }
@@ -732,10 +745,15 @@ struct AppDependencies {
     func openInitialLibrary(using model: AppModel) async -> Bool {
         do {
             try await prepare()
+        } catch is CancellationError {
+            return false
         } catch {
+            guard !Task.isCancelled else { return false }
+            let diagnostic = ErrorDiagnosticSnapshot(error)
             logger.error(
-                "Initial library preparation failed (\(String(describing: type(of: error)), privacy: .public))."
+                "首次资料库准备失败（\(diagnostic.typeName, privacy: .public)；\(diagnostic.summary, privacy: .private)）。"
             )
+            model.alertMessage = "准备本地资料库失败：\(diagnostic.summary)"
             return false
         }
         guard !Task.isCancelled else { return false }
@@ -822,7 +840,7 @@ struct AppDependencies {
                         attemptID: attemptID
                     )
                 } catch {
-                    let message = "测试刷新失败。"
+                    let message = "测试刷新失败：\(ErrorDiagnosticSnapshot(error).summary)"
                     try? await repository.recordFailure(
                         profileID: profileID,
                         resource: resource,
@@ -858,6 +876,14 @@ private enum ProductionDependencyError: Error {
     case libraryUnavailable
 }
 
+private func libraryFailureOutcomes(
+    resources: Set<RefreshResource>,
+    diagnostic: ErrorDiagnosticSnapshot
+) -> [RefreshOutcome] {
+    let message = "资料库依赖不可用：\(diagnostic.summary)"
+    return resources.map { RefreshOutcome(resource: $0, succeeded: false, message: message) }
+}
+
 #if DEBUG
 @MainActor
 private final class InertBackgroundRefreshScheduler: BackgroundRefreshScheduling {
@@ -888,7 +914,7 @@ private actor SeededLibrarySeeder {
         self.repository = repository
     }
 
-    func seed() async {
+    func seed() async throws {
         guard !didSeed else { return }
         didSeed = true
         let now = Date()
@@ -978,7 +1004,7 @@ private actor SeededLibrarySeeder {
                 fetchedAt: now
             )
         } catch {
-            return
+            throw ErrorDiagnosticSnapshot(error)
         }
     }
 
@@ -1009,36 +1035,42 @@ private actor SeededLibrarySeeder {
 
 private actor UnavailableLibraryRepository: LibraryRepository,
     ConditionalRefreshStatusWriting {
-    func profiles() throws -> [SourceProfile] { throw ProductionDependencyError.libraryUnavailable }
-    func activeProfile() throws -> SourceProfile? { throw ProductionDependencyError.libraryUnavailable }
+    private let diagnostic: ErrorDiagnosticSnapshot
+
+    init(diagnostic: ErrorDiagnosticSnapshot = .init(ProductionDependencyError.libraryUnavailable)) {
+        self.diagnostic = diagnostic
+    }
+
+    func profiles() throws -> [SourceProfile] { throw diagnostic }
+    func activeProfile() throws -> SourceProfile? { throw diagnostic }
     func createProfile(_ input: ValidatedSourceProfileInput, now: Date) throws -> SourceProfile {
         _ = input
         _ = now
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func updateProfile(id: UUID, input: ValidatedSourceProfileInput, now: Date) throws {
         _ = id
         _ = input
         _ = now
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
-    func deleteProfile(id: UUID) throws { _ = id; throw ProductionDependencyError.libraryUnavailable }
-    func setActiveProfile(id: UUID) throws { _ = id; throw ProductionDependencyError.libraryUnavailable }
+    func deleteProfile(id: UUID) throws { _ = id; throw diagnostic }
+    func setActiveProfile(id: UUID) throws { _ = id; throw diagnostic }
     func channels(profileID: UUID) throws -> [Channel] {
         _ = profileID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func epgChannels(profileID: UUID) throws -> [EPGChannel] {
         _ = profileID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func epgProgrammeCount(profileID: UUID) async throws -> Int {
         _ = profileID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func epgCoverageEnd(profileID: UUID) async throws -> Date? {
         _ = profileID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func programmes(
         profileID: UUID,
@@ -1048,16 +1080,16 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = profileID
         _ = xmltvChannelID
         _ = overlapping
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func manualMapping(profileID: UUID, channelID: String) throws -> ManualEPGMapping? {
         _ = profileID
         _ = channelID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func manualMappings(profileID: UUID) throws -> [String: String] {
         _ = profileID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func programmes(
         profileID: UUID,
@@ -1067,13 +1099,13 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = profileID
         _ = xmltvChannelIDs
         _ = overlapping
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func setManualMapping(profileID: UUID, channelID: String, xmltvChannelID: String?) throws {
         _ = profileID
         _ = channelID
         _ = xmltvChannelID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func setManualMappingIfCurrentChannel(
         profileID: UUID,
@@ -1083,19 +1115,19 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = profileID
         _ = channelID
         _ = xmltvChannelID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func installPlaylist(profileID: UUID, channels: [Channel], fetchedAt: Date) throws {
         _ = profileID
         _ = channels
         _ = fetchedAt
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func installEPG(profileID: UUID, fileURL: URL, fetchedAt: Date) throws -> XMLTVParseSummary {
         _ = profileID
         _ = fileURL
         _ = fetchedAt
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func recordAttempt(
         profileID: UUID,
@@ -1107,7 +1139,7 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = resource
         _ = at
         _ = attemptID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func beginRefresh(
         profileID: UUID,
@@ -1119,7 +1151,7 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = resource
         _ = context
         _ = at
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func recordSuccess(
         profileID: UUID,
@@ -1131,7 +1163,7 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = resource
         _ = at
         _ = attemptID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func recordFailure(
         profileID: UUID,
@@ -1145,7 +1177,7 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = summary
         _ = at
         _ = attemptID
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
     func recordRefreshFailure(
         profileID: UUID,
@@ -1159,7 +1191,7 @@ private actor UnavailableLibraryRepository: LibraryRepository,
         _ = context
         _ = summary
         _ = at
-        throw ProductionDependencyError.libraryUnavailable
+        throw diagnostic
     }
-    func purgeUnreferencedSnapshots() throws { throw ProductionDependencyError.libraryUnavailable }
+    func purgeUnreferencedSnapshots() throws { throw diagnostic }
 }

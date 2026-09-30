@@ -457,6 +457,36 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.profiles[0].m3uStatus.errorSummary, message)
     }
 
+    func testUnknownRefreshFailurePreservesTypeAndOriginalReason() async throws {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(data: [:], failures: [.playlist: .connection])
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let outcomes = await coordinator.refresh(
+            profileID: profileID, resources: [.playlist], trigger: .manual
+        )
+        let message = try XCTUnwrap(outcomes.first?.message)
+        XCTAssertTrue(message.contains("LeakyDownloadError"))
+        XCTAssertTrue(message.contains("could not load"))
+        XCTAssertFalse(message.contains("secret"))
+    }
+
+    func testPlaylistFailuresDistinguishMissingHeaderFromEmptyChannels() async throws {
+        var messages: [String] = []
+        for data in [Data("bad header".utf8), Data("#EXTM3U\n".utf8)] {
+            let repository = RepositorySpy(profiles: [makeProfile()])
+            let coordinator = makeCoordinator(
+                repository: repository, downloader: FakeRemoteDownloader(data: [.playlist: data])
+            )
+            let outcomes = await coordinator.refresh(
+                profileID: profileID, resources: [.playlist], trigger: .manual
+            )
+            messages.append(try XCTUnwrap(outcomes.first?.message))
+        }
+        XCTAssertNotEqual(messages[0], messages[1])
+        XCTAssertTrue(messages[0].contains("missingHeader"))
+        XCTAssertTrue(messages[1].contains("noChannels"))
+    }
+
     func testFailureSummaryRemainsBoundedWhenSourceURLHasALongPath() async throws {
         let path = String(repeating: "a", count: 400)
         let url = URL(string: "https://example.test/\(path)?token=secret")!

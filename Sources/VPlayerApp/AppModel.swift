@@ -106,6 +106,7 @@ final class AppModel {
     @ObservationIgnored private var libraryChangeTask: Task<Void, Never>?
     @ObservationIgnored private let beforeLibraryPresentationApply: @Sendable () async -> Void
     @ObservationIgnored private var alertKind = AlertKind.operation
+    @ObservationIgnored private var lastReloadFailure: ErrorDiagnosticSnapshot?
 
     init(
         repository: any LibraryRepository,
@@ -223,6 +224,7 @@ final class AppModel {
         let terminalRefreshOverlayIDsAtStart = terminalRefreshOverlays.mapValues(\.id)
         activeTransition = nil
         reloadID = currentReloadID
+        lastReloadFailure = nil
         // A background M3U/EPG refresh can hold the repository actor while it
         // installs a large snapshot. Keep a previously loaded channel library
         // visible and selectable until the replacement is complete; only the
@@ -328,7 +330,8 @@ final class AppModel {
             return .failedWhileCurrent
         } catch {
             guard reloadID == currentReloadID else { return .superseded }
-            presentOperationMessage("无法读取数据，请稍后重试。")
+            lastReloadFailure = ErrorDiagnosticSnapshot(error)
+            presentOperationError(error, operation: "读取资料库失败")
             finishLoading(reloadID: currentReloadID)
             return .failedWhileCurrent
         }
@@ -341,6 +344,7 @@ final class AppModel {
         let terminalRefreshOverlayIDsAtStart = terminalRefreshOverlays.mapValues(\.id)
         activeTransition = nil
         reloadID = currentReloadID
+        lastReloadFailure = nil
 
         do {
             let loadedProfiles = try await repository.profiles()
@@ -358,7 +362,8 @@ final class AppModel {
             return reloadID == currentReloadID ? .failedWhileCurrent : .superseded
         } catch {
             guard reloadID == currentReloadID else { return .superseded }
-            presentOperationMessage("无法读取数据，请稍后重试。")
+            lastReloadFailure = ErrorDiagnosticSnapshot(error)
+            presentOperationError(error, operation: "读取源配置失败")
             return .failedWhileCurrent
         }
     }
@@ -371,6 +376,7 @@ final class AppModel {
         let loadedChannels = channels
         activeTransition = nil
         reloadID = currentReloadID
+        lastReloadFailure = nil
 
         do {
             let loadedProfiles = try await repository.profiles()
@@ -442,7 +448,8 @@ final class AppModel {
             return reloadID == currentReloadID ? .failedWhileCurrent : .superseded
         } catch {
             guard reloadID == currentReloadID else { return .superseded }
-            presentOperationMessage("无法读取数据，请稍后重试。")
+            lastReloadFailure = ErrorDiagnosticSnapshot(error)
+            presentOperationError(error, operation: "读取 EPG 数据失败")
             return .failedWhileCurrent
         }
     }
@@ -569,7 +576,7 @@ final class AppModel {
                     return false
                 }
                 reconcileCreatedProfile(createdProfile)
-                presentOperationMessage("播放列表已保存，但界面未能重新读取。请重试；再次保存不会重复创建。")
+                presentReloadFailure("播放列表已保存，但界面未能重新读取。请重试；再次保存不会重复创建。")
                 return false
             }
             guard !cancelledCreationAttemptIDs.contains(attemptID) else {
@@ -590,7 +597,7 @@ final class AppModel {
             )
             return true
         } catch {
-            presentOperationError(error)
+            presentOperationError(error, operation: "创建播放列表失败")
             return false
         }
     }
@@ -623,12 +630,12 @@ final class AppModel {
             let reloadApplied = await reload()
             startAutomaticRefresh(profileID: profileID, resources: retargetedResources)
             guard reloadApplied else {
-                presentOperationMessage("更改已保存，但界面未能重新读取。请稍后重试。")
+                presentReloadFailure("更改已保存，但界面未能重新读取。请稍后重试。")
                 return false
             }
             return true
         } catch {
-            presentOperationError(error)
+            presentOperationError(error, operation: "修改播放列表失败")
             return false
         }
     }
@@ -664,7 +671,7 @@ final class AppModel {
                 if deletedActiveProfile {
                     clearActiveBoundState()
                 }
-                presentOperationMessage("播放列表已删除，但界面未能重新读取。请稍后重试。")
+                presentReloadFailure("播放列表已删除，但界面未能重新读取。请稍后重试。")
                 return false
             case .superseded:
                 return false
@@ -682,7 +689,7 @@ final class AppModel {
                     return false
                 }
             }
-            presentOperationError(error)
+            presentOperationError(error, operation: "删除播放列表失败")
             return false
         }
     }
@@ -712,7 +719,7 @@ final class AppModel {
             case .failedWhileCurrent:
                 activeProfile = profiles.first { $0.id == profileID }
                 clearChannelState()
-                presentOperationMessage("当前播放列表已切换，但频道未能重新读取。请稍后重试。")
+                presentReloadFailure("当前播放列表已切换，但频道未能重新读取。请稍后重试。")
                 return false
             case .superseded:
                 return false
@@ -726,7 +733,7 @@ final class AppModel {
             guard restoreActiveBoundState(ifOwnedBy: activeTransition) else {
                 return false
             }
-            presentOperationError(error)
+            presentOperationError(error, operation: "切换播放列表失败")
             return false
         }
     }
@@ -1015,14 +1022,14 @@ final class AppModel {
                 return false
             }
             guard await reload() else {
-                presentOperationMessage("映射已保存，但界面未能重新读取。请稍后重试。")
+                presentReloadFailure("映射已保存，但界面未能重新读取。请稍后重试。")
                 return false
             }
             return true
         } catch {
-            presentOperationError(error)
+            let original = ErrorDiagnosticSnapshot(error)
             _ = await reload()
-            presentOperationMessage("无法保存映射，请刷新频道后重试。")
+            presentOperationError(original, operation: "保存 EPG 映射失败")
             return false
         }
     }
@@ -1239,10 +1246,17 @@ final class AppModel {
         }
     }
 
-    private func presentOperationError(_ error: any Error) {
-        presentOperationMessage(
-            SourceProfileValidationMessage.text(for: error) ?? "操作失败，请稍后重试。"
-        )
+    private func presentOperationError(_ error: any Error, operation: String) {
+        if let validation = SourceProfileValidationMessage.text(for: error) {
+            presentOperationMessage(validation)
+        } else {
+            presentOperationMessage("\(operation)：\(ErrorDiagnosticSnapshot(error).summary)")
+        }
+    }
+
+    private func presentReloadFailure(_ message: String) {
+        let detail = lastReloadFailure.map { "\n\($0.summary)" } ?? ""
+        presentOperationMessage(message + detail)
     }
 
     private func beginActiveTransition(to profile: SourceProfile?) -> ActiveTransition {

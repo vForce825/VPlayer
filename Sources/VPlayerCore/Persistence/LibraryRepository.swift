@@ -159,11 +159,24 @@ public extension LibraryRepository {
     }
 }
 
-public enum LibraryRepositoryError: Error, Equatable, Sendable {
+public enum LibraryRepositoryError: Error, Equatable, Sendable, LocalizedError {
     case profileNotFound
     case invalidChannelProfile
     case duplicatePlaylistChannel
     case epgHasNoChannels
     case corruptPersistedValue
+    case corruptPersistedField(field: String)
+    case persistedValueDecodingFailed(field: String, diagnostic: ErrorDiagnosticSnapshot)
     case sourceConfigurationChanged
+
+    public var errorDescription: String? {
+        switch self {
+        case let .corruptPersistedField(field):
+            return "持久化字段 \(field) 无效。"
+        case let .persistedValueDecodingFailed(field, diagnostic):
+            return "持久化字段 \(field) 解码失败：\(diagnostic.summary)"
+        default:
+            return nil
+        }
+    }
 }

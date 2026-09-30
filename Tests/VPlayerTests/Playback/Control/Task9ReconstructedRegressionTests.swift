@@ -374,8 +374,8 @@ private final class Task9SDKGate: PlaybackAudioSessionSDK, @unchecked Sendable {
 private final class Task9BeforeBindingOwner: PlaybackAudioSessionOwner, @unchecked Sendable {
     let history = PlaybackStreamRecorder<PlaybackAudioSessionEventEnvelope>()
     override func startAcquisition(_ ticket: ControlTaskTicket,
-        receiver: any PlaybackAudioSessionCompletionReceiving) -> Bool {
-        let started = super.startAcquisition(ticket, receiver: receiver)
+        receiver: any PlaybackAudioSessionCompletionReceiving) throws -> Bool {
+        let started = try super.startAcquisition(ticket, receiver: receiver)
         if started, let envelope = monitor.emit(.interruptionEnded(shouldResume: true)) { history.append(envelope) }
         return started
     }
@@ -508,7 +508,7 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         let admission = try registry.admitPlaybackRequest(requestID: UUID())
         let acquisition = try XCTUnwrap(registry.beginOutputAcquisition(admission: admission,
             resetRecoveryMandatorySuffix: 3_000_000_000))
-        XCTAssertTrue(owner.startAcquisition(acquisition, receiver: service))
+        XCTAssertTrue(try owner.startAcquisition(acquisition, receiver: service))
         await fulfillment(of: [category], timeout: 2)
         let registration = try XCTUnwrap(owner.registration(for: acquisition))
         let original = try XCTUnwrap(registry.outputResourceContextSnapshot())

@@ -1208,12 +1208,26 @@ private enum RawDemuxEventCopier {
     }
 
     private static func mapError(_ raw: VPFFDemuxEvent) throws -> PlaybackCoreError {
+        let stage: FFmpegFailureStage
+        switch raw.error_stage {
+        case VPFF_DEMUX_STAGE_VALIDATION: stage = .validation
+        case VPFF_DEMUX_STAGE_OPEN: stage = .open
+        case VPFF_DEMUX_STAGE_STREAM_INFO: stage = .streamInfo
+        case VPFF_DEMUX_STAGE_SELECTION: stage = .selection
+        case VPFF_DEMUX_STAGE_BSF_INIT: stage = .bsfInit
+        case VPFF_DEMUX_STAGE_READ: stage = .read
+        case VPFF_DEMUX_STAGE_BSF_SEND: stage = .bsfSend
+        case VPFF_DEMUX_STAGE_BSF_RECEIVE: stage = .bsfReceive
+        default: stage = .unspecified
+        }
         switch raw.error_kind {
-        case VPFF_DEMUX_ERROR_OPEN: .demuxOpen(raw.ffmpeg_error)
-        case VPFF_DEMUX_ERROR_READ: .demuxRead(raw.ffmpeg_error)
-        case VPFF_DEMUX_ERROR_TIMEOUT: .networkTimeout
-        case VPFF_DEMUX_ERROR_UNSUPPORTED_VIDEO: .unsupportedVideoCodec
-        case VPFF_DEMUX_ERROR_UNSUPPORTED_AUDIO: .unsupportedAudioCodec
+        case VPFF_DEMUX_ERROR_OPEN: return .ffmpegFailure(kind: .open, stage: stage, status: raw.ffmpeg_error)
+        case VPFF_DEMUX_ERROR_READ: return .ffmpegFailure(kind: .read, stage: stage, status: raw.ffmpeg_error)
+        case VPFF_DEMUX_ERROR_TIMEOUT: return .ffmpegFailure(kind: .timeout, stage: stage, status: raw.ffmpeg_error)
+        case VPFF_DEMUX_ERROR_UNSUPPORTED_VIDEO:
+            return .ffmpegFailure(kind: .unsupportedVideo, stage: stage, status: raw.ffmpeg_error)
+        case VPFF_DEMUX_ERROR_UNSUPPORTED_AUDIO:
+            return .ffmpegFailure(kind: .unsupportedAudio, stage: stage, status: raw.ffmpeg_error)
         default: throw RawDemuxCopyError.malformed
         }
     }

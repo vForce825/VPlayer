@@ -7,6 +7,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import VideoToolbox
+import VPlayerCore
 
 struct VTCompressionSessionID: RawRepresentable, Sendable, Hashable {
     let rawValue: UInt64
@@ -81,6 +82,7 @@ struct VTCompressionOutput: @unchecked Sendable {
     let status: OSStatus
     let infoFlags: VTEncodeInfoFlags
     let sampleBuffer: CMSampleBuffer?
+    var failureDiagnostic: ErrorDiagnosticSnapshot? = nil
 
     static func success(sampleBuffer: CMSampleBuffer) -> Self {
         Self(status: noErr, infoFlags: [], sampleBuffer: sampleBuffer)
@@ -549,9 +551,10 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
             failIsolated(failure)
             return
         } catch {
+            let failure = VTVideoEncoderFailure.unexpected(PlaybackErrorDiagnostics.snapshot(error))
             frame.surfaceLease.release()
-            completion(.failure(.invalidPixelBuffer))
-            failIsolated(.invalidPixelBuffer)
+            completion(.failure(failure))
+            failIsolated(failure)
             return
         }
         guard waiting.count + active.count
@@ -661,8 +664,9 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
                 )
             )
         } catch {
-            return VTCompressionOutput(status: kCMBlockBufferBadPointerParameterErr,
-                                       infoFlags: output.infoFlags, sampleBuffer: nil)
+            return VTCompressionOutput(status: output.status,
+                infoFlags: output.infoFlags, sampleBuffer: nil,
+                failureDiagnostic: PlaybackErrorDiagnostics.snapshot(error))
         }
     }
 
@@ -673,6 +677,10 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         guard let pending = active[identity],
               pending.frame.identity == identity else {
             // 重复或终态后的迟到 callback 没有任何提交权。
+            return
+        }
+        if let diagnostic = output.failureDiagnostic {
+            failIsolated(.unexpected(diagnostic))
             return
         }
         guard output.status == noErr else {
@@ -712,7 +720,7 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
             failIsolated(failure)
             return
         } catch {
-            failIsolated(.unexpectedOutputFormat)
+            failIsolated(.unexpected(PlaybackErrorDiagnostics.snapshot(error)))
             return
         }
         guard let hardwareProof else {

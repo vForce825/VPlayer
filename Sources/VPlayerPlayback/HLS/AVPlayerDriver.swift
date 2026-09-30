@@ -5,6 +5,7 @@
 import AVFoundation
 import Darwin
 import Foundation
+import VPlayerCore
 import os
 
 /// 值包装不分配第二锁；SDK ManagedBuffer 提供稳定地址，不借 Swift stored value 的临时指针。
@@ -352,7 +353,10 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                     switch observed.status {
                     case .readyToPlay: gate.resolve(.success(true), token: token)
                     case .failed:
-                        gate.resolve(.failure(AVPlayerItemCoordinatorFailure.itemFailed), token: token)
+                        let failure: any Error
+                        if let error = observed.error { failure = PlaybackErrorDiagnostics.snapshot(error) }
+                        else { failure = AVPlayerItemCoordinatorFailure.itemFailed }
+                        gate.resolve(.failure(failure), token: token)
                     default: break
                     }
                 }
@@ -480,7 +484,11 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             player.cancelPendingPrerolls()
             gate.resolve(.failure(CancellationError()), token: token)
         }
-        guard succeeded, currentItemIdentity == identity else {
+        guard currentItemIdentity == identity else {
+            throw AVPlayerItemCoordinatorFailure.prerollFailed
+        }
+        guard succeeded else {
+            if let error = item?.error { throw PlaybackErrorDiagnostics.snapshot(error) }
             throw AVPlayerItemCoordinatorFailure.prerollFailed
         }
     }
@@ -511,6 +519,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        if !succeeded, let error = item?.error { throw PlaybackErrorDiagnostics.snapshot(error) }
         return AVPlayerPrerollReceipt(item: identity, playhead: playhead, succeeded: succeeded)
     }
 
@@ -952,7 +961,7 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
     }
 }
 
-/// prepare 持久终态只保存固定业务错误码；开放错误在同步边界立即归约。
+/// prepare 持久终态保存固定业务错误或内联诊断快照，不继续持有任意原异常对象。
 enum AVPlayerFixedPreparationFailure: Error, Sendable, Equatable {
     case coordinator(AVPlayerItemCoordinatorFailure)
     case aac(AVPlayerAACEndpointValidationFailure)
@@ -960,6 +969,7 @@ enum AVPlayerFixedPreparationFailure: Error, Sendable, Equatable {
     case completed(CompletedMediaEvidenceError)
     case publication(HLSPublicationFailure)
     case cancelled
+    case unexpected(ErrorDiagnosticSnapshot)
 
     init(_ error: any Error) {
         switch error {
@@ -970,7 +980,7 @@ enum AVPlayerFixedPreparationFailure: Error, Sendable, Equatable {
         case let value as CompletedMediaEvidenceError: self = .completed(value)
         case let value as HLSPublicationFailure: self = .publication(value)
         case is CancellationError: self = .cancelled
-        default: self = .coordinator(.itemFailed)
+        default: self = .unexpected(PlaybackErrorDiagnostics.snapshot(error))
         }
     }
 
@@ -982,6 +992,7 @@ enum AVPlayerFixedPreparationFailure: Error, Sendable, Equatable {
         case .completed(let value): value
         case .publication(let value): value
         case .cancelled: CancellationError()
+        case .unexpected(let value): value
         }
     }
 }

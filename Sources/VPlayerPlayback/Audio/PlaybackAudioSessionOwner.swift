@@ -122,8 +122,8 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
         try self.init(registry: registry, sdk: sdk, monitor: nil)
     }
 
-    func startAcquisition(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) -> Bool {
-        switch dispatch(prepareAcquisition(ticket, receiver: receiver)) {
+    func startAcquisition(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) throws -> Bool {
+        switch dispatch(try prepareAcquisition(ticket, receiver: receiver)) {
         case .started, .parked: true
         case .rejected: false
         }
@@ -153,7 +153,7 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
 
     /// 握手/配置准备和装箱完整返回后才enqueue；salt/registration/first不会跨入本次SDK投影。
     private func prepareAcquisition(_ ticket: ControlTaskTicket,
-        receiver: any PlaybackAudioSessionCompletionReceiving) -> AudioSessionPreparedDelivery {
+        receiver: any PlaybackAudioSessionCompletionReceiving) throws -> AudioSessionPreparedDelivery {
         guard registry.claimStart(ticket) else { return .rejected }
         guard let salt = lane.makeEndpointSalt() else {
             _ = registry.completeOutputAcquisitionWithoutLease(ticket)
@@ -169,9 +169,9 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
             }
             return prepare(first, family: .audio, receiver: receiver)
         } catch {
-            // checked注册失败没有产生lease；准确原票必须结清。若已安装lease，原入口明确拒绝而不伪造no-lease。
+            // 注册失败须结清准确原票；已有 lease 时结清会拒绝，原异常仍随本次调用返回。
             _ = registry.completeOutputAcquisitionWithoutLease(ticket)
-            return .rejected
+            throw error
         }
     }
 

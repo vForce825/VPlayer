@@ -70,7 +70,7 @@ final class SampleBufferPlaybackBackend: PlaybackBackend,
         guard invocation.performPositiveRateSideEffect({
             pipeline?.setPlaybackRate(1.0)
         }) else {
-            throw PlaybackCoreError.demuxOpen(-1)
+            throw PlaybackCoreError.outputActivationRejected
         }
     }
 

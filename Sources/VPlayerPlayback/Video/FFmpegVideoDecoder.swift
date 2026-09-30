@@ -364,7 +364,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 } catch let failure as VideoDecoderFailure {
                     outcome = .failed(failure)
                 } catch {
-                    outcome = .failed(.sessionCreate(kVTVideoDecoderMalfunctionErr))
+                    outcome = .failed(.unexpected(.init(error)))
                 }
                 completeTransition(token: token, outcome: outcome)
             }

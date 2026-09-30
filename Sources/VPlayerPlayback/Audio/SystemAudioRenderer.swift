@@ -7,6 +7,7 @@ import AudioToolbox
 import CoreMedia
 import Dispatch
 import Foundation
+import VPlayerCore
 
 final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
     let identity: AudioRendererIdentity
@@ -18,6 +19,8 @@ final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var statusObservation: NSKeyValueObservation?
     private var notificationTokens: [NSObjectProtocol] = []
     private var requesting = false
+    private let failureLock = NSLock()
+    private var firstFailureEvent: AudioRendererEvent?
 
     init(
         identity: AudioRendererIdentity,
@@ -81,9 +84,9 @@ final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
 
     func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void) {
         stopObserving()
-        statusObservation = renderer.observe(\.status, options: [.new]) { renderer, _ in
-            guard renderer.status == .failed else { return }
-            handler(.failed(Self.sanitized(renderer.error)))
+        statusObservation = renderer.observe(\.status, options: [.new]) { [weak self] renderer, _ in
+            guard let self, renderer.status == .failed else { return }
+            handler(recordedFailureEvent(renderer.error))
         }
         let flushed = notificationCenter.addObserver(
             forName: Notification.Name.AVSampleBufferAudioRendererWasFlushedAutomatically,
@@ -113,11 +116,29 @@ final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
         notificationTokens.removeAll(keepingCapacity: false)
     }
 
-    private static func sanitized(_ error: (any Error)?) -> String {
-        guard let error else { return "AVFoundation:unknown" }
+    /// 首错属于真实 renderer 实例；监听重绑不为同一失败实例重建诊断实体。
+    func recordedFailureEvent(_ error: (any Error)?) -> AudioRendererEvent {
+        failureLock.lock()
+        defer { failureLock.unlock() }
+        if let firstFailureEvent { return firstFailureEvent }
+        let event = Self.failureEvent(error)
+        firstFailureEvent = event
+        return event
+    }
+
+    static func failureEvent(_ error: (any Error)?) -> AudioRendererEvent {
+        guard let error else {
+            return .failedWithDiagnostic(reason: "AVFoundation:unknown", diagnostic: .init(
+                typeName: "AVSampleBufferAudioRenderer", code: "error-unavailable",
+                message: "系统报告音频渲染器失败，但未提供错误详情。"))
+        }
         let value = error as NSError
-        let domain = String(value.domain.prefix(96))
-        return "\(domain):\(value.code)"
+        // 先截取借用的 NSString，避免为旧 metrics 复制未知长度的原始域。
+        let selector = #selector(getter: NSError.domain)
+        let borrowedDomain = value.responds(to: selector)
+            ? value.perform(selector)?.takeUnretainedValue() as? NSString : nil
+        let domain = borrowedDomain?.substring(to: min(borrowedDomain?.length ?? 0, 96)) ?? "unknown"
+        return .failedWithDiagnostic(reason: "\(domain):\(value.code)", diagnostic: .init(error))
     }
 }
 

@@ -168,13 +168,11 @@ final class BackgroundRefreshRegistrar {
     }
 
     private static func sanitizedSchedulingError(_ error: any Error) -> String {
-        _ = error
-        return "无法安排后台刷新，系统稍后可能再次提供刷新机会。"
+        return "无法安排后台刷新：\(ErrorDiagnosticSnapshot(error).summary)"
     }
 
     private static func sanitizedProfileLoadError(_ error: any Error) -> String {
-        _ = error
-        return "后台刷新无法读取源配置。"
+        return "后台刷新无法读取源配置：\(ErrorDiagnosticSnapshot(error).summary)"
     }
 }
 

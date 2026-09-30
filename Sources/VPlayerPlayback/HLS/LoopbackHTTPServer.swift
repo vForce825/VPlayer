@@ -7,6 +7,7 @@ import CoreMedia
 import Darwin
 import Foundation
 import Network
+import VPlayerCore
 
 struct LoopbackStorageLayout: Sendable {
     static let current = Self()
@@ -2069,7 +2070,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(loopback), port: .any)
         let listener: NWListener
         do { listener = try NWListener(using: parameters) }
-        catch { throw LoopbackHTTPServerError.transportUnavailable }
+        catch { throw PlaybackErrorDiagnostics.snapshot(error) }
         let startupQueue = DispatchQueue(label: "org.vplayer.loopback-http.start")
         let gate = LoopbackStartupGate()
         let cancellationRelay = LoopbackStartupCancellationRelay()
@@ -2138,13 +2139,14 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                                 }
                             }
                             probe.stateUpdateHandler = { probeState in
-                                guard case .failed = probeState, gate.claim() else { return }
+                                guard case .failed(let error) = probeState, gate.claim() else { return }
+                                let failure = PlaybackErrorDiagnostics.snapshot(error)
                                 server.cancelStartupEndpointProbe()
                                 let ticket = server.closeAdmission()
                                 try? server.drain(cleanupTicket: ticket)
                                 try? server.retire(cleanupTicket: ticket)
                                 continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                                    : LoopbackHTTPServerError.invalidBinding)
+                                    : failure)
                             }
                             probe.start(queue: startupQueue)
                         } catch {
@@ -2161,7 +2163,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                         #endif
                         guard gate.claim() else { return }
                         continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                            : LoopbackHTTPServerError.transportUnavailable)
+                            : PlaybackErrorDiagnostics.snapshot(err))
                     case .cancelled:
                         #if DEBUG
                         PlaybackDiagnosticTracker.shared.append("lb_cancelled")
@@ -2181,8 +2183,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     }
 
     func path(for key: HLSResourceKey) throws -> String {
-        do { return try store.resourceURI(key) }
-        catch { throw LoopbackHTTPServerError.invalidConfiguration }
+        try store.resourceURI(key)
     }
 
     func resumePausedBodySends(testing capability: LoopbackHTTPTestingCapability) {
@@ -3699,8 +3700,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             snapshot: accumulator.snapshot,
             terminalLeaf: terminal,
             issuer: aacHTTPIssuer)
-        do { try binding.acceptHTTP(receipt, issuer: aacHTTPIssuer) }
-        catch { throw LoopbackHTTPServerError.invalidConfiguration }
+        try binding.acceptHTTP(receipt, issuer: aacHTTPIssuer)
     }
 
     private func failAACHTTPFinalizationLocked(participantID: UInt64) {

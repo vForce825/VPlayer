@@ -724,6 +724,8 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertFalse(firstOpen)
         XCTAssertFalse(foreground.isInitialLibraryLoadComplete)
         XCTAssertEqual(firstSnapshot.profileLookupCount, 0)
+        XCTAssertTrue(model.alertMessage?.contains("StartupProbeError") == true)
+        XCTAssertTrue(model.alertMessage?.contains("expected") == true)
 
         let retryOpen = await dependencies.openInitialLibrary(using: model)
         let prepareAttemptCount = await prepare.attemptCount
@@ -782,14 +784,32 @@ final class VPlayerAppStartupTests: XCTestCase {
         }
 
         let firstOutcome = await startup.start()
+        let firstFailure = await startup.lastFailure
         let retryOutcome = await startup.start()
+        let failureAfterRetry = await startup.lastFailure
         let repeatedOutcome = await startup.start()
         let attemptCount = await probe.attemptCount
 
         XCTAssertEqual(firstOutcome, .failed)
+        XCTAssertTrue(firstFailure?.typeName.contains("StartupProbeError") == true)
+        XCTAssertTrue(firstFailure?.summary.contains("expected") == true)
         XCTAssertEqual(retryOutcome, .completed)
+        XCTAssertNil(failureAfterRetry)
         XCTAssertEqual(repeatedOutcome, .alreadyCompleted)
         XCTAssertEqual(attemptCount, 2)
+    }
+
+    func testUnavailableDefaultRefreshPreservesDependencyFailureReason() async {
+        let dependencies = makeDependencies(maintenance: StartupMaintenanceProbe())
+
+        let outcomes = await dependencies.refresh(UUID(), [.playlist, .epg], .manual)
+
+        XCTAssertEqual(outcomes.count, 2)
+        for outcome in outcomes {
+            XCTAssertFalse(outcome.succeeded)
+            XCTAssertTrue(outcome.message?.contains("ProductionDependencyError") == true)
+            XCTAssertTrue(outcome.message?.contains("libraryUnavailable") == true)
+        }
     }
 
     func testAppInitializationRegistersBackgroundRefreshExactlyOnce() {

@@ -4,6 +4,7 @@
 
 import CoreGraphics
 import CoreMedia
+import VPlayerCore
 import CoreVideo
 import Foundation
 import VideoToolbox
@@ -172,6 +173,7 @@ public enum VideoDecoderFailure: Error, Sendable, Equatable {
     case badData(OSStatus)
     case malfunction(OSStatus)
     case backpressureTimeout
+    case unexpected(ErrorDiagnosticSnapshot)
 }
 
 /// Identifies one decoder transition and, after a successful configure, the

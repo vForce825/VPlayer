@@ -3,12 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
-
-enum SystemHLSPublicationGraphFailure: Error, Sendable {
-    case receive(logicalSequence: UInt64, mediaType: FinalFMP4MediaType,
-                 range: FMP4PresentationRange?, commonStart: ExactMediaTime?,
-                 accessUnitDuration: ExactMediaTime?, underlying: String)
-}
+import VPlayerCore
 
 /// 同一 item 的 writer→validator→publisher→store 汇合点。所有 readiness 都来自
 /// `HLSPublicationCoordinator.visible`，不会用 packet 数或布尔标志伪造三秒前缀。
@@ -42,7 +37,7 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
     private var windows: [UInt64: Window] = [:]
     private var initialWriterIDs: [UInt64] = []
     private var currentByParticipant: [UInt64: Window] = [:]
-    private var storedError: Error?
+    private var storedError: ErrorDiagnosticSnapshot?
     private var naturalEndPending = false
     private var prefixUnavailableAtNaturalEnd = false
     private var lastLogicalSequence: UInt64 = 0
@@ -135,14 +130,7 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
             }
         } catch {
             PlaybackDiagnosticTracker.shared.set("pub_err_s\(object.logicalSequence)_\(window.mediaType)_\(error)")
-            storedError = SystemHLSPublicationGraphFailure.receive(
-                logicalSequence: object.logicalSequence,
-                mediaType: window.mediaType,
-                range: try? FMP4PresentationRange.inspect(
-                    report: object.report, mediaType: window.mediaType),
-                commonStart: object.publicationEvidence?.boundary?.commonStart,
-                accessUnitDuration: object.publicationEvidence?.boundary?.accessUnitDuration,
-                underlying: String(reflecting: error))
+            if storedError == nil { storedError = PlaybackErrorDiagnostics.snapshot(error) }
             _ = relay.releaseForControl(object)
         }
     }
@@ -299,7 +287,7 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
 
     func recordFailure(_ error: Error) {
         condition.withLock {
-            if storedError == nil { storedError = error }
+            if storedError == nil { storedError = PlaybackErrorDiagnostics.snapshot(error) }
             condition.broadcast()
         }
     }

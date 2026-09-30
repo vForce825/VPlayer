@@ -500,7 +500,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                     if submissionEpoch.value == transitionRevision {
                         invalidateIsolated()
                     }
-                    outcome = .failed(.sessionCreate(kVTVideoDecoderMalfunctionErr))
+                    outcome = .failed(.unexpected(.init(error)))
                 }
             case let .drain(drainToken):
                 token = drainToken
@@ -1083,7 +1083,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         } catch {
             emit(
                 ClassifiedFailure(
-                    failure: .malfunction(kVTVideoDecoderMalfunctionErr),
+                    failure: .unexpected(.init(error)),
                     isRecoverable: false
                 ),
                 identity: token.identity

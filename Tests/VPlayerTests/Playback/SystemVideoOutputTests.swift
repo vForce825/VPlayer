@@ -8,6 +8,24 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SystemVideoOutputTests: XCTestCase {
+    func testRendererFailurePreservesOriginalErrorDetails() throws {
+        let backend = FakeVideoRendererBackend()
+        let failures = VideoResetResultBox()
+        let harness = makeHarness(backend: backend,
+            failureSink: { error, _ in failures.record(.failure(error)) })
+        backend.emit(.failed(NSError(domain: "VideoRenderer.Test", code: -91,
+            userInfo: [NSLocalizedDescriptionKey: "视频渲染器原始异常"])))
+        harness.output.waitUntilIdleForTesting()
+
+        let error = try XCTUnwrap(failures.error)
+        let failure = PlaybackController.failure(for: error)
+        XCTAssertTrue(failure.userMessage.contains("NSError"))
+        XCTAssertTrue(failure.userMessage.contains("VideoRenderer.Test"))
+        XCTAssertTrue(failure.userMessage.contains("-91"))
+        XCTAssertTrue(failure.userMessage.contains("视频渲染器原始异常"))
+        XCTAssertEqual(failures.count, 1)
+    }
+
     func testPerformanceMetricsRefreshIsSingleFlightAndFeedsSharedCollector() throws {
         let backend = FakeVideoRendererBackend()
         let metrics = PlaybackMetrics(channelID: "renderer-native-metrics", now: { 1 })
@@ -360,11 +378,11 @@ final class SystemVideoOutputTests: XCTestCase {
     func testRecoveryCoalescesBackendEventsAndReplaysPipelineSeeds() throws {
         let backend = FakeVideoRendererBackend()
         let recovery = VideoOutputEventBox()
-        let failures = VideoOutputEventBox()
+        let failures = VideoResetResultBox()
         let harness = makeHarness(
             backend: backend,
             recoverySink: { _ in recovery.record() },
-            failureSink: { _, _ in failures.record() }
+            failureSink: { error, _ in failures.record(.failure(error)) }
         )
         let generation = MediaGeneration(rawValue: 0)
         let first = try frame(sequence: 1, pts: 1, generation: generation)
@@ -406,10 +424,14 @@ final class SystemVideoOutputTests: XCTestCase {
         harness.output.waitUntilIdleForTesting()
         XCTAssertEqual(backend.enqueuedPTS, [1, 2, 1, 2])
 
-        backend.emit(.failed(NSError(domain: "renderer", code: 3)))
+        backend.emit(.failed(NSError(domain: "renderer", code: 3,
+            userInfo: [NSLocalizedDescriptionKey: "恢复后视频渲染器再次失败"])))
         harness.output.waitUntilIdleForTesting()
         XCTAssertEqual(failures.count, 1, "恢复后无新进展的再次失败应升级为终止错误")
         XCTAssertEqual(recovery.count, 1)
+        let failure = PlaybackController.failure(for: try XCTUnwrap(failures.error))
+        XCTAssertTrue(failure.userMessage.contains("恢复后视频渲染器再次失败"),
+            "终态应使用本次回调的真实错误，即使 backend.error 尚未更新")
     }
 
     func testPostRecoveryFrameAllowsOneNewCoalescedRecoveryRequest() throws {

@@ -4,6 +4,7 @@
 
 import OSLog
 import SwiftUI
+import VPlayerCore
 import VPlayerPlayback
 
 enum AppLaunchMode: Equatable {
@@ -169,7 +170,7 @@ struct AcceptanceSourcePrefill: Equatable {
 private struct LiveDependenciesRootView: View {
     private enum LoadState {
         case loading
-        case failed
+        case failed(ErrorDiagnosticSnapshot)
         case ready
     }
 
@@ -184,12 +185,12 @@ private struct LiveDependenciesRootView: View {
             case .loading:
                 ProgressView("正在打开本地资料库…")
                     .accessibilityIdentifier("library.runtime.loading")
-            case .failed:
+            case .failed(let diagnostic):
                 VStack(spacing: 28) {
                     ContentUnavailableView(
                         "无法打开本地资料库",
                         systemImage: "externaldrive.badge.xmark",
-                        description: Text("本地资料暂时无法打开，请重试。")
+                        description: Text("本地资料暂时无法打开，请重试。\n\(diagnostic.summary)")
                     )
                     Button("重试") {
                         loadAttempt += 1
@@ -213,11 +214,12 @@ private struct LiveDependenciesRootView: View {
             } catch is CancellationError {
                 return
             } catch {
-                launchLogger.error(
-                    "Live library bootstrap failed (\(String(describing: type(of: error)), privacy: .public))."
-                )
                 guard !Task.isCancelled else { return }
-                loadState = .failed
+                let diagnostic = ErrorDiagnosticSnapshot(error)
+                launchLogger.error(
+                    "本地资料库启动失败（\(diagnostic.typeName, privacy: .public)；\(diagnostic.summary, privacy: .private)）。"
+                )
+                loadState = .failed(diagnostic)
             }
         }
     }

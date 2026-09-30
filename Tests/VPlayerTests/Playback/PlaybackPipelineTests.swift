@@ -2296,7 +2296,9 @@ final class PlaybackPipelineTests: XCTestCase {
         let failed = await events.next()
         XCTAssertEqual(
             failed,
-            .failed(PlaybackFailure(code: "demux.read", userMessage: "读取频道流失败，请检查网络后重试。"))
+            .failed(PlaybackFailure(code: "demux.read",
+                userMessage: "读取频道流失败，请检查网络后重试。（FFmpeg 返回码 -1）",
+                diagnosticCode: "demux.read.status.-1"))
         )
         fake.emit(.failed(.metalCommand("late")))
         fake.emit(.ready(readinessCycle: 0))
@@ -2304,7 +2306,9 @@ final class PlaybackPipelineTests: XCTestCase {
         let stableState = await controller.currentStateForTesting
         XCTAssertEqual(
             stableState,
-            .failed(PlaybackFailure(code: "demux.read", userMessage: "读取频道流失败，请检查网络后重试。"))
+            .failed(PlaybackFailure(code: "demux.read",
+                userMessage: "读取频道流失败，请检查网络后重试。（FFmpeg 返回码 -1）",
+                diagnosticCode: "demux.read.status.-1"))
         )
     }
 
@@ -2593,7 +2597,7 @@ final class PlaybackPipelineTests: XCTestCase {
         ))
 
         try await eventually {
-            harness.events.snapshot().contains(.failed(.videoDecode(-211)))
+            harness.events.snapshot().contains(.failed(.videoDecoderFailure(.malfunction(-211))))
         }
         XCTAssertEqual(
             harness.events.snapshot().filter {

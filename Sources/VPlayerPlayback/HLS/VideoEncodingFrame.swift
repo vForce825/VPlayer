@@ -5,6 +5,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import VPlayerCore
 
 struct VideoEncodingFrameIdentity: Sendable, Hashable {
     let generation: MediaGeneration
@@ -158,6 +159,7 @@ enum VTVideoEncoderFailure: Error, Sendable, Equatable {
     case cancelled
     case bitrateTargetExceeded
     case arithmeticOverflow
+    case unexpected(ErrorDiagnosticSnapshot)
 }
 
 struct VTHardwareEncoderProof: Sendable, Hashable {

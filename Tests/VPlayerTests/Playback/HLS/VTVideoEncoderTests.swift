@@ -11,6 +11,30 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VTVideoEncoderTests: XCTestCase {
+    func testCompressedCopyFailurePreservesOriginalErrorInsteadOfSyntheticCallbackStatus() throws {
+        let api = FakeVTCompressionAPI()
+        api.synchronousOutput = .success(sampleBuffer: try makeCompressedSampleBuffer())
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let ownership = HLSVideoCopyOwnership(maximumPayloadBytes: 1,
+            applicationLedger: ledger)
+        let encoder = try makeEncoder(api: api, compressedOutputOwnership: ownership)
+        let completion = expectation(description: "保留 compressed copy 首错")
+        encoder.encode(frame: try makeFrame(id: 1)) { result in
+            guard case .failure(let failure) = result else {
+                XCTFail("超过复制容量的 native 输出必须失败")
+                completion.fulfill()
+                return
+            }
+            let description = String(reflecting: failure)
+            XCTAssertTrue(description.contains("PlaybackCoreError"), description)
+            XCTAssertTrue(description.contains("videoDecode"), description)
+            XCTAssertTrue(description.contains(String(SampleBufferBuilder.invalidDataErrorCode)), description)
+            completion.fulfill()
+        }
+        wait(for: [completion], timeout: 2)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
     func testSynchronousNativeOutputIsCopiedBeforeWorkQueuePublication() throws {
         let api = FakeVTCompressionAPI()
         api.synchronousOutput = .success(sampleBuffer: try makeCompressedSampleBuffer())

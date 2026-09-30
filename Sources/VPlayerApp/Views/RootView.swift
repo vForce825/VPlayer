@@ -9,7 +9,7 @@ struct RootView: View {
     private enum InitialLibraryState {
         case loading
         case ready
-        case failed
+        case failed(String)
     }
 
     private let dependencies: AppDependencies
@@ -35,12 +35,11 @@ struct RootView: View {
         if dependencies.isLibraryAvailable {
             libraryContent
         } else {
-            // Every repository call fails in this state, so an explicit
-            // explanation beats a generic retry alert on each screen.
+            let detail = dependencies.libraryUnavailableDiagnostic.map { "\n\($0.summary)" } ?? ""
             ContentUnavailableView(
                 "无法打开本地资料库",
                 systemImage: "externaldrive.badge.xmark",
-                description: Text("设备存储不可用，可能是空间不足或权限受限。请释放存储空间后重新启动 VPlayer。")
+                description: Text("本地资料库依赖不可用，请重试或重新启动 VPlayer。\(detail)")
             )
             .accessibilityIdentifier("library.unavailable")
         }
@@ -56,12 +55,12 @@ struct RootView: View {
                     .accessibilityIdentifier("library.loading")
             case .ready:
                 libraryTabs
-            case .failed:
+            case .failed(let message):
                 VStack(spacing: 28) {
                     ContentUnavailableView(
                         "无法载入资料库",
                         systemImage: "arrow.clockwise.circle",
-                        description: Text("本地资料暂时无法读取，请重试。")
+                        description: Text(message)
                     )
                     Button("重试") {
                         initialLibraryAttempt += 1
@@ -74,12 +73,10 @@ struct RootView: View {
             initialLibraryState = .loading
             let opened = await dependencies.openInitialLibrary(using: model)
             guard !Task.isCancelled else { return }
-            // A failed repository read also raises the model's generic alert.
-            // Bootstrap owns this persistent retry screen, so avoid presenting
-            // two competing failure affordances; successful retry also clears
-            // any stale alert from the preceding attempt.
+            // 原始原因先转交失败页，再关闭对应的一次性提示。
+            let failureMessage = model.alertMessage ?? "本地资料暂时无法读取，请重试。"
             model.dismissAlert()
-            initialLibraryState = opened ? .ready : .failed
+            initialLibraryState = opened ? .ready : .failed(failureMessage)
         }
         .alert(model.alertTitle, isPresented: Binding(
             get: { model.alertMessage != nil },

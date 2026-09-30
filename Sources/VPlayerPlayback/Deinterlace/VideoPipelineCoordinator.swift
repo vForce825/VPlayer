@@ -576,7 +576,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             return false
         } catch {
             recordHLSIDRRejection(accessUnit, reason: "decode.unknown")
-            hooks.fail(.videoDecode(-1), generation)
+            hooks.fail(.capture(error, stage: "video.decode"), generation)
             return false
         }
     }
@@ -893,7 +893,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 }
             } catch {
                 hooks.submissionRejected(pending.accessUnit.id, pending.identity)
-                hooks.fail(.videoDecode(-1), generation)
+                hooks.fail(.capture(error, stage: "video.decode.pending"), generation)
             }
         }
     }
@@ -1053,6 +1053,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         case let .sessionCreate(status): ("sessionCreate", status)
         case .softwareDecoder: ("softwareDecoder", 0)
         case .backpressureTimeout: ("backpressureTimeout", 0)
+        case .unexpected: ("unexpected", 0)
         }
     }
 

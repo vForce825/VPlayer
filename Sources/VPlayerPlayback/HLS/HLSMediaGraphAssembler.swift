@@ -3,15 +3,51 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import VPlayerCore
+
+/// 已归约的原异常快照直接跨层传递，避免包装枚举占用有限诊断容量。
+enum PlaybackErrorDiagnostics {
+    static func snapshot(_ error: any Error) -> ErrorDiagnosticSnapshot {
+        switch error {
+        case let diagnostic as ErrorDiagnosticSnapshot: return diagnostic
+        case let failure as PlaybackCoreError:
+            if case .unexpected(_, let diagnostic) = failure { return diagnostic }
+            if case .videoDecoderFailure(.unexpected(let diagnostic)) = failure { return diagnostic }
+        case let failure as HLSVideoTranscodeBranchFailure:
+            switch failure {
+            case .encoder(.unexpected(let diagnostic)), .invalidFrame(.unexpected(let diagnostic)),
+                 .decoder(.unexpected(let diagnostic)): return diagnostic
+            default: break
+            }
+        case let failure as VideoDecoderFailure:
+            if case .unexpected(let diagnostic) = failure { return diagnostic }
+        case let failure as AACRenditionFailure:
+            if case .unexpected(let diagnostic) = failure { return diagnostic }
+        case let failure as SegmentedFMP4WriterFailure:
+            if case .systemError(let diagnostic) = failure { return diagnostic }
+        case let failure as VTVideoEncoderFailure:
+            if case .unexpected(let diagnostic) = failure { return diagnostic }
+        case let failure as AVPlayerFixedPreparationFailure:
+            if case .unexpected(let diagnostic) = failure { return diagnostic }
+        default: break
+        }
+        return ErrorDiagnosticSnapshot(error)
+    }
+}
 
 /// 生产 delivery authority 的窄端口。实现者必须由同一 writer/publisher/store/server
 /// 图签发 prefix 与 retirement receipt；此协议不提供 Bool readiness 或伪造 endpoint 的
 /// 默认实现，防止新的系统 builder 悄悄降级为测试图。
 protocol SystemHLSDeliveryGraphAuthority: AnyObject, Sendable {
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { get }
     func append(_ event: AdmittedDemuxEvent)
     func awaitAllTrackPlayablePrefix(minimumSeconds: Int) async -> AVPlayerItemReplacementBundle?
     func finishAllTracksAtNaturalEOF() async -> Bool
     func retireAllResourcesAndAwaitReceipt() async -> Bool
+}
+
+extension SystemHLSDeliveryGraphAuthority {
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { nil }
 }
 
 /// 把唯一 demux 的 admitted event 串到真实 delivery authority。它不拥有第二个队列、
@@ -23,6 +59,7 @@ final class SystemHLSDeliveryGraph: HLSMediaGraphAssembler.DeliveryGraph, @unche
     init(authority: any SystemHLSDeliveryGraphAuthority) { self.authority = authority }
 
     func accept(_ event: AdmittedDemuxEvent) { authority.append(event) }
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { authority.failureDiagnostic }
 
     func waitUntilPlayablePrefix() async -> HLSMediaGraphAssembler.HLSMediaGraphPlayablePrefix? {
         guard let replacement = await authority.awaitAllTrackPlayablePrefix(minimumSeconds: 3) else {
@@ -57,6 +94,7 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
     /// packet 交给既有 progressive remux、YADIF2x→VT、compressed 或 PCM→AAC writer 路径，
     /// 并只在全部 selected track 的真实 publication 覆盖达到三秒时签发 prefix receipt。
     protocol DeliveryGraph: AnyObject, Sendable {
+        var failureDiagnostic: ErrorDiagnosticSnapshot? { get }
         func accept(_ event: AdmittedDemuxEvent)
         func waitUntilPlayablePrefix() async -> HLSMediaGraphPlayablePrefix?
         func finishNaturalEOF() async -> Bool
@@ -131,7 +169,9 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
             PlaybackDiagnosticTracker.shared.set("assembler_prefix_nil")
             #endif
             condition.withLock { phase = .failed }
+            let failure = graph.failureDiagnostic
             _ = await retireAndAwaitReceipt()
+            if let failure { throw failure }
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
         #if DEBUG
@@ -155,6 +195,7 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
         guard mayFinish else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
         guard await graph.finishNaturalEOF() else {
             condition.withLock { phase = .failed }
+            if let failure = graph.failureDiagnostic { throw failure }
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
         condition.withLock { phase = .playable }
@@ -180,4 +221,8 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
         // tail 由它随下游 alias 移交，不能在这个同步回调后把裸 packet 存进第二个队列。
         graph.accept(event)
     }
+}
+
+extension HLSMediaGraphAssembler.DeliveryGraph {
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { nil }
 }

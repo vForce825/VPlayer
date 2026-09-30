@@ -6,6 +6,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import VPlayerCore
 
 /// 渐进视频即将推进共同边界前，必须先让已排队音频追到上一视频时刻。
 /// 隔行分支的安全终点由转码输出的 `writtenThrough` 单独证明，不能复用输入 PTS。
@@ -627,7 +628,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var worker: Task<Void, Never>!
     private var state: State = .reading
     private var terminalResult: Bool?
-    private var failureDescription: String?
+    private var firstFailureDiagnostic: ErrorDiagnosticSnapshot?
     private var diagnosticStage = "configured"
     private var loopbackServer: LoopbackHTTPServer?
 
@@ -1788,7 +1789,12 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 try server.drain(cleanupTicket: ticket)
                 try server.retire(cleanupTicket: ticket)
             } catch {
-                condition.withLock { state = .failed }
+                condition.withLock {
+                    if firstFailureDiagnostic == nil {
+                        firstFailureDiagnostic = PlaybackErrorDiagnostics.snapshot(error)
+                    }
+                    state = .failed
+                }
                 return false
             }
         }
@@ -1829,8 +1835,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         #endif
         condition.withLock {
             state = .failed
-            if failureDescription == nil {
-                failureDescription = "\(diagnosticStage): \(String(reflecting: error))"
+            if firstFailureDiagnostic == nil {
+                firstFailureDiagnostic = PlaybackErrorDiagnostics.snapshot(error)
             }
             terminalResult = false
             condition.broadcast()
@@ -1839,7 +1845,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     }
 
     var failureDescriptionForDiagnostics: String? {
-        condition.withLock { failureDescription }
+        failureDiagnostic?.summary
+    }
+
+    var failureDiagnostic: ErrorDiagnosticSnapshot? {
+        condition.withLock { firstFailureDiagnostic }
     }
 
     private func setDiagnosticStage(_ value: String) {

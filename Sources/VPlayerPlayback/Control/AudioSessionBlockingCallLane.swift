@@ -7,6 +7,7 @@ import CommonCrypto
 import CoreFoundation
 import Dispatch
 import Foundation
+import VPlayerCore
 
 enum AudioSessionBlockingCallOperation: Sendable, Equatable {
     case longFormCategory, defaultCategory, multichannel, activate, deactivate, currentRoute
@@ -83,9 +84,12 @@ enum AudioSessionFailurePresentation {
         case .osStatus: "osStatus"
         case .unknown: "unknown"
         }
+        let diagnosticDetail = detail.diagnostic.map {
+            "；异常类型 \($0.typeName)；原始信息 \($0.summary)"
+        } ?? ""
         return .init(
             code: code,
-            userMessage: "\(message)（系统返回码 \(detail.code)），请检查音频输出后重试。",
+            userMessage: "\(message)（系统返回码 \(detail.code)\(diagnosticDetail)），请检查音频输出后重试。",
             diagnosticCode: "\(code).\(domain).\(detail.code)"
         )
     }
@@ -228,7 +232,7 @@ final class AudioSessionBlockingCallLane: Sendable, Equatable {
         let domain = value.responds(to: selector) ? value.perform(selector)?.takeUnretainedValue() as? NSString : nil
         return .init(
             domain: domain?.isEqual(to: NSOSStatusErrorDomain) == true ? .osStatus : .unknown,
-            code: Int32(clamping: value.code))
+            code: Int32(clamping: value.code), diagnostic: .init(error))
     }
 
     /// 端点数32、UID256字节、port64字节；固定scratch，不复制或排序原始标识集合。

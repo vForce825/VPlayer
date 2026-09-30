@@ -44,8 +44,9 @@ public struct XMLTVParseSummary: Equatable, Sendable {
     public let programmeCount: Int
 }
 
-public enum XMLTVParserError: Error, Equatable, Sendable {
+public enum XMLTVParserError: Error, Equatable, Sendable, LocalizedError {
     case malformed
+    case parserFailure(line: Int, column: Int, diagnostic: ErrorDiagnosticSnapshot)
     case entityDeclarationForbidden
     case excessiveDepth
     case excessiveText
@@ -53,6 +54,13 @@ public enum XMLTVParserError: Error, Equatable, Sendable {
     case excessiveProgrammes
     case excessiveEvents
     case invalidProgramme
+
+    public var errorDescription: String? {
+        if case let .parserFailure(line, column, diagnostic) = self {
+            return "XML 第 \(line) 行、第 \(column) 列解析失败：\(diagnostic.summary)"
+        }
+        return nil
+    }
 }
 
 public final class XMLTVParser {
@@ -81,6 +89,13 @@ public final class XMLTVParser {
             throw error
         }
         guard succeeded, parser.parserError == nil else {
+            if let error = parser.parserError {
+                throw XMLTVParserError.parserFailure(
+                    line: parser.lineNumber,
+                    column: parser.columnNumber,
+                    diagnostic: ErrorDiagnosticSnapshot(error)
+                )
+            }
             throw XMLTVParserError.malformed
         }
         return XMLTVParseSummary(

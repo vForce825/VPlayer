@@ -985,7 +985,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         guard let header = try context.fetch(FetchDescriptor<EPGSnapshotRecord>(
             predicate: #Predicate { $0.id == snapshotID }
         )).first else {
-            throw LibraryRepositoryError.corruptPersistedValue
+            throw LibraryRepositoryError.corruptPersistedField(field: "EPGSnapshotRecord.id")
         }
         header.channelCount = channelCount
         header.programmeCount = programmeCount
@@ -1109,13 +1109,23 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
 
     private static func profile(from record: SourceProfileRecord) throws -> SourceProfile {
-        guard let m3uURL = URL(string: record.m3uURLString),
-              let epgURL = URL(string: record.epgURLString),
-              let m3uInterval = RefreshInterval(rawValue: record.m3uRefreshIntervalRaw),
-              let epgInterval = RefreshInterval(rawValue: record.epgRefreshIntervalRaw),
-              let m3uState = RefreshState(rawValue: record.m3uStateRaw),
-              let epgState = RefreshState(rawValue: record.epgStateRaw) else {
-            throw LibraryRepositoryError.corruptPersistedValue
+        guard let m3uURL = URL(string: record.m3uURLString) else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "SourceProfileRecord.m3uURLString")
+        }
+        guard let epgURL = URL(string: record.epgURLString) else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "SourceProfileRecord.epgURLString")
+        }
+        guard let m3uInterval = RefreshInterval(rawValue: record.m3uRefreshIntervalRaw) else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "SourceProfileRecord.m3uRefreshIntervalRaw")
+        }
+        guard let epgInterval = RefreshInterval(rawValue: record.epgRefreshIntervalRaw) else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "SourceProfileRecord.epgRefreshIntervalRaw")
+        }
+        guard let m3uState = RefreshState(rawValue: record.m3uStateRaw) else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "SourceProfileRecord.m3uStateRaw")
+        }
+        guard let epgState = RefreshState(rawValue: record.epgStateRaw) else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "SourceProfileRecord.epgStateRaw")
         }
         return SourceProfile(
             id: record.id,
@@ -1145,13 +1155,16 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
 
     private static func channel(from record: ChannelRecord) throws -> Channel {
         guard let streamURL = URL(string: record.streamURLString) else {
-            throw LibraryRepositoryError.corruptPersistedValue
+            throw LibraryRepositoryError.corruptPersistedField(field: "ChannelRecord.streamURLString")
         }
         let attributes: [String: String]
         do {
             attributes = try JSONDecoder().decode([String: String].self, from: record.attributesJSON)
         } catch {
-            throw LibraryRepositoryError.corruptPersistedValue
+            throw LibraryRepositoryError.persistedValueDecodingFailed(
+                field: "ChannelRecord.attributesJSON",
+                diagnostic: ErrorDiagnosticSnapshot(error)
+            )
         }
         return Channel(
             sourceProfileID: record.sourceProfileID,

@@ -103,11 +103,12 @@ final class ForegroundRefreshDriver {
     }
 
     private static func sanitizedProfileLoadError(_ error: any Error) -> String {
+        let diagnostic = ErrorDiagnosticSnapshot(error)
         switch error {
         case LibraryRepositoryError.profileNotFound:
-            return "无法读取源配置：找不到源配置。"
+            return "无法读取源配置：找不到源配置。\n\(diagnostic.summary)"
         default:
-            return "无法读取源配置。"
+            return "无法读取源配置：\(diagnostic.summary)"
         }
     }
 }

@@ -11,6 +11,17 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testReloadFailureShowsOriginalErrorTypeAndCase() async {
+        let repository = RepositorySpy(profiles: [])
+        await repository.setReadFailure(true)
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] })
+
+        let succeeded = await model.reload()
+        XCTAssertFalse(succeeded)
+        XCTAssertTrue(model.alertMessage?.contains("InjectedError") == true)
+        XCTAssertTrue(model.alertMessage?.contains("read") == true)
+    }
+
     func testReloadIssuesOneProgrammeQueryRegardlessOfChannelCount() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Source", now: now)
@@ -2727,6 +2738,8 @@ final class AppModelTests: XCTestCase {
         let attemptID = UUID()
         await repository.setReadFailure(true)
         let firstCreateSucceeded = await model.create(input: input, attemptID: attemptID)
+        XCTAssertTrue(model.alertMessage?.contains("InjectedError") == true)
+        XCTAssertTrue(model.alertMessage?.contains("read") == true)
         let changedInput = SourceProfileInput(
             name: "Changed while retrying",
             m3uURLString: "https://example.test/changed.m3u",
@@ -4159,6 +4172,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.model.profiles, [fixture.activeProfile, second])
         XCTAssertEqual(fixture.model.alertTitle, "操作失败")
         XCTAssertNotNil(fixture.model.alertMessage)
+        XCTAssertTrue(fixture.model.alertMessage?.contains("InjectedError") == true)
+        XCTAssertTrue(fixture.model.alertMessage?.contains("setActiveProfile") == true)
         let repositorySnapshot = await fixture.repository.snapshot()
         XCTAssertEqual(repositorySnapshot.activeProfileID, fixture.activeProfile.id)
         XCTAssertEqual(repositorySnapshot.profiles, [fixture.activeProfile, second])

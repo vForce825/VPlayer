@@ -5,6 +5,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import VPlayerCore
 
 public enum AudioRoute: Sendable, Equatable {
     case systemCompressed
@@ -303,6 +304,7 @@ enum AudioRendererMediaKind: Sendable, Equatable {
 
 enum AudioRendererEvent: Sendable, Equatable {
     case failed(String)
+    case failedWithDiagnostic(reason: String, diagnostic: ErrorDiagnosticSnapshot)
     case automaticFlush(CMTime?)
     case outputConfigurationChanged
 }

@@ -70,6 +70,41 @@ final class RefreshLifecycleTests: XCTestCase {
         XCTAssertEqual(reportedStatuses, [])
     }
 
+    func testForegroundProfileLoadFailureKeepsOriginalTypeAndReasonWithoutPrivateAddresses() async {
+        let probe = ForegroundLoopProbe()
+        let failure = NSError(
+            domain: "Lifecycle.ProfileLoad",
+            code: -412,
+            userInfo: [NSLocalizedDescriptionKey:
+                "配置读取原始失败 https://private.example/config?token=secret /private/source.sqlite password=secret"]
+        )
+        var reportedStatuses: [String] = []
+        let driver = ForegroundRefreshDriver(
+            loadProfiles: { throw failure },
+            refresh: { _, _, _ in [] },
+            sleep: {
+                await probe.recordSleepStarted()
+                try await Task.sleep(for: .seconds(3_600))
+            },
+            reportStatus: { reportedStatuses.append($0) }
+        )
+        defer { driver.deactivate() }
+
+        driver.initialLibraryLoadDidComplete()
+        driver.activate()
+        await probe.waitForSleepCount(1)
+
+        XCTAssertEqual(reportedStatuses.count, 1)
+        let message = reportedStatuses.first ?? ""
+        XCTAssertTrue(message.contains("NSError"))
+        XCTAssertTrue(message.contains("Lifecycle.ProfileLoad"))
+        XCTAssertTrue(message.contains("-412"))
+        XCTAssertTrue(message.contains("配置读取原始失败"))
+        XCTAssertFalse(message.contains("private.example"))
+        XCTAssertFalse(message.contains("/private/source.sqlite"))
+        XCTAssertFalse(message.contains("password=secret"))
+    }
+
     func testForegroundActivationWaitsForInitialLibraryLoadBeforeStartingLoop() async {
         let probe = ForegroundLoopProbe()
         let driver = ForegroundRefreshDriver(
@@ -160,6 +195,64 @@ final class RefreshLifecycleTests: XCTestCase {
             return XCTFail("Expected a background refresh trigger")
         }
         XCTAssertEqual(task.completions, [true])
+    }
+
+    func testBackgroundProfileLoadFailureKeepsOriginalTypeAndReason() async throws {
+        let scheduler = BackgroundSchedulerSpy()
+        let failure = NSError(
+            domain: "Lifecycle.BackgroundProfileLoad",
+            code: -413,
+            userInfo: [NSLocalizedDescriptionKey: "后台配置读取原始失败"]
+        )
+        var reportedStatuses: [String] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { throw failure },
+            refresh: { _, _, _ in [] },
+            reportStatus: { reportedStatuses.append($0) }
+        )
+        registrar.register()
+        let task = BackgroundTaskSpy()
+
+        try scheduler.launch(task)
+        await eventually { task.completions.count == 1 }
+
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(reportedStatuses.count, 1)
+        let message = reportedStatuses.first ?? ""
+        XCTAssertTrue(message.contains("NSError"))
+        XCTAssertTrue(message.contains("Lifecycle.BackgroundProfileLoad"))
+        XCTAssertTrue(message.contains("-413"))
+        XCTAssertTrue(message.contains("后台配置读取原始失败"))
+    }
+
+    func testBackgroundSchedulingFailureKeepsOriginalTypeAndReason() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.submitError = NSError(
+            domain: "Lifecycle.BackgroundSchedule",
+            code: -414,
+            userInfo: [NSLocalizedDescriptionKey: "后台计划提交原始失败"]
+        )
+        var reportedStatuses: [String] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { [profile] },
+            refresh: { _, _, _ in [] },
+            now: { now },
+            reportStatus: { reportedStatuses.append($0) }
+        )
+
+        registrar.scheduleNext()
+        await eventually { !reportedStatuses.isEmpty }
+
+        XCTAssertEqual(reportedStatuses.count, 1)
+        let message = reportedStatuses.first ?? ""
+        XCTAssertTrue(message.contains("NSError"))
+        XCTAssertTrue(message.contains("Lifecycle.BackgroundSchedule"))
+        XCTAssertTrue(message.contains("-414"))
+        XCTAssertTrue(message.contains("后台计划提交原始失败"))
     }
 
     func testBackgroundExpirationCancelsWorkAndCompletesExactlyOnce() async throws {
@@ -567,6 +660,7 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
     private(set) var registrationCount = 0
     private(set) var cancelledIdentifiers: [String] = []
     private(set) var submissions: [Submission] = []
+    var submitError: NSError?
     private var handler: (@MainActor @Sendable (any BackgroundRefreshTask) -> Void)?
 
     func register(
@@ -583,6 +677,7 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
     }
 
     func submit(identifier: String, earliestBeginDate: Date) throws {
+        if let submitError { throw submitError }
         submissions.append(Submission(
             identifier: identifier,
             earliestBeginDate: earliestBeginDate

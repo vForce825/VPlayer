@@ -324,7 +324,7 @@ private final class FFmpegPCMCallbackCollector: @unchecked Sendable {
         } catch let error as PlaybackCoreError {
             lock.withLock { storedError = error }
         } catch {
-            lock.withLock { storedError = .audioFallbackDecode(FFmpegPCMAudioDecoder.invalidCallbackErrorCode) }
+            lock.withLock { storedError = .capture(error, stage: "audio.pcm-output") }
         }
     }
 

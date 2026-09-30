@@ -6,8 +6,19 @@ import AudioToolbox
 import CoreMedia
 import CryptoKit
 import Foundation
+import VPlayerCore
 
-enum AACRenditionFailure: Error, Equatable { case invalidLayout, invalidInput, capacityExceeded, budgetUnavailable, invalidPlan, busy, cancelled, framework(OSStatus), frameworkProperty(OSStatus, UInt32), calibrationMismatch, aacEncoderCookieInvariantViolation }
+enum AACRenditionFailure: Error, Equatable {
+    case invalidLayout, invalidInput, capacityExceeded, budgetUnavailable, invalidPlan, busy, cancelled
+    case framework(OSStatus), frameworkProperty(OSStatus, UInt32), calibrationMismatch, aacEncoderCookieInvariantViolation
+    case unexpected(ErrorDiagnosticSnapshot)
+
+    init(_ error: any Error) {
+        if let known = error as? Self { self = known }
+        else if error is CancellationError { self = .cancelled }
+        else { self = .unexpected(PlaybackErrorDiagnostics.snapshot(error)) }
+    }
+}
 struct AACASBD: Sendable, Hashable {
     var sampleRate: Double = 0
     var formatID: UInt32 = 0
@@ -581,7 +592,7 @@ final class AACRenditionEncoder: @unchecked Sendable {
             return try makeEpoch(pass: pass, realFrames: n, leading: leadingSampleCount)
         } catch {
             if !claimed { throw error }
-            presentationTerminal.fail((error as? AACRenditionFailure) ?? .calibrationMismatch)
+            presentationTerminal.fail(AACRenditionFailure(error))
             dispose()
             throw error
         }
@@ -833,7 +844,7 @@ final class AACRenditionEncoder: @unchecked Sendable {
                    failure == .capacityExceeded || failure == .budgetUnavailable {
                     throw error
                 }
-                presentationTerminal.fail((error as? AACRenditionFailure) ?? .calibrationMismatch)
+                presentationTerminal.fail(AACRenditionFailure(error))
                 dispose()
             }
             throw error
@@ -866,7 +877,7 @@ final class AACRenditionEncoder: @unchecked Sendable {
                 if let summary = try pump(offered, append: append).summary { return summary }
             }
         } catch {
-            presentationTerminal.fail((error as? AACRenditionFailure) ?? .calibrationMismatch)
+            presentationTerminal.fail(AACRenditionFailure(error))
             dispose()
             throw error
         }
@@ -886,7 +897,7 @@ final class AACRenditionEncoder: @unchecked Sendable {
             guard before.data == resetCookie else { throw AACRenditionFailure.aacEncoderCookieInvariantViolation }
             guard let resetEvidence, try actualFormat(at: .beforeLive) == resetEvidence.format else { throw AACRenditionFailure.calibrationMismatch }
         } catch {
-            presentationTerminal.fail((error as? AACRenditionFailure) ?? .calibrationMismatch)
+            presentationTerminal.fail(AACRenditionFailure(error))
             throw error
         }
     }

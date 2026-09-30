@@ -6,6 +6,7 @@ import AVFoundation
 import CoreMedia
 import Dispatch
 import Foundation
+import VPlayerCore
 
 struct VideoEnqueueReceipt: Sendable, Equatable {
     let generation: MediaGeneration
@@ -347,7 +348,7 @@ final class SystemVideoOutput: @unchecked Sendable {
                 failureSink(error, generation)
             } catch {
                 ledger.release(next.frame)
-                let failure = PlaybackCoreError.videoSampleBuffer("sample.unknown")
+                let failure = PlaybackCoreError.unexpected(stage: "video.sample-buffer", diagnostic: .init(error))
                 rejectIsolated(next.frame, acceptanceID: next.acceptanceID, error: failure)
                 failureSink(failure, generation)
             }
@@ -537,20 +538,23 @@ final class SystemVideoOutput: @unchecked Sendable {
     private func handleBackendEventIsolated(_ event: VideoRendererBackendEvent) {
         guard !stopped else { return }
         let shouldRecover: Bool
+        let observedFailure: PlaybackCoreError?
         switch event {
         case .requiresFlushToResumeDecoding:
             shouldRecover = true
+            observedFailure = nil
         case let .failed(error):
+            observedFailure = Self.rendererFailure(error)
             shouldRecover = backend.requiresFlushToResumeDecoding
                 || backend.status == .failed
-            if !shouldRecover {
-                failureSink(.videoRendererFailed(Self.sanitized(error)), generation)
+            if !shouldRecover, let observedFailure {
+                failureSink(observedFailure, generation)
             }
         }
         guard shouldRecover else { return }
         guard !recoveryRequestInFlight else { return }
         guard !recoveryCompletedWithoutProgress else {
-            failureSink(.videoRendererFailed(Self.sanitized(backend.error)), generation)
+            failureSink(observedFailure ?? Self.rendererFailure(backend.error), generation)
             return
         }
         recoveryRequestInFlight = true
@@ -651,10 +655,14 @@ final class SystemVideoOutput: @unchecked Sendable {
         return value
     }
 
-    private static func sanitized(_ error: (any Error)?) -> String {
-        guard let error else { return "AVFoundation:unknown" }
-        let value = error as NSError
-        return "\(String(value.domain.prefix(96))):\(value.code)"
+    private static func rendererFailure(_ error: (any Error)?) -> PlaybackCoreError {
+        if let core = error as? PlaybackCoreError { return core }
+        if let error {
+            return .unexpected(stage: "video.renderer", diagnostic: .init(error))
+        }
+        return .unexpected(stage: "video.renderer", diagnostic: .init(
+            typeName: "AVSampleBufferVideoRenderer", code: "error-unavailable",
+            message: "系统报告视频渲染器失败，但未提供错误详情。"))
     }
 
     // Deterministic inspection hooks kept internal to the testable framework.

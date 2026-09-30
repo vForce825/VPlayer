@@ -11,6 +11,18 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class LoopbackHTTPServerTests: XCTestCase {
+    func testResourcePathFailurePreservesPublicationErrorTypeAndReason() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let invalidKey = HLSResourceKey(itemGeneration: 19, mediaEpoch: 1,
+            participantID: UInt64.max, logicalSequence: 1, kind: .media)
+        XCTAssertThrowsError(try fixture.server.path(for: invalidKey)) { error in
+            let description = String(reflecting: error)
+            XCTAssertTrue(description.contains("HLSPublicationFailure"), description)
+            XCTAssertTrue(description.contains("identityMismatch"), description)
+        }
+    }
+
     func testSessionTokenIsSystemSignedPerSessionAndHasCanonicalLowercaseHex() async throws {
         let first = try await Task20HTTPFixture.start()
         let second = try await Task20HTTPFixture.start()

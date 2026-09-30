@@ -134,11 +134,28 @@ final class AudioSessionLifecycleTests: XCTestCase {
             let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.failure, .success],
                 categoryFailure: NSError(domain: domain, code: code))
             let handoff = try await harness.acquire()
-            XCTAssertEqual(harness.registry.processAudioSessionReceiptSnapshot()?.preferredFailureReason, expected)
+            let actual = try XCTUnwrap(harness.registry.processAudioSessionReceiptSnapshot()?.preferredFailureReason)
+            XCTAssertEqual(actual.domain, expected.domain)
+            XCTAssertEqual(actual.code, expected.code)
             XCTAssertEqual(harness.sdk.events, [.category(.longFormAudio), .category(.default), .multichannel, .activate])
             XCTAssertEqual(harness.sdk.maximumConcurrentCalls, 1)
             try await harness.release(handoff)
         }
+    }
+
+    @MainActor
+    func testSDKFailurePreservesBoundedTypeDomainCodeAndOriginalMessage() async throws {
+        let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.failure, .success],
+            categoryFailure: NSError(domain: "AudioSession.Test", code: -42,
+                userInfo: [NSLocalizedDescriptionKey: "音频会话原始异常"]))
+        let handoff = try await harness.acquire()
+        let failure = try XCTUnwrap(harness.registry.processAudioSessionReceiptSnapshot()?.preferredFailureReason)
+        let presentation = AudioSessionFailurePresentation.failure(operation: .defaultCategory,
+            result: .configuration(.failed(failure)), recoveryStage: nil)
+        XCTAssertTrue(presentation.userMessage.contains("AudioSession.Test"))
+        XCTAssertTrue(presentation.userMessage.contains("音频会话原始异常"))
+        XCTAssertTrue(presentation.userMessage.contains("NSError"))
+        try await harness.release(handoff)
     }
 
     @MainActor
@@ -156,7 +173,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
                 harness.sdk.armReentrancy(stage: stage, action: action, registry: harness.registry,
                     contextNonce: originalContext.contextNonce, instant: harness.clock.nowNanoseconds)
                 let before = harness.registry.executor.safetyIngress.snapshot
-                XCTAssertTrue(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+                XCTAssertTrue(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
                 let sdk = harness.sdk
                 let entered = await Task.detached { sdk.waitForBlockedCall() }.value
                 XCTAssertTrue(entered, "回调必须在对应SDK调用内同步完成，然后才阻塞其返回")
@@ -178,7 +195,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
                 }
                 XCTAssertNil(harness.registry.processAudioSessionReceiptSnapshot())
                 XCTAssertNil(harness.registry.outputAcquisitionCommitSnapshot())
-                XCTAssertFalse(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+                XCTAssertFalse(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
                 XCTAssertEqual(sdk.randomInvocationCount, 1)
                 sdk.releaseBlockedCall()
                 let expectedAfterReturn: [AudioSessionSDKSpy.Event]
@@ -230,7 +247,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success])
         let acquisition = try harness.prepareAcquisition()
         XCTAssertTrue(harness.registry.requestCancel(acquisition))
-        XCTAssertFalse(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertFalse(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
         XCTAssertEqual(harness.registry.phase(of: acquisition), .terminal(.canceled))
         XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.acquisitionNoLeaseReceipt?.acquisitionTicket, acquisition)
         XCTAssertEqual(harness.sdk.randomInvocationCount, 0)
@@ -936,7 +953,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
     func testBlockedActivationKeepsMainAndIngressAliveThenLateSuccessDeactivatesOnce() async throws {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success], blockedEvent: .activate)
         let acquisition = try harness.prepareAcquisition()
-        XCTAssertTrue(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertTrue(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
         let sdk = harness.sdk
         let reached = await Task.detached { sdk.waitForBlockedCall() }.value
         XCTAssertTrue(reached)
@@ -955,7 +972,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
         XCTAssertTrue(harness.registry.claimStart(stop))
         XCTAssertTrue(registration.stop(stop))
         XCTAssertNil(try coordinator.advance(owner: owner), "SDK未返回之前不能创建deactivate或释放lease")
-        XCTAssertFalse(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertFalse(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
         XCTAssertEqual(harness.sdk.events.filter { $0 == .activate }.count, 1)
         harness.sdk.releaseBlockedCall()
         for _ in 0..<500 {
@@ -986,14 +1003,17 @@ final class AudioSessionLifecycleTests: XCTestCase {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success],
             allocator: .init(initialIssuedValue: .max, initialNamespace: .lease))
         let acquisition = try harness.prepareAcquisition()
-        XCTAssertFalse(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertThrowsError(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver)) { error in
+            XCTAssertEqual(error as? PlaybackIdentityAllocationError, .identitySpaceExhausted,
+                "原 lease 身份异常必须随本次接管调用返回，不能只留下 rejected")
+        }
         XCTAssertEqual(harness.sdk.randomInvocationCount, 1)
         XCTAssertTrue(harness.sdk.events.isEmpty)
         XCTAssertNil(harness.owner.registration(for: acquisition))
         XCTAssertNil(harness.registry.ownedResourceSnapshot())
         XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.acquisitionNoLeaseReceipt?.acquisitionTicket, acquisition)
         XCTAssertEqual(harness.registry.phase(of: acquisition), .terminal(.canceled), "耗尽先撤权，但必须准确记录实际no-lease返回")
-        XCTAssertFalse(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertFalse(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
         XCTAssertEqual(harness.sdk.randomInvocationCount, 1, "准确原acquire已结清，重放不得再次随机或发行lease")
     }
 
@@ -1001,7 +1021,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
     func testRandomFailureCompletesTheOriginalAcquisitionWithoutLease() throws {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success], randomFails: true)
         let acquisition = try harness.prepareAcquisition()
-        XCTAssertFalse(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertFalse(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
         XCTAssertTrue(harness.sdk.events.isEmpty)
         XCTAssertNil(harness.registry.ownedResourceSnapshot())
         XCTAssertNotNil(harness.registry.outputResourceContextSnapshot()?.acquisitionNoLeaseReceipt)
@@ -1012,7 +1032,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
     func testAcquisitionActivationFailureDoesNotRetryOrProduceReadyReceipt() async throws {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success], activationFailures: 1)
         let acquisition = try harness.prepareAcquisition()
-        XCTAssertTrue(harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        XCTAssertTrue(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
         for _ in 0..<500 {
             if harness.registry.outputAcquisitionCommitSnapshot() != nil ||
                 harness.registry.outputResourceContextSnapshot()?.disposition == .releaseAfterTeardown { break }
@@ -1389,7 +1409,7 @@ final class AudioSessionLifecycleTestHarness {
     func acquire(reset: Bool = false, parentCap: UInt64 = 40_000_000_000,
         mandatorySuffix: UInt64 = 3_000_000_000) async throws -> OutputAcquisitionHandoff {
         let acquisition = try prepareAcquisition(reset: reset, parentCap: parentCap, mandatorySuffix: mandatorySuffix)
-        XCTAssertTrue(owner.startAcquisition(acquisition, receiver: receiver))
+        XCTAssertTrue(try owner.startAcquisition(acquisition, receiver: receiver))
         // 只观察真实ready-to-commit结果，不制造配置phase、receipt或reservation proof。
         for _ in 0..<500 {
             if let token = registry.outputAcquisitionCommitSnapshot() {

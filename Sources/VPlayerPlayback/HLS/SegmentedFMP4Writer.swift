@@ -8,6 +8,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import UniformTypeIdentifiers
+import VPlayerCore
 
 struct HLSVideoRemuxWriterMaterializationAuthority: Sendable {
     let binding: FMP4WriterBinding
@@ -232,12 +233,17 @@ protocol SegmentedFMP4SystemCallbackSink: AnyObject, Sendable {
 protocol SegmentedFMP4SystemWriting: AnyObject, Sendable {
     var objectIdentity: ObjectIdentifier { get }
     var isReadyForMoreMediaData: Bool { get }
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { get }
     func startWriting(at sourceTime: CMTime) -> Bool
     func append(_ sampleBuffer: CMSampleBuffer) -> Bool
     func flushSegment() -> Bool
     func markInputAsFinished()
     func finishWriting(_ completion: @escaping @Sendable (Bool) -> Void)
     func cancelWriting()
+}
+
+extension SegmentedFMP4SystemWriting {
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { nil }
 }
 
 protocol SegmentedFMP4SystemWriterFactory: Sendable {
@@ -404,6 +410,9 @@ private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting
 
     var objectIdentity: ObjectIdentifier { ObjectIdentifier(writer) }
     var isReadyForMoreMediaData: Bool { input.isReadyForMoreMediaData }
+    var failureDiagnostic: ErrorDiagnosticSnapshot? {
+        writer.error.map { PlaybackErrorDiagnostics.snapshot($0) }
+    }
 
     func startWriting(at sourceTime: CMTime) -> Bool {
         guard writer.startWriting() else { return false }
@@ -456,6 +465,7 @@ enum SegmentedFMP4WriterFailure: Error, Sendable, Equatable {
     case boundaryMismatch
     case notReady
     case systemFailure
+    case systemError(ErrorDiagnosticSnapshot)
     case compressedIdentityMismatch
     case aacEndpointMismatch
     case inputEvidenceCapacityExceeded
@@ -1973,6 +1983,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private var finishSystemSucceeded = false
     private var finishContinuation: CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?
     private var storedTerminalReceipt: SegmentedFMP4WriterTerminalReceipt?
+    private var firstSystemFailureDiagnostic: ErrorDiagnosticSnapshot?
     /// endpoint receipt/authority 与 terminal binding 必须在 writer lane 内作为
     /// 一个不可分割的终态推进。成功后的并发 loser 只能被拒绝，不能再把
     /// 已封存的 binding 覆盖成 failure。
@@ -2171,9 +2182,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 logicalSequence: 0
             ))
             guard systemWriter.startWriting(at: sourceTime) else {
+                let failure = systemFailureIsolated()
                 systemWriter.cancelWriting()
                 _ = signTerminalIsolated(.failed)
-                throw SegmentedFMP4WriterFailure.systemFailure
+                throw failure
             }
             guard state != .terminal else { throw SegmentedFMP4WriterFailure.systemFailure }
             state = .started
@@ -2325,9 +2337,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 }
                 retainedTerminalOwnerships.append(ownership)
                 guard appendAndCommitIsolated(sampleBuffer, ticket: ticket, sampleIdentity: identity) else {
+                    let failure = systemFailureIsolated()
                     systemWriter.cancelWriting()
                     _ = signTerminalIsolated(.failed)
-                    throw SegmentedFMP4WriterFailure.systemFailure
+                    throw failure
                 }
                 try recordAppendIsolated(sampleBuffer, ticket: ticket)
             }
@@ -2407,9 +2420,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     guard appendAndCommitIsolated(
                         epoch.buffers[index], ticket: ticket, sampleIdentity: identities[index]
                     ) else {
+                        let failure = systemFailureIsolated()
                         systemWriter.cancelWriting()
                         _ = signTerminalIsolated(.failed)
-                        throw SegmentedFMP4WriterFailure.systemFailure
+                        throw failure
                     }
                     appendedAny = true
                     try failRecordAppendIfRequestedIsolated()
@@ -2452,9 +2466,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             }
             guard systemWriter.isReadyForMoreMediaData else { return .retryLater }
 
-            let buffer: CMSampleBuffer
-            do { buffer = try emission.materializeSampleBuffer() }
-            catch { throw SegmentedFMP4WriterFailure.aacEndpointMismatch }
+            let buffer = try emission.materializeSampleBuffer()
             guard let format = CMSampleBufferGetFormatDescription(buffer),
                   CMFormatDescriptionEqual(format, otherFormatDescription: sourceFormatHint),
                   ObjectIdentifier(format) == emission.liveContext.formatIdentity,
@@ -2575,9 +2587,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 })
                 guard appendAndCommitIsolated(buffer, ticket: ticket,
                                               sampleIdentity: identity) else {
+                    let failure = systemFailureIsolated()
                     systemWriter.cancelWriting()
                     _ = signTerminalIsolated(.failed)
-                    throw SegmentedFMP4WriterFailure.systemFailure
+                    throw failure
                 }
                 systemAppendSucceeded = true
                 try failRecordAppendIfRequestedIsolated()
@@ -3183,9 +3196,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         retainedTerminalOwnerships.append(ownership)
         guard appendAndCommitIsolated(sampleBuffer, ticket: ticket, sampleIdentity: sampleIdentity) else {
+            let failure = systemFailureIsolated()
             systemWriter.cancelWriting()
             _ = signTerminalIsolated(.failed)
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw failure
         }
         try recordAppendIsolated(sampleBuffer, ticket: ticket)
     }
@@ -3475,9 +3489,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             frameDuration: currentFrameDuration
         ))
         guard systemWriter.flushSegment() else {
+            let failure = systemFailureIsolated()
             systemWriter.cancelWriting()
             _ = signTerminalIsolated(.failed)
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw failure
         }
         currentSegmentProjectedBytes = 0
         currentSegmentInputCount = 0
@@ -3574,6 +3589,15 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
     }
 
+    /// 必须在 cancel/retire 前读取系统首错；这些操作可能覆盖 AVAssetWriter.error。
+    private func systemFailureIsolated() -> SegmentedFMP4WriterFailure {
+        if firstSystemFailureDiagnostic == nil {
+            firstSystemFailureDiagnostic = systemWriter.failureDiagnostic
+        }
+        if let diagnostic = firstSystemFailureDiagnostic { return .systemError(diagnostic) }
+        return .systemFailure
+    }
+
     private func finishSystemDidComplete(_ succeeded: Bool) {
         var continuation: CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?
         var result: Result<SegmentedFMP4WriterTerminalReceipt, Error>?
@@ -3581,9 +3605,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         withLane {
             guard state == .finishing else { return }
             guard succeeded else {
+                let failure = systemFailureIsolated()
                 requiresCleanup = true
                 continuation = beginFailureRetirementIsolated()
-                result = .failure(SegmentedFMP4WriterFailure.systemFailure)
+                result = .failure(failure)
                 return
             }
             finishSystemSucceeded = true

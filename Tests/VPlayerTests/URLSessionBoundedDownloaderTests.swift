@@ -254,9 +254,113 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         )
 
         XCTAssertEqual(local.code, "network.localPermissionDenied")
-        XCTAssertEqual(local.message, "请在“设置”中允许 VPlayer 访问本地网络后重试。")
+        XCTAssertTrue(local.message.contains("请在“设置”中允许 VPlayer 访问本地网络后重试。"))
+        XCTAssertTrue(local.message.contains("NSPOSIXErrorDomain(1)"))
+        XCTAssertTrue(local.message.contains("NSURLErrorDomain(-1004)"))
         XCTAssertEqual(publicHost.code, "network.connectionFailed")
+        XCTAssertTrue(publicHost.message.contains("NSPOSIXErrorDomain(1)"))
+        XCTAssertFalse(publicHost.message.contains("允许 VPlayer 访问本地网络"))
         XCTAssertNotEqual(publicHost.message, local.message)
+    }
+
+    func testNetworkFailuresDistinguishCausesAndPreserveSystemCodes() {
+        let cases: [(URLError.Code, String)] = [
+            (.timedOut, "network.timeout"),
+            (.cannotFindHost, "network.dns"),
+            (.dnsLookupFailed, "network.dns"),
+            (.cannotConnectToHost, "network.connectionFailed"),
+            (.notConnectedToInternet, "network.offline"),
+            (.secureConnectionFailed, "network.tls"),
+            (.serverCertificateUntrusted, "network.tls"),
+            (.cancelled, "network.cancelled")
+        ]
+        for (code, expected) in cases {
+            let failure = NetworkFailureMapper.map(
+                URLError(code), for: URL(string: "https://example.test/live")!
+            )
+            XCTAssertEqual(failure.code, expected, "系统错误码 \(code.rawValue)")
+            XCTAssertTrue(failure.message.contains(NSURLErrorDomain))
+            XCTAssertTrue(failure.message.contains(String(code.rawValue)))
+        }
+    }
+
+    func testUnknownNetworkFailurePreservesItsTypeAndReasonWithoutAddresses() {
+        let failure = NetworkFailureMapper.map(
+            DiagnosticDownloadError(
+                errorDescription: "解码资源失败，原因标记 codec-42；https://user:pass@example.test/live?token=secret；/Users/private/cache.bin"
+            ),
+            for: URL(string: "https://example.test/live")!
+        )
+        XCTAssertEqual(failure.code, "network.unknown")
+        XCTAssertTrue(failure.message.contains("DiagnosticDownloadError"))
+        XCTAssertTrue(failure.message.contains("codec-42"))
+        XCTAssertFalse(failure.message.contains("example.test"))
+        XCTAssertFalse(failure.message.contains("secret"))
+        XCTAssertFalse(failure.message.contains("/Users/private"))
+    }
+
+    func testDiagnosticSnapshotBoundsUnicodeTextAndPreservesTheErrorCode() {
+        let snapshot = ErrorDiagnosticSnapshot(
+            typeName: String(repeating: "错误类型", count: 100),
+            code: "diagnostic.code.42",
+            message: String(repeating: "中文原始说明", count: 200)
+        )
+        XCTAssertLessThanOrEqual(snapshot.typeName.utf8.count, 128)
+        XCTAssertLessThanOrEqual(snapshot.summary.utf8.count, 128 + 3 + 256)
+        XCTAssertTrue(snapshot.summary.contains("diagnostic.code.42"))
+        XCTAssertFalse(snapshot.summary.contains("�"))
+        XCTAssertEqual(String(describing: snapshot), snapshot.summary)
+        XCTAssertEqual(ErrorDiagnosticSnapshot(snapshot), snapshot)
+    }
+
+    func testDiagnosticSnapshotDoesNotRetainTheOriginalError() {
+        weak var original: NSError?
+        let snapshot = autoreleasepool {
+            let error = NSError(domain: "OriginalDomain", code: 42, userInfo: [
+                NSLocalizedDescriptionKey: "原始说明 codec-42"
+            ])
+            original = error
+            return ErrorDiagnosticSnapshot(error)
+        }
+        XCTAssertNil(original)
+        XCTAssertTrue(snapshot.summary.contains("OriginalDomain(42)"))
+        XCTAssertTrue(snapshot.summary.contains("codec-42"))
+    }
+
+    func testWrappedNetworkFailureIncludesUnderlyingCause() {
+        let error = NSError(domain: "OuterDomain", code: 42, userInfo: [
+            NSLocalizedDescriptionKey: "下载请求失败",
+            NSUnderlyingErrorKey: NSError(domain: NSURLErrorDomain, code: URLError.timedOut.rawValue, userInfo: [
+                NSLocalizedDescriptionKey: "原始超时说明"
+            ])
+        ])
+        let failure = NetworkFailureMapper.map(error, for: URL(string: "https://example.test/live")!)
+        XCTAssertEqual(failure.code, "network.timeout")
+        XCTAssertTrue(failure.message.contains("OuterDomain(42)"))
+        XCTAssertTrue(failure.message.contains("NSURLErrorDomain(-1001)"))
+        XCTAssertTrue(failure.message.contains("原始超时说明"))
+    }
+
+    func testWrappedStorageFailureIsNotClassifiedAsNetworkFailure() {
+        let error = NSError(domain: "StoreDomain", code: 42, userInfo: [
+            NSUnderlyingErrorKey: CocoaError(.fileWriteOutOfSpace)
+        ])
+        XCTAssertFalse(NetworkFailureMapper.isNetworkError(error))
+    }
+
+    func testNetworkPOSIXErrorsDistinguishTimeoutConnectionAndOffline() {
+        let cases: [(POSIXErrorCode, String)] = [
+            (.ETIMEDOUT, "network.timeout"),
+            (.ECONNREFUSED, "network.connectionFailed"),
+            (.ENETUNREACH, "network.offline")
+        ]
+        for (code, expected) in cases {
+            let failure = NetworkFailureMapper.map(
+                NWError.posix(code), for: URL(string: "https://example.test/live")!
+            )
+            XCTAssertEqual(failure.code, expected)
+            XCTAssertTrue(failure.message.contains(String(code.rawValue)))
+        }
     }
 
     func testDNSPolicyDenialMapsOnlyForLocalHosts() {
@@ -274,7 +378,7 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
                 policyDenied,
                 for: URL(string: "https://example.com/list.m3u")!
             ).code,
-            "network.connectionFailed"
+            "network.dns"
         )
     }
 
@@ -367,4 +471,8 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
             return error
         }
     }
+}
+
+private struct DiagnosticDownloadError: LocalizedError, Sendable {
+    let errorDescription: String?
 }

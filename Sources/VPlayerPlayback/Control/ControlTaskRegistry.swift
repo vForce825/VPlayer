@@ -6,6 +6,7 @@ import Dispatch
 import Darwin
 import Foundation
 import ObjectiveC
+import VPlayerCore
 
 /// executor外部同步入口的固定34槽映射；值类型本身不分配数组或第二张运行时表。
 struct PlaybackExternalSyncProducerReservation: Sendable, Equatable {
@@ -470,6 +471,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
         let externalSyncReservation: Int
         let weakSideTables: Int
         let fixedErrorReservation: Int
+        let diagnosticStorageReservation: Int
         let fixedBridgeReservation: Int
         let processGlobals: Int
         let controllerAndProgressObjects: Int
@@ -502,7 +504,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
         var total: Int {
             fixedObjects + commandBacking + groupBacking + counterBacking + dispatchObjects +
                 permanentCaptures + inFlightDeliveries + registrations + fixedScratch + routeWrapper +
-                transientArrays + externalSyncReservation + weakSideTables + fixedErrorReservation +
+                transientArrays + externalSyncReservation + weakSideTables + fixedErrorReservation + diagnosticStorageReservation +
                 fixedBridgeReservation + processGlobals + controllerAndProgressObjects +
                 backendAndCleanupRunnerObjects + taskSlabs + escapingCaptures + continuations +
                 stateTerminationSyncBridge + mediaTerminationSyncBridge
@@ -538,6 +540,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
             externalSyncReservation: externalProducers.total,
             weakSideTables: 5 * 32, // executor、scheduler、Registry、controller、cleanup runner五个唯一target。
             fixedErrorReservation: 34 * 2 * 80,
+            // SDK 串行 lane 的进程/阶段、资源责任、当前返回及同步旧尾最多四个首错实体；
+            // 前后两个 backend runner 的首错另计。复制诊断值共享同一固定 backing。
+            diagnosticStorageReservation: 6 * ErrorDiagnosticSnapshot.maximumStorageAllocationBytes,
             fixedBridgeReservation: 64,
             processGlobals: 4 * MemoryLayout<UnsafeRawPointer>.stride,
             controllerAndProgressObjects: object(PlaybackController.self) +
@@ -3783,8 +3788,20 @@ final class ControlTaskRegistry: @unchecked Sendable {
         var subscription: PlaybackStateSubscription?
         var published = false
         var wake: CheckedContinuation<Void, Never>?
-        let failure = PlaybackState.failed(.init(code: "playback.control-terminal",
-            userMessage: "播放控制已到达安全边界，请重新选择频道。"))
+        let cause = executor.safetyIngress.snapshot.failure
+        let detail: String
+        switch cause {
+        case .identitySpaceExhausted: detail = "播放身份编号已耗尽"
+        case .callbackDepthOverflow: detail = "系统回调嵌套深度超出限制"
+        case .invalidEvidence: detail = "播放控制凭证无效"
+        case .clockOverflow: detail = "播放控制时钟计算溢出"
+        case nil:
+            let phase = outputResourceContextSnapshot().map { String(describing: $0.phase) } ?? "unavailable"
+            detail = "播放控制任务超过时间预算，阶段 \(phase)"
+        }
+        var failure = PlaybackState.failed(.init(code: "playback.control-terminal",
+            userMessage: "\(detail)，请重新选择频道。",
+            diagnosticCode: "playback.control-terminal.\(cause.map { String(describing: $0) } ?? "deadline")"))
         let owner: OutputTransitionOwnerTicket? = try? transaction { output in
             guard var context = authority.outputContext, context.poisoned,
                   let reservation = authority.cleanupReservation, reservation.ticket == context.reservation else { return nil }
@@ -3809,6 +3826,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             if case .coldStart(let admitted) = authority.playbackRequestAdmission,
                admitted.identity.sessionIdentity != context.sessionIdentity { return owner }
             authority.playbackRequestAdmission = nil
+            if case .failed = authority.publicState { failure = authority.publicState }
             if authority.publicState != failure {
                 authority.publicState = failure
                 subscription = authority.stateSubscription
@@ -4065,7 +4083,14 @@ final class ControlTaskRegistry: @unchecked Sendable {
             } catch is CancellationError {
                 result = .canceled
             } catch {
-                result = .failed((error as? PlaybackCoreError) ?? .demuxOpen(-1))
+                let stage: String
+                switch runner.operation {
+                case .factory: stage = "backend.factory"
+                case .prepare: stage = "backend.prepare"
+                case .activation: stage = "backend.activation"
+                case .suspend: stage = "backend.suspend"
+                }
+                result = .failed(.capture(error, stage: stage))
             }
         }
         if case .succeeded = result,
@@ -4348,8 +4373,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             } catch is CancellationError {
                 result = .canceled
             } catch {
-                result = .failed(
-                    (error as? PlaybackCoreError) ?? .demuxOpen(-1))
+                result = .failed(.capture(error, stage: "backend.reprepare"))
             }
         }
         if case .succeeded = result {} else {
@@ -4391,7 +4415,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }), authority.commands[index]?.backendOperation === runner else {
                 return
             }
-            runner.result = .failed(.demuxOpen(-1))
+            runner.result = .failed(.backendPublicationReplacementRejected)
             if authority.commands[index]?.phase == .running {
                 authority.commands[index]?.phase = .terminal(.completed)
             } else if authority.commands[index]?.phase == .cancelRequested {
@@ -4442,7 +4466,26 @@ final class ControlTaskRegistry: @unchecked Sendable {
     /// receiver只提交原owner；任务分配、handle换手及退出尾部均留在原固定record。
     func startOwnedTerminalCleanup(owner: OutputTransitionOwnerTicket,
         receiver: any PlaybackOwnedCleanupReceiving, terminalState: PlaybackState) -> Bool {
-        startOwnedCleanup(owner: owner, receiver: receiver, terminalState: terminalState)
+        if case .failed(let failure) = terminalState {
+            publishOwnedTerminalFailure(owner: owner, failure: failure)
+        }
+        return startOwnedCleanup(owner: owner, receiver: receiver, terminalState: terminalState)
+    }
+
+    /// 首错先于任何异步清理发布；准确 owner/session 防止旧任务覆盖新播放。
+    private func publishOwnedTerminalFailure(owner: OutputTransitionOwnerTicket, failure: PlaybackFailure) {
+        executor.sync {
+            let subscription: PlaybackStateSubscription? = try? transaction { _ in
+                guard let context = authority.outputContext, context.owner == owner,
+                      owner.reason.releasesLease, context.disposition == .releaseAfterTeardown else { return nil }
+                if case .coldStart(let admission) = authority.playbackRequestAdmission,
+                   admission.identity.sessionIdentity != context.sessionIdentity { return nil }
+                if case .failed = authority.publicState { return nil }
+                authority.publicState = .failed(failure)
+                return authority.stateSubscription
+            }
+            subscription?.continuation.yield(.failed(failure))
+        }
     }
 
     /// 真实SDK失败在同锁completion签发terminal owner；只借原图relay中的接收者，不能投到新session。
@@ -4460,17 +4503,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 return nil
             }
             // SDK 可能先于 relay 绑定完成；先保留真实错误，稍后由控制器领取原 owner 清理。
-            let subscription: PlaybackStateSubscription? = try? transaction { _ in
-                guard let context = authority.outputContext, context.owner == owner,
-                      context.disposition == .releaseAfterTeardown, !context.poisoned else { return nil }
-                if case .coldStart(let admission) = authority.playbackRequestAdmission,
-                   admission.identity.sessionIdentity != context.sessionIdentity { return nil }
-                // 同一个 terminal owner 只能确定一次用户可见原因；进展检查不得覆盖真实 SDK 错误。
-                if case .failed = authority.publicState { return nil }
-                authority.publicState = .failed(failure)
-                return authority.stateSubscription
-            }
-            subscription?.continuation.yield(.failed(failure))
+            publishOwnedTerminalFailure(owner: owner, failure: failure)
             if let receiver, case let .failed(currentFailure) = playbackStateSnapshot() {
                 _ = startOwnedTerminalCleanup(owner: owner, receiver: receiver,
                     terminalState: .failed(currentFailure))

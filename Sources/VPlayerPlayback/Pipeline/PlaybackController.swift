@@ -4,6 +4,7 @@
 
 import AVFoundation
 import Foundation
+import VPlayerCore
 
 protocol PlaybackTerminalMetricsProviding: Sendable {
     func snapshot(window: Duration) -> PlaybackMetricsSnapshot
@@ -60,7 +61,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         case admission, acquisition, acquisitionStart, registration
         case relayPreparation, relayBinding, acquisitionToken, acquisitionCommit, acquisitionHandoff
         case stableRoute, successorContext, successorOwner, resetReceipt, successorNonce
-        case outputCycle, outputRebase, factoryClaim, factoryStart, outputReprepare, unexpected
+        case outputCycle, outputRebase, factoryClaim, factoryRelayBinding, factoryStart, outputReprepare
 
         var playbackFailure: PlaybackFailure {
             let message = switch self {
@@ -81,9 +82,9 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             case .outputCycle: "音频输出周期更新失败，播放已停止。"
             case .outputRebase: "音频输出资源交接失败，播放已停止。"
             case .factoryClaim: "播放器创建任务领取失败，播放已停止。"
-            case .factoryStart: "播放器创建任务或事件监听启动失败，播放已停止。"
+            case .factoryRelayBinding: "播放器事件监听绑定失败，播放已停止。"
+            case .factoryStart: "播放器创建任务未能启动，播放已停止。"
             case .outputReprepare: "播放器恢复准备失败，播放已停止。"
-            case .unexpected: "播放启动时遇到未预期的控制流程错误，请重试。"
             }
             return .init(code: "playback.startup.\(rawValue)", userMessage: message)
         }
@@ -311,7 +312,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             sessionIdentity = budget.identity.sessionIdentity
         } catch {
             diagnosticStage = "admit_failed"
-            publish(.failed(StartupFailure.admission.playbackFailure))
+            publish(.failed(Self.failure(for: .capture(error, stage: "startup.admission"))))
             return
         }
         invalidateSession()
@@ -344,7 +345,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             }
             
             let receiver = routeService ?? defaultReceiver
-            guard audioSessionOwner.startAcquisition(acquisition, receiver: receiver) else {
+            guard try audioSessionOwner.startAcquisition(acquisition, receiver: receiver) else {
                 diagnosticStage = "startAcquisition_failed"
                 _ = registry.cancelAcquisitionSession()
                 throw StartupFailure.acquisitionStart.playbackFailure
@@ -466,7 +467,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             if case let .failed(original) = registry.playbackStateSnapshot() { failure = original }
             else if let typed = error as? PlaybackFailure { failure = typed }
             else if let core = error as? PlaybackCoreError { failure = Self.failure(for: core) }
-            else { failure = StartupFailure.unexpected.playbackFailure }
+            else { failure = Self.failure(for: .capture(error, stage: "startup.acquisition")) }
             registry.deactivateOutputEventRelays(session: sessionIdentity)
             routeService?.unbindSession()
             if let context = registry.outputResourceContextSnapshot(), context.sessionIdentity == sessionIdentity,
@@ -573,11 +574,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 }
                 let relayGroup = try registry.createGroup(resource: .backend(candidateID), parent: creation.reservation.workGroup)
                 let relayDrain = try registry.enqueue(group: relayGroup, slot: .accounting, policy: .routeNeutral)
-                guard registry.bindEventRelay(relay, to: relayDrain),
-                      registry.startOutputFactoryOperation(factoryTicket, input: .init(factory: backendFactory,
-                        kind: kind, identity: candidateID, request: request, tuning: tuning, relay: relay))
-                else {
-                    diagnosticStage = "bind_or_startOutputFactory_failed"
+                guard registry.bindEventRelay(relay, to: relayDrain) else {
+                    diagnosticStage = "bind_factory_relay_failed"
+                    throw StartupFailure.factoryRelayBinding.playbackFailure
+                }
+                guard registry.startOutputFactoryOperation(factoryTicket, input: .init(factory: backendFactory,
+                        kind: kind, identity: candidateID, request: request, tuning: tuning, relay: relay)) else {
+                    diagnosticStage = "startOutputFactory_failed"
                     throw StartupFailure.factoryStart.playbackFailure
                 }
                 diagnosticStage = "joining_factory"
@@ -676,7 +679,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             let failure: PlaybackFailure
             if let typed = error as? PlaybackFailure { failure = typed }
             else if let core = error as? PlaybackCoreError { failure = Self.failure(for: core) }
-            else { failure = StartupFailure.unexpected.playbackFailure }
+            else { failure = Self.failure(for: .capture(error, stage: "startup.successor")) }
             if fromEventRelay {
                 if let context = registry.outputResourceContextSnapshot() {
                     beginOwnedBackendTerminal(context: context, terminalState: .failed(failure))
@@ -1041,9 +1044,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             registry.startOutputSuspendOperation(stop.task, owner: owner) else {
             return
         }
-        guard case .succeeded = await registry.joinOutputBackendOperation(stop.task),
-              registry.finishOutputPause(owner: owner) else {
+        switch await registry.joinOutputBackendOperation(stop.task) {
+        case .succeeded:
+            guard registry.finishOutputPause(owner: owner) else { return }
+        case .failed(let error):
+            beginOwnedBackendTerminal(context: original, terminalState: .failed(Self.failure(for: error)))
             return
+        case .canceled: return
         }
         registry.updatePreparedSampleBufferPause(contextNonce: original.contextNonce,
             paused: true, readinessCycle: controllerState.readinessCycle)
@@ -1065,7 +1072,9 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         switch outcome {
         case .succeeded:
             publish(.playing(request))
-        default:
+        case .failed(let error):
+            beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
+        case .canceled:
             break
         }
     }
@@ -1506,20 +1515,24 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
 
     static func failure(for error: PlaybackCoreError) -> PlaybackFailure {
         let mapped = switch error {
-        case .unsupportedProtocol:
-            PlaybackFailure(code: "protocol.unsupported", userMessage: "不支持此播放协议，请使用 HTTP 或 HTTPS 地址。")
-        case .demuxOpen:
-            PlaybackFailure(code: "demux.open", userMessage: "无法打开频道流，请检查地址和网络后重试。")
-        case .demuxRead:
-            PlaybackFailure(code: "demux.read", userMessage: "读取频道流失败，请检查网络后重试。")
+        case .unsupportedProtocol(let scheme):
+            detailedFailure(code: "protocol.unsupported", message: "不支持此播放协议，请使用 HTTP 或 HTTPS 地址。",
+                detail: ErrorDiagnosticSnapshot(typeName: "播放协议", message: scheme).summary)
+        case .demuxOpen(let status):
+            demuxFailure(status: status, opening: true)
+        case .demuxRead(let status):
+            demuxFailure(status: status, opening: false)
+        case let .ffmpegFailure(kind, stage, status):
+            ffmpegFailure(kind: kind, stage: stage, status: status)
         case .networkTimeout:
             PlaybackFailure(code: "network.timeout", userMessage: "连接频道超时，请检查网络后重试。")
         case .unsupportedVideoCodec:
             PlaybackFailure(code: "video.codec", userMessage: "不支持此频道的视频编码，请尝试其他频道。")
         case .unsupportedAudioCodec:
             PlaybackFailure(code: "audio.codec", userMessage: "不支持此频道的音频编码，请尝试其他频道。")
-        case .videoFormatDescription:
-            PlaybackFailure(code: "video.format", userMessage: "无法解析视频格式，请尝试其他频道。")
+        case .videoFormatDescription(let status):
+            detailedFailure(code: "video.format", message: "无法解析视频格式，请尝试其他频道。",
+                detail: "系统返回码 \(status)", diagnosticCode: "video.format.status.\(status)")
         case .hardwareDecoderUnavailable:
             PlaybackFailure(code: "video.hardware", userMessage: "硬件视频解码器不可用，请稍后重试。")
         case .videoDecoderTransitionTimeout:
@@ -1531,43 +1544,57 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         case let .videoDecode(status):
             PlaybackFailure(
                 code: "video.decode",
-                userMessage: "视频解码失败，请尝试其他频道。",
+                userMessage: "视频解码失败（系统返回码 \(status)），请尝试其他频道。",
                 diagnosticCode: "video.decode.status.\(status)"
             )
+        case .videoDecoderFailure(let cause):
+            videoDecoderFailure(for: cause)
         case let .videoSampleBuffer(reason):
             PlaybackFailure(
                 code: "video.sample-buffer",
-                userMessage: "视频帧处理失败，请稍后重试。",
+                userMessage: "视频帧处理失败（\(ErrorDiagnosticSnapshot(typeName: "videoSampleBuffer", message: reason).summary)），请稍后重试。",
                 diagnosticCode: "video.sample-buffer.reason.\(safeRendererReason(reason))"
             )
         case let .videoRendererFailed(reason):
             PlaybackFailure(
                 code: "video.renderer",
-                userMessage: "视频输出失败，请稍后重试。",
+                userMessage: "视频输出失败（\(ErrorDiagnosticSnapshot(typeName: "videoRendererFailed", message: reason).summary)），请稍后重试。",
                 diagnosticCode: "video.renderer.reason.\(safeRendererReason(reason))"
             )
-        case .audioFormatDescription:
-            PlaybackFailure(code: "audio.format", userMessage: "无法解析音频格式，请尝试其他频道。")
+        case .audioFormatDescription(let status):
+            detailedFailure(code: "audio.format", message: "无法解析音频格式，请尝试其他频道。",
+                detail: "系统返回码 \(status)", diagnosticCode: "audio.format.status.\(status)")
         case let .audioFallbackDecode(status):
             PlaybackFailure(
                 code: "audio.decode",
-                userMessage: "音频解码失败，请尝试其他频道。",
+                userMessage: "音频解码失败（返回码 \(status)），请尝试其他频道。",
                 diagnosticCode: "audio.decode.status.\(status)"
             )
         case let .audioRendererFailed(reason):
             PlaybackFailure(
                 code: "audio.renderer",
-                userMessage: "音频输出失败，请检查播放设备后重试。",
+                userMessage: "音频输出失败（\(ErrorDiagnosticSnapshot(typeName: "audioRendererFailed", message: reason).summary)），请检查播放设备后重试。",
                 diagnosticCode: "audio.renderer.reason.\(safeRendererReason(reason))"
             )
         case .renderTextureMapping:
             PlaybackFailure(code: "video.texture", userMessage: "视频纹理处理失败，请稍后重试。")
-        case .metalCommand:
-            PlaybackFailure(code: "metal.command", userMessage: "视频渲染失败，请稍后重试。")
+        case .metalCommand(let reason):
+            detailedFailure(code: "metal.command", message: "视频渲染失败，请稍后重试。",
+                detail: ErrorDiagnosticSnapshot(typeName: "metalCommand", message: reason).summary,
+                diagnosticCode: "metal.command.reason.\(safeRendererReason(reason))")
         case .cancelled:
             PlaybackFailure(code: "playback.cancelled", userMessage: "播放已取消，请重新选择频道。")
         case .controlEventCapacityExceeded:
             PlaybackFailure(code: "playback.control-capacity", userMessage: "播放控制事件超出安全容量，播放已停止。")
+        case .outputActivationRejected:
+            PlaybackFailure(code: "playback.activation-rejected", userMessage: "播放器的音频输出激活授权已失效，请重新选择频道。")
+        case .backendPublicationReplacementRejected:
+            PlaybackFailure(code: "playback.publication-replacement", userMessage: "播放器的媒体发布替换被拒绝，输出资源状态不匹配，请重新选择频道。")
+        case .presented(let failure):
+            failure
+        case let .unexpected(stage, diagnostic):
+            detailedFailure(code: "playback.\(stage)", message: "\(failureStageName(stage))失败，请重试。",
+                detail: diagnostic.summary, diagnosticCode: "playback.\(stage).\(diagnostic.typeName)")
         }
         return PlaybackFailure(
             code: mapped.code,
@@ -1575,6 +1602,100 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             diagnosticCode: mapped.diagnosticCode,
             retryDisposition: error.retryDisposition
         )
+    }
+
+    private static func videoDecoderFailure(for cause: VideoDecoderFailure) -> PlaybackFailure {
+            let code: String
+            let message: String
+            switch cause {
+            case .sessionCreate:
+                code = "video.decoder.session-create"; message = "无法创建视频解码会话，请重试。"
+            case .badData:
+                code = "video.decoder.bad-data"; message = "视频解码输入数据无效，请尝试其他频道。"
+            case .malfunction:
+                code = "video.decoder.malfunction"; message = "视频解码会话失效，请重试。"
+            case .softwareDecoder:
+                code = "video.hardware"; message = "硬件视频解码器不可用，请稍后重试。"
+            case .backpressureTimeout:
+                code = "video.decoder.backpressure"; message = "视频解码提交等待超时，请重试。"
+            case .unexpected:
+                code = "video.decoder.unexpected"; message = "视频解码器遇到未识别异常，请重试。"
+            }
+            let diagnostic: ErrorDiagnosticSnapshot
+            if case .unexpected(let original) = cause { diagnostic = original }
+            else { diagnostic = .init(cause) }
+            return .init(code: code, userMessage: "\(message)（\(diagnostic.summary)）",
+                diagnosticCode: code, retryDisposition: PlaybackCoreError.videoDecoderFailure(cause).retryDisposition)
+    }
+
+    private static func detailedFailure(code: String, message: String, detail: String,
+                                        diagnosticCode: String? = nil) -> PlaybackFailure {
+        .init(code: code, userMessage: "\(message)（\(detail)）", diagnosticCode: diagnosticCode ?? code)
+    }
+
+    private static func demuxFailure(status: Int32, opening: Bool) -> PlaybackFailure {
+        switch status {
+        case FFmpegDemuxer.doubleStartErrorCode:
+            detailedFailure(code: "demux.duplicate-start", message: "频道读取任务重复启动，请重试。", detail: "内部返回码 \(status)")
+        case FFmpegDemuxer.malformedEventErrorCode:
+            detailedFailure(code: "demux.invalid-event", message: "频道数据解析结果无效，请重试。", detail: "内部返回码 \(status)")
+        case FFmpegDemuxer.oversizedValueErrorCode:
+            detailedFailure(code: "demux.capacity", message: "频道数据超出读取容量限制，请尝试其他频道。", detail: "内部返回码 \(status)")
+        default:
+            detailedFailure(code: opening ? "demux.open" : "demux.read",
+                message: opening ? "无法打开频道流，请检查地址和网络后重试。" : "读取频道流失败，请检查网络后重试。",
+                detail: "FFmpeg 返回码 \(status)", diagnosticCode: "demux.\(opening ? "open" : "read").status.\(status)")
+        }
+    }
+
+    private static func ffmpegFailure(kind: FFmpegFailureKind, stage: FFmpegFailureStage, status: Int32) -> PlaybackFailure {
+        let code: String
+        let message: String
+        switch kind {
+        case .unsupportedVideo, .unsupportedAudio:
+            code = kind == .unsupportedVideo ? "video.codec" : "audio.codec"
+            let media = kind == .unsupportedVideo ? "视频" : "音频"
+            message = "\(stage.displayName)时发现不支持的\(media)编码，请尝试其他频道。"
+        case .open, .read, .timeout:
+            code = kind == .timeout ? "network.timeout" : "demux.\(kind.rawValue)"
+            message = "\(stage.displayName)\(kind == .timeout ? "超时" : "失败")，请重试。"
+        }
+        return detailedFailure(code: code, message: message, detail: "FFmpeg 返回码 \(status)",
+            diagnosticCode: "ffmpeg.\(kind.rawValue).\(stage.rawValue).\(status)")
+    }
+
+    private static func failureStageName(_ stage: String) -> String {
+        switch stage {
+        case "backend.factory": "播放器创建"
+        case "backend.prepare": "播放器准备"
+        case "backend.reprepare": "播放器重新准备"
+        case "backend.activation": "播放器输出激活"
+        case "backend.suspend": "播放器输出暂停"
+        case "startup.admission": "播放请求建立"
+        case "startup.acquisition": "音频会话接管"
+        case "startup.successor": "播放器输出切换"
+        case "audio.renderer": "音频输出"
+        case "video.renderer": "视频输出"
+        case "video.sample-buffer": "视频帧处理"
+        case "demux.start": "频道读取任务启动"
+        case "pipeline.packet": "频道数据包处理"
+        case "pipeline.format": "播放格式更新"
+        case "video.assembly": "视频码流组装"
+        case "video.decode", "video.decode.pending": "视频解码提交"
+        case "video.deinterlace.setup": "视频去隔行处理初始化"
+        case "video.scan-probe.setup": "视频扫描格式检测初始化"
+        case "video.hlsTranscode": "HLS 视频转码"
+        case "audio.anchor": "音频时间锚点准备"
+        case "audio.pcm-output": "PCM 音频输出回调"
+        case "audio.retention", "audio.replay-retention": "音频缓存管理"
+        case "audio.renderer.configure": "音频渲染器配置"
+        case "audio.renderer.reset", "audio.renderer.reset-pcm": "音频渲染器重置"
+        case "audio.renderer.fallback": "音频 PCM 回退"
+        case "audio.renderer.drive": "音频帧提交"
+        case "audio.renderer.replay-prune", "audio.recovery.replay-prune": "音频重放缓存裁剪"
+        case "audio.renderer.retry-replay", "audio.recovery.replay": "音频恢复重放"
+        default: "播放处理 [\(stage)]"
+        }
     }
 
     private static func safeRendererReason(_ reason: String) -> String {

@@ -855,16 +855,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     }
 
     static func coreError(for failure: VideoDecoderFailure) -> PlaybackCoreError {
-        switch failure {
-        case let .sessionCreate(status):
-            .videoDecode(status)
-        case .softwareDecoder:
-            .hardwareDecoderUnavailable
-        case let .badData(status), let .malfunction(status):
-            .videoDecode(status)
-        case .backpressureTimeout:
-            .videoDecode(kVTVideoDecoderNotAvailableNowErr)
-        }
+        .videoDecoderFailure(failure)
     }
 
     private func submitOrRun(_ operation: @escaping @Sendable () -> Void) {
@@ -930,7 +921,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("pipeline_demuxer_failed_other_\(error)")
             #endif
-            failIsolated(.demuxOpen(-1))
+            failIsolated(.capture(error, stage: "demux.start"))
         }
     }
 
@@ -1008,7 +999,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         } catch let error as VideoDecoderFailure {
             failIsolated(Self.coreError(for: error))
         } catch {
-            failIsolated(.demuxRead(-1))
+            failIsolated(.capture(error, stage: "pipeline.packet"))
         }
     }
 
@@ -1126,7 +1117,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         } catch let error as PlaybackCoreError {
             failIsolated(error)
         } catch {
-            failIsolated(.videoDecode(-1))
+            failIsolated(.capture(error, stage: "video.assembly"))
         }
     }
 
@@ -1157,7 +1148,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         } catch let error as PlaybackCoreError {
             failIsolated(error)
         } catch {
-            failIsolated(.audioRendererFailed("audio.pipeline"))
+            failIsolated(.capture(error, stage: "pipeline.format"))
         }
     }
 
@@ -2337,7 +2328,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         } catch let error as PlaybackCoreError {
             failIsolated(error)
         } catch {
-            failIsolated(.audioRendererFailed("audio.pipeline"))
+            failIsolated(.capture(error, stage: "pipeline.format"))
         }
     }
 
@@ -2505,7 +2496,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             } catch let error as PlaybackCoreError {
                 failIsolated(error)
             } catch {
-                failIsolated(.demuxRead(-1))
+                failIsolated(.capture(error, stage: "pipeline.packet"))
             }
         }
         if let pendingPacketAdmission {
@@ -2516,7 +2507,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 } catch let error as PlaybackCoreError {
                     failIsolated(error)
                 } catch {
-                    failIsolated(.demuxRead(-1))
+                    failIsolated(.capture(error, stage: "pipeline.packet"))
                 }
             }
             pendingPacketAdmission.acknowledgement.signal()
@@ -2544,9 +2535,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         } catch let error as PlaybackCoreError {
             failIsolated(error)
         } catch {
-            failIsolated(.audioRendererFailed(
-                CompressedAudioRetentionPolicy.accountingError
-            ))
+            failIsolated(.capture(error, stage: "audio.retention"))
         }
         return false
     }
@@ -3101,7 +3090,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 return false
             } catch {
                 anchorPreparationTransaction = nil
-                failIsolated(.audioRendererFailed("audio.anchor"))
+                failIsolated(.capture(error, stage: "audio.anchor"))
                 return false
             }
             guard outputRouteRevisionMatchesIsolated(preparation.routeRevision) else {
@@ -3223,9 +3212,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             return
         } catch {
             anchorPreparationTransaction = nil
-            failIsolated(.audioRendererFailed(
-                CompressedAudioRetentionPolicy.accountingError
-            ))
+            failIsolated(.capture(error, stage: "audio.retention"))
             return
         }
         preparedAnchor = PreparedAnchor(
@@ -3590,7 +3577,7 @@ final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked S
                 maximumPendingFrames: tuning.deinterlaceBufferFrames
             )
         } catch {
-            throw PlaybackCoreError.metalCommand("yadif.setup")
+            throw PlaybackCoreError.capture(error, stage: "video.deinterlace.setup")
         }
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("makepipeline_before_probe")
@@ -3599,7 +3586,7 @@ final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked S
         do {
             probe = try LumaScanProbe(commandQueue: commandQueue, maximumFrames: 12)
         } catch {
-            throw PlaybackCoreError.metalCommand("scan-probe.setup")
+            throw PlaybackCoreError.capture(error, stage: "video.scan-probe.setup")
         }
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("makepipeline_before_pipeline_alloc")

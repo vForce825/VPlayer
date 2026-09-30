@@ -1982,11 +1982,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             slot.retire(token)
         }
         let token = try slot.begin(.loaded)
-        var foreign: NSError? = NSError(domain: "task21.foreign", code: 7,
-            userInfo: ["payload": String(repeating: "x", count: 4096)])
-        weak var retainedForeign = foreign
-        slot.resolve(.failure(try XCTUnwrap(foreign)), token: token)
-        foreign = nil
+        weak var retainedForeign: NSError?
+        autoreleasepool {
+            let foreign = NSError(domain: "task21.foreign", code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "音频输出首次准备失败",
+                           "payload": String(repeating: "x", count: 4096)])
+            retainedForeign = foreign
+            slot.resolve(.failure(foreign), token: token)
+        }
         XCTAssertNil(retainedForeign, "未消费 terminal 不得继续持任意 NSError/userInfo")
         retainedForeign = nil
         do {
@@ -1995,7 +1998,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             }
             XCTFail("未知错误必须 fail closed")
         } catch {
-            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed)
+            let description = String(reflecting: error)
+            XCTAssertTrue(description.contains("task21.foreign"), description)
+            XCTAssertTrue(description.contains("7"), description)
+            XCTAssertTrue(description.contains("音频输出首次准备失败"), description)
         }
         slot.retire(token)
     }

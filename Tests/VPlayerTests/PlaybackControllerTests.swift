@@ -6,7 +6,74 @@ import Foundation
 import XCTest
 @testable import VPlayerPlayback
 
+private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
+    let error: any Error
+    func makePipeline(tuning: PlaybackTuning, channelID: String,
+                      eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void)
+        async throws -> any PlaybackPipelineProtocol {
+        throw error
+    }
+}
+
 final class PlaybackControllerTests: XCTestCase {
+    func testBackendFirstFailureIsVisibleWhileCleanupWaitsAndSurvivesSafetyTerminal() async throws {
+        let pipeline = FakeControllerPipeline()
+        pipeline.stopAutomaticallyCompletes = false
+        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([pipeline]), audioSessionOwner: owner
+        )
+        await controller.play(makeRequest(channelID: "first-error-cleanup"))
+        pipeline.emit(.failed(.audioRendererFailed("NativeAudioFailure:-702")))
+        try await eventually { pipeline.snapshot().isStopWaiting }
+        guard case let .failed(original) = await controller.currentStateForTesting else {
+            pipeline.completeStop()
+            return XCTFail("真实首错必须在清理等待前保留")
+        }
+        XCTAssertTrue(original.userMessage.contains("NativeAudioFailure:-702"))
+        await controller.failPresentationControl()
+        for _ in 0..<100 { await Task.yield() }
+        let duringCleanup = await controller.currentStateForTesting
+        XCTAssertEqual(duringCleanup, .failed(original), "控制终态不可覆盖真实首错")
+        pipeline.completeStop()
+        await owner.registry.joinOwnedTerminalCleanup()
+        let afterCleanup = await controller.currentStateForTesting
+        XCTAssertEqual(afterCleanup, .failed(original))
+    }
+
+    func testForeignPipelineConstructionErrorsKeepTheirTypeAndReasonAfterCleanup() async throws {
+        let errors: [any Error] = [
+            AVPlayerItemCoordinatorFailure.prerollFailed,
+            AVPlayerItemCoordinatorFailure.staleIdentity,
+            NSError(domain: "PlayerSetupFailure", code: -701,
+                    userInfo: [NSLocalizedDescriptionKey: "输出设备准备失败"]),
+        ]
+        var messages: [String] = []
+        for error in errors {
+            let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+            let controller = makeRoutedPlaybackController(
+                factory: ErrorReportingPipelineFactory(error: error), audioSessionOwner: owner
+            )
+            await controller.play(makeRequest(channelID: "foreign-factory-error"))
+            guard case let .failed(failure) = await controller.currentStateForTesting else {
+                return XCTFail("创建失败必须呈现具体错误")
+            }
+            XCTAssertEqual(failure.code, "playback.backend.prepare")
+            XCTAssertFalse(failure.userMessage.contains("检查地址和网络"))
+            messages.append(failure.userMessage)
+            await owner.registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(owner.registry.ownedResourceSnapshot())
+            XCTAssertEqual(owner.sdk.deactivateCallCount, 1)
+        }
+        XCTAssertTrue(messages[0].contains("AVPlayerItemCoordinatorFailure"))
+        XCTAssertTrue(messages[0].contains("prerollFailed"))
+        XCTAssertTrue(messages[1].contains("staleIdentity"))
+        XCTAssertTrue(messages[2].contains("PlayerSetupFailure"))
+        XCTAssertTrue(messages[2].contains("-701"))
+        XCTAssertTrue(messages[2].contains("输出设备准备失败"))
+        XCTAssertEqual(Set(messages).count, 3)
+    }
+
     func testColdStartReportsBothCategoryFailuresWithSystemCode() async throws {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = AudioSessionSDKSpy(
@@ -463,6 +530,8 @@ final class PlaybackControllerTests: XCTestCase {
             guard case let .failed(failure) = await controller.currentStateForTesting else { return false }
             return failure.code == "audio.session.recovery.configuration" && first.snapshot().completedStopCount == 1
         }
+        // 首错先于清理完成发布；资源释放须独立等待准确原 cleanup runner。
+        try await eventually { owner.registry.outputResourceContextSnapshot() == nil }
         XCTAssertTrue(first.snapshot().starts.isEmpty)
         XCTAssertFalse(factory.isPending(callID: 2))
         XCTAssertNil(owner.registry.outputResourceContextSnapshot())
@@ -1144,10 +1213,10 @@ private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwne
         if interruptedAtAcquisition { monitor.emit(.interruptionBegan) }
     }
 
-    override func startAcquisition(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) -> Bool {
+    override func startAcquisition(_ ticket: ControlTaskTicket, receiver: any PlaybackAudioSessionCompletionReceiving) throws -> Bool {
         let previous = lock.withLock { _acquisitions.last }
         let previousReleased = previous.map { registration(for: $0) == nil } ?? true
-        let started = super.startAcquisition(ticket, receiver: receiver)
+        let started = try super.startAcquisition(ticket, receiver: receiver)
         // 只记录真实登记结果，不能预测lease序号或伪造acquisition成功。
         if let registration = registration(for: ticket) {
             let id = registration.identity.leaseID

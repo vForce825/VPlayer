@@ -10,6 +10,112 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
+    func testNativeAudioRendererRepeatedFailuresKeepFirstDiagnosticAcrossObservationRestart() throws {
+        let renderer = SystemAudioRenderer(identity: .init(rawValue: 1), mediaKind: .compressed)
+        let firstError = NSError(domain: "AudioRenderer.First", code: -84,
+            userInfo: [NSLocalizedDescriptionKey: "渲染器首次原始异常"])
+        let subsequentError = NSError(domain: "AudioRenderer.Later", code: -85,
+            userInfo: [NSLocalizedDescriptionKey: "渲染器后续异常"])
+        let firstEvent = renderer.recordedFailureEvent(firstError)
+        renderer.startObserving { _ in }
+        renderer.stopObserving()
+        renderer.startObserving { _ in }
+        defer { renderer.stopObserving() }
+        let repeatedEvent = renderer.recordedFailureEvent(subsequentError)
+
+        guard case .failedWithDiagnostic(let firstReason, let firstDiagnostic) = firstEvent,
+              case .failedWithDiagnostic(let repeatedReason, let repeatedDiagnostic) = repeatedEvent else {
+            return XCTFail("原生 renderer 首错必须携带有界诊断")
+        }
+        XCTAssertEqual(firstReason, "AudioRenderer.First:-84")
+        XCTAssertEqual(repeatedReason, firstReason)
+        XCTAssertEqual(repeatedDiagnostic, firstDiagnostic)
+        XCTAssertTrue(repeatedDiagnostic.summary.contains("渲染器首次原始异常"))
+        XCTAssertFalse(repeatedDiagnostic.summary.contains("AudioRenderer.Later"))
+        XCTAssertFalse(repeatedDiagnostic.summary.contains("渲染器后续异常"))
+    }
+
+    func testAudioRendererPipelinePreservesKnownFormatFailure() throws {
+        let harness = try makeHarness()
+        harness.decoderFactory.pushBody = { _ in
+            throw PlaybackCoreError.audioFormatDescription(-77)
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: compressed, in: harness, reason: "renderer:-1"
+        )
+        harness.synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
+        drain(harness.executor)
+
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [.audioFormatDescription(-77)])
+    }
+
+    func testAudioRendererPipelinePreservesUnknownErrorDetails() throws {
+        let harness = try makeHarness()
+        harness.decoderFactory.pushBody = { _ in
+            throw NSError(domain: "AudioRenderer.Test", code: -75,
+                userInfo: [NSLocalizedDescriptionKey: "音频回调原始异常"])
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: compressed, in: harness, reason: "renderer:-1"
+        )
+        harness.synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
+        drain(harness.executor)
+
+        let error = try XCTUnwrap(harness.failures.snapshot.first?.error)
+        let failure = PlaybackController.failure(for: error)
+        XCTAssertTrue(failure.userMessage.contains("NSError"))
+        XCTAssertTrue(failure.userMessage.contains("AudioRenderer.Test"))
+        XCTAssertTrue(failure.userMessage.contains("-75"))
+        XCTAssertTrue(failure.userMessage.contains("音频回调原始异常"))
+        XCTAssertEqual(harness.failures.snapshot.count, 1)
+    }
+
+    func testNativeAudioRendererFailureKeepsDiagnosticsAndRecoveryPolicy() throws {
+        let harness = try makeHarness()
+        let nativeError = NSError(domain: "AudioRenderer.Test", code: -83,
+            userInfo: [NSLocalizedDescriptionKey: "系统音频渲染器原始异常"])
+        let nativeEvent = SystemAudioRenderer.failureEvent(nativeError)
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        compressed.emit(nativeEvent)
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        let retry = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(retry.mediaKind, .compressed)
+        retry.emit(nativeEvent)
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 1, didRemove: true)
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(pcm.mediaKind, .linearPCM)
+        pcm.emit(nativeEvent)
+        drain(harness.executor)
+
+        let error = try XCTUnwrap(harness.failures.snapshot.first?.error)
+        let failure = PlaybackController.failure(for: error)
+        XCTAssertTrue(failure.userMessage.contains("NSError"))
+        XCTAssertTrue(failure.userMessage.contains("AudioRenderer.Test"))
+        XCTAssertTrue(failure.userMessage.contains("系统音频渲染器原始异常"))
+        XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.pcmFallbackCount, 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.lastCompressedRendererFailure?.domain, "AudioRenderer.Test")
+        XCTAssertEqual(harness.pipeline.diagnostics.lastCompressedRendererFailure?.code, -83)
+        XCTAssertEqual(harness.failures.snapshot.count, 1)
+    }
+
     func testAutomaticFlushOriginTrackerRetainsOnlyCurrentTicket() {
         var tracker = AudioAutomaticFlushProgressOriginTracker()
         let first = AudioRendererProgressTicket(rawValue: 1)
@@ -5380,6 +5486,35 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
         XCTAssertEqual(sampleCounts, [2, 2, 2])
         XCTAssertEqual(Set(timestamps).count, 3)
+    }
+
+    func testPCMStreamingConsumerFailurePreservesOriginalSystemDiagnostic() throws {
+        let ownership = HLSAudioCopyOwnership(
+            maximumCompressedBytes: 64, maximumPCMBytes: 16, capacity: 1,
+            applicationLedger: HLSDeliveryApplicationChargeLedger()
+        )
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[.stereo(frames: 2)]]
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac, extradata: Data([0x12, 0x10]),
+            api: native, hlsCopyOwnership: ownership
+        )
+        let original = NSError(
+            domain: "PCMConsumer.UnitTest", code: -818,
+            userInfo: [NSLocalizedDescriptionKey: "PCM consumer 原始失败原因"]
+        )
+
+        XCTAssertThrowsError(try decoder.pushStreamingForHLS(makeSample(id: 23)) { _ in
+            throw original
+        }) { error in
+            let shown = String(reflecting: error)
+            XCTAssertTrue(shown.contains("PCMConsumer.UnitTest(-818)"), shown)
+            XCTAssertTrue(shown.contains("PCM consumer 原始失败原因"), shown)
+            XCTAssertTrue(shown.contains("NSError"), shown)
+            XCTAssertTrue(shown.contains("audio.pcm-output"), shown)
+            guard let core = error as? PlaybackCoreError else { return XCTFail("PCM 回调应返回内部具体错误") }
+            XCTAssertEqual(PlaybackController.failure(for: core).retryDisposition, .chooseAnotherChannel)
+        }
     }
 
     func testTask22FADTSMultiFrameAndRemainingCarryKeepIndependentLastHolderCharges() throws {

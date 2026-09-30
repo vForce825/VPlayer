@@ -84,6 +84,23 @@ final class XMLTVParserTests: XCTestCase {
         XCTAssertTrue(sink.programmes.isEmpty)
     }
 
+    func testMalformedXMLPreservesSystemErrorCodeAndSourcePosition() throws {
+        let xml = "<tv>\n<channel id=\"one\"><display-name>News</channel>\n</tv>"
+        let systemParser = XMLParser(data: Data(xml.utf8))
+        XCTAssertFalse(systemParser.parse())
+        let systemError = try XCTUnwrap(systemParser.parserError as NSError?)
+        let sink = CollectingXMLTVSink()
+
+        try withTemporaryXML(xml) { fileURL in
+            XCTAssertThrowsError(try XMLTVParser().parse(fileURL: fileURL, into: sink)) { error in
+                let shown = String(reflecting: error)
+                XCTAssertTrue(shown.contains("NSXMLParserErrorDomain(\(systemError.code))"), shown)
+                XCTAssertTrue(shown.contains("line: \(systemParser.lineNumber)"), shown)
+                XCTAssertTrue(shown.contains("column: \(systemParser.columnNumber)"), shown)
+            }
+        }
+    }
+
     func testParsesUTCAndPositiveOffsetAsTheSameInstant() throws {
         XCTAssertEqual(
             try XMLTVTimeParser().parse("20260718150000 Z"),

@@ -9,9 +9,28 @@ import CryptoKit
 import Foundation
 import UniformTypeIdentifiers
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testSystemWriterStartFailurePreservesOriginalErrorBeforeCancellation() throws {
+        let factory = Task17FakeSystemWriterFactory(
+            failurePoint: .start,
+            diagnosticError: NSError(domain: "AVAssetWriter.Native", code: -11800,
+                userInfo: [NSLocalizedDescriptionKey: "系统 writer 原始失败"]))
+        let writer = try Task17Fixtures.makeWriter(seed: 91_001, kind: .aac,
+            sourceFormatHint: Task17Fixtures.audioFormat(magicCookie: Data([0x11, 0x90])),
+            factory: factory)
+        XCTAssertThrowsError(try writer.start(at: CMTime(value: 10, timescale: 1))) { error in
+            let description = String(reflecting: error)
+            XCTAssertTrue(description.contains("AVAssetWriter.Native"), description)
+            XCTAssertTrue(description.contains("-11800"), description)
+            XCTAssertTrue(description.contains("系统 writer 原始失败"), description)
+        }
+        XCTAssertEqual(factory.lastWriter?.cancelCount, 1)
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .failed)
+    }
+
     func testTrackBundlesUseIndependentOneInputHLSWritersAndRetainDelegate() throws {
         let factory = Task17FakeSystemWriterFactory()
         var writers: [SegmentedFMP4Writer?] = []
@@ -6914,6 +6933,7 @@ private final class Task17FakeSystemWriterFactory: SegmentedFMP4SystemWriterFact
     private let rejectAppendOrdinal: Int?
     private let mediaPayloadByteCount: Int?
     private let mediaWrittenStart: CMTime?
+    private let diagnosticError: NSError?
     private var storedConfigurations: [SegmentedFMP4SystemConfiguration] = []
     private var storedWriters: [Task17WeakSystemWriter] = []
     private var storedSinks: [Task17WeakCallbackSink] = []
@@ -6927,7 +6947,8 @@ private final class Task17FakeSystemWriterFactory: SegmentedFMP4SystemWriterFact
         blocksCancel: Bool = false,
         rejectAppendOrdinal: Int? = nil,
         mediaPayloadByteCount: Int? = nil,
-        mediaWrittenStart: CMTime? = nil
+        mediaWrittenStart: CMTime? = nil,
+        diagnosticError: NSError? = nil
     ) {
         self.failurePoint = failurePoint
         self.defersFinish = defersFinish
@@ -6938,6 +6959,7 @@ private final class Task17FakeSystemWriterFactory: SegmentedFMP4SystemWriterFact
         self.rejectAppendOrdinal = rejectAppendOrdinal
         self.mediaPayloadByteCount = mediaPayloadByteCount
         self.mediaWrittenStart = mediaWrittenStart
+        self.diagnosticError = diagnosticError
     }
 
     var configurations: [SegmentedFMP4SystemConfiguration] {
@@ -6971,6 +6993,7 @@ private final class Task17FakeSystemWriterFactory: SegmentedFMP4SystemWriterFact
             rejectAppendOrdinal: rejectAppendOrdinal,
             mediaPayloadByteCount: mediaPayloadByteCount,
             mediaWrittenStart: mediaWrittenStart,
+            diagnosticError: diagnosticError,
             callbackSink: callbackSink
         )
         lock.withLock {
@@ -6993,6 +7016,7 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
     private let rejectAppendOrdinal: Int?
     private let mediaPayloadByteCount: Int?
     private let mediaWrittenStart: CMTime?
+    private var diagnosticError: NSError?
     private weak var callbackSink: (any SegmentedFMP4SystemCallbackSink)?
     private var deferredMediaCount = 0
     private var initializationIsDeferred = false
@@ -7018,6 +7042,7 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
         rejectAppendOrdinal: Int?,
         mediaPayloadByteCount: Int?,
         mediaWrittenStart: CMTime?,
+        diagnosticError: NSError?,
         callbackSink: any SegmentedFMP4SystemCallbackSink
     ) {
         self.failurePoint = failurePoint
@@ -7029,6 +7054,7 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
         self.rejectAppendOrdinal = rejectAppendOrdinal
         self.mediaPayloadByteCount = mediaPayloadByteCount
         self.mediaWrittenStart = mediaWrittenStart
+        self.diagnosticError = diagnosticError
         self.callbackSink = callbackSink
     }
 
@@ -7105,11 +7131,18 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
     }
 
     func cancelWriting() {
-        lock.withLock { storedCalls.append(.cancel) }
+        lock.withLock {
+            storedCalls.append(.cancel)
+            diagnosticError = nil
+        }
         if blocksCancel {
             cancelEntered.signal()
             _ = cancelRelease.wait(timeout: .now() + 2)
         }
+    }
+
+    var failureDiagnostic: ErrorDiagnosticSnapshot? {
+        lock.withLock { diagnosticError.map(ErrorDiagnosticSnapshot.init) }
     }
 
     func completeFinish(success: Bool) {

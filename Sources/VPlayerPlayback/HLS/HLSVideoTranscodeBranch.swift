@@ -7,6 +7,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import IOSurface
+import VPlayerCore
 
 enum HLSVideoTranscodeBranchFailure: Error, Sendable, Equatable {
     case batchCapacityExceeded(required: Int, available: Int)
@@ -1022,7 +1023,7 @@ final class HLSVideoBranch: @unchecked Sendable {
         let transcodeGeneration = transcodeBranch.generation
         transcodeBranch.installTerminalFailureSink { [weak self] failure in
             self?.fail(
-                .metalCommand("hls.atomicEncoding.branch.\(failure)"),
+                .capture(failure, stage: "video.hlsTranscode"),
                 transcodeGeneration
             )
         }
@@ -1905,7 +1906,8 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
                     workQueue.async { [self] in failIsolated(failure) }
                     return .rejected(failure)
                 } catch {
-                    let failure = HLSVideoTranscodeBranchFailure.invalidFrame(.arithmeticOverflow)
+                    let failure = HLSVideoTranscodeBranchFailure.invalidFrame(
+                        .unexpected(PlaybackErrorDiagnostics.snapshot(error)))
                     acceptsSubmissions = false
                     workQueue.async { [self] in failIsolated(failure) }
                     return .rejected(failure)
@@ -1980,7 +1982,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             failIsolated(failure)
             return
         } catch {
-            failIsolated(.invalidFrame(.invalidPixelBuffer))
+            failIsolated(.invalidFrame(.unexpected(PlaybackErrorDiagnostics.snapshot(error))))
             return
         }
 
@@ -2000,7 +2002,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             failIsolated(.invalidFrame(failure))
             return
         } catch {
-            failIsolated(.invalidFrame(.arithmeticOverflow))
+            failIsolated(.invalidFrame(.unexpected(PlaybackErrorDiagnostics.snapshot(error))))
             return
         }
 
@@ -2075,7 +2077,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         } catch {
             nextGapFillReference?.reservoir.close()
             for lease in leases { lease.release() }
-            failIsolated(.invalidFrame(.invalidPixelBuffer))
+            failIsolated(.invalidFrame(.unexpected(PlaybackErrorDiagnostics.snapshot(error))))
             return
         }
 
@@ -2087,7 +2089,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             return
         } catch {
             nextGapFillReference?.reservoir.close()
-            failIsolated(.invalidFrame(.arithmeticOverflow))
+            failIsolated(.invalidFrame(.unexpected(PlaybackErrorDiagnostics.snapshot(error))))
             return
         }
         gapFillReference = nextGapFillReference

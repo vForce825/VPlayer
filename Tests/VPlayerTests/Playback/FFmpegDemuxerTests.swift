@@ -654,11 +654,11 @@ final class FFmpegDemuxerTests: XCTestCase {
 
     func testCErrorKindsMapOnlyToInternalPlaybackCoreErrors() throws {
         let cases: [(VPFFDemuxErrorKind, Int32, PlaybackCoreError)] = [
-            (VPFF_DEMUX_ERROR_OPEN, -10, .demuxOpen(-10)),
-            (VPFF_DEMUX_ERROR_READ, -11, .demuxRead(-11)),
-            (VPFF_DEMUX_ERROR_TIMEOUT, -12, .networkTimeout),
-            (VPFF_DEMUX_ERROR_UNSUPPORTED_VIDEO, -13, .unsupportedVideoCodec),
-            (VPFF_DEMUX_ERROR_UNSUPPORTED_AUDIO, -14, .unsupportedAudioCodec),
+            (VPFF_DEMUX_ERROR_OPEN, -10, .ffmpegFailure(kind: .open, stage: .read, status: -10)),
+            (VPFF_DEMUX_ERROR_READ, -11, .ffmpegFailure(kind: .read, stage: .read, status: -11)),
+            (VPFF_DEMUX_ERROR_TIMEOUT, -12, .ffmpegFailure(kind: .timeout, stage: .read, status: -12)),
+            (VPFF_DEMUX_ERROR_UNSUPPORTED_VIDEO, -13, .ffmpegFailure(kind: .unsupportedVideo, stage: .read, status: -13)),
+            (VPFF_DEMUX_ERROR_UNSUPPORTED_AUDIO, -14, .ffmpegFailure(kind: .unsupportedAudio, stage: .read, status: -14)),
         ]
         for entry in cases {
             let bridge = FakeFFmpegDemuxBridge { handle in
@@ -666,6 +666,50 @@ final class FFmpegDemuxerTests: XCTestCase {
                 return entry.1
             }
             XCTAssertEqual(try run(bridge: bridge).last, .failure(entry.2))
+        }
+    }
+
+    func testFFmpegFailuresExposeTheirActualStageAndReturnCode() throws {
+        let cases: [(VPFFDemuxErrorKind, VPFFDemuxErrorStage, String, Int32)] = [
+            (VPFF_DEMUX_ERROR_OPEN, VPFF_DEMUX_STAGE_OPEN, "打开", -401),
+            (VPFF_DEMUX_ERROR_OPEN, VPFF_DEMUX_STAGE_STREAM_INFO, "流信息", -402),
+            (VPFF_DEMUX_ERROR_READ, VPFF_DEMUX_STAGE_BSF_RECEIVE, "接收", -403),
+            (VPFF_DEMUX_ERROR_TIMEOUT, VPFF_DEMUX_STAGE_READ, "读取", -404),
+        ]
+        var messages: [String] = []
+        for (kind, stage, name, code) in cases {
+            let bridge = FakeFFmpegDemuxBridge { handle in
+                handle.emitTerminal(VPFF_EVENT_ERROR, errorKind: kind, ffmpegError: code, errorStage: stage)
+                return code
+            }
+            guard case let .failure(error)? = try run(bridge: bridge).last else {
+                return XCTFail("FFmpeg 错误必须保留到播放终态")
+            }
+            let failure = PlaybackController.failure(for: error)
+            XCTAssertTrue(failure.userMessage.contains(name), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains(String(code)), failure.userMessage)
+            messages.append(failure.userMessage)
+        }
+        XCTAssertEqual(Set(messages).count, 4)
+    }
+
+    func testUnsupportedCodecFailuresKeepSelectionVersusRuntimeStageAndStatus() throws {
+        for kind in [VPFF_DEMUX_ERROR_UNSUPPORTED_VIDEO, VPFF_DEMUX_ERROR_UNSUPPORTED_AUDIO] {
+            var messages: [String] = []
+            for stage in [VPFF_DEMUX_STAGE_SELECTION, VPFF_DEMUX_STAGE_READ] {
+                let bridge = FakeFFmpegDemuxBridge { handle in
+                    handle.emitTerminal(VPFF_EVENT_ERROR, errorKind: kind, ffmpegError: -405, errorStage: stage)
+                    return -405
+                }
+                guard case .failure(let failure) = try XCTUnwrap(try run(bridge: bridge).last) else {
+                    return XCTFail("不支持的编码必须形成具体错误")
+                }
+                let mapped = PlaybackController.failure(for: failure)
+                XCTAssertTrue(mapped.userMessage.contains("-405"), mapped.userMessage)
+                XCTAssertEqual(mapped.retryDisposition, .chooseAnotherChannel)
+                messages.append(mapped.userMessage)
+            }
+            XCTAssertNotEqual(messages[0], messages[1], "轨道选择与运行中变更必须能区分")
         }
     }
 

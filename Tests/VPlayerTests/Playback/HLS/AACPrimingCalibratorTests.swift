@@ -10,6 +10,23 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AACPrimingCalibratorTests: XCTestCase {
+    func testForeignStreamFailureRetainsOriginalTerminalReason() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        encoder.markVisible()
+        XCTAssertThrowsError(try encoder.encodeStream(nextPCM: {
+            throw NSError(domain: "AAC.Upstream", code: -77,
+                userInfo: [NSLocalizedDescriptionKey: "上游 PCM 首次读取失败"])
+        }, append: { _ in XCTFail("上游失败后不能发布音频") }))
+        let description = String(reflecting: try XCTUnwrap(encoder.terminalFailure))
+        XCTAssertTrue(description.contains("AAC.Upstream"), description)
+        XCTAssertTrue(description.contains("-77"), description)
+        XCTAssertTrue(description.contains("上游 PCM 首次读取失败"), description)
+        XCTAssertFalse(encoder.mayPublishTailOrEndList)
+        XCTAssertEqual(harness.calibrator.presentationTerminal.publicationCount, 1)
+    }
+
     func testHLSRawSystemDecodePreservesEveryAUAndMeasuresChangedPrefix() async throws {
         let reference = AACPrimingCalibratorTestHarness.indexedSignal(start: 0, frames: 4_096, channels: 1)
         var baseline: Int?

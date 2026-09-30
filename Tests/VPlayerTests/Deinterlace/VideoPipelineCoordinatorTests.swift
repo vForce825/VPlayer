@@ -1486,7 +1486,7 @@ final class VideoPipelineCoordinatorTests: XCTestCase {
             generation: generation
         ))
 
-        XCTAssertEqual(harness.host.failures.map(\.0), [.videoDecode(-81)])
+        XCTAssertEqual(harness.host.failures.map(\.0), [.videoDecoderFailure(.sessionCreate(-81))])
         XCTAssertEqual(harness.host.failures.map(\.1), [generation])
     }
 
