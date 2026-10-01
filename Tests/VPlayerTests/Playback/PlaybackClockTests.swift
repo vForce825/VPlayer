@@ -4,10 +4,125 @@
 
 import AVFoundation
 import CoreMedia
+import Foundation
 import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackClockTests: XCTestCase {
+    @MainActor
+    func testSimulatorOutputAuthorizationPreservesScheduledSDKStart() async throws {
+#if targetEnvironment(simulator)
+        // 只检查真实 SDK 的时钟语义；无 renderer、无媒体、无 HDMI 延迟测量。
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        let clock = RenderSynchronizerClock(synchronizer: synchronizer)
+        let hostClock = CMClockGetHostTimeClock()
+        let beginHostTime = CMClockGetTime(hostClock)
+        let futureHostTime = CMTimeAdd(beginHostTime, CMTime(value: 500, timescale: 1_000))
+        let anchorMediaTime = CMTime(value: 10, timescale: 1)
+        clock.anchor(mediaTime: anchorMediaTime, atHostTime: futureHostTime, rate: 0)
+        clock.setRate(1)
+        defer { clock.pause() }
+
+        var samples: [(label: String, host: CMTime, media: CMTime)] = []
+        func sample(_ label: String) {
+            samples.append((label, CMClockGetTime(hostClock), clock.currentTime))
+        }
+        sample("立即")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        sample("约100ms")
+        try await Task.sleep(nanoseconds: 500_000_000)
+        sample("约600ms")
+        for value in samples {
+            print(String(format: "SDK时钟探针 %@：实际host经过=%.6fs，媒体时间=%.6fs，速率=%.1f",
+                value.label, CMTimeSubtract(value.host, beginHostTime).seconds,
+                value.media.seconds, synchronizer.rate))
+        }
+        let last = try XCTUnwrap(samples.last)
+        XCTAssertTrue(last.media.isNumeric && last.media.seconds.isFinite)
+        let expectedWithLead = anchorMediaTime.seconds + CMTimeSubtract(last.host, futureHostTime).seconds
+        let difference = last.media.seconds - expectedWithLead
+        XCTAssertEqual(difference, 0, accuracy: 0.1,
+                       "启用输出必须保留未来启动时刻，不能提前开始媒体时钟")
+        print(String(format: "SDK时钟验证：相对预定启动轨迹的差值=%.6fs", difference))
+#else
+        throw XCTSkip("SDK时钟探针只允许在模拟器运行")
+#endif
+    }
+
+    func testOutputAuthorizationPreservesPendingAnchorMediaAndFutureHostTime() throws {
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        var anchors: [(CMTime, CMTime, Float)] = []
+        let clock = RenderSynchronizerClock(
+            synchronizer: synchronizer,
+            currentTime: { .zero },
+            pause: {},
+            anchor: { anchors.append(($0, $1, $2)) },
+            hostTime: { .zero }
+        )
+        let mediaTime = CMTime(value: 10, timescale: 1)
+        let futureHostTime = CMTime(value: 500, timescale: 1_000)
+        clock.anchor(mediaTime: mediaTime, atHostTime: futureHostTime, rate: 0)
+        clock.setRate(1)
+
+        XCTAssertEqual(anchors.count, 2)
+        let authorized = try XCTUnwrap(anchors.last)
+        XCTAssertEqual(authorized.0, mediaTime)
+        XCTAssertEqual(authorized.1, futureHostTime)
+        XCTAssertEqual(authorized.2, 1)
+
+        // 后续调速不能重新回到起播锚点。
+        clock.setRate(2)
+        XCTAssertEqual(anchors.count, 2)
+    }
+
+    func testPausingOutputCancelsPendingStartAnchorBeforeNextAuthorization() {
+        for useZeroRate in [false, true] {
+            let synchronizer = AVSampleBufferRenderSynchronizer()
+            var anchors: [(CMTime, CMTime, Float)] = []
+            let clock = RenderSynchronizerClock(
+                synchronizer: synchronizer,
+                currentTime: { .zero },
+                pause: {},
+                anchor: { anchors.append(($0, $1, $2)) }
+            )
+            clock.anchor(mediaTime: .zero, atHostTime: .zero, rate: 0)
+            if useZeroRate {
+                clock.setRate(0)
+            } else {
+                clock.pause()
+            }
+            clock.setRate(1)
+
+            XCTAssertEqual(anchors.count, 1)
+        }
+    }
+
+    func testDelayedOutputAuthorizationReschedulesExpiredStartWithOriginalLead() throws {
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        var anchors: [(CMTime, CMTime, Float)] = []
+        var hostTime = CMTime.zero
+        let clock = RenderSynchronizerClock(
+            synchronizer: synchronizer,
+            currentTime: { .zero },
+            pause: {},
+            anchor: { anchors.append(($0, $1, $2)) },
+            hostTime: { hostTime }
+        )
+        clock.anchor(
+            mediaTime: CMTime(value: 10, timescale: 1),
+            atHostTime: CMTime(value: 500, timescale: 1_000),
+            rate: 0
+        )
+        hostTime = CMTime(value: 1, timescale: 1)
+        clock.setRate(1)
+
+        let authorized = try XCTUnwrap(anchors.last)
+        XCTAssertEqual(authorized.0, CMTime(value: 10, timescale: 1))
+        XCTAssertEqual(authorized.1, CMTime(value: 1_500, timescale: 1_000))
+        XCTAssertEqual(authorized.2, 1)
+    }
+
     func testPublicReadinessInitializerAcceptsOriginalVoidPrepareAnchorClosure() {
         let clock = FakePlaybackClock()
         var prepared: [CMTime] = []

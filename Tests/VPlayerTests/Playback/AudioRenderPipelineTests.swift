@@ -2661,6 +2661,123 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.route, .systemCompressed)
     }
 
+    func testAutomaticFlushBackpressureSkipsExpiredAC3WhenSharedClockAdvances() throws {
+        for flushCount in 1...2 {
+            let harness = try makeHarness(
+                codec: .ac3,
+                initialRouteCategory: .hdmi,
+                clockMode: .externallyManaged
+            )
+            let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+            renderer.configureReadiness(ready: true, sufficient: true)
+            for index in 0..<4 {
+                try perform(on: harness.executor) {
+                    try harness.pipeline.enqueue(try self.makeSample(
+                        id: UInt64(index + 1),
+                        codec: .ac3,
+                        pts: CMTime(value: Int64(index * 32), timescale: 1_000),
+                        duration: CMTime(value: 32, timescale: 1_000)
+                    ))
+                }
+            }
+            try perform(on: harness.executor) {
+                harness.pipeline.setSharedTimelineOpened(true)
+            }
+            harness.synchronizer.setCurrentTime(CMTime(value: 16, timescale: 1_000))
+            renderer.configureReadiness(ready: false)
+            for _ in 0..<flushCount {
+                renderer.emit(.automaticFlush(.zero))
+                drain(harness.executor)
+            }
+            XCTAssertTrue(renderer.snapshot.pendingPTS.isEmpty)
+
+            // 视频和共享时钟在音频输出阻塞时继续前进，边界上已结束的帧也不能晚送。
+            harness.synchronizer.setCurrentTime(CMTime(value: 64, timescale: 1_000))
+            renderer.configureReadiness(ready: true, sufficient: true)
+            renderer.fireReady()
+            drain(harness.executor)
+
+            XCTAssertEqual(renderer.snapshot.pendingPTS, [
+                CMTime(value: 64, timescale: 1_000),
+                CMTime(value: 96, timescale: 1_000),
+            ])
+            XCTAssertEqual(harness.pipeline.recoveryCount, UInt64(flushCount))
+            XCTAssertTrue(harness.synchronizer.rateSnapshot.isEmpty)
+            XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        }
+    }
+
+    func testLiveRecoveryKeepsExpiredAnchorHistoryWithoutSendingItToAudioOutput() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            harness.pipeline.updateRecoveryFloor(CMTime(value: 1, timescale: 2))
+            for index in 0..<3 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTime(value: Int64(index), timescale: 1),
+                    duration: CMTime(value: 1, timescale: 1)
+                ))
+            }
+            harness.pipeline.setSharedTimelineOpened(true)
+        }
+        harness.synchronizer.setCurrentTime(CMTime(value: 2, timescale: 1))
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.pendingPTS, [CMTime(value: 2, timescale: 1)])
+        try perform(on: harness.executor) {
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1, 3])
+            harness.pipeline.setSharedTimelineOpened(false)
+            harness.synchronizer.setCurrentTime(.zero)
+            try harness.pipeline.prepareAnchor(
+                at: CMTime(value: 1, timescale: 2),
+                in: AudioContinuityIslandID(rawValue: 1)
+            )
+        }
+        XCTAssertEqual(renderer.snapshot.pendingPTS, [.zero, CMTime(value: 2, timescale: 1)])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testNormalLateCompressedInputIsStillSubmittedWithoutRecovery() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        try perform(on: harness.executor) {
+            harness.pipeline.setSharedTimelineOpened(true)
+            harness.synchronizer.setCurrentTime(CMTime(value: 33, timescale: 1_000))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: .zero,
+                duration: CMTime(value: 32, timescale: 1_000)
+            ))
+        }
+        XCTAssertEqual(renderer.snapshot.pendingPTS, [.zero])
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testClosedSharedTimelinePreservesCompressedPrerollBeforeReanchor() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1, pts: .zero, duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        // 旧时钟位置不能裁掉新播放尚未重锚的起播音频。
+        harness.synchronizer.setCurrentTime(CMTime(value: 10, timescale: 1))
+        renderer.configureReadiness(ready: true, sufficient: true)
+        renderer.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(renderer.snapshot.pendingPTS, [.zero])
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
     func testOutputConfigurationCorrelatedWithAutomaticFlushDoesNotReplayBeforeProgressDeadline() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)

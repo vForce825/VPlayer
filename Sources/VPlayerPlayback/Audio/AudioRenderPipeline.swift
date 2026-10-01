@@ -168,6 +168,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         var sentCompressed: Bool
         var decoded: Bool
         var acceptedCompressed: Bool
+        var discardIfExpiredDuringRecovery = false
     }
 
     private struct ReplayRetentionPlan {
@@ -556,6 +557,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         for index in replay.indices {
             replay[index].sentCompressed = false
             replay[index].decoded = false
+            replay[index].discardIfExpiredDuringRecovery = false
         }
         needsDecoderResetBeforeNextCompressedEnqueue = true
         driveRenderer()
@@ -1400,6 +1402,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         for index in replay.indices {
             replay[index].sentCompressed = false
             replay[index].decoded = false
+            replay[index].discardIfExpiredDuringRecovery = true
         }
         needsDecoderResetBeforeNextCompressedEnqueue = true
         pendingPCM.removeAll(keepingCapacity: false)
@@ -1772,6 +1775,19 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
               renderer.mediaKind == .compressed,
               rendererAttached, !replacing, !terminal else { return }
         while let index = replay.firstIndex(where: { !$0.sentCompressed }) {
+            // 恢复受阻期间共享时钟仍会前进，ready 回调不能补送已经结束的音频。
+            // 保留重锚所需的历史，只将过期帧标为本轮已处理；prepareAnchor 会重新放行。
+            // 起播尚未重锚时不能使用旧时钟位置裁剪 preroll。
+            if clockMode == .externallyManaged, sharedTimelineOpened,
+               replay[index].discardIfExpiredDuringRecovery,
+               let interval = replayInterval(of: replay[index]) {
+                let currentTime = synchronizer.currentTime()
+                if currentTime.isNumeric, CMTimeCompare(interval.end, currentTime) <= 0 {
+                    replay[index].sentCompressed = true
+                    replay[index].discardIfExpiredDuringRecovery = false
+                    continue
+                }
+            }
             let sample = replay[index].sample
             let needsDecoderReset = needsDecoderResetBeforeNextCompressedEnqueue
             let sampleBuffer = if needsDecoderReset {
@@ -1791,6 +1807,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 needsDecoderResetBeforeNextCompressedEnqueue = false
             }
             replay[index].sentCompressed = true
+            replay[index].discardIfExpiredDuringRecovery = false
             if !replay[index].acceptedCompressed {
                 replay[index].acceptedCompressed = true
                 recordCompressedPreroll(sample)
