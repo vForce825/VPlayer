@@ -37,7 +37,8 @@ final class ScriptedFFmpegParserFactory: FFmpegParserFactory {
     ) throws -> any FFmpegParserHandle {
         configurations.append(configuration)
         let handle = ScriptedFFmpegParserHandle(
-            factory: self,
+            pushScript: pushScript,
+            drainScript: drainScript,
             handleIndex: handles.count,
             receiver: receiver
         )
@@ -47,7 +48,8 @@ final class ScriptedFFmpegParserFactory: FFmpegParserFactory {
 }
 
 final class ScriptedFFmpegParserHandle: FFmpegParserHandle {
-    private let factory: ScriptedFFmpegParserFactory
+    private let pushScript: ScriptedFFmpegParserFactory.PushScript
+    private let drainScript: ScriptedFFmpegParserFactory.DrainScript
     private let receiver: (FFmpegParsedFrame) throws -> Void
     let handleIndex: Int
     private(set) var pushCount = 0
@@ -55,11 +57,13 @@ final class ScriptedFFmpegParserHandle: FFmpegParserHandle {
     private(set) var destroyCount = 0
 
     init(
-        factory: ScriptedFFmpegParserFactory,
+        pushScript: @escaping ScriptedFFmpegParserFactory.PushScript,
+        drainScript: @escaping ScriptedFFmpegParserFactory.DrainScript,
         handleIndex: Int,
         receiver: @escaping (FFmpegParsedFrame) throws -> Void
     ) {
-        self.factory = factory
+        self.pushScript = pushScript
+        self.drainScript = drainScript
         self.handleIndex = handleIndex
         self.receiver = receiver
     }
@@ -67,13 +71,13 @@ final class ScriptedFFmpegParserHandle: FFmpegParserHandle {
     func push(_ bytes: Data, pts: Int64?, dts: Int64?, duration: Int64?) throws {
         let index = pushCount
         pushCount += 1
-        try factory.pushScript(self, index, bytes, pts, dts, duration)
+        try pushScript(self, index, bytes, pts, dts, duration)
     }
 
     func drain() throws {
         let index = drainCount
         drainCount += 1
-        try factory.drainScript(self, index)
+        try drainScript(self, index)
     }
 
     func destroy() {

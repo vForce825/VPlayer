@@ -9,6 +9,50 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class CompressedAudioAssemblerTests: XCTestCase {
+    func testScriptedParserHandleKeepsScriptsWithoutRetainingFactory() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(codec: .ac3, extradata: Data())
+        weak var releasedFactory: ScriptedFFmpegParserFactory?
+        var retainedHandle: ScriptedFFmpegParserHandle?
+        do {
+            let factory = ScriptedFFmpegParserFactory(
+                pushScript: { _, _, _, _, _, _ in
+                    throw PlaybackCoreError.audioFormatDescription(-1_234)
+                },
+                drainScript: { _, _ in throw PlaybackCoreError.audioFallbackDecode(-5_678) }
+            )
+            releasedFactory = factory
+            _ = try factory.makeParser(
+                configuration: FFmpegParserConfiguration(audio: try XCTUnwrap(tracks.audio)),
+                receiver: { _ in }
+            )
+            retainedHandle = try XCTUnwrap(factory.handles.first)
+        }
+        XCTAssertNil(releasedFactory, "外部 handle 可继续使用脚本，但不能阻止 factory 释放")
+        let handle = try XCTUnwrap(retainedHandle)
+        XCTAssertThrowsError(try handle.push(Data([0x01]), pts: 0, dts: nil, duration: nil)) {
+            XCTAssertEqual($0 as? PlaybackCoreError, .audioFormatDescription(-1_234))
+        }
+        XCTAssertThrowsError(try handle.drain()) {
+            XCTAssertEqual($0 as? PlaybackCoreError, .audioFallbackDecode(-5_678))
+        }
+    }
+
+    func testAC3WriterFixtureReleasesCoordinatorAndApplicationChargeAfterScope() throws {
+        let ledger = PlaybackApplicationChargeLedger.shared
+        let baseline = ledger.chargedBytes
+        weak var releasedHarness: Task17AC3Harness?
+        weak var releasedCoordinator: AudioServiceSemanticCoordinator?
+        do {
+            let harness = try Task17AC3Harness(seed: 94_001)
+            releasedHarness = harness
+            releasedCoordinator = harness.coordinator
+            _ = try harness.makeAccessUnit(presentationTimeStamp: .zero)
+        }
+        XCTAssertNil(releasedHarness, "parser 脚本不能在 fixture scope 结束后保留 harness")
+        XCTAssertNil(releasedCoordinator, "scope 结束后应释放 coordinator 及其固定预付额度")
+        XCTAssertEqual(ledger.chargedBytes, baseline, "下一测试必须可以复用 application 容量")
+    }
+
     func testGenerationRebindDropsLateAudioParserCallbackAndRebuildsAtNextPush() throws {
         let codec = VPlayerPlayback.AudioCodec.mp3
         let payload = AssemblerTestFixtures.syntheticMPEGFrame(codec: codec)

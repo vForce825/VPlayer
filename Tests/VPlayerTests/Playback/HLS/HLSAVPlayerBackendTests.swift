@@ -266,11 +266,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
 
     func testProductionProgressiveGraphPublishesSixSecondLoopbackPrefixAndRetires()
         async throws {
-        let rawBase = ProcessInfo.processInfo.environment[
-            "VPLAYER_TASK22_FIXTURE_BASE_URL"
-        ] ?? "http://127.0.0.1:19022"
-        let base = try XCTUnwrap(URL(string: rawBase))
-        let source = base.appending(path: "task22-progressive-h264-aac-16s.ts")
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let source = fixture.source
         let lifecycle = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_001)
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
         let assembler = HLSMediaGraphAssembler(
@@ -299,13 +297,17 @@ final class HLSAVPlayerBackendTests: XCTestCase {
 
     func testProductionProgressiveGraphPublishesFifteenSecondEOFAndRetires()
         async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-15.4s-eof.ts")
+        defer { fixture.server?.stop() }
         try await assertProductionFixtureSucceeds(
-            named: "task22-progressive-h264-aac-15.4s-eof.ts",
+            source: fixture.source,
             outputNonce: 22_002)
     }
 
     func testProductionShortFixtureRejectsPrefixAndRetiresWithoutItem() async throws {
-        let source = fixtureURL(named: "task22-progressive-h264-aac-0.8s-short.ts")
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-0.8s-short.ts")
+        defer { fixture.server?.stop() }
+        let source = fixture.source
         let lifecycle = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_003)
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
         let assembler = HLSMediaGraphAssembler(
@@ -326,18 +328,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
 
     func testProductionInterlacedGraphUsesYADIF2xAndFailsClosedWithoutHardwareEncoder()
         async throws {
-        #if targetEnvironment(simulator)
-        let source = fixtureURL(named: "task22-interlaced-h264-mp2-16s.ts")
-        #else
-        let bundledSource = try XCTUnwrap(
-            Bundle(for: Self.self).url(
-                forResource: "task22-interlaced-h264-mp2-16s",
-                withExtension: "ts"),
-            "真机测试包缺少 16 秒隔行媒体 fixture")
-        let fixtureServer = try Task22BundledHTTPFixtureServer(fileURL: bundledSource)
-        defer { fixtureServer.stop() }
-        let source = fixtureServer.sourceURL
-        #endif
+        let fixture = try makeProductionFixture(named: "task22-interlaced-h264-mp2-16s.ts")
+        defer { fixture.server?.stop() }
+        let source = fixture.source
         let lifecycle = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_004)
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
         let assembler = HLSMediaGraphAssembler(
@@ -391,9 +384,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     }
 
     private func assertProductionFixtureSucceeds(
-        named name: String, outputNonce: UInt64
+        source: URL, outputNonce: UInt64
     ) async throws {
-        let source = fixtureURL(named: name)
         let lifecycle = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: outputNonce)
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
         let assembler = HLSMediaGraphAssembler(
@@ -418,11 +410,20 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertEqual(assembler.currentPhase, .retired)
     }
 
-    private func fixtureURL(named name: String) -> URL {
-        let rawBase = ProcessInfo.processInfo.environment[
+    private func makeProductionFixture(
+        named name: String
+    ) throws -> (source: URL, server: Task22BundledHTTPFixtureServer?) {
+        if let rawBase = ProcessInfo.processInfo.environment[
             "VPLAYER_TASK22_FIXTURE_BASE_URL"
-        ] ?? "http://127.0.0.1:19022"
-        return URL(string: rawBase)!.appending(path: name)
+        ] {
+            let base = try XCTUnwrap(URL(string: rawBase), "Task22 fixture 基础 URL 无效")
+            return (base.appending(path: name), nil)
+        }
+        let bundledSource = try XCTUnwrap(
+            Bundle(for: Self.self).url(forResource: name, withExtension: nil),
+            "测试包缺少生产媒体图 fixture：\(name)")
+        let server = try Task22BundledHTTPFixtureServer(fileURL: bundledSource)
+        return (server.sourceURL, server)
     }
 }
 
@@ -452,9 +453,8 @@ private final class EmptyHLSFailureDemuxHandle: FFmpegDemuxHandle, @unchecked Se
     func destroy() {}
 }
 
-#if !targetEnvironment(simulator)
-/// 真机上的 source 仍必须走生产 HTTP 输入合同；测试服务只把测试包内的固定 TS 暴露到
-/// 本机 loopback，避免把 Mac 局域网、IPv6 路由或设备休眠状态混入 Metal/VT 验收。
+/// 生产媒体图测试走生产 HTTP 输入合同；测试服务只把测试包内的固定 TS 暴露到
+/// 本机随机 loopback 端口，保证模拟器和真机都具备相同的输入服务前提。
 private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "org.vplayer.tests.task22-fixture-http")
@@ -507,11 +507,10 @@ private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
             throw NSError(
                 domain: "Task22BundledHTTPFixtureServer",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "真机 loopback fixture 服务启动失败"])
+                userInfo: [NSLocalizedDescriptionKey: "loopback fixture 服务启动失败"])
         }
         sourceURL = url
     }
 
     func stop() { listener.cancel() }
 }
-#endif
