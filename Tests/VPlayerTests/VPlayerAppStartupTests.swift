@@ -164,6 +164,58 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
     }
 
+    func testLastLogoDownloadWaiterCancellationReleasesSlotAndTemporaryFile() async throws {
+        let downloadsDirectory = temporaryLogoDownloadsDirectory()
+        defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
+        let loader = logoDataLoader(downloadsDirectory: downloadsDirectory)
+        let urls = (0..<5).map {
+            URL(string: "https://images.example/queued-\($0).png")!
+        }
+        for _ in 0..<4 {
+            StubURLProtocol.enqueue(.init(
+                chunks: [Data("partial".utf8)],
+                completes: false,
+                callbackDelay: 0.02
+            ))
+        }
+        StubURLProtocol.enqueue(.init(chunks: [Data("logo".utf8)]))
+        let firstFour = urls.prefix(4).map { url in
+            Task { await loader.data(for: url, maximumByteCount: 16) }
+        }
+        let fourStarted = await waitForLogoRequestCount(4)
+        guard fourStarted else {
+            firstFour.forEach { $0.cancel() }
+            XCTFail("四个下载应占满默认并发槽")
+            return
+        }
+        let fifth = Task { await loader.data(for: urls[4], maximumByteCount: 16) }
+        try await Task.sleep(for: .milliseconds(50))
+        let requestsBeforeCancellation = StubURLProtocol.requests.count
+
+        firstFour[0].cancel()
+        let cancelledData = await firstFour[0].value
+        let fifthStarted = await waitForLogoRequestCount(5)
+        let fifthData: Data?
+        if fifthStarted {
+            fifthData = await fifth.value
+        } else {
+            fifth.cancel()
+            fifthData = nil
+        }
+        for task in firstFour.dropFirst() {
+            task.cancel()
+            _ = await task.value
+        }
+        let filesRemoved = await waitForLogoDownloadDirectoryToEmpty(downloadsDirectory)
+
+        XCTAssertEqual(requestsBeforeCancellation, 4)
+        XCTAssertNil(cancelledData)
+        XCTAssertTrue(fifthStarted)
+        XCTAssertEqual(fifthData, Data("logo".utf8))
+        XCTAssertTrue(filesRemoved)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+    }
+
     func testChannelLogoCacheDecodesAwayFromMainThreadWhenCalledOnMainActor() async throws {
         XCTAssertTrue(Thread.isMainThread)
         let cacheDirectory = temporaryLogoCacheDirectory()
@@ -317,6 +369,23 @@ final class VPlayerAppStartupTests: XCTestCase {
         while StubURLProtocol.stopLoadingCount == 0, Date() < deadline {
             await Task.yield()
         }
+    }
+
+    private func waitForLogoRequestCount(_ count: Int) async -> Bool {
+        for _ in 0..<200 {
+            if StubURLProtocol.requests.count >= count { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    private func waitForLogoDownloadDirectoryToEmpty(_ directory: URL) async -> Bool {
+        for _ in 0..<200 {
+            let files = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+            if files?.isEmpty == true { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
     }
 
     func testAcceptanceLaunchIsExactDebugOnlyAndNeverSelectsTheFixtureEngine() {

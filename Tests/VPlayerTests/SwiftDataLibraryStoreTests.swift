@@ -9,6 +9,138 @@ import XCTest
 
 @MainActor
 final class SwiftDataLibraryStoreTests: XCTestCase {
+    func testChannelQueryPreservesOrderAndStableIdentityAcrossReadBatches() async throws {
+        let (container, writer) = try makeStore()
+        let profile = try await writer.createProfile(input(name: "Home"), now: date(10))
+        let expected = (0..<513).map { index in
+            Channel(
+                sourceProfileID: profile.id,
+                displayName: "频道 \(index)",
+                streamURL: URL(string: "https://stream.example/batched/\(index)")!,
+                tvgID: "guide-\(index)",
+                tvgName: nil,
+                logoURL: nil,
+                groupTitle: "分组 \(index % 3)",
+                attributes: ["number": "\(index)"],
+                order: index % 7
+            )
+        }.sorted { ($0.order, $0.id) < ($1.order, $1.id) }
+        try await writer.installPlaylist(
+            profileID: profile.id,
+            channels: Array(expected.reversed()),
+            fetchedAt: date(20)
+        )
+        let other = try await writer.createProfile(input(name: "Other"), now: date(30))
+        try await writer.installPlaylist(
+            profileID: other.id,
+            channels: [channel(profileID: other.id, name: "其他源", path: "other")],
+            fetchedAt: date(40)
+        )
+
+        // 使用全新读取上下文，避免安装时已注册的模型掩盖读取行为。
+        let reader = SwiftDataLibraryStore(modelContainer: container)
+        let actual = try await reader.channels(profileID: profile.id)
+
+        XCTAssertEqual(actual, expected, "跨读取批次不能漏行、重复或改变同序号频道的稳定顺序")
+    }
+
+    func testEPGQueriesPreserveLexicalIDsOverlapAndPerChannelOrderAcrossReadBatches() async throws {
+        let (container, writer) = try makeStore()
+        let profile = try await writer.createProfile(input(name: "Home"), now: date(10))
+        let snapshotID = UUID()
+        let otherSnapshotID = UUID()
+        let context = ModelContext(container)
+        let profileID = profile.id
+        let profileRecord = try XCTUnwrap(try context.fetch(
+            FetchDescriptor<SourceProfileRecord>(predicate: #Predicate { $0.id == profileID })
+        ).first)
+        profileRecord.epgSnapshotID = snapshotID
+        let identifiers = ["10", "2", "A", "a", "ä", "中"]
+            + (0..<513).map { "guide-\($0)" }
+        for identifier in identifiers.reversed() {
+            context.insert(EPGChannelRecord(
+                snapshotID: snapshotID,
+                xmltvID: identifier,
+                displayNames: ["名称 \(identifier)"],
+                iconURLString: nil
+            ))
+        }
+        context.insert(EPGChannelRecord(
+            snapshotID: otherSnapshotID,
+            xmltvID: "其他快照",
+            displayNames: ["其他快照"],
+            iconURLString: nil
+        ))
+        let channelIDs = ["guide-2", "guide-10"]
+        for channelID in channelIDs {
+            for index in (0..<513).reversed() {
+                let stableID = String(format: "%04d", index) + "-" + channelID
+                context.insert(ProgrammeRecord(
+                    snapshotID: snapshotID,
+                    stableID: stableID,
+                    xmltvChannelID: channelID,
+                    start: date(100 + Double(index / 3)),
+                    stop: date(102 + Double(index / 3)),
+                    title: "节目 \(index)",
+                    subtitle: "副标题 \(index)",
+                    programmeDescription: "说明 \(index)",
+                    categories: ["类别"]
+                ))
+            }
+        }
+        let excluded: [(UUID, String, String, TimeInterval, TimeInterval)] = [
+            (snapshotID, "end-at-lower", "guide-2", 90, 100),
+            (snapshotID, "start-at-upper", "guide-2", 1_000, 1_001),
+            (snapshotID, "unrequested-channel", "unrequested", 100, 101),
+            (otherSnapshotID, "other-snapshot", "guide-2", 100, 101)
+        ]
+        for (id, stableID, channelID, start, stop) in excluded {
+            context.insert(ProgrammeRecord(
+                snapshotID: id,
+                stableID: stableID,
+                xmltvChannelID: channelID,
+                start: date(start),
+                stop: date(stop),
+                title: "不应读取",
+                subtitle: nil,
+                programmeDescription: nil,
+                categories: []
+            ))
+        }
+        try context.save()
+        let reader = SwiftDataLibraryStore(modelContainer: container)
+
+        let channels = try await reader.epgChannels(profileID: profile.id)
+        XCTAssertEqual(channels.map(\.id), identifiers.sorted(), "XMLTV ID 保留字典序，不能变为自然排序")
+        let window = date(100)..<date(1_000)
+        let grouped = try await reader.programmes(
+            profileID: profile.id,
+            xmltvChannelIDs: Set(channelIDs + ["missing"]),
+            overlapping: window
+        )
+        XCTAssertEqual(Set(grouped.keys), Set(channelIDs), "没有节目的请求频道不新增空字典项")
+        for channelID in channelIDs {
+            let expectedIDs = (0..<513).map { String(format: "%04d", $0) + "-" + channelID }
+            let programmes = try XCTUnwrap(grouped[channelID])
+            XCTAssertEqual(programmes.map(\.id), expectedIDs)
+            XCTAssertEqual(programmes[256].subtitle, "副标题 256")
+            XCTAssertEqual(programmes[256].summary, "说明 256")
+            XCTAssertEqual(programmes[256].categories, ["类别"])
+            let single = try await reader.programmes(
+                profileID: profile.id,
+                xmltvChannelID: channelID,
+                overlapping: window
+            )
+            XCTAssertEqual(single, programmes, "单频道和批量读取保留相同的半开区间及排序")
+        }
+        let empty = try await reader.programmes(
+            profileID: profile.id,
+            xmltvChannelIDs: [],
+            overlapping: window
+        )
+        XCTAssertTrue(empty.isEmpty)
+    }
+
     func testCorruptChannelAttributesPreserveDecodingCaseAndReason() async throws {
         let fixtures: [(String, String, String)] = [
             ("{", "dataCorrupted", "not valid JSON"),

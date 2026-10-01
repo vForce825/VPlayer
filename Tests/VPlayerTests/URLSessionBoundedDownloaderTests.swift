@@ -65,6 +65,53 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         try FileManager.default.removeItem(at: result.temporaryFileURL)
     }
 
+    func testSequentialDownloadsReuseOneSession() async throws {
+        SessionIdentityURLProtocol.reset()
+        defer { SessionIdentityURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SessionIdentityURLProtocol.self]
+        let downloader = URLSessionBoundedDownloader(
+            configuration: configuration,
+            downloadsDirectory: downloadsDirectory
+        )
+
+        for index in 0..<2 {
+            let result = try await downloader.download(
+                url: URL(string: "https://session-identity.example/logo-\(index).png")!,
+                byteLimit: 16
+            )
+            XCTAssertEqual(try Data(contentsOf: result.temporaryFileURL), Data("logo".utf8))
+            try FileManager.default.removeItem(at: result.temporaryFileURL)
+        }
+
+        let taskIdentifiers = SessionIdentityURLProtocol.taskIdentifiers
+        XCTAssertEqual(taskIdentifiers.count, 2)
+        XCTAssertEqual(taskIdentifiers, [1, 2], "同一 URLSession 的 taskIdentifier 应连续增长")
+    }
+
+    func testConcurrentDownloadsKeepTheirLimitsAndTemporaryFilesIndependent() async throws {
+        StubURLProtocol.enqueue(.init(
+            chunks: [Data("small".utf8)], callbackDelay: 0.1
+        ))
+        StubURLProtocol.enqueue(.init(
+            chunks: [Data("large".utf8)], callbackDelay: 0.1
+        ))
+        let (downloader, _) = makeDownloader()
+        let smallURL = URL(string: "https://example.test/small.png")!
+        let largeURL = URL(string: "https://example.test/large.png")!
+
+        let small = Task { try await downloader.download(url: smallURL, byteLimit: 4) }
+        await waitUntil { StubURLProtocol.requests.count == 1 }
+        let large = Task { try await downloader.download(url: largeURL, byteLimit: 5) }
+        let smallError = await captureError { try await small.value }
+        let largeResource = try await large.value
+
+        XCTAssertEqual(smallError as? RemoteDownloadError, .responseTooLarge(limit: 4))
+        XCTAssertEqual(try Data(contentsOf: largeResource.temporaryFileURL), Data("large".utf8))
+        try FileManager.default.removeItem(at: largeResource.temporaryFileURL)
+        await assertDownloadsDirectoryBecomesEmpty()
+    }
+
     func testUnknownLengthOverflowFailsAtElevenBytesAndRemovesPartialFile() async {
         StubURLProtocol.enqueue(.init(chunks: [Data("123456".utf8), Data("78901".utf8)]))
         let (downloader, _) = makeDownloader()
@@ -475,4 +522,49 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
 
 private struct DiagnosticDownloadError: LocalizedError, Sendable {
     let errorDescription: String?
+}
+
+private final class SessionIdentityURLProtocol: URLProtocol, @unchecked Sendable {
+    private final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var identifiers: [Int] = []
+
+        func append(_ identifier: Int) {
+            lock.withLock { identifiers.append(identifier) }
+        }
+
+        var snapshot: [Int] {
+            lock.withLock { identifiers }
+        }
+
+        func reset() {
+            lock.withLock { identifiers.removeAll() }
+        }
+    }
+
+    private static let state = State()
+
+    static var taskIdentifiers: [Int] { state.snapshot }
+    static func reset() { state.reset() }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "session-identity.example"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.state.append(task?.taskIdentifier ?? -1)
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200,
+            httpVersion: "HTTP/1.1", headerFields: nil
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data("logo".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

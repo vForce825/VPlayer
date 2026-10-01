@@ -13,6 +13,212 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testAsyncVideoBackpressureResumesSameTicketExactlyOnce() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_001)
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "系统 append 已等待背压")
+        native.observeAsyncAppend(entered: { entered.fulfill() })
+        let ticket = try fixture.boundary.issueVideoAppend(
+            for: fixture.output, writerBinding: fixture.writer.binding)
+        let writer = fixture.writer
+        let output = fixture.output
+        let append = Task {
+            try await writer.appendVideoAwaitingReadiness(output, ticket: ticket)
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertNil(fixture.writer.terminalReceipt, "暂时不可写不得终结 writer")
+        XCTAssertEqual(native.appendCount, 0)
+        native.setReadyForMoreMediaData(true)
+        try await append.value
+        let terminal = try await fixture.writer.finish()
+        XCTAssertEqual(terminal.terminalReason, .finished)
+        XCTAssertEqual(terminal.inputCount, 1)
+        XCTAssertEqual(native.appendCount, 1, "恢复后同一票据只能提交一次")
+    }
+
+    func testAsyncAppendCancellationRetainsOwnershipUntilNativeReturns() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_002)
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "系统 append 已挂起")
+        let cancellation = expectation(description: "系统 append 已收到取消")
+        native.observeAsyncAppend(entered: { entered.fulfill() },
+            cancellation: { cancellation.fulfill() }, deferCancellationReturn: true)
+        let ticket = try fixture.boundary.issueVideoAppend(
+            for: fixture.output, writerBinding: fixture.writer.binding)
+        let writer = fixture.writer
+        let output = fixture.output
+        let append = Task {
+            try await writer.appendVideoAwaitingReadiness(output, ticket: ticket)
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        append.cancel()
+        await fulfillment(of: [cancellation], timeout: 2)
+        XCTAssertEqual(fixture.writer.usage.retainedTerminalOwnershipCount, 1,
+                       "取消请求不能提前释放仍由系统 append 使用的输入")
+        XCTAssertNil(fixture.writer.terminalReceipt)
+        native.completeAsyncCancellation(returnSuccess: true)
+        do {
+            try await append.value
+            XCTFail("被取消的 append 不得成功提交票据")
+        } catch is CancellationError {
+        }
+        XCTAssertEqual(fixture.writer.terminalReceipt?.terminalReason, .cancelled)
+        XCTAssertEqual(fixture.writer.terminalReceipt?.inputCount, 0)
+        XCTAssertEqual(fixture.writer.usage.retainedTerminalOwnershipCount, 0)
+        XCTAssertEqual(native.appendCount, 1, "即使系统晚成功，也只能尝试原输入一次")
+    }
+
+    func testFinishWaitsForAsyncAppendBeforeMarkingInputFinished() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_003)
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "系统 append 已等待")
+        native.observeAsyncAppend(entered: { entered.fulfill() })
+        let ticket = try fixture.boundary.issueVideoAppend(
+            for: fixture.output, writerBinding: fixture.writer.binding)
+        let writer = fixture.writer
+        let output = fixture.output
+        let append = Task {
+            try await writer.appendVideoAwaitingReadiness(output, ticket: ticket)
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        let requested = expectation(description: "finish 已请求")
+        let finish = Task {
+            requested.fulfill()
+            return try await writer.finish()
+        }
+        await fulfillment(of: [requested], timeout: 2)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(native.calls.contains(.markFinished),
+                       "在途 append 未归来前不得封闭系统输入")
+        XCTAssertFalse(native.calls.contains(.finish))
+        native.setReadyForMoreMediaData(true)
+        try await append.value
+        let terminal = try await finish.value
+        XCTAssertEqual(terminal.terminalReason, .finished)
+        XCTAssertEqual(terminal.inputCount, 1)
+        XCTAssertEqual(Array(native.calls.suffix(3)), [.append, .markFinished, .finish])
+    }
+
+    private func makeAsyncVideoFixture(seed: UInt64) throws -> (
+        writer: SegmentedFMP4Writer, boundary: SegmentBoundaryCoordinator,
+        output: HLSVideoEncodedOutput, factory: Task17FakeSystemWriterFactory
+    ) {
+        let sample = try Task17Fixtures.realH264Sample()
+        let boundary = try SegmentBoundaryCoordinator(
+            mode: .audioVideo(epochStart: .zero, videoMode: .passthrough))
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeAuthorizedWriter(seed: seed, kind: .video,
+            boundary: boundary, sourceFormatHint: sample.format, factory: factory)
+        let output = Task17Fixtures.videoOutput(fixture: sample,
+            generation: seed, accessUnitID: seed + 1, sequenceNumber: seed + 2)
+        try writer.start(at: .zero)
+        return (writer, boundary, output, factory)
+    }
+
+    func testAsyncVideoRejectsSourceHeaderMutationDuringNativeWait() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_004)
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "副本 append 已挂起")
+        native.observeAsyncAppend(entered: { entered.fulfill() })
+        let writer = fixture.writer
+        let output = fixture.output
+        let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+        let append = Task { try await writer.appendVideoAwaitingReadiness(output, ticket: ticket) }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(CMSampleBufferSetOutputPresentationTimeStamp(output.sampleBuffer,
+            newValue: CMTime(value: 1, timescale: 1)), noErr)
+        native.setReadyForMoreMediaData(true)
+        do {
+            try await append.value
+            XCTFail("原 header 变更不得提交已冻结票据")
+        } catch {
+            XCTAssertEqual(error as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
+        }
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .failed)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 0)
+        XCTAssertNil(ticket.committedBoundary)
+        XCTAssertEqual(native.appendCount, 1)
+    }
+
+    func testAsyncNativeThrowPreservesDiagnosticBeforeCancellation() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_005)
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        native.setAsyncAppendFailure(NSError(domain: "Receiver.Native", code: -92_005,
+            userInfo: [NSLocalizedDescriptionKey: "异步 receiver 原始异常"]))
+        do {
+            try await fixture.writer.appendVideoAwaitingReadiness(fixture.output,
+                ticket: try fixture.boundary.issueVideoAppend(for: fixture.output,
+                    writerBinding: fixture.writer.binding))
+            XCTFail("native 异常必须传播")
+        } catch {
+            let diagnostic = String(reflecting: error)
+            XCTAssertTrue(diagnostic.contains("Receiver.Native"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("-92005"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("异步 receiver 原始异常"), diagnostic)
+        }
+        XCTAssertEqual(fixture.writer.terminalReceipt?.terminalReason, .failed)
+        XCTAssertEqual(native.appendCount, 0)
+    }
+
+    func testAsyncVideoPreservesNonpropagatingDecoderAttachment() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_007)
+        CMSetAttachment(fixture.output.sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding, value: kCFBooleanTrue,
+            attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        try await fixture.writer.appendVideoAwaitingReadiness(fixture.output,
+            ticket: try fixture.boundary.issueVideoAppend(for: fixture.output,
+                writerBinding: fixture.writer.binding))
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        XCTAssertEqual(native.resetDecoderAttachments, [true])
+        let terminal = try await fixture.writer.finish()
+        XCTAssertEqual(terminal.inputCount, 1)
+    }
+
+    func testAsyncAudioBranchCancellationRetainsPumpLeaseUntilNativeReturns() async throws {
+        let request = try AACRenditionRequest(layout: RenditionAudioLayout(labels: [.l, .r]),
+            capabilityVersion: "async-aac-cancellation")
+        let calibration = try await AACPrimingCalibrator().calibrate(
+            plan: try AACCalibrationPlan.build([request]))
+        let encoder = try XCTUnwrap(calibration.encoders.first)
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 92_006, kind: .aac,
+            sourceFormatHint: try encoder.incrementalFormatDescription(), factory: factory)
+        let boundary = try Task17Fixtures.aacCoordinator(
+            epoch: Task17Fixtures.aacEpoch(bufferCount: 1), writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        let gate = HLSDataPlaneAdmission(capacity: 1,
+            maximumBytes: AudioRenditionBranch.maximumPumpOutputBytes)
+        let branch = AudioRenditionBranch(encoder: encoder, writer: writer,
+            coordinator: boundary, admission: gate)
+        let native = try XCTUnwrap(factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "AAC append 已挂起")
+        let cancelled = expectation(description: "AAC native 收到取消")
+        native.observeAsyncAppend(entered: { entered.fulfill() },
+            cancellation: { cancelled.fulfill() }, deferCancellationReturn: true)
+        let samples = (0..<(16_384 * 2)).map { sin(Float($0) * 0.003125) * 0.25 }
+        let pump = Task { try await branch.pumpAwaitingWriter(.pcm(samples)) }
+        await fulfillment(of: [entered], timeout: 3)
+        let original = try XCTUnwrap(branch.pendingEmissionIdentity)
+        branch.cancel()
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertEqual(gate.usage.count, 1)
+        XCTAssertEqual(branch.pendingEmissionIdentity, original)
+        XCTAssertNil(writer.terminalReceipt)
+        native.completeAsyncCancellation(returnSuccess: true)
+        do { _ = try await pump.value; XCTFail("取消不得提交 emission") }
+        catch is CancellationError {}
+        XCTAssertEqual(gate.usage.count, 0)
+        XCTAssertNil(branch.pendingEmissionIdentity)
+        XCTAssertNil(branch.firstCommittedEmissionIdentity)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 0)
+        XCTAssertEqual(native.appendCount, 1)
+    }
+
     func testSystemWriterStartFailurePreservesOriginalErrorBeforeCancellation() throws {
         let factory = Task17FakeSystemWriterFactory(
             failurePoint: .start,
@@ -1277,8 +1483,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let samples = (0..<(16_384 * 2)).map { index in
             sin(Float(index) * 0.003125) * 0.25
         }
+        let native = try XCTUnwrap(factory.lastWriter)
+        let entered = expectation(description: "AAC 原 emission 等待 writer")
+        native.observeAsyncAppend(entered: { entered.fulfill() })
         let blockedPump = Task.detached {
-            try branch.pump(.pcm(samples))
+            try await branch.pumpAwaitingWriter(.pcm(samples))
         }
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(factory.lastWriter?.appendCount, 0,
@@ -1287,8 +1496,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
 
         factory.lastWriter?.setReadyForMoreMediaData(false)
         blocker.release()
-        let waiting = try await blockedPump.value
-        XCTAssertTrue(waiting.waitingForWriter)
+        await fulfillment(of: [entered], timeout: 3)
+        native.observeAsyncAppend(entered: {})
         XCTAssertEqual(factory.lastWriter?.appendCount, 0)
         XCTAssertEqual(writer.incrementalAACCommittedInputCount, 0,
                        "暂时不可写不得提前提交 snapshot/ordinal/digest")
@@ -1304,17 +1513,18 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let pending = try XCTUnwrap(branch.pendingEmissionIdentity)
 
         factory.lastWriter?.setReadyForMoreMediaData(true)
-        let preEOS = try XCTUnwrap(try branch.retryPending())
+        let preEOS = try await blockedPump.value
         XCTAssertFalse(preEOS.waitingForWriter)
         XCTAssertEqual(branch.firstCommittedEmissionIdentity, pending,
                        "重试必须提交原对象，不得重新 Fill")
         XCTAssertTrue(preEOS.needsInput)
         XCTAssertGreaterThan(factory.lastWriter?.appendCount ?? 0, 0)
         let countBeforeUnavailable = factory.lastWriter?.appendCount
-        XCTAssertNil(try branch.pump(.unavailable).finalReceipt)
+        let unavailable = try await branch.pumpAwaitingWriter(.unavailable)
+        XCTAssertNil(unavailable.finalReceipt)
         XCTAssertEqual(factory.lastWriter?.appendCount, countBeforeUnavailable)
 
-        let terminal = try branch.pump(.endOfStream)
+        let terminal = try await branch.pumpAwaitingWriter(.endOfStream)
         XCTAssertNotNil(terminal.finalReceipt)
         XCTAssertEqual(branch.writerReceipt?.inputCount,
                        terminal.finalReceipt?.emissionCount)
@@ -1765,7 +1975,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             sequenceNumber: 1
         )
         try writer.start(at: .zero)
-        try writer.appendVideo(
+        try await writer.appendVideoAwaitingReadiness(
             output,
             ticket: try boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
         )
@@ -1791,7 +2001,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             try exactWriter.start(at: start)
             let ticket = try exactBoundary.issueVideoAppend(for: exactOutput, writerBinding: exactWriter.binding)
             XCTAssertNil(ticket.committedBoundary)
-            try exactWriter.appendVideo(exactOutput, ticket: ticket)
+            try await exactWriter.appendVideoAwaitingReadiness(exactOutput, ticket: ticket)
             XCTAssertEqual(try XCTUnwrap(ticket.committedBoundary).commonStart, try ExactMediaTime(start))
             _ = try await exactWriter.finish()
             let exactMedia = try XCTUnwrap(exactCollector.objects.first { $0.kind == .media })
@@ -1802,19 +2012,23 @@ final class SegmentedFMP4WriterTests: XCTestCase {
     }
 
     func testRealAACWriterProducesRecognizableInitializationAndMediaCallbacks() async throws {
-        let epoch = try await Task17Fixtures.realAACEncodedEpoch()
+        let request = try AACRenditionRequest(layout: RenditionAudioLayout(labels: [.l, .r]),
+            capabilityVersion: "async-real-system-aac")
+        let calibrated = try await AACPrimingCalibrator().calibrate(
+            plan: try AACCalibrationPlan.build([request]))
+        let encoder = try XCTUnwrap(calibrated.encoders.first)
         let collector = Task17ObjectCollector()
-        let writer = try Task17Fixtures.makeWriter(
-            seed: 1_900,
-            kind: .aac,
-            sourceFormatHint: try XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
-            collector: collector
-        )
+        let writer = try Task17Fixtures.makeWriter(seed: 1_900, kind: .aac,
+            sourceFormatHint: try encoder.incrementalFormatDescription(), collector: collector)
+        let boundary = try Task17Fixtures.aacCoordinator(
+            epoch: Task17Fixtures.aacEpoch(bufferCount: 1), writer: writer)
+        let branch = AudioRenditionBranch(encoder: encoder, writer: writer, coordinator: boundary)
         try writer.start(at: CMTime(value: 10, timescale: 1))
-        try writer.appendAACEncodedEpoch(
-            epoch,
-            coordinator: try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
-        )
+        _ = try await branch.pumpAwaitingWriter(.pcm((0..<(8_192 * 2)).map {
+            sin(Float($0) * 0.003125) * 0.25
+        }))
+        let final = try await branch.pumpAwaitingWriter(.endOfStream)
+        XCTAssertNotNil(final.finalReceipt)
         let receipt = try await writer.finish()
         let initialization = try XCTUnwrap(collector.objects.first { $0.kind == .initialization })
         let media = try XCTUnwrap(collector.objects.first { $0.kind == .media })
@@ -4563,7 +4777,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 for: fixture.timed[0], admission: fixture.admissions[0]
             )
             try writer.start(at: CMTime(value: 10, timescale: 1))
-            try writer.appendRemuxVideo(
+            try await writer.appendRemuxVideoAwaitingReadiness(
                 submission,
                 ticket: try fixture.boundary.issueRemuxVideoAppend(
                     for: submission, writerBinding: writer.binding
@@ -7031,6 +7245,13 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
     private var storedCapturedPayloads: [Data] = []
     private var rejectsNextAppend = false
     private var readyForMoreMediaData = true
+    private var asyncAppendContinuation: CheckedContinuation<Void, Error>?
+    private var asyncEntered: (@Sendable () -> Void)?
+    private var asyncCancellation: (@Sendable () -> Void)?
+    private var defersAsyncCancellationReturn = false
+    private var asyncCancellationRequested = false
+    private var asyncAppendFailure: (any Error)?
+    private var storedResetDecoderAttachments: [Bool] = []
 
     init(
         failurePoint: Task17SystemFailurePoint?,
@@ -7065,6 +7286,7 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
     var calls: [Task17SystemCall] { lock.withLock { storedCalls } }
     var appendCount: Int { lock.withLock { storedAppendCount } }
     var capturedPayloads: [Data] { lock.withLock { storedCapturedPayloads } }
+    var resetDecoderAttachments: [Bool] { lock.withLock { storedResetDecoderAttachments } }
     var cancelCount: Int { calls.filter { $0 == .cancel }.count }
     var isTerminal: Bool { cancelCount > 0 || calls.contains(.finish) }
 
@@ -7080,6 +7302,10 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
     }
 
     func append(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        if let value = CMGetAttachment(sampleBuffer,
+            key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding, attachmentModeOut: nil) {
+            lock.withLock { storedResetDecoderAttachments.append((value as? NSNumber)?.boolValue == true) }
+        }
         if let block = CMSampleBufferGetDataBuffer(sampleBuffer) {
             let length = CMBlockBufferGetDataLength(block)
             var copy = Data(count: length)
@@ -7105,7 +7331,78 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
 
     func rejectNextAppend() { lock.withLock { rejectsNextAppend = true } }
     func setReadyForMoreMediaData(_ ready: Bool) {
-        lock.withLock { readyForMoreMediaData = ready }
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            readyForMoreMediaData = ready
+            guard ready, !asyncCancellationRequested else { return nil }
+            defer { asyncAppendContinuation = nil }
+            return asyncAppendContinuation
+        }
+        continuation?.resume()
+    }
+
+    func observeAsyncAppend(
+        entered: @escaping @Sendable () -> Void,
+        cancellation: (@Sendable () -> Void)? = nil,
+        deferCancellationReturn: Bool = false
+    ) {
+        lock.withLock {
+            asyncEntered = entered
+            asyncCancellation = cancellation
+            defersAsyncCancellationReturn = deferCancellationReturn
+        }
+    }
+
+    func setAsyncAppendFailure(_ error: any Error) {
+        lock.withLock { asyncAppendFailure = error }
+    }
+
+    /// 模拟系统 receiver：只挂起媒体准入，真实 writer 的票据和账本仍由生产代码处理。
+    func appendAwaitingReadiness(
+        _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+    ) async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let action = lock.withLock { () -> (Bool, Bool, (@Sendable () -> Void)?) in
+                    precondition(asyncAppendContinuation == nil)
+                    let cancelled = asyncCancellationRequested
+                    let complete = (!cancelled && readyForMoreMediaData)
+                        || (cancelled && !defersAsyncCancellationReturn)
+                    if !complete { asyncAppendContinuation = continuation }
+                    return (complete, cancelled, asyncEntered)
+                }
+                action.2?()
+                if action.0 {
+                    if action.1 { continuation.resume(throwing: CancellationError()) }
+                    else { continuation.resume() }
+                }
+            }
+            if let error = lock.withLock({ asyncAppendFailure }) { throw error }
+            // 允许模拟取消请求之后系统才报告成功；writer 仍须拒绝该晚到提交。
+            guard sampleBuffer.withUnsafeSampleBuffer({ append($0) }) else {
+                throw SegmentedFMP4WriterFailure.systemFailure
+            }
+        } onCancel: {
+            let action = self.lock.withLock { () -> (
+                CheckedContinuation<Void, Error>?, (@Sendable () -> Void)?
+            ) in
+                self.asyncCancellationRequested = true
+                let continuation = self.defersAsyncCancellationReturn
+                    ? nil : self.asyncAppendContinuation
+                if continuation != nil { self.asyncAppendContinuation = nil }
+                return (continuation, self.asyncCancellation)
+            }
+            action.1?()
+            action.0?.resume(throwing: CancellationError())
+        }
+    }
+
+    func completeAsyncCancellation(returnSuccess: Bool = false) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            defer { asyncAppendContinuation = nil }
+            return asyncAppendContinuation
+        }
+        if returnSuccess { continuation?.resume() }
+        else { continuation?.resume(throwing: CancellationError()) }
     }
 
     func flushSegment() -> Bool {

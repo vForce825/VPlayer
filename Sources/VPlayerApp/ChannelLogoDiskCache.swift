@@ -14,6 +14,9 @@ actor ChannelLogoDiskCache {
     private let directory: URL
     private let capacity: Int
     private let fileManager: FileManager
+    private var knownTotalSize: Int?
+    private var storesSinceScan = 0
+    private let reconciliationInterval = 32
 
     init(
         directory: URL,
@@ -38,13 +41,13 @@ actor ChannelLogoDiskCache {
               let fileSize = values.fileSize,
               fileSize >= 0,
               fileSize <= maximumByteCount else {
-            try? fileManager.removeItem(at: fileURL)
+            removeData(forKey: key)
             return nil
         }
         guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
               data.count == fileSize,
               data.count <= maximumByteCount else {
-            try? fileManager.removeItem(at: fileURL)
+            removeData(forKey: key)
             return nil
         }
         try? fileManager.setAttributes(
@@ -61,19 +64,49 @@ actor ChannelLogoDiskCache {
             return
         }
         do {
-            try data.write(to: fileURL(forKey: key), options: .atomic)
-            try pruneIfNeeded()
+            let url = fileURL(forKey: key)
+            let previousSize = regularFileSize(at: url) ?? 0
+            try data.write(to: url, options: .atomic)
+            if let knownTotalSize {
+                let remaining = max(0, knownTotalSize - previousSize)
+                let (updated, overflow) = remaining.addingReportingOverflow(data.count)
+                self.knownTotalSize = overflow ? Int.max : updated
+                storesSinceScan += 1
+            }
+            let needsCapacityScan = self.knownTotalSize.map { $0 > capacity } ?? true
+            if needsCapacityScan || storesSinceScan >= reconciliationInterval {
+                try pruneIfNeeded()
+            }
         } catch {
+            knownTotalSize = nil
             // Disk caching is best-effort; the memory cache already owns the image.
         }
     }
 
     func removeData(forKey key: String) {
-        try? fileManager.removeItem(at: fileURL(forKey: key))
+        let url = fileURL(forKey: key)
+        let size = regularFileSize(at: url) ?? 0
+        do {
+            try fileManager.removeItem(at: url)
+            if let knownTotalSize {
+                self.knownTotalSize = max(0, knownTotalSize - size)
+            }
+        } catch {
+            // 缺失文件不改变缓存，其余失败交给下一次全目录核算修正。
+            if fileManager.fileExists(atPath: url.path) { knownTotalSize = nil }
+        }
     }
 
     private func fileURL(forKey key: String) -> URL {
         directory.appendingPathComponent(key, isDirectory: false)
+    }
+
+    private func regularFileSize(at url: URL) -> Int? {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey]
+        guard let values = try? url.resourceValues(forKeys: keys),
+              values.isRegularFile == true,
+              let size = values.fileSize, size >= 0 else { return nil }
+        return size
     }
 
     private func pruneIfNeeded() throws {
@@ -101,11 +134,19 @@ actor ChannelLogoDiskCache {
                 modificationDate: values.contentModificationDate ?? .distantPast
             ))
         }
-        guard totalSize > capacity else { return }
+        guard totalSize > capacity else {
+            knownTotalSize = totalSize
+            storesSinceScan = 0
+            return
+        }
         for entry in entries.sorted(by: { $0.modificationDate < $1.modificationDate }) {
-            try? fileManager.removeItem(at: entry.url)
-            totalSize = max(0, totalSize - entry.size)
+            do {
+                try fileManager.removeItem(at: entry.url)
+                totalSize = max(0, totalSize - entry.size)
+            } catch { continue }
             if totalSize <= capacity { break }
         }
+        knownTotalSize = totalSize
+        storesSinceScan = 0
     }
 }

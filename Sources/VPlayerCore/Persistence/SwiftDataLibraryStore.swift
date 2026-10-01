@@ -55,6 +55,7 @@ typealias LibraryStoreSaveContextObserver = @Sendable (
 @ModelActor
 public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting,
     ConditionalRefreshStatusWriting {
+    private static let readBatchSize = 256
     private var saveFault: LibraryStoreSaveFault?
     private var epgCancellationCheck: @Sendable () throws -> Void = {
         try Task.checkCancellation()
@@ -255,20 +256,31 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
 
     public func channels(profileID: UUID) throws -> [Channel] {
         guard let snapshotID = try profileRecord(id: profileID).playlistSnapshotID else { return [] }
-        let records = try modelContext.fetch(FetchDescriptor<ChannelRecord>(
-            predicate: #Predicate { $0.snapshotID == snapshotID }
-        )).sorted {
-            ($0.order, $0.stableID) < ($1.order, $1.stableID)
+        let descriptor = FetchDescriptor<ChannelRecord>(
+            predicate: #Predicate { $0.snapshotID == snapshotID },
+            sortBy: [
+                SortDescriptor(\.order),
+                SortDescriptor(\.stableID, comparator: .lexical)
+            ]
+        )
+        var result: [Channel] = []
+        try modelContext.enumerate(descriptor, batchSize: Self.readBatchSize) { record in
+            result.append(try Self.channel(from: record))
         }
-        return try records.map(Self.channel(from:))
+        return result
     }
 
     public func epgChannels(profileID: UUID) throws -> [EPGChannel] {
         guard let snapshotID = try profileRecord(id: profileID).epgSnapshotID else { return [] }
-        return try modelContext.fetch(FetchDescriptor<EPGChannelRecord>(
-            predicate: #Predicate { $0.snapshotID == snapshotID }
-        )).sorted { $0.xmltvID < $1.xmltvID }
-            .map(Self.epgChannel(from:))
+        let descriptor = FetchDescriptor<EPGChannelRecord>(
+            predicate: #Predicate { $0.snapshotID == snapshotID },
+            sortBy: [SortDescriptor(\.xmltvID, comparator: .lexical)]
+        )
+        var result: [EPGChannel] = []
+        try modelContext.enumerate(descriptor, batchSize: Self.readBatchSize) { record in
+            result.append(Self.epgChannel(from: record))
+        }
+        return result
     }
 
     public func epgProgrammeCount(profileID: UUID) async throws -> Int {
@@ -296,16 +308,23 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         guard let snapshotID = try profileRecord(id: profileID).epgSnapshotID else { return [] }
         let lowerBound = overlapping.lowerBound
         let upperBound = overlapping.upperBound
-        return try modelContext.fetch(FetchDescriptor<ProgrammeRecord>(
+        let descriptor = FetchDescriptor<ProgrammeRecord>(
             predicate: #Predicate {
                 $0.snapshotID == snapshotID
                     && $0.xmltvChannelID == xmltvChannelID
                     && $0.start < upperBound
                     && $0.stop > lowerBound
-            }
-        )).sorted {
-            ($0.start, $0.stableID) < ($1.start, $1.stableID)
-        }.map(Self.programme(from:))
+            },
+            sortBy: [
+                SortDescriptor(\.start),
+                SortDescriptor(\.stableID, comparator: .lexical)
+            ]
+        )
+        var result: [Programme] = []
+        try modelContext.enumerate(descriptor, batchSize: Self.readBatchSize) { record in
+            result.append(Self.programme(from: record))
+        }
+        return result
     }
 
     public func manualMapping(
@@ -324,12 +343,11 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
 
     public func manualMappings(profileID: UUID) throws -> [String: String] {
         _ = try profileRecord(id: profileID)
-        let records = try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>(
+        let descriptor = FetchDescriptor<ManualEPGMappingRecord>(
             predicate: #Predicate { $0.sourceProfileID == profileID }
-        ))
+        )
         var result: [String: String] = [:]
-        result.reserveCapacity(records.count)
-        for record in records {
+        try modelContext.enumerate(descriptor, batchSize: Self.readBatchSize) { record in
             result[record.channelID] = record.xmltvChannelID
         }
         return result
@@ -345,18 +363,20 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         let channelIDs = Array(xmltvChannelIDs)
         let lowerBound = overlapping.lowerBound
         let upperBound = overlapping.upperBound
-        let records = try modelContext.fetch(FetchDescriptor<ProgrammeRecord>(
+        let descriptor = FetchDescriptor<ProgrammeRecord>(
             predicate: #Predicate {
                 $0.snapshotID == snapshotID
                     && channelIDs.contains($0.xmltvChannelID)
                     && $0.start < upperBound
                     && $0.stop > lowerBound
-            }
-        )).sorted {
-            ($0.start, $0.stableID) < ($1.start, $1.stableID)
-        }
+            },
+            sortBy: [
+                SortDescriptor(\.start),
+                SortDescriptor(\.stableID, comparator: .lexical)
+            ]
+        )
         var result: [String: [Programme]] = [:]
-        for record in records {
+        try modelContext.enumerate(descriptor, batchSize: Self.readBatchSize) { record in
             result[record.xmltvChannelID, default: []].append(Self.programme(from: record))
         }
         return result

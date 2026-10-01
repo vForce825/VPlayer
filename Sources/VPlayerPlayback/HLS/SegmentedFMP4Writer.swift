@@ -236,6 +236,9 @@ protocol SegmentedFMP4SystemWriting: AnyObject, Sendable {
     var failureDiagnostic: ErrorDiagnosticSnapshot? { get }
     func startWriting(at sourceTime: CMTime) -> Bool
     func append(_ sampleBuffer: CMSampleBuffer) -> Bool
+    func appendAwaitingReadiness(
+        _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+    ) async throws
     func flushSegment() -> Bool
     func markInputAsFinished()
     func finishWriting(_ completion: @escaping @Sendable (Bool) -> Void)
@@ -244,6 +247,15 @@ protocol SegmentedFMP4SystemWriting: AnyObject, Sendable {
 
 extension SegmentedFMP4SystemWriting {
     var failureDiagnostic: ErrorDiagnosticSnapshot? { nil }
+
+    /// 既有 inspection adapter 保留立即 append；真实系统 adapter 必须覆盖异步入口。
+    func appendAwaitingReadiness(
+        _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+    ) async throws {
+        try sampleBuffer.withUnsafeSampleBuffer { buffer in
+            guard append(buffer) else { throw SegmentedFMP4WriterFailure.systemFailure }
+        }
+    }
 }
 
 protocol SegmentedFMP4SystemWriterFactory: Sendable {
@@ -366,9 +378,124 @@ final class SegmentedFMP4SystemReportProvenance: @unchecked Sendable {
     }
 }
 
+/// 新 header 由本次 append 独占；共享的媒体 backing 由输入 owner 持续保留。
+/// 原 header 留在 typed 票据的只读证据链中，不跨 executor 发送该借用别名。
+private func nativeReadySample(
+    copying sample: CMSampleBuffer
+) throws -> CMReadySampleBuffer<CMSampleBuffer.DynamicContent> {
+    var copied: CMSampleBuffer?
+    let status = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault,
+        sampleBuffer: sample, sampleBufferOut: &copied)
+    guard status == noErr else {
+        throw SegmentedFMP4WriterFailure.systemError(PlaybackErrorDiagnostics.snapshot(
+            NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                userInfo: [NSLocalizedDescriptionKey: "HLS native sample header 复制失败"])))
+    }
+    guard let copied, ObjectIdentifier(copied) != ObjectIdentifier(sample) else {
+        throw SegmentedFMP4WriterFailure.systemError(PlaybackErrorDiagnostics.snapshot(
+            NSError(domain: "VPlayerHLS.NativeReadySample", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "HLS sample 复制未返回独立 header"])))
+    }
+    guard CMSampleBufferDataIsReady(copied) else {
+        throw SegmentedFMP4WriterFailure.systemError(PlaybackErrorDiagnostics.snapshot(
+            NSError(domain: "VPlayerHLS.NativeReadySample", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "HLS native append 输入数据尚未 ready"])))
+    }
+    // CreateCopy 仅承诺传播附件；HLS 样本的 decoder control 也包含非传播附件。
+    for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+        if let attachments = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+            target: sample, attachmentMode: mode) {
+            CMSetAttachments(copied, attachments: attachments, attachmentMode: mode)
+        }
+    }
+    // C out-pointer 缺少返回值独占注解；CreateCopy 已创建独立 header。
+    // 仅此局部桥接绕过区域推断；媒体 backing 仍只读且由原 owner 保留。
+    nonisolated(unsafe) let nativeHeader = copied
+    return CMReadySampleBuffer(unsafeBuffer: nativeHeader)
+}
+
+private indirect enum NativeAttachmentFacts: Sendable, Equatable {
+    case dictionary([String: NativeAttachmentFacts])
+    case array([NativeAttachmentFacts])
+    case string(String)
+    case number(String, String)
+    case data(Data)
+
+    static func freeze(_ value: Any) throws -> NativeAttachmentFacts {
+        if let dictionary = value as? NSDictionary {
+            var result: [String: NativeAttachmentFacts] = [:]
+            for (key, value) in dictionary {
+                guard let key = key as? String else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
+                result[key] = try freeze(value)
+            }
+            return .dictionary(result)
+        }
+        if let array = value as? NSArray { return .array(try array.map { try freeze($0) }) }
+        if let data = value as? Data { return .data(data) }
+        if let number = value as? NSNumber {
+            return .number(String(cString: number.objCType), number.stringValue)
+        }
+        if let string = value as? String { return .string(string) }
+        throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+    }
+}
+
+/// sample 对象身份由原 typed 票据保留；此快照证明 native 副本携带相同媒体事实。
+private struct NativeSampleFacts: Sendable, Equatable {
+    let format: ObjectIdentifier?
+    let timing: [String]
+    let sizes: [Int]
+    let attachments: [NativeAttachmentFacts?]
+    let payloadDigest: Data?
+
+    static func freeze(_ sample: CMSampleBuffer) throws -> NativeSampleFacts {
+        func exact(_ time: CMTime) -> String {
+            "\(time.value)/\(time.timescale)/\(time.flags.rawValue)/\(time.epoch)"
+        }
+        let count = CMSampleBufferGetNumSamples(sample)
+        var timing = [exact(CMSampleBufferGetDuration(sample)),
+            exact(CMSampleBufferGetPresentationTimeStamp(sample)),
+            exact(CMSampleBufferGetDecodeTimeStamp(sample)),
+            exact(CMSampleBufferGetOutputPresentationTimeStamp(sample)),
+            exact(CMSampleBufferGetOutputDuration(sample))]
+        for index in 0..<count {
+            var info = CMSampleTimingInfo()
+            guard CMSampleBufferGetSampleTimingInfo(sample, at: index,
+                timingInfoOut: &info) == noErr else {
+                throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+            }
+            timing.append(contentsOf: [exact(info.duration),
+                exact(info.presentationTimeStamp), exact(info.decodeTimeStamp)])
+        }
+        let sampleAttachments = CMSampleBufferGetSampleAttachmentsArray(sample,
+            createIfNecessary: false).map { $0 as NSArray }
+        let propagating = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+            target: sample, attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        let privateAttachments = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+            target: sample, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        let attachments: [NativeAttachmentFacts?] = try [sampleAttachments,
+            propagating.map { $0 as NSDictionary }, privateAttachments.map { $0 as NSDictionary }]
+            .map { try $0.map { try NativeAttachmentFacts.freeze($0) } }
+        let digest: Data?
+        if let block = CMSampleBufferGetDataBuffer(sample) {
+            var bytes = Data(count: CMBlockBufferGetDataLength(block))
+            let result = bytes.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(block, atOffset: 0,
+                    dataLength: $0.count, destination: $0.baseAddress!)
+            }
+            guard result == noErr else { throw SegmentedFMP4WriterFailure.systemFailure }
+            digest = Data(SHA256.hash(data: bytes))
+        } else { digest = nil }
+        return NativeSampleFacts(format: CMSampleBufferGetFormatDescription(sample).map(ObjectIdentifier.init),
+            timing: timing, sizes: (0..<count).map { CMSampleBufferGetSampleSize(sample, at: $0) },
+            attachments: attachments, payloadDigest: digest)
+    }
+}
+
 private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting, @unchecked Sendable {
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
+    private let receiver: AVAssetWriterInput.SampleBufferReceiver
     private let segmentDelegate: AVAssetSegmentDelegate
 
     init(
@@ -401,9 +528,10 @@ private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting
         input.expectsMediaDataInRealTime = false
         if configuration.mediaType == .video { input.mediaTimeScale = configuration.videoMediaTimeScale }
         guard writer.canAdd(input) else { throw SegmentedFMP4WriterFailure.invalidSystemConfiguration }
-        writer.add(input)
+        let receiver = writer.inputReceiver(for: input)
         self.writer = writer
         self.input = input
+        self.receiver = receiver
         self.segmentDelegate = segmentDelegate
         try configuration.callbackContext?.bind(adapter: self, writer: ObjectIdentifier(writer), source: sourceFormatHint)
     }
@@ -420,14 +548,22 @@ private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting
         return true
     }
 
-    func append(_ sampleBuffer: CMSampleBuffer) -> Bool { input.append(sampleBuffer) }
+    func append(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        (try? receiver.appendImmediately(nativeReadySample(copying: sampleBuffer))) ?? false
+    }
+
+    func appendAwaitingReadiness(
+        _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+    ) async throws {
+        try await receiver.append(sampleBuffer)
+    }
 
     func flushSegment() -> Bool {
         writer.flushSegment()
         return writer.status == .writing && writer.error == nil
     }
 
-    func markInputAsFinished() { input.markAsFinished() }
+    func markInputAsFinished() { receiver.finish() }
 
     func finishWriting(_ completion: @escaping @Sendable (Bool) -> Void) {
         writer.finishWriting { [weak self] in
@@ -1836,6 +1972,27 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             return AppendSuccessAuthority(writer: writer, ticket: ticket, sampleIdentity: sampleIdentity)
         }
 
+        /// 资格仍只由真实 native append 返回签发；取消后的晚成功不会成为 commit 资格。
+        fileprivate static func appendAwaitingReadiness(
+            _ sample: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>,
+            using writer: SegmentedFMP4Writer,
+            operationIdentity: UUID,
+            ticket: SegmentBoundaryAppendTicket,
+            sampleIdentity: SegmentBoundarySampleIdentity
+        ) async throws -> AppendSuccessAuthority {
+            try Task.checkCancellation()
+            try await writer.systemWriter.appendAwaitingReadiness(sample)
+            try Task.checkCancellation()
+            return try writer.withLane {
+                guard writer.state == .started,
+                      writer.awaitingAppend?.identity == operationIdentity else {
+                    throw SegmentedFMP4WriterFailure.illegalState
+                }
+                return AppendSuccessAuthority(writer: writer, ticket: ticket,
+                                              sampleIdentity: sampleIdentity)
+            }
+        }
+
         func consume(
             binding: FMP4WriterBinding,
             trackKind: SegmentedFMP4TrackKind,
@@ -1965,7 +2122,19 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private enum ReadinessFailurePolicy {
         case terminal
         case recoverable
+        case awaiting
     }
+    private struct AwaitingAppend: Sendable {
+        let identity: UUID
+        let sample: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+        let ticket: SegmentBoundaryAppendTicket
+        let sampleIdentity: SegmentBoundarySampleIdentity
+        let native: Task<AppendSuccessAuthority, Error>
+        let facts: NativeSampleFacts
+        let validatesSource: @Sendable (NativeSampleFacts) throws -> Bool
+    }
+    private var awaitingAppend: AwaitingAppend?
+    private var finishRequested = false
     private var remuxVideoCadence: RemuxVideoCadence?
     private var compressedCadence: CompressedCadence?
     private var remuxFormatAuthorityWitness: AnyObject?
@@ -2214,6 +2383,82 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
     }
 
+    func appendVideoAwaitingReadiness(
+        _ output: HLSVideoEncodedOutput,
+        ticket: SegmentBoundaryAppendTicket
+    ) async throws {
+        do {
+            try Task.checkCancellation()
+            let identity = try SegmentBoundaryCoordinator.videoIdentity(output)
+            let operation = try withLane {
+                var admission = try preflightTypedIsolated(output.sampleBuffer,
+                    ticket: ticket, sampleIdentity: identity,
+                    readinessFailurePolicy: .awaiting)
+                defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                return try beginAwaitingAppendIsolated(output.sampleBuffer,
+                    ticket: ticket, sampleIdentity: identity,
+                    ownership: FMP4InputOwnership { withExtendedLifetime(output) {} },
+                    validatesSource: { try NativeSampleFacts.freeze(output.sampleBuffer) == $0 },
+                    admission: &admission)
+            }
+            try await completeAwaitingAppend(operation)
+        } catch {
+            ticket.abort(binding: binding, session: boundarySession)
+            throw error
+        }
+    }
+
+    func appendRemuxVideoAwaitingReadiness(
+        _ submission: HLSVideoRemuxSubmission,
+        ticket: SegmentBoundaryAppendTicket
+    ) async throws {
+        let attempt: HLSVideoRemuxWriterAttempt
+        do { attempt = try submission.currentWriterAttempt(binding: binding) }
+        catch {
+            ticket.abort(binding: binding, session: boundarySession)
+            throw SegmentedFMP4WriterFailure.boundaryMismatch
+        }
+        try await appendRemuxVideoAwaitingReadiness(attempt, ticket: ticket)
+    }
+
+    func appendRemuxVideoAwaitingReadiness(
+        _ attempt: HLSVideoRemuxWriterAttempt,
+        ticket: SegmentBoundaryAppendTicket
+    ) async throws {
+        do {
+            try Task.checkCancellation()
+            guard trackKind == .video, attempt.writerBinding == binding else {
+                throw SegmentedFMP4WriterFailure.boundaryMismatch
+            }
+            let identity = try SegmentBoundaryCoordinator.remuxVideoIdentity(attempt)
+            let operation = try withLane {
+                guard remuxFormatAuthorityWitness == nil
+                    || remuxFormatAuthorityWitness === attempt.remuxFormatAuthorityWitness else {
+                    throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+                }
+                // rollover、票据及容量仍在唯一 payload claim 前验证。
+                var admission = try preflightRemuxAdmissionIsolated(attempt,
+                    ticket: ticket, sampleIdentity: identity,
+                    readinessFailurePolicy: .awaiting)
+                defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                let sample = try attempt.materializeForWriter(
+                    HLSVideoRemuxWriterMaterializationAuthority(binding: binding))
+                return try beginAwaitingAppendIsolated(sample, ticket: ticket,
+                    sampleIdentity: identity,
+                    ownership: FMP4InputOwnership { withExtendedLifetime(attempt.pending) {} },
+                    validatesSource: { _ in try attempt.validatesFrozenIdentity() },
+                    admission: &admission)
+            }
+            try await completeAwaitingAppend(operation) {
+                self.remuxFormatAuthorityWitness = attempt.remuxFormatAuthorityWitness
+            }
+        } catch {
+            ticket.abort(binding: binding, session: boundarySession)
+            _ = attempt.relinquishAfterAbort()
+            throw error
+        }
+    }
+
     func appendRemuxVideo(
         _ submission: HLSVideoRemuxSubmission,
         ticket: SegmentBoundaryAppendTicket
@@ -2453,112 +2698,12 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
         return try withLane {
-            guard incrementalAACReceipt == nil else {
-                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+            guard state == .started, !finishRequested, awaitingAppend == nil else {
+                throw SegmentedFMP4WriterFailure.illegalState
             }
-            guard emission.identity == emission.liveContext.encoderIdentity,
-                  ((incrementalAACLiveContext === emission.liveContext
-                    && emission.liveContext.matches(binding))
-                    || (incrementalAACLiveContext == nil
-                        && emission.liveContext.bind(to: binding))),
-                  incrementalAACNextOrdinal == emission.ordinal else {
-                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
-            }
-            guard systemWriter.isReadyForMoreMediaData else { return .retryLater }
-
-            let buffer = try emission.materializeSampleBuffer()
-            guard let format = CMSampleBufferGetFormatDescription(buffer),
-                  CMFormatDescriptionEqual(format, otherFormatDescription: sourceFormatHint),
-                  ObjectIdentifier(format) == emission.liveContext.formatIdentity,
-                  let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
-                  asbd.mFormatID == kAudioFormatMPEG4AAC,
-                  asbd.mSampleRate.rounded(.towardZero) == asbd.mSampleRate,
-                  let sampleRate = Int32(exactly: asbd.mSampleRate),
-                  sampleRate == 48_000,
-                  asbd.mFramesPerPacket > 0,
-                  CMSampleBufferGetNumSamples(buffer) > 0 else {
-                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
-            }
-            let decodedProduct = CMSampleBufferGetNumSamples(buffer)
-                .multipliedReportingOverflow(by: Int(asbd.mFramesPerPacket))
-            guard !decodedProduct.overflow,
-                  let decoded = Int64(exactly: decodedProduct.partialValue) else {
-                throw SegmentedFMP4WriterFailure.arithmeticOverflow
-            }
-            let leading = try trim(buffer,
-                key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
-                sampleRate: sampleRate)
-            let trailing = try trim(buffer,
-                key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
-                sampleRate: sampleRate)
-            let trims = leading.addingReportingOverflow(trailing)
-            let effective = decoded.subtractingReportingOverflow(trims.partialValue)
-            guard !trims.overflow, !effective.overflow, effective.partialValue >= 0,
-                  leading <= decoded, trailing <= decoded,
-                  emission.isFinalBuffer || trailing == 0,
-                  emission.ordinal == 0 || leading == 0,
-                  emission.ordinal != 0
-                    || leading == Int64(emission.liveContext.calibratedLeadingFrames),
-                  let leadingInt = Int(exactly: leading) else {
-                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
-            }
-            let duration = try ExactMediaTime(CMSampleBufferGetDuration(buffer))
-            guard duration == ExactMediaTime(value: decoded, timescale: sampleRate) else {
-                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
-            }
-            let physical = try ExactMediaTime(
-                CMSampleBufferGetPresentationTimeStamp(buffer))
-            let output = try ExactMediaTime(
-                CMSampleBufferGetOutputPresentationTimeStamp(buffer))
-            let previous = incrementalAACAccounting
-            if let previous {
-                guard previous.encoderIdentity == emission.identity,
-                      previous.sampleRate == sampleRate,
-                      previous.nextPhysicalStart == physical,
-                      previous.nextOutputStart == output,
-                      !previous.sawFinalEmission else {
-                    throw SegmentedFMP4WriterFailure.aacEndpointMismatch
-                }
-            } else {
-                guard AACIncrementalStreamAccounting.firstEmissionIsValid(
-                    decodedFrames: decoded,
-                    leadingFrames: leading,
-                    trailingFrames: trailing),
-                      output == (try physical.adding(
-                    ExactMediaTime(value: leading, timescale: sampleRate))) else {
-                    throw SegmentedFMP4WriterFailure.aacEndpointMismatch
-                }
-            }
-            let nextCount = incrementalAACNextOrdinal.addingReportingOverflow(1)
-            let previousDecoded = previous?.totalDecodedFrames ?? 0
-            let nextDecoded = previousDecoded.addingReportingOverflow(decoded)
-            let previousReal = previous?.realSampleCount ?? 0
-            let nextReal = previousReal.addingReportingOverflow(effective.partialValue)
-            guard !nextCount.overflow, !nextDecoded.overflow, !nextReal.overflow else {
-                throw SegmentedFMP4WriterFailure.arithmeticOverflow
-            }
-            let nextDigest = AACRenditionEncoder.foldEmissionDigest(
-                incrementalAACDigest,
-                ordinal: emission.ordinal,
-                evidence: emission.evidenceDigest)
-            let prospective = AACIncrementalStreamAccounting(
-                encoderIdentity: emission.identity,
-                inputCount: nextCount.partialValue,
-                inputDigest: nextDigest,
-                realSampleCount: nextReal.partialValue,
-                totalDecodedFrames: nextDecoded.partialValue,
-                leadingFrames: previous?.leadingFrames ?? leadingInt,
-                trailingFrames: trailing,
-                sampleRate: sampleRate,
-                firstPhysicalStart: previous?.firstPhysicalStart ?? physical,
-                firstOutputStart: previous?.firstOutputStart ?? output,
-                nextPhysicalStart: try physical.adding(duration),
-                nextOutputStart: try output.adding(
-                    ExactMediaTime(value: effective.partialValue,
-                                   timescale: sampleRate)),
-                sawFinalEmission: emission.isFinalBuffer,
-                liveContextIdentity: emission.liveContextIdentity,
-                lastEmissionEvidenceDigest: emission.evidenceDigest)
+            guard let prepared = try prepareAACIncrementalIsolated(emission,
+                awaitsReadiness: false) else { return .retryLater }
+            let buffer = prepared.buffer
             let identity = try SegmentBoundaryCoordinator.aacIdentity(buffer)
             var ticket: SegmentBoundaryAppendTicket?
             var systemAppendSucceeded = false
@@ -2605,17 +2750,193 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             }
             // 只有系统 append、ticket commit 与 writer 账本全部成功后，才一次提交
             // 增量 snapshot/ordinal/digest；暂时不可写返回时这些值保持不变。
-            incrementalAACAccounting = prospective
-            incrementalAACNextOrdinal = nextCount.partialValue
-            incrementalAACDigest = nextDigest
-            incrementalAACLiveContext = emission.liveContext
-            if windowFirstPhysicalStart == nil {
-                windowFirstPhysicalStart = physical
-                windowFirstOutputStart = output
-                windowLeadingFrames = leading
-            }
+            commitAACPreparationIsolated(prepared, emission: emission)
             return .appended
         }
+    }
+
+    private struct AACAppendPreparation {
+        let buffer: CMSampleBuffer
+        let accounting: AACIncrementalStreamAccounting
+        let nextOrdinal: UInt64
+        let digest: Data
+        let physical: ExactMediaTime
+        let output: ExactMediaTime
+        let leading: Int64
+    }
+
+    private func prepareAACIncrementalIsolated(
+        _ emission: AACIncrementalEmission,
+        awaitsReadiness: Bool
+    ) throws -> AACAppendPreparation? {
+        guard incrementalAACReceipt == nil else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        guard emission.identity == emission.liveContext.encoderIdentity,
+              ((incrementalAACLiveContext === emission.liveContext
+                && emission.liveContext.matches(binding))
+                || (incrementalAACLiveContext == nil
+                    && emission.liveContext.bind(to: binding))),
+              incrementalAACNextOrdinal == emission.ordinal else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        if !awaitsReadiness, !systemWriter.isReadyForMoreMediaData { return nil }
+
+        let buffer = try emission.materializeSampleBuffer()
+        guard let format = CMSampleBufferGetFormatDescription(buffer),
+              CMFormatDescriptionEqual(format, otherFormatDescription: sourceFormatHint),
+              ObjectIdentifier(format) == emission.liveContext.formatIdentity,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatMPEG4AAC,
+              asbd.mSampleRate.rounded(.towardZero) == asbd.mSampleRate,
+              let sampleRate = Int32(exactly: asbd.mSampleRate),
+              sampleRate == 48_000,
+              asbd.mFramesPerPacket > 0,
+              CMSampleBufferGetNumSamples(buffer) > 0 else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        let decodedProduct = CMSampleBufferGetNumSamples(buffer)
+            .multipliedReportingOverflow(by: Int(asbd.mFramesPerPacket))
+        guard !decodedProduct.overflow,
+              let decoded = Int64(exactly: decodedProduct.partialValue) else {
+            throw SegmentedFMP4WriterFailure.arithmeticOverflow
+        }
+        let leading = try trim(buffer,
+            key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+            sampleRate: sampleRate)
+        let trailing = try trim(buffer,
+            key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
+            sampleRate: sampleRate)
+        let trims = leading.addingReportingOverflow(trailing)
+        let effective = decoded.subtractingReportingOverflow(trims.partialValue)
+        guard !trims.overflow, !effective.overflow, effective.partialValue >= 0,
+              leading <= decoded, trailing <= decoded,
+              emission.isFinalBuffer || trailing == 0,
+              emission.ordinal == 0 || leading == 0,
+              emission.ordinal != 0
+                || leading == Int64(emission.liveContext.calibratedLeadingFrames),
+              let leadingInt = Int(exactly: leading) else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        let duration = try ExactMediaTime(CMSampleBufferGetDuration(buffer))
+        guard duration == ExactMediaTime(value: decoded, timescale: sampleRate) else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        let physical = try ExactMediaTime(
+            CMSampleBufferGetPresentationTimeStamp(buffer))
+        let output = try ExactMediaTime(
+            CMSampleBufferGetOutputPresentationTimeStamp(buffer))
+        let previous = incrementalAACAccounting
+        if let previous {
+            guard previous.encoderIdentity == emission.identity,
+                  previous.sampleRate == sampleRate,
+                  previous.nextPhysicalStart == physical,
+                  previous.nextOutputStart == output,
+                  !previous.sawFinalEmission else {
+                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+            }
+        } else {
+            guard AACIncrementalStreamAccounting.firstEmissionIsValid(
+                decodedFrames: decoded,
+                leadingFrames: leading,
+                trailingFrames: trailing),
+                  output == (try physical.adding(
+                ExactMediaTime(value: leading, timescale: sampleRate))) else {
+                throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+            }
+        }
+        let nextCount = incrementalAACNextOrdinal.addingReportingOverflow(1)
+        let previousDecoded = previous?.totalDecodedFrames ?? 0
+        let nextDecoded = previousDecoded.addingReportingOverflow(decoded)
+        let previousReal = previous?.realSampleCount ?? 0
+        let nextReal = previousReal.addingReportingOverflow(effective.partialValue)
+        guard !nextCount.overflow, !nextDecoded.overflow, !nextReal.overflow else {
+            throw SegmentedFMP4WriterFailure.arithmeticOverflow
+        }
+        let nextDigest = AACRenditionEncoder.foldEmissionDigest(
+            incrementalAACDigest,
+            ordinal: emission.ordinal,
+            evidence: emission.evidenceDigest)
+        let prospective = AACIncrementalStreamAccounting(
+            encoderIdentity: emission.identity,
+            inputCount: nextCount.partialValue,
+            inputDigest: nextDigest,
+            realSampleCount: nextReal.partialValue,
+            totalDecodedFrames: nextDecoded.partialValue,
+            leadingFrames: previous?.leadingFrames ?? leadingInt,
+            trailingFrames: trailing,
+            sampleRate: sampleRate,
+            firstPhysicalStart: previous?.firstPhysicalStart ?? physical,
+            firstOutputStart: previous?.firstOutputStart ?? output,
+            nextPhysicalStart: try physical.adding(duration),
+            nextOutputStart: try output.adding(
+                ExactMediaTime(value: effective.partialValue,
+                               timescale: sampleRate)),
+            sawFinalEmission: emission.isFinalBuffer,
+            liveContextIdentity: emission.liveContextIdentity,
+            lastEmissionEvidenceDigest: emission.evidenceDigest)
+        return AACAppendPreparation(buffer: buffer, accounting: prospective,
+            nextOrdinal: nextCount.partialValue, digest: nextDigest,
+            physical: physical, output: output, leading: leading)
+    }
+
+    private func commitAACPreparationIsolated(
+        _ prepared: AACAppendPreparation,
+        emission: AACIncrementalEmission
+    ) {
+        incrementalAACAccounting = prepared.accounting
+        incrementalAACNextOrdinal = prepared.nextOrdinal
+        incrementalAACDigest = prepared.digest
+        incrementalAACLiveContext = emission.liveContext
+        if windowFirstPhysicalStart == nil {
+            windowFirstPhysicalStart = prepared.physical
+            windowFirstOutputStart = prepared.output
+            windowLeadingFrames = prepared.leading
+        }
+    }
+
+    func appendAACIncrementalAwaitingReadiness(
+        _ emission: AACIncrementalEmission,
+        coordinator: SegmentBoundaryCoordinator
+    ) async throws -> AACIncrementalAppendResult {
+        try Task.checkCancellation()
+        guard trackKind == .aac, coordinator.session === boundarySession else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        let admitted = try withLane { () throws -> (AwaitingAppend, AACAppendPreparation) in
+            guard state == .started, !finishRequested, awaitingAppend == nil,
+                  let prepared = try prepareAACIncrementalIsolated(emission,
+                    awaitsReadiness: true) else {
+                throw SegmentedFMP4WriterFailure.illegalState
+            }
+            let identity = try SegmentBoundaryCoordinator.aacIdentity(prepared.buffer)
+            let ticket = try coordinator.issueAACAppend(for: prepared.buffer,
+                rendition: binding.renditionIdentity, writerBinding: binding)
+            do {
+                var admission = try preflightTypedIsolated(prepared.buffer,
+                    ticket: ticket, sampleIdentity: identity,
+                    readinessFailurePolicy: .awaiting)
+                defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                let operation = try beginAwaitingAppendIsolated(prepared.buffer,
+                    ticket: ticket, sampleIdentity: identity,
+                    ownership: FMP4InputOwnership { withExtendedLifetime(emission) {} },
+                    // 此 header 是 writer 从不可变 emission 私有物化的，外部没有 header
+                    // alias；复核签出它的 live context，无需再分配一次 payload。
+                    validatesSource: { [binding] _ in
+                        emission.identity == emission.liveContext.encoderIdentity
+                            && emission.liveContext.matches(binding)
+                    },
+                    admission: &admission)
+                return (operation, prepared)
+            } catch {
+                ticket.abort(binding: binding, session: boundarySession)
+                throw error
+            }
+        }
+        try await completeAwaitingAppend(admitted.0) {
+            self.commitAACPreparationIsolated(admitted.1, emission: emission)
+        }
+        return .appended
     }
 
     func sealAACIncrementalStream(
@@ -2659,42 +2980,42 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         try await withCheckedThrowingContinuation { continuation in
             let immediate: Result<SegmentedFMP4WriterTerminalReceipt, Error>? = withLane {
                 if let receipt = storedTerminalReceipt { return .success(receipt) }
-                guard state == .started else {
+                guard state == .started, !finishRequested else {
                     return .failure(SegmentedFMP4WriterFailure.illegalState)
                 }
-                guard mediaPendingCallbackCount < Self.pendingCallbackCapacity,
-                      relay.canReserve(projectedByteCount: currentSegmentProjectedBytes) else {
-                    systemWriter.cancelWriting()
-                    _ = signTerminalIsolated(.failed)
-                    return .failure(SegmentedFMP4WriterFailure.illegalState)
-                }
-                do {
-                    let ticket = try relay.reserve(
-                        kind: .media,
-                        logicalSequence: lastLogicalSequence ?? 0,
-                        projectedByteCount: currentSegmentProjectedBytes
-                    )
-                    pendingCallbacks.append(.init(
-                        ticket: ticket,
-                        kind: .media,
-                        logicalSequence: lastLogicalSequence ?? 0,
-                        boundary: currentPublicationBoundary,
-                        frameDuration: currentFrameDuration
-                    ))
-                } catch {
+                finishRequested = true
+                finishContinuation = continuation
+                // 已准入的 append 仍可提交；后续输入已被封闭。native 返回后才 finish。
+                guard awaitingAppend == nil else { return nil }
+                do { try beginFinishIsolated() }
+                catch {
+                    finishContinuation = nil
                     systemWriter.cancelWriting()
                     _ = signTerminalIsolated(.failed)
                     return .failure(error)
                 }
-                state = .finishing
-                finishContinuation = continuation
-                systemWriter.markInputAsFinished()
-                systemWriter.finishWriting { [weak self] succeeded in
-                    self?.finishSystemDidComplete(succeeded)
-                }
                 return nil
             }
             if let immediate { continuation.resume(with: immediate) }
+        }
+    }
+
+    private func beginFinishIsolated() throws {
+        guard state == .started, finishRequested, awaitingAppend == nil,
+              mediaPendingCallbackCount < Self.pendingCallbackCapacity,
+              relay.canReserve(projectedByteCount: currentSegmentProjectedBytes) else {
+            throw SegmentedFMP4WriterFailure.illegalState
+        }
+        let ticket = try relay.reserve(kind: .media,
+            logicalSequence: lastLogicalSequence ?? 0,
+            projectedByteCount: currentSegmentProjectedBytes)
+        pendingCallbacks.append(.init(ticket: ticket, kind: .media,
+            logicalSequence: lastLogicalSequence ?? 0,
+            boundary: currentPublicationBoundary, frameDuration: currentFrameDuration))
+        state = .finishing
+        systemWriter.markInputAsFinished()
+        systemWriter.finishWriting { [weak self] succeeded in
+            self?.finishSystemDidComplete(succeeded)
         }
     }
 
@@ -2863,29 +3184,40 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
 
     @discardableResult
     func cancel() -> SegmentedFMP4WriterTerminalReceipt {
-        var mustJoinRegisteredCleanup = false
-        let result: (
-            SegmentedFMP4WriterTerminalReceipt,
-            CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?
-        )? = withLane {
-            if let storedTerminalReceipt { return (storedTerminalReceipt, nil) }
-            if state == .retiring {
-                mustJoinRegisteredCleanup = true
-                return nil
-            }
-            systemWriter.cancelWriting()
-            let continuation = finishContinuation
-            finishContinuation = nil
-            return (signTerminalIsolated(.cancelled), continuation)
+        requestCancellation()
+        // 兼容同步调用方的终态返回；等待始终发生在 writer lane 外。
+        cleanupGroup.wait()
+        return withLane { storedTerminalReceipt! }
+    }
+
+    func cancelAwaitingCompletion() async -> SegmentedFMP4WriterTerminalReceipt {
+        requestCancellation()
+        await withCheckedContinuation { continuation in
+            cleanupGroup.notify(queue: cleanupQueue) { continuation.resume() }
         }
-        if mustJoinRegisteredCleanup {
-            cleanupGroup.wait()
-            return withLane { storedTerminalReceipt! }
+        return withLane { storedTerminalReceipt! }
+    }
+
+    /// 图层 retire 必须先发出取消，再等待自己的 worker；这里不等待在途输入归来。
+    func requestCancellation() {
+        let action = withLane { () -> (CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?, Bool) in
+            guard state != .terminal, state != .retiring else { return (nil, false) }
+            state = .retiring
+            cleanupGroup.enter()
+            return (takeFinishContinuationIsolated(), true)
         }
-        guard let result else { preconditionFailure("缺失 writer 终态") }
-        result.1?.resume(throwing: SegmentedFMP4WriterFailure.illegalState)
-        relay.notifyPublicationDrainIfReady()
-        return result.0
+        guard action.1 else { return }
+        scheduleRetirementCleanup(action.0,
+            result: .failure(CancellationError()), reason: .cancelled)
+    }
+
+    private func requestAppendFailureRetirement() {
+        let action = withLane { () -> (CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?, Error)? in
+            guard state != .terminal, state != .retiring else { return nil }
+            let failure = systemFailureIsolated()
+            return (beginFailureRetirementIsolated(), failure)
+        }
+        if let action { scheduleFailureCleanup(action.0, result: .failure(action.1)) }
     }
 
     func receiveSystemSegment(
@@ -3204,11 +3536,101 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         try recordAppendIsolated(sampleBuffer, ticket: ticket)
     }
 
+    /// lane 只负责准入及所有权登记；系统等待由唯一在途 Task 持有。
+    private func beginAwaitingAppendIsolated(
+        _ sampleBuffer: CMSampleBuffer,
+        ticket: SegmentBoundaryAppendTicket,
+        sampleIdentity: SegmentBoundarySampleIdentity,
+        ownership: FMP4InputOwnership,
+        validatesSource: @escaping @Sendable (NativeSampleFacts) throws -> Bool,
+        admission: inout AppendPreflightAdmission
+    ) throws -> AwaitingAppend {
+        let facts = try NativeSampleFacts.freeze(sampleBuffer)
+        // 上游提交后只读使用同一冻结 sample。跨 executor 传递 CoreMedia 的 ready
+        // 容器；账本也只在其同步借用中读取，所有 backing owner 保留到 native 归来。
+        let sample = try nativeReadySample(copying: sampleBuffer)
+        guard try sample.withUnsafeSampleBuffer({ try NativeSampleFacts.freeze($0) }) == facts,
+              try validatesSource(facts) else {
+            throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+        }
+        try flushIfRequiredIsolated(ticket, admission: &admission)
+        guard state == .started, !finishRequested, awaitingAppend == nil,
+              retainedTerminalOwnerships.count < ownershipLimits.hardCapacity,
+              ticket.prepare(binding: binding, trackKind: trackKind,
+                             sampleIdentity: sampleIdentity, session: boundarySession) else {
+            throw SegmentedFMP4WriterFailure.boundaryMismatch
+        }
+        retainedTerminalOwnerships.append(ownership)
+        let identity = UUID()
+        let native = Task { [self, sample, ticket, sampleIdentity] in
+            try await AppendSuccessAuthority.appendAwaitingReadiness(sample, using: self,
+                operationIdentity: identity, ticket: ticket, sampleIdentity: sampleIdentity)
+        }
+        let operation = AwaitingAppend(identity: identity, sample: sample,
+            ticket: ticket, sampleIdentity: sampleIdentity, native: native,
+            facts: facts, validatesSource: validatesSource)
+        awaitingAppend = operation
+        return operation
+    }
+
+    private func completeAwaitingAppend(
+        _ operation: AwaitingAppend,
+        afterCommit: () throws -> Void = {}
+    ) async throws {
+        do {
+            let authority = try await withTaskCancellationHandler {
+                try await operation.native.value
+            } onCancel: {
+                self.requestCancellation()
+            }
+            try Task.checkCancellation()
+            try withLane {
+                guard state == .started, awaitingAppend?.identity == operation.identity else {
+                    throw CancellationError()
+                }
+                try operation.sample.withUnsafeSampleBuffer { sample in
+                    guard try NativeSampleFacts.freeze(sample) == operation.facts,
+                          try operation.validatesSource(operation.facts) else {
+                        throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+                    }
+                    guard commitAppendIsolated(sample, ticket: operation.ticket,
+                        sampleIdentity: operation.sampleIdentity, authority: authority) else {
+                        throw SegmentedFMP4WriterFailure.boundaryMismatch
+                    }
+                    try failRecordAppendIfRequestedIsolated()
+                    try recordAppendIsolated(sample, ticket: operation.ticket)
+                }
+                try afterCommit()
+                awaitingAppend = nil
+                if finishRequested { try beginFinishIsolated() }
+            }
+        } catch {
+            operation.ticket.abort(binding: binding, session: boundarySession)
+            let failure: Error = withLane {
+                if state == .retiring || state == .terminal { return error }
+                if error is CancellationError { return error }
+                if let typed = error as? SegmentedFMP4WriterFailure { return typed }
+                if firstSystemFailureDiagnostic == nil {
+                    firstSystemFailureDiagnostic = systemWriter.failureDiagnostic
+                        ?? PlaybackErrorDiagnostics.snapshot(error)
+                }
+                return systemFailureIsolated()
+            }
+            if error is CancellationError { requestCancellation() }
+            else { requestAppendFailureRetirement() }
+            await withCheckedContinuation { continuation in
+                cleanupGroup.notify(queue: cleanupQueue) { continuation.resume() }
+            }
+            throw failure
+        }
+    }
+
     /// remux 的所有可恢复准入必须发生在一次性 payload claim 之前。
     private func preflightRemuxAdmissionIsolated(
         _ attempt: HLSVideoRemuxWriterAttempt,
         ticket: SegmentBoundaryAppendTicket,
-        sampleIdentity: SegmentBoundarySampleIdentity
+        sampleIdentity: SegmentBoundarySampleIdentity,
+        readinessFailurePolicy: ReadinessFailurePolicy = .recoverable
     ) throws -> AppendPreflightAdmission {
         let charge = attempt.remuxPayloadByteCount.addingReportingOverflow(
             Self.sampleChargeOverhead
@@ -3227,7 +3649,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             ),
             ticket: ticket,
             sampleIdentity: sampleIdentity,
-            readinessFailurePolicy: .recoverable
+            readinessFailurePolicy: readinessFailurePolicy
         )
     }
 
@@ -3239,6 +3661,16 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         guard let authority = AppendSuccessAuthority.append(
             sampleBuffer, using: self, ticket: ticket, sampleIdentity: sampleIdentity
         ) else { return false }
+        return commitAppendIsolated(sampleBuffer, ticket: ticket,
+            sampleIdentity: sampleIdentity, authority: authority)
+    }
+
+    private func commitAppendIsolated(
+        _ sampleBuffer: CMSampleBuffer,
+        ticket: SegmentBoundaryAppendTicket,
+        sampleIdentity: SegmentBoundarySampleIdentity,
+        authority: AppendSuccessAuthority
+    ) -> Bool {
         guard ticket.commit(authority: authority), let boundary = ticket.committedBoundary else { return false }
         if currentSegmentInputCount == 0 {
             currentPublicationBoundary = boundary
@@ -3279,7 +3711,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private func preflightTypedIsolated(
         _ sampleBuffer: CMSampleBuffer,
         ticket: SegmentBoundaryAppendTicket,
-        sampleIdentity: SegmentBoundarySampleIdentity
+        sampleIdentity: SegmentBoundarySampleIdentity,
+        readinessFailurePolicy: ReadinessFailurePolicy = .terminal
     ) throws -> AppendPreflightAdmission {
         guard let format = CMSampleBufferGetFormatDescription(sampleBuffer) else {
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
@@ -3314,7 +3747,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             ),
             ticket: ticket,
             sampleIdentity: sampleIdentity,
-            readinessFailurePolicy: .terminal
+            readinessFailurePolicy: readinessFailurePolicy
         )
     }
 
@@ -3326,7 +3759,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         sampleIdentity: SegmentBoundarySampleIdentity,
         readinessFailurePolicy: ReadinessFailurePolicy
     ) throws -> AppendPreflightAdmission {
-        guard state == .started else { throw SegmentedFMP4WriterFailure.illegalState }
+        guard state == .started, !finishRequested, awaitingAppend == nil else {
+            throw SegmentedFMP4WriterFailure.illegalState
+        }
         guard ticket.accepts(
             binding: binding,
             trackKind: trackKind,
@@ -3446,7 +3881,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 throw SegmentedFMP4WriterFailure.boundaryMismatch
             }
         }
-        guard systemWriter.isReadyForMoreMediaData else {
+        if readinessFailurePolicy != .awaiting, !systemWriter.isReadyForMoreMediaData {
             if readinessFailurePolicy == .terminal {
                 // 已物化 typed sample 的系统 readiness 是运行时失败；remux 则在唯一
                 // payload claim 前以 recoverable 策略返回，不取消仍可继续的 writer。
@@ -3513,7 +3948,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ buffers: [CMSampleBuffer],
         preview: [SegmentBoundaryInspection]
     ) throws {
-        guard state == .started else { throw SegmentedFMP4WriterFailure.illegalState }
+        guard state == .started, !finishRequested, awaitingAppend == nil else {
+            throw SegmentedFMP4WriterFailure.illegalState
+        }
         guard !rolloverPending, buffers.count == preview.count else {
             throw SegmentedFMP4WriterFailure.rolloverRequired
         }
@@ -3799,16 +4236,33 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ continuation: CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?,
         result: Result<SegmentedFMP4WriterTerminalReceipt, Error>
     ) {
+        scheduleRetirementCleanup(continuation, result: result, reason: .failed)
+    }
+
+    private func scheduleRetirementCleanup(
+        _ continuation: CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?,
+        result: Result<SegmentedFMP4WriterTerminalReceipt, Error>,
+        reason: SegmentedFMP4WriterTerminalReason
+    ) {
+        let native = withLane { awaitingAppend?.native }
+        native?.cancel()
         cleanupQueue.async { [self] in
             systemWriter?.cancelWriting()
-            withLane {
-                guard state == .retiring else { return }
-                _ = signTerminalIsolated(.failed)
+            Task { [self] in
+                // native 可能晚成功；取消封闭的事务已不能签发 append 资格。
+                // backing、pending callback 和 admission ownership 至此才可释放。
+                if let native { _ = await native.result }
+                withLane {
+                    guard state == .retiring else { return }
+                    awaitingAppend = nil
+                    _ = signTerminalIsolated(reason)
+                }
+                if let continuation {
+                    resumeAfterPublications(continuation, with: result)
+                }
+                relay.notifyPublicationDrainIfReady()
+                cleanupGroup.leave()
             }
-            if let continuation {
-                resumeAfterPublications(continuation, with: result)
-            }
-            cleanupGroup.leave()
         }
     }
 

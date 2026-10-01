@@ -32,6 +32,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
     private var storedLastCommittedEmissionIdentity: AACIncrementalEmissionIdentity?
     private var physicalWriterCount = 1
     private var rolloverInProgress = false
+    private var asyncRunnerActive = false
     private var candidateTicket: AudioOnlyCandidateTicket?
     private var drainFences: CandidateBranchDrainFences?
 
@@ -113,8 +114,16 @@ final class AudioRenditionBranch: @unchecked Sendable {
     }
 
     func pump(_ input: AACStreamPumpInput) throws -> AACStreamPumpResult {
-        runner.lock()
-        defer { runner.unlock() }
+        try runner.withLock {
+            guard lock.withLock({ !asyncRunnerActive && !rolloverInProgress }) else {
+                throw AACRenditionFailure.busy
+            }
+            try collectPumpIsolated(input)
+            return try flushPendingIsolated()
+        }
+    }
+
+    private func collectPumpIsolated(_ input: AACStreamPumpInput) throws {
         guard lock.withLock({ !ended }) else {
             throw AACRenditionFailure.invalidInput
         }
@@ -145,12 +154,54 @@ final class AudioRenditionBranch: @unchecked Sendable {
             pending = PendingBatch(emissions: emissions, result: result,
                                    lease: pumpLease)
         }
-        return try flushPendingIsolated()
+    }
+
+    /// runner 只覆盖 converter 的同步操作；native append 等待期间用状态门保持单入口。
+    func pumpAwaitingWriter(_ input: AACStreamPumpInput) async throws -> AACStreamPumpResult {
+        try claimAsyncRunner()
+        defer { endAsyncRunner() }
+        try runner.withLock { try collectPumpIsolated(input) }
+        return try await flushPendingAwaitingWriter()
+    }
+
+    func retryPendingAwaitingWriter() async throws -> AACStreamPumpResult? {
+        try claimAsyncRunner()
+        defer { endAsyncRunner() }
+        guard lock.withLock({ pending != nil }) else { return nil }
+        return try await flushPendingAwaitingWriter()
+    }
+
+    private func claimAsyncRunner() throws {
+        try runner.withLock {
+            try lock.withLock {
+                guard !ended, !asyncRunnerActive, !rolloverInProgress else {
+                    throw AACRenditionFailure.busy
+                }
+                asyncRunnerActive = true
+            }
+        }
+    }
+
+    private func endAsyncRunner() {
+        let retiring = lock.withLock { () -> PendingBatch? in
+            asyncRunnerActive = false
+            guard ended else { return nil }
+            defer { pending = nil }
+            return pending
+        }
+        retiring?.lease.release()
+    }
+
+    var isWriterWindowRolloverPending: Bool {
+        lock.withLock { writer.isAACWriterWindowRolloverPending }
     }
 
     func retryPending() throws -> AACStreamPumpResult? {
         runner.lock()
         defer { runner.unlock() }
+        guard lock.withLock({ !asyncRunnerActive && !rolloverInProgress }) else {
+            throw AACRenditionFailure.busy
+        }
         guard lock.withLock({ pending != nil }) else { return nil }
         return try flushPendingIsolated()
     }
@@ -160,7 +211,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
     func retryPendingAcrossWriterWindow() async throws -> AACStreamPumpResult? {
         var createdWriter: SegmentedFMP4Writer?
         let oldWriter: SegmentedFMP4Writer = try lock.withLock {
-            guard pending != nil, !ended, !rolloverInProgress,
+            guard pending != nil, !ended, !rolloverInProgress, !asyncRunnerActive,
                   writer.isAACWriterWindowRolloverPending,
                   writerWindowFactory != nil else {
                 throw AACRenditionFailure.busy
@@ -198,6 +249,45 @@ final class AudioRenditionBranch: @unchecked Sendable {
             if let createdWriter, createdWriter !== oldWriter {
                 _ = createdWriter.cancel()
             }
+            throw error
+        }
+    }
+
+    func retryPendingAcrossWriterWindowAwaitingWriter() async throws -> AACStreamPumpResult? {
+        try claimAsyncRunner()
+        defer { endAsyncRunner() }
+        let oldWriter = try lock.withLock { () throws -> SegmentedFMP4Writer in
+            guard pending != nil, writer.isAACWriterWindowRolloverPending,
+                  writerWindowFactory != nil else { throw AACRenditionFailure.busy }
+            rolloverInProgress = true
+            return writer
+        }
+        var created: SegmentedFMP4Writer?
+        do {
+            let continuation = try await oldWriter.finishAACWriterWindow()
+            try Task.checkCancellation()
+            guard let writerWindowFactory else { throw AACRenditionFailure.invalidInput }
+            let next = try writerWindowFactory(continuation)
+            created = next
+            try next.start(at: .zero)
+            try lock.withLock {
+                guard writer === oldWriter, pending != nil, !ended else {
+                    throw AACRenditionFailure.cancelled
+                }
+                writer = next
+                physicalWriterCount += 1
+                rolloverInProgress = false
+            }
+            return try await flushPendingAwaitingWriter()
+        } catch {
+            let batch = lock.withLock { () -> PendingBatch? in
+                rolloverInProgress = false
+                ended = true
+                defer { pending = nil }
+                return pending
+            }
+            batch?.lease.release()
+            if let created { _ = await created.cancelAwaitingCompletion() }
             throw error
         }
     }
@@ -273,6 +363,60 @@ final class AudioRenditionBranch: @unchecked Sendable {
         }
     }
 
+    private func flushPendingAwaitingWriter() async throws -> AACStreamPumpResult {
+        guard let batch = lock.withLock({ pending }) else { throw AACRenditionFailure.invalidInput }
+        do {
+            while true {
+                let next = try lock.withLock { () throws -> (SegmentedFMP4Writer, AACIncrementalEmission)? in
+                    guard !ended, pending === batch else { throw AACRenditionFailure.cancelled }
+                    guard batch.nextIndex < batch.emissions.count else { return nil }
+                    return (writer, batch.emissions[batch.nextIndex])
+                }
+                guard let (currentWriter, emission) = next else { break }
+                let result = try await currentWriter.appendAACIncrementalAwaitingReadiness(
+                    emission, coordinator: coordinator)
+                guard result == .appended else { throw AACRenditionFailure.busy }
+                try lock.withLock {
+                    guard !ended, pending === batch else { throw AACRenditionFailure.cancelled }
+                    batch.nextIndex += 1
+                    let identity = AACIncrementalEmissionIdentity(emission)
+                    if storedFirstCommittedEmissionIdentity == nil { storedFirstCommittedEmissionIdentity = identity }
+                    storedLastCommittedEmissionIdentity = identity
+                }
+            }
+            if let final = batch.result.finalReceipt {
+                let current = lock.withLock { writer }
+                let receipt = try current.sealAACIncrementalStream(final)
+                try lock.withLock {
+                    guard !ended, pending === batch else { throw AACRenditionFailure.cancelled }
+                    precondition(storedWriterReceipt == nil, "AAC branch 终态只能封存一次")
+                    storedWriterReceipt = receipt
+                    storedFinalReceipt = final
+                    ended = true
+                }
+            }
+            lock.withLock { if pending === batch { pending = nil } }
+            batch.lease.release()
+            return batch.result
+        } catch SegmentedFMP4WriterFailure.rolloverRequired {
+            if lock.withLock({ ended }) {
+                lock.withLock { if pending === batch { pending = nil } }
+                batch.lease.release()
+                throw AACRenditionFailure.cancelled
+            }
+            return AACStreamPumpResult(needsInput: batch.result.needsInput,
+                summary: nil, finalReceipt: nil, waitingForWriter: true,
+                waitingForEncoderBudget: false)
+        } catch {
+            lock.withLock {
+                if pending === batch { pending = nil }
+                ended = true
+            }
+            batch.lease.release()
+            throw error
+        }
+    }
+
     func attachAudioOnlyCandidate(ticket: AudioOnlyCandidateTicket, fences: CandidateBranchDrainFences) {
         lock.withLock {
             candidateTicket = ticket
@@ -282,17 +426,26 @@ final class AudioRenditionBranch: @unchecked Sendable {
 
     func cancel(semantic: AudioServiceSemanticCoordinator? = nil) {
         admission.cancel()
-        runner.lock()
-        let retiring = lock.withLock { () -> PendingBatch? in
-            ended = true
-            defer { pending = nil }
-            return pending
+        let action = runner.withLock {
+            lock.withLock { () -> (SegmentedFMP4Writer, PendingBatch?, CandidateBranchDrainFences?) in
+                ended = true
+                // 异步 flush 独占的 batch 由该任务在 native 返回后释放 reservation。
+                let retiring = asyncRunnerActive ? nil : pending
+                if !asyncRunnerActive { pending = nil }
+                return (writer, retiring, drainFences)
+            }
         }
-        retiring?.lease.release()
-        let fencesToRetire = lock.withLock { drainFences }
-        _ = fencesToRetire?.retire(semantic: semantic)
-        runner.unlock()
+        action.0.requestCancellation()
+        action.1?.lease.release()
+        _ = action.2?.retire(semantic: semantic)
     }
+
+    func cancelAndAwait() async {
+        cancel()
+        let current = lock.withLock { writer }
+        _ = await current.cancelAwaitingCompletion()
+    }
+
 }
 
 struct AACIncrementalEmissionIdentity: Sendable, Hashable {
