@@ -29,8 +29,15 @@ final class SystemPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked S
     func activate() throws { try session.setActive(true) }
     func deactivate() throws { try session.setActive(false, options: .notifyOthersOnDeactivation) }
     func currentRoute() -> any AudioSessionRouteSnapshot {
-        // 恰好一次系统route getter；不读latency/buffer/rate/channel标量。
-        SystemAudioSessionRouteSnapshot(route: session.currentRoute)
+        // 路由及时序只在同一次授权 SDK 调用内读取，随后由原 sampler 的完成 CAS 提升。
+        let route = session.currentRoute
+        let outputLatency = session.outputLatency
+        let ioBufferDuration = session.ioBufferDuration
+        return SystemAudioSessionRouteSnapshot(
+            route: route,
+            outputLatency: outputLatency,
+            ioBufferDuration: ioBufferDuration
+        )
     }
     func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool {
         guard let base = bytes.baseAddress else { return false }
@@ -42,8 +49,12 @@ final class SystemPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked S
 final class SystemAudioSessionRouteSnapshot: AudioSessionRouteSnapshot, @unchecked Sendable {
     private let route: NSObject
     private let outputs: NSArray?
-    init(route: NSObject) {
+    let outputLatency: TimeInterval
+    let ioBufferDuration: TimeInterval
+    init(route: NSObject, outputLatency: TimeInterval = 0, ioBufferDuration: TimeInterval = 0) {
         self.route = route
+        self.outputLatency = outputLatency
+        self.ioBufferDuration = ioBufferDuration
         let selector = #selector(getter: AVAudioSessionRouteDescription.outputs)
         if route.responds(to: selector), let outputs = route.perform(selector)?.takeUnretainedValue() as? NSArray,
            outputs.count <= 32 { self.outputs = outputs }

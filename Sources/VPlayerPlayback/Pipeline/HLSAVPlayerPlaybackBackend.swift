@@ -260,6 +260,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("hls_backendPrepared")
             #endif
+            next.armRuntimeFailure()
         } catch {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("hls_catch_\(error)")
@@ -342,6 +343,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 latestReceipt = nil
             }
             _ = try await coordinator.prepareCurrentItem(invocation: invocation)
+            next.armRuntimeFailure()
         } catch {
             _ = await next.retireProducerGraph()
             lock.withLock {

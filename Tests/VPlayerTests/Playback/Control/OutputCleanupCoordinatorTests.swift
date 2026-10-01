@@ -19,7 +19,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             let call = try claimGraphRoute(registry, lane: fixture.lane,
                 observation: try XCTUnwrap(handoff.routeObservation), source: try XCTUnwrap(handoff.sampler))
             let registration = try XCTUnwrap(call.request.registration)
-            guard case .available(_, let fingerprint) = AudioSessionBlockingCallLane.project(
+            guard case .available(_, let fingerprint, _) = AudioSessionBlockingCallLane.project(
                 GraphRouteSnapshot.builtIn, salt: registration.salt) else { return XCTFail("真实SDK端点投影必须有效") }
             let result = AudioSessionBlockingCallResult.route(.available(ports: invalidPorts, endpointFingerprint: fingerprint))
             let completion = try completeGraphAudioCall(registry, lane: fixture.lane, call.request, result)

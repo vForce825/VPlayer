@@ -103,7 +103,7 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
                   authority.monitorLifecycle == registration.identity.monitorLifecycle,
                   let commit = registry.stableRouteCommitSnapshot(),
                   commit.exactlyMatches(authority, observationGateOpen: true) else { return }
-            let committedSnapshot = Self.snapshot(for: commit.authority,
+            let committedSnapshot = Self.snapshot(for: commit,
                 revision: lock.withLock { revision })
             handler(committedSnapshot)
         }
@@ -200,16 +200,16 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         commitHandler?(commit)
         let (subscriberCopy, snapshot) = lock.withLock {
             revision += 1
-            return (subscriber, Self.snapshot(for: commit.authority, revision: revision))
+            return (subscriber, Self.snapshot(for: commit, revision: revision))
         }
         subscriberCopy?(snapshot)
     }
 
     private static func snapshot(
-        for authority: PlaybackRouteAuthorityIdentity,
+        for commit: StableRouteCommitIdentity,
         revision: UInt64
     ) -> AudioOutputRouteSnapshot {
-        let ports = authority.semanticIdentity?.ports ?? []
+        let ports = commit.authority.semanticIdentity?.ports ?? []
         let category: AudioOutputRouteCategory
         if ports.contains(.airPlay) { category = .airPlay }
         else if ports.contains(.hdmi) { category = .hdmi }
@@ -217,6 +217,8 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         else if ports.isEmpty { category = .none }
         else { category = .other }
         return AudioOutputRouteSnapshot(ports: ports, category: category,
-            reason: .initial, revision: revision, outputLatency: 0, ioBufferDuration: 0)
+            reason: .initial, revision: revision,
+            outputLatency: commit.outputTiming.outputLatency,
+            ioBufferDuration: commit.outputTiming.ioBufferDuration)
     }
 }

@@ -1344,12 +1344,6 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             #endif
             return
         }
-        guard context.owner == nil else {
-            #if DEBUG
-            PlaybackDiagnosticTracker.shared.set("pipeline_event_has_owner")
-            #endif
-            return
-        }
         guard context.phase == .installed else {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("pipeline_event_phase_\(context.phase)")
@@ -1359,6 +1353,22 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         guard context.candidateBackendIdentity == backendIdentity else {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("pipeline_event_backend_mismatch")
+            #endif
+            return
+        }
+        let mayReceive: Bool
+        if case let .backendFailed(_, scope, _) = event {
+            // prepareNonce 只在已核对的原 run/backend/Registry 域中识别完整冻结票。
+            guard let ticket = context.prepareTicket, ticket.backendIdentity == backendIdentity,
+                  scope.matches(ticket) else { return }
+            // 普通 pause 保留同一媒体图；等待 suspend 时到达的唯一首错仍须终止该图。
+            mayReceive = context.owner == nil || context.owner?.reason == .pause
+        } else {
+            mayReceive = context.owner == nil
+        }
+        guard mayReceive else {
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.set("pipeline_event_has_owner")
             #endif
             return
         }
@@ -1403,6 +1413,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         case let .failed(error):
             terminalMetricsProvider = registry.terminalMetricsProjection(backendIdentity: backendIdentity)
             beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
+        case let .backendFailed(diagnostic, _, metadataOwner):
+            // 同步映射期间显式保留原预费；终态只留映射后的有界字符串，不保存 raw snapshot。
+            withExtendedLifetime(metadataOwner) {
+                terminalMetricsProvider = registry.terminalMetricsProjection(backendIdentity: backendIdentity)
+                let error = PlaybackCoreError.capture(diagnostic, stage: "hls.mediaGraph.runtime")
+                beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
+            }
         }
     }
 
@@ -1668,6 +1685,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         switch stage {
         case "backend.factory": "播放器创建"
         case "backend.prepare": "播放器准备"
+        case "hls.mediaGraph.runtime": "HLS 媒体生成"
         case "backend.reprepare": "播放器重新准备"
         case "backend.activation": "播放器输出激活"
         case "backend.suspend": "播放器输出暂停"

@@ -6,6 +6,111 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackAudioRouteServiceTests: XCTestCase {
+    func testAuthoritativeHDMISamplePublishesSystemOutputTiming() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .hdmi)
+        harness.sdk.setOutputTiming(outputLatency: 0.080, ioBufferDuration: 0.020)
+        try await harness.acquireWithoutNotification()
+        let received = RouteSnapshotRecorder()
+        harness.service.addSubscriber { snapshot in received.append(snapshot) }
+        XCTAssertNil(received.last, "最新 SDK 样本必须通过既有稳定提交后才能发布")
+
+        await harness.advanceThroughStabilityWindow()
+
+        let snapshot = try XCTUnwrap(received.last)
+        XCTAssertEqual(snapshot.category, .hdmi)
+        XCTAssertEqual(snapshot.outputLatency, 0.080, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.ioBufferDuration, 0.020, accuracy: 0.000_001)
+        XCTAssertEqual(harness.routeGetterCallCount, 1)
+    }
+
+    func testLateSubscriberReplaysCommittedOutputTimingWithoutReadingNewSDKState() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .hdmi)
+        harness.sdk.setOutputTiming(outputLatency: 0.080, ioBufferDuration: 0.020)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+
+        // 尚未通过新 sampler 的 SDK 状态不能覆盖已经提交的时序证据。
+        harness.sdk.setOutputTiming(outputLatency: 0.500, ioBufferDuration: 0.050)
+        let received = RouteSnapshotRecorder()
+        harness.service.addSubscriber { snapshot in received.append(snapshot) }
+
+        let snapshot = try XCTUnwrap(received.last)
+        XCTAssertEqual(snapshot.outputLatency, 0.080, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.ioBufferDuration, 0.020, accuracy: 0.000_001)
+        XCTAssertEqual(harness.routeGetterCallCount, 1,
+            "迟到订阅只能重放原 commit，不得在订阅回调旁路读取 SDK")
+    }
+
+    func testOutputTimingRefreshKeepsRouteSemanticAndOriginalStabilityDeadline() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .hdmi)
+        harness.sdk.setOutputTiming(outputLatency: 0.080, ioBufferDuration: 0.020)
+        try await harness.acquireWithoutNotification()
+        guard case .pending(let firstPending) = harness.registry.outputRouteObservationSnapshot() else {
+            return XCTFail("首次真实样本必须等待稳定提交")
+        }
+        let firstObservation = try XCTUnwrap(firstPending.ticket)
+        let firstTicket = try XCTUnwrap(try harness.registry.armOutputRouteStability(observation: firstObservation))
+        let received = RouteSnapshotRecorder()
+        harness.service.addSubscriber { snapshot in received.append(snapshot) }
+
+        harness.clock.advance(nanoseconds: 60_000_000)
+        harness.sdk.setOutputTiming(outputLatency: 0.120, ioBufferDuration: 0.030)
+        harness.service.resample(reason: .unknown)
+        try await harness.flushRouteSampler()
+        guard case .pending(let refreshedPending) = harness.registry.outputRouteObservationSnapshot() else {
+            return XCTFail("重采样完成后必须等待原稳定窗口")
+        }
+        let refreshedObservation = try XCTUnwrap(refreshedPending.ticket)
+        let refreshedTicket = try XCTUnwrap(try harness.registry.armOutputRouteStability(observation: refreshedObservation))
+        XCTAssertEqual(refreshedTicket.authority.semanticIdentity, firstTicket.authority.semanticIdentity,
+            "输出延迟是样本时序，不能创建另一种端点或配置身份")
+        XCTAssertEqual(refreshedTicket.anchorInstant, firstTicket.anchorInstant)
+        XCTAssertEqual(refreshedTicket.deadlineInstant, firstTicket.deadlineInstant,
+            "相同语义的新延迟不能重新延长 120ms 稳定窗口")
+        XCTAssertNil(received.last)
+
+        harness.clock.advance(nanoseconds: 65_000_000)
+        harness.clock.fireDeadlineTimerEarly()
+        harness.registry.executor.sync {}
+
+        let snapshot = try XCTUnwrap(received.last)
+        XCTAssertEqual(snapshot.outputLatency, 0.120, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.ioBufferDuration, 0.030, accuracy: 0.000_001)
+        XCTAssertEqual(harness.routeGetterCallCount, 2,
+            "每组时序数据必须来自各自的一次授权 route getter")
+        XCTAssertEqual(harness.registry.stableRouteCommitSnapshot()?.authority.semanticIdentity,
+            firstTicket.authority.semanticIdentity)
+    }
+
+    func testInvalidSDKOutputTimingClearsOnlyInvalidFieldAndKeepsUsableRoute() async throws {
+        let cases: [(TimeInterval, TimeInterval, TimeInterval, TimeInterval)] = [
+            (-0.080, 0.020, 0, 0.020),
+            (0.080, -0.020, 0.080, 0),
+            (.nan, 0.020, 0, 0.020),
+            (0.080, .nan, 0.080, 0),
+            (.infinity, 0.020, 0, 0.020),
+            (0.080, .infinity, 0.080, 0),
+        ]
+        for (index, values) in cases.enumerated() {
+            let harness = RouteServiceTestHarness(initialPorts: .hdmi)
+            harness.sdk.setOutputTiming(outputLatency: values.0, ioBufferDuration: values.1)
+            try await harness.acquireWithoutNotification()
+            await harness.advanceThroughStabilityWindow()
+            let received = RouteSnapshotRecorder()
+            harness.service.addSubscriber { snapshot in received.append(snapshot) }
+
+            let snapshot = try XCTUnwrap(received.last, "第 \(index) 组异常时序不能使有效 HDMI 端点消失")
+            XCTAssertEqual(snapshot.category, .hdmi)
+            XCTAssertTrue(snapshot.outputLatency.isFinite)
+            XCTAssertTrue(snapshot.ioBufferDuration.isFinite)
+            XCTAssertGreaterThanOrEqual(snapshot.outputLatency, 0)
+            XCTAssertGreaterThanOrEqual(snapshot.ioBufferDuration, 0)
+            XCTAssertEqual(snapshot.outputLatency, values.2, accuracy: 0.000_001)
+            XCTAssertEqual(snapshot.ioBufferDuration, values.3, accuracy: 0.000_001)
+            XCTAssertEqual(harness.routeGetterCallCount, 1)
+        }
+    }
+
     func testLateSubscriberReceivesCommittedBluetoothRoute() async throws {
         let harness = RouteServiceTestHarness(initialPorts: .bluetooth)
         try await harness.acquireWithoutNotification()

@@ -6579,6 +6579,212 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     }
 
 
+    func test实际接纳前没有覆盖且连续压缩样本延伸到各自结尾() throws {
+        // 撤销 accepted 后的覆盖更新，或把尚未送入 renderer 的输入当作覆盖，都会失败。
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        let observer: any AudioRendererCoverageObserving = harness.pipeline
+        let frameDuration = CMTime(value: 1_024, timescale: 48_000)
+        let firstSample = try makeSample(id: 1, pts: CMTime(value: 1, timescale: 1), duration: frameDuration)
+        XCTAssertEqual(CMTimeCompare(CMSampleBufferGetOutputDuration(firstSample.sampleBuffer), frameDuration), 0,
+            "AAC 夹具的实际输出时长必须与 48000 Hz 的 1024 帧一致")
+        XCTAssertNil(observer.acceptedCoverage)
+
+        renderer.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(firstSample)
+        }
+        XCTAssertNil(observer.acceptedCoverage, "保留队列中的样本尚未成为 renderer 覆盖")
+
+        renderer.configureReadiness(ready: true)
+        renderer.fireReady()
+        drain(harness.executor)
+        let first = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(first.generation, MediaGeneration(rawValue: 1))
+        XCTAssertEqual(first.continuityIslandID, AudioContinuityIslandID(rawValue: 1))
+        XCTAssertEqual(CMTimeCompare(first.firstPTS, CMTime(value: 1, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(first.endPTS, CMTime(value: 49_024, timescale: 48_000)), 0)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 49_024, timescale: 48_000),
+                duration: frameDuration
+            ))
+        }
+        let continuous = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(continuous.epoch, first.epoch)
+        XCTAssertEqual(CMTimeCompare(continuous.firstPTS, CMTime(value: 1, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(continuous.endPTS, CMTime(value: 50_048, timescale: 48_000)), 0,
+            "覆盖结尾必须包含连续样本的实际 duration")
+    }
+
+    func test暂时背压不能把尚未接纳的样本计入覆盖结尾() throws {
+        // 若 backpressured 分支也推进覆盖，第二个样本会提前把结尾推到两帧结尾。
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        let observer: any AudioRendererCoverageObserving = harness.pipeline
+        let frameDuration = CMTime(value: 1_024, timescale: 48_000)
+        let firstSample = try makeSample(id: 1, pts: CMTime(value: 2, timescale: 1), duration: frameDuration)
+        let secondSample = try makeSample(id: 2, pts: CMTime(value: 97_024, timescale: 48_000), duration: frameDuration)
+        XCTAssertEqual(CMTimeCompare(CMSampleBufferGetOutputDuration(firstSample.sampleBuffer), frameDuration), 0)
+        XCTAssertEqual(CMTimeCompare(CMSampleBufferGetOutputDuration(secondSample.sampleBuffer), frameDuration), 0)
+        renderer.configureReadiness(ready: true)
+        renderer.configureEnqueueResults([.accepted, .backpressured, .accepted])
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(firstSample)
+            try harness.pipeline.enqueue(secondSample)
+        }
+        let held = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(CMTimeCompare(held.firstPTS, CMTime(value: 2, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(held.endPTS, CMTime(value: 97_024, timescale: 48_000)), 0,
+            "背压期间保留的第二个样本不能扩展实际覆盖")
+
+        renderer.fireReady()
+        drain(harness.executor)
+        let accepted = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(accepted.epoch, held.epoch)
+        XCTAssertEqual(CMTimeCompare(accepted.firstPTS, CMTime(value: 2, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(accepted.endPTS, CMTime(value: 98_048, timescale: 48_000)), 0,
+            "解除背压后只有成功接纳才可延伸覆盖")
+    }
+
+    func test清空切岛和更换渲染器不能继承旧接纳覆盖() throws {
+        // 遗漏自动 flush、切岛、generation flush 或 replacement 的覆盖失效都会失败。
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        let observer: any AudioRendererCoverageObserving = harness.pipeline
+        let frameDuration = CMTime(value: 1_024, timescale: 48_000)
+        let firstSample = try makeSample(id: 1, pts: CMTime(value: 1, timescale: 1), duration: frameDuration)
+        XCTAssertEqual(CMTimeCompare(CMSampleBufferGetOutputDuration(firstSample.sampleBuffer), frameDuration), 0)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(firstSample)
+        }
+        _ = try XCTUnwrap(observer.acceptedCoverage)
+
+        renderer.configureReadiness(ready: false)
+        renderer.emit(.automaticFlush(CMTime(value: 1, timescale: 1)))
+        drain(harness.executor)
+        XCTAssertNil(observer.acceptedCoverage, "系统清空物理队列后历史接纳不再证明当前覆盖")
+        harness.recoveryScheduler.advance(by: AudioRecoveryCoordinator.collectionDelay)
+        drain(harness.executor)
+        XCTAssertNil(observer.acceptedCoverage, "重播仍受背压时不能恢复旧覆盖")
+        renderer.configureReadiness(ready: true)
+        renderer.fireReady()
+        drain(harness.executor)
+        _ = try XCTUnwrap(observer.acceptedCoverage)
+
+        let secondIsland = AudioContinuityIslandID(rawValue: 2)
+        try perform(on: harness.executor) {
+            harness.pipeline.activateContinuityIsland(secondIsland, generation: MediaGeneration(rawValue: 1))
+        }
+        XCTAssertNil(observer.acceptedCoverage, "新的连续岛不能继承上一岛的覆盖")
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 4, timescale: 1),
+                duration: frameDuration,
+                continuityIslandID: secondIsland
+            ))
+        }
+        let second = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(second.continuityIslandID, secondIsland)
+        XCTAssertEqual(CMTimeCompare(second.firstPTS, CMTime(value: 4, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(second.endPTS, CMTime(value: 193_024, timescale: 48_000)), 0)
+
+        let nextGeneration = MediaGeneration(rawValue: 2)
+        let thirdIsland = AudioContinuityIslandID(rawValue: 3)
+        try perform(on: harness.executor) {
+            harness.pipeline.flush(to: nextGeneration)
+            harness.pipeline.activateContinuityIsland(thirdIsland, generation: nextGeneration)
+        }
+        XCTAssertNil(observer.acceptedCoverage, "generation flush 必须撤销旧 epoch 的接纳证据")
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 3,
+                pts: CMTime(value: 6, timescale: 1),
+                duration: frameDuration,
+                generation: nextGeneration,
+                continuityIslandID: thirdIsland
+            ))
+        }
+        let current = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertNotEqual(current.epoch, second.epoch)
+        XCTAssertEqual(current.generation, nextGeneration)
+        XCTAssertEqual(current.continuityIslandID, thirdIsland)
+        XCTAssertEqual(CMTimeCompare(current.firstPTS, CMTime(value: 6, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(current.endPTS, CMTime(value: 289_024, timescale: 48_000)), 0)
+
+        renderer.emit(.failed("接纳覆盖更换渲染器"))
+        drain(harness.executor)
+        XCTAssertNil(observer.acceptedCoverage, "旧 renderer 进入移除过程即不再具有当前覆盖")
+        harness.synchronizer.completeRemoval(index: harness.synchronizer.removalCount - 1, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertNil(observer.acceptedCoverage, "新 renderer 尚未接纳重播前覆盖必须为空")
+        renderer.fireReady()
+        drain(harness.executor)
+        XCTAssertNil(observer.acceptedCoverage, "旧 renderer 的迟到 ready 不能恢复新 renderer 的覆盖")
+
+        replacement.configureReadiness(ready: true)
+        replacement.fireReady()
+        drain(harness.executor)
+        let replayed = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(replayed.generation, nextGeneration)
+        XCTAssertEqual(replayed.continuityIslandID, thirdIsland)
+        XCTAssertEqual(CMTimeCompare(replayed.firstPTS, CMTime(value: 6, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(replayed.endPTS, CMTime(value: 289_024, timescale: 48_000)), 0)
+    }
+
+    func testPCM覆盖使用实际输出样本时间而不是压缩输入时间() throws {
+        // 若沿用压缩 parser 输入的 1 秒起点和 1 秒 duration，覆盖会错误落在 [1, 2]。
+        let harness = makeCapabilityHarness(initialRouteCategory: .hdmi)
+        harness.decodeCapability.supported = false
+        harness.decoderFactory.pushBody = { _ in
+            [
+                try self.makePCMBuffer(pts: CMTime(value: 5, timescale: 1), frameCount: 12_000),
+                try self.makePCMBuffer(pts: CMTime(value: 21, timescale: 4), frameCount: 6_000),
+            ]
+        }
+        let observer: any AudioRendererCoverageObserving = harness.pipeline
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                self.makeRenderConfiguration(codec: .aac, extradata: Data([0x11, 0x90]), fingerprint: self.fingerprint(1)),
+                generation: MediaGeneration(rawValue: 1)
+            )
+            harness.pipeline.activateContinuityIsland(
+                AudioContinuityIslandID(rawValue: 1), generation: MediaGeneration(rawValue: 1)
+            )
+        }
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+        XCTAssertNil(observer.acceptedCoverage)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.configureEnqueueResults([.accepted, .backpressured, .accepted])
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1)
+            ))
+        }
+        let firstPCM = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(CMTimeCompare(firstPCM.firstPTS, CMTime(value: 5, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(firstPCM.endPTS, CMTime(value: 21, timescale: 4)), 0,
+            "48000 Hz 的 12000 帧实际覆盖四分之一秒，第二个 PCM 样本尚未接纳")
+
+        renderer.fireReady()
+        drain(harness.executor)
+        let allPCM = try XCTUnwrap(observer.acceptedCoverage)
+        XCTAssertEqual(allPCM.epoch, firstPCM.epoch)
+        XCTAssertEqual(allPCM.generation, MediaGeneration(rawValue: 1))
+        XCTAssertEqual(allPCM.continuityIslandID, AudioContinuityIslandID(rawValue: 1))
+        XCTAssertEqual(CMTimeCompare(allPCM.firstPTS, CMTime(value: 5, timescale: 1)), 0)
+        XCTAssertEqual(CMTimeCompare(allPCM.endPTS, CMTime(value: 43, timescale: 8)), 0,
+            "后续 6000 帧再增加八分之一秒，结尾不能取压缩输入或未接纳队列")
+    }
+
     private func assertCoreError(
         _ expected: PlaybackCoreError,
         file: StaticString = #filePath,

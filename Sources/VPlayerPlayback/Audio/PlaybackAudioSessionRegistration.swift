@@ -73,5 +73,12 @@ struct AudioSessionRouteEndpoint: @unchecked Sendable {
 
 protocol AudioSessionRouteSnapshot: AnyObject, Sendable {
     var endpointCount: Int { get }
+    var outputLatency: TimeInterval { get }
+    var ioBufferDuration: TimeInterval { get }
     func endpoint(at index: Int) -> AudioSessionRouteEndpoint
+}
+
+extension AudioSessionRouteSnapshot {
+    var outputLatency: TimeInterval { 0 }
+    var ioBufferDuration: TimeInterval { 0 }
 }

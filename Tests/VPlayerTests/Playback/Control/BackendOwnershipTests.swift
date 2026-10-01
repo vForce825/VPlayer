@@ -4,12 +4,16 @@
 
 import Foundation
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 final class TrackingPlaybackBackend: PlaybackBackend,
-    SampleBufferQuiescenceIssuerInstalling, @unchecked Sendable {
+    SampleBufferQuiescenceIssuerInstalling, BackendPublicationReplacementAuthorityInstalling,
+    @unchecked Sendable {
     let identity: PlaybackBackendIdentity
     let kind: PlaybackBackendKind
+    let backendPublicationReplacementAuthoritySlot =
+        ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
     let presentation: PlaybackPresentation? = .sampleBuffer(PlaybackPresentationContext())
     private weak var harness: BackendOwnershipTestHarness?
     
@@ -28,6 +32,23 @@ final class TrackingPlaybackBackend: PlaybackBackend,
     private var teardownResult: BackendTeardownResult = .confirmedLocalOutputStopped
     private var prepareCalls = 0
     private var activationCalls = 0
+    private var lastPrepareInvocation: ControlTaskRegistry.BackendPrepareInvocation?
+    var prepareInvocationForTesting: ControlTaskRegistry.BackendPrepareInvocation? {
+        lock.withLock { lastPrepareInvocation }
+    }
+    private var holdSuspend = false
+    private var suspendContinuation: CheckedContinuation<Void, Never>?
+
+    var isSuspendWaiting: Bool { lock.withLock { suspendContinuation != nil } }
+    func setHoldSuspend(_ hold: Bool) { lock.withLock { holdSuspend = hold } }
+    func completeSuspend() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            holdSuspend = false
+            defer { suspendContinuation = nil }
+            return suspendContinuation
+        }
+        continuation?.resume()
+    }
 
     func configureRetirement(required: Bool, result: BackendTeardownResult) {
         lock.withLock { requiresRetirement = required; teardownResult = result }
@@ -95,11 +116,10 @@ final class TrackingPlaybackBackend: PlaybackBackend,
     }
     
     func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
-        _ = invocation.ticket
-        lock.withLock { prepareCalls += 1 }
+        lock.withLock { prepareCalls += 1; lastPrepareInvocation = invocation }
     }
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
-        _ = invocation.ticket
+        lock.withLock { lastPrepareInvocation = invocation }
     }
     
     private func markAudible() -> Bool {
@@ -130,6 +150,17 @@ final class TrackingPlaybackBackend: PlaybackBackend,
     }
     
     func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async -> BackendSuspendResult {
+        if lock.withLock({ holdSuspend }) {
+            await withCheckedContinuation { continuation in
+                let released = lock.withLock { () -> Bool in
+                    guard holdSuspend else { return true }
+                    precondition(suspendContinuation == nil)
+                    suspendContinuation = continuation
+                    return false
+                }
+                if released { continuation.resume() }
+            }
+        }
         if lock.withLock({ requiresRetirement }) { return .requiresRetirement }
         if markInaudible() {
             harness?.decrementAudibleCount()
@@ -206,6 +237,12 @@ final class HarnessBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
     var configureBackend: (@Sendable (TrackingPlaybackBackend) -> Void)?
     private let lock = NSLock()
     private var _createdBackends: [TrackingPlaybackBackend] = []
+    private var eventSinks: [PlaybackBackendIdentity: @Sendable (PlaybackPipelineEvent) -> Void] = [:]
+
+    func emit(_ event: PlaybackPipelineEvent, from identity: PlaybackBackendIdentity) {
+        let sink = lock.withLock { eventSinks[identity] }
+        sink?(event)
+    }
     var holdCreation = false
     private var creationContinuation: CheckedContinuation<Void, Never>?
 
@@ -250,6 +287,7 @@ final class HarnessBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
             try? await Task.sleep(nanoseconds: delayNanoseconds)
         }
         let backend = TrackingPlaybackBackend(identity: identity, kind: kind, harness: harness)
+        lock.withLock { eventSinks[identity] = eventSink }
         configureBackend?(backend)
         recordCreatedBackend(backend)
         harness?.recordBackendCreation(backend)
@@ -373,6 +411,57 @@ final class BackendOwnershipTestHarness: @unchecked Sendable {
 }
 
 final class BackendOwnershipTests: XCTestCase {
+    func testScopedFailureDuringPendingPauseUpgradesExistingOwnedCleanup() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        let ticket = try XCTUnwrap(harness.registry.outputResourceContextSnapshot()?.prepareTicket)
+        let backend = try XCTUnwrap(harness.factory.createdBackends.first)
+        backend.setHoldSuspend(true)
+        defer { backend.completeSuspend() }
+        let pause = Task { await harness.controller.setPaused(true) }
+        do {
+            try await waitForHLSFailureCondition { backend.isSuspendWaiting }
+            XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.owner?.reason, .pause)
+            harness.factory.emit(.backendFailed(ErrorDiagnosticSnapshot(
+                NSError(domain: "HLS.LateOffer", code: -81)), prepareScope: .init(ticket: ticket),
+                metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)), from: backend.identity)
+            try await waitForHLSFailureCondition {
+                harness.registry.outputResourceContextSnapshot()?.owner?.reason == .terminal
+            }
+            XCTAssertTrue(backend.isSuspendWaiting, "升级后须 join 原 suspend，不能另建 stop")
+            backend.completeSuspend()
+            await pause.value
+            await harness.registry.joinOwnedTerminalCleanup()
+            guard case let .failed(failure) = await harness.controller.currentStateForTesting else {
+                return XCTFail("pause 中唯一首错不得丢失或恢复为 paused")
+            }
+            XCTAssertTrue(failure.userMessage.contains("HLS.LateOffer"))
+            XCTAssertEqual(backend.retirementSnapshot.count, 1)
+            XCTAssertEqual(harness.currentAudibleOutputs, 0)
+            XCTAssertNil(harness.registry.ownedResourceSnapshot())
+        } catch {
+            backend.completeSuspend()
+            await pause.value
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+    }
+
+    private func waitForHLSFailureCondition(
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !(await condition()) {
+            if ContinuousClock.now >= deadline {
+                XCTFail("HLS 错误传播的有界状态等待超时")
+                throw NSError(domain: "HLSFailureRegressionTimeout", code: 1)
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     func testOldBackendStopMustConfirmBeforeSuccessorCreation() async throws {
         let harness = BackendOwnershipTestHarness()
         await harness.playLocal()
@@ -669,6 +758,9 @@ final class BackendOwnershipTests: XCTestCase {
         XCTAssertTrue(registry.claimStart(prepare))
         XCTAssertTrue(registry.completeOutputPrepare(prepare))
         let installed = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        // 从真实 Registry 首次签发票冻结 scope；本测试不制造 prepare 身份。
+        let oldPrepareTicket = try XCTUnwrap(installed.prepareTicket)
+        let oldFailureScope = PlaybackBackendPrepareFailureScope(ticket: oldPrepareTicket)
         let owner = try XCTUnwrap(registry.beginOutputTransition(contextNonce: installed.contextNonce,
             reason: .pause, anchorInstant: registry.clock.nowNanoseconds, teardown: false))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
@@ -689,6 +781,15 @@ final class BackendOwnershipTests: XCTestCase {
         XCTAssertTrue(registry.claimStart(nextPrepare))
         XCTAssertTrue(registry.completeOutputPrepare(nextPrepare))
         let next = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        // reprepareQuiescentOutput 已经为同一真实注册 backend 签发下一张 prepare 票。
+        // 此处只验证签发身份域，不宣称真实 HLS producer prepare 或声音验收。
+        let newPrepareTicket = try XCTUnwrap(next.prepareTicket)
+        XCTAssertEqual(newPrepareTicket.backendIdentity, oldPrepareTicket.backendIdentity)
+        XCTAssertEqual(newPrepareTicket.backendIdentity, backend.identity)
+        XCTAssertNotEqual(newPrepareTicket.prepareNonce, oldPrepareTicket.prepareNonce,
+            "保留同一 backend 时，新 prepare 也必须重新签发 checked nonce")
+        XCTAssertFalse(oldFailureScope.matches(newPrepareTicket),
+            "旧图冻结的错误 scope 不得匹配同 backend 的新 prepare")
         XCTAssertFalse(next.suspendRequiresRetirement)
         XCTAssertFalse(registry.completeOutputSuspend(.requiresRetirement, invocation: invocation, backend: backend))
         let nextOwner = try XCTUnwrap(registry.beginOutputTransition(contextNonce: next.contextNonce,

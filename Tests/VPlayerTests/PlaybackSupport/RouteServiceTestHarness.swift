@@ -166,7 +166,13 @@ import AVFAudio
 
 final class FakeSDKRouteSnapshot: AudioSessionRouteSnapshot, @unchecked Sendable {
     let ports: PlaybackRoutePorts
-    init(ports: PlaybackRoutePorts) { self.ports = ports }
+    let outputLatency: TimeInterval
+    let ioBufferDuration: TimeInterval
+    init(ports: PlaybackRoutePorts, outputLatency: TimeInterval = 0, ioBufferDuration: TimeInterval = 0) {
+        self.ports = ports
+        self.outputLatency = outputLatency
+        self.ioBufferDuration = ioBufferDuration
+    }
     var endpointCount: Int { ports.isEmpty ? 0 : 1 }
     func endpoint(at index: Int) -> AudioSessionRouteEndpoint {
         if ports.contains(.airPlay) {
@@ -204,9 +210,18 @@ final class FakeAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
     var onDeactivate: (@Sendable () -> Void)?
     var calls: [Call] = []
     let lock = NSLock()
+    private var outputLatency: TimeInterval = 0
+    private var ioBufferDuration: TimeInterval = 0
     
     init(initialPorts: PlaybackRoutePorts) {
         self.initialPorts = initialPorts
+    }
+
+    func setOutputTiming(outputLatency: TimeInterval, ioBufferDuration: TimeInterval) {
+        lock.withLock {
+            self.outputLatency = outputLatency
+            self.ioBufferDuration = ioBufferDuration
+        }
     }
     
     func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {
@@ -244,16 +259,21 @@ final class FakeAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
     }
     
     func currentRoute() -> any AudioSessionRouteSnapshot {
-        lock.withLock {
+        let captured = lock.withLock {
             currentConcurrency += 1
             routeCallCount += 1
             calls.append(.currentRoute)
             maxConcurrency = max(maxConcurrency, currentConcurrency)
             harness?.routeGetterMaximumConcurrency = maxConcurrency
             harness?.routeGetterCallCount = routeCallCount
+            return (initialPorts, outputLatency, ioBufferDuration)
         }
         defer { lock.withLock { currentConcurrency -= 1 } }
-        return FakeSDKRouteSnapshot(ports: initialPorts)
+        return FakeSDKRouteSnapshot(
+            ports: captured.0,
+            outputLatency: captured.1,
+            ioBufferDuration: captured.2
+        )
     }
 }
 

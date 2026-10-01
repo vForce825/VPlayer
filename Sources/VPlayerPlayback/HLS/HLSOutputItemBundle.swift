@@ -3,6 +3,101 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import VPlayerCore
+import Darwin
+import ObjectiveC
+
+/// 既有元数据预费的共同 lifetime owner；queued 首错与 producer 共享同一费用。
+final class HLSRuntimeFailureMetadataOwner: @unchecked Sendable, Equatable {
+    static let reservationBytes = 2 * 1_024
+    private let ledger: PlaybackResourceContextLedger
+    private let reservation: PlaybackResourceContextReservation
+
+    private init(ledger: PlaybackResourceContextLedger,
+                 reservation: PlaybackResourceContextReservation) {
+        self.ledger = ledger
+        self.reservation = reservation
+    }
+
+    static func reserve(in ledger: PlaybackResourceContextLedger) throws -> HLSRuntimeFailureMetadataOwner {
+        let reservation = try ledger.reserve(allocationIdentity: .stable(UUID()), bytes: reservationBytes)
+        let owner = HLSRuntimeFailureMetadataOwner(ledger: ledger, reservation: reservation)
+        try ledger.rebind(reservation, to: .object(ObjectIdentifier(owner)))
+        return owner
+    }
+
+    // 强持 ledger 至此；reservation 的 weak ledger 不会因先析构而漏归还全局费用。
+    deinit { ledger.release(reservation) }
+    static func == (lhs: HLSRuntimeFailureMetadataOwner, rhs: HLSRuntimeFailureMetadataOwner) -> Bool {
+        lhs === rhs
+    }
+
+    var knownAllocationBytes: Int {
+        func actual(_ object: AnyObject) -> Int {
+            malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(object).toOpaque()))
+        }
+        return actual(self) + actual(reservation) +
+            malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+    }
+}
+
+/// 每次 prepare attempt 独立的固定首错槽；失败 attempt 退休后永不投递运行时事件。
+final class HLSRuntimeFailureRelay: @unchecked Sendable {
+    private enum State { case dormant, armed, closed }
+    private let lock = NSLock()
+    private let sink: @Sendable (ErrorDiagnosticSnapshot, HLSRuntimeFailureMetadataOwner) -> Void
+    private var state: State = .dormant
+    private var firstFailure: ErrorDiagnosticSnapshot?
+    private let metadataOwner: HLSRuntimeFailureMetadataOwner
+
+    /// owner 已 reserve 后才制造 relay、NSLock 和 production 新 capture。
+    init(metadataOwner: HLSRuntimeFailureMetadataOwner,
+         sink: @escaping @Sendable (ErrorDiagnosticSnapshot, HLSRuntimeFailureMetadataOwner) -> Void) throws {
+        self.metadataOwner = metadataOwner
+        self.sink = sink
+        guard knownAllocationUpperBoundBytes <= HLSRuntimeFailureMetadataOwner.reservationBytes else {
+            throw LoopbackHTTPReservationError.hardCapacityExceeded
+        }
+    }
+
+    /// app 对象实测 malloc 大小 + owner/两级 token/snapshot 的固定 allocation +
+    /// 新增三处固定 capture 及 reabstraction 余量；沿用既有 metadata ABI 上界口径。
+    var knownAllocationUpperBoundBytes: Int {
+        func actual(_ object: AnyObject) -> Int {
+            malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(object).toOpaque()))
+        }
+        let bridgeCapture = malloc_good_size(32 +
+            MemoryLayout<ControlTaskRegistry.BackendPrepareInvocation>.stride +
+            MemoryLayout<SystemHLSOutputItemBundleBuilder.RuntimeEventSink>.stride)
+        let relayCapture = malloc_good_size(32 + MemoryLayout<HLSRuntimeFailureRelay>.stride)
+        let publicationCapture = malloc_good_size(32 +
+            MemoryLayout<SystemHLSMediaGraphAuthority?>.stride) + 32
+        // 256B 覆盖两处函数 reabstraction；64B 覆盖 bundle/builder 新引用的分配级差。
+        return actual(self) + actual(lock) + metadataOwner.knownAllocationBytes +
+            ErrorDiagnosticSnapshot.maximumStorageAllocationBytes +
+            bridgeCapture + relayCapture + publicationCapture + 256 + 64
+    }
+
+    func record(_ diagnostic: ErrorDiagnosticSnapshot) {
+        let delivery = lock.withLock { () -> ErrorDiagnosticSnapshot? in
+            guard state != .closed, firstFailure == nil else { return nil }
+            firstFailure = diagnostic
+            return state == .armed ? diagnostic : nil
+        }
+        if let delivery { sink(delivery, metadataOwner) }
+    }
+
+    func arm() {
+        let delivery = lock.withLock { () -> ErrorDiagnosticSnapshot? in
+            guard state == .dormant else { return nil }
+            state = .armed
+            return firstFailure
+        }
+        if let delivery { sink(delivery, metadataOwner) }
+    }
+
+    func close() { lock.withLock { state = .closed } }
+}
 
 /// HLS item 的唯一资源图 owner。它不复制 AVPlayer request，也不把 producer 的
 /// 生命周期藏在 backend 的临时 Task 内：producer 在 prepare 内启动，只有 Registry
@@ -24,6 +119,7 @@ final class HLSOutputItemBundle: @unchecked Sendable {
     private var replacementStorage: AVPlayerItemReplacementBundle?
     private let startProducer: ProducerStart
     private let retireProducer: ProducerRetirement
+    private let runtimeFailure: HLSRuntimeFailureRelay?
     private let lock = NSLock()
     private var lifecycle: Lifecycle = .dormant
     /// 所有并发 retire caller 必须 join 同一真实 graph retirement receipt；不能由
@@ -33,7 +129,8 @@ final class HLSOutputItemBundle: @unchecked Sendable {
     init(
         replacement: AVPlayerItemReplacementBundle,
         startProducer: @escaping ProducerStart,
-        retireProducer: @escaping ProducerRetirement
+        retireProducer: @escaping ProducerRetirement,
+        runtimeFailure: HLSRuntimeFailureRelay? = nil
     ) {
         replacementStorage = replacement
         self.startProducer = {
@@ -41,17 +138,20 @@ final class HLSOutputItemBundle: @unchecked Sendable {
             return replacement
         }
         self.retireProducer = retireProducer
+        self.runtimeFailure = runtimeFailure
     }
 
     /// 延迟 replacement 仅供 production graph 使用：在 backend 已强持 bundle 后才启动唯一
     /// source，取得全选轨三秒真实前缀并创建同一 loopback item。
     init(
         startProducer: @escaping ProducerStart,
-        retireProducer: @escaping ProducerRetirement
+        retireProducer: @escaping ProducerRetirement,
+        runtimeFailure: HLSRuntimeFailureRelay? = nil
     ) {
         replacementStorage = nil
         self.startProducer = startProducer
         self.retireProducer = retireProducer
+        self.runtimeFailure = runtimeFailure
     }
 
     var replacement: AVPlayerItemReplacementBundle {
@@ -75,7 +175,12 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         guard mayStart else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
         do {
             let replacement = try await startProducer()
-            lock.withLock { replacementStorage = replacement }
+            let accepted = lock.withLock { () -> Bool in
+                guard lifecycle == .producing else { return false }
+                replacementStorage = replacement
+                return true
+            }
+            guard accepted else { throw CancellationError() }
         } catch {
             _ = await retireProducerGraph()
             throw error
@@ -85,6 +190,7 @@ final class HLSOutputItemBundle: @unchecked Sendable {
     /// 退役是幂等的。`false` 是真实 graph 尚未可证明停止，调用方必须 fail-closed，
     /// 不能用伪造 AVPlayer receipt 换取 Registry cleanup。
     func retireProducerGraph() async -> Bool {
+        runtimeFailure?.close()
         let retirement = lock.withLock { () -> Task<Bool, Never>? in
             switch lifecycle {
             case .retired, .retiring:
@@ -107,6 +213,9 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         }
         return confirmed
     }
+
+    /// 只有 backend 完成该 attempt 的最后一个准备 await 后启用；已到首错锁外回放。
+    func armRuntimeFailure() { runtimeFailure?.arm() }
 }
 
 /// bundle factory 是生产媒体 graph 的装配点。它收到 Registry 已冻结的 prepare
@@ -124,19 +233,26 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
     typealias GraphFactory = @Sendable (
         URL,
         ControlTaskRegistry.BackendPrepareInvocation,
-        HLSDeliveryApplicationChargeLedger
+        HLSDeliveryApplicationChargeLedger,
+        @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void
     ) throws -> HLSMediaGraphAssembler
+    typealias RuntimeEventSink = @Sendable (PlaybackPipelineEvent) -> Void
 
     let sourceURLForDiagnostics: URL
     let demuxerCardinality = 1
     let playablePrefixMinimumSeconds = 6
     private let graphFactory: GraphFactory
     private let applicationLedger: HLSDeliveryApplicationChargeLedger
+    private let runtimeEventSink: RuntimeEventSink
+    private let resourceContextLedger: PlaybackResourceContextLedger
 
-    convenience init(sourceURL: URL) throws {
-        try self.init(sourceURL: sourceURL, applicationLedger: .shared, graphFactory: { source, invocation, ledger in
+    convenience init(sourceURL: URL,
+                     runtimeEventSink: @escaping RuntimeEventSink = { _ in }) throws {
+        try self.init(sourceURL: sourceURL, applicationLedger: .shared,
+                      runtimeEventSink: runtimeEventSink,
+                      graphFactory: { source, invocation, ledger, failureSink in
             let authority = try SystemHLSMediaGraphAuthority(
-                lifecycle: invocation.outputLifecycleEpoch)
+                lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
             return HLSMediaGraphAssembler(
                 sourceURL: source,
                 applicationLedger: ledger,
@@ -151,9 +267,11 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
         }
         self.sourceURLForDiagnostics = sourceURL
         applicationLedger = .shared
-        graphFactory = { source, invocation, ledger in
+        runtimeEventSink = { _ in }
+        resourceContextLedger = .shared
+        graphFactory = { source, invocation, ledger, failureSink in
             let authority = try SystemHLSMediaGraphAuthority(
-                lifecycle: invocation.outputLifecycleEpoch)
+                lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
             return HLSMediaGraphAssembler(
                 sourceURL: source,
                 applicationLedger: ledger,
@@ -164,6 +282,8 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
     init(
         sourceURL: URL,
         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
+        resourceContextLedger: PlaybackResourceContextLedger = .shared,
+        runtimeEventSink: @escaping RuntimeEventSink = { _ in },
         graphFactory: @escaping GraphFactory
     ) throws {
         let scheme = sourceURL.scheme?.lowercased() ?? ""
@@ -172,16 +292,30 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
         }
         self.sourceURLForDiagnostics = sourceURL
         self.applicationLedger = applicationLedger
+        // production 两者均为 shared；local context ledger 只用于显式测试配对。
+        guard resourceContextLedger.usesApplicationLedger(applicationLedger) else {
+            throw LoopbackHTTPReservationError.hardCapacityExceeded
+        }
+        self.resourceContextLedger = resourceContextLedger
+        self.runtimeEventSink = runtimeEventSink
         self.graphFactory = graphFactory
     }
 
     func makeBundle(
         invocation: ControlTaskRegistry.BackendPrepareInvocation
     ) async throws -> HLSOutputItemBundle {
-        let assembler = try graphFactory(sourceURLForDiagnostics, invocation, applicationLedger)
+        let metadata = try HLSRuntimeFailureMetadataOwner.reserve(in: resourceContextLedger)
+        let sink = runtimeEventSink
+        let observation = try HLSRuntimeFailureRelay(metadataOwner: metadata) { diagnostic, owner in
+            sink(.backendFailed(diagnostic, prepareScope: .init(ticket: invocation.ticket),
+                metadataOwner: owner))
+        }
+        let assembler = try graphFactory(sourceURLForDiagnostics, invocation, applicationLedger,
+                                        { diagnostic in observation.record(diagnostic) })
         return HLSOutputItemBundle(
             startProducer: { try await assembler.startUntilPlayablePrefix() },
-            retireProducer: { await assembler.retireAndAwaitReceipt() }
+            retireProducer: { await assembler.retireAndAwaitReceipt() },
+            runtimeFailure: observation
         )
     }
 }

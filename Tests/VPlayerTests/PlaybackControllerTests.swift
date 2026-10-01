@@ -4,6 +4,7 @@
 
 import Foundation
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
@@ -16,6 +17,147 @@ private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
 }
 
 final class PlaybackControllerTests: XCTestCase {
+    func testCurrentRelayRejectsFrozenOldPrepareScopeAndAcceptsCurrentFailure() async throws {
+        let first = FakeControllerPipeline()
+        let current = FakeControllerPipeline()
+        current.stopAutomaticallyCompletes = false
+        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([first, current]), audioSessionOwner: owner)
+        let firstRequest = makeRequest(channelID: "scope-first-issued-ticket")
+        let currentRequest = makeRequest(channelID: "scope-current-issued-ticket")
+        defer {
+            first.releaseStopForFailureCleanup()
+            current.releaseStopForFailureCleanup()
+        }
+
+        func waitForScopeState(_ stage: String, _ condition: () async -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !(await condition()) {
+                guard ContinuousClock.now < deadline else {
+                    throw NSError(domain: "HLSPrepareScopeRegressionTimeout", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "有域首错回归等待超时：\(stage)"])
+                }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+        }
+
+        do {
+            await controller.play(firstRequest)
+            let oldTicket = try XCTUnwrap(owner.registry.outputResourceContextSnapshot()?.prepareTicket)
+            let oldScope = PlaybackBackendPrepareFailureScope(ticket: oldTicket)
+            let firstCycle = await controller.readinessCycleForTesting
+            first.emit(.ready(readinessCycle: firstCycle))
+            try await waitForScopeState("首个真实签发播放已 ready") {
+                await controller.currentStateForTesting == .playing(firstRequest)
+            }
+
+            // 两次播放使用同一个 owner.registry；新票由正常控制流程签发，不手造 nonce。
+            await controller.play(currentRequest)
+            let currentTicket = try XCTUnwrap(owner.registry.outputResourceContextSnapshot()?.prepareTicket)
+            XCTAssertNotEqual(currentTicket.prepareNonce, oldTicket.prepareNonce)
+            XCTAssertNotEqual(currentTicket.backendIdentity, oldTicket.backendIdentity,
+                "此 controller 子测试明确使用新播放，不宣称同 backend replacement 的端到端验收")
+            XCTAssertFalse(oldScope.matches(currentTicket))
+            let currentCycle = await controller.readinessCycleForTesting
+            current.emit(.ready(readinessCycle: currentCycle))
+            try await waitForScopeState("当前真实签发播放已 ready") {
+                await controller.currentStateForTesting == .playing(currentRequest)
+            }
+            XCTAssertEqual(first.snapshot().completedStopCount, 1)
+            XCTAssertEqual(current.snapshot().stopCount, 0)
+
+            // 故意通过当前 relay 投递旧票的冻结 scope，使 envelope 的 run/backend 检查通过；
+            // 被测拒绝点必须是当前 PrepareTicket 与旧 prepareNonce 的不匹配。
+            let oldMetadata = try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)
+            let oldDiagnostic = ErrorDiagnosticSnapshot(typeName: "HLS.OldGraph", message: "旧图排队错误")
+            current.emit(.backendFailed(oldDiagnostic, prepareScope: oldScope,
+                metadataOwner: oldMetadata))
+            // 同一 relay 的 FIFO sentinel 证明旧 failure 已被消费，不靠任意 sleep 断言未停止。
+            current.emit(.phase(.buffering, readinessCycle: currentCycle))
+            try await waitForScopeState("当前 relay 已消费旧错误后的 FIFO sentinel") {
+                await controller.currentStateForTesting == .buffering(currentRequest)
+            }
+            XCTAssertEqual(owner.registry.outputResourceContextSnapshot()?.prepareTicket, currentTicket)
+            XCTAssertEqual(current.snapshot().stopCount, 0)
+            XCTAssertEqual(first.snapshot().completedStopCount, 1)
+
+            let currentMetadata = try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)
+            let currentDiagnostic = ErrorDiagnosticSnapshot(typeName: "HLS.CurrentGraph", message: "当前图真实错误")
+            current.emit(.backendFailed(currentDiagnostic, prepareScope: .init(ticket: currentTicket),
+                metadataOwner: currentMetadata))
+            try await waitForScopeState("当前 scope 首错已开始唯一 owned stop") {
+                current.snapshot().isStopWaiting
+            }
+            guard case let .failed(failure) = await controller.currentStateForTesting else {
+                current.releaseStopForFailureCleanup()
+                await controller.stop()
+                await owner.registry.joinOwnedTerminalCleanup()
+                return XCTFail("当前票首错必须在 cleanup 等待前公开")
+            }
+            XCTAssertTrue(failure.userMessage.contains("当前图真实错误"), failure.userMessage)
+            XCTAssertFalse(failure.userMessage.contains("旧图排队错误"), failure.userMessage)
+            XCTAssertEqual(current.snapshot().stopCount, 1)
+            current.completeStop()
+            await owner.registry.joinOwnedTerminalCleanup()
+            let finalState = await controller.currentStateForTesting
+            XCTAssertEqual(finalState, .failed(failure))
+            XCTAssertEqual(current.snapshot().stopCount, 1)
+            XCTAssertEqual(current.snapshot().completedStopCount, 1)
+            XCTAssertNil(owner.registry.ownedResourceSnapshot())
+        } catch {
+            first.releaseStopForFailureCleanup()
+            current.releaseStopForFailureCleanup()
+            await controller.stop()
+            await owner.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+    }
+
+    func testCurrentScopedBackendFailureStopsOnceAndPreservesOriginalDiagnostic() async throws {
+        let pipeline = FakeControllerPipeline()
+        pipeline.stopAutomaticallyCompletes = false
+        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([pipeline]), audioSessionOwner: owner)
+        defer { pipeline.releaseStopForFailureCleanup() }
+        do {
+            await controller.play(makeRequest(channelID: "hls-first-runtime-error"))
+            let ticket = try XCTUnwrap(owner.registry.outputResourceContextSnapshot()?.prepareTicket)
+            let original = ErrorDiagnosticSnapshot(NSError(domain: "HLS.Publication.Native", code: -72,
+                userInfo: [NSLocalizedDescriptionKey: "后继分段发布关闭"]))
+            pipeline.emit(.backendFailed(original,
+                prepareScope: .init(ticket: ticket),
+                metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)))
+            try await eventually { pipeline.snapshot().isStopWaiting }
+            guard case let .failed(failure) = await controller.currentStateForTesting else {
+                pipeline.releaseStopForFailureCleanup()
+                await controller.stop()
+                await owner.registry.joinOwnedTerminalCleanup()
+                return XCTFail("有域首错必须在 owned cleanup 等待前可见")
+            }
+            XCTAssertTrue(failure.userMessage.contains("HLS 媒体生成"), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains("HLS.Publication.Native"), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains("-72"), failure.userMessage)
+            pipeline.emit(.backendFailed(ErrorDiagnosticSnapshot(
+                typeName: "HLS.Secondary", message: "第二错误"), prepareScope: .init(ticket: ticket),
+                metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)))
+            await controller.failPresentationControl()
+            XCTAssertEqual(pipeline.snapshot().stopCount, 1)
+            pipeline.completeStop()
+            await owner.registry.joinOwnedTerminalCleanup()
+            let finalState = await controller.currentStateForTesting
+            XCTAssertEqual(finalState, .failed(failure))
+            XCTAssertNil(owner.registry.ownedResourceSnapshot())
+            XCTAssertEqual(pipeline.snapshot().completedStopCount, 1)
+        } catch {
+            pipeline.releaseStopForFailureCleanup()
+            await controller.stop()
+            await owner.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+    }
+
     func testBackendFirstFailureIsVisibleWhileCleanupWaitsAndSurvivesSafetyTerminal() async throws {
         let pipeline = FakeControllerPipeline()
         pipeline.stopAutomaticallyCompletes = false

@@ -73,9 +73,9 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
             let builder: SystemHLSOutputItemBundleBuilder
             if let hlsGraphFactory {
                 builder = try SystemHLSOutputItemBundleBuilder(
-                    sourceURL: url, graphFactory: hlsGraphFactory)
+                    sourceURL: url, runtimeEventSink: eventSink, graphFactory: hlsGraphFactory)
             } else {
-                builder = try SystemHLSOutputItemBundleBuilder(sourceURL: url)
+                builder = try SystemHLSOutputItemBundleBuilder(sourceURL: url, runtimeEventSink: eventSink)
             }
             let driver = try await MainActor.run {
                 try SystemAVPlayerDriver.make(

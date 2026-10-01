@@ -47,7 +47,7 @@ private final class AudioReadyCallbackGate: @unchecked Sendable {
     }
 }
 
-final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendable {
+final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCoverageObserving, @unchecked Sendable {
     private typealias StopCompletion = @Sendable () -> Void
     typealias RecoveryScheduler = @Sendable (
         DispatchTimeInterval,
@@ -65,6 +65,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     private static let pendingPCMCapacity = 96
     private static let pcmStartupPrerollDuration = CMTime(value: 1, timescale: 4)
     private static let compressedStartupPrerollDuration = CMTime(value: 1, timescale: 4)
+    private static let acceptedCoverageTolerance = CMTime(value: 1, timescale: 1_000)
     private static let progressDeadlineDelay: DispatchTimeInterval = .seconds(1)
     private static let noOutputRouteDeadlineDelay: DispatchTimeInterval = .seconds(3)
     private static let noOutputRouteError = "audio.output-route.unavailable"
@@ -156,6 +157,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         var isReadyForPlayback = false
         var route = AudioRoute.systemCompressed
         var routeSnapshot: AudioOutputRouteSnapshot?
+        var acceptedCoverage: AudioRendererAcceptedCoverage?
         var recoveryCount: UInt64 = 0
         var diagnostics = DiagnosticsState()
     }
@@ -335,6 +337,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         )
     }
 
+    var acceptedCoverage: AudioRendererAcceptedCoverage? {
+        withSnapshot { $0.acceptedCoverage }
+    }
+
     var isReadyForPlayback: Bool {
         withSnapshot { $0.isReadyForPlayback }
     }
@@ -498,6 +504,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         guard configured, !stopped, !terminal,
               generation == self.generation,
               islandID != activeContinuityIslandID else { return }
+        resetRendererAcceptedCoverage()
 
         guard activeContinuityIslandID != nil else {
             activeContinuityIslandID = islandID
@@ -605,6 +612,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             return
         }
         guard configured, !stopped else { return }
+        resetRendererAcceptedCoverage()
         if let renderer {
             resetRendererQueue(renderer)
         } else {
@@ -688,6 +696,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
             stopCompletions.append(completion)
         }
         guard !stopped else { return }
+        resetRendererAcceptedCoverage()
         if let newEpoch = takeEpochWithoutThrow() { epoch = newEpoch }
         stopped = true
         configured = false
@@ -780,6 +789,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         generation: MediaGeneration,
         epoch: UInt64
     ) {
+        resetRendererAcceptedCoverage()
         routeMonitor.stop()
         decoder?.destroy()
         decoder = nil
@@ -1455,6 +1465,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         continuation: RemovalContinuation
     ) {
         guard pendingRemoval == nil else { return }
+        // 必须先撤销覆盖；下面的 readiness 通知可以同步重入观察当前队列。
+        resetRendererAcceptedCoverage()
         let wasReady = isReadyForPlayback
         let transition = PendingRemoval(
             rendererID: renderer.identity,
@@ -1802,6 +1814,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                 return
             }
             recordRendererAcceptance(on: renderer)
+            recordRendererAcceptedCoverage(sampleBuffer)
             recordRendererAcceptanceDiagnostic(at: sample.presentationTimeStamp)
             if needsDecoderReset {
                 needsDecoderResetBeforeNextCompressedEnqueue = false
@@ -1870,6 +1883,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
                     return
                 }
                 recordRendererAcceptance(on: renderer)
+                recordRendererAcceptedCoverage(sample)
                 recordRendererAcceptanceDiagnostic(
                     at: CMSampleBufferGetPresentationTimeStamp(sample)
                 )
@@ -2299,6 +2313,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
 
     private func emitTerminal(_ error: PlaybackCoreError) {
         guard !terminal else { return }
+        resetRendererAcceptedCoverage()
         recoveryCoordinator.invalidate()
         automaticFlushProgressOrigin.clear()
         terminal = true
@@ -2398,6 +2413,55 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         )
     }
 
+    private func recordRendererAcceptedCoverage(_ sampleBuffer: CMSampleBuffer) {
+        guard configured, !stopped, !terminal, !replacing, rendererAttached,
+              let islandID = activeContinuityIslandID,
+              rendererDemandProgress.rendererID == renderer?.identity,
+              rendererDemandProgress.epoch == epoch else {
+            resetRendererAcceptedCoverage()
+            return
+        }
+        // 只读取已经成功入队的实际输出时间；保留队列和压缩 parser 输入不参与覆盖。
+        let first = CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer)
+        let duration = CMSampleBufferGetOutputDuration(sampleBuffer)
+        let end = CMTimeAdd(first, duration)
+        guard first.isNumeric, duration.isNumeric, end.isNumeric,
+              CMTimeCompare(duration, .zero) > 0,
+              CMTimeCompare(end, first) > 0 else {
+            resetRendererAcceptedCoverage()
+            return
+        }
+        let episode = rendererDemandProgress.queueEpisode
+        snapshotLock.withLock {
+            var spanFirst = first
+            var spanEnd = end
+            if let current = publicSnapshot.acceptedCoverage,
+               current.epoch == epoch, current.generation == generation,
+               current.continuityIslandID == islandID, current.queueEpisode == episode {
+                let upper = CMTimeAdd(current.endPTS, Self.acceptedCoverageTolerance)
+                let lower = CMTimeSubtract(current.firstPTS, Self.acceptedCoverageTolerance)
+                if upper.isNumeric, lower.isNumeric,
+                   CMTimeCompare(first, upper) <= 0,
+                   CMTimeCompare(end, lower) >= 0 {
+                    if CMTimeCompare(current.firstPTS, spanFirst) < 0 { spanFirst = current.firstPTS }
+                    if CMTimeCompare(current.endPTS, spanEnd) > 0 { spanEnd = current.endPTS }
+                }
+            }
+            publicSnapshot.acceptedCoverage = .init(
+                epoch: epoch,
+                generation: generation,
+                continuityIslandID: islandID,
+                queueEpisode: episode,
+                firstPTS: spanFirst,
+                endPTS: spanEnd
+            )
+        }
+    }
+
+    private func resetRendererAcceptedCoverage() {
+        snapshotLock.withLock { publicSnapshot.acceptedCoverage = nil }
+    }
+
     private func recordRendererBackpressure(on renderer: any AudioRenderer) {
         rendererDemandProgress.backpressured(
             rendererID: renderer.identity,
@@ -2416,6 +2480,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
         rendererID: AudioRendererIdentity,
         epoch: UInt64
     ) {
+        resetRendererAcceptedCoverage()
         invalidateRendererRequest(on: renderer)
         rendererDemandProgress.queueWasReset(
             rendererID: rendererID,
@@ -2425,6 +2490,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func resetRendererQueue(_ renderer: any AudioRenderer) {
+        resetRendererAcceptedCoverage()
         invalidateRendererRequest(on: renderer)
         rendererDemandProgress.queueWasReset(
             rendererID: renderer.identity,
@@ -2435,6 +2501,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func invalidateRendererDemandLifetime(on renderer: (any AudioRenderer)?) {
+        resetRendererAcceptedCoverage()
         if case .disarm = rendererPumpState.rendererDidChange() {
             renderer?.stopRequestingMediaData()
         }
@@ -2444,6 +2511,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, @unchecked Sendabl
     }
 
     private func establishRendererDemandLifetime(for renderer: any AudioRenderer) {
+        resetRendererAcceptedCoverage()
         if case .disarm = rendererPumpState.rendererDidChange() {
             renderer.stopRequestingMediaData()
         }

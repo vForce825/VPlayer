@@ -51,10 +51,26 @@ enum OutputRouteSampleResult: Sendable, Equatable {
     case available(PlaybackRouteSemanticIdentity)
 }
 
+/// 同一次授权 SDK 样本的固定时序值；不参与端点、后端或稳定票的身份比较。
+struct AudioSessionRouteOutputTiming: Sendable, Equatable {
+    static let zero = Self(outputLatency: 0, ioBufferDuration: 0)
+    let outputLatency: Double
+    let ioBufferDuration: Double
+
+    init(outputLatency: Double, ioBufferDuration: Double) {
+        self.outputLatency = outputLatency.isFinite && outputLatency >= 0 ? outputLatency : 0
+        self.ioBufferDuration = ioBufferDuration.isFinite && ioBufferDuration >= 0 ? ioBufferDuration : 0
+    }
+}
+
 /// lane只交此固定值；最终token/incarnation只由最新样本的同一次completion CAS生成。
 enum AudioSessionRouteSampleEvidence: Sendable, Equatable {
     case none
-    case available(ports: PlaybackRoutePorts, endpointFingerprint: SessionEndpointFingerprint)
+    case available(
+        ports: PlaybackRoutePorts,
+        endpointFingerprint: SessionEndpointFingerprint,
+        outputTiming: AudioSessionRouteOutputTiming = .zero
+    )
     case invalid
 }
 
@@ -79,6 +95,25 @@ struct OutputRouteStabilityCandidate: Sendable, Equatable {
     let firstMatchingSampleInstant: UInt64
     let boundary: OutputRouteAvailabilityBoundary
     var arm: Arm?
+    let outputTiming: AudioSessionRouteOutputTiming
+
+    init(
+        source: ControlTaskTicket,
+        observation: RouteObservationTicket,
+        authority: PlaybackRouteAuthorityIdentity,
+        firstMatchingSampleInstant: UInt64,
+        boundary: OutputRouteAvailabilityBoundary,
+        arm: Arm?,
+        outputTiming: AudioSessionRouteOutputTiming = .zero
+    ) {
+        self.source = source
+        self.observation = observation
+        self.authority = authority
+        self.firstMatchingSampleInstant = firstMatchingSampleInstant
+        self.boundary = boundary
+        self.arm = arm
+        self.outputTiming = outputTiming
+    }
 
     // 完整票从同一登记候选和准确arm事实投影，不重复持有第二份authority。
     var stabilityTicket: RouteStabilityTicket? {

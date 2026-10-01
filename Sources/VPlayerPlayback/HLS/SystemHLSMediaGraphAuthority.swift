@@ -599,6 +599,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private let publication: SystemHLSPublicationGraph
     private let publicationDeadlineNanoseconds: Int64
     private let publicationWaitInterval: TimeInterval
+    private let runtimeFailureSink: @Sendable (ErrorDiagnosticSnapshot) -> Void
     private let timeline = HLSTimelineCoordinator()
     private let stream: AsyncStream<AdmittedDemuxEvent>
     private let streamContinuation: AsyncStream<AdmittedDemuxEvent>.Continuation
@@ -608,6 +609,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var firstFailureDiagnostic: ErrorDiagnosticSnapshot?
     private var diagnosticStage = "configured"
     private var loopbackServer: LoopbackHTTPServer?
+    private var prefixPreparationInFlight = false
+    private var prefixRetirementWaiter: CheckedContinuation<Void, Never>?
 
     // 以下只由 worker 访问，retire 在 worker 终止后才释放。
     private var tracks: DemuxTrackSet?
@@ -649,12 +652,14 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
 
     init(
         lifecycle: OutputLifecycleEpoch,
-        publicationDeadlineNanoseconds: Int64 = 120_000_000_000
+        publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
+        failureSink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void = { _ in }
     ) throws {
         guard publicationDeadlineNanoseconds > 0 else {
             throw HLSPublicationFailure.invalidDuration
         }
         self.lifecycle = lifecycle
+        runtimeFailureSink = failureSink
         itemGeneration = lifecycle.outputNonce
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
         publicationWaitInterval = TimeInterval(publicationDeadlineNanoseconds)
@@ -665,10 +670,12 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         let pair = AsyncStream<AdmittedDemuxEvent>.makeStream()
         stream = pair.stream
         streamContinuation = pair.continuation
+        publication.installFailureSink { [weak self] diagnostic in self?.fail(diagnostic) }
         worker = Task { [weak self] in await self?.run() }
     }
 
     func append(_ admitted: AdmittedDemuxEvent) {
+        guard condition.withLock({ state == .reading || state == .playable }) else { return }
         switch streamContinuation.yield(admitted) {
         case .enqueued:
             if admitted.isTerminal { streamContinuation.finish() }
@@ -688,6 +695,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         do {
             for await admitted in stream {
                 try Task.checkCancellation()
+                guard condition.withLock({ state != .failed && state != .retiring && state != .retired }) else { return }
                 var borrowed: DemuxEvent?
                 admitted.withBorrowedEvent { borrowed = $0 }
                 guard let borrowed else { continue }
@@ -1626,7 +1634,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
 
     private func finishNaturalEOFIsolated() async throws {
         let canFinish = condition.withLock { () -> Bool in
-            guard state != .retiring, state != .retired else { return false }
+            guard state != .failed, state != .retiring, state != .retired else { return false }
             state = .finishing
             return true
         }
@@ -1685,7 +1693,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
         try publication.finishNaturalEnd()
         setDiagnosticStage("naturalEOF.complete")
-        condition.withLock { terminalResult = true; condition.broadcast() }
+        condition.withLock {
+            guard state != .failed, state != .retiring, state != .retired else { return }
+            terminalResult = true
+            condition.broadcast()
+        }
     }
 
     func awaitAllTrackPlayablePrefix(minimumSeconds: Int) async
@@ -1694,6 +1706,21 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_start")
         #endif
         guard minimumSeconds == 3 else { return nil }
+        let mayPrepare = condition.withLock { () -> Bool in
+            guard state != .failed, state != .retiring, state != .retired,
+                  !prefixPreparationInFlight else { return false }
+            prefixPreparationInFlight = true
+            return true
+        }
+        guard mayPrepare else { return nil }
+        defer {
+            let waiter = condition.withLock { () -> CheckedContinuation<Void, Never>? in
+                prefixPreparationInFlight = false
+                defer { prefixRetirementWaiter = nil }
+                return prefixRetirementWaiter
+            }
+            waiter?.resume()
+        }
         do {
             let readiness = Task.detached(priority: .userInitiated) {
                 try self.publication.waitForVisible(
@@ -1719,10 +1746,14 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_loopback_ready")
             #endif
-            condition.withLock {
+            let mayCommit = condition.withLock { () -> Bool in
+                // retirement 必须等 prefix preparation 结束；新建 server 仍归同一 owner。
                 loopbackServer = prepared.server
+                guard state != .failed, state != .retiring, state != .retired else { return false }
                 state = .playable
+                return true
             }
+            guard mayCommit else { return nil }
             return prepared.replacement
         } catch {
             #if DEBUG
@@ -1767,6 +1798,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             return true
         }
         if !shouldRetire { return condition.withLock { state == .retired } }
+        let hasPendingPrefix = condition.withLock { prefixPreparationInFlight }
+        if hasPendingPrefix {
+            // 镜像取消只唤醒 prefix waiter；recordFailure 不反向投递 runtime failure。
+            publication.recordFailure(CancellationError())
+        }
         streamContinuation.finish()
         worker.cancel()
         let targets = condition.withLock {
@@ -1778,6 +1814,17 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         targets.3?.signal()
         interlacedOutputSemaphore.signal()
         _ = await worker.value
+        if hasPendingPrefix {
+            await withCheckedContinuation { continuation in
+                let completed = condition.withLock { () -> Bool in
+                    guard prefixPreparationInFlight else { return true }
+                    precondition(prefixRetirementWaiter == nil)
+                    prefixRetirementWaiter = continuation
+                    return false
+                }
+                if completed { continuation.resume() }
+            }
+        }
         if let branch = condition.withLock({ audioBranch }) { await branch.cancelAndAwait() }
         audioBridge?.destroy()
         let interlacedRetired: Bool
@@ -1838,21 +1885,23 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     }
 
     private func fail(_ error: Error) {
-        let accepted = condition.withLock { () -> Bool in
-            guard state != .retiring, state != .retired else { return false }
+        let first = condition.withLock { () -> ErrorDiagnosticSnapshot? in
+            guard state != .retiring, state != .retired,
+                  firstFailureDiagnostic == nil else { return nil }
+            let diagnostic = PlaybackErrorDiagnostics.snapshot(error)
             state = .failed
-            if firstFailureDiagnostic == nil {
-                firstFailureDiagnostic = PlaybackErrorDiagnostics.snapshot(error)
-            }
+            firstFailureDiagnostic = diagnostic
             terminalResult = false
             condition.broadcast()
-            return true
+            return diagnostic
         }
-        guard accepted else { return }
+        guard let first else { return }
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("fail_\(diagnosticStage)_\(type(of: error)).\(error)")
         #endif
-        publication.recordFailure(error)
+        streamContinuation.finish()
+        publication.recordFailure(first)
+        runtimeFailureSink(first)
     }
 
     var failureDescriptionForDiagnostics: String? {
@@ -1862,6 +1911,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     var failureDiagnostic: ErrorDiagnosticSnapshot? {
         condition.withLock { firstFailureDiagnostic }
     }
+
+    #if DEBUG
+    // 只读测试接点：测试必须继续使用同一真实 publication 图和系统 callback。
+    var publicationForTesting: SystemHLSPublicationGraph { publication }
+    #endif
 
     private func setDiagnosticStage(_ value: String) {
         #if DEBUG

@@ -68,7 +68,7 @@ final class SampleBufferPlaybackBackend: PlaybackBackend,
     
     func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
         guard invocation.performPositiveRateSideEffect({
-            pipeline?.setPlaybackRate(1.0)
+            pipeline?.setPlaybackRate(1.0, invocation: invocation)
         }) else {
             throw PlaybackCoreError.outputActivationRejected
         }

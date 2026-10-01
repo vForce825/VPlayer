@@ -92,6 +92,17 @@ struct PlaybackRouteAuthorityIdentity: Sendable, Equatable {
 struct StableRouteCommitIdentity: Sendable, Equatable {
     let epoch: UInt64
     let authority: PlaybackRouteAuthorityIdentity
+    let outputTiming: AudioSessionRouteOutputTiming
+
+    init(
+        epoch: UInt64,
+        authority: PlaybackRouteAuthorityIdentity,
+        outputTiming: AudioSessionRouteOutputTiming = .zero
+    ) {
+        self.epoch = epoch
+        self.authority = authority
+        self.outputTiming = outputTiming
+    }
 
     func exactlyMatches(_ current: PlaybackRouteAuthorityIdentity, observationGateOpen: Bool) -> Bool {
         observationGateOpen && current.semanticIdentity != nil && authority == current &&

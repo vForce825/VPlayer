@@ -327,7 +327,11 @@ final class AudioSessionBlockingCallLane: Sendable, Equatable {
         withUnsafeMutableBytes(of: &result) {
             _ = CC_SHA256_Final($0.baseAddress?.assumingMemoryBound(to: UInt8.self), &aggregate)
         }
-        return .available(ports: ports, endpointFingerprint: result)
+        return .available(
+            ports: ports,
+            endpointFingerprint: result,
+            outputTiming: .init(outputLatency: snapshot.outputLatency, ioBufferDuration: snapshot.ioBufferDuration)
+        )
     }
 
     private static func hash(

@@ -150,7 +150,13 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, SampleBufferPlayba
         }
         if shouldWait {
             await withCheckedContinuation { continuation in
-                lock.withLock { stopContinuation = continuation }
+                let released = lock.withLock { () -> Bool in
+                    // 清理可在 shouldWait 读取后先到达；必须与 continuation 注册同锁复核。
+                    guard !stopAutomaticallyCompletes else { return true }
+                    stopContinuation = continuation
+                    return false
+                }
+                if released { continuation.resume() }
             }
         }
         lock.withLock {
@@ -161,6 +167,16 @@ final class FakeControllerPipeline: PlaybackPipelineProtocol, SampleBufferPlayba
 
     func completeStop() {
         let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            defer { stopContinuation = nil }
+            return stopContinuation
+        }
+        continuation?.resume()
+    }
+
+    /// 失败回归清理必须同时放行当前 stop 和尚未开始的后续 stop。
+    func releaseStopForFailureCleanup() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            stopAutomaticallyCompletes = true
             defer { stopContinuation = nil }
             return stopContinuation
         }

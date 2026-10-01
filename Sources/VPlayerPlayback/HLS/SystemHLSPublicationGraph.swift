@@ -38,6 +38,7 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
     private var initialWriterIDs: [UInt64] = []
     private var currentByParticipant: [UInt64: Window] = [:]
     private var storedError: ErrorDiagnosticSnapshot?
+    private var failureSink: (@Sendable (ErrorDiagnosticSnapshot) -> Void)?
     private var naturalEndPending = false
     private var prefixUnavailableAtNaturalEnd = false
     private var lastLogicalSequence: UInt64 = 0
@@ -45,6 +46,16 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
     private(set) var store: SealedMediaStore?
     private(set) var declaration: HLSItemDeclaration?
     private(set) var publisher: HLSPublicationCoordinator?
+    #if DEBUG
+    // 测试只控制真实 callback 的到达顺序，不替代 validator、offer 或来源凭据。
+    private var beforeReceiveForTesting: (@Sendable (SealedMediaObject) -> Void)?
+
+    func installBeforeReceiveForTesting(
+        _ observer: @escaping @Sendable (SealedMediaObject) -> Void
+    ) {
+        condition.withLock { beforeReceiveForTesting = observer }
+    }
+    #endif
 
     init(itemGeneration: UInt64,
          publicationDeadlineNanoseconds: Int64 = 120_000_000_000) throws {
@@ -54,6 +65,13 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
         self.itemGeneration = itemGeneration
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
         token = try LoopbackSessionToken.generateSystemCapability()
+    }
+
+    func installFailureSink(_ sink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void) {
+        condition.withLock {
+            precondition(failureSink == nil && storedError == nil)
+            failureSink = sink
+        }
     }
 
     func configureVideo(frameRate: MediaRational?) throws {
@@ -97,8 +115,18 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
     }
 
     private func receive(_ object: SealedMediaObject, relay: SegmentReportRelay) {
+        #if DEBUG
+        let observer = condition.withLock { beforeReceiveForTesting }
+        observer?(object)
+        #endif
+        var firstFailure: (ErrorDiagnosticSnapshot, @Sendable (ErrorDiagnosticSnapshot) -> Void)?
         condition.lock()
-        defer { condition.broadcast(); condition.unlock() }
+        defer {
+            condition.broadcast()
+            condition.unlock()
+            // authority.fail 会反向 recordFailure；必须先退出本图的 condition。
+            if let (diagnostic, sink) = firstFailure { sink(diagnostic) }
+        }
         guard storedError == nil,
               let window = windows[object.binding.writerIdentity.rawValue],
               window.relay === relay else {
@@ -130,7 +158,11 @@ final class SystemHLSPublicationGraph: @unchecked Sendable {
             }
         } catch {
             PlaybackDiagnosticTracker.shared.set("pub_err_s\(object.logicalSequence)_\(window.mediaType)_\(error)")
-            if storedError == nil { storedError = PlaybackErrorDiagnostics.snapshot(error) }
+            if storedError == nil {
+                let diagnostic = PlaybackErrorDiagnostics.snapshot(error)
+                storedError = diagnostic
+                if let failureSink { firstFailure = (diagnostic, failureSink) }
+            }
             _ = relay.releaseForControl(object)
         }
     }

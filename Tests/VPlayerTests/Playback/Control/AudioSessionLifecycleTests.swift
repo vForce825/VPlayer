@@ -551,7 +551,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
             .init(uid: "有界端点-\($0)" as NSString, portType: AVAudioSession.Port.airPlay.rawValue as NSString, dataSource: .missing)
         }
         let value = AudioSessionBlockingCallLane.project(GraphRouteSnapshot(endpoints), salt: salt)
-        guard case .available(let ports, _) = value else { return XCTFail("32端点边界必须有效") }
+        guard case .available(let ports, _, _) = value else { return XCTFail("32端点边界必须有效") }
         XCTAssertEqual(ports, .airPlay)
         XCTAssertEqual(AudioSessionBlockingCallLane.project(GraphRouteSnapshot(Array(endpoints.reversed())), salt: salt), value)
         XCTAssertNotEqual(AudioSessionBlockingCallLane.project(GraphRouteSnapshot(endpoints), salt: otherSalt), value)
@@ -849,7 +849,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
             let route = ObjectiveCRouteDouble(outputs: NSArray(object: ObjectiveCPortDouble(uid: uid, port: port)))
             let evidence = AudioSessionBlockingCallLane.project(SystemAudioSessionRouteSnapshot(route: route), salt: salt)
             if valid {
-                guard case .available(let ports, _) = evidence else { XCTFail("精确字节边界必须有效"); continue }
+                guard case .available(let ports, _, _) = evidence else { XCTFail("精确字节边界必须有效"); continue }
                 XCTAssertEqual(ports, .other)
             } else { XCTAssertEqual(evidence, .invalid, "部分转换/超限不能截断成有效或none") }
         }

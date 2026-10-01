@@ -249,7 +249,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         /// 这是签发时的冻结身份，不代表当前授权。当前性只能由下面的
-        /// `revalidateCurrentAuthority`/`performPositiveRateSideEffect` 判定。
+        /// `revalidateCurrentAuthority`及两个正速率副作用方法判定。
         var activation: ActivationEpoch { frozenActivation }
 
         /// source/interval 只允许从原 Registry 的当前权威原子读取。interval 已关闭、
@@ -265,6 +265,14 @@ final class ControlTaskRegistry: @unchecked Sendable {
             capability.perform(sourceTaskNonce: sourceTaskNonce,
                                activation: frozenActivation,
                                sideEffect: sideEffect)
+        }
+
+        /// 同一已消费activation的后续共享速率副作用；仍须在原Cell内确认当前授权。
+        func performCurrentPlaybackRateSideEffect(_ sideEffect: () -> Void) -> Bool {
+            capability.performCurrentPlaybackRate(
+                sourceTaskNonce: sourceTaskNonce,
+                activation: frozenActivation,
+                sideEffect: sideEffect)
         }
 
         /// await 返回及 KVO `.playing` 发布前均复验原 Registry 的当前权威。
@@ -325,6 +333,14 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 activation: activation, sideEffect: sideEffect) == true
         }
 
+        func performCurrentPlaybackRate(sourceTaskNonce: UInt64,
+                                        activation: ActivationEpoch,
+                                        sideEffect: () -> Void) -> Bool {
+            registry?.performCurrentPlaybackRateSideEffect(
+                capability: self, sourceTaskNonce: sourceTaskNonce,
+                activation: activation, sideEffect: sideEffect) == true
+        }
+
         func revalidate(sourceTaskNonce: UInt64,
                         activation: ActivationEpoch) -> Bool {
             registry?.revalidatePositiveRateInvocation(
@@ -344,6 +360,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
             consumed = true
             return true
         }
+
+        fileprivate var hasBeenConsumedWhileSafetyCellLocked: Bool { consumed }
     }
 
     /// Registry 在既有 suspend command 上投递给后端的停止能力。
@@ -2007,6 +2025,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             var normalized = result
             var fingerprint = lastEndpointFingerprint
             var configuration = outputConfigurationIncarnation
+            var outputTiming = AudioSessionRouteOutputTiming.zero
             if let rawEvidence {
                 if configuration == nil || pending.outputConfigurationChanged {
                     configuration = .init(rawValue: try allocator.next(in: .nonce))
@@ -2016,7 +2035,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 case .none:
                     normalized = .none
                     fingerprint = nil
-                case .available(let ports, let evidence):
+                case .available(let ports, let evidence, let timing):
                     guard !ports.isEmpty, ports.rawValue & ~UInt8(31) == 0,
                           let backend = try PlaybackBackendSelection.select(ports: ports, actualPolicy: .longFormAudio)
                     else { throw PlaybackSafetyFailure.invalidEvidence }
@@ -2025,6 +2044,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         token = previous.endpointTopologyToken
                     } else { token = .init(rawValue: try allocator.next(in: .nonce)) }
                     fingerprint = evidence
+                    outputTiming = timing
                     normalized = .available(.init(ports: ports,
                         backend: backend,
                         outputConfigurationIncarnation: configuration!, endpointTopologyToken: token))
@@ -2116,7 +2136,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 } ?? instant
                 routeStabilityCandidate = .init(source: claim.source, observation: claim.observation,
                     // 上方outputContext已安装同一context，再从已提交值投影最终authority。
-                    authority: currentRouteAuthority(context: &context)!, firstMatchingSampleInstant: anchor, boundary: boundary, arm: nil)
+                    authority: currentRouteAuthority(context: &context)!, firstMatchingSampleInstant: anchor,
+                    boundary: boundary, arm: nil, outputTiming: outputTiming)
             } else {
                 routeStabilityCandidate = nil
                 stableRouteCommit = nil
@@ -6474,6 +6495,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             MemoryLayout<CurrentPlaybackOperationDeadlineTicket>.stride + MemoryLayout<PlaybackProgressBudgetTicket>.stride +
             MemoryLayout<PostConfigurationRouteState>.stride + 10 * MemoryLayout<UInt64>.stride +
             MemoryLayout<AudioSessionRouteSampleEvidence?>.stride + MemoryLayout<OutputRouteSampleResult>.stride +
+            MemoryLayout<AudioSessionRouteOutputTiming>.stride +
             MemoryLayout<SessionEndpointFingerprint?>.stride + MemoryLayout<OutputConfigurationIncarnation?>.stride +
             MemoryLayout<SessionEndpointFingerprint>.stride + MemoryLayout<EndpointTopologyToken>.stride
         let projection = 2 * MemoryLayout<UnsafeRawPointer>.stride + MemoryLayout<OutputAcquisitionCommitToken>.stride +
@@ -7547,12 +7569,14 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 throw PlaybackBackendSelectionError.airPlayLongFormUnavailable
             }
             if case .postConfiguration = candidate.boundary {
-                return try commitResetRouteStabilityLocked(ticket, context: &context, sourceIndex: index, output: &output)
+                return try commitResetRouteStabilityLocked(ticket, context: &context, sourceIndex: index,
+                    outputTiming: candidate.outputTiming, output: &output)
             }
             guard ticket.authority.configurationTransitionIdentity == nil, ticket.authority.postConfigurationStageIdentity == nil,
                   ticket.authority.systemOpenConfigurationGeneration == authority.currentConfigurationGeneration,
                   context.pendingReset == nil else { return nil }
-            let commit = StableRouteCommitIdentity(epoch: try allocator.next(in: .routeCommit), authority: ticket.authority)
+            let commit = StableRouteCommitIdentity(epoch: try allocator.next(in: .routeCommit),
+                authority: ticket.authority, outputTiming: candidate.outputTiming)
             context.audioAdmissionFenceRevision = ticket.authority.audioAdmissionFenceRevision
             authority.outputContext = context
             authority.stableRouteCommit = commit
@@ -7730,7 +7754,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     private func commitResetRouteStabilityLocked(_ ticket: RouteStabilityTicket, context: inout OutputResourceContext, sourceIndex: Int,
-        output: inout PlaybackOutputSafetyState) throws -> StableRouteCommitIdentity? {
+        outputTiming: AudioSessionRouteOutputTiming, output: inout PlaybackOutputSafetyState) throws -> StableRouteCommitIdentity? {
         guard context.phase == .pendingSuccessorLease,
               let binding = context.systemRecoveryBinding, let stage = authority.postConfigurationRouteState,
               context.pendingReset == binding.incarnation.identity.root,
@@ -7752,7 +7776,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
             routeObservationRevision: ticket.authority.routeObservationRevision, semanticIdentity: semantic,
             configurationTransitionIdentity: nil, postConfigurationStageIdentity: nil,
             systemOpenConfigurationGeneration: authority.currentConfigurationGeneration)
-        let commit = StableRouteCommitIdentity(epoch: try allocator.next(in: .routeCommit), authority: open)
+        let commit = StableRouteCommitIdentity(epoch: try allocator.next(in: .routeCommit),
+            authority: open, outputTiming: outputTiming)
         let nonce = try allocator.next(in: .nonce)
         let claimant: OutputSuccessorCreationOwner
         switch context.claimOrigin {
@@ -8685,6 +8710,36 @@ final class ControlTaskRegistry: @unchecked Sendable {
                       record.phase == .running || record.phase == .terminal(.completed),
                       self.authority.matches(record.safetySnapshot),
                       capability.consumeWhileSafetyCellLocked() else { return false }
+                return true
+            }, sideEffect: sideEffect)
+    }
+
+    /// 已消费activation的后续正速率仍在原Cell最终副作用点复验；不重新消费首次
+    /// activation，也不把缓存的nominal rate或renderer coverage当作权限。
+    private func performCurrentPlaybackRateSideEffect(
+        capability: BackendPositiveRateCapability,
+        sourceTaskNonce: UInt64,
+        activation: ActivationEpoch,
+        sideEffect: () -> Void
+    ) -> Bool {
+        executor.safetyIngress.performPositiveRateSideEffect(
+            validateAndConsume: { _ in
+                guard capability.hasBeenConsumedWhileSafetyCellLocked,
+                      case .installed(let context, let backend) = self.authority.resourceState,
+                      let sourceTask = context.sourceTask,
+                      sourceTask.nonce == sourceTaskNonce,
+                      let interval = context.interval,
+                      interval.activation == activation,
+                      context.activation == activation,
+                      context.suspend == nil, context.owner == nil,
+                      backend.identity == interval.backendIdentity,
+                      backend.lifecycle == interval.outputLifecycle,
+                      let record = self.authority.commands.first(where: {
+                          $0?.controlTaskTicket == sourceTask
+                      }) ?? nil,
+                      !record.resultInvalidated,
+                      record.phase == .running || record.phase == .terminal(.completed),
+                      self.authority.matches(record.safetySnapshot) else { return false }
                 return true
             }, sideEffect: sideEffect)
     }

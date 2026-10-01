@@ -154,6 +154,11 @@ final class PlaybackResourceContextLedger: @unchecked Sendable {
         (0..<Self.maximumAllocationCount).reduce(0) { $0 + allocations[$1].bytes }
     }
 
+    /// 只核既有账本配对身份；不签发或扩大任何资源权限。
+    func usesApplicationLedger(_ ledger: HLSDeliveryApplicationChargeLedger) -> Bool {
+        applicationLedger === ledger
+    }
+
     var chargedBytes: Int { lock.withLock { chargedBytesLocked } }
     var maximumChargedBytes: Int { lock.withLock { maximum } }
     var shouldBackpressure: Bool { chargedBytes >= Self.softBytes }

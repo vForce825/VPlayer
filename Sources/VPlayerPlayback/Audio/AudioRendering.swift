@@ -266,6 +266,20 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
     func stopAwaitingRendererRemoval() async
 }
 
+/// 当前物理队列实际接纳的连续媒体覆盖；仅供健康观察，不证明输出授权或实际发声。
+struct AudioRendererAcceptedCoverage: Sendable, Equatable {
+    let epoch: UInt64
+    let generation: MediaGeneration
+    let continuityIslandID: AudioContinuityIslandID
+    let queueEpisode: UInt64
+    let firstPTS: CMTime
+    let endPTS: CMTime
+}
+
+protocol AudioRendererCoverageObserving: AnyObject {
+    var acceptedCoverage: AudioRendererAcceptedCoverage? { get }
+}
+
 public extension AudioRenderPipelineProtocol {
     func stopAwaitingRendererRemoval() async {
         stop()

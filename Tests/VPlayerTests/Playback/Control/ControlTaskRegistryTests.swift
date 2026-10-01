@@ -9,6 +9,84 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class ControlTaskRegistryTests: XCTestCase {
+    func test已消费的同一播放授权允许重复倍率副作用但不重复激活() async throws {
+        let fixture = try await CurrentPlaybackRateGateFixture.make()
+        let invocation = try XCTUnwrap(fixture.backend.lastActivation)
+        let interval = try XCTUnwrap(fixture.graph.registry.outputResourceContextSnapshot()?.interval)
+        var adjustments = 0
+        XCTAssertTrue(invocation.performCurrentPlaybackRateSideEffect { adjustments += 1 })
+        XCTAssertTrue(invocation.performCurrentPlaybackRateSideEffect { adjustments += 1 })
+        XCTAssertEqual(adjustments, 2)
+        XCTAssertEqual(fixture.backend.firstPositiveCalls, 1)
+        XCTAssertFalse(invocation.performPositiveRateSideEffect { adjustments += 100 },
+                       "倍率调节不能使首次activation的单次消费能力重新可用")
+        XCTAssertEqual(fixture.graph.registry.outputResourceContextSnapshot()?.interval, interval,
+                       "调节始终沿用同一潜在出声区间")
+    }
+
+    func test未消费首次激活的能力不能用于倍率副作用() async throws {
+        let fixture = try await CurrentPlaybackRateGateFixture.make(consumeActivation: false)
+        let invocation = try XCTUnwrap(fixture.backend.lastActivation)
+        var calls = 0
+        XCTAssertTrue(invocation.revalidateCurrentAuthority(), "夹具必须具有当前授权但尚未消费首次激活")
+        XCTAssertFalse(invocation.performCurrentPlaybackRateSideEffect { calls += 1 })
+        XCTAssertEqual(calls, 0)
+        XCTAssertTrue(invocation.performPositiveRateSideEffect { calls += 1 })
+        XCTAssertTrue(invocation.performCurrentPlaybackRateSideEffect { calls += 1 })
+        XCTAssertEqual(calls, 2, "只在原首次激活能力已成功消费后允许同授权调节")
+    }
+
+    func test路由首入口撤权且停止尚未执行时拒绝倍率副作用() async throws {
+        let fixture = try await CurrentPlaybackRateGateFixture.make()
+        let registry = fixture.graph.registry
+        let invocation = try XCTUnwrap(fixture.backend.lastActivation)
+        let before = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval)
+        guard case .open(let route) = registry.outputRouteObservationSnapshot() else {
+            return XCTFail("夹具必须具有真实稳定路由")
+        }
+        registry.executor.safetyIngress.beginRouteObservation(.init(
+            sessionIdentity: route.sessionIdentity, monitorLifecycle: route.monitorLifecycle,
+            notificationRevision: route.routeObservationRevision + 1,
+            reasonBits: 1, topologyChangeHint: false, outputConfigurationChanged: false,
+            observedRoute: route.semanticIdentity))
+        XCTAssertFalse(registry.executor.safetyIngress.snapshot.outputPermitPresent)
+        XCTAssertEqual(fixture.backend.physicalRate, 1, "夹具故意尚未执行异步停止，不能以rate0冒充拒绝")
+        var calls = 0
+        XCTAssertFalse(invocation.performCurrentPlaybackRateSideEffect { calls += 1 })
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.interval, before,
+                       "安全撤权本身不能提前关闭仍可能出声的区间")
+    }
+
+    func test同生命周期重新授权后旧激活不能调节新时钟() async throws {
+        let fixture = try await CurrentPlaybackRateGateFixture.make()
+        let registry = fixture.graph.registry
+        let prior = try XCTUnwrap(fixture.backend.lastActivation)
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(fixture.graph.coordinator.begin(
+            contextNonce: context.contextNonce, reason: .pause,
+            at: registry.clock.nowNanoseconds, teardown: false))
+        let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        XCTAssertTrue(registry.startOutputSuspendOperation(suspend.task, owner: owner))
+        let stopped = await registry.joinOutputBackendOperation(suspend.task)
+        guard case .succeeded = stopped else { return XCTFail("真实停止操作必须成功") }
+        XCTAssertTrue(registry.finishOutputPause(owner: owner))
+        let activation = try XCTUnwrap(registry.beginOutputActivation(contextNonce: context.contextNonce))
+        XCTAssertTrue(registry.startOutputActivationOperation(activation))
+        let activated = await registry.joinOutputBackendOperation(activation)
+        guard case .succeeded = activated else { return XCTFail("新activation必须真实接纳") }
+        let current = try XCTUnwrap(fixture.backend.lastActivation)
+        XCTAssertEqual(current.activation.outputLifecycleEpoch, prior.activation.outputLifecycleEpoch)
+        XCTAssertNotEqual(current.activation, prior.activation)
+        var oldCalls = 0
+        var currentCalls = 0
+        XCTAssertFalse(prior.performCurrentPlaybackRateSideEffect { oldCalls += 1 })
+        XCTAssertTrue(current.performCurrentPlaybackRateSideEffect { currentCalls += 1 })
+        XCTAssertEqual(oldCalls, 0)
+        XCTAssertEqual(currentCalls, 1)
+        XCTAssertEqual(fixture.backend.firstPositiveCalls, 2)
+    }
+
     func testFrozenActivationProofPreservesEveryRetiredResourceCombination() throws {
         let fixture = try AudioPhaseFixture(ownsResources: false)
         let phase = fixture.phase.identity
@@ -1406,6 +1484,84 @@ final class ControlTaskRegistryTests: XCTestCase {
         """)
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+}
+
+/// 只替代最终输出执行器；授权、区间、停止proof与phase均来自真实Registry。
+private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
+    SampleBufferQuiescenceIssuerInstalling, @unchecked Sendable {
+    private let lock = NSLock()
+    private let consumeActivation: Bool
+    private var storedIdentity = PlaybackBackendIdentity(
+        sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0)
+    private var storedActivation: ControlTaskRegistry.BackendPositiveRateInvocation?
+    private var issuer: ControlTaskRegistry.SampleBufferQuiescenceIssuer?
+    private var storedRate: Float = 0
+    private var storedFirstPositiveCalls = 0
+
+    init(consumeActivation: Bool) { self.consumeActivation = consumeActivation }
+    var identity: PlaybackBackendIdentity { lock.withLock { storedIdentity } }
+    var presentation: PlaybackPresentation? { nil }
+    var lastActivation: ControlTaskRegistry.BackendPositiveRateInvocation? {
+        lock.withLock { storedActivation }
+    }
+    var physicalRate: Float { lock.withLock { storedRate } }
+    var firstPositiveCalls: Int { lock.withLock { storedFirstPositiveCalls } }
+    func configure(identity: PlaybackBackendIdentity) { lock.withLock { storedIdentity = identity } }
+    func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
+    func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
+    func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
+        lock.withLock { storedActivation = invocation }
+        if consumeActivation {
+            _ = invocation.performPositiveRateSideEffect {
+                lock.withLock { storedRate = 1; storedFirstPositiveCalls += 1 }
+            }
+        }
+    }
+    func installSampleBufferQuiescenceIssuer(_ issuer: ControlTaskRegistry.SampleBufferQuiescenceIssuer) {
+        lock.withLock { self.issuer = issuer }
+    }
+    func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async -> BackendSuspendResult {
+        let (issuer, identity) = lock.withLock {
+            storedRate = 0
+            return (self.issuer, storedIdentity)
+        }
+        guard let proof = issuer?.issue(backendIdentity: identity, invocation: invocation,
+                                       observedRate: 0, preparedPreserved: true) else {
+            return .requiresRetirement
+        }
+        return .quiescent(proof)
+    }
+    func retireOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
+        lock.withLock { storedRate = 0 }
+        return .confirmedLocalOutputStopped
+    }
+}
+
+private struct CurrentPlaybackRateGateFixture {
+    let graph: OutputGraphFixture
+    let backend: CurrentPlaybackRateGateBackend
+
+    static func make(consumeActivation: Bool = true) async throws -> Self {
+        let backend = CurrentPlaybackRateGateBackend(consumeActivation: consumeActivation)
+        let graph = try OutputGraphFixture(backendObject: backend)
+        backend.configure(identity: graph.lifecycle.backendIdentity)
+        let prepare = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(graph.registry.startOutputPrepareOperation(prepare))
+        let prepared = await graph.registry.joinOutputBackendOperation(prepare)
+        guard case .succeeded = prepared else {
+            XCTFail("真实prepare必须成功")
+            throw ControlTaskRegistry.Failure.invalidGroup
+        }
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let activation = try XCTUnwrap(graph.registry.beginOutputActivation(contextNonce: context.contextNonce))
+        XCTAssertTrue(graph.registry.startOutputActivationOperation(activation))
+        let activated = await graph.registry.joinOutputBackendOperation(activation)
+        guard case .succeeded = activated else {
+            XCTFail("真实activation必须成功")
+            throw ControlTaskRegistry.Failure.invalidGroup
+        }
+        return .init(graph: graph, backend: backend)
     }
 }
 
