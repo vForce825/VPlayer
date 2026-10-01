@@ -12,6 +12,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         let operations: [String]
         let enqueuedFormatIDs: [AudioFormatID]
         let enqueuedPTS: [CMTime]
+        let pendingPTS: [CMTime]
         let requestCount: Int
         let stopRequestCount: Int
         let observationStartCount: Int
@@ -33,6 +34,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var operations: [String] = []
     private var enqueuedFormatIDs: [AudioFormatID] = []
     private var enqueuedPTS: [CMTime] = []
+    private var pendingPTS: [CMTime] = []
     private var requestCount = 0
     private var stopRequestCount = 0
     private var observationStartCount = 0
@@ -93,13 +95,17 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
             operations.append("enqueue")
             enqueuedFormatIDs.append(formatID)
             enqueuedPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            pendingPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             enqueuesSinceReadyCallback += 1
             return .accepted
         }
     }
 
     func flush() {
-        withLock { operations.append("flush") }
+        withLock {
+            operations.append("flush")
+            pendingPTS.removeAll(keepingCapacity: true)
+        }
     }
 
     func requestMediaDataWhenReady(_ handler: @escaping @Sendable () -> Void) {
@@ -147,7 +153,13 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     }
 
     func emit(_ event: AudioRendererEvent) {
-        withLock { eventHandler }?(event)
+        let handler = withLock { () -> (@Sendable (AudioRendererEvent) -> Void)? in
+            if case .automaticFlush = event {
+                pendingPTS.removeAll(keepingCapacity: true)
+            }
+            return eventHandler
+        }
+        handler?(event)
     }
 
     func captureEventHandler() -> (@Sendable (AudioRendererEvent) -> Void)? {
@@ -164,6 +176,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
                 operations: operations,
                 enqueuedFormatIDs: enqueuedFormatIDs,
                 enqueuedPTS: enqueuedPTS,
+                pendingPTS: pendingPTS,
                 requestCount: requestCount,
                 stopRequestCount: stopRequestCount,
                 observationStartCount: observationStartCount,

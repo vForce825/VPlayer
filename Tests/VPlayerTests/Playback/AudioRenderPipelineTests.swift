@@ -2634,7 +2634,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.route, .systemCompressed)
     }
 
-    func testSecondAutomaticFlushBeforeDeadlineDoesNotReplayOrRebuild() throws {
+    func testSecondAutomaticFlushRefillsPhysicalQueueWithoutRebuilding() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
         renderer.configureReadiness(ready: true)
@@ -2642,17 +2642,23 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             try harness.pipeline.enqueue(try self.makeSample(id: 1))
         }
         let initialEnqueueCount = renderer.snapshot.enqueuedPTS.count
+        let expectedPendingPTS = renderer.snapshot.pendingPTS
+        XCTAssertFalse(expectedPendingPTS.isEmpty)
 
         renderer.emit(.automaticFlush(.zero))
         drain(harness.executor)
         let firstReplayCount = renderer.snapshot.enqueuedPTS.count
+        XCTAssertEqual(renderer.snapshot.pendingPTS, expectedPendingPTS)
         renderer.emit(.automaticFlush(.zero))
         drain(harness.executor)
 
         XCTAssertEqual(firstReplayCount, initialEnqueueCount + 1)
-        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, firstReplayCount)
-        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
+        XCTAssertEqual(renderer.snapshot.pendingPTS, expectedPendingPTS,
+                       "相同 flushTime 的第二次清空也必须补回实际队列")
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, firstReplayCount + 1)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 2)
         XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
     }
 
     func testOutputConfigurationCorrelatedWithAutomaticFlushDoesNotReplayBeforeProgressDeadline() throws {
@@ -3921,7 +3927,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
     }
 
-    func testSecondAutomaticFlushDuringSettleDoesNotStartSecondCompressedRecovery() throws {
+    func testSecondAutomaticFlushDuringSettleRefillsWithoutRebuildingCompressedRenderer() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
         try perform(on: harness.executor) {
@@ -3933,8 +3939,8 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         renderer.emit(.automaticFlush(CMTime(value: 1, timescale: 1)))
         drain(harness.executor)
 
-        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
-        XCTAssertEqual(harness.pipeline.recoveryCount, 1)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 2)
+        XCTAssertEqual(harness.pipeline.recoveryCount, 2)
         XCTAssertTrue(harness.support.checkSnapshot.isEmpty)
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed])
         XCTAssertEqual(harness.pipeline.route, .systemCompressed)

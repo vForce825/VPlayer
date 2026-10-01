@@ -21,13 +21,24 @@ final class AudioRendererRecoveryProgressTests: XCTestCase {
         XCTAssertEqual(try deadlineTicket(actions).rawValue, 1)
     }
 
-    func testCorrelatedFlushBeforeDeadlineDoesNotReplayAgain() {
+    func testRepeatedAutomaticFlushReplaysWithoutPostponingOriginalDeadline() throws {
         var monitor = AudioRendererRecoveryProgressMonitor()
-        _ = monitor.automaticFlush(key: key(), token: token(), hasReplay: true)
+        let baseline = token()
+        let ticket = try deadlineTicket(monitor.automaticFlush(
+            key: key(), token: baseline, hasReplay: true))
 
+        for _ in 0..<3 {
+            XCTAssertEqual(
+                monitor.automaticFlush(key: key(), token: baseline, hasReplay: true),
+                [.replay],
+                "每次真实清空都需要补回音频，但不能延长原有进度期限"
+            )
+        }
+        XCTAssertTrue(monitor.hasActiveBaseline)
         XCTAssertEqual(
-            monitor.automaticFlush(key: key(), token: token(), hasReplay: true),
-            []
+            monitor.deadlineFired(ticket, token: baseline),
+            [.rebuildCompressed],
+            "连续清空不能重置一次压缩重建的上限"
         )
     }
 

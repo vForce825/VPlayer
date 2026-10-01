@@ -189,7 +189,10 @@ struct AudioRendererRecoveryProgressMonitor: Sendable {
     ) -> [AudioRendererProgressAction] {
         startAttemptIfNeeded(key)
         observeProgress(token)
-        guard hasReplay, baseline == nil else { return [] }
+        guard hasReplay else { return [] }
+        // 每次自动清空都代表物理队列已丢失。已有进度观察只限制重建和降级，
+        // 不能阻止补回音频；沿用原有期限，避免连续清空无限延长恢复窗口。
+        if baseline != nil { return [.replay] }
         return beginBaseline(
             key: key,
             token: token,
