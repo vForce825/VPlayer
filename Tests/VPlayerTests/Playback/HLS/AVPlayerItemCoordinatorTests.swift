@@ -8,6 +8,7 @@ import CoreVideo
 import Darwin
 import VideoToolbox
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 @MainActor
@@ -475,9 +476,39 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         driver.replaceCurrentItemWithNil(item: item)
-        try driver.install(url: URL(fileURLWithPath: "/tmp/VPlayer-task21-sdk-fixed-nonexistent.m3u8"), identity: item)
-        do { _ = try await driver.waitUntilReady(item: item); XCTFail("无效媒体必须报告固定失败") }
-        catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed) }
+        // Same 43-byte failure input validated by the raw Release controls.
+        // A missing file-scheme .m3u8 did not reliably reach item failure.
+        let invalidURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("VPlayer-readiness-failure-\(UUID().uuidString).mp4")
+        let invalidBytes = Data("VPlayer deliberately malformed MP4 fixture\n".utf8)
+        try invalidBytes.write(to: invalidURL, options: .atomic)
+        defer {
+            driver.replaceCurrentItemWithNil(item: item)
+            driver.removeObservers(item: item)
+            XCTAssertNoThrow(try FileManager.default.removeItem(at: invalidURL))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: invalidURL.path))
+        let bytes = try Data(contentsOf: invalidURL)
+        XCTAssertEqual(bytes, invalidBytes)
+        guard bytes == invalidBytes else {
+            throw NSError(domain: "NativeReadinessFixture", code: 1)
+        }
+        try driver.install(url: invalidURL, identity: item)
+        let invalidItem = try XCTUnwrap(driver.player.currentItem)
+        do {
+            _ = try await driver.waitUntilReady(item: item)
+            XCTFail("Malformed media must report the native item failure")
+        } catch {
+            let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot)
+            let nativeError = try XCTUnwrap(invalidItem.error)
+            XCTAssertEqual(diagnostic, PlaybackErrorDiagnostics.snapshot(nativeError))
+        }
+        XCTAssertTrue(driver.player.currentItem === invalidItem)
+        XCTAssertEqual(invalidItem.status, .failed)
+        XCTAssertNotNil(invalidItem.error)
+        XCTAssertEqual(driver.activeWaiterCount, 0)
+        driver.replaceCurrentItemWithNil(item: item)
+        driver.removeObservers(item: item)
     }
 
     func testSystemDriverUsesConfiguredStartupBufferForHomePodHLS() throws {
@@ -1547,6 +1578,12 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                           "清理后同票必须领取原 receipt identity")
             XCTAssertEqual(joined, receipt)
             try await completed.shutdown()
+            XCTAssertTrue(completed.backend.quiescenceReceipt?.identity === receipt.identity,
+                          "terminal retirement must preserve the original successful stop receipt")
+            XCTAssertNotEqual(completed.backend.lastSuspendInvocation?.suspendTicket,
+                              invocation.suspendTicket,
+                              "terminal cleanup must exercise the Registry's replacement suspend ticket")
+            XCTAssertEqual(completed.backend.lastRetiredEpoch, completed.lifecycle)
 
             let foreign = try await Task21Harness()
             _ = try await foreign.prepare()
@@ -1589,27 +1626,44 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testInstallPrepareAndStopTicketsAreSingleFlightAcrossAwaitCancellationAndTimeout() async throws {
+        var checkpoint = "prepare.construct"
+        defer {
+            if checkpoint != "complete" {
+                print("TASK21_SINGLEFLIGHT_FAILURE checkpoint=\(checkpoint) "
+                    + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
+            }
+        }
         let prepare = try await Task21Harness()
+        checkpoint = "prepare.first"
         let first = try await prepare.prepare()
+        checkpoint = "prepare.replay"
         let second = try await prepare.prepare()
         XCTAssertEqual(first.identity, second.identity,
                        "同一 item 的 prepare 必须加入原 operation ticket")
+        checkpoint = "prepare.shutdown"
         try await prepare.shutdown()
 
+        checkpoint = "stop.construct"
         let stop = try await Task21Harness()
+        checkpoint = "stop.prepare"
         _ = try await stop.prepare()
+        checkpoint = "stop.activate"
         _ = try await stop.activate()
         stop.driver.holdDirectPausedRead = true
         let pending = Task { try await stop.stop() }
         await stop.driver.waitForPauseCall()
+        checkpoint = "stop.reinstall"
         XCTAssertThrowsError(try stop.reinstall())
         XCTAssertEqual(stop.coordinator.currentItemIdentity, stop.oldItem,
                        "install 不得清掉或越过在途 stop")
         stop.coordinator.timeoutCurrentStop()
         stop.driver.releaseDirectPausedRead(rate: 0, status: .paused)
+        checkpoint = "stop.join"
         _ = try? await pending.value
         XCTAssertEqual(stop.driver.pauseCallCount, 1)
+        checkpoint = "stop.shutdown"
         try await stop.shutdown()
+        checkpoint = "complete"
     }
 
     func testStorageConcurrentRegistryStopJoinsOriginalRunnerWhileLeafRejectsReentry() async throws {
@@ -3130,7 +3184,17 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertTrue(completion.value,
                       "固定槽 terminal 通知、HTTP 复核与 endpoint 安装后 prepare 才能恢复")
         guard completion.value else {
+            let history = http.server.preparationHistoryFactCounts
+            let selection = http.server.currentAudioSelectionCapability(
+                itemGeneration: item.itemGeneration,
+                publicationSequence: http.publicationSequence)
+            print("TASK21_FINAL_AAC_PREPARE_FAILURE phase=\(coordinator.phase) "
+                + "publication=\(http.publicationSequence) selection=\(selection != nil) "
+                + "authorities=\(history.authorities) resources=\(history.resources) "
+                + "selections=\(history.selections) "
+                + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
             preparation.cancel()
+            _ = try? await preparation.value
             return
         }
         let prepared = try await preparation.value
@@ -4980,6 +5044,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
     private var preparedValue: PreparedAVPlayerItem?
     private var activationValue: BackendActivationResult?
     private var quiescenceValue: AVPlayerQuiescenceReceipt?
+    private var quiescenceInvocation: ControlTaskRegistry.BackendSuspendInvocation?
     private var errorValue: Error?
     private var suspendCallCountValue = 0
     private var retireCallCountValue = 0
@@ -5058,6 +5123,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
             preparedValue = nil
             activationValue = nil
             quiescenceValue = nil
+            quiescenceInvocation = nil
             errorValue = nil
         }
     }
@@ -5110,6 +5176,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
             let proof = ControlTaskRegistry.BackendQuiescenceProof.avPlayer(attestation)
             lock.withLock {
                 quiescenceValue = value
+                quiescenceInvocation = invocation
                 lastProof = proof
                 lastSuspendInvocation = invocation
             }
@@ -5134,7 +5201,10 @@ private final class Task21RegistryBackend: PlaybackBackend,
                   let receipt = quiescenceValue,
                   receipt.item.outputLifecycleEpoch == epoch,
                   receipt.suspendTicket.lifecycle == epoch,
-                  let invocation = lastSuspendInvocation,
+                  // Terminal ownership replaces a completed pause ticket. Its
+                  // rejected second leaf must not replace the successful
+                  // receipt's original issuer/invocation pair.
+                  let invocation = quiescenceInvocation,
                   invocation.lifecycle == epoch,
                   invocation.suspendTicket == receipt.suspendTicket,
                   invocation.closeClaim == receipt.closeClaim else { return nil }
@@ -5574,13 +5644,13 @@ private final class Task21RealIntegrationFixture {
         let video = try XCTUnwrap(snapshot.media[1], file: file, line: line)
         let audioTail = try XCTUnwrap(seed.audioPackets.last, file: file, line: line)
         let videoTail = try XCTUnwrap(seed.videoPackets.last, file: file, line: line)
-        XCTAssertEqual(audioTail.object.key, seed.endpointAuthority.receipt.terminalMedia.key,
+        XCTAssertEqual(HLSResourceKey(audioTail.object), seed.endpointAuthority.receipt.terminalMedia.key,
                        "The finite seed must retain its original writer's actual terminal AAC body",
                        file: file, line: line)
         XCTAssertTrue(snapshot.aacTerminalBindings[2] === seed.endpointAuthority.terminalBinding,
                       file: file, line: line)
-        XCTAssertEqual(audio.resources.last, audioTail.object.key, file: file, line: line)
-        XCTAssertEqual(video.resources.last, videoTail.object.key, file: file, line: line)
+        XCTAssertEqual(audio.resources.last, HLSResourceKey(audioTail.object), file: file, line: line)
+        XCTAssertEqual(video.resources.last, HLSResourceKey(videoTail.object), file: file, line: line)
         XCTAssertEqual(audio.logicalSequences.last, seed.endpointAuthority.receipt.terminalLogicalSequence,
                        file: file, line: line)
         XCTAssertEqual(video.logicalSequences.last, audio.logicalSequences.last, file: file, line: line)
@@ -6404,7 +6474,7 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             + "videoEnd=\(videoTail.receipt.presentationRange.end) pending=\(pending)")
         guard avSeed.audioPackets.map({ $0.object.logicalSequence })
                 == avSeed.videoPackets.map({ $0.object.logicalSequence }),
-              audioTail.object.key == avSeed.endpointAuthority.receipt.terminalMedia.key,
+              HLSResourceKey(audioTail.object) == avSeed.endpointAuthority.receipt.terminalMedia.key,
               audioTail.receipt.presentationRange.end
                 == avSeed.endpointAuthority.receipt.terminalPhysicalEnd else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
@@ -6421,7 +6491,7 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             XCTAssertEqual(Set(first.logicalSequences + last.logicalSequences),
                            Set(packets.map { $0.object.logicalSequence }),
                            "Every accepted packet in this short finite fixture must appear in a committed window")
-            XCTAssertEqual(last.resources.last, packets.last?.object.key)
+            XCTAssertEqual(last.resources.last, packets.last.map { HLSResourceKey($0.object) })
             XCTAssertEqual(last.logicalSequences.last, audioTail.object.logicalSequence)
             XCTAssertEqual(last.text.components(separatedBy: "#EXT-X-ENDLIST").count - 1, 1)
             XCTAssertTrue(last.text.hasSuffix("#EXT-X-ENDLIST\n"))

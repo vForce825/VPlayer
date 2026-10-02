@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-finite-uri-${{ github.ref }}
+  group: macos-ci-finite-fixed-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -110,3 +110,59 @@ jobs:
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/LoopbackFull.xcresult"
 
+      - name: Verify remaining fixture repairs and original native failure path
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/FixtureRepairs.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalLiveAACRequiresWriterIssuedRetainedTerminalBindingAndInstallsEOSConstraintAfterFinish \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testInstallPrepareAndStopTicketsAreSingleFlightAcrossAwaitCancellationAndTimeout \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testQuiescenceReceiptRemainsVerifiableAfterCleanupAndDirectStateMatchesInstalledItem \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSDKFixedSystemLoopbackLoadedReceiptAndItemFailure
+      - name: Report scoped remaining fixture failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/FixtureRepairs.xcresult"
+
+  release-validation:
+    name: Original native failure path and reference controls
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        id: release_preflight
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Run Release boundary suite
+        run: |
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests -resultBundlePath "$RUNNER_TEMP/ReleaseBoundary.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+            -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -only-testing:VPlayerReleaseBoundaryTests/SDKSystemLoadedReleaseTests/testSystemLoopbackLoadedReceiptAndItemFailure \
+            -only-testing:VPlayerReleaseBoundaryTests/SDKReadinessReferenceReleaseTests
+      - name: Report scoped Release boundary failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseBoundary.xcresult"

@@ -6,6 +6,7 @@ import AVFoundation
 import Darwin
 import Foundation
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 private final class ReleaseWeakFoundationURLOwnerBox {
@@ -231,26 +232,58 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         add(attachment)
 
         driver.replaceCurrentItemWithNil(item: item)
-        let nonexistentURL = URL(
-            fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent(
-                "VPlayer-task21-release-boundary-\(UUID().uuidString).m3u8")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: nonexistentURL.path))
-        probe.stage = "loaded.invalid_item_ready"
-        var installedNonexistentItem = false
-        do {
-            try driver.install(url: nonexistentURL, identity: item)
-            installedNonexistentItem = true
-            _ = try await driver.waitUntilReady(item: item)
-            XCTFail("无效媒体必须报告固定 itemFailed")
-        } catch {
-            XCTAssertTrue(installedNonexistentItem,
-                          "期望失败必须来自 waitUntilReady，而非 install")
-            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed)
+        // The missing file-scheme HLS URL stalled even in raw AVPlayer controls.
+        // This exact existing 43-byte fixture independently reaches native failure:
+        // https://github.com/vForce825/VPlayer/actions/runs/37008106413
+        let invalidURL = try ReleaseCorruptMP4ReadinessFixture.create()
+        defer {
+            driver.replaceCurrentItemWithNil(item: item)
+            driver.removeObservers(item: item)
+            XCTAssertNoThrow(try FileManager.default.removeItem(at: invalidURL))
         }
+        try ReleaseCorruptMP4ReadinessFixture.verify(invalidURL)
+        probe.stage = "loaded.invalid_item_ready"
+        try driver.install(url: invalidURL, identity: item)
+        let invalidItem = try XCTUnwrap(driver.player.currentItem)
+        do {
+            _ = try await driver.waitUntilReady(item: item)
+            XCTFail("Malformed media must report the native item failure")
+        } catch {
+            let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot)
+            let nativeError = try XCTUnwrap(invalidItem.error)
+            XCTAssertEqual(diagnostic, PlaybackErrorDiagnostics.snapshot(nativeError))
+        }
+        XCTAssertTrue(driver.player.currentItem === invalidItem)
+        XCTAssertEqual(invalidItem.status, .failed)
+        XCTAssertNotNil(invalidItem.error)
         XCTAssertEqual(driver.activeWaiterCount, 0)
         driver.replaceCurrentItemWithNil(item: item)
+        driver.removeObservers(item: item)
         try fixture.teardown()
+    }
+}
+
+private enum ReleaseCorruptMP4ReadinessFixture {
+    private static let corruptMP4Bytes = Data("VPlayer deliberately malformed MP4 fixture\n".utf8)
+
+    static func create() throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("VPlayer-readiness-reference-\(UUID().uuidString).mp4")
+        try Self.corruptMP4Bytes.write(to: url, options: .atomic)
+        return url
+    }
+
+    static func verify(_ url: URL) throws {
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        let bytes = try Data(contentsOf: url)
+        let matches = bytes == Self.corruptMP4Bytes
+        print("READINESS_REFERENCE fixture=corrupt_mp4 exists=\(exists) "
+            + "bytes=\(bytes.count) contentMatches=\(matches)")
+        XCTAssertTrue(exists)
+        XCTAssertTrue(matches)
+        guard exists, matches else {
+            throw NSError(domain: "ReleaseReadinessFixture", code: 1)
+        }
     }
 }
 
@@ -291,16 +324,15 @@ private final class ReleaseReadinessTaskProgress {
 
 @MainActor
 final class SDKReadinessReferenceReleaseTests: XCTestCase {
-    // These independent controls leave the original 120-second native tests
-    // untouched. A control must reach its expected terminal result; observing
+    // These independent controls preserve the original 120-second native-test
+    // limit. A control must reach its expected terminal result; observing
     // unknown or cancelling a stuck operation is a test failure, never a skip.
     // Prior nonexistent file-scheme .m3u8 controls stayed unknown in both raw
     // players and the driver, while independent isPlayable returned true:
     // https://github.com/vForce825/VPlayer/actions/runs/37005698567
     // That HLS URL shape and suitability query are not file-readability oracles.
-    // Use byte-verified malformed file media before replacing any original fixture.
+    // The byte-verified malformed file reached native failure in run37008106413.
     private let observationTimeout: TimeInterval = 15
-    private static let corruptMP4Bytes = Data("VPlayer deliberately malformed MP4 fixture\n".utf8)
 
     func testObservedStatusDrivesTerminalWhenTypedChangeValueIsAbsent() {
         let facts = ReleaseReadinessKVOFacts()
@@ -320,9 +352,9 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
 
     private func checkRawCorruptMP4(observeBeforeAttachment: Bool) async throws {
         let label = observeBeforeAttachment ? "raw.before_attach" : "raw.after_attach"
-        let url = try createCorruptMP4File()
+        let url = try ReleaseCorruptMP4ReadinessFixture.create()
         defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: url)) }
-        try verifyCorruptMP4File(url)
+        try ReleaseCorruptMP4ReadinessFixture.verify(url)
         let player = AVPlayer()
         let item = AVPlayerItem(url: url)
         // Match install's media settings in both references. Only KVO ordering
@@ -363,9 +395,9 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
     }
 
     func testFreshDriverCorruptMP4Fails() async throws {
-        let url = try createCorruptMP4File()
+        let url = try ReleaseCorruptMP4ReadinessFixture.create()
         defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: url)) }
-        try verifyCorruptMP4File(url)
+        try ReleaseCorruptMP4ReadinessFixture.verify(url)
         let allocator = PlaybackIdentityAllocator()
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
         let identity = AVPlayerItemInstanceIdentity(
@@ -423,9 +455,9 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
     func testIndependentCorruptMP4DurationLoadFails() async throws {
         // A separate asset and URL prevent this explicit load from preparing
         // an item in another control. Asset loading is not item readiness.
-        let url = try createCorruptMP4File()
+        let url = try ReleaseCorruptMP4ReadinessFixture.create()
         defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: url)) }
-        try verifyCorruptMP4File(url)
+        try ReleaseCorruptMP4ReadinessFixture.verify(url)
         let asset = AVURLAsset(url: url)
         let terminal = expectation(description: "Malformed MP4 duration load fails")
         let progress = ReleaseReadinessTaskProgress()
@@ -458,26 +490,6 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
             print("READINESS_REFERENCE stage=asset.returned error=\(Self.errorFact(error as NSError))")
             XCTAssertFalse(error is CancellationError,
                            "Diagnostic cancellation is not native asset failure")
-        }
-    }
-
-    private func createCorruptMP4File() throws -> URL {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("VPlayer-readiness-reference-\(UUID().uuidString).mp4")
-        try Self.corruptMP4Bytes.write(to: url, options: .atomic)
-        return url
-    }
-
-    private func verifyCorruptMP4File(_ url: URL) throws {
-        let exists = FileManager.default.fileExists(atPath: url.path)
-        let bytes = try Data(contentsOf: url)
-        let matches = bytes == Self.corruptMP4Bytes
-        print("READINESS_REFERENCE fixture=corrupt_mp4 exists=\(exists) "
-            + "bytes=\(bytes.count) contentMatches=\(matches)")
-        XCTAssertTrue(exists)
-        XCTAssertTrue(matches)
-        guard exists, matches else {
-            throw NSError(domain: "ReleaseReadinessFixture", code: 1)
         }
     }
 
