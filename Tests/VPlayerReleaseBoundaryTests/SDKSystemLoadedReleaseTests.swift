@@ -34,16 +34,21 @@ private final class ReleasePreparationProgressProbe {
             catch { return }
             guard !Task.isCancelled, let self else { return }
             let player = driver?.player
+            let item = player?.currentItem
             // These bounded test-only facts are read once. Never retain an item,
             // URL, or production callback owner in the suspended probe task.
-            let ranges = player?.currentItem?.loadedTimeRanges ?? []
+            let ranges = item?.loadedTimeRanges ?? []
             let first = ranges.count <= 128 ? ranges.first?.timeRangeValue : nil
             let last = ranges.count <= 128 ? ranges.last?.timeRangeValue : nil
             let requests = server?.acceptedGETSnapshot()
             let usage = server?.usage
             print("RELEASE_PREPARATION_WAIT stage=\(self.stage) "
                 + "waitPhase=\(driver?.prepareWait.activePhase.map { String(describing: $0) } ?? "none") "
-                + "itemStatus=\(player?.currentItem?.status.rawValue ?? -1) "
+                + "playerStatus=\(player?.status.rawValue ?? -1) "
+                + "playerError=\(Self.errorFact(player?.error as NSError?)) "
+                + "itemStatus=\(item?.status.rawValue ?? -1) "
+                + "itemError=\(Self.errorFact(item?.error as NSError?)) "
+                + "assetPlayableState=\(Self.playableFact(item)) "
                 + "timeControlStatus=\(player?.timeControlStatus.rawValue ?? -1) "
                 + "rangeCount=\(ranges.count) "
                 + "firstStart=\(Self.timeFact(first?.start)) "
@@ -70,6 +75,23 @@ private final class ReleasePreparationProgressProbe {
     private static func requestFact(_ snapshot: LoopbackAcceptedGETSnapshot?) -> String {
         guard let snapshot else { return "none" }
         return "playlist:\(snapshot.playlistCount),init:\(snapshot.initializationCount),media:\(snapshot.mediaCount)"
+    }
+
+    private static func errorFact(_ error: NSError?) -> String {
+        guard let error else { return "none" }
+        return "\(String(error.domain.prefix(96))):\(error.code)"
+    }
+
+    private static func playableFact(_ item: AVPlayerItem?) -> String {
+        guard let item else { return "no_item" }
+        // status(of:) only inspects current loading state. Do not call load(_:)
+        // here, because that would change the operation this probe observes.
+        switch item.asset.status(of: .isPlayable) {
+        case .notYetLoaded: return "notYetLoaded"
+        case .loading: return "loading"
+        case .loaded(let playable): return "loaded:\(playable)"
+        case .failed(let error): return "failed:\(errorFact(error))"
+        }
     }
 
     private static func timeFact(_ time: CMTime?) -> String {

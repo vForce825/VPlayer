@@ -1,4 +1,4 @@
-name: Native admission ownership and selection diagnostic
+name: Release native readiness status diagnostic
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-native-tail-${{ github.ref }}
+  group: macos-ci-release-status-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Xcode 27.0 / tvOS 27.0
+  release-validation:
+    name: Release boundaries and cold startup
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
@@ -32,67 +32,27 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-
-      - name: Verify Xcode and simulator runtime
+      - name: Verify toolchain
         run: |
           xcodebuild -version
-          xcrun --sdk appletvsimulator --show-sdk-version
-          xcrun simctl list runtimes
-          xcrun simctl list devices available
-          xcrun simctl list runtimes -j | jq -e '
-            .runtimes[] |
-            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
-          '
-
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Install build tooling
         run: brew install mint jq ripgrep
-
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
-
-      - name: Install Apple Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
-
-      - name: Check deployment floors and precompiled Metal reproducibility
-        run: |
-          python3 Scripts/Tests/test_tvos27_deployment.py
-          ./Scripts/Tests/test_precompiled_metal_library.sh
-
-      - name: Compile complete Debug test targets for diagnostic isolation
-        id: debug_build
+      - name: Verify committed project and licenses
+        id: release_preflight
         run: |
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
-          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify manual actions and background resource preference contracts
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Run Release boundary suite
         run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests -resultBundlePath "$RUNNER_TEMP/ReleaseBoundary.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+            -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/ResourceAcceptance.xcresult" \
-            -only-testing:VPlayerTests/NowPlayingIntegrationTests \
-            -only-testing:VPlayerTests/RefreshLifecycleTests \
-            -only-testing:VPlayerTests/VPlayerAppStartupTests \
-            -only-testing:VPlayerTests/ReducedResourceUsageTests
-      - name: Report scoped resource preference failures
+            -only-testing:VPlayerReleaseBoundaryTests/SDKSystemLoadedReleaseTests
+      - name: Report scoped Release boundary failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ResourceAcceptance.xcresult"
-      - name: Verify native selection phases and exact admission teardown
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/ControlNative.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testEndpointAdmissionConsumesSealedWriterSnapshotAndRejectsServedTrimMutations \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalAlreadyCancelledReadyWaitCannotRetainObservationOrDeadlineSlot
-      - name: Report scoped control and native failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlNative.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseBoundary.xcresult"
