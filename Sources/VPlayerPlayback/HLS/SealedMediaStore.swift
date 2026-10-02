@@ -871,68 +871,92 @@ final class SealedMediaStore: @unchecked Sendable {
         try preparationCoverageReceipt(owner: .startup(owner), context: context, requested: requested)
     }
 
-    func preparationCoverageReceipt(owner: FrozenCompletedCoverageOwner,
+    private func preparationCoverageReceipt(owner: FrozenCompletedCoverageOwner,
                                     context: LoopbackCoverageContext,
                                     requested: FMP4PresentationRange) throws
         -> ServedRenditionCoverageReceipt? {
         try domain.sync {
-            guard owner.metadataStore === self,
-                  context.preparedPlayheadIdentity.itemGeneration == itemGeneration else { return nil }
-            guard let dependencies = try ServedCoverageDependencies.frozen(owner: owner,
-                rendition: context.renditionIdentity, requested: requested) else { return nil }
-            var cursor = requested.start
-            for _ in 0..<dependencies.count {
-                var next = cursor
-                for ordinal in dependencies.indices {
-                    guard let input = dependencies.input(atOrdinal: ordinal),
-                          let range = try input.map.intersection(with: requested) else { continue }
-                    if try HLSChecked.compare(range.start, cursor) <= 0,
-                       try HLSChecked.compare(range.end, next) > 0 { next = range.end }
-                }
-                if try HLSChecked.compare(next, requested.end) >= 0 { cursor = next; break }
-                guard try HLSChecked.compare(next, cursor) > 0 else { return nil }
-                cursor = next
-            }
-            guard try HLSChecked.compare(cursor, requested.end) >= 0 else { return nil }
-            var hash = SHA256()
-            func append<T: FixedWidthInteger>(_ value: T) {
-                var bigEndian = value.bigEndian
-                withUnsafeBytes(of: &bigEndian) { hash.update(bufferPointer: $0) }
-            }
-            func appendUUID(_ value: UUID) {
-                withUnsafeBytes(of: value.uuid) { hash.update(bufferPointer: $0) }
-            }
-            func appendDigest(_ value: Data) {
-                append(UInt64(value.count))
-                hash.update(data: value)
-            }
-            append(itemGeneration)
-            append(context.renditionIdentity.rawValue)
-            for ordinal in dependencies.indices {
-                let dependency = dependencies[ordinal]
-                let input = dependencies.input(atOrdinal: ordinal)!
-                let range = try input.map.intersection(with: requested)!
-                append(dependency.mediaEpoch)
-                appendUUID(dependency.epochProofIdentity)
-                appendUUID(dependency.segmentReceiptIdentity)
-                appendUUID(dependency.initializationBackingIdentity.rawValue)
-                appendUUID(dependency.mediaBackingIdentity.rawValue)
-                appendUUID(dependency.initializationEvidenceIdentity)
-                appendUUID(dependency.mediaEvidenceIdentity)
-                appendDigest(input.initialization.sealedDigest)
-                appendDigest(input.media.sealedDigest)
-                append(range.start.value)
-                append(UInt64(range.start.timescale))
-                append(range.end.value)
-                append(UInt64(range.end.timescale))
-            }
+            guard context.preparedPlayheadIdentity.itemGeneration == itemGeneration,
+                  let verified = try frozenRenditionCoverageLocked(owner: owner,
+                    rendition: context.renditionIdentity, requested: requested) else { return nil }
             return .init(authority: coverageAuthority,
                 preparedPlayheadIdentity: context.preparedPlayheadIdentity,
                 observedRenditionSetReceiptIdentity: context.observedRenditionSetReceipt.identity,
-                renditionIdentity: context.renditionIdentity, itemGeneration: itemGeneration,
-                canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested,
-                dependencies: dependencies)
+                renditionIdentity: verified.renditionIdentity, itemGeneration: verified.itemGeneration,
+                canonicalCoverageDigest: verified.canonicalCoverageDigest,
+                presentationRange: verified.presentationRange, dependencies: verified.dependencies)
         }
+    }
+
+    /// This creates no startup playhead/selection authority. The paused-window
+    /// server issuer must authenticate its scope and retained resource membership.
+    func pausedWindowCoverageReceipt(owner: PausedWindowCoverageLease,
+                                     rendition: AudioRenditionIdentity,
+                                     requested: FMP4PresentationRange) throws
+        -> FrozenRenditionCoverageReceipt? {
+        try domain.sync {
+            try frozenRenditionCoverageLocked(owner: .paused(owner),
+                rendition: rendition, requested: requested)
+        }
+    }
+
+    private func frozenRenditionCoverageLocked(owner: FrozenCompletedCoverageOwner,
+                                               rendition: AudioRenditionIdentity,
+                                               requested: FMP4PresentationRange) throws
+        -> FrozenRenditionCoverageReceipt? {
+        guard owner.metadataStore === self else { return nil }
+        guard let dependencies = try ServedCoverageDependencies.frozen(owner: owner,
+            rendition: rendition, requested: requested) else { return nil }
+        var cursor = requested.start
+        for _ in 0..<dependencies.count {
+            var next = cursor
+            for ordinal in dependencies.indices {
+                guard let input = dependencies.input(atOrdinal: ordinal),
+                      let range = try input.map.intersection(with: requested) else { continue }
+                if try HLSChecked.compare(range.start, cursor) <= 0,
+                   try HLSChecked.compare(range.end, next) > 0 { next = range.end }
+            }
+            if try HLSChecked.compare(next, requested.end) >= 0 { cursor = next; break }
+            guard try HLSChecked.compare(next, cursor) > 0 else { return nil }
+            cursor = next
+        }
+        guard try HLSChecked.compare(cursor, requested.end) >= 0 else { return nil }
+        var hash = SHA256()
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var bigEndian = value.bigEndian
+            withUnsafeBytes(of: &bigEndian) { hash.update(bufferPointer: $0) }
+        }
+        func appendUUID(_ value: UUID) {
+            withUnsafeBytes(of: value.uuid) { hash.update(bufferPointer: $0) }
+        }
+        func appendDigest(_ value: Data) {
+            append(UInt64(value.count))
+            hash.update(data: value)
+        }
+        append(itemGeneration)
+        append(rendition.rawValue)
+        for ordinal in dependencies.indices {
+            let dependency = dependencies[ordinal]
+            let input = dependencies.input(atOrdinal: ordinal)!
+            let range = try input.map.intersection(with: requested)!
+            append(dependency.mediaEpoch)
+            appendUUID(dependency.epochProofIdentity)
+            appendUUID(dependency.segmentReceiptIdentity)
+            appendUUID(dependency.initializationBackingIdentity.rawValue)
+            appendUUID(dependency.mediaBackingIdentity.rawValue)
+            appendUUID(dependency.initializationEvidenceIdentity)
+            appendUUID(dependency.mediaEvidenceIdentity)
+            appendDigest(input.initialization.sealedDigest)
+            appendDigest(input.media.sealedDigest)
+            append(range.start.value)
+            append(UInt64(range.start.timescale))
+            append(range.end.value)
+            append(UInt64(range.end.timescale))
+        }
+        return .init(authority: coverageAuthority,
+            renditionIdentity: rendition, itemGeneration: itemGeneration,
+            canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested,
+            dependencies: dependencies)
     }
 
     /// 冻结前只读预检。仅遍历该 owner 已钉住且 HTTP full-body 完成的对象，

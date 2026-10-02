@@ -1413,6 +1413,29 @@ struct ServedRenditionCoverageReceipt: Sendable, Equatable {
     }
 }
 
+/// Immutable media verification only. A server must separately bind a paused
+/// window to its original item/timeline and current owned resume scope.
+struct FrozenRenditionCoverageReceipt: Sendable, Equatable {
+    let renditionIdentity: AudioRenditionIdentity
+    let itemGeneration: UInt64
+    let canonicalCoverageDigest: FrozenCanonicalCoverageDigest
+    let presentationRange: FMP4PresentationRange
+    let dependencies: ServedCoverageDependencies
+
+    init(authority: SealedCoverageIssuanceAuthority,
+         renditionIdentity: AudioRenditionIdentity,
+         itemGeneration: UInt64,
+         canonicalCoverageDigest: FrozenCanonicalCoverageDigest,
+         presentationRange: FMP4PresentationRange,
+         dependencies: ServedCoverageDependencies) {
+        self.renditionIdentity = renditionIdentity
+        self.itemGeneration = itemGeneration
+        self.canonicalCoverageDigest = canonicalCoverageDigest
+        self.presentationRange = presentationRange
+        self.dependencies = dependencies
+    }
+}
+
 final class ServedRenditionCoverageAccumulator: @unchecked Sendable {
     private struct CoverageEntry {
         let dependency: ServedRenditionCoverageDependency

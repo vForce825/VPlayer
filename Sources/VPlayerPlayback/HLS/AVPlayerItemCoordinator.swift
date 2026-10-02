@@ -96,6 +96,8 @@ protocol AVPlayerDriving: AnyObject {
     func pause(item: AVPlayerItemInstanceIdentity)
     func waitUntilPaused(item: AVPlayerItemInstanceIdentity) async throws
     func directState(item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState
+    /// Best-effort synchronous metadata read; failure never prevents physical stop.
+    func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime?
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item: AVPlayerItemInstanceIdentity) throws
     func installNaturalEndTerminalHandler(
@@ -121,6 +123,7 @@ extension AVPlayerDriving {
     var preferredForwardBufferDuration: TimeInterval { 3 }
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws {}
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws {}
+    func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime? { nil }
     func retainInstallationResourceContext(_ reservation: PlaybackResourceContextReservation) {}
 }
 
@@ -534,6 +537,22 @@ struct AVPlayerQuiescenceReceipt: Sendable, Equatable {
 
 final class AVPlayerQuiescenceReceiptIdentity: @unchecked Sendable {}
 
+/// Only the original successful owned stop binds its pre-disconnect cursor.
+/// Copies are immutable metadata: neither a receipt nor a caller-provided time
+/// can construct this association or grant activation/timeline authority.
+struct AVPlayerPausedCursorBinding: Sendable {
+    let stopIdentity: AVPlayerQuiescenceReceiptIdentity
+    let item: AVPlayerItemInstanceIdentity
+    let time: ExactMediaTime
+
+    fileprivate init(stopIdentity: AVPlayerQuiescenceReceiptIdentity,
+                     item: AVPlayerItemInstanceIdentity, time: ExactMediaTime) {
+        self.stopIdentity = stopIdentity
+        self.item = item
+        self.time = time
+    }
+}
+
 /// 只有 AVPlayer coordinator 在完成 pause KVO 与同 item direct read 后才能构造。
 /// 普通 backend 只拿到最终 opaque attestation，无法用布尔值拼出 Registry 证明。
 final class AVPlayerBackendQuiescenceAttestation: @unchecked Sendable {
@@ -940,6 +959,9 @@ final class AVPlayerItemCoordinator {
     private var authorizationArmed = false
     private var activationInFlight = false
     private var stopTask: OutputPlayerStopTask?
+    // Inline in the existing measured 12 KiB coordinator root; no new owner,
+    // receipt field, callback, wait slot, reservation, or renewable budget.
+    private var pausedCursorBinding: AVPlayerPausedCursorBinding?
     private var invalidationFailure: AVPlayerItemCoordinatorFailure?
     private var invalidated: Bool { invalidationFailure != nil }
     // An alias to the bundle's existing charged relay; it never captures this coordinator.
@@ -1178,6 +1200,7 @@ final class AVPlayerItemCoordinator {
         stopTask = nil
         preparationTicket = nil
         lastQuiescenceReceipt = nil
+        pausedCursorBinding = nil
         publicationReadiness = nil
         invalidationFailure = nil
         runtimeFailureRelay = nil
@@ -1265,6 +1288,7 @@ final class AVPlayerItemCoordinator {
         let quiescentReservation = retainedGraphReservation
             .forQuiescentReplacement(request: installedRequest)
         request = nil
+        pausedCursorBinding = nil
         runtimeFailureRelay = nil
         authorization = nil
         authorizationArmed = false
@@ -1707,6 +1731,9 @@ final class AVPlayerItemCoordinator {
             }
             authorizationArmed = false
             lastQuiescenceReceipt = nil
+            // A future resume issuer must copy its immutable scope before this
+            // accepted activation consumes the old quiescence terminal.
+            pausedCursorBinding = nil
             stopTask = nil
             state.phase = .prepared
         }
@@ -1861,6 +1888,9 @@ final class AVPlayerItemCoordinator {
             #endif
             driver.cancelPendingPrerolls(item: item)
             driver.pause(item: item)
+            // Read on this owned synchronous stack before disconnect can reset
+            // AVPlayer time. Keep it local until this exact stop commits.
+            let pausedTime = driver.pausedTime(item: item)
             try await driver.setDisconnectedFromSystemAudio(true, item: item)
             guard driver.disconnectedFromSystemAudio else {
                 throw AVPlayerItemCoordinatorFailure.systemAudioConnectionNotConfirmed
@@ -1887,11 +1917,23 @@ final class AVPlayerItemCoordinator {
             // 完成前保持 stopping，避免把“已静止”和“已退休”混成一个阶段。
             state.phase = .stopping
             task.complete(.success(receipt))
+            if request?.item == item, stopTask === task,
+               task.receiptIdentity === receipt.identity {
+                // This exact successful stop owns the slot even when its
+                // metadata read failed. Never retain a predecessor's cursor.
+                pausedCursorBinding = nil
+                if !invalidated, driver.currentItemIdentity == item, let pausedTime {
+                    pausedCursorBinding = .init(stopIdentity: receipt.identity,
+                                               item: item, time: pausedTime)
+                }
+            }
             return receipt
         } catch {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("cap_av_stop_err_\(error)")
             #endif
+            // A late predecessor must never erase a successor's association.
+            if request?.item == item, stopTask === task { pausedCursorBinding = nil }
             task.complete(.failure(error))
             throw error
         }
@@ -1907,6 +1949,7 @@ final class AVPlayerItemCoordinator {
         driver.removeObservers(item: receipt.item)
         (evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource)?.retirePreparation()
         request = nil
+        pausedCursorBinding = nil
         runtimeFailureRelay = nil
         authorizationArmed = false
         retainedGraphReservation = .empty
@@ -1938,10 +1981,27 @@ final class AVPlayerItemCoordinator {
             && receipt.directlyConfirmedRateZero
     }
 
+    /// Revalidate the retained binding by folding pending publication/selection
+    /// authority events first; this can invalidate scope and request owned stop.
+    /// This is not a passive diagnostic getter. It never recaptures time or
+    /// refreshes scope, and retiring a cursor preserves physical cleanup receipts.
+    func capturedPausedCursor(for receipt: AVPlayerQuiescenceReceipt) -> AVPlayerPausedCursorBinding? {
+        consumePendingPublicationAuthorityEvent()
+        consumePendingRenditionSelectionEvent()
+        guard !invalidated, state.phase == .stopping,
+              let binding = pausedCursorBinding,
+              binding.stopIdentity === receipt.identity,
+              binding.item == receipt.item, request?.item == binding.item,
+              driver.currentItemIdentity == binding.item,
+              accept(receipt) else { return nil }
+        return binding
+    }
+
     private func issueNonce() throws -> UInt64 {
         do { return try allocator.next(in: .nonce) }
         catch {
             if invalidationFailure == nil { invalidationFailure = .identitySpaceExhausted }
+            pausedCursorBinding = nil
             throw AVPlayerItemCoordinatorFailure.identitySpaceExhausted
         }
     }
@@ -2130,6 +2190,7 @@ final class AVPlayerItemCoordinator {
     ) {
         guard !invalidated else { return }
         invalidationFailure = failure
+        pausedCursorBinding = nil
         renditionSelectionSlot = .invalid
         if let next = try? Self.checkedIncrement(invalidationCount, allocator: allocator) {
             invalidationCount = next

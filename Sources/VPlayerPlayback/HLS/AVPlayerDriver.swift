@@ -1128,6 +1128,17 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                             timeControlStatus: player.timeControlStatus)
     }
 
+    /// This must be read immediately after the owned pause and before the
+    /// asynchronous audio disconnect. Invalid metadata cannot fail teardown.
+    func pausedTime(item identity: AVPlayerItemInstanceIdentity) -> ExactMediaTime? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              !systemAudioTransitionInFlight,
+              player.rate == 0, player.timeControlStatus == .paused else { return nil }
+        // ExactMediaTime rejects nonnumeric times, nonpositive timescales and
+        // nonzero epochs instead of dropping epoch or converting via seconds.
+        return try? ExactMediaTime(player.currentTime())
+    }
+
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item identity: AVPlayerItemInstanceIdentity) throws {
         guard currentItemIdentity == identity, let item,

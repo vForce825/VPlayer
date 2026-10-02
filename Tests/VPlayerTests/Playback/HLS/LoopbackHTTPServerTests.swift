@@ -37,7 +37,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try XCTUnwrap(frozen).freezeCompletedResources()
         XCTAssertTrue(try XCTUnwrap(frozen).containsCompletedResource(mediaSlot))
         XCTAssertFalse(try XCTUnwrap(frozen).containsCompletedResource(initSlot))
-        XCTAssertNil(try ServedCoverageDependencies.frozen(owner: XCTUnwrap(frozen),
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(owner: XCTUnwrap(frozen),
             rendition: .init(rawValue: 1), requested: requested),
             "Completed media cannot certify a merely pinned initialization")
 
@@ -47,7 +47,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
         })
         XCTAssertFalse(try XCTUnwrap(frozen).containsCompletedResource(initSlot))
-        XCTAssertNil(try ServedCoverageDependencies.frozen(owner: XCTUnwrap(frozen),
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(owner: XCTUnwrap(frozen),
             rendition: .init(rawValue: 1), requested: requested),
             "Later HTTP completion cannot rewrite an already frozen lease")
         frozen = nil
@@ -58,8 +58,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
         _ = try XCTUnwrap(renewed).retainMetadata(in: store, key: media)
         _ = try XCTUnwrap(renewed).retainMetadata(in: store, key: initialization)
         try XCTUnwrap(renewed).freezeCompletedResources()
-        var dependencies = try ServedCoverageDependencies.frozen(owner: XCTUnwrap(renewed),
-            rendition: .init(rawValue: 1), requested: requested)
+        var dependencies = try store.pausedWindowCoverageReceipt(owner: XCTUnwrap(renewed),
+            rendition: .init(rawValue: 1), requested: requested)?.dependencies
         XCTAssertNotNil(dependencies)
         XCTAssertTrue(dependencies?.input(atOrdinal: 0)?.initialization.isComplete == true)
         XCTAssertTrue(dependencies?.input(atOrdinal: 0)?.media.isComplete == true)
@@ -70,6 +70,54 @@ final class LoopbackHTTPServerTests: XCTestCase {
         dependencies = nil
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
         XCTAssertTrue(store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+    }
+
+    func testPausedWindowAndStartupCoverageKeepIdenticalDigestsAndGapRejection() async throws {
+        let lifecycle = Task19.binding().outputLifecycleEpoch
+        let fixture = try await FinalReplacementHTTPFixture.start(
+            outputLifecycleEpoch: lifecycle, itemGeneration: 19)
+        defer { fixture.shutdown() }
+        let snapshot = try XCTUnwrap(fixture.publication.publisher.visible)
+        let timeline = try makeRealTimelineEvidence(
+            fixture: fixture, snapshot: snapshot, lifecycle: lifecycle)
+        let store = fixture.publication.store
+        let playlist = try XCTUnwrap(snapshot.media[2])
+        let media = try XCTUnwrap(playlist.resources.last)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let initialization = try XCTUnwrap(playlist.initializationResources.first {
+            store.completedEvidenceSnapshot(for: $0)?.resourceIdentity == map.initializationBackingIdentity
+        })
+        let requested = try XCTUnwrap(map.samples.first).presentationRange
+        let context = Self.makeCoverageContext(rendition: 2, nonce: 72_401,
+            timeline: timeline.authority, selectionCapability: timeline.selection)
+        let original = fixture.evidenceSource.preparationOwner
+        let startup = try XCTUnwrap(store.preparationCoverageReceipt(owner: original,
+            context: context, requested: requested))
+
+        let paused = try PausedWindowCoverageLease.reserve()
+        _ = try paused.retainMetadata(in: store, key: media)
+        _ = try paused.retainMetadata(in: store, key: initialization)
+        try paused.freezeCompletedResources()
+        let renewed = try XCTUnwrap(store.pausedWindowCoverageReceipt(owner: paused,
+            rendition: .init(rawValue: 2), requested: requested))
+        XCTAssertEqual(renewed.itemGeneration, startup.itemGeneration)
+        XCTAssertEqual(renewed.renditionIdentity, startup.renditionIdentity)
+        XCTAssertEqual(renewed.presentationRange, startup.presentationRange)
+        XCTAssertEqual(renewed.canonicalCoverageDigest, startup.canonicalCoverageDigest)
+        XCTAssertEqual(renewed.dependencies, startup.dependencies)
+
+        let end = try XCTUnwrap(map.samples.last).presentationRange.end
+        let gap = try FMP4PresentationRange(start: requested.start,
+            duration: end.adding(Task19.time(1)).subtracting(requested.start))
+        XCTAssertNil(try store.preparationCoverageReceipt(owner: original,
+            context: context, requested: gap))
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(owner: paused,
+            rendition: .init(rawValue: 2), requested: gap))
+        XCTAssertNil(original.coverage(at: 1))
+        XCTAssertNil(paused.coverage(at: 1))
+        XCTAssertEqual(try store.preparationCoverageReceipt(owner: original,
+            context: context, requested: requested)?.canonicalCoverageDigest,
+            startup.canonicalCoverageDigest)
     }
 
     func testResourcePathFailurePreservesPublicationErrorTypeAndReason() async throws {
