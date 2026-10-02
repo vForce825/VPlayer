@@ -316,7 +316,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
             let preparedTime = player.currentTime()
             XCTAssertEqual(CMTimeCompare(preparedTime, target), 0)
-            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage)
 
             await changeRawNativeAudioConnection(true, player: player,
                 stage: "lifecycle.disconnect_prepared", probe: probe)
@@ -326,14 +326,19 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             // microseconds. Preserve the owned target and inspect native time;
             // do not manufacture equality or introduce an epsilon.
             XCTAssertEqual(item.status, .readyToPlay)
-            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage,
+                requiresCoverage: false)
 
             await changeRawNativeAudioConnection(false, player: player,
                 stage: "lifecycle.reconnect_prepared", probe: probe)
             XCTAssertFalse(player.disconnectedFromSystemAudio)
             try await requireRawNativeReady(player, item: item, stage: "lifecycle.reconnected_ready", probe: probe)
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
-            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+            // Reconnect may invalidate native buffering even while readiness
+            // stays true (source a9 raw control). Recovery must reload after the real
+            // reseek; requiring retained coverage here would skip that experiment.
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage,
+                requiresCoverage: false)
 
             // Only a new physical seek may re-establish the original exact
             // target after a connection change. This is a raw diagnostic, not
@@ -351,6 +356,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             guard reseekCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
             XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
+            try await requireRawNativeCoverage(player, item: item, start: target,
+                stage: "lifecycle.reloaded", probe: probe)
             guard player.status == .readyToPlay, item.status == .readyToPlay, player.rate == 0 else {
                 throw FixtureIntegrationFailure.nativeReadinessFailed
             }
@@ -363,8 +370,12 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             guard reprerollCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
             XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
-            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage)
         } catch {
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).caught "
+                + "errorType=\(String(reflecting: type(of: error))) "
+                + "fixtureFailure=\(String(describing: error as? FixtureIntegrationFailure)) "
+                + "taskCancelled=\(Task.isCancelled)")
             operationFailure = error
         }
 
@@ -393,7 +404,38 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         XCTAssertEqual(player.rate, 0)
         XCTAssertEqual(player.timeControlStatus, .paused)
         XCTAssertTrue(events.hasNoObservedOwnershipOrRateChange)
-        if let operationFailure { throw operationFailure }
+        if let operationFailure {
+            print("RAW_HTTP_LIFECYCLE stage=lifecycle.rethrow "
+                + "errorType=\(String(reflecting: type(of: operationFailure))) "
+                + "fixtureFailure=\(String(describing: operationFailure as? FixtureIntegrationFailure)) "
+                + "taskCancelled=\(Task.isCancelled)")
+            throw operationFailure
+        }
+    }
+
+    @MainActor
+    private func requireRawNativeCoverage(_ player: AVPlayer, item: AVPlayerItem,
+                                          start: CMTime, stage: String,
+                                          probe: NativeHTTPReadinessProgressProbe) async throws {
+        probe.stage = stage
+        let requested = CMTimeRange(start: start, duration: CMTime(value: 1, timescale: 1))
+        let loaded = expectation(description: "\(stage) loads the entire exact diagnostic window")
+        let facts = NativeHTTPCoverageKVOFacts()
+        let observation = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { observed, _ in
+            let code = VPReadLoadedRangeCoverage(observed, requested).code
+            if facts.record(Int(code)) { loaded.fulfill() }
+        }
+        defer { observation.invalidate() }
+        await fulfillment(of: [loaded], timeout: 15)
+        let code = VPReadLoadedRangeCoverage(item, requested).code
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).observed "
+            + "requestedStart=\(NativeHTTPReadinessProgressProbe.timeFact(start)) "
+            + "diagnosticDuration=1/1 code=\(code) \(facts.summary) "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player))")
+        XCTAssertEqual(code, 0)
+        guard player.currentItem === item, code == 0 else {
+            throw FixtureIntegrationFailure.nativeLoadedCoverageFailed
+        }
     }
 
     @MainActor
@@ -451,8 +493,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    private func assertRawDiagnosticCoverage(_ player: AVPlayer, item: AVPlayerItem,
-                                             stage: String) throws {
+    private func checkRawDiagnosticCoverage(_ player: AVPlayer, item: AVPlayerItem,
+                                            stage: String, requiresCoverage: Bool = true) throws {
         let observed = player.currentTime()
         XCTAssertTrue(observed.isNumeric)
         XCTAssertEqual(observed.epoch, 0)
@@ -466,7 +508,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         let coverage = VPReadLoadedRangeCoverage(item, requested)
         print("RAW_HTTP_LIFECYCLE stage=\(stage).coverage "
             + "observed=\(NativeHTTPReadinessProgressProbe.timeFact(observed)) "
-            + "diagnosticDuration=1/1 code=\(coverage.code)")
+            + "diagnosticDuration=1/1 code=\(coverage.code) required=\(requiresCoverage)")
+        guard requiresCoverage else { return }
         XCTAssertEqual(coverage.code, 0, "The complete observed forward window must remain loaded")
         guard coverage.code == 0 else { throw FixtureIntegrationFailure.nativeLoadedCoverageFailed }
     }
@@ -1084,6 +1127,27 @@ private final class NativeHTTPReadinessKVOFacts: @unchecked Sendable {
             "kvoCount=\(count) kvoStatus=\(lastStatus) "
                 + "kvoTypedChange=\(lastChangeStatus) kvoTerminal=\(terminalStatus)"
         }
+    }
+}
+
+private final class NativeHTTPCoverageKVOFacts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var lastCode = -1
+    private var fulfilled = false
+
+    func record(_ code: Int) -> Bool {
+        lock.withLock {
+            count += 1
+            lastCode = code
+            guard code == 0, !fulfilled else { return false }
+            fulfilled = true
+            return true
+        }
+    }
+
+    var summary: String {
+        lock.withLock { "loadedKVOCount=\(count) loadedKVOLastCode=\(lastCode)" }
     }
 }
 

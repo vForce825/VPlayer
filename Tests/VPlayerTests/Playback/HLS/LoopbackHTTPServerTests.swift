@@ -671,8 +671,19 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let successor = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
-        let newInit = try XCTUnwrap(successor.initializationResources.last)
         let newMedia = try XCTUnwrap(successor.resources.last)
+        let newMap = try XCTUnwrap(fixture.task19.store.decodeCoverageMap(for: newMedia))
+        // A rolling playlist advertises an unordered set of init resources from
+        // both epochs. Select the one authenticated by this media's decode map.
+        let matchingInitializations = successor.initializationResources.filter {
+            $0.mediaEpoch == newMedia.mediaEpoch
+                && fixture.server.completedEvidence(for: $0)?.resourceIdentity
+                    == newMap.initializationBackingIdentity
+        }
+        XCTAssertEqual(matchingInitializations.count, 1)
+        let newInit = try XCTUnwrap(matchingInitializations.first)
+        XCTAssertEqual(newInit.mediaEpoch, 2)
+        XCTAssertEqual(newMedia.mediaEpoch, 2)
         clock.value = Task19.second * 60
         fixture.task19.store.sweep(now: clock.value)
         XCTAssertTrue(preparationOwner.isHistoryActive)
@@ -692,19 +703,26 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: fixture.server.path(for: key)).status, 200)
         }
-        let newMap = try XCTUnwrap(fixture.task19.store.decodeCoverageMap(for: newMedia))
+        XCTAssertEqual(fixture.server.completedEvidence(for: newInit)?.isComplete, true)
+        XCTAssertEqual(fixture.server.completedEvidence(for: newMedia)?.isComplete, true)
+        XCTAssertEqual(fixture.server.completedEvidence(for: newInit)?.stateIdentity,
+                       newMap.initializationStateIdentity)
+        XCTAssertEqual(fixture.server.completedEvidence(for: newMedia)?.stateIdentity,
+                       newMap.evidenceStateIdentity)
         let newRange = try XCTUnwrap(newMap.samples.first).presentationRange
-        let successorReceipt = try XCTUnwrap(fixture.server.coverageReceipt(
-            for: context, adding: newRange))
-        XCTAssertEqual(successorReceipt.preparedPlayheadIdentity, context.preparedPlayheadIdentity)
-        XCTAssertEqual(successorReceipt.presentationRange, newRange)
-        XCTAssertEqual(successorReceipt.dependencies.count, 1)
-        let successorDependency = try XCTUnwrap(successorReceipt.dependencies.first)
-        XCTAssertEqual(successorDependency.mediaEpoch, newMedia.mediaEpoch)
-        XCTAssertEqual(successorDependency.epochProofIdentity, newMap.epochProofIdentity)
-        XCTAssertEqual(successorDependency.segmentReceiptIdentity, newMap.segmentReceiptIdentity)
-        XCTAssertEqual(successorDependency.mediaBackingIdentity, newMap.resourceIdentity)
-        XCTAssertNotEqual(successorDependency.mediaEpoch, dependency.mediaEpoch)
+        let successorReceipt = try fixture.server.coverageReceipt(for: context, adding: newRange)
+        XCTAssertNotNil(successorReceipt)
+        if let successorReceipt {
+            XCTAssertEqual(successorReceipt.preparedPlayheadIdentity, context.preparedPlayheadIdentity)
+            XCTAssertEqual(successorReceipt.presentationRange, newRange)
+            XCTAssertEqual(successorReceipt.dependencies.count, 1)
+            let successorDependency = successorReceipt.dependencies.first
+            XCTAssertEqual(successorDependency?.mediaEpoch, newMedia.mediaEpoch)
+            XCTAssertEqual(successorDependency?.epochProofIdentity, newMap.epochProofIdentity)
+            XCTAssertEqual(successorDependency?.segmentReceiptIdentity, newMap.segmentReceiptIdentity)
+            XCTAssertEqual(successorDependency?.mediaBackingIdentity, newMap.resourceIdentity)
+            XCTAssertNotEqual(successorDependency?.mediaEpoch, dependency.mediaEpoch)
+        }
         let newEnd = try XCTUnwrap(newMap.samples.last).presentationRange.end
         let spanning = try FMP4PresentationRange(start: oldRange.start,
             duration: newEnd.subtracting(oldRange.start))

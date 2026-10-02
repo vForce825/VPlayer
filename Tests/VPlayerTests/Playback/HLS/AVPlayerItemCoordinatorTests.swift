@@ -415,6 +415,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
             XCTAssertEqual(tracks.count, 1,
                            "a missing selection group is only valid here with one real audio track")
+            let soleTrack = try XCTUnwrap(tracks.first)
+            let isPlayable = try await soleTrack.load(.isPlayable)
+            XCTAssertTrue(isPlayable,
+                          "the direct playlist fallback requires its sole audio track to be playable")
 
             progress.mark("production-selection")
             try await driver.selectAudibleMedia(item: item)
@@ -1549,7 +1553,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     func testAACEndpointReceiptRequiresSameWriterProofPlaylistHTTPBackingAndEffectiveEnd()
         async throws {
         let fixture = try await Task21RealIntegrationFixture.make()
-        defer { fixture.shutdown() }
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
         try await fixture.validateEndpointThroughCompletedSocketBodies()
         XCTAssertThrowsError(try fixture.validateEndpoint(),
                              "writer terminal authority 只能消费一次")
@@ -1558,7 +1563,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     func testAACEndpointMutationTableRejectsDeletedTrimPlusMinusOneAndPrematureNonfinalTrim()
         async throws {
         let fixture = try await Task21RealIntegrationFixture.make()
-        defer { fixture.shutdown() }
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
         try await fixture.validateEndpointThroughCompletedSocketBodies()
         XCTAssertThrowsError(try fixture.validateEndpoint(),
                              "消费后的 endpoint authority 不得重放或改写")
@@ -2037,32 +2043,52 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview2RegistryCapabilityIsConsumedOnceAtMainActorPlayBoundaryAndRevalidatedForPlayingRelay()
         async throws {
-        let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        harness.driver.beforePositiveRateSideEffect = { invocation in
-            guard let sourceTask = invocation.currentSnapshot?.sourceTask else { return }
-            _ = harness.graph.registry.requestCancel(sourceTask)
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let revokedOwner: Task21OwnedTestHarness
+        do {
+            let harness = try await Task21Harness()
+            revokedOwner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await revokedOwner.tearDown() }
+            _ = try await harness.prepare()
+            harness.driver.beforePositiveRateSideEffect = { [weak harness] invocation in
+                guard let harness,
+                      let sourceTask = invocation.currentSnapshot?.sourceTask else { return }
+                _ = harness.graph.registry.requestCancel(sourceTask)
+            }
+
+            let result = try await harness.activate()
+            XCTAssertEqual(result, .rejected,
+                           "正 rate 副作用紧邻边界必须再次消费 Registry 单次能力")
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+            harness.driver.beforePositiveRateSideEffect = nil
         }
+        // Drop this test's aliases before the owner joins the original Registry
+        // runner and verifies exact ledger recovery, then build the next fixture.
+        try await revokedOwner.tearDown()
 
-        let result = try await harness.activate()
-        XCTAssertEqual(result, .rejected,
-                       "正 rate 副作用紧邻边界必须再次消费 Registry 单次能力")
-        XCTAssertEqual(harness.driver.playCallCount, 0)
-
-        let playing = try await Task21Harness()
-        _ = try await playing.prepare()
-        _ = try await playing.activate()
-        _ = playing.graph.registry.requestCancel(
-            try XCTUnwrap(playing.graph.registry.outputResourceContextSnapshot()?.sourceTask)
-        )
-        playing.observe(.playing)
-        XCTAssertEqual(playing.coordinator.publishedPlayingCount, 0,
-                       "playing relay 发布前也必须重新核验同一 Registry 权威")
+        let playingOwner: Task21OwnedTestHarness
+        do {
+            let playing = try await Task21Harness()
+            playingOwner = Task21OwnedTestHarness(playing, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await playingOwner.tearDown() }
+            _ = try await playing.prepare()
+            _ = try await playing.activate()
+            _ = playing.graph.registry.requestCancel(
+                try XCTUnwrap(playing.graph.registry.outputResourceContextSnapshot()?.sourceTask)
+            )
+            playing.observe(.playing)
+            XCTAssertEqual(playing.coordinator.publishedPlayingCount, 0,
+                           "playing relay 发布前也必须重新核验同一 Registry 权威")
+        }
+        try await playingOwner.tearDown()
     }
 
     func testReview2LoopbackTerminalRenditionConflictAutomaticallyStartsRegistrySingleFlightStopAndReprepare()
         async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
         let harness = try await Task21Harness()
+        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
         _ = try await harness.prepare()
         _ = try await harness.activate()
         harness.evidence.completedRenditions.append(.init(rawValue: 202))
@@ -2078,15 +2104,28 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview2EveryAACParticipantRequiresWriterEndpointAuthorityWhileExplicitNonAACMayProceed()
         async throws {
-        let missingAACAuthority = try await Task21Harness(requiresAACEndpointAuthority: true)
-        await XCTAssertThrowsErrorAsync(try await missingAACAuthority.prepare(),
-                                        "每个 AAC participant 都必须绑定 Task17 endpoint authority")
-        XCTAssertEqual(missingAACAuthority.driver.prerollCallCount, 0)
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let missingOwner: Task21OwnedTestHarness
+        do {
+            let missingAACAuthority = try await Task21Harness(requiresAACEndpointAuthority: true)
+            missingOwner = Task21OwnedTestHarness(missingAACAuthority, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await missingOwner.tearDown() }
+            await XCTAssertThrowsErrorAsync(try await missingAACAuthority.prepare(),
+                                            "每个 AAC participant 都必须绑定 Task17 endpoint authority")
+            XCTAssertEqual(missingAACAuthority.driver.prerollCallCount, 0)
+        }
+        try await missingOwner.tearDown()
 
-        let explicitlyNonAAC = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
-        _ = try await explicitlyNonAAC.prepare()
-        XCTAssertEqual(explicitlyNonAAC.coordinator.phase, .prepared,
-                       "只有声明为非 AAC 的 participant 才可省略 AAC authority")
+        let nonAACOwner: Task21OwnedTestHarness
+        do {
+            let explicitlyNonAAC = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+            nonAACOwner = Task21OwnedTestHarness(explicitlyNonAAC, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await nonAACOwner.tearDown() }
+            _ = try await explicitlyNonAAC.prepare()
+            XCTAssertEqual(explicitlyNonAAC.coordinator.phase, .prepared,
+                           "只有声明为非 AAC 的 participant 才可省略 AAC authority")
+        }
+        try await nonAACOwner.tearDown()
     }
 
     func testReview2NaturalEOSRecordsStableCurrentTimeWithoutSeekingAndValidatesServedTrimMutationTable()
@@ -2133,9 +2172,28 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             timeControlStatus: .paused
         )
 
-        await XCTAssertThrowsErrorAsync(try await harness.stop())
+        let failedStop = Task { try await harness.stop() }
+        defer {
+            harness.backend.allowRetirementCompletion()
+            failedStop.cancel()
+        }
+        let retirementArrived = await harness.backend.waitForRetirementCall(timeout: .seconds(2))
+        XCTAssertTrue(retirementArrived,
+                      "The genuine Registry failed-stop runner must reach retirement before its test gate opens")
+        harness.backend.allowRetirementCompletion()
+        await XCTAssertThrowsErrorAsync(try await failedStop.value)
+        XCTAssertEqual(harness.backend.lastError as? AVPlayerItemCoordinatorFailure,
+                       .directPauseNotConfirmed)
+        XCTAssertNil(harness.backend.quiescenceReceipt)
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        XCTAssertNil(harness.backend.lastRetiredEpoch)
         XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval,
                         "backend-kind proof 身份不匹配时 Registry 不得关闭 interval")
+        try await harness.retireFailedTestTransport()
+        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval)
+        XCTAssertEqual(harness.driver.directStateOverride?.item,
+                       Task21Fixtures.staleGenerationItem(from: harness.item),
+                       "Transport cleanup must not repair the injected state to manufacture a proof")
     }
 
     func testReview2SystemLoadedRangeWaiterMergesAdjacentRangesAndFinishesOnceForCancelReplaceTimeout()
@@ -2682,16 +2740,29 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview2AVParticipantCardinalityTimeoutTaxonomyAndCheckedCountersFailClosed()
         async throws {
-        let duplicateVideo = try await Task21Harness()
-        duplicateVideo.evidence.videoParticipantCount = 2
-        await XCTAssertThrowsErrorAsync(try await duplicateVideo.prepare(),
-                                        "A/V publication 必须恰好一个 video participant")
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let duplicateOwner: Task21OwnedTestHarness
+        do {
+            let duplicateVideo = try await Task21Harness()
+            duplicateOwner = Task21OwnedTestHarness(duplicateVideo, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await duplicateOwner.tearDown() }
+            duplicateVideo.evidence.videoParticipantCount = 2
+            await XCTAssertThrowsErrorAsync(try await duplicateVideo.prepare(),
+                                            "A/V publication 必须恰好一个 video participant")
+        }
+        try await duplicateOwner.tearDown()
 
         var failures: [AVPlayerItemCoordinatorFailure?] = []
         for mutation in [Task21PrepareMutation.readyTimeout, .loadedTimeout, .prerollTimeout] {
-            let harness = try await Task21Harness(prepareMutation: mutation)
-            do { _ = try await harness.prepare(); failures.append(nil) }
-            catch { failures.append(error as? AVPlayerItemCoordinatorFailure) }
+            let owner: Task21OwnedTestHarness
+            do {
+                let harness = try await Task21Harness(prepareMutation: mutation)
+                owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+                addTeardownBlock { try await owner.tearDown() }
+                do { _ = try await harness.prepare(); failures.append(nil) }
+                catch { failures.append(error as? AVPlayerItemCoordinatorFailure) }
+            }
+            try await owner.tearDown()
         }
         XCTAssertEqual(Set(failures.compactMap { $0 }.map(String.init(describing:))).count, 3,
                        "ready、loaded、preroll timeout 必须有准确且互异的分类")
@@ -2700,19 +2771,25 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             initialIssuedValue: UInt64.max,
             initialNamespace: .nonce
         )
-        let authorityHarness = try await Task21Harness()
-        let exhausted = try AVPlayerItemCoordinator(driver: Task21FakeDriver(),
-            evidenceSource: authorityHarness.evidence, allocator: exhaustedAllocator)
-        let exhaustedItem = AVPlayerItemInstanceIdentity(
-            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_006),
-            itemGeneration: 1
-        )
-        try exhausted.install(Task21Fixtures.request(item: exhaustedItem,
-            liveEdge: Task21Fixtures.time(7), boundaries: [Task21Fixtures.time(4)],
-            directAudioOnlyRendition: nil))
-        await XCTAssertThrowsErrorAsync(try await exhausted.prepareCurrentItem()) { error in
-            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .identitySpaceExhausted)
+        let authorityOwner: Task21OwnedTestHarness
+        do {
+            let authorityHarness = try await Task21Harness()
+            authorityOwner = Task21OwnedTestHarness(authorityHarness, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await authorityOwner.tearDown() }
+            let exhausted = try AVPlayerItemCoordinator(driver: Task21FakeDriver(),
+                evidenceSource: authorityHarness.evidence, allocator: exhaustedAllocator)
+            let exhaustedItem = AVPlayerItemInstanceIdentity(
+                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_006),
+                itemGeneration: 1
+            )
+            try exhausted.install(Task21Fixtures.request(item: exhaustedItem,
+                liveEdge: Task21Fixtures.time(7), boundaries: [Task21Fixtures.time(4)],
+                directAudioOnlyRendition: nil))
+            await XCTAssertThrowsErrorAsync(try await exhausted.prepareCurrentItem()) { error in
+                XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .identitySpaceExhausted)
+            }
         }
+        try await authorityOwner.tearDown()
     }
 
     func testReview2CoordinatorFixedCapacityRejectsBeforeInstallationAndOwnsOneWaiterWithoutTimer()
@@ -3223,7 +3300,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             outputLifecycleEpoch: item.outputLifecycleEpoch)
         let fixture = try await FinalWriterTerminalHTTPFixture.start(
             pending: pending, item: item)
+        defer { fixture.shutdown() }
         let source = fixture.bundle.evidenceSource
+        let waitSlot = AVPlayerPrepareWaitSlot()
+        try source.bindPrepareWaitSlot(waitSlot)
         let current = Task {
             try await source.consumePlayerItemTimelineMapping(
                 endpointAuthority: nil,
@@ -3232,8 +3312,20 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 publicationSequence: fixture.publicationSequence,
                 selection: nil)
         }
-        for _ in 0..<8 { await Task.yield() }
-        fixture.shutdown()
+        defer { current.cancel() }
+        let waiterDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !waitSlot.isActive, ContinuousClock.now < waiterDeadline {
+            await Task.yield()
+        }
+        guard waitSlot.isActive else {
+            current.cancel()
+            _ = try? await current.value
+            return XCTFail("The original mapping waiter must occupy its fixed slot before server termination")
+        }
+        // This test exercises the server's terminal event, not source retirement.
+        // Keep its handler alive until both waiters have observed the irreversible
+        // server failure; full fixture cleanup retires the source afterward.
+        _ = fixture.server.closeAdmission()
 
         do {
             _ = try await current.value
@@ -6419,12 +6511,21 @@ private final class Task21RealIntegrationFixture {
     func prepare() async throws -> PreparedAVPlayerItem {
         if let prepared { return prepared }
         let preparationStarted = ContinuousClock.now
+        let sourceTask = graph.registry.outputResourceContextSnapshot()?.sourceTask
+        let attemptIdentity = UUID().uuidString
+        let attemptMarker = "native_prepare_begin_\(attemptIdentity)"
+        let session = item.outputLifecycleEpoch.backendIdentity.sessionIdentity
+        let attemptScope = "fixture=Task21RealIntegration session=\(session.sessionID) "
+            + "request=\(session.requestID.uuidString) "
+            + "backend=\(item.outputLifecycleEpoch.backendIdentity.backendGeneration) "
+            + "output=\(item.outputLifecycleEpoch.outputNonce) item=\(item.itemGeneration) "
+            + "sourceTask=\(sourceTask.map { String($0.nonce) } ?? "nil")"
+        PlaybackDiagnosticTracker.shared.append(attemptMarker)
+        print("NATIVE_PREPARE_ATTEMPT_BEGIN attempt=\(attemptIdentity) \(attemptScope)")
         reportNativePublication(stage: "prepare-begin", elapsed: .zero)
         let value: PreparedAVPlayerItem
         do {
-            let ticket = try XCTUnwrap(
-                graph.registry.outputResourceContextSnapshot()?.sourceTask
-            )
+            let ticket = try XCTUnwrap(sourceTask)
             guard graph.registry.startOutputPrepareOperation(ticket),
                   case .succeeded = await graph.registry.joinOutputBackendOperation(ticket),
                   let result = backend.prepared else {
@@ -6437,6 +6538,13 @@ private final class Task21RealIntegrationFixture {
             let failureItemTime = CMTimeGetSeconds(player.currentTime())
             reportNativePublication(stage: "prepare-failed",
                 elapsed: preparationStarted.duration(to: .now))
+            let history = PlaybackDiagnosticTracker.shared.recentHistory
+            let attemptHistory = history.range(of: attemptMarker, options: .backwards)
+                .map { String(history[$0.upperBound...]) } ?? "attempt_marker_not_retained"
+            print("NATIVE_PREPARE_ATTEMPT_FAILURE attempt=\(attemptIdentity) "
+                + "\(attemptScope) "
+                + "elapsed=\(preparationStarted.duration(to: .now)) "
+                + "phase=\(coordinator.phase) error=\(error) history=\(attemptHistory)")
             print("NATIVE_ADMISSION prepare-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount) phase=\(coordinator.phase) history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
             let ranges = failureItem?.loadedTimeRanges.map {
                 let value = $0.timeRangeValue
@@ -6819,18 +6927,22 @@ private final class Task21RealIntegrationFixture {
     /// endpoint admission 的系统媒体链不依赖 AVPlayer readiness：真实 GET 让
     /// Loopback 的 full-body send terminal 签发 Task20 publication evidence。
     func validateEndpointThroughCompletedSocketBodies() async throws {
-        let completed = try await primeCompletedSocketBodies()
+        let basis = try await primeCompletedSocketBodies()
+        // This endpoint-only probe is the evidence consumer. A native prepare
+        // must instead own this freeze after its seek/loaded coverage checks.
+        let completed = try XCTUnwrap(server.freezePreparationCompletedEvidence(
+            owner: basis.preparationOwner))
         try AVPlayerAACEndpointValidator.validate(
             authority: publication.seed.endpointAuthority,
             completedPublication: completed
         )
     }
 
-    /// 只推进真实 Loopback body/send-terminal ledger，不消费 writer endpoint authority；
-    /// prepare 随后仍须通过 production evidence source 完成同一 authority 的唯一消费。
+    /// Prime real body/send-terminal facts without freezing the preparation owner
+    /// or consuming its writer endpoint; production prepare owns both transitions.
     @discardableResult
     func primeCompletedSocketBodies() async throws
-        -> LoopbackCompletedPublicationEvidence {
+        -> LoopbackPreparationPublicationBasis {
         guard let media = publication.publisher.visible?.media[2] else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
@@ -6860,16 +6972,15 @@ private final class Task21RealIntegrationFixture {
         // endpoint admission 只消费冻结 playlist 实际引用且完成 full-body terminal 的 URL；
         // writer 中未进入当前呈现窗口的旧 backing 不属于 HTTP 完成前提。
         let expectedMediaKeys = Set(media.resources)
-        var completed: LoopbackCompletedPublicationEvidence?
+        var completed: LoopbackPreparationPublicationBasis?
         for _ in 0..<100 {
-            if let capability = server.completedPublicationCapability(
+            if let evidence = evidenceSource.preparationPublicationBasis(
                 itemURL: itemURL,
-                itemGeneration: item.itemGeneration,
+                item: item,
                 publicationSequence: try XCTUnwrap(
                     publication.publisher.visible?.publicationSequence
                 )
-            ), let evidence = server.consumeCompletedPublicationCapability(capability),
-               let participant = evidence.participants.first(where: {
+            ), let participant = evidence.participants.first(where: {
                    $0.participantID
                     == publication.seed.endpoint.binding.publicationParticipantID.rawValue
                }), Set(participant.completedMedia.map(\.key)).isSuperset(of: expectedMediaKeys) {
@@ -6881,6 +6992,8 @@ private final class Task21RealIntegrationFixture {
         guard let completed else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
+        XCTAssertFalse(completed.preparationOwner.completionIsFrozen,
+                       "HTTP priming must leave the production preparation owner unfrozen")
         return completed
     }
 
