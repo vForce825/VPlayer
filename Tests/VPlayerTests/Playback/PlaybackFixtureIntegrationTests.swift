@@ -81,6 +81,28 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         })
     }
 
+    @MainActor
+    func testProgressiveAACFixtureTraversesRealAudioReceiverLifecycle() async throws {
+        // Like the other demux fixtures, run with the existing HTTP fixture
+        // runner. Native Receiver failures are never converted into skips.
+        let fixture = try assemble(path: "progressive-h264-aac.ts")
+        let configuration = try XCTUnwrap(fixture.audioConfigurations.first)
+        let firstFrame = try XCTUnwrap(fixture.audioFrames.first)
+        XCTAssertEqual(firstFrame.codec, .aac)
+        var continuity = AudioContinuityBuffer()
+        continuity.reset(to: firstFrame.generation)
+        let samples = try fixture.audioFrames.prefix(3).map { frame in
+            guard case let .admitted(admitted) = try continuity.admit(frame) else {
+                XCTFail("Real AAC fixture must pass canonical continuity admission")
+                throw FixtureIntegrationFailure.invalidAudioContinuity
+            }
+            return try SampleBufferBuilder.makeAudio(frame: admitted,
+                formatDescription: configuration.formatDescription,
+                forceResetDecoderBeforeDecoding: false)
+        }
+        try await NativeAudioReceiverSmoke.assertLifecycle(samples: samples, mediaKind: .compressed)
+    }
+
     func testProgressiveAACFixtureDecodesAssemblerFramesThroughRealPCMDecoder() throws {
         let result = try assemble(path: "progressive-h264-aac.ts")
         let source = try XCTUnwrap(result.trackSet.audio)
@@ -636,6 +658,7 @@ private enum FixtureIntegrationFailure: Error {
     case missingTracks
     case invalidHTTPResponse
     case requestTimedOut
+    case invalidAudioContinuity
 }
 
 private struct AssembledFixture {

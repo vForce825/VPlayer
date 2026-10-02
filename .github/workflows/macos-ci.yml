@@ -50,179 +50,159 @@ jobs:
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
 
-      - name: Verify committed generated project and licenses
-        id: source_check
+      - name: Install Apple Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Check deployment floors and precompiled Metal reproducibility
+        run: |
+          python3 Scripts/Tests/test_tvos27_deployment.py
+          ./Scripts/Tests/test_precompiled_metal_library.sh
+
+      - name: Compile and run unit and UI tests
+        run: |
+          ./Scripts/test.sh -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+
+  release-validation:
+    name: Release boundaries and cold startup
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        id: release_preflight
         run: |
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
-
-      - name: Inspect bounded native VideoToolbox capability scalars
-        run: ./Scripts/probe-tvos-vt-capabilities.sh
-
-      - name: Compile tvOS 27 app and tests
-        id: build
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Run Release boundary suite
         run: |
-          options=()
-          help="$(xcodebuild -help 2>&1)"
-          if printf '%s\n' "$help" | grep -F -- '-continue-building-after-errors'; then
-            options+=(-continue-building-after-errors)
-          else
-            echo "Optional continue-building flag is not advertised; retaining default build behavior"
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Run Release startup suite
+        if: ${{ !cancelled() && steps.release_preflight.outcome == 'success' }}
+        run: |
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Check six Release cold starts including allocator accounting
+        if: ${{ !cancelled() && steps.release_preflight.outcome == 'success' }}
+        run: |
+          TVOS_SIMULATOR_UDID="$(xcrun simctl list devices available -j | jq -er '
+            .devices["com.apple.CoreSimulator.SimRuntime.tvOS-27-0"][] |
+            select(.name == "Apple TV 4K (3rd generation)") | .udid' | head -n 1)"
+          export TVOS_SIMULATOR_UDID
+          simulator_state="$(xcrun simctl list devices available -j | jq -er --arg id "$TVOS_SIMULATOR_UDID" '
+            .devices[][] | select(.udid == $id) | .state')"
+          if [[ "$simulator_state" != "Booted" ]]; then
+            xcrun simctl boot "$TVOS_SIMULATOR_UDID"
           fi
-          xcodebuild build-for-testing "${options[@]}" \
-            -project VPlayer.xcodeproj \
-            -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" \
-            CODE_SIGNING_ALLOWED=NO
+          xcrun simctl bootstatus "$TVOS_SIMULATOR_UDID" -b
+          ./Scripts/test-release-startup.sh
 
-      - name: Verify bounded XCTest timeout and diagnostics options
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+  artifact-validation:
+    name: FFmpeg audit and reproducibility regressions
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
         run: |
-          help="$(xcodebuild -help 2>&1)"
-          for option in -collect-test-diagnostics -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
-            printf '%s\n' "$help" | grep -F -- "$option"
-          done
-
-      - name: Prepare bounded test runner
-        id: prepare_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
         run: |
-          cat > "$RUNNER_TEMP/vplayer-bounded-tests.py" <<'PY'
-          import os, re, selectors, signal, subprocess, sys, time
-          
-          command = [
-              "xcodebuild", "test-without-building", "-project", "VPlayer.xcodeproj",
-              "-scheme", "VPlayer", "-destination", os.environ["TVOS_TEST_DESTINATION"],
-              "-parallel-testing-enabled", "NO", "-collect-test-diagnostics", "never",
-              "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
-              "-maximum-test-execution-time-allowance", "300",
-          ] + sys.argv[1:] + ["CODE_SIGNING_ALLOWED=NO"]
-          process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-          selector = selectors.DefaultSelector()
-          selector.register(process.stdout, selectors.EVENT_READ)
-          started = time.monotonic()
-          completed_at = None
-          known_fixture_timeout = False
-          buffer = b""
-          
-          def emit(line):
-              global completed_at, known_fixture_timeout
-              print(line, flush=True)
-              if "testActivationCallsPlayExactlyOnceOnlyForMatchingPermit" in line and "exceeded execution time allowance" in line:
-                  known_fixture_timeout = True
-                  print("CI_DIAGNOSTIC_STOP: known shared HLS fixture timed out; remaining cases are not verified", flush=True)
-              if re.search(r"Test Suite .* started at|Test Case .* started\.", line):
-                  completed_at = None
-              if re.search(r"Test Suite 'Selected tests' (passed|failed) at", line):
-                  completed_at = time.monotonic()
-                  print("CI_POST_SUITE_WATCHDOG: suite completion observed; allowing 180 seconds for finalization", flush=True)
-          
-          def diagnose():
-              print("CI_POST_SUITE_WATCHDOG: owned process did not exit; preserving failure", flush=True)
-              listing = subprocess.check_output(["ps", "-ax", "-o", "pid=,ppid=,stat=,etime=,comm="], text=True)
-              rows = []
-              for line in listing.splitlines():
-                  parts = line.split(None, 4)
-                  if len(parts) == 5:
-                      rows.append((int(parts[0]), int(parts[1]), parts[4], line))
-              owned = {process.pid}
-              while True:
-                  descendants = owned | {pid for pid, parent, _, _ in rows if parent in owned}
-                  if descendants == owned:
-                      break
-                  owned = descendants
-              relevant = [(pid, command, line) for pid, parent, command, line in rows
-                          if pid in owned or os.path.basename(command).startswith("VPlayer")]
-              for _, _, line in relevant:
-                  print("CI_PROCESS " + line, flush=True)
-              subprocess.run(["xcrun", "simctl", "list", "devices", "booted", "--json"], timeout=20, check=False)
-              sample_pids = [process.pid] + [pid for pid, command, _ in relevant
-                                            if pid != process.pid and os.path.basename(command).startswith("VPlayer")][:3]
-              for pid in sample_pids:
-                  print("CI_PROCESS_SAMPLE " + str(pid), flush=True)
-                  try:
-                      sample = subprocess.run(["sample", str(pid), "3", "1"], capture_output=True, text=True, timeout=15)
-                      print("\n".join((sample.stdout + sample.stderr).splitlines()[:400]), flush=True)
-                  except subprocess.TimeoutExpired:
-                      print("CI_PROCESS_SAMPLE timed out", flush=True)
-          
-          while True:
-              for key, _ in selector.select(timeout=1):
-                  chunk = os.read(key.fileobj.fileno(), 65536)
-                  if not chunk:
-                      selector.unregister(key.fileobj)
-                      continue
-                  buffer += chunk
-                  while b"\n" in buffer:
-                      line, buffer = buffer.split(b"\n", 1)
-                      emit(line.decode("utf-8", errors="replace"))
-              if process.poll() is not None:
-                  if buffer:
-                      emit(buffer.decode("utf-8", errors="replace"))
-                  raise SystemExit(process.returncode)
-              now = time.monotonic()
-              if known_fixture_timeout or (completed_at is not None and now - completed_at > 180) or now - started > 1800:
-                  diagnose()
-                  os.killpg(process.pid, signal.SIGTERM)
-                  try:
-                      process.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      os.killpg(process.pid, signal.SIGKILL)
-                      process.wait(timeout=10)
-                  print("CI_XCODEBUILD_RETURN_CODE=" + str(process.returncode), flush=True)
-                  print("CI_DIAGNOSTIC_EXIT=124", flush=True)
-                  raise SystemExit(124)
-          
-          PY
-          python3 -m py_compile "$RUNNER_TEMP/vplayer-bounded-tests.py"
-
-      - name: Probe actual test-host allocation contract
-        id: startup_probe
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Run dependency lock, tamper, promotion and reproducibility regressions
         run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests
-
-      - name: Core, ownership, observation and Large Text regressions
-        id: core_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
+          ./Scripts/Tests/test_ffmpeg_lock.sh
+          ./Scripts/Tests/test_ffmpeg_audit.sh
+      - name: Test bootstrap and device-acceptance runner contracts without hardware
         run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/AudioSessionLifecycleTests \
-            -only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests \
-            -only-testing:VPlayerTests/NativeReceiverAdapterTests \
-            -only-testing:VPlayerTests/AudioRendererRecoveryProgressTests \
-            -only-testing:VPlayerTests/SystemVideoOutputTests \
-            -only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests \
-            -only-testing:VPlayerTests/AVPlayerLogSnapshotCacheTests \
-            -only-testing:VPlayerTests/RefreshLifecycleTests \
-            -only-testing:VPlayerTests/NowPlayingIntegrationTests \
-            -only-testing:VPlayerTests/CommittedLibraryObservationTests \
-            -only-testing:VPlayerTests/ReducedResourceUsageTests \
-            -only-testing:VPlayerTests/OutputCleanupCoordinatorTests \
-            -only-testing:VPlayerTests/PlaybackDeadlineTests \
-            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests \
-            -only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests \
-            -only-testing:VPlayerTests/SampleBufferBackendTests \
-            -only-testing:VPlayerTests/ChannelProgrammeLayoutTests \
-            -only-testing:VPlayerTests/Task9RuntimeOwnershipTests/testPauseCancelsAndJoinsInflightActivationBeforeOneSuspension \
-            -only-testing:VPlayerTests/VTVideoEncoderTests/testRealSystemVTCompressionCreatesPreparesAndReturnsHardwareFirstOutput \
-            -only-testing:VPlayerTests/VTVideoEncoderTests/testUnsupportedMandatoryClosedGOPPropertyRejectsBothCodecsWithExactNativeFailure \
-            -only-testing:VPlayerTests/VTVideoEncoderTests/testSimulatorRejectsMeasuredUnsupportedNativeClosedGOPPropertyWithExactFailure \
-            -only-testing:VPlayerTests/PlaybackPipelineTests/testOneHundredRandomizedOldCallbacksNeverReachPresentation \
-            -only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity
+          ./Scripts/test-bootstrap-check.sh
+          ./Scripts/test-device-acceptance-signal.sh
+          ./Scripts/test-device-acceptance-signing.sh
 
-      - name: Representative HLS lifecycle and cancellation regressions
-        id: hls_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
+  fixture-validation:
+    name: HTTP playback and full-length 4K timeline fixtures
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
         run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testLiveAVPreparationUsesWriterPrefixWhenFinalTailIsOutsidePublication \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testActivationCallsPlayExactlyOnceOnlyForMatchingPermit \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSystemDriverUsesConfiguredStartupBufferForHomePodHLS \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts
-
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build and fixture tooling
+        run: brew install mint jq ripgrep ffmpeg
+      - name: Build and audit pinned application FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Check fixture runner, server and generator contracts
+        run: |
+          python3 Scripts/Tests/test_playback_fixture_runner.py
+          python3 Scripts/Tests/test_timeline_fixture.py
+          python3 Scripts/Support/fixture_server.py --self-test
+          ./Scripts/run-playback-integration-tests.sh --self-test
+          ./Scripts/generate-playback-fixtures.sh --self-test
+      - name: Run HTTP playback and 900-second 4K timeline coverage
+        timeout-minutes: 30
+        run: |
+          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/vplayer-timeline.XXXXXX")"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 Scripts/generate-timeline-fixture.py "$fixture_dir/timeline.ts"
+          ./Scripts/run-playback-integration-tests.sh \
+            --timeline-fixture "$fixture_dir/timeline.ts" \
+            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
+            --only-testing VPlayerTests/HLSTimelineTests \
+            -- -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300

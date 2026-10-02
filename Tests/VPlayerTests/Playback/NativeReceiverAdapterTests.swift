@@ -9,6 +9,16 @@ import XCTest
 
 @MainActor
 final class NativeReceiverAdapterTests: XCTestCase {
+    func testRealSDKPCMAudioReceiverEOFRegistrationResumeFlushAndRemoval() async throws {
+        let samples = try (0..<3).map { index in
+            try PCMSampleBufferBuilder.make(bytes: Data(repeating: 0, count: 480 * 2 * 4),
+                frameCount: 480, sampleRate: 48_000, channels: 2,
+                channelOrder: .native, channelLayoutMask: 3,
+                presentationTimeStamp: CMTime(value: Int64(index * 480), timescale: 48_000))
+        }
+        try await NativeAudioReceiverSmoke.assertLifecycle(samples: samples, mediaKind: .linearPCM)
+    }
+
     func testRealSDKVideoReceiverCanResumeAfterIdleEventsFlushAndRemove() async throws {
         let synchronizer = AVSampleBufferRenderSynchronizer()
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
@@ -572,4 +582,163 @@ private final class NativeControlResults: @unchecked Sendable {
     private var stored: [Bool] = []
     var values: [Bool] { lock.withLock { stored } }
     func record(_ value: Bool) { lock.withLock { stored.append(value) } }
+}
+
+/// Shared by the generated PCM test and the real demux/assembler AAC fixture test.
+/// This checks native Receiver acceptance and ownership, not audible playback.
+@MainActor
+enum NativeAudioReceiverSmoke {
+    static func assertLifecycle(samples: [CMSampleBuffer], mediaKind: AudioRendererMediaKind) async throws {
+        XCTAssertEqual(samples.count, 3)
+        guard samples.count == 3 else { throw SmokeFailure.invalidSamples }
+        for sample in samples {
+            XCTAssertTrue(CMSampleBufferDataIsReady(sample))
+            XCTAssertGreaterThan(CMSampleBufferGetNumSamples(sample), 0)
+            XCTAssertGreaterThan(CMSampleBufferGetTotalSampleSize(sample), 0)
+        }
+        let ownership = try await exercise(samples: samples, mediaKind: mediaKind)
+        try await waitUntil("adapter and native renderer ownership released after removal") {
+            ownership.adapter == nil && ownership.renderer == nil
+        }
+    }
+
+    private static func exercise(samples: [CMSampleBuffer], mediaKind: AudioRendererMediaKind)
+        async throws -> WeakAudioRendererProbe {
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        let synchronization = SystemAudioSynchronizer(synchronizer)
+        let renderer = SystemAudioRenderer(identity: .init(rawValue: 100), mediaKind: mediaKind)
+        let ownership = WeakAudioRendererProbe(renderer)
+        let ready = NativeAdapterCounter()
+        let events = NativeAudioSmokeEvents()
+        XCTAssertFalse(renderer.isReadyForMoreMediaData, "Unattached renderer has no native Receiver")
+        try synchronization.attach(renderer)
+        // A paused clock keeps the three tiny submissions bounded. These
+        // assertions require neither clock advancement nor audible playback.
+        synchronization.setRate(0, time: CMSampleBufferGetPresentationTimeStamp(samples[0]))
+        XCTAssertTrue(renderer.isReadyForMoreMediaData)
+        renderer.startObserving(events.record)
+        renderer.requestMediaDataWhenReady { ready.increment() }
+
+        var lifecycleFailure: (any Error)?
+        do {
+            try await enqueue(samples[0], into: renderer, ready: ready, stage: "first native audio acceptance")
+            let beforeEOF = ready.value
+            renderer.finishedEnqueuing()
+            try await waitUntil("native EOF registration control worker completion") {
+                ready.value > beforeEOF && renderer.isReadyForMoreMediaData
+            }
+            // This barrier proves the real owner registered its SDK sequence.
+            // The SDK exposes no first-next/suspension signal: resumed acceptance
+            // exercises cancellation but is not proof of an idle-next race.
+            try await enqueue(samples[1], into: renderer, ready: ready, stage: "native audio acceptance after EOF registration")
+            let beforeSecondEOF = ready.value
+            renderer.finishedEnqueuing()
+            try await waitUntil("second native EOF registration control worker completion") {
+                ready.value > beforeSecondEOF && renderer.isReadyForMoreMediaData
+            }
+            let beforeFlush = ready.value
+            renderer.flush()
+            try await waitUntil("native audio flush and event-task settlement") {
+                ready.value > beforeFlush && renderer.isReadyForMoreMediaData
+            }
+            try await enqueue(samples[2], into: renderer, ready: ready, stage: "native audio acceptance after physical flush")
+            let beforeFinalEOF = ready.value
+            renderer.finishedEnqueuing()
+            try await waitUntil("final native EOF registration before removal") {
+                ready.value > beforeFinalEOF && renderer.isReadyForMoreMediaData
+            }
+        } catch { lifecycleFailure = error }
+
+        // Removal is attempted even when enqueue/control times out. Never await
+        // an SDK task directly: a stuck native iterator must remain a test failure,
+        // rather than trapping XCTest in an unbounded task-group join.
+        let removed = XCTestExpectation(description: "SDK audio Receiver removal completes")
+        let removals = NativeControlResults()
+        synchronization.remove(renderer, at: .invalid) { success in
+            removals.record(success)
+            removed.fulfill()
+        }
+        let removalWait = await XCTWaiter.fulfillment(of: [removed], timeout: 3)
+        renderer.stopRequestingMediaData()
+        renderer.stopObserving()
+        XCTAssertEqual(removalWait, .completed, "Native audio Receiver removal timed out")
+        XCTAssertEqual(removals.values, [true], "SDK must confirm physical Receiver removal exactly once")
+        XCTAssertFalse(renderer.isReadyForMoreMediaData, "Detached Receiver cannot admit more samples")
+        XCTAssertNil(events.failure, "Native audio Receiver failed: \(events.failure ?? "")")
+        if let lifecycleFailure { throw lifecycleFailure }
+        guard removalWait == .completed, removals.values == [true] else { throw SmokeFailure.removal }
+        return ownership
+    }
+
+    private static func enqueue(_ sample: CMSampleBuffer, into renderer: SystemAudioRenderer,
+        ready: NativeAdapterCounter, stage: String) async throws {
+        let beforeEnqueue = ready.value
+        let completed = XCTestExpectation(description: stage)
+        let result = NativeAudioSmokeResult()
+        renderer.enqueue(sample) { outcome in result.record(outcome); completed.fulfill() }
+        let wait = await XCTWaiter.fulfillment(of: [completed], timeout: 3)
+        XCTAssertEqual(wait, .completed, "\(stage) timed out")
+        XCTAssertTrue(result.accepted, "\(stage): \(result.description)")
+        guard wait == .completed, result.accepted else { throw SmokeFailure.enqueue }
+        // Completion is delivered before the feed's readiness callback. Settle
+        // that callback so it cannot satisfy the next EOF/control barrier.
+        try await waitUntil("\(stage) readiness callback") {
+            ready.value > beforeEnqueue && renderer.isReadyForMoreMediaData
+        }
+    }
+
+    private static func waitUntil(_ stage: String, condition: @MainActor () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        while clock.now < deadline {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTFail("Timed out waiting for \(stage)")
+        throw SmokeFailure.timeout
+    }
+
+    private enum SmokeFailure: Error { case invalidSamples, enqueue, removal, timeout }
+
+    @MainActor
+    private final class WeakAudioRendererProbe {
+        weak var adapter: SystemAudioRenderer?
+        weak var renderer: AVSampleBufferAudioRenderer?
+        init(_ adapter: SystemAudioRenderer) {
+            self.adapter = adapter
+            renderer = adapter.renderer
+        }
+    }
+}
+
+private final class NativeAudioSmokeResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didAccept = false
+    private var summary = "no native completion"
+    var accepted: Bool { lock.withLock { didAccept } }
+    var description: String { lock.withLock { summary } }
+    func record(_ result: Result<AudioRendererEnqueueResult, any Error>) {
+        lock.withLock {
+            switch result {
+            case let .success(value): didAccept = value.isAccepted; summary = String(describing: value)
+            case let .failure(error): summary = String(describing: error)
+            }
+        }
+    }
+}
+
+private final class NativeAudioSmokeEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var firstFailure: String?
+    var failure: String? { lock.withLock { firstFailure } }
+    func record(_ event: AudioRendererEvent) {
+        lock.withLock {
+            switch event {
+            case let .failed(reason), let .failedWithDiagnostic(reason, _):
+                if firstFailure == nil { firstFailure = reason }
+            case .automaticFlush, .outputConfigurationChanged: break
+            }
+        }
+    }
 }

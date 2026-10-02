@@ -763,11 +763,22 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         ], "observer只观察生产事件，不能替代relay transport或再次消费原key")
         XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 0)
         XCTAssertTrue(factory.backends.isEmpty)
-        let stop = Task { await controller.stop() }
+        let beforeStop = task9CleanupBoundaryDiagnostic(registry)
+        let stop = Task {
+            await controller.stop()
+            return task9CleanupBoundaryDiagnostic(registry)
+        }
         sdk.gate.signal()
         await play.value
-        await stop.value
-        XCTAssertNil(registry.cleanupReservationSnapshot())
+        let afterStopReturn = await stop.value
+        let afterBothCallers = task9CleanupBoundaryDiagnostic(registry)
+        let calls = sdk.base.lock.withLock {
+            "category=\(sdk.base.categoryCallCount),activate=\(sdk.base.activateCallCount),deactivate=\(sdk.base.deactivateCallCount)"
+        }
+        XCTAssertNil(registry.cleanupReservationSnapshot(),
+            "Original session=\(context.sessionIdentity.sessionID),reservation=\(context.reservation.nonce); " +
+            "beforeStop={\(beforeStop)}; stopReturned={\(afterStopReturn)}; " +
+            "bothCallersReturned={\(afterBothCallers)}; SDK={\(calls)}")
     }
 
     func testPlayDuringResetConfigurationIsRetainedUntilExactlyThatConfigurationCompletes() async throws {
@@ -2546,6 +2557,58 @@ private func task9OwnedRecords(_ registry: ControlTaskRegistry) -> [OwnedPostIng
             as! [OwnedPostIngressControlCommand?]).compactMap { $0 }
     }
     return records
+}
+
+/// Bounded failure diagnostics only: borrow registry fields on their executor;
+/// never print requests, URLs, resource payloads, or mutable controller fields.
+private func task9CleanupBoundaryDiagnostic(_ registry: ControlTaskRegistry) -> String {
+    registry.executor.sync {
+        let context = registry.outputResourceContextSnapshot()
+        let reservation = registry.cleanupReservationSnapshot()
+        let safety = registry.executor.safetyIngress.snapshot
+        let authority = task9Field("authority", of: registry)!
+        let permit = task9Field("audioSessionPermit", of: authority)
+        let permitNonce = permit.flatMap { task9Field("recordNonce", of: $0) as? UInt64 }
+        let permitOperation = permit.flatMap { task9Field("operation", of: $0) as? AudioSessionBlockingCallOperation }
+        let admissionSession: UInt64?
+        if case .coldStart(let admission) = registry.playbackRequestAdmissionSnapshot() {
+            admissionSession = admission.identity.sessionIdentity.sessionID
+        } else { admissionSession = nil }
+        let state: String
+        switch registry.playbackStateSnapshot() {
+        case .failed: state = "failed"
+        case .stopped: state = "stopped"
+        default: state = "nonterminal"
+        }
+        let records = task9OwnedRecords(registry).map { record -> String in
+            let payload: String
+            switch record.payload {
+            case .controllerCleanup(let runner):
+                payload = "cleanup(owner=\(runner.owner.identity.nonce)/\(runner.owner.reason)," +
+                    "task=\(runner.task != nil),join=\(runner.joinRequested)," +
+                    "terminal=\(runner.terminalRequested),returned=\(runner.recoveryReturnCommitted))"
+            case .eventDrain(let runner): payload = "drain(task=\(runner.task != nil),join=\(runner.joining))"
+            case .backendOperation: payload = "backendOperation"
+            case .audio(_, _, let result): payload = "audio(result=\(result != nil))"
+            case .deactivation(_, let result): payload = "deactivation(result=\(result != nil))"
+            case .resource: payload = "resource"
+            case .factoryResult: payload = "factoryResult"
+            case nil: payload = "none"
+            }
+            return "\(record.controlTaskTicket.nonce):\(record.slot):\(record.phase):\(payload):" +
+                "claimed=\(record.resultClaimed),invalid=\(record.resultInvalidated)," +
+                "transferred=\(record.activationResponsibilityTransferred)"
+        }.joined(separator: ";")
+        return "state=\(state),admission=\(String(describing: admissionSession))," +
+            "session=\(String(describing: context?.sessionIdentity.sessionID))," +
+            "reservation=\(String(describing: reservation?.ticket.nonce)),terminal=\(reservation?.terminal == true)," +
+            "phase=\(String(describing: context?.phase)),owner=\(String(describing: context?.owner?.identity.nonce))/\(String(describing: context?.owner?.reason))," +
+            "source=\(String(describing: context?.sourceTask?.nonce)),poisoned=\(context?.poisoned == true)," +
+            "monitorStopped=\(context?.monitorStopped == true),delivery=\(context?.delivery != nil)," +
+            "owned=\(registry.ownedResourceSnapshot() != nil),callbackDepth=\(safety.callbackDepth)," +
+            "safetyFailure=\(String(describing: safety.failure)),permit=\(String(describing: permitNonce))/\(String(describing: permitOperation))," +
+            "records=[\(records)]"
+    }
 }
 
 private func task9ContainsTask(_ value: Any, depth: Int = 0) -> Bool {
