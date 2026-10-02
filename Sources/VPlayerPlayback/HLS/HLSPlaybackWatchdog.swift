@@ -51,6 +51,8 @@ public actor HLSPlaybackWatchdog {
     private var recoveryScheduled: Bool = false
     private var scopedSession: PlaybackSessionIdentity?
     private var scopedControlRevision: UInt64 = 0
+    private var replacementGeneration: UInt64 = 0
+    private var retiredThroughSessionID: UInt64?
 
     public init(
         recoveryCoordinator: PlaybackRecoveryCoordinator,
@@ -84,7 +86,20 @@ public actor HLSPlaybackWatchdog {
         disarm()
     }
 
+    /// Fence replacement before its next session can arm. A delayed arm from
+    /// any already-admitted predecessor remains retired even if its revision
+    /// matches the last scoped arm; a delayed older replacement cannot disarm B.
+    func beginReplacement(generation: UInt64, retiring session: PlaybackSessionIdentity?) {
+        guard generation > replacementGeneration else { return }
+        replacementGeneration = generation
+        if let sessionID = session?.sessionID ?? scopedSession?.sessionID {
+            retiredThroughSessionID = max(retiredThroughSessionID ?? sessionID, sessionID)
+        }
+        disarm()
+    }
+
     private func accepts(session: PlaybackSessionIdentity, controlRevision: UInt64) -> Bool {
+        if let retiredThroughSessionID, session.sessionID <= retiredThroughSessionID { return false }
         if let scopedSession {
             if session == scopedSession {
                 guard controlRevision >= scopedControlRevision else { return false }

@@ -12,6 +12,120 @@ import XCTest
 
 @MainActor
 final class FullScreenPlayerViewModelTests: XCTestCase {
+    func testRemoteCommandsPreserveCompletedIntentUntilAuthoritativeAcknowledgementAfterRetry() async throws {
+        for initiallyPaused in [false, true] {
+            let engine = ControlledViewModelPlaybackEngine()
+            let request = makeRequest()
+            let model = FullScreenPlayerViewModel(
+                request: request, engine: engine,
+                presentationStreamProvider: { Self.finishedPresentationStream() },
+                settings: makeSettings()
+            )
+            model.start()
+            try await eventually { await engine.playCount == 1 }
+            await engine.emit(state: .preparing(request))
+            try await eventually { model.state == .preparing(request) }
+            await engine.emit(state: .playing(request))
+            try await eventually { model.state == .playing(request) }
+
+            let failure = retryableFailure()
+            await engine.emit(state: .failed(failure))
+            try await eventually { model.state == .failed(failure) }
+            model.retry()
+            try await eventually { await engine.playCount == 2 }
+            // Preparation can be coalesced out of the production state stream.
+            // Leave the local retry synchronization gate closed intentionally.
+            let staleState: PlaybackState = initiallyPaused ? .paused(request) : .playing(request)
+            await engine.emit(state: staleState)
+            try await eventually { model.state == staleState }
+
+            let firstTarget = !initiallyPaused
+            await model.setPausedFromNowPlaying(firstTarget)
+            XCTAssertEqual(model.state, staleState, "The engine has returned without acknowledging its command")
+            await model.setPausedFromNowPlaying(firstTarget)
+            let duplicateOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+            XCTAssertEqual(duplicateOperations, [
+                "pause:\(firstTarget):start", "pause:\(firstTarget):end",
+            ], "A completed but unacknowledged command remains the desired intent")
+
+            await model.setPausedFromNowPlaying(initiallyPaused)
+            let oppositeOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+            XCTAssertEqual(oppositeOperations, [
+                "pause:\(firstTarget):start", "pause:\(firstTarget):end",
+                "pause:\(initiallyPaused):start", "pause:\(initiallyPaused):end",
+            ], "Stale visible state must not discard the later opposite command")
+
+            // A delayed acknowledgement of the first command also cannot
+            // replace the final intent, even after the physical queue drains.
+            let lateState: PlaybackState = firstTarget ? .paused(request) : .playing(request)
+            await engine.emit(state: lateState)
+            try await eventually { model.state == lateState }
+            await model.setPausedFromNowPlaying(initiallyPaused)
+            let lateOperations = await engine.operations.filter { $0.hasPrefix("pause:") }
+            XCTAssertEqual(lateOperations, oppositeOperations)
+            await model.stop()
+        }
+    }
+
+    func testSuspendedPauseCoalescesAThousandCommandsToCurrentAndLatestIntent() async throws {
+        let gate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [1: gate])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.playCount == 1 }
+        await engine.emit(state: .preparing(request))
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        model.togglePause()
+        try await eventually { await gate.hasWaiter }
+        for _ in 0..<1_000 { model.togglePause() }
+        let drain = Task { await model.setPausedFromNowPlaying(true) }
+        await gate.open()
+        await drain.value
+        let operations = await engine.operations.filter { $0.hasPrefix("pause:") }
+        XCTAssertLessThanOrEqual(operations.count, 4, "Only the running command and latest queued intent may execute")
+        XCTAssertEqual(operations.last, "pause:true:end")
+        await model.stop()
+    }
+
+    func testRetryCancelsHeldWorkerAndStartsOneUncancelledSuccessor() async throws {
+        let gate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [1: gate])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            settings: makeSettings()
+        )
+        model.start()
+        try await eventually { await engine.playCount == 1 }
+        await engine.emit(state: .preparing(request))
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        model.togglePause()
+        try await eventually { await gate.hasWaiter }
+        model.togglePause() // A second intent queues behind the held command.
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
+        model.retry()
+        try await eventually { await engine.playCount == 2 }
+        await engine.emit(state: .preparing(request))
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        model.togglePause() // Retain one G2 intent while canceled G1 returns.
+        await gate.open()
+        try await eventually { await engine.completedPauseCancellationStates.count == 2 }
+        let cancellations = await engine.completedPauseCancellationStates
+        XCTAssertEqual(cancellations, [true, false], "Retry revokes G1 and gives its one successor a fresh task capability")
+        await model.stop()
+    }
+
     func testPlayerOverlayUsesOneThreeSecondSteadyPlaybackTimeout() {
         let request = makeRequest()
 
@@ -2018,6 +2132,7 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine, PlaybackPresent
     private(set) var operations: [String] = []
     private var tuningCallCount = 0
     private var pauseCallCount = 0
+    private(set) var completedPauseCancellationStates: [Bool] = []
     private var presentationMountNonce: UInt64
     private var claimCallCount = 0
     private(set) var presentationControlFailureCount = 0
@@ -2081,6 +2196,7 @@ private actor ControlledViewModelPlaybackEngine: PlaybackEngine, PlaybackPresent
         let call = pauseCallCount
         operations.append("pause:\(paused):start")
         if let gate = pauseGates[call] ?? pauseGate { await gate.wait() }
+        completedPauseCancellationStates.append(Task.isCancelled)
         operations.append("pause:\(paused):end")
     }
 

@@ -167,9 +167,8 @@ private struct Task9ExplicitResumeFixture {
         let transition = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
             reason: .recovery, at: clock.read(), teardown: false))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let suspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(suspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: transition))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))

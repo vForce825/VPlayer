@@ -10,6 +10,160 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AACPrimingCalibratorTests: XCTestCase {
+    func testAwaitedOwnedCallRejectsOverlapAndLateSuccessAfterCancellation() async throws {
+        let lane = AACOwnedCallLane()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "awaited call holds the owned permit")
+        let call = Task {
+            try await lane.callAwaiting {
+                entered.fulfill()
+                await gate.wait()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertThrowsError(try lane.call {}) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        lane.requestCancel()
+        XCTAssertFalse(lane.finishCancellation { XCTFail("cannot clean up an in-flight append") })
+        await gate.open()
+        do {
+            try await call.value
+            XCTFail("late native success must not commit after cancellation")
+        } catch {
+            XCTAssertEqual(error as? AACRenditionFailure, .cancelled)
+        }
+        XCTAssertTrue(lane.finishCancellation {})
+        XCTAssertTrue(lane.isCancellationFinished)
+    }
+
+    func testAwaitedOwnedCallPreservesOriginalErrorAndReleasesPermit() async throws {
+        let lane = AACOwnedCallLane()
+        do {
+            try await lane.callAwaiting {
+                lane.requestCancel()
+                throw NSError(domain: "AAC.NativeAppend", code: -71,
+                    userInfo: [NSLocalizedDescriptionKey: "first native append failure"])
+            }
+            XCTFail("native failure must propagate")
+        } catch {
+            let native = error as NSError
+            XCTAssertEqual(native.domain, "AAC.NativeAppend")
+            XCTAssertEqual(native.code, -71)
+            XCTAssertEqual(native.localizedDescription, "first native append failure")
+        }
+        XCTAssertTrue(lane.finishCancellation {})
+    }
+
+    func testAsyncLoopbackStreamDrainsBoundedBatchBeforeReadingMorePCM() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        let probe = AACCalibrationStreamProbe()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "first append awaits native acceptance")
+        let stream = Task {
+            try await AACSystemLoopback.encodeStreamAwaitingAppend(
+                encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+            ) { buffer in
+                if probe.recordAppend(buffer) == 1 {
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            }
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        let readsAtBackpressure = probe.readCount
+        XCTAssertEqual(readsAtBackpressure, 1, "the first 16384-frame block must emit before the next read")
+        XCTAssertThrowsError(try harness.calibrator.lane.call {}) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        XCTAssertGreaterThan(harness.calibrator.workspace.currentBytes, encoder.retainedEvidenceBytes,
+                             "signed input backing must remain charged until append returns")
+        XCTAssertNil(encoder.terminalFailure)
+        XCTAssertEqual(probe.readCount, readsAtBackpressure)
+        await gate.open()
+        let summary = try await stream.value
+        XCTAssertEqual(summary.realSampleCount, 65_536)
+        XCTAssertEqual(probe.readCount, 5, "four PCM blocks and one EOS read")
+        XCTAssertEqual(probe.appendedFrames, summary.totalDecodedFrames)
+        XCTAssertGreaterThan(probe.appendCount, 32)
+        XCTAssertLessThanOrEqual(summary.maximumRetainedPackets, 64)
+        XCTAssertLessThanOrEqual(harness.calibrator.workspace.peakBytes, 4_194_304)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, encoder.retainedEvidenceBytes)
+        XCTAssertNoThrow(try harness.calibrator.lane.call {})
+    }
+
+    func testAsyncLoopbackCancellationRetainsBatchUntilLateAppendReturns() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        let probe = AACCalibrationStreamProbe()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "native append has retained one sample")
+        let stream = Task {
+            try await AACSystemLoopback.encodeStreamAwaitingAppend(
+                encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+            ) { buffer in
+                _ = probe.recordAppend(buffer)
+                entered.fulfill()
+                await gate.wait()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        let retained = harness.calibrator.workspace.currentBytes
+        harness.calibrator.cancel()
+        XCTAssertThrowsError(try harness.calibrator.finishOnOwnedRunner()) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, retained)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertNil(encoder.terminalFailure)
+        await gate.open()
+        do {
+            _ = try await stream.value
+            XCTFail("late append success cannot finish a cancelled stream")
+        } catch {
+            XCTAssertEqual(error as? AACRenditionFailure, .cancelled)
+        }
+        XCTAssertEqual(probe.appendCount, 1)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+        XCTAssertEqual(encoder.terminalFailure, .cancelled)
+        XCTAssertNoThrow(try harness.calibrator.finishOnOwnedRunner())
+    }
+
+    func testAsyncLoopbackStreamAppendFailureSnapshotsFirstErrorAndDisposes() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        encoder.markVisible()
+        let probe = AACCalibrationStreamProbe()
+        do {
+            _ = try await AACSystemLoopback.encodeStreamAwaitingAppend(
+                encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+            ) { _ in
+                throw NSError(domain: "AAC.NativeAppend", code: -72,
+                    userInfo: [NSLocalizedDescriptionKey: "original receiver failure"])
+            }
+            XCTFail("append failure must stop the stream")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "AAC.NativeAppend")
+            XCTAssertEqual((error as NSError).code, -72)
+        }
+        let first = try XCTUnwrap(encoder.terminalFailure)
+        harness.calibrator.presentationTerminal.fail(.cancelled)
+        XCTAssertEqual(encoder.terminalFailure, first)
+        let description = String(reflecting: first)
+        XCTAssertTrue(description.contains("AAC.NativeAppend"), description)
+        XCTAssertTrue(description.contains("-72"), description)
+        XCTAssertTrue(description.contains("original receiver failure"), description)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertEqual(harness.calibrator.presentationTerminal.publicationCount, 1)
+        XCTAssertFalse(encoder.mayPublishTailOrEndList)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+    }
+
     func testForeignStreamFailureRetainsOriginalTerminalReason() async throws {
         let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
         let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
@@ -710,7 +864,7 @@ final class AACPrimingCalibratorTests: XCTestCase {
 
     func testWorkspaceEverySubledgerAliasSoftHardAndPreallocationCookieLimits() throws {
         let workspace = AACCalibrationWorkspace()
-        let caps: [(AACCalibrationWorkspace.Kind, Int)] = [(.sourcePCM,524_288),(.aacPackets,524_288),(.temporaryFile,1_048_576),(.decodedPCM,1_048_576),(.correlation,524_288),(.nonPayload,524_288)]
+        let caps: [(AACCalibrationWorkspace.Kind, Int)] = [(.sourcePCM,524_288),(.aacPackets,2 * 1_024 * 1_024),(.temporaryFile,1_048_576),(.decodedPCM,1_048_576),(.correlation,524_288),(.nonPayload,524_288)]
         for (kind, cap) in caps {
             let lease = try workspace.acquire(kind, bytes: cap)
             XCTAssertThrowsError(try workspace.acquire(kind, bytes: 1))
@@ -996,6 +1150,43 @@ private final class AACCookieBoundaryFixture: AACCalibrationObserver, @unchecked
             if formats.count < 8 {
                 formats.append("actual[\(formats.count)]: ASBD=\(format.asbd), leading=\(format.leadingPrimeFrames), trailing=\(format.trailingPrimeFrames), layout=\(format.layoutBacking.data.map { String(format: "%02x", $0) }.joined())")
             }
+        }
+    }
+}
+
+private actor AACCalibrationAppendGate {
+    private var opened = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func open() {
+        opened = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private final class AACCalibrationStreamProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private var appends = 0
+    private var frames: Int64 = 0
+    var readCount: Int { lock.withLock { reads } }
+    var appendCount: Int { lock.withLock { appends } }
+    var appendedFrames: Int64 { lock.withLock { frames } }
+    func nextPCM() -> [Float]? {
+        let index = lock.withLock { let index = reads; reads += 1; return index }
+        guard index < 4 else { return nil }
+        return AACPrimingCalibratorTestHarness.indexedSignal(
+            start: index * 16_384, frames: 16_384, channels: 2)
+    }
+    func recordAppend(_ buffer: CMSampleBuffer) -> Int {
+        lock.withLock {
+            appends += 1
+            frames += Int64(CMSampleBufferGetNumSamples(buffer)) * 1_024
+            return appends
         }
     }
 }

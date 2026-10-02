@@ -637,16 +637,15 @@ final class HLSVideoIntegrationTests: XCTestCase {
             outputSettings: nil,
             sourceFormatHint: formatDesc
         )
-        writerInput.expectsMediaDataInRealTime = false
         writerInput.mediaTimeScale = timeScale
         guard writer.canAdd(writerInput) else { throw CompressionError(status: -2) }
-        writer.add(writerInput)
-        guard writer.startWriting() else { throw CompressionError(status: -3) }
+        let receiver = writer.inputReceiver(for: writerInput)
+        try writer.start()
         writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(firstSample))
         for sb in sampleBuffers {
-            writerInput.append(sb)
+            try await receiver.append(makeReadyWriterFixtureSample(copying: sb))
         }
-        writerInput.markAsFinished()
+        receiver.finish()
         await writer.finishWriting()
         guard writer.status == .completed else {
             throw writer.error ?? CompressionError(status: -4)

@@ -241,7 +241,7 @@ final class ReleaseAACSeed: @unchecked Sendable {
             ownershipLimits: .init(rolloverThreshold: 256, hardCapacity: 384),
             relay: relay, systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
         try writer.start(at: effectiveStart)
-        try writer.appendAACEncodedEpoch(epoch, coordinator: boundary)
+        try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
         return ReleasePendingAACSeed(
             writer: writer, sink: sink, relay: relay, epoch: epoch,
             encodedBuffers: coalesced, streamSummary: summary)

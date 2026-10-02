@@ -73,6 +73,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var mediaInformationProviderTask: Task<Void, Never>?
     private var mediaInformationTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
+    @ObservationIgnored private var pauseWorkerTask: Task<Void, Never>?
+    @ObservationIgnored private var pauseWorkerID: UUID?
     private var stopTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
@@ -147,6 +149,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     deinit {
+        pauseWorkerTask?.cancel()
         if let nowPlayingOwnerID {
             let nowPlaying = nowPlaying
             Task { @MainActor [weak nowPlaying] in
@@ -218,7 +221,17 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         case .playing, .paused: break
         case .idle, .preparing, .buffering, .recovering, .stopped, .failed: return
         }
+        // A drained worker can still be waiting for the state stream to
+        // acknowledge its last command. Preserve that intent over stale state.
+        if !acceptsAuthoritativePauseState,
+           pendingPauseCommands.isEmpty,
+           awaitingAuthoritativePause == nil {
+            desiredPaused = isPaused
+        }
         if desiredPaused != paused { enqueuePause(paused) }
+        // A retiring worker can still be physically suspended. Its completion
+        // starts the one successor worker; never overlap physical command lanes.
+        await pauseWorkerTask?.value
         await pauseTask?.value
     }
 
@@ -234,29 +247,63 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
 
     private func enqueuePause(_ paused: Bool) {
         desiredPaused = paused
-        let command = PendingPauseCommand(id: UUID(), target: desiredPaused)
-        pendingPauseCommands.append(command)
+        let command = PendingPauseCommand(id: UUID(), target: paused)
+        if pauseWorkerTask != nil, pauseTask == nil {
+            // The old generation is canceled but has not physically returned.
+            // Retain just one successor intent in addition to that old command.
+            pendingPauseCommands = [command]
+        } else if pendingPauseCommands.count < 2 {
+            pendingPauseCommands.append(command)
+        } else {
+            // Keep the exact in-flight head; fold a burst into the latest tail.
+            pendingPauseCommands[1] = command
+        }
         awaitingAuthoritativePause = nil
-        let predecessor = pauseTask
+        startPauseWorkerIfNeeded()
+    }
+
+    private func startPauseWorkerIfNeeded() {
+        guard pauseWorkerTask == nil, !pendingPauseCommands.isEmpty, !stopped else { return }
+        if let nowPlayingOwnerID, nowPlaying?.owns(nowPlayingOwnerID) != true {
+            pendingPauseCommands.removeAll()
+            return
+        }
+        // This may run from a canceled predecessor's defer. A new unstructured
+        // worker gets its own cancellation state; do not test the finishing
+        // task's cancellation while deciding whether a successor is needed.
+        let workerID = UUID()
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
         let engine = engine
-        let task = Task { [weak self] in
-            await predecessor?.value
-            guard let self,
-                  isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-            if let scoped = engine as? any RequestScopedPlaybackControlling {
-                await scoped.setPaused(command.target, requestID: request.id)
-            } else {
-                await engine.setPaused(command.target)
+        let requestID = request.id
+        pauseWorkerID = workerID
+        let task = Task { @MainActor [weak self] in
+            defer { self?.finishPauseWorker(workerID) }
+            while let command = self?.nextPauseCommand(lifecycle: lifecycle, playback: playback) {
+                if let scoped = engine as? any RequestScopedPlaybackControlling {
+                    await scoped.setPaused(command.target, requestID: requestID)
+                } else {
+                    await engine.setPaused(command.target)
+                }
+                guard !Task.isCancelled else { return }
+                self?.retirePauseCommand(command, lifecycle: lifecycle, playback: playback)
             }
-            retirePauseCommand(
-                command,
-                lifecycle: lifecycle,
-                playback: playback
-            )
         }
+        pauseWorkerTask = task
         pauseTask = task
+    }
+
+    private func nextPauseCommand(lifecycle: UInt64, playback: UInt64) -> PendingPauseCommand? {
+        guard isCurrent(lifecycle: lifecycle, playback: playback) else { return nil }
+        return pendingPauseCommands.first
+    }
+
+    private func finishPauseWorker(_ id: UUID) {
+        guard pauseWorkerID == id else { return }
+        pauseWorkerID = nil
+        pauseWorkerTask = nil
+        pauseTask = nil
+        startPauseWorkerIfNeeded()
     }
 
     func retry() {
@@ -696,10 +743,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         case .preparing, .buffering, .recovering:
             acceptsAuthoritativePauseState = true
         case .playing:
-            acceptsAuthoritativePauseState = true
             applyAuthoritativePauseState(false)
         case .paused:
-            acceptsAuthoritativePauseState = true
             applyAuthoritativePauseState(true)
         case .stopped, .failed:
             resetPauseIntent()
@@ -737,6 +782,10 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     private func resetPauseIntent() {
+        // There is one physical worker, so cancellation revokes every command
+        // in this generation. Retain it until physical return to prevent a new
+        // generation from growing a chain of suspended unstructured tasks.
+        pauseWorkerTask?.cancel()
         pauseTask?.cancel()
         pauseTask = nil
         desiredPaused = false

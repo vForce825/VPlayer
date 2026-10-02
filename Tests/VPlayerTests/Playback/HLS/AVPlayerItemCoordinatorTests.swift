@@ -12,6 +12,78 @@ import XCTest
 
 @MainActor
 final class AVPlayerItemCoordinatorTests: XCTestCase {
+    func testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries() async throws {
+        let encoded = try await Task21RealAACSeed.makeEncodedInput()
+        XCTAssertGreaterThanOrEqual(encoded.buffers.count, 7)
+        func payload(_ buffers: [CMSampleBuffer]) throws -> Data {
+            var result = Data()
+            for buffer in buffers {
+                let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(buffer))
+                let byteCount = CMBlockBufferGetDataLength(block)
+                var bytes = Data(count: byteCount)
+                try bytes.withUnsafeMutableBytes { destination in
+                    try AACRenditionEncoder.check(CMBlockBufferCopyDataBytes(block,
+                        atOffset: 0, dataLength: byteCount,
+                        destination: destination.baseAddress!))
+                }
+                result.append(bytes)
+            }
+            return result
+        }
+
+        // The single-rendition and dual-rendition fixtures use seven and six
+        // original second buckets respectively; neither may submit coarse buckets
+        // after removing priming trim, because their first bucket can contain 49 AUs.
+        for bucketCount in [6, 7] {
+            let buckets = Array(encoded.buffers.prefix(bucketCount))
+            let first = try XCTUnwrap(buckets.first)
+            let origin = CMSampleBufferGetOutputPresentationTimeStamp(first)
+            let originalTrim = Task21RealAACSeed.trimTime(first,
+                key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+            let accessUnits = try Task21RealAVSeed.retimedAudioAccessUnits(buckets)
+            XCTAssertEqual(accessUnits.count, buckets.reduce(0) {
+                $0 + CMSampleBufferGetNumSamples($1)
+            })
+            XCTAssertEqual(try payload(accessUnits), try payload(buckets))
+            XCTAssertEqual(Task21RealAACSeed.trimTime(first,
+                key: kCMSampleBufferAttachmentKey_TrimDurationAtStart), originalTrim,
+                "Retiming must not mutate the cached source trim")
+            let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
+                epochStart: origin, videoMode: .reencodedClosedGOP))
+            let rendition = AudioRenditionIdentity(rawValue: 2)
+            try boundary.registerAudioRendition(rendition,
+                accessUnit: .aac(sampleRate: 48_000), firstEffectiveStart: origin)
+            var videoFrame: Int64 = 0
+            var expectedStart = origin
+            var flushCount = 0
+            for accessUnit in accessUnits {
+                let start = CMSampleBufferGetOutputPresentationTimeStamp(accessUnit)
+                let duration = CMTime(value: 1_024, timescale: 48_000)
+                XCTAssertEqual(CMSampleBufferGetNumSamples(accessUnit), 1)
+                XCTAssertEqual(CMTimeCompare(start, expectedStart), 0)
+                XCTAssertEqual(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(accessUnit), start), 0)
+                XCTAssertEqual(CMTimeCompare(CMSampleBufferGetDuration(accessUnit), duration), 0)
+                expectedStart = CMTimeAdd(start, duration)
+                while CMTimeCompare(CMTimeAdd(origin, CMTime(value: videoFrame, timescale: 24)),
+                                    expectedStart) <= 0 {
+                    _ = try boundary.inspectVideoBoundary(
+                        at: CMTimeAdd(origin, CMTime(value: videoFrame, timescale: 24)),
+                        isIDR: videoFrame.isMultiple(of: 24))
+                    videoFrame += 1
+                }
+                let inspection = try boundary.inspectAudioBoundary(rendition: rendition, at: start)
+                if inspection.requiresFlushBeforeAppend {
+                    flushCount += 1
+                    let cut = CMTimeAdd(origin, CMTime(value: Int64(flushCount), timescale: 1))
+                    XCTAssertGreaterThanOrEqual(CMTimeCompare(start, cut), 0)
+                    XCTAssertLessThan(CMTimeCompare(start, CMTimeAdd(cut, duration)), 0,
+                        "The first AU after each cut must stay inside the strict one-AU boundary window")
+                }
+            }
+            XCTAssertGreaterThanOrEqual(flushCount, bucketCount - 1)
+        }
+    }
+
     func testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate() async throws {
         let harness = try await Task21Harness()
         _ = try await harness.prepare()
@@ -5623,17 +5695,25 @@ final class Task21RealAACSeed: @unchecked Sendable {
         throw AACRenditionFailure.invalidLayout
     }
 
+    fileprivate static func makeEncodedInput(
+        layoutLabels: [RenditionChannelLabel] = [.l, .r]
+    ) async throws -> Task21AACEncodedInput {
+        let template = try await encodedTemplate(layoutLabels: layoutLabels)
+        let buffers = try template.buffers.map {
+            try makeEncodedBuffer(from: $0, format: template.format)
+        }
+        return Task21AACEncodedInput(buffers: buffers, summary: template.streamSummary)
+    }
+
     fileprivate static func makePending(
         itemGeneration: UInt64 = 19,
         outputLifecycleEpoch: OutputLifecycleEpoch? = nil,
         layoutLabels: [RenditionChannelLabel] = [.l, .r]
     ) async throws
         -> Task21PendingAACSeed {
-        let template = try await encodedTemplate(layoutLabels: layoutLabels)
-        let coalesced = try template.buffers.map {
-            try makeEncodedBuffer(from: $0, format: template.format)
-        }
-        let summary = template.streamSummary
+        let input = try await makeEncodedInput(layoutLabels: layoutLabels)
+        let coalesced = input.buffers
+        let summary = input.summary
         let workspace = AACCalibrationWorkspace()
         let payloadBytes = coalesced.reduce(0) {
             $0 + (CMSampleBufferGetDataBuffer($1).map(CMBlockBufferGetDataLength) ?? 0)
@@ -5682,7 +5762,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
             ownershipLimits: .init(rolloverThreshold: 256, hardCapacity: 384),
             relay: relay, systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
         try writer.start(at: effectiveStart)
-        try writer.appendAACEncodedEpoch(epoch, coordinator: boundary)
+        try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
         return Task21PendingAACSeed(
             writer: writer, sink: sink, relay: relay, epoch: epoch,
             encodedBuffers: coalesced, streamSummary: summary)
@@ -5917,6 +5997,12 @@ final class Task21RealAACSeed: @unchecked Sendable {
         return time.isValid ? time : nil
     }
 
+}
+
+/// Fresh buffers rebuilt from the immutable encoding template for one fixture owner.
+private struct Task21AACEncodedInput: @unchecked Sendable {
+    let buffers: [CMSampleBuffer]
+    let summary: AACStreamSummary
 }
 
 private struct Task21AACEncodedBufferTemplate: @unchecked Sendable {
@@ -6370,12 +6456,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
         // 编码块：系统 writer 的最终 flush 段因此仍落在 HLS 最多 7 段的
         // 可见窗口内，两个 terminal media key 都能由同一 snapshot 广告。
         let inputBufferCount = additionalAudioSeed == nil ? 7 : 6
-        let retimedAudioBuckets = try retimedUntrimmedAudio(
-            Array(audio.encodedBuffers.prefix(inputBufferCount))
-        )
-        let retimedAudio = try additionalAudioSeed == nil
-            ? retimedAudioBuckets
-            : splitAACAccessUnits(retimedAudioBuckets)
+        let retimedAudio = try retimedAudioAccessUnits(
+            Array(audio.encodedBuffers.prefix(inputBufferCount)))
         guard retimedAudio.count >= 6,
               let firstAudio = retimedAudio.first,
               let audioFormat = CMSampleBufferGetFormatDescription(firstAudio) else {
@@ -6387,10 +6469,9 @@ final class Task21RealAVSeed: @unchecked Sendable {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         let additionalRetimedAudio = try additionalAudioSeed.map { seed in
-            let buckets = try retimedUntrimmedAudio(
+            try retimedAudioAccessUnits(
                 Array(seed.encodedBuffers.prefix(inputBufferCount)),
                 startingAt: sourceStart)
-            return try splitAACAccessUnits(buckets)
         }
         let additionalAudioFormat = additionalRetimedAudio?.first.flatMap {
             CMSampleBufferGetFormatDescription($0)
@@ -6553,7 +6634,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                 _ buffer: CMSampleBuffer,
                 from completeEpoch: AACEncodedEpoch,
                 to writer: SegmentedFMP4Writer
-            ) throws {
+            ) async throws {
                 let counts = try aacEpochCounts([buffer])
                 let chunk = AACEncodedEpoch(
                     identity: completeEpoch.identity,
@@ -6566,7 +6647,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     bandwidth: completeEpoch.bandwidth,
                     packetLease: completeEpoch.packetLease,
                     formatLease: completeEpoch.formatLease)
-                try writer.appendAACEncodedEpoch(chunk, coordinator: boundary)
+                try await writer.appendAACEncodedEpochAwaitingReadiness(chunk, coordinator: boundary)
             }
             let audioEpoch = try makeCompleteEpoch(retimedAudio, seed: audio)
             let additionalEpoch = try makeCompleteEpoch(
@@ -6603,18 +6684,18 @@ final class Task21RealAVSeed: @unchecked Sendable {
                    CMTimeCompare(videoStart, audioEnd) <= 0,
                    CMTimeCompare(videoStart, additionalEnd) <= 0 {
                     let output = videoOutputs[videoIndex]
-                    try videoWriter.appendVideo(output,
+                    try await videoWriter.appendVideoAwaitingReadiness(output,
                         ticket: boundary.issueVideoAppend(for: output,
                             writerBinding: videoBinding))
                     videoIndex += 1
                 } else if audioIndex < audioEpoch.buffers.count,
                           CMTimeCompare(audioEnd, additionalEnd) <= 0 {
-                    try appendAccessUnit(audioEpoch.buffers[audioIndex],
+                    try await appendAccessUnit(audioEpoch.buffers[audioIndex],
                         from: audioEpoch, to: audioWriter)
                     audioIndex += 1
                 } else {
                     let buffer = additionalEpoch.buffers[additionalAudioIndex]
-                    try appendAccessUnit(buffer, from: additionalEpoch,
+                    try await appendAccessUnit(buffer, from: additionalEpoch,
                                          to: additionalAudioWriter)
                     additionalAudioIndex += 1
                 }
@@ -6634,7 +6715,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                         bufferEnd
                       ) < 0 {
                     let output = videoOutputs[videoIndex]
-                    try videoWriter.appendVideo(output,
+                    try await videoWriter.appendVideoAwaitingReadiness(output,
                         ticket: boundary.issueVideoAppend(for: output,
                             writerBinding: videoBinding))
                     videoIndex += 1
@@ -6649,11 +6730,11 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     bandwidth: audio.streamSummary.bandwidth,
                     packetLease: try workspace.acquire(.aacPackets, bytes: bytes),
                     formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
-                try audioWriter.appendAACEncodedEpoch(epoch, coordinator: boundary)
+                try await audioWriter.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
             }
             while videoIndex < videoOutputs.count {
                 let output = videoOutputs[videoIndex]
-                try videoWriter.appendVideo(output,
+                try await videoWriter.appendVideoAwaitingReadiness(output,
                     ticket: boundary.issueVideoAppend(for: output,
                         writerBinding: videoBinding))
                 videoIndex += 1
@@ -6789,6 +6870,15 @@ final class Task21RealAVSeed: @unchecked Sendable {
             additionalAudio: additionalAudio)
     }
 
+    fileprivate static func retimedAudioAccessUnits(
+        _ buffers: [CMSampleBuffer], startingAt requestedStart: CMTime? = nil
+    ) throws -> [CMSampleBuffer] {
+        // Removing the leading trim keeps its packets: the original first second
+        // can become 49 * 1024 / 48000 = 1.045333 seconds. Submit individual AUs so
+        // the next common cut is encountered within the strict 1024/48000 window.
+        try splitAACAccessUnits(retimedUntrimmedAudio(buffers, startingAt: requestedStart))
+    }
+
     private static func retimedUntrimmedAudio(
         _ buffers: [CMSampleBuffer],
         startingAt requestedStart: CMTime? = nil
@@ -6842,7 +6932,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
         }
     }
 
-    /// dual-audio 先固定六个真实秒桶，再把每个压缩 packet 拆回一个 AAC AU。
+    /// 先固定真实秒桶，再把每个压缩 packet 拆回一个 AAC AU。
     /// boundary 因而逐 AU 看到 1024/48k cadence；payload、format 与双 PTS
     /// 均来自系统编码结果，trim 只允许留在完整 epoch 的首尾。
     private static func splitAACAccessUnits(

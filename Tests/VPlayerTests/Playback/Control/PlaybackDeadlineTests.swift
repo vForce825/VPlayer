@@ -268,11 +268,9 @@ final class PlaybackDeadlineTests: XCTestCase {
         ))
         let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
         let close = try XCTUnwrap(registry.outputResourceContextSnapshot()?.closeClaim)
-        XCTAssertTrue(registry.claimStart(suspend.task))
-        XCTAssertTrue(coordinator.completeSuspend(.init(
-            suspendTicket: suspend, closeClaim: close, directlyConfirmedRateZero: true,
-            preparedPreserved: true
-        )))
+        let suspendSuspension = try claimGraphSuspend(registry, suspend)
+        XCTAssertEqual(suspendSuspension.closeClaim, close)
+        XCTAssertTrue(suspendSuspension.complete(in: registry, preparedPreserved: true))
         XCTAssertTrue(registry.finishOutputPause(owner: owner))
         XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .pause)), .acceptedWaiting)
         XCTAssertNil(registry.outputResourceContextSnapshot()?.parentDeadline)
@@ -596,10 +594,8 @@ final class PlaybackDeadlineTests: XCTestCase {
         _ = try XCTUnwrap(fixture.coordinator.begin(
             contextNonce: context.contextNonce, reason: .pause, at: clock.nowNanoseconds))
         let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(old.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(
-            suspendTicket: old, closeClaim: nil, directlyConfirmedRateZero: true,
-            preparedPreserved: true)))
+        let oldSuspension = try claimGraphSuspend(registry, old)
+        XCTAssertTrue(oldSuspension.complete(in: registry, preparedPreserved: true))
 
         clock.advance(nanoseconds: 10)
         _ = try XCTUnwrap(fixture.coordinator.begin(
@@ -634,10 +630,8 @@ final class PlaybackDeadlineTests: XCTestCase {
             contextNonce: context.contextNonce, reason: .pause,
             at: clock.nowNanoseconds, teardown: true))
         let first = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(first.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(
-            suspendTicket: first, closeClaim: nil, directlyConfirmedRateZero: true,
-            preparedPreserved: true)))
+        let firstSuspension = try claimGraphSuspend(registry, first)
+        XCTAssertTrue(firstSuspension.complete(in: registry, preparedPreserved: true))
         XCTAssertTrue(registry.finishOutputPause(owner: pause))
         let cleanup = try XCTUnwrap(registry.outputResourceContextSnapshot()?.budget)
 

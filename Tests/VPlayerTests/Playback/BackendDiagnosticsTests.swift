@@ -137,6 +137,23 @@ final class BackendDiagnosticsTests: XCTestCase {
         XCTAssertEqual(BackendDiagnosticErrorCode.hlsWatchdogBacklog.rawValue, "hls.watchdog.backlog")
     }
 
+    func testReplacementDisarmRetiresOldArmsBeforeNewSessionActivation() async {
+        let watchdog = HLSPlaybackWatchdog(recoveryCoordinator: PlaybackRecoveryCoordinator())
+        let old = PlaybackSessionIdentity(sessionID: 10, requestID: UUID())
+        let current = PlaybackSessionIdentity(sessionID: 11, requestID: UUID())
+        await watchdog.arm(activationEpoch: 100, hasObservedProgress: true, session: old, controlRevision: 7)
+        await watchdog.beginReplacement(generation: 2, retiring: old)
+        await watchdog.arm(activationEpoch: 100, hasObservedProgress: true, session: old, controlRevision: 7)
+        let stillDisarmed = await watchdog.isArmed
+        XCTAssertFalse(stillDisarmed)
+        await watchdog.arm(activationEpoch: 200, hasObservedProgress: true, session: current, controlRevision: 0)
+        await watchdog.beginReplacement(generation: 1, retiring: old)
+        let replacementArmed = await watchdog.isArmed
+        let currentEpoch = await watchdog.currentActivationEpoch
+        XCTAssertTrue(replacementArmed, "An older replacement transition cannot disarm the new activation")
+        XCTAssertEqual(currentEpoch, 200)
+    }
+
     func testScopedWatchdogRejectsOldSessionAndOldSameSessionControlRevision() async {
         let watchdog = HLSPlaybackWatchdog(recoveryCoordinator: PlaybackRecoveryCoordinator())
         let old = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())

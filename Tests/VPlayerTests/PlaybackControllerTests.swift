@@ -17,6 +17,78 @@ private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
 }
 
 final class PlaybackControllerTests: XCTestCase {
+    func testCancelledScopedPauseAndPlayCannotAdoptSameRequestRetryRun() async throws {
+        for paused in [true, false] {
+            let first = FakeControllerPipeline()
+            let replacement = FakeControllerPipeline()
+            let controller = makeRoutedPlaybackController(
+                factory: FakeControllerPipelineFactory([first, replacement]))
+            let request = makeRequest(channelID: "same-request-retry")
+            await controller.play(request)
+            let firstCycle = await controller.readinessCycleForTesting
+            first.emit(.ready(readinessCycle: firstCycle))
+            try await eventually { await controller.currentStateForTesting == .playing(request) }
+            if !paused { await controller.setPaused(true) }
+            let gate = ManualControllerAsyncGate()
+            defer { gate.open() }
+            await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
+                if checkpoint == .pauseIngress { await gate.wait() }
+            }
+            let oldCommand = Task { await controller.setPaused(paused, requestID: request.id) }
+            try await eventually { gate.waiterCount == 1 }
+            // FullScreen's failure/retry path cancels the originating command,
+            // then intentionally reuses this exact request UUID for its new run.
+            oldCommand.cancel()
+            await controller.play(request)
+            let replacementCycle = await controller.readinessCycleForTesting
+            replacement.emit(.ready(readinessCycle: replacementCycle))
+            try await eventually { await controller.currentStateForTesting == .playing(request) }
+            if !paused { await controller.setPaused(true) }
+            let expected: PlaybackState = paused ? .playing(request) : .paused(request)
+            let before = await controller.currentStateForTesting
+            XCTAssertEqual(before, expected)
+            let pauseCount = replacement.snapshot().pauses.count
+            gate.open()
+            await oldCommand.value
+            let after = await controller.currentStateForTesting
+            XCTAssertEqual(after, expected)
+            XCTAssertEqual(replacement.snapshot().pauses.count, pauseCount)
+            await controller.stop()
+        }
+    }
+
+    func testReplacementPreparationRejectsDelayedPreviousWatchdogArm() async throws {
+        let factory = SuspendedControllerPipelineFactory()
+        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+        let controller = makeRoutedPlaybackController(factory: factory, audioSessionOwner: owner)
+        let first = FakeControllerPipeline()
+        let replacement = FakeControllerPipeline()
+        let firstRequest = makeRequest(channelID: "watchdog-old")
+        let replacementRequest = makeRequest(channelID: "watchdog-new")
+        let firstPlay = Task { await controller.play(firstRequest) }
+        try await eventually { factory.isPending(callID: 1) }
+        factory.succeed(callID: 1, with: first)
+        await firstPlay.value
+        let oldSession = try XCTUnwrap(owner.registry.outputResourceContextSnapshot()?.sessionIdentity)
+        let oldEpochValue = await controller.watchdog.currentActivationEpoch
+        let oldEpoch = try XCTUnwrap(oldEpochValue)
+        let nextPlay = Task { await controller.play(replacementRequest) }
+        try await eventually { factory.isPending(callID: 2) }
+        // B has crossed its exact new-play disarm but is still held in prepare.
+        // Deliver A's previously authorized arm after that transition.
+        await controller.watchdog.arm(activationEpoch: oldEpoch, hasObservedProgress: true,
+            session: oldSession, controlRevision: 0)
+        let armedDuringPrepare = await controller.watchdog.isArmed
+        let epochDuringPrepare = await controller.watchdog.currentActivationEpoch
+        XCTAssertFalse(armedDuringPrepare)
+        XCTAssertNil(epochDuringPrepare)
+        factory.succeed(callID: 2, with: replacement)
+        await nextPlay.value
+        let armedForReplacement = await controller.watchdog.isArmed
+        XCTAssertTrue(armedForReplacement)
+        await controller.stop()
+    }
+
     func testScopedStopSuspendedAtWatchdogBoundaryCannotCancelReplacement() async throws {
         let first = FakeControllerPipeline()
         let replacement = FakeControllerPipeline()

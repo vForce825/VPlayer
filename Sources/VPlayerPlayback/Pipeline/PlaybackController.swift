@@ -30,6 +30,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     
     private var controllerState = PlaybackControllerState()
     private var userControlRevision: UInt64 = 0
+    private var playAdmissionGeneration: UInt64 = 0
+    private var latestAdmittedSession: PlaybackSessionIdentity?
     private var terminalMetricsProvider: (any PlaybackTerminalMetricsProviding)?
     private var mediaGeneration: MediaGeneration?
     private var currentMediaInformation: PlaybackMediaInformation?
@@ -302,9 +304,16 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     public func play(_ request: PlaybackRequest) async {
+        let (generation, overflow) = playAdmissionGeneration.addingReportingOverflow(1)
+        guard !overflow else { return }
+        playAdmissionGeneration = generation
         diagnosticStage = "play_entry"
         recoveryCoordinator.cancelCurrentRecovery()
-        await watchdog.disarm()
+        // Revoke old arm authority before replacement preparation starts. This
+        // transition has its own generation because independently queued actor
+        // calls must not rely on FIFO delivery for correctness.
+        await watchdog.beginReplacement(generation: generation, retiring: latestAdmittedSession)
+        guard playAdmissionGeneration == generation else { return }
         // 新播放请求一进入actor就撤销旧UI所有权，不能让前驱资源排空时间延长旧画面寿命。
         if let context = registry.outputResourceContextSnapshot() {
             finishPresentation(for: context.sessionIdentity)
@@ -316,14 +325,16 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         let parentDeadline: CurrentPlaybackOperationDeadlineTicket
         do {
             diagnosticStage = "admitting_request"
-            parentDeadline = try await admitAfterJoiningCleanup(requestID: request.id)
+            parentDeadline = try await admitAfterJoiningCleanup(requestID: request.id, generation: generation)
             guard case .coldStart(let budget) = parentDeadline else { diagnosticStage = "parentDeadline_not_coldStart"; return }
             sessionIdentity = budget.identity.sessionIdentity
         } catch {
+            guard playAdmissionGeneration == generation else { return }
             diagnosticStage = "admit_failed"
             publish(.failed(Self.failure(for: .capture(error, stage: "startup.admission"))))
             return
         }
+        guard playAdmissionGeneration == generation else { return }
         invalidateSession()
         let runIdentity = PlaybackRunIdentity(sessionID: sessionIdentity.sessionID, requestID: request.id)
         
@@ -495,10 +506,16 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
 
-    private func admitAfterJoiningCleanup(requestID: UUID) async throws -> CurrentPlaybackOperationDeadlineTicket {
+    private func admitAfterJoiningCleanup(requestID: UUID, generation: UInt64) async throws -> CurrentPlaybackOperationDeadlineTicket {
         while true {
-            do { return try registry.admitPlaybackRequest(requestID: requestID) }
-            catch ControlTaskRegistry.Failure.cleanupTailPending {
+            guard playAdmissionGeneration == generation else { throw CancellationError() }
+            do {
+                let admission = try registry.admitPlaybackRequest(requestID: requestID)
+                if case .coldStart(let budget) = admission {
+                    latestAdmittedSession = budget.identity.sessionIdentity
+                }
+                return admission
+            } catch ControlTaskRegistry.Failure.cleanupTailPending {
                 await registry.joinAutomaticCleanupTailBeforeAdmission()
             }
         }
@@ -719,7 +736,12 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         #if DEBUG
         if expectedRequestID != nil { await requestScopedControlCheckpoint?(.pauseIngress) }
         #endif
-        guard let request = controllerState.request,
+        // FullScreen cancels the originating pause task before every retry.
+        // Actor hops preserve that task's cancellation capability, even though
+        // retry deliberately reuses the same PlaybackRequest UUID. Check it
+        // before adopting the current admittedRun, not only after a suspension.
+        guard !Task.isCancelled,
+              let request = controllerState.request,
               expectedRequestID.map({ $0 == request.id }) ?? true,
               let controlRun = admittedRun, controlRun.requestID == request.id else { return }
         switch registry.playbackStateSnapshot() {
@@ -845,6 +867,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     public func stop(requestID: UUID) async { await stop(expectedRequestID: requestID) }
 
     private func stop(expectedRequestID: UUID?) async {
+        guard expectedRequestID == nil || !Task.isCancelled else { return }
         let requestID = controllerState.request?.id
         guard expectedRequestID == nil || expectedRequestID == requestID else { return }
         let stoppingRun = admittedRun
@@ -862,7 +885,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         #endif
         // The watchdog call is a real actor suspension. Do not read a replacement
         // request and accidentally adopt it as the target of this earlier Stop.
-        guard controllerState.request?.id == requestID, admittedRun == stoppingRun,
+        guard expectedRequestID == nil || !Task.isCancelled,
+              controllerState.request?.id == requestID, admittedRun == stoppingRun,
               stoppingRun != nil || registry.cleanupReservationSnapshot()?.ticket == reservation else { return }
         terminalMetricsProvider = nil
         if let stoppingRun {
@@ -1550,7 +1574,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     private func ownsUserControl(_ run: PlaybackRunIdentity, revision: UInt64) -> Bool {
-        userControlRevision == revision && isCurrent(run)
+        !Task.isCancelled && userControlRevision == revision && isCurrent(run)
     }
 
     private func advanceReadinessCycle() {
