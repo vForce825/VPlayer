@@ -51,12 +51,17 @@ jobs:
         run: ./ci_scripts/ci_post_clone.sh
 
       - name: Verify committed generated project and licenses
+        id: source_check
         run: |
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
 
+      - name: Inspect bounded native VideoToolbox capability scalars
+        run: ./Scripts/probe-tvos-vt-capabilities.sh
+
       - name: Compile tvOS 27 app and tests
         id: build
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         run: |
           options=()
           help="$(xcodebuild -help 2>&1)"
@@ -72,6 +77,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO
 
       - name: Verify bounded XCTest timeout and diagnostics options
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           help="$(xcodebuild -help 2>&1)"
           for option in -collect-test-diagnostics -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
@@ -80,6 +86,7 @@ jobs:
 
       - name: Prepare bounded test runner
         id: prepare_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cat > "$RUNNER_TEMP/vplayer-bounded-tests.py" <<'PY'
           import os, re, selectors, signal, subprocess, sys, time
@@ -204,14 +211,6 @@ jobs:
             -only-testing:VPlayerTests/PlaybackPipelineTests/testOneHundredRandomizedOldCallbacksNeverReachPresentation \
             -only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity
 
-      - name: AAC and native writer regressions
-        id: writer_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
-        run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/SegmentedFMP4WriterTests \
-            -only-testing:VPlayerTests/AACPrimingCalibratorTests
-
       - name: Representative HLS lifecycle and cancellation regressions
         id: hls_tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
@@ -223,3 +222,12 @@ jobs:
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts
+
+      - name: AAC and native writer regressions
+        id: writer_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
+        run: |
+          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests \
+            -only-testing:VPlayerTests/AACPrimingCalibratorTests
+

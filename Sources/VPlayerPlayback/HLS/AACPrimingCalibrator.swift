@@ -387,7 +387,7 @@ private final class AACProofSegmentDelegate: NSObject, AVAssetWriterDelegate, @u
             storage.accumulator.releaseAll()
         }
     }
-    /// Called after native terminal/detachment and temporary-file cleanup. The
+    /// Called after native terminal and temporary-file cleanup. The
     /// callback lock joins any entered callback; late callbacks see no storage.
     /// Retiring physical storage, not only its lease, tolerates delayed shell ARC.
     func retire() {
@@ -425,7 +425,9 @@ private final class AACLoopbackWriterRetirement: AACOwnedWriterRetiring, @unchec
         if let writer = storage.writer {
             // Apple specifies synchronous cancellation joins the writing session.
             if writer.status == .unknown || writer.status == .writing { writer.cancelWriting() }
-            writer.delegate = nil
+            // The delegate setter rejects terminal writers. Keep the weak
+            // reference unchanged: retire() joins callbacks under their lock,
+            // and late callbacks cannot access the retired physical storage.
         }
         try? FileManager.default.removeItem(at: storage.url)
         storage.delegate.retire()

@@ -292,6 +292,7 @@ private final class Task9PreparedBackend: PlaybackBackend,
     private let prepareGate: Task9OperationGate?
     private let retirementGate: Task9OperationGate?
     private let activationGate: Task9OperationGate?
+    private let activationCompletionGate: Task9OperationGate?
     private let suspensionGate: Task9OperationGate?
     private let prepareFailure: PlaybackCoreError?
     private let sink: @Sendable (PlaybackPipelineEvent) -> Void
@@ -306,7 +307,8 @@ private final class Task9PreparedBackend: PlaybackBackend,
 
     init(identity: PlaybackBackendIdentity, prepareGate: Task9OperationGate?, retirementGate: Task9OperationGate?,
          sink: @escaping @Sendable (PlaybackPipelineEvent) -> Void, outputConcurrency: Task9OutputConcurrency,
-         activationGate: Task9OperationGate? = nil, suspensionGate: Task9OperationGate? = nil,
+         activationGate: Task9OperationGate? = nil, activationCompletionGate: Task9OperationGate? = nil,
+         suspensionGate: Task9OperationGate? = nil,
          prepareFailure: PlaybackCoreError? = nil) {
         self.identity = identity
         self.prepareGate = prepareGate
@@ -314,6 +316,7 @@ private final class Task9PreparedBackend: PlaybackBackend,
         self.sink = sink
         self.outputConcurrency = outputConcurrency
         self.activationGate = activationGate
+        self.activationCompletionGate = activationCompletionGate
         self.suspensionGate = suspensionGate
         self.prepareFailure = prepareFailure
     }
@@ -333,7 +336,7 @@ private final class Task9PreparedBackend: PlaybackBackend,
     }
     func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
         await activationGate?.enter()
-        _ = invocation.performPositiveRateSideEffect {
+        let accepted = invocation.performPositiveRateSideEffect {
             outputConcurrency.activate(identity)
             lock.withLock {
                 activations += 1
@@ -341,6 +344,7 @@ private final class Task9PreparedBackend: PlaybackBackend,
                 physicalRate = 1
             }
         }
+        if accepted { await activationCompletionGate?.enter() }
     }
     func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async -> BackendSuspendResult {
         await suspensionGate?.enter()
@@ -372,6 +376,7 @@ private final class Task9PreparedBackend: PlaybackBackend,
 private final class Task9PreparedFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let factoryGate: Task9OperationGate?
     private let activationGate: Task9OperationGate?
+    private let activationCompletionGate: Task9OperationGate?
     private let suspensionGate: Task9OperationGate?
     private let firstPrepareFailure: PlaybackCoreError?
     private let prepareGate: Task9OperationGate?
@@ -382,11 +387,13 @@ private final class Task9PreparedFactory: PlaybackBackendFactory, @unchecked Sen
 
     init(prepareGate: Task9OperationGate? = nil, retirementGate: Task9OperationGate? = nil,
          factoryGate: Task9OperationGate? = nil, activationGate: Task9OperationGate? = nil,
+         activationCompletionGate: Task9OperationGate? = nil,
          suspensionGate: Task9OperationGate? = nil, firstPrepareFailure: PlaybackCoreError? = nil) {
         self.prepareGate = prepareGate
         self.retirementGate = retirementGate
         self.factoryGate = factoryGate
         self.activationGate = activationGate
+        self.activationCompletionGate = activationCompletionGate
         self.suspensionGate = suspensionGate
         self.firstPrepareFailure = firstPrepareFailure
     }
@@ -398,7 +405,8 @@ private final class Task9PreparedFactory: PlaybackBackendFactory, @unchecked Sen
         await factoryGate?.enter()
         let backend = Task9PreparedBackend(identity: identity, prepareGate: prepareGate,
             retirementGate: retirementGate, sink: eventSink, outputConcurrency: outputConcurrency,
-            activationGate: activationGate, suspensionGate: suspensionGate,
+            activationGate: activationGate, activationCompletionGate: activationCompletionGate,
+            suspensionGate: suspensionGate,
             prepareFailure: lock.withLock { created.isEmpty ? firstPrepareFailure : nil })
         lock.withLock { created.append(backend) }
         return backend
@@ -3545,12 +3553,14 @@ final class Task9RuntimeOwnershipTests: XCTestCase {
 
     func testPauseCancelsAndJoinsInflightActivationBeforeOneSuspension() async throws {
         let gate = Task9OperationGate()
-        let fixture = try Task9RuntimeFixture(factory: .init(activationGate: gate))
+        let fixture = try Task9RuntimeFixture(factory: .init(activationCompletionGate: gate))
         let request = fixture.request()
         let play = Task { await fixture.controller.play(request) }
         await gate.waitUntilEntered()
         let activation = try XCTUnwrap(task9OwnedRecords(fixture.registry).first { $0.slot == .activation })
         let backend = try XCTUnwrap(fixture.factory.backends.first)
+        XCTAssertEqual(backend.activationCount, 1, "The held async return must follow an actual positive-rate side effect")
+        XCTAssertEqual(fixture.factory.outputConcurrency.current, 1)
         let finished = PlaybackStreamRecorder<Bool>()
         let pause = Task { await fixture.controller.setPaused(true); finished.append(true) }
         for _ in 0..<500 {
@@ -3568,6 +3578,38 @@ final class Task9RuntimeOwnershipTests: XCTestCase {
         XCTAssertEqual(backend.suspensionEpochs.count, 1)
         XCTAssertEqual(fixture.factory.outputConcurrency.current, 0)
         XCTAssertEqual(fixture.factory.outputConcurrency.maximum, 1)
+        let state = await fixture.controller.currentStateForTesting
+        XCTAssertEqual(state, .paused(request))
+        await fixture.controller.stop()
+    }
+
+    func testPauseBeforePositiveRateClaimPreventsActivationAndJoinsBeforeSuspension() async throws {
+        let gate = Task9OperationGate()
+        let fixture = try Task9RuntimeFixture(factory: .init(activationGate: gate))
+        let request = fixture.request()
+        let play = Task { await fixture.controller.play(request) }
+        await gate.waitUntilEntered()
+        let activation = try XCTUnwrap(task9OwnedRecords(fixture.registry).first { $0.slot == .activation })
+        let backend = try XCTUnwrap(fixture.factory.backends.first)
+        XCTAssertEqual(backend.activationCount, 0, "This gate is before the physical positive-rate capability is consumed")
+        let finished = PlaybackStreamRecorder<Bool>()
+        let pause = Task { await fixture.controller.setPaused(true); finished.append(true) }
+        for _ in 0..<500 {
+            if fixture.registry.outputResourceContextSnapshot()?.owner?.reason == .pause { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(fixture.registry.phase(of: activation.controlTaskTicket), .cancelRequested,
+            "pause先撤销原activation，但不得在真实调用返回前伪造terminal")
+        XCTAssertTrue(backend.suspensionEpochs.isEmpty, "原activation返回前不能先suspend再被迟到activate反转")
+        XCTAssertTrue(finished.snapshot.isEmpty)
+        await gate.release()
+        await play.value
+        await pause.value
+        XCTAssertEqual(backend.activationCount, 0,
+            "The canceled invocation must not execute its later positive-rate side effect")
+        XCTAssertEqual(backend.suspensionEpochs.count, 1)
+        XCTAssertEqual(fixture.factory.outputConcurrency.current, 0)
+        XCTAssertEqual(fixture.factory.outputConcurrency.maximum, 0)
         let state = await fixture.controller.currentStateForTesting
         XCTAssertEqual(state, .paused(request))
         await fixture.controller.stop()

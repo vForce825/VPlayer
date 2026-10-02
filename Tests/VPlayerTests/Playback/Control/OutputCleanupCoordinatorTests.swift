@@ -2245,11 +2245,21 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
 
     // 首reset消费必须已经拥有有效票；不能等旧acquire或backend drain后重锚。
     func testFirstSessionResetMaterializesDeadlineBeforeDrainAndTransfersSameTicketToNewRoot() throws {
-        let fixture = try AcquiringOutputFixture()
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let fixture = try AcquiringOutputFixture(audioLane: AudioSessionBlockingCallLane(sdk: sdk))
         let registry = fixture.registry
-        try registry.executor.sync {
+        let configuration = try XCTUnwrap(registry.beginOutputAcquisitionConfiguration(
+            contextNonce: fixture.contextNonce, parent: fixture.parent))
+        XCTAssertEqual(registry.phase(of: configuration), .queued)
+        XCTAssertEqual(registry.registeredAudioSessionPhase()?.configurationProgress, .awaitingLongForm)
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "queued phase must not start an SDK call")
+        let materializedIdentity = try registry.executor.sync {
             fixture.clock.set(200)
             registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
+            _ = registry.executor.withSafetyIngressBarrier(operationDescriptor: .resourceOwnership) { _ in
+                XCTFail("pending reset must materialize its deadline before executing the target")
+            }
+            let identity = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot()?.ticketIdentity)
             try authorizeGraphResetRecoveryClock(registry)
             fixture.clock.set(220)
             registry.executor.safetyIngress.performSyncIngress(.interruptionBegan)
@@ -2257,10 +2267,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             registry.executor.safetyIngress.performSyncIngress(.interruptionEnded(shouldResume: false))
             fixture.clock.set(300)
             _ = registry.executor.withSafetyIngressBarrier(operationDescriptor: .resourceOwnership) { _ in
-                XCTFail("首票物化不能同时执行目标")
+                XCTFail("pending interruption ingress must be folded before executing the target")
             }
+            return identity
         }
         let first = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot(), "drain前必须有完整有效state")
+        XCTAssertEqual(first.ticketIdentity, materializedIdentity)
         let binding = try XCTUnwrap(registry.outputResourceContextSnapshot()?.resetPreRouteBinding)
         XCTAssertEqual(first.accumulatedEffectiveTime, 50)
         XCTAssertEqual(first.runningSince, 300, "ended(false)不再是物理冻结")
@@ -2286,6 +2298,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             "新用户操作只能重新arm原边界，不能复用旧freeze generation")
         XCTAssertNotEqual(registry.outputResourceContextSnapshot()?.resetPreRouteBinding, binding)
         XCTAssertNil(try registry.freezeOutputResetPreRouteClock(binding), "旧binding永久无权")
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "logical clock authorization must not invoke the SDK")
     }
 
     func testAcquisitionRejectsMissingOrUnpayableResetSuffixBeforeReservation() throws {
@@ -2302,8 +2315,14 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testLiveResetClockConsumesInterruptionOnlyWindowAndTimesOutDuringDrain() throws {
-        let fixture = try AcquiringOutputFixture()
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let fixture = try AcquiringOutputFixture(audioLane: AudioSessionBlockingCallLane(sdk: sdk))
         let registry = fixture.registry
+        let configuration = try XCTUnwrap(registry.beginOutputAcquisitionConfiguration(
+            contextNonce: fixture.contextNonce, parent: fixture.parent))
+        XCTAssertEqual(registry.phase(of: configuration), .queued)
+        XCTAssertEqual(registry.registeredAudioSessionPhase()?.configurationProgress, .awaitingLongForm)
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "queued phase must not start an SDK call")
         registry.executor.sync {
             fixture.clock.set(200)
             registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
@@ -2341,6 +2360,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let terminalOwner = try XCTUnwrap(registry.outputResourceContextSnapshot()?.owner)
         XCTAssertEqual(terminalOwner.reason, .terminal)
         XCTAssertNotNil(registry.outputCleanupOwnerTask(terminalOwner), "到界必须安装或join准确父owner record")
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "logical timeout must not fabricate a physical invocation")
     }
 
     func testFirstResetCheckedPreparationFailurePublishesNoPartialBindingAndKeepsOwnedLease() throws {

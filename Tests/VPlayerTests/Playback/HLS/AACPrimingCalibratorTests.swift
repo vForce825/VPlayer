@@ -292,6 +292,43 @@ final class AACPrimingCalibratorTests: XCTestCase {
             else { baseline = measured; XCTAssertGreaterThan(measured, 0) }
         }
     }
+
+    func testCompletedLoopbackRetiresWriterStorageBeforeReturning() async throws {
+        let calibrator = AACPrimingCalibrator()
+        let request = try AACPrimingCalibratorTestHarness.request([.c])
+        let plan = try AACCalibrationPlan.build([request])
+        let encoder = try AACRenditionEncoder(
+            identity: .init(plan: plan, ordinal: 0, request: request, nonce: ConverterInstanceNonce()),
+            lane: calibrator.lane, workspace: calibrator.workspace,
+            observer: AACDefaultCalibrationObserver(), presentationTerminal: calibrator.presentationTerminal)
+        defer { encoder.dispose() }
+        let pass = try encoder.encodePass(
+            AACPrimingCalibratorTestHarness.signal(frames: 4_096, channels: 1),
+            cookieStage: .finalizedPass(1))
+        let epoch = try encoder.makeEpoch(pass: pass, realFrames: pass.totalFrames, leading: 0)
+        let loopbackWorkspace = AACCalibrationWorkspace()
+        let loopbackLane = AACOwnedCallLane()
+        let observer = AACReviewFixture()
+
+        // Exercise completed native-writer retirement directly, without a prior
+        // calibration masking its lifecycle failure in fixture construction.
+        let decoded = try await AACSystemLoopback.decode(epoch: epoch, lane: loopbackLane,
+            workspace: loopbackWorkspace, observer: observer)
+        XCTAssertTrue(decoded.didDrainNaturally)
+        XCTAssertEqual(decoded.rawFrameCount, pass.totalFrames)
+        XCTAssertEqual(decoded.packetIdentity, try AACPrimingCalibratorTestHarness.packetIdentity(epoch.buffers))
+        XCTAssertEqual(observer.initializationEvents, 1)
+        XCTAssertGreaterThan(observer.mediaEvents, 0)
+        let outputBytes = decoded.lease.bytes + decoded.metadataLease.bytes
+            + decoded.rawReaderCookie.lease.bytes + decoded.writerCookieEvidence.backing.lease.bytes
+            + decoded.writerCookieEvidence.metadataLease.bytes
+        XCTAssertEqual(loopbackWorkspace.currentBytes, outputBytes,
+                       "only returned evidence remains; writer/delegate/file storage is physically retired")
+        XCTAssertNoThrow(try loopbackLane.call {})
+        XCTAssertLessThanOrEqual(loopbackWorkspace.peakBytes, 4_194_304)
+        withExtendedLifetime(decoded) {}
+    }
+
     func testIncrementalPumpAlternatesTwoRenditionsWithoutCallbackReentryOrReset() async throws {
         let observer = AACReviewFixture()
         let calibrator = AACPrimingCalibrator(observer: observer)
