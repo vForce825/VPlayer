@@ -8662,9 +8662,7 @@ private final class Task21AdvertisedAudioFixture {
 
     static func make() async throws -> Task21AdvertisedAudioFixture {
         let box = FinalLockedValue<Task19Harness>()
-        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
-            itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in }
-        ) { token in
+        let prepare: @Sendable (LoopbackSessionToken) async throws -> LoopbackPreparedPublication = { token in
             let clock = try HLSNaturalEndPublicationClock.make()
             let publication = try await Task19Harness(loopbackSession: token, audioCount: 2,
                 terminalLogicalSequence: 5, publicationClock: clock)
@@ -8677,6 +8675,9 @@ private final class Task21AdvertisedAudioFixture {
             return LoopbackPreparedPublication(store: publication.store,
                 declaration: declaration, snapshot: snapshot)
         }
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
+            itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in },
+            prepare: prepare)
         var reservedSource: LoopbackAVPlayerPreparationEvidenceSource?
         do {
             let publication = try XCTUnwrap(box.value)
