@@ -1270,10 +1270,18 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorNeverAppliesManualLatencyShift() async throws {
-        let harness = try await Task21Harness(liveEdge: 7.25, boundaries: [4.24])
+        let harness = try await Task21Harness()
+        addTeardownBlock { try await harness.shutdown() }
         let prepared = try await harness.prepare()
-        XCTAssertEqual(prepared.identity.mediaTime, Task21Fixtures.time(4.24))
-        XCTAssertEqual(harness.driver.requestedSeekTime, Task21Fixtures.time(4.24))
+        let authority = prepared.identity.timelineMappingAuthority
+        let expectedMediaTime = try XCTUnwrap(
+            try authority.mapping.latestBoundary(withLead: Task21Fixtures.time(3)))
+        let expectedPlayerTime = try authority.playerItemTime(for: expectedMediaTime)
+        XCTAssertNotEqual(expectedMediaTime, expectedPlayerTime,
+            "The real fixture must exercise its nonzero media-to-player timeline offset")
+        XCTAssertEqual(prepared.identity.mediaTime, expectedMediaTime)
+        XCTAssertEqual(harness.driver.requestedSeekTime, expectedPlayerTime,
+            "Seek must use the authenticated timeline mapping without an extra latency shift")
         XCTAssertEqual(harness.driver.manualLatencyShiftCallCount, 0)
     }
 
@@ -1359,9 +1367,12 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     func testAuthorizedLivePlaybackUnexpectedPauseStartsSingleReplacement() async throws {
         // 这里只验证授权后的状态机；音频直出夹具可避免将 AV 边界
         // 合成的独立稳定性带进本用例。
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
         let live = try await Task21Harness(
             directAudioOnlyRendition: .init(rawValue: 2)
         )
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
         _ = try await live.prepare()
         _ = try await live.activate()
         live.driver.emitTimeControlStatus(.playing)
@@ -1375,6 +1386,16 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             live.graph.registry.outputResourceContextSnapshot()?.suspend,
             "仍持有正速授权的 AVPlayer 意外暂停必须进入 Registry 单飞 replacement"
         )
+        let retirementStarted = await live.backend.waitForRetirementCall(timeout: .seconds(2))
+        if !retirementStarted {
+            print("TASK21_OWNER_RETIREMENT_FAILURE phase=await_retirement "
+                + "baseline=\(resourceBaseline) "
+                + "actual=\(PlaybackResourceContextLedger.shared.chargedBytes) "
+                + "retirementCalls=\(live.backend.retireCallCount)")
+        }
+        XCTAssertTrue(retirementStarted,
+            "The test must exercise the real escaped runner held at its retirement gate")
+        XCTAssertEqual(live.backend.retireCallCount, 1)
     }
 
     func testReadinessRejectsCrossServerEvidenceAndRequiresFrozenAVParticipantsAndCompletedBodies() async throws {
@@ -4438,6 +4459,70 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
     }
 
     deinit { shutdown() }
+}
+
+/// Owns one ordinary test fixture through async teardown. Alias-retention tests
+/// continue using their explicit raw fixture lifetimes.
+@MainActor
+private final class Task21OwnedTestHarness {
+    private var harness: Task21Harness?
+    private weak var registry: ControlTaskRegistry?
+    private weak var backend: Task21RegistryBackend?
+    private weak var coordinator: AVPlayerItemCoordinator?
+    private let resourceBaseline: Int
+    private let constructedResourceBytes: Int
+
+    init(_ harness: Task21Harness, resourceBaseline: Int) {
+        self.harness = harness
+        registry = harness.graph.registry
+        backend = harness.backend
+        coordinator = harness.coordinator
+        self.resourceBaseline = resourceBaseline
+        constructedResourceBytes = PlaybackResourceContextLedger.shared.chargedBytes
+    }
+
+    func tearDown(file: StaticString = #filePath, line: UInt = #line) async throws {
+        do { try await releaseOwnedHarness() }
+        catch {
+            reportFailure(phase: "owned_shutdown")
+            throw error
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (registry != nil || backend != nil || coordinator != nil
+               || PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline),
+              ContinuousClock.now < deadline {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+        let resourceBytes = PlaybackResourceContextLedger.shared.chargedBytes
+        if registry != nil || backend != nil || coordinator != nil
+            || resourceBytes != resourceBaseline {
+            reportFailure(phase: "after_owned_join")
+        }
+        XCTAssertNil(registry, "The original registered runner must release its registry",
+                     file: file, line: line)
+        XCTAssertNil(backend, file: file, line: line)
+        XCTAssertNil(coordinator, file: file, line: line)
+        XCTAssertEqual(resourceBytes, resourceBaseline,
+            "Exact fixture resource charges must return after the owned retirement joins",
+            file: file, line: line)
+    }
+
+    private func releaseOwnedHarness() async throws {
+        // Existing shutdown upgrades the exact owner, releases its retirement
+        // gate, and joins the original task. Only success permits dropping it.
+        try await harness?.shutdown()
+        harness = nil
+    }
+
+    private func reportFailure(phase: String) {
+        print("TASK21_OWNER_RETIREMENT_FAILURE phase=\(phase) "
+            + "baseline=\(resourceBaseline) constructed=\(constructedResourceBytes) "
+            + "actual=\(PlaybackResourceContextLedger.shared.chargedBytes) "
+            + "registryAlive=\(registry != nil) backendAlive=\(backend != nil) "
+            + "coordinatorAlive=\(coordinator != nil)")
+    }
 }
 
 @MainActor

@@ -722,7 +722,13 @@ final class AudioServiceLeaseTests: XCTestCase {
         var escapedProofs: [AdmittedAudioServiceInputUnitProof] = []
         escapedProofs.reserveCapacity(AudioServiceRegistryCapacity.authoritativeAdmittedProofs)
 
+        let diagnosticStart = ContinuousClock.now
         for index in 0..<AudioServiceRegistryCapacity.authoritativeAdmittedProofs {
+            if index.isMultiple(of: 512) {
+                print("PROOF_ESCROW_PROGRESS phase=admit index=\(index) "
+                    + "elapsed=\(diagnosticStart.duration(to: .now)) "
+                    + "retained=\(escapedProofs.count)")
+            }
             let proof = index == 0 ? harness.admitted
                 : try harness.admitNextUnit(rawValue: UInt64(400_000 + index))
             XCTAssertTrue(try harness.coordinator.registerEligibleCompressedPlan(
@@ -751,9 +757,11 @@ final class AudioServiceLeaseTests: XCTestCase {
             XCTAssertEqual($0 as? AudioServiceSemanticFailure, .registryCapacityExceeded)
         }
 
+        print("PROOF_ESCROW_PROGRESS phase=release_last elapsed=\(diagnosticStart.duration(to: .now))")
         escapedProofs.removeLast()
         let reused = try harness.admitNextUnit(rawValue: 900_001)
         XCTAssertTrue(harness.coordinator.retireAdmittedProof(reused))
+        print("PROOF_ESCROW_PROGRESS phase=complete elapsed=\(diagnosticStart.duration(to: .now))")
     }
 
     func testAuthoritativeProofIndexDerivationAndApplicationByteBoundaryHaveNoPartialInstall()

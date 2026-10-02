@@ -132,16 +132,22 @@ final class HLSResourceStoreTests: XCTestCase {
     }
 
     func testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic() throws {
-        for bytes in [560 * 1024 * 1024 - 1, 560 * 1024 * 1024, 560 * 1024 * 1024 + 1,
-                      688 * 1024 * 1024 - 1, 688 * 1024 * 1024, 688 * 1024 * 1024 + 1] {
+        // The application budget includes the media reservation's fixed32KiB
+        // evidence precharge, not just its payload. Keep the exact total-byte edges.
+        let mediaEvidenceBytes = 32 * 1_024
+        XCTAssertFalse(HLSDeliveryApplicationChargeLedger.shared.shouldBackpressure,
+            "Global application backpressure must be inactive for this store-local threshold check")
+        for totalBytes in [560 * 1024 * 1024 - 1, 560 * 1024 * 1024, 560 * 1024 * 1024 + 1,
+                           688 * 1024 * 1024 - 1, 688 * 1024 * 1024, 688 * 1024 * 1024 + 1] {
+            let bytes = totalBytes - mediaEvidenceBytes
             let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
-            if bytes > 688 * 1024 * 1024 {
+            if totalBytes > 688 * 1024 * 1024 {
                 XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: bytes))
                 XCTAssertEqual(store.usage.reservedBytes, 0)
             } else {
                 let reservation = try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: bytes)
                 XCTAssertEqual(store.usage.reservedBytes, bytes)
-                XCTAssertEqual(store.usage.shouldBackpressure, bytes >= 560 * 1024 * 1024)
+                XCTAssertEqual(store.usage.shouldBackpressure, totalBytes >= 560 * 1024 * 1024)
                 store.cancel(reservation)
             }
             XCTAssertEqual(store.usage.resourceCount, 0)
@@ -159,6 +165,10 @@ final class HLSResourceStoreTests: XCTestCase {
             XCTAssertEqual(store.usage.reservedBytes, 0)
         }
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
+        XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media,
+            bodyBytes: 688 * 1_024 * 1_024),
+            "Payload alone at the hard limit must still charge its evidence and reject atomically")
+        XCTAssertEqual(store.usage.reservedBytes, 0)
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: .max))
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: -1))
     }

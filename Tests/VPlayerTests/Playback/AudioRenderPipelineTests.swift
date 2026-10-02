@@ -1506,7 +1506,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count, 1)
         XCTAssertEqual(
             Array(renderer.snapshot.operations.dropFirst(operationsBeforeActivation)),
-            ["stopRequest", "flush", "enqueue"]
+            ["stopRequest", "flush", "observe", "enqueue"]
         )
         XCTAssertEqual(renderer.snapshot.enqueuedPTS, [
             CMTime(value: 1, timescale: 1),
@@ -4583,6 +4583,10 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             in: harness,
             reason: "force-pcm"
         )
+        let retryBeforeTimelineReset = transition.retryRenderer.snapshot
+        XCTAssertEqual(retryBeforeTimelineReset.requestCount, 1)
+        XCTAssertEqual(retryBeforeTimelineReset.observationStartCount, 2,
+            "The retry receiver was observed at installation and after its replay queue reset")
 
         performWithoutThrow(on: harness.executor) {
             harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
@@ -4596,7 +4600,9 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             1,
             "compressed renderer was not removed"
         )
-        XCTAssertEqual(transition.retryRenderer.snapshot.observationStartCount, 1)
+        XCTAssertEqual(transition.retryRenderer.snapshot.observationStartCount,
+                       retryBeforeTimelineReset.observationStartCount,
+                       "A pending removal cannot install another receiver observation")
         XCTAssertEqual(harness.renderers.snapshot.count, 2)
         try perform(on: harness.executor) {
             try harness.pipeline.enqueue(try self.makeSample(

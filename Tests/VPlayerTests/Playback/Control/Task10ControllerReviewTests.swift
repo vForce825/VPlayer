@@ -148,7 +148,14 @@ final class Task10ControllerReviewTests: XCTestCase {
         XCTAssertEqual(fixture.factory.createdBackends.count, 1, "旧输出未静止前不得创建后继")
 
         first.confirmStop()
-        try await requireEventually("旧输出确认后未创建 reset 后继") {
+        try await requireEventually("reset must settle into explicit-user-action wait") {
+            await fixture.controller.currentStateForTesting == .paused(fixture.request)
+        }
+        XCTAssertEqual(fixture.factory.createdBackends.count, 1)
+        XCTAssertNil(probe.snapshot.replacements.last?.desired)
+        XCTAssertTrue(fixture.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        await fixture.controller.setPaused(false)
+        try await requireEventually("旧输出确认及显式resume后未创建 reset 后继") {
             fixture.factory.createdBackends.count == 2
         }
         try await requireEventually("reset 后继未在原 stream 发布") {
@@ -279,6 +286,12 @@ final class Task10ControllerReviewTests: XCTestCase {
 
             switch scenario {
             case .reset:
+                try await requireEventually("reset preemption must await explicit user action") {
+                    await fixture.controller.currentStateForTesting == .paused(fixture.request)
+                }
+                XCTAssertEqual(fixture.factory.createdBackends.count, 1)
+                XCTAssertTrue(fixture.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+                await fixture.controller.setPaused(false)
                 try await requireEventually("reset recovery owner未继续创建后继backend") {
                     fixture.factory.createdBackends.count >= 2
                 }

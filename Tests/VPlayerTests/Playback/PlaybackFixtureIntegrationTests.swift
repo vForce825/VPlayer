@@ -70,7 +70,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             result,
             width: 1_280,
             height: 720,
-            videoDelay: 1,
+            videoDelay: 2,
             audioCodec: .aac
         )
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
@@ -161,7 +161,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             result,
             width: 1_920,
             height: 1_080,
-            videoDelay: 1,
+            videoDelay: 2,
             audioCodec: .mp2
         )
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
@@ -220,7 +220,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             result,
             width: 1_280,
             height: 720,
-            videoDelay: 0,
+            videoDelay: 2,
             audioCodec: .aac
         )
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
@@ -467,6 +467,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         XCTAssertEqual(video.codec, .h264)
         XCTAssertEqual(video.width, width)
         XCTAssertEqual(video.height, height)
+        // The audited fixture generator fixes bframes=2 for both TS files;
+        // the HLS child is byte-identical to the progressive transport stream.
         XCTAssertEqual(video.videoDelay, videoDelay)
         XCTAssertEqual(audio.codec, audioCodec)
         XCTAssertGreaterThanOrEqual(result.videoAccessUnits.count, 25)

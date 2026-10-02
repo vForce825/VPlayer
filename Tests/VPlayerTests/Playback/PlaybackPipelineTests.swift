@@ -545,6 +545,20 @@ final class PlaybackPipelineTests: XCTestCase {
                 }.count == 1
         }
 
+        if harness.clock.snapshot().anchors.count != 1 {
+            let state = await harness.pipeline.debugSnapshot()
+            let receiver = replacement.snapshot
+            let coverage = audio.pipeline.acceptedCoverage
+            print("RETRY_PREROLL_FAILURE terminal=\(state.isTerminal) paused=\(state.isPaused) "
+                + "videoRequired=\(state.requiredVideoFrameCount) videoAdmission=\(state.videoAdmissionOpen) "
+                + "pendingDecode=\(state.pendingVideoDecodeCount) outstandingDecode=\(state.outstandingVideoDecodeCount) "
+                + "audioReady=\(audio.pipeline.isReadyForPlayback) "
+                + "audioRouteReady=\(audio.pipeline.isOutputRouteReadyForSharedAnchor) "
+                + "acceptedCount=\(receiver.enqueuedPTS.count) pendingCount=\(receiver.pendingPTS.count) "
+                + "requestCount=\(receiver.requestCount) observationCount=\(receiver.observationStartCount) "
+                + "coveragePresent=\(coverage != nil) anchors=\(harness.clock.snapshot().anchors.count)")
+        }
+
         XCTAssertEqual(
             harness.events.snapshot().filter {
                 if case .ready = $0 { return true }

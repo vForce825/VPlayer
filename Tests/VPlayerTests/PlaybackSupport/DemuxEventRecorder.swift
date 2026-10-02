@@ -8,10 +8,12 @@ import Foundation
 final class DemuxEventRecorder: @unchecked Sendable {
     private let condition = NSCondition()
     private var storedEvents: [DemuxEvent] = []
+    private var terminalSeen = false
 
     func record(_ event: DemuxEvent) {
         condition.lock()
         storedEvents.append(event)
+        terminalSeen = terminalSeen || event.isTerminal
         condition.broadcast()
         condition.unlock()
     }
@@ -20,7 +22,9 @@ final class DemuxEventRecorder: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(timeout)
-        while !storedEvents.contains(where: \.isTerminal), condition.wait(until: deadline) {}
+        // The full fixture has tens of thousands of packets. Re-scanning all
+        // prior events on every broadcast makes observation itself quadratic.
+        while !terminalSeen, condition.wait(until: deadline) {}
         return storedEvents
     }
 

@@ -215,9 +215,20 @@ final class HLSPublisherTests: XCTestCase {
 
     func testReviewI2EOFDrainsTwoAndEightBacklogBeforeUniqueEndList() async throws {
         for backlog in [2, 8] {
-            let h = try await Task19Harness()
+            let h = try await Task19Harness(terminalLogicalSequence: UInt64(5 + backlog))
             try await h.initial()
+            let initialPublication = h.publisher.visible?.publicationSequence
+            XCTAssertThrowsError(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: Task19.second, naturalEnd: true)) { error in
+                XCTAssertEqual(error as? HLSPublicationFailure, .identityMismatch)
+            }
+            XCTAssertEqual(h.publisher.visible?.publicationSequence, initialPublication,
+                "An unfinished writer cannot authorize a terminal publication")
             try await h.offerBoth(count: backlog)
+            let endpoint = try XCTUnwrap(h.tracks[2]?.endpointAuthority)
+            XCTAssertEqual(endpoint.receipt.terminalLogicalSequence, UInt64(5 + backlog))
+            XCTAssertEqual(endpoint.media.count, 6 + backlog,
+                "The terminal authority must cover every real callback, including the pending prefix")
             for index in 1...backlog {
                 let ticket = h.publisher.ticket
                 XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: Int64(index) * Task19.second,
@@ -551,9 +562,10 @@ final class HLSPublisherTests: XCTestCase {
 
     func testNaturalEOFLastSegmentOrUniqueEndOnlyObeysGateAndTeardownDoesNotEnd() async throws {
         for withSegment in [true, false] {
-            let h = try await Task19Harness()
+            let h = try await Task19Harness(terminalLogicalSequence: withSegment ? 6 : 5)
             try await h.initial()
             if withSegment { try await h.offerBoth(count: 1) }
+            XCTAssertNotNil(h.tracks[2]?.endpointAuthority)
             XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 999_999_999, naturalEnd: true), .waiting)
             XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 1_000_000_000, naturalEnd: true), .published)
             XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { $0.text.hasSuffix("#EXT-X-ENDLIST\n") })
@@ -871,6 +883,9 @@ final class Task19Track: @unchecked Sendable {
     let formatVariant: Task19.FormatVariant
     private var firstMedia: SealedMediaObject?
     private var formalWriter: SegmentedFMP4Writer?
+    private let terminalLogicalSequence: UInt64?
+    private var endpointMedia: [SealedMediaObject] = []
+    private(set) var endpointAuthority: AACEffectiveEndpointAuthority?
 
     /// 正式 audio track 把同一个 writer 私有终态槽交给 publisher；初始化对象、
     /// timeline mapping 与后续 endpoint 因而保持在同一 binding/media epoch。
@@ -878,7 +893,10 @@ final class Task19Track: @unchecked Sendable {
         mediaType == .audio ? formalWriter?.aacTerminalBinding : nil
     }
     var aacRenditionBinding: AACRenditionTerminalBinding? {
-        mediaType == .audio ? formalWriter?.aacRenditionTerminalBinding : nil
+        // Finite batch fixtures seal the existing writer terminal authority from
+        // all original batch inputs, rather than claim incremental encoder EOS.
+        mediaType == .audio && terminalLogicalSequence == nil
+            ? formalWriter?.aacRenditionTerminalBinding : nil
     }
 
     init(id: UInt64, mediaType: FinalFMP4MediaType, duration: ExactMediaTime = Task19.time(1),
@@ -886,6 +904,7 @@ final class Task19Track: @unchecked Sendable {
          item: UInt64 = 19, boundary: SegmentBoundaryCoordinator? = nil, channels: Int = 2,
          offsets: [Int64]? = nil, plannedDurations: [ExactMediaTime]? = nil,
          bindingOverride: FMP4WriterBinding? = nil, terminalSegment: Bool = false,
+         terminalLogicalSequence: UInt64? = nil,
          formatVariant: Task19.FormatVariant = .baseline) async throws {
         binding = try bindingOverride ?? Task19.binding(id: id, epoch: epoch,
             writer: PlaybackIdentityAllocator.shared.next(in: .nonce), item: item)
@@ -898,11 +917,13 @@ final class Task19Track: @unchecked Sendable {
         epochStart = start
         self.plannedDurations = plannedDurations
         self.formatVariant = formatVariant
+        self.terminalLogicalSequence = terminalSegment ? sequence : terminalLogicalSequence
         format = try XCTUnwrap(CMSampleBufferGetFormatDescription(Task19.sample(mediaType: mediaType,
             start: start.cmTime, duration: duration.cmTime, channels: channels, formatVariant: formatVariant)))
         nextSequence = sequence
         nextStart = start
-        sink = Task19SystemSink(binding: binding)
+        sink = Task19SystemSink(binding: binding,
+            retainAACEndpointInputs: self.terminalLogicalSequence != nil && mediaType == .audio)
         relay = SegmentReportRelay(binding: binding, limits: mediaType == .video ? .video : .audio,
             capacity: 8, objectSink: sink.collect)
         sink.relay = relay
@@ -912,7 +933,8 @@ final class Task19Track: @unchecked Sendable {
         let firstDuration = plannedDurations?.first ?? duration
         if let boundary {
             formalWriter = try await sink.produceFormal(mediaType: mediaType, sequence: sequence, start: start, duration: firstDuration,
-                boundary: boundary, format: format, continuing: nil, terminalSegment: terminalSegment,
+                boundary: boundary, format: format, continuing: nil,
+                terminalSegment: self.terminalLogicalSequence == sequence,
                 formatVariant: formatVariant)
         } else { try await sink.produce(mediaType: mediaType, sequence: sequence, start: start, duration: duration) }
         initialization = try XCTUnwrap(sink.take(.initialization))
@@ -937,12 +959,26 @@ final class Task19Track: @unchecked Sendable {
                 } else { actualDuration = duration }
                 formalWriter = try await sink.produceFormal(mediaType: mediaType, sequence: nextSequence, start: nextStart,
                     duration: actualDuration, boundary: boundary, format: format, continuing: formalWriter,
+                    terminalSegment: terminalLogicalSequence == nextSequence,
                     formatVariant: formatVariant)
             } else { try await sink.produce(mediaType: mediaType, sequence: nextSequence, start: nextStart, duration: duration) }
             if let extraInit = sink.take(.initialization) { XCTAssertTrue(relay.releaseForControl(extraInit)) }
             object = try XCTUnwrap(sink.take(.media))
         }
         let receipt = try timeline.validate(object, using: proof)
+        if mediaType == .audio, terminalLogicalSequence != nil {
+            endpointMedia.append(object)
+            if terminalLogicalSequence == object.logicalSequence {
+                let writer = try XCTUnwrap(formalWriter)
+                endpointAuthority = try writer.makeAACEffectiveEndpointAuthority(
+                    epoch: sink.endpointEpoch(), initializationObject: initialization,
+                    mediaObjects: endpointMedia)
+                XCTAssertEqual(endpointAuthority?.receipt.terminalLogicalSequence,
+                               object.logicalSequence)
+                sink.releaseEndpointInputs()
+                endpointMedia.removeAll(keepingCapacity: false)
+            }
+        }
         nextSequence += 1
         nextStart = receipt.presentationRange.end
         lastMediaByteCount = object.bytes.count
@@ -959,7 +995,42 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
     private var objects: [SealedMediaObject] = []
     private var sequence: UInt64 = 0
     private var formalAACIdentity: AACEncoderIdentity?
-    init(binding: FMP4WriterBinding) { self.binding = binding }
+    private let retainAACEndpointInputs: Bool
+    private var endpointInputs: [AACEncodedEpoch] = []
+    init(binding: FMP4WriterBinding, retainAACEndpointInputs: Bool = false) {
+        self.binding = binding
+        self.retainAACEndpointInputs = retainAACEndpointInputs
+    }
+    func endpointEpoch() throws -> AACEncodedEpoch {
+        let inputs = lock.withLock { endpointInputs }
+        let first = try XCTUnwrap(inputs.first)
+        let last = try XCTUnwrap(inputs.last)
+        guard inputs.allSatisfy({ $0.identity == first.identity }),
+              inputs.dropFirst().allSatisfy({ $0.leadingFrames == 0 }),
+              inputs.dropLast().allSatisfy({ $0.trailingFrames == 0 }) else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        let buffers = inputs.flatMap(\.buffers)
+        let payloadBytes = buffers.reduce(0) {
+            $0 + (CMSampleBufferGetDataBuffer($1).map(CMBlockBufferGetDataLength) ?? 0)
+        }
+        let workspace = AACCalibrationWorkspace()
+        return AACEncodedEpoch(identity: first.identity, buffers: buffers,
+            realSampleCount: inputs.reduce(0) { $0 + $1.realSampleCount },
+            totalDecodedFrames: inputs.reduce(0) { $0 + $1.totalDecodedFrames },
+            leadingFrames: first.leadingFrames, trailingFrames: last.trailingFrames,
+            actualLeadingPrimeFrames: first.actualLeadingPrimeFrames,
+            actualTrailingPrimeFrames: last.actualTrailingPrimeFrames,
+            bandwidth: .init(configuredBitrate: first.bandwidth.configuredBitrate,
+                payloadCeiling: first.bandwidth.payloadCeiling,
+                fmp4BodyCeiling: first.bandwidth.fmp4BodyCeiling,
+                peakPayloadBits: inputs.map { $0.bandwidth.peakPayloadBits }.max() ?? 0,
+                accessUnitCount: inputs.reduce(0) { $0 + $1.bandwidth.accessUnitCount },
+                requiresWriterBodyAccounting: true),
+            packetLease: try workspace.acquire(.aacPackets, bytes: payloadBytes),
+            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+    }
+    func releaseEndpointInputs() { lock.withLock { endpointInputs.removeAll() } }
     func collect(_ object: SealedMediaObject) { lock.withLock { objects.append(object); lock.broadcast() } }
     func take(_ kind: SealedMediaObjectKind) -> SealedMediaObject? {
         lock.withLock {
@@ -1068,9 +1139,10 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
                     peakPayloadBits: UInt64(submittedCount * 6 * 8), accessUnitCount: UInt64(submittedCount), requiresWriterBodyAccounting: true),
                 packetLease: try workspace.acquire(.aacPackets, bytes: submittedCount * 6), formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
             try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
+            if retainAACEndpointInputs { lock.withLock { endpointInputs.append(epoch) } }
         }
         if terminalSegment {
-            // 只用于真实短 EOF 负例；不再把终态实例伪装为后续连续 writer。
+            // 有限夹具在已声明的最后一段真实 finish；不把终态实例伪装为后续 writer。
             let completed = XCTestExpectation(description: "真实短 EOF terminal")
             let error = Task19ErrorBox()
             Task.detached {
@@ -1420,6 +1492,7 @@ final class Task19Harness: @unchecked Sendable {
          publicEnvelope: UInt64? = nil,
          publicationDeadlineNanoseconds: Int64 = 3_000_000_000,
          initialWindowMinimumSeconds: Int = 6,
+         terminalLogicalSequence: UInt64? = nil,
          initialFormatVariants: [UInt64: Task19.FormatVariant] = [:]) async throws {
         let sessionToken = loopbackSession?.value ?? token
         store = loopbackSession.map { SealedMediaStore(loopbackSession: $0, itemGeneration: 19) }
@@ -1432,10 +1505,12 @@ final class Task19Harness: @unchecked Sendable {
             : [Task19.time(48_256, 48_000)] + Array(repeating: Task19.time(48_128, 48_000), count: 5) + [Task19.time(1)]
         if !audioOnly { tracks[1] = try await Task19Track(id: 1, mediaType: .video, duration: videoDuration,
             boundary: boundary, plannedDurations: specialVideo,
+            terminalLogicalSequence: terminalLogicalSequence,
             formatVariant: initialFormatVariants[1] ?? .baseline) }
         for index in 0..<audioCount { tracks[UInt64(index + 2)] = try await Task19Track(id: UInt64(index + 2), mediaType: .audio,
             duration: audioDuration, start: audioStart, item: audioOnly ? UInt64(20 + index) : 19,
-            boundary: boundary, channels: [2, 6, 8][index], offsets: audioBoundaryOffsets, plannedDurations: specialAudio) }
+            boundary: boundary, channels: [2, 6, 8][index], offsets: audioBoundaryOffsets,
+            plannedDurations: specialAudio, terminalLogicalSequence: terminalLogicalSequence) }
         var declaration = try Task19.declaration(audioOnly: audioOnly, audioCount: audioCount)
         declaration.token = sessionToken
         if let track = tracks[1] {
@@ -1492,9 +1567,12 @@ final class Task19Harness: @unchecked Sendable {
             proof: first.proof, declaration: declaration)
         let publisher = try HLSPublicationCoordinator(store: store,
             participants: [.init(initialization: first.initialization, proof: first.proof, relay: first.relay,
-                candidateTicket: candidate.ticket, candidate: candidate)], declaration: declaration,
+                candidateTicket: candidate.ticket, candidate: candidate,
+                aacTerminalBinding: first.aacTerminalBinding)], declaration: declaration,
             anchor: .init(mediaOrigin: Task19.time(0), utcMilliseconds: 0))
         let packet = try await first.next()
+        XCTAssertNotNil(first.endpointAuthority,
+            "The short-window rejection must occur after genuine writer terminal authentication")
         XCTAssertEqual(try publisher.offer(packet.object, receipt: packet.receipt, relay: packet.relay,
             ticket: publisher.ticket, now: 0), .waiting)
         XCTAssertNil(publisher.visible)

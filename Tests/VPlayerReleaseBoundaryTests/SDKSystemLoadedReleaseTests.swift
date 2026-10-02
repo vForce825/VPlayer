@@ -19,6 +19,33 @@ private struct ReleaseScopedRuntimeObservation {
 }
 
 @MainActor
+private final class ReleasePreparationProgressProbe {
+    var stage: String
+    weak var driver: SystemAVPlayerDriver?
+    private var task: Task<Void, Never>?
+
+    init(stage: String) {
+        self.stage = stage
+        task = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) }
+            catch { return }
+            guard !Task.isCancelled, let self else { return }
+            let player = driver?.player
+            print("RELEASE_PREPARATION_WAIT stage=\(stage) "
+                + "itemStatus=\(player?.currentItem?.status.rawValue ?? -1) "
+                + "timeControlStatus=\(player?.timeControlStatus.rawValue ?? -1) "
+                + "rangeCount=\(player?.currentItem?.loadedTimeRanges.count ?? 0) "
+                + "disconnected=\(driver?.disconnectedFromSystemAudio ?? false) "
+                + "waiterCount=\(driver?.activeWaiterCount ?? 0) "
+                + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes)")
+        }
+    }
+
+    func cancel() { task?.cancel(); task = nil }
+    deinit { task?.cancel() }
+}
+
+@MainActor
 final class SDKSystemLoadedReleaseTests: XCTestCase {
     /// 纯观测入口：若真实System prepare任一阶段不再可达或清理失败，本方法失败；
     /// allocation数值由同次LLDB在原调用点读取，不把测试探针分配当生产分配。
@@ -63,12 +90,15 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
     @inline(never)
     private func makeScopedRuntimeObservation() async throws
         -> ReleaseScopedRuntimeObservation {
+        let probe = ReleasePreparationProgressProbe(stage: "scoped.fixture")
+        defer { probe.cancel() }
         let allocator = PlaybackIdentityAllocator()
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
         var fixture: ReleaseAACPublicationFixture? = try await .make(lifecycle: lifecycle)
         defer { try? fixture?.teardown() }
         let item = try XCTUnwrap(fixture).request.item
         var driver: SystemAVPlayerDriver? = try .make(player: AVPlayer())
+        probe.driver = driver
         var coordinator: AVPlayerItemCoordinator? = try .init(
             driver: try XCTUnwrap(driver), evidenceSource: try XCTUnwrap(fixture).source,
             allocator: allocator)
@@ -84,9 +114,11 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
                 sawInstalledOwner = weakOwner.value != nil
             }
         }
+        probe.stage = "scoped.coordinator_prepare"
         print("TASK21_RELEASE_RUNTIME stage=prepare-begin")
         let prepared = try await XCTUnwrap(coordinator).prepareCurrentItem()
         print("TASK21_RELEASE_RUNTIME stage=prepare-returned")
+        probe.cancel()
 
         coordinator = nil
         driver?.replaceCurrentItemWithNil(item: item)
@@ -103,19 +135,24 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
     }
 
     func testSystemLoopbackLoadedReceiptAndItemFailure() async throws {
+        let probe = ReleasePreparationProgressProbe(stage: "loaded.fixture")
+        defer { probe.cancel() }
         let allocator = PlaybackIdentityAllocator()
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
         let fixture = try await ReleaseAACPublicationFixture.make(lifecycle: lifecycle)
         defer { try? fixture.teardown() }
+        probe.stage = "loaded.timeline_mapping"
         let playhead = try await fixture.makePreparedPlayhead()
         let item = fixture.request.item
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        probe.driver = driver
         try driver.install(url: fixture.request.itemURL, identity: item)
         defer { driver.replaceCurrentItemWithNil(item: item) }
 
         let requested = try FMP4PresentationRange(
             start: playhead.playerItemTime,
             duration: ExactMediaTime(value: 1, timescale: 100))
+        probe.stage = "loaded.native_ranges"
         let receipt = try await driver.waitForLoadedTimeRanges(
             item: item, playhead: playhead, covering: requested)
         XCTAssertEqual(receipt, .init(item: item, playhead: playhead,
@@ -138,6 +175,7 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
             .appendingPathComponent(
                 "VPlayer-task21-release-boundary-\(UUID().uuidString).m3u8")
         XCTAssertFalse(FileManager.default.fileExists(atPath: nonexistentURL.path))
+        probe.stage = "loaded.invalid_item_ready"
         var installedNonexistentItem = false
         do {
             try driver.install(url: nonexistentURL, identity: item)

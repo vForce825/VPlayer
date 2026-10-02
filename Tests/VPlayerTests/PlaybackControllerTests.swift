@@ -1333,14 +1333,15 @@ final class PlaybackControllerTests: XCTestCase {
         XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
         XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
         let interrupted = await f.controller.currentStateForTesting
-        XCTAssertEqual(interrupted, .recovering(f.request))
+        XCTAssertEqual(interrupted, .paused(f.request),
+            "A user resume action cannot cross the still-active physical interruption")
         _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
         try await eventually { f.successor.snapshot().starts.count == 1 }
         XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
         XCTAssertEqual(f.factory.makeCountSnapshot, 2)
         XCTAssertEqual(f.outputConcurrency.maximum, 1)
-        XCTAssertEqual(f.successor.snapshot().startReadinessCycles, [3])
-        f.successor.emit(.ready(readinessCycle: 3))
+        XCTAssertEqual(f.successor.snapshot().startReadinessCycles, [2])
+        f.successor.emit(.ready(readinessCycle: 2))
         try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
         await f.controller.stop()
     }

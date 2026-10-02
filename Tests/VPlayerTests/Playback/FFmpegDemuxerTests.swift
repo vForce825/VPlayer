@@ -9,6 +9,35 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class FFmpegDemuxerTests: XCTestCase {
+    func testRecorderRecognizesEveryTerminalBeforeWaiting() {
+        let terminals: [DemuxEvent] = [.endOfStream, .cancelled, .failure(.demuxRead(-74))]
+        for terminal in terminals {
+            let recorder = DemuxEventRecorder()
+            recorder.record(terminal)
+            XCTAssertEqual(recorder.waitForTerminal(timeout: 0), [terminal])
+            XCTAssertEqual(recorder.waitForTerminal(timeout: 0), [terminal],
+                "A second reader must retain the original terminal observation")
+        }
+    }
+
+    func testRecorderRetainsNonterminalBurstAndExactFailedTerminal() {
+        let recorder = DemuxEventRecorder()
+        let packet = DemuxEvent.packet(DemuxPacket(streamIndex: 0, codec: .h264,
+            data: Data([0]), presentationTimeStamp: .zero, decodeTimeStamp: .zero,
+            duration: CMTime(value: 1, timescale: 25), isKey: true, isCorrupt: false))
+        for _ in 0..<128 { recorder.record(packet) }
+        XCTAssertEqual(recorder.waitForCount(128, timeout: 0), Array(repeating: packet, count: 128))
+        let terminal = DemuxEvent.failure(.demuxRead(-75))
+        DispatchQueue.global().async {
+            for _ in 128..<65_000 { recorder.record(packet) }
+            recorder.record(terminal)
+        }
+        let events = recorder.waitForTerminal(timeout: 5)
+        XCTAssertEqual(events.count, 65_001)
+        XCTAssertEqual(events.last, terminal)
+        XCTAssertTrue(events.dropLast().allSatisfy { $0 == packet })
+    }
+
     func testUnknownExplicitRoleIsCopiedAsUnclassifiableRatherThanAbsent() throws {
         for scenario in [VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_TOKEN,
                          VPFF_TRACK_EXTRAS_DEBUG_UNKNOWN_ROLE_COMMENT,

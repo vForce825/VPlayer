@@ -150,14 +150,19 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         let first = harness.cell.snapshot.system.latestResetIngress
         harness.system(.interruptionBegan, at: 120)
         harness.system(.interruptionEnded(shouldResume: true), at: 170)
+        XCTAssertEqual(harness.cell.snapshot.interruptionState, .ended(shouldResume: true))
+        XCTAssertTrue(harness.cell.snapshot.mediaServicesResumeRequired)
+        XCTAssertTrue(harness.cell.snapshot.interruptionVeto,
+            "A recommendation cannot replace the explicit post-reset user action")
         harness.system(.mediaServicesReset, at: 200)
         let state = harness.cell.snapshot
         XCTAssertEqual(state.system.firstUndrainedResetIngressInstant, 100)
         XCTAssertEqual(state.system.latestResetIngress?.ingressInstant, 200)
         XCTAssertNotEqual(first?.rootIdentity, state.system.latestResetIngress?.rootIdentity)
-        XCTAssertEqual(state.system.resetPreRouteClockFold?.effectiveNanoseconds, 50)
-        XCTAssertEqual(state.system.resetPreRouteClockFold?.frozen, false)
-        XCTAssertEqual(state.interruptionState, .ended(shouldResume: true))
+        XCTAssertEqual(state.system.resetPreRouteClockFold?.effectiveNanoseconds, 0)
+        XCTAssertEqual(state.system.resetPreRouteClockFold?.frozen, true)
+        XCTAssertEqual(state.interruptionState, .inactive)
+        XCTAssertTrue(state.mediaServicesResumeRequired)
         harness.releaseExecutor()
     }
 
@@ -167,10 +172,13 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         harness.system(.interruptionBegan, at: 100)
         harness.system(.mediaServicesReset, at: 110)
         harness.system(.interruptionEnded(shouldResume: false), at: 150)
-        harness.system(.mediaServicesReset, at: 200)
         XCTAssertEqual(harness.cell.snapshot.interruptionState, .ended(shouldResume: false))
         XCTAssertTrue(harness.cell.snapshot.interruptionVeto)
-        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 50)
+        harness.system(.mediaServicesReset, at: 200)
+        XCTAssertEqual(harness.cell.snapshot.interruptionState, .inactive)
+        XCTAssertTrue(harness.cell.snapshot.interruptionVeto)
+        XCTAssertTrue(harness.cell.snapshot.mediaServicesResumeRequired)
+        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 0)
         harness.releaseExecutor()
     }
 
@@ -392,8 +400,12 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         harness.system(.interruptionBegan, at: 130)
         harness.system(.interruptionEnded(shouldResume: true), at: 150)
         harness.system(.mediaServicesReset, at: 170)
-        XCTAssertEqual(harness.cell.snapshot.system.interruptionClockFold?.effectiveNanoseconds, 50)
-        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 30)
+        // Only the 100...120 pre-reset interval runs. No user action resumes
+        // either clock after reset; interruption recommendations cannot do so.
+        XCTAssertEqual(harness.cell.snapshot.system.interruptionClockFold?.effectiveNanoseconds, 20)
+        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 0)
+        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.frozen, true)
+        XCTAssertTrue(harness.cell.snapshot.mediaServicesResumeRequired)
         XCTAssertEqual(harness.cell.snapshot.system.firstUndrainedResetIngressInstant, 120)
         harness.releaseExecutor()
     }
@@ -415,9 +427,11 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         XCTAssertEqual(snapshot.throughRevision, 13)
         XCTAssertEqual(snapshot.ownerSystemEventRevision, 23)
         XCTAssertEqual(snapshot.mediaServicesEpoch, 31)
-        XCTAssertEqual(snapshot.interruptionEpoch, 42)
+        XCTAssertEqual(snapshot.interruptionEpoch, 43,
+            "Reset, began and ended each consume the independent interruption domain")
         XCTAssertEqual(snapshot.system.latestResetIngress?.rootIdentity, 51)
-        XCTAssertEqual(snapshot.freezeGeneration, 62)
+        XCTAssertEqual(snapshot.freezeGeneration, 63,
+            "Reset invalidation, began and ended each advance freeze identity")
         XCTAssertEqual(snapshot.audioAdmissionFenceRevision, 3)
         harness.releaseExecutor()
     }

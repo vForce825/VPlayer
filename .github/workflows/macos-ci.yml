@@ -78,6 +78,22 @@ jobs:
       - name: Report scoped capacity diagnostic failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugCapacity.xcresult"
+      - name: Diagnose genuine finite Publisher terminal receipts
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/DebugPublisher.xcresult" \
+            -only-testing:VPlayerTests/HLSPublisherTests/testInitialSixSevenAndEighthInvariantUseEachReceiptDuration \
+            -only-testing:VPlayerTests/HLSPublisherTests/testNaturalEOFLastSegmentOrUniqueEndOnlyObeysGateAndTeardownDoesNotEnd \
+            -only-testing:VPlayerTests/HLSPublisherTests/testReviewI2EOFDrainsTwoAndEightBacklogBeforeUniqueEndList \
+            -only-testing:VPlayerTests/HLSPublisherTests/testReviewI4RejectsUnboundReportsWholeOffsetAndIllegalFirstShortWindow
+      - name: Report scoped Publisher diagnostic failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugPublisher.xcresult"
       - name: Diagnose complete HLS classes without parallel workers
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
@@ -122,6 +138,8 @@ jobs:
             -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testResetOutsideInterruptionUsesSeparateFirstResetAnchor \
             -only-testing:VPlayerTests/HLSResourceStoreTests/testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic \
             -only-testing:VPlayerTests/Task9ProductionDeadlineTests \
+            -only-testing:VPlayerTests/FFmpegDemuxerTests/testRecorderRecognizesEveryTerminalBeforeWaiting \
+            -only-testing:VPlayerTests/FFmpegDemuxerTests/testRecorderRetainsNonterminalBurstAndExactFailedTerminal \
             -only-testing:VPlayerTests/PlaybackControllerTests/testSuspendedStopClearsOnlyItsOriginalTerminalMetrics \
             -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testStopSuspendedAtWatchdogStillJoinsSameSessionTerminalCleanup \
             -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testObsoleteStopCannotJoinReplacementSessionTerminalCleanup \
@@ -131,6 +149,34 @@ jobs:
       - name: Report scoped control diagnostic failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugControl.xcresult"
+
+      - name: Inspect Address Sanitizer support and run separate raw storage checks
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          help="$(xcodebuild -help 2>&1)"
+          if ! printf '%s\n' "$help" | grep -F -- '-enableAddressSanitizer'; then
+            echo 'CI_ASAN_NOT_RUN=installed_xcodebuild_does_not_advertise_support'
+            exit 0
+          fi
+          echo 'CI_ASAN_SUPPORT_VERIFIED=1'
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/DerivedDataASan" \
+            -enableAddressSanitizer YES -parallel-testing-enabled NO \
+            -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/DebugASan.xcresult" \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadOverflowClearsAllReferencesDuringConcurrentProducers \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingReleasesQueuedReferencesAndDeinitializesAfterJoin
+      - name: Report scoped Address Sanitizer test failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugASan.xcresult"
 
   release-validation:
     name: Release boundaries and cold startup
