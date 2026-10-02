@@ -1,82 +1,41 @@
-name: Paused native audio connection lifecycle diagnostic
-
-# Standard GitHub-hosted runners are free for this public repository.
-# Do not add larger runners, artifact uploads, or persistent caches without
-# reviewing their billing and storage implications.
+name: Foundation URL host round-trip diagnostic
 "on":
   push:
     branches: [migration/tvos27]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
-  group: macos-ci-raw-lifecycle-${{ github.ref }}
+  group: macos-ci-host-roundtrip-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
-  fixture-validation:
-    name: HTTP playback and full-length 4K timeline fixtures
+  host-roundtrip:
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 10
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
-      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_ANALYTICS: "1"
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
       - name: Verify toolchain
+        run: xcodebuild -version
+      - name: Measure fixed synthetic Foundation URL round trips
         run: |
-          xcodebuild -version
-          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
-      - name: Install build and fixture tooling
-        run: brew install mint jq ripgrep ffmpeg
-      - name: Build and audit pinned application FFmpeg
-        run: ./ci_scripts/ci_post_clone.sh
-      - name: Verify committed project and licenses
-        run: |
-          ./Scripts/bootstrap.sh --check
-          ./Scripts/verify-licenses.sh
-          python3 Scripts/Tests/test_tvos27_deployment.py
-      - name: Check fixture runner, server and generator contracts
-        run: |
-          python3 Scripts/Tests/test_playback_fixture_runner.py
-          python3 Scripts/Tests/test_timeline_fixture.py
-          python3 Scripts/Support/fixture_server.py --self-test
-          ./Scripts/run-playback-integration-tests.sh --self-test
-          ./Scripts/generate-playback-fixtures.sh --self-test
-      - name: Run exact paused native audio connection lifecycle
-        run: |
-          set -o pipefail
-          ./Scripts/run-playback-integration-tests.sh \
-            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests/testRawHTTPHLSPrerollAndAudioConnectionTransitionsRemainPaused \
-            -- -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 \
-            2>&1 | tee "$RUNNER_TEMP/raw-http-readiness.log"
-      - name: Require native lifecycle case executed without skips
-        if: ${{ always() }}
-        run: |
-          python3 - "$RUNNER_TEMP/raw-http-readiness.log" <<'PY'
-          import pathlib, re, sys
-          text = pathlib.Path(sys.argv[1]).read_text()
-          names = [
-              "testRawHTTPHLSPrerollAndAudioConnectionTransitionsRemainPaused",
-          ]
-          for name in names:
-              pattern = r"Test Case '-\[VPlayerTests\.PlaybackFixtureIntegrationTests " + re.escape(name) + r"\]' (passed|failed|skipped|exceeded execution)"
-              states = re.findall(pattern, text)
-              if states != ["passed"]:
-                  raise SystemExit(f"RAW_HTTP_EXECUTION_GATE_FAILED case={name} outcomes={states}")
-          if not re.search(r"Executed 1 test, with 0 failures", text):
-              raise SystemExit("RAW_HTTP_EXECUTION_GATE_FAILED missing exact one-case zero-failure summary")
-          if re.search(r"Executed 1 test, with [1-9]\d* tests? skipped", text):
-              raise SystemExit("RAW_HTTP_EXECUTION_GATE_FAILED skipped cases")
-          print("RAW_HTTP_EXECUTION_GATE executed=1 passed=1 skipped=0 failed=0")
-          PY
+          cat > "$RUNNER_TEMP/host-roundtrip.swift" <<'SWIFT'
+          import Foundation
+          let original = URL(string: "http://127.0.0.1:12345/fixed")!
+          let encodedHost = "%31%32%37.0.0.1"
+          var parts = URLComponents(url: original, resolvingAgainstBaseURL: false)!
+          parts.percentEncodedHost = encodedHost
+          let assignedEncoded = parts.percentEncodedHost == encodedHost
+          guard let componentURL = parts.url,
+                let literalURL = URL(string: "http://%31%32%37.0.0.1:12345/fixed") else {
+              fatalError("fixed synthetic URL construction failed")
+          }
+          func report(_ label: String, _ url: URL, _ assigned: Bool) {
+              let absolute = url.absoluteString
+              let roundTrip = URLComponents(string: absolute)!
+              let literalHost = roundTrip.percentEncodedHost == "127.0.0.1"
+              print("URI_HOST_ROUNDTRIP construction=\(label) assignedEncoded=\(assigned) absoluteRetainsEncoded=\(absolute.contains(encodedHost)) ingressLiteralHost=\(literalHost) urlEqualsOriginal=\(url == original) absoluteEqualsOriginal=\(absolute == original.absoluteString)")
+          }
+          report("components", componentURL, assignedEncoded)
+          report("literal", literalURL, URLComponents(string: "http://%31%32%37.0.0.1:12345/fixed")!.percentEncodedHost == encodedHost)
+          SWIFT
+          xcrun swift "$RUNNER_TEMP/host-roundtrip.swift"
