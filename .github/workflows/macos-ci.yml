@@ -50,6 +50,9 @@ jobs:
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
 
+      - name: Install official Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: Rebuild tvOS 27 Metal libraries
         run: ./Scripts/build-metal-libraries.sh
 
