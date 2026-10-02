@@ -73,6 +73,8 @@ final class HLSRuntimeFailureRelay: @unchecked Sendable {
         let publicationCapture = malloc_good_size(32 +
             MemoryLayout<SystemHLSMediaGraphAuthority?>.stride) + 32
         // 256B 覆盖两处函数 reabstraction；64B 覆盖 bundle/builder 新引用的分配级差。
+        // Coordinator's relay alias is part of its separately measured 12 KiB
+        // resource-context root; this metadata bound does not prove that root's capacity.
         return actual(self) + actual(lock) + metadataOwner.knownAllocationBytes +
             ErrorDiagnosticSnapshot.maximumStorageAllocationBytes +
             bridgeCapture + relayCapture + publicationCapture + 256 + 64
@@ -213,6 +215,10 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         }
         return confirmed
     }
+
+    /// The coordinator retains only an alias to this already charged attempt relay.
+    /// No callback capture, extra owner, or alternate failure scope is created.
+    var runtimeFailureRelay: HLSRuntimeFailureRelay? { runtimeFailure }
 
     /// 只有 backend 完成该 attempt 的最后一个准备 await 后启用；已到首错锁外回放。
     func armRuntimeFailure() { runtimeFailure?.arm() }

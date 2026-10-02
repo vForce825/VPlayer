@@ -1566,22 +1566,39 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testQuiescenceReceiptRemainsVerifiableAfterCleanupAndDirectStateMatchesInstalledItem() async throws {
+        func checkpoint(_ stage: String) {
+            print("TASK21_QUIESCENCE_CHECKPOINT stage=\(stage) "
+                + "resourceBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) "
+                + "history=\(PlaybackDiagnosticTracker.shared.current)")
+        }
         do {
+            checkpoint("completed.construct.begin")
             let completed = try await Task21Harness()
+            checkpoint("completed.construct.end")
+            checkpoint("completed.prepare.begin")
             _ = try await completed.prepare()
+            checkpoint("completed.prepare.end")
+            checkpoint("completed.activate.begin")
             _ = try await completed.activate()
+            checkpoint("completed.activate.end")
+            checkpoint("completed.stop.begin")
             let receipt = try await completed.stop()
+            checkpoint("completed.stop.end")
             try completed.coordinator.completeLifecycleCleanup(receipt)
             XCTAssertNil(completed.driver.currentItemIdentity)
             XCTAssertEqual(completed.coordinator.phase, .quiescent)
             XCTAssertTrue(completed.coordinator.accept(receipt),
                           "request 清空后仍必须验收已签发的完整 receipt")
             let invocation = try XCTUnwrap(completed.backend.lastSuspendInvocation)
+            checkpoint("completed.replay.begin")
             let joined = try await completed.coordinator.stop(invocation)
+            checkpoint("completed.replay.end")
             XCTAssertTrue(joined.identity === receipt.identity,
                           "清理后同票必须领取原 receipt identity")
             XCTAssertEqual(joined, receipt)
+            checkpoint("completed.shutdown.begin")
             try await completed.shutdown()
+            checkpoint("completed.shutdown.end")
             XCTAssertTrue(completed.backend.quiescenceReceipt?.identity === receipt.identity,
                           "terminal retirement must preserve the original successful stop receipt")
             XCTAssertNotEqual(completed.backend.lastSuspendInvocation?.suspendTicket,
@@ -1589,40 +1606,93 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                               "terminal cleanup must exercise the Registry's replacement suspend ticket")
             XCTAssertEqual(completed.backend.lastRetiredEpoch, completed.lifecycle)
 
+            checkpoint("foreign.construct.begin")
             let foreign = try await Task21Harness()
+            checkpoint("foreign.construct.end")
+            checkpoint("foreign.prepare.begin")
             _ = try await foreign.prepare()
+            checkpoint("foreign.prepare.end")
+            checkpoint("foreign.activate.begin")
             _ = try await foreign.activate()
+            checkpoint("foreign.activate.end")
+            checkpoint("foreign.stop.begin")
             _ = try await foreign.stop()
+            checkpoint("foreign.stop.end")
             let foreignInvocation = try XCTUnwrap(foreign.backend.lastSuspendInvocation)
             await XCTAssertThrowsErrorAsync(try await completed.coordinator.stop(foreignInvocation),
                 "独立 Registry 复用数值 nonce 的外来票也不能领取旧 receipt")
+            checkpoint("foreign.shutdown.begin")
             try await foreign.shutdown()
+            checkpoint("foreign.shutdown.end")
         }
         do {
+            checkpoint("retired.construct.begin")
             let retired = try await Task21Harness()
+            checkpoint("retired.construct.end")
+            checkpoint("retired.prepare.begin")
             _ = try await retired.prepare()
+            checkpoint("retired.prepare.end")
+            checkpoint("retired.activate.begin")
             _ = try await retired.activate()
+            checkpoint("retired.activate.end")
+            checkpoint("retired.stop.begin")
             let retiredReceipt = try await retired.stop()
+            checkpoint("retired.stop.end")
             let retiredInvocation = try XCTUnwrap(retired.backend.lastSuspendInvocation)
             retired.evidence.completedRenditions.append(.init(rawValue: 202))
             for _ in 0..<32 { await Task.yield() }
+            checkpoint("retired.replacement.begin")
             try await retired.coordinator.retireForReplacement(retired.item.outputLifecycleEpoch)
+            checkpoint("retired.replacement.end")
             XCTAssertNil(retired.driver.currentItemIdentity)
+            checkpoint("retired.replay.begin")
             let retiredJoin = try await retired.coordinator.stop(retiredInvocation)
+            checkpoint("retired.replay.end")
             XCTAssertTrue(retiredJoin.identity === retiredReceipt.identity,
                           "replacement retirement 清 request 后也须 join 原停止终态")
             XCTAssertEqual(retiredJoin, retiredReceipt)
+            checkpoint("retired.shutdown.begin")
             try await retired.shutdown()
+            checkpoint("retired.shutdown.end")
         }
+        checkpoint("mismatched.construct.begin")
         let mismatched = try await Task21Harness()
+        checkpoint("mismatched.construct.end")
+        checkpoint("mismatched.prepare.begin")
         _ = try await mismatched.prepare()
+        checkpoint("mismatched.prepare.end")
+        checkpoint("mismatched.activate.begin")
         _ = try await mismatched.activate()
+        checkpoint("mismatched.activate.end")
         mismatched.driver.currentItemIdentity = Task21Fixtures.staleGenerationItem(from: mismatched.item)
-        await XCTAssertThrowsErrorAsync(try await mismatched.stop(),
-                                        "direct state 必须来自实际 current item")
         let corruptedIdentity = mismatched.driver.currentItemIdentity
+        let failedStop = Task { try await mismatched.stop() }
+        defer {
+            mismatched.backend.allowRetirementCompletion()
+            failedStop.cancel()
+        }
+        checkpoint("mismatched.retirement_arrival.begin")
+        let retirementArrived = await mismatched.backend.waitForRetirementCall(timeout: .seconds(2))
+        checkpoint("mismatched.retirement_arrival.end")
+        XCTAssertTrue(retirementArrived,
+                      "The original failed Registry suspend must enter its genuine retirement call")
+        // The Registry runner joins retirement before completing the failed stop.
+        // Release only this fixture's completion gate before joining that runner;
+        // the receipt/identity checks still force unconfirmed physical retirement.
+        // Release on a failed arrival assertion too, so it cannot strand the task.
+        mismatched.backend.allowRetirementCompletion()
+        checkpoint("mismatched.stop.begin")
+        await XCTAssertThrowsErrorAsync(try await failedStop.value,
+                                        "direct state 必须来自实际 current item")
+        checkpoint("mismatched.stop.end")
+        XCTAssertEqual(mismatched.backend.lastError as? AVPlayerItemCoordinatorFailure,
+                       .staleIdentity)
+        XCTAssertNil(mismatched.backend.lastRetiredEpoch,
+                     "Releasing a test gate must never confirm retirement of the corrupted item")
         XCTAssertNil(mismatched.backend.quiescenceReceipt)
+        checkpoint("mismatched.transport_retire.begin")
         try await mismatched.retireFailedTestTransport()
+        checkpoint("mismatched.transport_retire.end")
         XCTAssertEqual(mismatched.driver.currentItemIdentity, corruptedIdentity,
                        "cleanup must not restore the injected identity to manufacture quiescence")
         XCTAssertNil(mismatched.coordinator.lastQuiescenceReceipt)
@@ -2023,6 +2093,247 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.driver.prerollCallCount, 0)
         XCTAssertEqual(harness.driver.playCallCount, 0)
         try await harness.shutdown()
+    }
+
+    func testMalformedCurrentResourceUsesOriginalRuntimeRelayAndOneTerminalCleanupWithoutReprepare()
+        async throws {
+        try await checkRuntimeLogTerminal(producerFailureFirst: false)
+    }
+
+    func testProducerFailureWinsRaceWithMalformedResourceInOriginalAttemptRelay() async throws {
+        try await checkRuntimeLogTerminal(producerFailureFirst: true)
+    }
+
+    func testProducerFirstWhilePreparingPreservesDiagnosticThroughFailedPrepareCleanup() async throws {
+        let attempt = try await checkPreparingLogFirstCause(producerFailureFirst: true)
+        attempt.builder.releaseObservedFailure()
+        XCTAssertEqual(attempt.builder.metadataChargedBytes, 0)
+    }
+
+    func testURIFirstWhilePreparingPreservesDiagnosticThroughFailedPrepareCleanup() async throws {
+        let attempt = try await checkPreparingLogFirstCause(producerFailureFirst: false)
+        attempt.builder.releaseObservedFailure()
+        XCTAssertEqual(attempt.builder.metadataChargedBytes, 0)
+    }
+
+    func testRetiredPriorAttemptCannotReplaceCurrentPreparingFailureOrEmitRuntimeEvent() async throws {
+        let allocator = PlaybackIdentityAllocator()
+        let prior = try await checkPreparingLogFirstCause(producerFailureFirst: false, allocator: allocator)
+        defer { prior.builder.releaseObservedFailure() }
+        let current = try await checkPreparingLogFirstCause(producerFailureFirst: false,
+            allocator: allocator, prior: prior)
+        XCTAssertNotEqual(prior.ticket, current.ticket)
+        XCTAssertFalse(PlaybackBackendPrepareFailureScope(ticket: prior.ticket).matches(current.ticket))
+        XCTAssertEqual(prior.builder.eventCount, 0)
+        XCTAssertEqual(prior.builder.retireCount, 1)
+        prior.builder.releaseObservedFailure()
+        current.builder.releaseObservedFailure()
+        XCTAssertEqual(prior.builder.metadataChargedBytes, 0)
+        XCTAssertEqual(current.builder.metadataChargedBytes, 0)
+    }
+
+    private func checkPreparingLogFirstCause(producerFailureFirst: Bool,
+        allocator: PlaybackIdentityAllocator = .init(),
+        prior: Task21RetiredPreparationLogAttempt? = nil) async throws -> Task21RetiredPreparationLogAttempt {
+        let forwarding = Task27HLSBackendForwarder()
+        let graph = try OutputGraphFixture(allocator: allocator, backendObject: forwarding)
+        let fixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: graph.lifecycle, audioOnly: true)
+        let transport = Task21LogTransportOwner(fixture: fixture)
+        addTeardownBlock { try await transport.retire() }
+        let driver = Task21FakeDriver()
+        let coordinator = try AVPlayerItemCoordinator(driver: driver,
+            evidenceSource: fixture.source,
+            backendPublicationReplacementAuthoritySlot:
+                forwarding.backendPublicationReplacementAuthoritySlot)
+        let builder = Task21LogFailureBundleBuilder(replacement: .init(
+            request: fixture.request, evidenceSource: fixture.source), retireProducer: {
+                do { try await transport.retire(); return true }
+                catch { XCTFail("Failed-prepare fixture transport did not retire: \(error)"); return false }
+            })
+        let backend = HLSAVPlayerPlaybackBackend(identity: graph.lifecycle.backendIdentity,
+            coordinator: coordinator, bundleBuilder: builder,
+            replacementSlot: forwarding.backendPublicationReplacementAuthoritySlot)
+        forwarding.attach(backend)
+        var malformed = try XCTUnwrap(URLComponents(url: fixture.request.itemURL,
+                                                    resolvingAgainstBaseURL: false))
+        malformed.percentEncodedPath += "/%2e%2e/media.m4s"
+        let uri = try XCTUnwrap(malformed.url)
+        let producerDiagnostic = ErrorDiagnosticSnapshot(typeName: "fixture.producer",
+            code: "first-cause", message: "Producer stopped after returning its playable prefix")
+        let uriDiagnostic = PlaybackErrorDiagnostics.snapshot(AVPlayerItemCoordinatorFailure.itemFailed)
+        var reachedFenceCount = 0
+        driver.onPreparationFence = { fence, item in
+            guard fence == .seek else { return }
+            driver.onPreparationFence = nil
+            reachedFenceCount += 1
+            XCTAssertEqual(item, fixture.request.item)
+            XCTAssertEqual(coordinator.phase, .preparing)
+            XCTAssertEqual(builder.buildCount, 1)
+            XCTAssertNotNil(builder.relay)
+            XCTAssertEqual(builder.metadataChargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+            if let prior {
+                XCTAssertNotEqual(prior.item, item)
+                XCTAssertNotEqual(prior.ticket, builder.prepareTicket)
+                prior.builder.relay?.record(producerDiagnostic)
+                coordinator.observeAccessLogURI(uri, item: prior.item)
+                XCTAssertEqual(prior.builder.eventCount, 0,
+                               "The genuinely retired attempt must stay closed to late producer delivery")
+                XCTAssertEqual(coordinator.phase, .preparing,
+                               "The old item cannot invalidate the current preparation")
+            }
+            if producerFailureFirst { builder.relay?.record(producerDiagnostic) }
+            XCTAssertEqual(driver.emitAccessLogURI(uri), .invalidLocalResource)
+            if !producerFailureFirst { builder.relay?.record(producerDiagnostic) }
+            XCTAssertEqual(builder.eventCount, 0,
+                           "A failed preparation must not arm or publish its runtime relay")
+            XCTAssertEqual(coordinator.phase, .stopping)
+        }
+        defer { driver.onPreparationFence = nil }
+        var operationError: (any Error)?
+        do {
+            let source = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+            XCTAssertTrue(graph.registry.startOutputPrepareOperation(source))
+            let result = await graph.registry.joinOutputBackendOperation(source)
+            guard case .failed(let failure) = result else {
+                XCTFail("The genuine prepare runner must retain the first failure, not succeed or cancel")
+                throw AVPlayerItemCoordinatorFailure.itemFailed
+            }
+            XCTAssertEqual(PlaybackErrorDiagnostics.snapshot(failure),
+                           producerFailureFirst ? producerDiagnostic : uriDiagnostic,
+                           "Failed-prepare unwinding must preserve the original fixed first diagnostic")
+            XCTAssertEqual(reachedFenceCount, 1)
+            XCTAssertEqual(driver.prerollCallCount, 0)
+            XCTAssertEqual(driver.playCallCount, 0)
+            XCTAssertEqual(builder.buildCount, 1, "An installed failed attempt cannot silently retry")
+            XCTAssertEqual(builder.retireCount, 1)
+            XCTAssertEqual(builder.eventCount, 0)
+            XCTAssertNil(builder.event)
+            XCTAssertFalse(coordinator.requiresReplacementRetirement(graph.lifecycle))
+            XCTAssertNil(graph.registry.outputResourceContextSnapshot()?.owner)
+        } catch { operationError = error }
+
+        let ticket = try XCTUnwrap(builder.prepareTicket)
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .terminal, at: graph.registry.clock.nowNanoseconds, teardown: true))
+        let receiver = Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+        XCTAssertTrue(graph.registry.startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+            terminalState: .failed(.init(code: "test.prepare-first-cause", userMessage: "fixture"))))
+        await graph.registry.joinOwnedTerminalCleanup(session: context.sessionIdentity)
+        try receiver.result()
+        XCTAssertNil(graph.registry.ownedResourceSnapshot())
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(coordinator.state.stopCount, 1)
+        XCTAssertEqual(builder.retireCount, 1, "Failed-prepare and terminal cleanup join the same retirement")
+        XCTAssertEqual(builder.buildCount, 1)
+        builder.relay?.record(producerDiagnostic)
+        XCTAssertEqual(builder.eventCount, 0, "A closed failed-attempt relay cannot emit after cleanup")
+        XCTAssertEqual(builder.metadataChargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+        try await transport.retire()
+        if let operationError { throw operationError }
+        return .init(builder: builder, item: fixture.request.item, ticket: ticket)
+    }
+
+    private func checkRuntimeLogTerminal(producerFailureFirst: Bool) async throws {
+        let forwarding = Task27HLSBackendForwarder()
+        let graph = try OutputGraphFixture(backendObject: forwarding)
+        let fixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: graph.lifecycle, audioOnly: true)
+        let transport = Task21LogTransportOwner(fixture: fixture)
+        addTeardownBlock { try await transport.retire() }
+        let driver = Task21FakeDriver()
+        let coordinator = try AVPlayerItemCoordinator(driver: driver,
+            evidenceSource: fixture.source,
+            backendPublicationReplacementAuthoritySlot:
+                forwarding.backendPublicationReplacementAuthoritySlot)
+        let builder = Task21LogFailureBundleBuilder(replacement: .init(
+            request: fixture.request, evidenceSource: fixture.source), retireProducer: {
+                do { try await transport.retire(); return true }
+                catch { XCTFail("Original URI fixture transport did not retire: \(error)"); return false }
+            })
+        let backend = HLSAVPlayerPlaybackBackend(identity: graph.lifecycle.backendIdentity,
+            coordinator: coordinator, bundleBuilder: builder,
+            replacementSlot: forwarding.backendPublicationReplacementAuthoritySlot)
+        forwarding.attach(backend)
+        var operationError: (any Error)?
+        do {
+            let prepare = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+            XCTAssertTrue(graph.registry.startOutputPrepareOperation(prepare))
+            guard case .succeeded = await graph.registry.joinOutputBackendOperation(prepare) else {
+                throw AVPlayerItemCoordinatorFailure.itemFailed
+            }
+            let ticket = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.prepareTicket)
+            XCTAssertEqual(coordinator.phase, .prepared)
+            XCTAssertEqual(builder.buildCount, 1)
+            let coordinatorPointer = UnsafeRawPointer(Unmanaged.passUnretained(coordinator).toOpaque())
+            let actualCoordinatorBytes = malloc_size(coordinatorPointer)
+            var measuredCoordinatorBytes: Int?
+            coordinator.inspectRetainedPreparationRoots { _, pointer, bytes in
+                if pointer == coordinatorPointer {
+                    XCTAssertNil(measuredCoordinatorBytes)
+                    measuredCoordinatorBytes = bytes
+                }
+            }
+            XCTAssertGreaterThan(actualCoordinatorBytes, 0)
+            XCTAssertEqual(measuredCoordinatorBytes, actualCoordinatorBytes,
+                           "Measure the original coordinator with its real attempt relay alias attached")
+            XCTAssertEqual(AVPlayerItemCoordinator.resourceContextReservationBytes, 12 * 1_024)
+            XCTAssertLessThanOrEqual(actualCoordinatorBytes,
+                                     AVPlayerItemCoordinator.resourceContextReservationBytes)
+            print("URI_COORDINATOR_ROOT actual=\(actualCoordinatorBytes) "
+                + "reservation=\(AVPlayerItemCoordinator.resourceContextReservationBytes); "
+                + "root-only measurement, aggregate preparation remains separately gated")
+            XCTAssertEqual(builder.metadataChargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+            XCTAssertLessThanOrEqual(try XCTUnwrap(builder.relay).knownAllocationUpperBoundBytes,
+                                     HLSRuntimeFailureMetadataOwner.reservationBytes)
+            let first = PlaybackErrorDiagnostics.snapshot(AVPlayerItemCoordinatorFailure.invalidTimeline)
+            if producerFailureFirst { builder.relay?.record(first) }
+            var malformed = try XCTUnwrap(URLComponents(url: fixture.request.itemURL,
+                                                        resolvingAgainstBaseURL: false))
+            malformed.percentEncodedPath += "/%2e%2e/media.m4s"
+            let uri = try XCTUnwrap(malformed.url)
+            XCTAssertEqual(driver.emitAccessLogURI(uri), .invalidLocalResource)
+            XCTAssertEqual(coordinator.phase, .stopping)
+            XCTAssertEqual(driver.rate, 0)
+            XCTAssertEqual(driver.playCallCount, 0)
+            XCTAssertFalse(coordinator.requiresReplacementRetirement(graph.lifecycle))
+            XCTAssertNil(graph.registry.outputResourceContextSnapshot()?.owner,
+                         "A transport fault must not launch a rendition replacement owner")
+            guard case let .backendFailed(diagnostic, scope, _)? = builder.event else {
+                throw AVPlayerItemCoordinatorFailure.noCurrentItem
+            }
+            XCTAssertTrue(scope.matches(ticket), "The event must retain the original prepare scope")
+            XCTAssertEqual(diagnostic, producerFailureFirst ? first
+                : PlaybackErrorDiagnostics.snapshot(AVPlayerItemCoordinatorFailure.itemFailed))
+            XCTAssertEqual(builder.eventCount, 1)
+            _ = driver.emitAccessLogURI(uri)
+            builder.relay?.record(first)
+            XCTAssertEqual(builder.eventCount, 1, "Both producers share the same immutable first-error slot")
+        } catch { operationError = error }
+
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .terminal, at: graph.registry.clock.nowNanoseconds, teardown: true))
+        let receiver = Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+        XCTAssertTrue(graph.registry.startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+            terminalState: .failed(.init(code: "test.uri-resource", userMessage: "fixture"))))
+        await graph.registry.joinOwnedTerminalCleanup(session: context.sessionIdentity)
+        try receiver.result()
+        XCTAssertNil(graph.registry.ownedResourceSnapshot())
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(builder.buildCount, 1, "Terminal cleanup cannot create a replacement bundle")
+        XCTAssertEqual(builder.retireCount, 1)
+        XCTAssertEqual(coordinator.state.stopCount, 1)
+        XCTAssertEqual(builder.metadataChargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes,
+                       "The queued event and explicit relay alias retain their original charge")
+        builder.releaseObservedFailure()
+        XCTAssertEqual(builder.metadataChargedBytes, 0,
+                       "Physical retirement must clear the coordinator alias before the last event is released")
+        try await transport.retire()
+        if let operationError { throw operationError }
     }
 
     func testQueuedCurrentLogFaultBlocksOwnedNativePlayBeforeDeliveryButStaleFaultDoesNot() async throws {
@@ -3804,6 +4115,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var diagnosticPhases = false
     var conflictingRenditionFence: AVPlayerPreparationFence?
     var accessLogURIAtFence: (AVPlayerPreparationFence, URL)?
+    var onPreparationFence: ((AVPlayerPreparationFence, AVPlayerItemInstanceIdentity) -> Void)?
     private var accessLogItem: AVPlayerItemInstanceIdentity?
     private var accessLogClassifier: (@Sendable (URL) -> AccessLogURIClassification)?
     private var accessLogHandler: (@MainActor @Sendable (AccessLogURIClassification, AVPlayerItemInstanceIdentity) -> Void)?
@@ -4030,6 +4342,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
 
     func preparationFenceReached(_ fence: AVPlayerPreparationFence,
                                  item: AVPlayerItemInstanceIdentity) {
+        onPreparationFence?(fence, item)
         if conflictingRenditionFence == fence { conflictHandler?() }
         if let (expected, uri) = accessLogURIAtFence, expected == fence {
             _ = emitAccessLogURI(uri)
@@ -5004,6 +5317,9 @@ private final class Task21Harness {
         let port = try XCTUnwrap(original.port)
         changed.port = port == 65_535 ? 65_534 : port + 1
         values.append(("foreign-port", try XCTUnwrap(changed.url)))
+        changed = original
+        changed.percentEncodedHost = "%31%32%37.0.0.1"
+        values.append(("encoded-host-spelling", try XCTUnwrap(changed.url)))
         for host in ["localhost", "127.1"] {
             changed = original
             changed.host = host
@@ -7298,19 +7614,34 @@ private final class FinalWriterTerminalHTTPFixture: @unchecked Sendable {
             XCTAssertFalse(body.isEmpty)
         }
         let terminalKey = try XCTUnwrap(publication.publisher.visible?.media[2]?.resources.last)
+        let terminalObject = try XCTUnwrap(publication.terminalMediaObject)
+        XCTAssertEqual(terminalKey, HLSResourceKey(terminalObject),
+                       "The advertised tail must be the actual final writer object")
+        func terminalBodyCompleted() -> Bool {
+            guard let evidence = server.completedEvidence(for: terminalKey) else { return false }
+            return evidence.isComplete && evidence.uniqueResponseCount > 0
+                && evidence.itemGeneration == terminalKey.itemGeneration
+                && evidence.mediaEpoch == terminalKey.mediaEpoch
+                && evidence.renditionIdentity == terminalObject.binding.renditionIdentity
+                && evidence.resourceIdentity == terminalObject.backing.identity
+                && evidence.sealedDigest == terminalObject.digest
+                && evidence.sealedBodyLength == terminalObject.bytes.count
+                && evidence.normalizedByteRanges == [0..<terminalObject.bytes.count]
+        }
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while server.currentAudioSelectionCapability(
+        while (server.currentAudioSelectionCapability(
             itemGeneration: 19,
             publicationSequence: publicationSequence
-        ) == nil, ContinuousClock.now < deadline {
+        ) == nil || !terminalBodyCompleted()), ContinuousClock.now < deadline {
             await Task.yield()
         }
-        guard let capability = server.completedPublicationCapability(
-            itemURL: bundle.request.itemURL, itemGeneration: 19,
-            publicationSequence: publicationSequence),
-              let evidence = server.consumeCompletedPublicationCapability(capability),
-              evidence.participants.first(where: { $0.participantID == 2 })?
-                .completedMedia.contains(where: { $0.key == terminalKey }) == true else {
+        // A DEBUG completed-publication capability freezes the active preparation
+        // owner's completed-resource set. The concurrently running coordinator
+        // must remain its sole freezer after seek/loaded-range coverage checks.
+        // Observe the exact real send-terminal body without minting that capability.
+        guard server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: publicationSequence) != nil,
+              terminalBodyCompleted() else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
     }
@@ -7355,6 +7686,8 @@ private final class FinalWriterTerminalPublicationHarness: @unchecked Sendable {
     private let timeline: SegmentTimelineValidator
     private var media: [SealedMediaObject]
     private var packets: [Task19Packet]
+
+    var terminalMediaObject: SealedMediaObject? { media.last }
 
     init(token: LoopbackSessionToken, pending: Task21PendingAACSeed,
          includeRenditionBinding: Bool = false,
@@ -8585,6 +8918,88 @@ private enum Task21Fixtures {
               terminalLogicalSequence: value.terminalLogicalSequence,
               lastEffectiveEnd: end,
               terminalPhysicalEnd: value.terminalPhysicalEnd)
+    }
+}
+
+@MainActor
+private struct Task21RetiredPreparationLogAttempt {
+    let builder: Task21LogFailureBundleBuilder
+    let item: AVPlayerItemInstanceIdentity
+    let ticket: PrepareTicket
+}
+
+@MainActor
+private final class Task21LogTransportOwner {
+    private var fixture: Task21HarnessAuthorityFixture?
+    init(fixture: Task21HarnessAuthorityFixture) { self.fixture = fixture }
+    func retire() async throws {
+        guard let fixture else { return }
+        try await fixture.retireTransportAwaitingCompletion()
+        self.fixture = nil
+    }
+}
+
+/// The real backend binds this genuine attempt relay. Only its event delivery is
+/// held in a scalar so the test can inspect the scope before owned terminal cleanup.
+private final class Task21LogFailureBundleBuilder: HLSOutputItemBundleBuilding, @unchecked Sendable {
+    private final class Events: @unchecked Sendable {
+        let lock = NSLock()
+        var event: PlaybackPipelineEvent?
+        var eventCount = 0
+        var retireCount = 0
+    }
+    private let replacement: AVPlayerItemReplacementBundle
+    private let retireProducer: HLSOutputItemBundle.ProducerRetirement
+    private let events = Events()
+    private let lock = NSLock()
+    private var storedRelay: HLSRuntimeFailureRelay?
+    private var storedPrepareTicket: PrepareTicket?
+    private var builds = 0
+    // A dedicated paired ledger makes the exact charge/last-alias assertion atomic
+    // with respect to this test; unrelated shared resource releases cannot affect it.
+    private let metadataLedger = PlaybackResourceContextLedger(
+        applicationLedger: HLSDeliveryApplicationChargeLedger())
+    var relay: HLSRuntimeFailureRelay? { lock.withLock { storedRelay } }
+    var prepareTicket: PrepareTicket? { lock.withLock { storedPrepareTicket } }
+    var buildCount: Int { lock.withLock { builds } }
+    var metadataChargedBytes: Int { metadataLedger.chargedBytes }
+    var event: PlaybackPipelineEvent? { events.lock.withLock { events.event } }
+    var eventCount: Int { events.lock.withLock { events.eventCount } }
+    var retireCount: Int { events.lock.withLock { events.retireCount } }
+
+    init(replacement: AVPlayerItemReplacementBundle,
+         retireProducer: @escaping HLSOutputItemBundle.ProducerRetirement) {
+        self.replacement = replacement
+        self.retireProducer = retireProducer
+    }
+
+    func releaseObservedFailure() {
+        lock.withLock { storedRelay = nil }
+        events.lock.withLock { events.event = nil }
+    }
+
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation)
+        async throws -> HLSOutputItemBundle {
+        let metadata = try HLSRuntimeFailureMetadataOwner.reserve(in: metadataLedger)
+        let events = events
+        let scope = PlaybackBackendPrepareFailureScope(ticket: invocation.ticket)
+        let relay = try HLSRuntimeFailureRelay(metadataOwner: metadata) { diagnostic, owner in
+            events.lock.withLock {
+                events.eventCount += 1
+                if events.event == nil {
+                    events.event = .backendFailed(diagnostic, prepareScope: scope, metadataOwner: owner)
+                }
+            }
+        }
+        lock.withLock { storedRelay = relay; storedPrepareTicket = invocation.ticket; builds += 1 }
+        let replacement = replacement
+        let retireProducer = retireProducer
+        return HLSOutputItemBundle(replacement: replacement, startProducer: { replacement },
+            retireProducer: {
+                events.lock.withLock { events.retireCount += 1 }
+                return await retireProducer()
+            },
+            runtimeFailure: relay)
     }
 }
 

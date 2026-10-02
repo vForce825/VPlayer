@@ -589,6 +589,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               snapshot.interval.itemGeneration == identity.itemGeneration else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        // Classification and this native admission run on MainActor. Inspect the
+        // current pending scalar without holding the hub lock across AVPlayer.
+        if let failure = eventHub.pendingAccessFailure(item: identity) { throw failure }
         guard invocation.performPositiveRateSideEffect({ player.play() }) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
@@ -688,19 +691,29 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     /// Reduce the complete fetched batch into one scalar. The visitor runs after
     /// the SDK await and validates the original ticket before any classification.
-    /// A matching tail cannot erase an earlier conflict in this coalesced read.
+    /// A benign tail cannot erase a fault. Queue a known fault immediately so it
+    /// fences native admission before delivery and never waits for another SDK read.
     private func readAccessLog(_ item: AVPlayerItem,
                                ticket: AVPlayerLogSnapshotCache.Ticket) async -> Int {
         var reduced: AccessLogURIClassification?
+        var faultEnqueued = false
         let count = await logReader.readAccessLog(item: item) { [self] rawURI in
             guard logSnapshotCache.isCurrent(ticket), self.item === item,
                   player.currentItem === item, let url = URL(string: rawURI),
                   let classification = eventHub.classify(url, item: ticket.scope.item) else { return }
-            if reduced != .conflicting { reduced = classification }
+            reduced = reduced?.coalescing(classification) ?? classification
+            if classification.isTerminalFault {
+                // The reader visits its complete batch synchronously on MainActor.
+                // One coalesced wake therefore sees the full fault priority.
+                eventHub.receive(classification, item: ticket.scope.item)
+                faultEnqueued = true
+            }
         }
         guard logSnapshotCache.isCurrent(ticket), self.item === item,
               player.currentItem === item else { return 0 }
-        if let reduced { eventHub.receive(reduced, item: ticket.scope.item) }
+        // The queued handler may have consumed the fault while this async call
+        // returned. Never emit that same batch again after its first delivery.
+        if !faultEnqueued, let reduced { eventHub.receive(reduced, item: ticket.scope.item) }
         return count
     }
 
@@ -1045,11 +1058,21 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
     func receive(_ classification: AccessLogURIClassification, item: AVPlayerItemInstanceIdentity) {
         let schedule = lock.withLock {
             guard self.item == item, accessHandler != nil else { return false }
-            // conflict 不能被随后 matching/unrelated 覆盖而丢失撤销语义。
-            if pendingAccess != .conflicting { pendingAccess = classification }
+            pendingAccess = pendingAccess?.coalescing(classification) ?? classification
             return reserveDeliveryLocked()
         }
         if schedule { deliver() }
+    }
+
+    func pendingAccessFailure(item: AVPlayerItemInstanceIdentity) -> AVPlayerItemCoordinatorFailure? {
+        lock.withLock {
+            guard self.item == item else { return nil }
+            switch pendingAccess {
+            case .invalidLocalResource: return .itemFailed
+            case .conflicting: return .selectionChanged
+            case .matching, .unrelated, nil: return nil
+            }
+        }
     }
 
     func receiveEndpoint(item: AVPlayerItemInstanceIdentity, token: UUID) {

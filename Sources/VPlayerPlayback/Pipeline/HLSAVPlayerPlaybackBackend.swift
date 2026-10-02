@@ -236,6 +236,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                     PlaybackDiagnosticTracker.shared.append("hls_c_inst_ok")
                     #endif
                     try createdCoordinator.bindPrepareInvocation(invocation)
+                    try createdCoordinator.bindRuntimeFailureRelay(next.runtimeFailureRelay,
+                        invocation: invocation)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("hls_c_bind_ok")
                     #endif
@@ -346,6 +348,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                     next.replacement,
                     invocation: invocation
                 )
+                try coordinator.bindRuntimeFailureRelay(next.runtimeFailureRelay,
+                    invocation: invocation)
             }
             _ = try await coordinator.prepareCurrentItem(invocation: invocation)
             next.armRuntimeFailure()

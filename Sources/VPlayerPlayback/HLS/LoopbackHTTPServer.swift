@@ -2888,15 +2888,18 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                               selected: AudioRenditionIdentity?)
         -> AccessLogURIClassification {
         queueSync {
-            guard observed.host == localHost else { return .unrelated }
-            guard observed.scheme == "http", observed.port == Int(port),
-                  observed.user == nil, observed.password == nil,
+            // This is the canonical advertised listener origin, not general web
+            // origin equivalence. URL.host decodes percent-encoded host spellings;
+            // those spellings, aliases, different schemes and ports are unrelated.
+            guard let components = URLComponents(url: observed, resolvingAgainstBaseURL: false),
+                  observed.scheme == "http", observed.host == localHost,
+                  components.percentEncodedHost == localHost,
+                  observed.port == Int(port) else { return .unrelated }
+            guard observed.user == nil, observed.password == nil,
                   observed.fragment == nil,
                   let binding = authorityBindings[publicationSequence],
                   binding.itemGeneration == itemGeneration,
                   let participants = participantsByPublication[publicationSequence],
-                  let components = URLComponents(url: observed,
-                                                 resolvingAgainstBaseURL: false),
                   components.percentEncodedPath == observed.path,
                   !observed.absoluteString.lowercased().contains("%2e") else {
                 return .invalidLocalResource
