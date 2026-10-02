@@ -273,6 +273,60 @@ final class VTVideoEncoderTests: XCTestCase {
         XCTAssertEqual(ledger.chargedBytes, 0)
     }
 
+    func testUnsupportedMandatoryClosedGOPPropertyRejectsBothCodecsWithExactNativeFailure() {
+        // Removing the mandatory-property guard would construct an encoder here,
+        // losing both the native diagnostic and the closed-GOP requirement.
+        let api = FakeVTCompressionAPI()
+        let key = kVTCompressionPropertyKey_AllowOpenGOP as String
+        api.unsupportedPropertyKeys = [key]
+
+        XCTAssertThrowsError(try makeEncoder(api: api)) { error in
+            XCTAssertEqual(error as? VTVideoEncoderFailure,
+                           .propertySet(key, kVTPropertyNotSupportedErr))
+        }
+        let snapshot = api.snapshot
+        XCTAssertEqual(snapshot.creates.map(\.codecType), [
+            kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
+        ])
+        XCTAssertEqual(snapshot.sets.filter { $0.key == key }.map(\.value), [
+            .boolean(false), .boolean(false),
+        ])
+        XCTAssertEqual(snapshot.invalidatedSessionIDs.map(\.rawValue), [1, 2])
+        XCTAssertEqual(snapshot.hardwareCopyCount, 0,
+                       "Rejected configuration must never issue a hardware proof")
+        XCTAssertTrue(snapshot.encodes.isEmpty)
+    }
+
+    #if targetEnvironment(simulator)
+    func testSimulatorRejectsMeasuredUnsupportedNativeClosedGOPPropertyWithExactFailure() throws {
+        let format = makeFormat(width: 1_280, height: 720)
+        let bitrate = try VTVideoBitratePolicy.freeze(
+            firstTwoSecondsByteCount: 100,
+            width: format.width, height: format.height,
+            bitDepth: format.bitDepth, dynamicRange: format.dynamicRange)
+        let configuration = VTVideoEncoderConfiguration(
+            generation: MediaGeneration(rawValue: 22_002),
+            inputFormat: format,
+            frameRate: try XCTUnwrap(MediaRational(num: 30, den: 1)),
+            bitrate: bitrate,
+            maximumPendingFrameCount: 4
+        )
+        let matches = simulatorMatchesMeasuredUnsupportedCapabilities(configuration)
+        XCTAssertTrue(matches,
+                      "Native capabilities differ from the measured tvOS 27 simulator condition; do not classify an unknown failure as an unsupported environment")
+        guard matches else { return }
+        var unexpected: VTVideoEncoder?
+        defer { unexpected?.cancel() }
+        XCTAssertThrowsError(unexpected = try VTVideoEncoder(configuration: configuration)) { error in
+            XCTAssertEqual(error as? VTVideoEncoderFailure, .propertySet(
+                kVTCompressionPropertyKey_AllowOpenGOP as String,
+                kVTPropertyNotSupportedErr
+            ))
+        }
+        XCTAssertNil(unexpected, "Rejected native configuration must not construct an encoder")
+    }
+    #endif
+
     func testRealSystemVTCompressionCreatesPreparesAndReturnsHardwareFirstOutput()
         async throws {
         let format = makeFormat(width: 1_280, height: 720)
@@ -284,13 +338,16 @@ final class VTVideoEncoderTests: XCTestCase {
             dynamicRange: format.dynamicRange)
         let generation = MediaGeneration(rawValue: 22_001)
         let ledger = HLSDeliveryApplicationChargeLedger()
-        let encoder = try VTVideoEncoder(configuration: .init(
+        let configuration = VTVideoEncoderConfiguration(
             generation: generation,
             inputFormat: format,
             frameRate: try XCTUnwrap(MediaRational(num: 30, den: 1)),
             bitrate: bitrate,
             maximumPendingFrameCount: 4
-        ), compressedOutputOwnership: .init(
+        )
+        try requireNativeHardwareFirstOutputCapabilities(configuration)
+        let encoder = try VTVideoEncoder(configuration: configuration,
+                                        compressedOutputOwnership: .init(
             maximumPayloadBytes: 64 * 1_024 * 1_024,
             capacity: 4,
             maximumRetainedBytes: 64 * 1_024 * 1_024,
@@ -1387,6 +1444,94 @@ private enum CodecConfigurationAtomFixture {
 }
 
 private extension VTVideoEncoderTests {
+    func requireNativeHardwareFirstOutputCapabilities(
+        _ configuration: VTVideoEncoderConfiguration
+    ) throws {
+        #if targetEnvironment(simulator)
+        // Xcode 27 / tvOS 27 simulator measurement: run 36973279538.
+        // These keys are public on tvOS 17.4+. A missing readback is not proof
+        // that physical hardware is absent, nor permission to assume hardware.
+        // Classify only the exact measured native capability combination.
+        guard simulatorMatchesMeasuredUnsupportedCapabilities(configuration) else { return }
+        let expected = VTVideoEncoderFailure.propertySet(
+            kVTCompressionPropertyKey_AllowOpenGOP as String,
+            kVTPropertyNotSupportedErr
+        )
+        do {
+            let unexpected = try VTVideoEncoder(configuration: configuration)
+            unexpected.cancel()
+            XCTFail("Production must reject the independently measured unsupported mandatory property")
+            return
+        } catch let failure as VTVideoEncoderFailure {
+            XCTAssertEqual(failure, expected,
+                           "The real simulator rejection must preserve the exact native key/status")
+            guard failure == expected else { throw failure }
+        }
+        throw XCTSkip("tvOS simulator capability limit: H.264 and HEVC both reject AllowOpenGOP=false with kVTPropertyNotSupportedErr (-12900), and UsingHardwareAcceleratedVideoEncoder is unsupported after prepare. Production's exact fail-closed rejection was verified; real hardware first-output acceptance still requires a capable device and is NOT VERIFIED here.")
+        #endif
+    }
+
+    #if targetEnvironment(simulator)
+    func simulatorMatchesMeasuredUnsupportedCapabilities(
+        _ configuration: VTVideoEncoderConfiguration
+    ) -> Bool {
+        let format = configuration.inputFormat
+        func matches(codec: CMVideoCodecType, profile: CFString) -> Bool {
+            var optionalSession: VTCompressionSession?
+            let createStatus = VTCompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                width: format.width, height: format.height, codecType: codec,
+                encoderSpecification: [
+                    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true,
+                ] as CFDictionary,
+                imageBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: format.pixelFormat,
+                    kCVPixelBufferWidthKey as String: format.width,
+                    kCVPixelBufferHeightKey as String: format.height,
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                ] as CFDictionary,
+                compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
+                compressionSessionOut: &optionalSession
+            )
+            guard let session = optionalSession else { return false }
+            defer { VTCompressionSessionInvalidate(session) }
+            guard createStatus == noErr else { return false }
+            func copyIsUnsupported(_ key: CFString) -> Bool {
+                var copied: Unmanaged<CFTypeRef>?
+                let status = withUnsafeMutablePointer(to: &copied) { pointer in
+                    VTSessionCopyProperty(
+                        session, key: key, allocator: kCFAllocatorDefault,
+                        valueOut: UnsafeMutableRawPointer(pointer)
+                    )
+                }
+                let value = copied?.takeRetainedValue()
+                return status == kVTPropertyNotSupportedErr && value == nil
+            }
+            var supported: CFDictionary?
+            guard VTSessionCopySupportedPropertyDictionary(session, supportedPropertyDictionaryOut: &supported) == noErr,
+                  let properties = supported as? [String: Any],
+                  properties[kVTCompressionPropertyKey_AllowOpenGOP as String] == nil,
+                  properties[kVTCompressionPropertyKey_OutputBitDepth as String] == nil,
+                  properties[kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder as String] == nil,
+                  VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowOpenGOP,
+                                       value: kCFBooleanFalse) == kVTPropertyNotSupportedErr,
+                  copyIsUnsupported(kVTCompressionPropertyKey_AllowOpenGOP),
+                  VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
+                                       value: profile) == noErr,
+                  VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowOpenGOP,
+                                       value: kCFBooleanFalse) == kVTPropertyNotSupportedErr,
+                  copyIsUnsupported(kVTCompressionPropertyKey_AllowOpenGOP),
+                  VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
+                return false
+            }
+            return copyIsUnsupported(kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder)
+        }
+        return matches(codec: kCMVideoCodecType_H264, profile: kVTProfileLevel_H264_High_AutoLevel)
+            && matches(codec: kCMVideoCodecType_HEVC, profile: kVTProfileLevel_HEVC_Main_AutoLevel)
+    }
+    #endif
+
     enum FallbackFailure: Equatable { case create, prepare, hardware }
 
     func makeEncoder(
@@ -2069,6 +2214,7 @@ private final class FakeVTCompressionAPI: VTCompressionAPI, @unchecked Sendable 
     var createStatuses: [OSStatus] = []
     var prepareStatuses: [OSStatus] = []
     var propertyStatuses: [OSStatus] = []
+    var unsupportedPropertyKeys: Set<String> = []
     var hardwareResults: [VTCompressionPropertyCopyResult] = [.hardware]
     var encodeStatuses: [OSStatus] = []
     var synchronousOutput: VTCompressionOutput?
@@ -2127,6 +2273,7 @@ private final class FakeVTCompressionAPI: VTCompressionAPI, @unchecked Sendable 
     ) -> OSStatus {
         lock.withLock {
             sets.append(SetRecord(key: key, value: value))
+            if unsupportedPropertyKeys.contains(key) { return kVTPropertyNotSupportedErr }
             return propertyStatuses.isEmpty ? noErr : propertyStatuses.removeFirst()
         }
     }

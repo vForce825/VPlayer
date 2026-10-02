@@ -1400,22 +1400,51 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
     func testAudioFailureReceiverUsesOwnedTerminalCleanupWithoutJoiningItself() async throws {
         let registry = ControlTaskRegistry(allocator: .init())
         let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let deactivationEntered = expectation(description: "Original cleanup reached physical deactivation")
+        let entered = Task9CompletionObservation()
+        let deactivationGate = DispatchSemaphore(value: 0)
+        defer { deactivationGate.signal() }
+        sdk.lock.withLock {
+            sdk.onDeactivate = {
+                entered.complete()
+                deactivationEntered.fulfill()
+                deactivationGate.wait()
+            }
+        }
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
         let service = PlaybackAudioRouteService(registry: registry, owner: owner)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: service, backendFactory: Task9PreparedFactory())
         await controller.play(request())
+        let session = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sessionIdentity)
+        let audioDrain = try actualAudioDrain(registry)
         owner.monitor.emit(.recoveryFailed(stage: .eventRelayCapacity))
-        for _ in 0..<500 {
-            if case .failed = await controller.currentStateForTesting { break }
-            try await Task.sleep(nanoseconds: 2_000_000)
+        await fulfillment(of: [deactivationEntered], timeout: 2)
+        guard entered.value else {
+            // A receiver that joins itself never reaches deactivation. Do not
+            // follow a failed entry barrier by joining that same deadlocked tail.
+            return XCTFail("Audio failure must return from its receiver so owned cleanup can join it")
         }
-        guard case .failed = await controller.currentStateForTesting else {
-            // 旧实现receiver→裸teardown→原receiver形成环；RED不再次await同一个死锁。
-            return XCTFail("audio failure必须从receiver返回，由原owned cleanup完成后发布终态")
+        guard case .failed = registry.playbackStateSnapshot() else {
+            return XCTFail("The first failure must be visible before physical cleanup finishes")
         }
+        XCTAssertNotNil(registry.ownedResourceSnapshot(), "Early failure publication is not physical lease release")
+        XCTAssertEqual(registry.phase(of: audioDrain.ticket), .terminal(.canceled),
+            "Deactivation follows the original audio receiver's actual return and join")
+        let cleanupRecord = try XCTUnwrap(task9OwnedRecords(registry).first {
+            if case .controllerCleanup = $0.payload { return true }
+            return false
+        })
+        guard case .controllerCleanup(let cleanupRunner) = cleanupRecord.payload else {
+            return XCTFail("The original cleanup record must retain its running task")
+        }
+        let cleanupTask = try XCTUnwrap(registry.executor.sync { cleanupRunner.task })
+        deactivationGate.signal()
+        await cleanupTask.value
         XCTAssertNil(registry.ownedResourceSnapshot())
         XCTAssertEqual(sdk.lock.withLock { sdk.deactivateCallCount }, 1)
+        await registry.joinOwnedTerminalCleanup(session: session)
+        XCTAssertNil(registry.phase(of: cleanupRecord.controlTaskTicket))
         await controller.stop()
         XCTAssertNil(registry.cleanupReservationSnapshot())
         XCTAssertEqual(registry.occupancy.groups, 0)
@@ -2361,25 +2390,66 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         let factory = Task9PreparedFactory()
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: service, backendFactory: factory)
-        await controller.play(request())
+        let requested = request()
+        await controller.play(requested)
         let predecessor = try XCTUnwrap(factory.backends.first)
+        let predecessorContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let predecessorRun = PlaybackRunIdentity(sessionID: predecessorContext.sessionIdentity.sessionID,
+            requestID: predecessorContext.sessionIdentity.requestID)
+        let predecessorDrainRecord = try XCTUnwrap(task9OwnedRecords(registry).first {
+            guard case .eventDrain(let runner) = $0.payload else { return false }
+            if case .pipeline = runner.relay { return true }
+            return false
+        })
+        guard case .eventDrain(let predecessorDrain) = predecessorDrainRecord.payload,
+              case .pipeline(let predecessorRelay) = predecessorDrain.relay else {
+            return XCTFail("The predecessor must use its original owned pipeline relay")
+        }
+        // Freeze the actual callback while it still captures the predecessor's
+        // backend identity. Awaiting it later also tests a delivery already past
+        // relay ingress; no latest backend identity is substituted by the test.
+        let predecessorReceiver = try XCTUnwrap(task9Field("receiver", of: predecessorRelay)
+            as? PlaybackSessionEventRelay.Receiver)
         sdk.lock.withLock { sdk.initialPorts = .airPlay }
         await controller.requestRouteHandoff(to: .hlsAVPlayer)
+
+        // Stable commit wakes prepareSuccessor before the route timer schedules
+        // its recovery callback. Finish that executor callback, then join the
+        // real recovery transaction before observing the settled successor.
+        registry.executor.sync {}
+        await controller.recoveryCoordinator.waitForCurrentRecovery()
         let successor = try XCTUnwrap(factory.backends.last)
         XCTAssertNotEqual(predecessor.identity, successor.identity)
-        let stream = await controller.events()
-        let unexpected = expectation(description: "原后端迟到terminal不得结束同session后继")
-        unexpected.isInverted = true
-        let observation = Task {
-            for await state in stream {
-                if state == .stopped { unexpected.fulfill(); return }
-            }
-        }
+        XCTAssertNil(registry.phase(of: predecessorDrainRecord.controlTaskTicket),
+            "The handoff must join and retire the predecessor's exact drain record")
+        XCTAssertTrue(registry.executor.sync { predecessorDrain.joining })
+        XCTAssertEqual(task9Field("isActive", of: predecessorRelay) as? Bool, false)
+        XCTAssertEqual(task9Field("pendingCount", of: predecessorRelay) as? Int, 0)
+        let settled = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        XCTAssertEqual(settled.candidateBackendIdentity, successor.identity)
+        XCTAssertTrue(settled.prepared)
+        XCTAssertNil(settled.owner)
+        XCTAssertEqual(registry.playbackStateSnapshot(), .playing(requested))
+        XCTAssertEqual(factory.outputConcurrency.current, 1)
+        let retirementBaseline = successor.retirementEpochs
+        let activationBaseline = successor.activationCount
+        let admissionBaseline = registry.playbackRequestAdmissionSnapshot()
+
         predecessor.emit(.stopped)
-        await fulfillment(of: [unexpected], timeout: 0.05)
+        XCTAssertEqual(task9Field("isActive", of: predecessorRelay) as? Bool, false)
+        XCTAssertEqual(task9Field("pendingCount", of: predecessorRelay) as? Int, 0,
+            "The retired relay must reject late ingress synchronously")
+        await predecessorReceiver(predecessorRun, .stopped)
         XCTAssertEqual(registry.outputResourceContextSnapshot()?.candidateBackendIdentity, successor.identity)
-        XCTAssertTrue(successor.retirementEpochs.isEmpty)
-        observation.cancel()
+        XCTAssertEqual(successor.retirementEpochs, retirementBaseline,
+            "A late predecessor terminal cannot add any successor retirement")
+        XCTAssertEqual(successor.activationCount, activationBaseline)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.activation, settled.activation)
+        XCTAssertNil(registry.outputResourceContextSnapshot()?.owner)
+        XCTAssertEqual(registry.playbackRequestAdmissionSnapshot(), admissionBaseline)
+        XCTAssertEqual(registry.playbackStateSnapshot(), .playing(requested))
+        XCTAssertEqual(factory.outputConcurrency.current, 1)
+        XCTAssertEqual(factory.outputConcurrency.maximum, 1)
         await controller.stop()
     }
 

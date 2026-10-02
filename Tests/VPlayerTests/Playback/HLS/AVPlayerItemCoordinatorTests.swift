@@ -932,6 +932,18 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(stale, .rejected)
     }
 
+    func testLiveAVPreparationUsesWriterPrefixWhenFinalTailIsOutsidePublication() async throws {
+        let harness = try await Task21Harness()
+        try harness.assertLiveAVPrefixPrerequisites()
+        let prepared = try await harness.prepare()
+        XCTAssertNotNil(prepared.identity.timelineMappingAuthority.aacPrefixReceipt)
+        XCTAssertNil(prepared.identity.timelineMappingAuthority.aacEndpointReceipt)
+        XCTAssertNil(harness.driver.constrainedPlaybackEnd,
+            "a live prefix must not invent the unpublished final endpoint")
+        XCTAssertEqual(harness.driver.prerollCallCount, 1)
+        try await harness.shutdown()
+    }
+
     func testRegistryPauseResumePauseReusesPreparedItemButRetiresOldReceipt() async throws {
         let harness = try await Task21Harness(
             directAudioOnlyRendition: .init(rawValue: 2))
@@ -4144,14 +4156,14 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
     let source: LoopbackAVPlayerPreparationEvidenceSource
     let request: AVPlayerItemPreparationRequest
     private let publication: Task21RealHLSHarness
-    private let endpointAuthority: AACEffectiveEndpointAuthority
+    private let endpointAuthority: AACEffectiveEndpointAuthority?
     private let diagnosticPhases: Bool
 
     private init(server: LoopbackHTTPServer,
                  source: LoopbackAVPlayerPreparationEvidenceSource,
                  request: AVPlayerItemPreparationRequest,
                  publication: Task21RealHLSHarness,
-                 endpointAuthority: AACEffectiveEndpointAuthority,
+                 endpointAuthority: AACEffectiveEndpointAuthority?,
                  diagnosticPhases: Bool) {
         self.server = server
         self.source = source
@@ -4238,11 +4250,30 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
         task21FixturePhase("selection.ready", enabled: diagnosticPhases)
+        let timelineEndpoint: AACEffectiveEndpointAuthority?
+        if let avSeed {
+            timelineEndpoint = avSeed.audioRenditionBinding.endpointAuthority
+        } else {
+            timelineEndpoint = seed.endpointAuthority
+        }
         return .init(server: server, source: source,
                      request: bundle.request, publication: publication,
-                     endpointAuthority: avSeed?.endpointAuthority
-                        ?? seed.endpointAuthority,
+                     endpointAuthority: timelineEndpoint,
                      diagnosticPhases: diagnosticPhases)
+    }
+
+    func assertLiveAVPrefixPrerequisites(file: StaticString = #filePath, line: UInt = #line) throws {
+        let avSeed = try XCTUnwrap(publication.avSeed, file: file, line: line)
+        let snapshot = try XCTUnwrap(publication.publisher.visible, file: file, line: line)
+        let binding = avSeed.audioRenditionBinding
+        let participantID = binding.publicationParticipantID.rawValue
+        let audio = try XCTUnwrap(snapshot.media[participantID], file: file, line: line)
+        XCTAssertTrue(snapshot.aacRenditionBindings[participantID] === binding, file: file, line: line)
+        XCTAssertNil(binding.finalWriterReceipt, file: file, line: line)
+        XCTAssertNil(binding.endpointAuthority, file: file, line: line)
+        XCTAssertFalse(audio.text.hasSuffix("#EXT-X-ENDLIST\n"), file: file, line: line)
+        XCTAssertFalse(audio.resources.contains(avSeed.endpointAuthority.receipt.terminalMedia.key),
+            "this regression must retain an unpublished final tail", file: file, line: line)
     }
 
     func shutdown() {
@@ -4376,6 +4407,10 @@ private final class Task21Harness {
                 ], directAudioOnlyRendition: preparation.directAudioOnlyRendition)
         }
         try coordinator.install(preparation)
+    }
+
+    func assertLiveAVPrefixPrerequisites(file: StaticString = #filePath, line: UInt = #line) throws {
+        try authorityFixture.assertLiveAVPrefixPrerequisites(file: file, line: line)
     }
 
     func prepare() async throws -> PreparedAVPlayerItem {
@@ -5607,7 +5642,10 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             candidateTicket: candidate?.ticket,
             candidate: candidate,
             aacTerminalBinding: (avSeed?.endpointAuthority ?? seed.endpointAuthority)
-                .terminalBinding
+                .terminalBinding,
+            // This A/V snapshot is live and deliberately omits its final tail.
+            // Carry the original writer's real prefix authority into publication.
+            aacRenditionBinding: avSeed?.audioRenditionBinding
         )]
         if let avSeed {
             participants.insert(.init(initialization: avSeed.videoInitialization,
@@ -6513,6 +6551,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
     let audioProof: EpochFormatProof
     let audioPackets: [Task19Packet]
     let endpointAuthority: AACEffectiveEndpointAuthority
+    let audioRenditionBinding: AACRenditionTerminalBinding
     let videoRelay: SegmentReportRelay
     let videoInitialization: SealedMediaObject
     let videoProof: EpochFormatProof
@@ -6529,6 +6568,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                  audioProof: EpochFormatProof,
                  audioPackets: [Task19Packet],
                  endpointAuthority: AACEffectiveEndpointAuthority,
+                 audioRenditionBinding: AACRenditionTerminalBinding,
                  videoRelay: SegmentReportRelay,
                  videoInitialization: SealedMediaObject,
                  videoProof: EpochFormatProof,
@@ -6544,6 +6584,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
         self.audioProof = audioProof
         self.audioPackets = audioPackets
         self.endpointAuthority = endpointAuthority
+        self.audioRenditionBinding = audioRenditionBinding
         self.videoRelay = videoRelay
         self.videoInitialization = videoInitialization
         self.videoProof = videoProof
@@ -6979,6 +7020,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
         return Task21RealAVSeed(audioRelay: audioRelay,
             audioInitialization: audioInitialization, audioProof: audioProof,
             audioPackets: audioPackets, endpointAuthority: endpointAuthority,
+            audioRenditionBinding: try XCTUnwrap(audioWriter.aacRenditionTerminalBinding),
             videoRelay: videoRelay,
             videoInitialization: videoInitialization, videoProof: videoProof,
             videoPackets: videoPackets, sourceOrigin: sourceOrigin,

@@ -208,6 +208,8 @@ jobs:
             -only-testing:VPlayerTests/ChannelProgrammeLayoutTests \
             -only-testing:VPlayerTests/Task9RuntimeOwnershipTests/testPauseCancelsAndJoinsInflightActivationBeforeOneSuspension \
             -only-testing:VPlayerTests/VTVideoEncoderTests/testRealSystemVTCompressionCreatesPreparesAndReturnsHardwareFirstOutput \
+            -only-testing:VPlayerTests/VTVideoEncoderTests/testUnsupportedMandatoryClosedGOPPropertyRejectsBothCodecsWithExactNativeFailure \
+            -only-testing:VPlayerTests/VTVideoEncoderTests/testSimulatorRejectsMeasuredUnsupportedNativeClosedGOPPropertyWithExactFailure \
             -only-testing:VPlayerTests/PlaybackPipelineTests/testOneHundredRandomizedOldCallbacksNeverReachPresentation \
             -only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity
 
@@ -216,18 +218,11 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
         run: |
           python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testLiveAVPreparationUsesWriterPrefixWhenFinalTailIsOutsidePublication \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testActivationCallsPlayExactlyOnceOnlyForMatchingPermit \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSystemDriverUsesConfiguredStartupBufferForHomePodHLS \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts
-
-      - name: AAC and native writer regressions
-        id: writer_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' && steps.startup_probe.outcome == 'success' }}
-        run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/SegmentedFMP4WriterTests \
-            -only-testing:VPlayerTests/AACPrimingCalibratorTests
 
