@@ -1533,10 +1533,12 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
                     + "_endpoint_\(delivery.6 != nil)")
             }
             #endif
-            // 先交付 conflict，使其撤销对后续 playing/EOS 发布可见。
+            // Access faults revoke authority first. A matching endpoint then
+            // admits its bounded direct-read verification before a coalesced
+            // paused status asks whether that exact verification is pending.
             if let classification = delivery.4 { delivery.5?(classification, delivery.0) }
-            if let status = delivery.1, let activation = delivery.2 { delivery.3?(status, delivery.0, activation) }
             if let endpoint = delivery.6 { delivery.7?(delivery.0, endpoint) }
+            if let status = delivery.1, let activation = delivery.2 { delivery.3?(status, delivery.0, activation) }
             withExtendedLifetime(resourceTail) {}
         }
     }
