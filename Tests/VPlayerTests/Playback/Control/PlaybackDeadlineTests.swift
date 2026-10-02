@@ -285,6 +285,60 @@ final class PlaybackDeadlineTests: XCTestCase {
         XCTAssertEqual(parent.runningSince, resumeInstant)
     }
 
+    func testOrdinaryRouteDeadlinePublishesRouteUnavailableAtExactBoundaryAndPreservesFirstFailure() async throws {
+        let earlierFailure = PlaybackFailure(code: "test.earlier", userMessage: "Earlier failure")
+        for firstFailure in [nil, earlierFailure] {
+            let active = try ActiveDeadlineFixture()
+            let registry = active.fixture.registry
+            XCTAssertTrue(registry.completePlaybackMediaProgress(active.receipt))
+            XCTAssertTrue(registry.complete(try XCTUnwrap(active.context.sourceTask)))
+            guard case .open(let open) = registry.outputRouteObservationSnapshot() else {
+                return XCTFail("Fixture must begin with an open route")
+            }
+            registry.executor.safetyIngress.beginRouteObservation(.init(
+                sessionIdentity: open.sessionIdentity, monitorLifecycle: open.monitorLifecycle,
+                notificationRevision: open.routeObservationRevision + 1, reasonBits: 1,
+                topologyChangeHint: false, outputConfigurationChanged: false,
+                observedRoute: nil
+            ))
+            guard case .pending(let pending) = registry.outputRouteObservationSnapshot() else {
+                return XCTFail("Route ingress must own an ordinary deadline")
+            }
+            let deadline = try XCTUnwrap(pending.deadline)
+            let arm = try XCTUnwrap(registry.ordinaryRouteDeadlineArmSnapshot())
+            if let firstFailure { registry.publishState(.failed(firstFailure)) }
+            let scheduler = PlaybackDeadlineScheduler(registry: registry)
+            var receiver: DeadlineNoopTerminalCleanupReceiver? = .init()
+            registry.bindPlaybackRuntime(scheduler: scheduler, receiver: try XCTUnwrap(receiver))
+
+            active.clock.set(deadline.deadlineInstant - 1)
+            registry.executor.sync {}
+            XCTAssertFalse(registry.outputResourceContextSnapshot()?.poisoned == true)
+            if firstFailure == nil {
+                XCTAssertNotEqual(registry.playbackStateSnapshot(),
+                    .failed(PlaybackController.routeUnavailableFailure))
+            }
+
+            active.clock.advance(nanoseconds: 1)
+            registry.executor.sync {}
+            let expected = PlaybackState.failed(firstFailure ?? PlaybackController.routeUnavailableFailure)
+            XCTAssertEqual(registry.playbackStateSnapshot(), expected,
+                "The authoritative route ticket must publish its semantic failure without a second timer")
+            XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
+            XCTAssertEqual(registry.playbackDeadlineScheduleSnapshot(), .init())
+            XCTAssertNil(try registry.rearmOutputOrdinaryRouteDeadline(arm))
+            XCTAssertEqual(registry.playbackStateSnapshot(), expected,
+                "A stale route timer cannot replace the first terminal failure")
+            // This test observes publication, not resource retirement. Remove
+            // the weak no-op receiver before joining its real Task tail so the
+            // still-poisoned fixture cannot enqueue another no-op cleanup.
+            withExtendedLifetime(receiver) {}
+            receiver = nil
+            await registry.joinOwnedTerminalCleanup()
+            withExtendedLifetime((active, scheduler)) {}
+        }
+    }
+
     func testFirstProgressThenRecoveryTransitionStartsSameSemanticRecoveryImmediately() throws {
         let active = try ActiveDeadlineFixture()
         let registry = active.fixture.registry
@@ -840,6 +894,11 @@ private struct ActiveDeadlineFixture {
             audioAdmissionFenceRevision: snapshot.audioAdmissionFenceRevision,
             stableRouteCommit: fixture.stable.stable)
     }
+}
+
+private final class DeadlineNoopTerminalCleanupReceiver: PlaybackOwnedCleanupReceiving, Sendable {
+    func performOwnedTerminalCleanup(owner: OutputTransitionOwnerTicket,
+        task: ControlTaskTicket, terminalState: PlaybackState) async {}
 }
 
 private extension CurrentPlaybackOperationDeadlineTicket {

@@ -1,4 +1,4 @@
-name: Paused coverage workspace validation
+name: Control deadlines and fixture ownership validation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-paused-workspace-${{ github.ref }}
+  group: macos-ci-control-ownership-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-test:
     name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
@@ -65,7 +65,7 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify workspace, store and physical capacity contracts
+      - name: Verify route deadlines and recovery
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -73,15 +73,34 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/PausedStorage.xcresult" \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests \
-            -only-testing:VPlayerTests/HLSResourceStoreTests \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests \
-            -only-testing:VPlayerTests/HLSCapacityTests
-      - name: Report scoped paused storage failures
+            -resultBundlePath "$RUNNER_TEMP/ControlDeadlines.xcresult" \
+            -only-testing:VPlayerTests/PlaybackDeadlineTests \
+            -only-testing:VPlayerTests/PlaybackRecoveryTests
+      - name: Report scoped ControlDeadlines failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorage.xcresult"
-      - name: Verify remaining native endpoint presentation cases
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlDeadlines.xcresult"
+      - name: Verify randomized callback isolation
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild -help > "$RUNNER_TEMP/repeat-help.txt" 2>&1
+          repeat_args=()
+          if grep -q -- '-test-iterations' "$RUNNER_TEMP/repeat-help.txt"; then
+            repeat_args=(-test-iterations 3)
+            echo CI_RANDOMIZED_REPEAT_COUNT=3
+          else
+            echo CI_RANDOMIZED_REPEAT_COUNT=1
+          fi
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            "${repeat_args[@]}" -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/RandomizedCallback.xcresult" \
+            -only-testing:VPlayerTests/PlaybackPipelineTests/testOneHundredRandomizedOldCallbacksNeverReachPresentation
+      - name: Report scoped RandomizedCallback failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/RandomizedCallback.xcresult"
+      - name: Verify same-process fixture ownership and Loopback successors
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -89,43 +108,15 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeEndpointPair.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerEOSStabilizesAtAACEffectiveEndpoint \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations
-      - name: Report scoped native endpoint failures
+            -resultBundlePath "$RUNNER_TEMP/OwnershipLoopback.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2SystemLoadedRangeWaiterMergesAdjacentRangesAndFinishesOnceForCancelReplaceTimeout \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3PositiveRateCapabilityAtomicallyRevalidatesConsumesAndPerformsMainActorPlay \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3PlayingRelayRejectsAuthorityRevokedAfterPlayReturns \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3BackendQuiescenceReceiptRequiresExactPrivateIssuerIdentityAndSingleConsumption \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3LiveAACPrepareUsesWriterTerminalBindingAndNaturalEndConsumesExactEndpointAuthority \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3CapacityChargesRetainedGraphAndFifthDeadlineFailsClosed \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3EOSAndPublicationRelaysCoalesceBurstsWithOneOwnedRunner \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests
+      - name: Report scoped OwnershipLoopback failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeEndpointPair.xcresult"
-      - name: Validate focused physical storage under Address Sanitizer
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild -help > "$RUNNER_TEMP/xcodebuild-help.txt" 2>&1
-          grep -q -- '-enableAddressSanitizer' "$RUNNER_TEMP/xcodebuild-help.txt"
-          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath "$RUNNER_TEMP/PausedStorageASan" -enableAddressSanitizer YES \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/PausedStorageASan.xcresult" \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceRejectsExpandedPinsAndInvalidCapacities \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderMatchesExistingNestedReorderedAndHeldFragments \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceRejectsReentryWithoutInvalidatingOuterScope \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceHardCapacityFailureDoesNotAllocateOrLosePins \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderRejectsMissingCommonSampleAndRAPPrefixBytes \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow \
-            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedWindowRequiresItsOwnFrozenInitializationCompletion \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadOverflowClearsAllReferencesDuringConcurrentProducers \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingReleasesQueuedReferencesAndDeinitializesAfterJoin
-      - name: Report scoped Address Sanitizer failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorageASan.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/OwnershipLoopback.xcresult"

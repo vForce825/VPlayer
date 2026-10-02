@@ -3013,34 +3013,98 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview2SystemLoadedRangeWaiterMergesAdjacentRangesAndFinishesOnceForCancelReplaceTimeout()
         async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
+        try await verifyNativeLoadedRangeReplacementCancellation()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline
+               || HLSDeliveryApplicationChargeLedger.shared.chargedBytes != applicationBaseline
+               || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline),
+              ContinuousClock.now < deadline {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline)
+        XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline)
+        print("LOADED_REPLACEMENT_PHASE native-owner-released")
+
+        let mergedBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        print("LOADED_REPLACEMENT_PHASE adjacent-fixture-begin")
+        let merged = try await Task21Harness()
+        let owner = Task21OwnedTestHarness(merged, resourceBaseline: mergedBaseline)
+        addTeardownBlock { try await owner.tearDown() }
+        merged.driver.returnAdjacentLoadedRangeFragments = true
+        print("LOADED_REPLACEMENT_PHASE adjacent-prepare-begin")
+        _ = try await merged.prepare()
+        print("LOADED_REPLACEMENT_PHASE adjacent-prepare-return")
+    }
+
+    private func verifyNativeLoadedRangeReplacementCancellation() async throws {
         let player = AVPlayer()
         let driver = try SystemAVPlayerDriver.make(player: player)
+        print("LOADED_REPLACEMENT_PHASE native-authority-begin")
         let fixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_002),
             audioOnly: false)
-        defer { fixture.shutdown() }
+        print("LOADED_REPLACEMENT_PHASE native-authority-return")
         let item = fixture.request.item
-        // timeline/endpoint 是一次性 admission。先在同一 Loopback authority 链完成
-        // 映射，再让系统 AVPlayer 发起自己的 HTTP 请求，避免测试用的手动 full-body
-        // evidence 与系统异步请求竞争 selection terminal。
-        let playhead = try await fixture.makePreparedPlayhead()
-        try driver.install(url: fixture.request.itemURL, identity: item)
-        let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
-                                                   duration: Task21Fixtures.time(3))
-        let waiter = Task {
-            try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
-                                                     covering: requested)
+        var operationError: (any Error)?
+        do {
+            // Complete the original timeline admission before native requests.
+            print("LOADED_REPLACEMENT_PHASE native-playhead-begin")
+            let playhead = try await fixture.makePreparedPlayhead()
+            print("LOADED_REPLACEMENT_PHASE native-playhead-return")
+            try driver.install(url: fixture.request.itemURL, identity: item)
+            let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
+                                                       duration: Task21Fixtures.time(3))
+            let finished = FinalLockedFlag()
+            let waiter = Task {
+                defer { finished.set() }
+                return try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
+                                                                 covering: requested)
+            }
+            defer { waiter.cancel() }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while driver.activeWaiterCount == 0, !finished.value, ContinuousClock.now < deadline {
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            print("LOADED_REPLACEMENT_PHASE native-waiter-installed "
+                + "active=\(driver.activeWaiterCount) finished=\(finished.value) "
+                + "phase=\(String(describing: driver.prepareWait.activePhase))")
+            XCTAssertEqual(driver.prepareWait.activePhase, .loaded,
+                           "Replacement must race the actual installed loaded-range waiter")
+            driver.replaceCurrentItemWithNil(item: item)
+            driver.replaceCurrentItemWithNil(item: item)
+            await XCTAssertThrowsErrorAsync(try await waiter.value)
+            XCTAssertEqual(driver.activeWaiterCount, 0,
+                           "取消、replace 与 entstehen timeout 竞争只能恢复一次")
+            print("LOADED_REPLACEMENT_PHASE native-waiter-joined")
+        } catch {
+            operationError = error
+            print("LOADED_REPLACEMENT_PHASE native-body-failure error=\(error)")
         }
-        while driver.activeWaiterCount == 0 { await Task.yield() }
+        // This phase owns no Registry output; retire its original native item,
+        // source and real transport before the separate merging fixture exists.
         driver.replaceCurrentItemWithNil(item: item)
-        driver.replaceCurrentItemWithNil(item: item)
-        await XCTAssertThrowsErrorAsync(try await waiter.value)
+        driver.removeObservers(item: item)
         XCTAssertEqual(driver.activeWaiterCount, 0,
-                       "取消、replace 与 entstehen timeout 竞争只能恢复一次")
-
-        let merged = try await Task21Harness()
-        merged.driver.returnAdjacentLoadedRangeFragments = true
-        _ = try await merged.prepare()
+                       "The original waiter must finish before authority retirement")
+        do {
+            // Join the same transport even if the test task was cancelled; its
+            // physical drain uses a throwing sleep while waiting for callbacks.
+            let cleanup = Task { try await fixture.retireTransportAwaitingCompletion() }
+            try await cleanup.value
+            print("LOADED_REPLACEMENT_PHASE native-transport-retired")
+        } catch {
+            XCTFail("Native loaded-range transport cleanup failed: \(error)")
+            throw operationError ?? error
+        }
+        if let operationError { throw operationError }
     }
 
     func testStorageStopReadsDirectlyAndLatePausedRelayCannotRepairFailedReceipt() async throws {
@@ -3790,12 +3854,16 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview3PositiveRateCapabilityAtomicallyRevalidatesConsumesAndPerformsMainActorPlay()
         async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
         let harness = try await Task21Harness()
+        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
         _ = try await harness.prepare()
-        harness.driver.afterPositiveRateCapabilityConsumeBeforeSideEffect = { invocation in
-            guard let sourceTask = invocation.currentSnapshot?.sourceTask else { return }
+        harness.driver.afterPositiveRateCapabilityConsumeBeforeSideEffect = { [weak harness] invocation in
+            guard let harness, let sourceTask = invocation.currentSnapshot?.sourceTask else { return }
             _ = harness.graph.registry.requestCancel(sourceTask)
         }
+        defer { harness.driver.afterPositiveRateCapabilityConsumeBeforeSideEffect = nil }
 
         let result = try await harness.activate()
 
@@ -3806,7 +3874,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testReview3PlayingRelayRejectsAuthorityRevokedAfterPlayReturns() async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
         let harness = try await Task21Harness()
+        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
         _ = try await harness.prepare()
         _ = try await harness.activate()
         let source = try XCTUnwrap(
@@ -3825,41 +3896,87 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview3BackendQuiescenceReceiptRequiresExactPrivateIssuerIdentityAndSingleConsumption()
         async throws {
-        let forged = try await Task21Harness()
-        _ = try await forged.prepare()
-        _ = try await forged.activate()
-        forged.backend.returnCallerForgedQuiescence = true
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let forgedOwner: Task21OwnedTestHarness
+        do {
+            let forged = try await Task21Harness()
+            forgedOwner = Task21OwnedTestHarness(forged, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await forgedOwner.tearDownCallerForgedTransport() }
+            _ = try await forged.prepare()
+            _ = try await forged.activate()
+            forged.backend.returnCallerForgedQuiescence = true
 
-        await XCTAssertThrowsErrorAsync(try await forged.stop(),
-            "普通 backend 不能用调用方布尔与公开 invocation 伪造 issuer receipt")
-        XCTAssertNotNil(forged.graph.registry.outputResourceContextSnapshot()?.interval)
+            let rejectedStop = Task { try await forged.stop() }
+            defer {
+                forged.backend.allowRetirementCompletion()
+                rejectedStop.cancel()
+            }
+            let arrived = await forged.backend.waitForRetirementCall(timeout: .seconds(2))
+            XCTAssertTrue(arrived,
+                          "The original rejected stop must reach retirement before its test gate opens")
+            forged.backend.allowRetirementCompletion()
+            await XCTAssertThrowsErrorAsync(try await rejectedStop.value,
+                "普通 backend 不能用调用方布尔与公开 invocation 伪造 issuer receipt")
+            XCTAssertNotNil(forged.graph.registry.outputResourceContextSnapshot()?.interval)
+            XCTAssertNil(forged.backend.lastProof)
+            XCTAssertNil(forged.backend.quiescenceReceipt)
+            XCTAssertNil(forged.coordinator.lastQuiescenceReceipt)
+            XCTAssertNil(forged.backend.lastRetiredEpoch)
+            XCTAssertTrue(forged.backend.returnCallerForgedQuiescence)
+        }
+        try await forgedOwner.tearDownCallerForgedTransport()
 
-        let replay = try await Task21Harness()
-        _ = try await replay.prepare()
-        _ = try await replay.activate()
-        let receipt = try await replay.stop()
-        XCTAssertFalse(replay.graph.registry.completeOutputSuspend(
-            .quiescent(replay.backend.lastProof!),
-            invocation: replay.backend.lastSuspendInvocation!,
-            backend: replay.backend),
-            "backend-kind opaque receipt 必须只能消费一次")
-        XCTAssertTrue(replay.coordinator.accept(receipt))
+        let replayOwner: Task21OwnedTestHarness
+        do {
+            let replay = try await Task21Harness()
+            replayOwner = Task21OwnedTestHarness(replay, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await replayOwner.tearDown() }
+            _ = try await replay.prepare()
+            _ = try await replay.activate()
+            let receipt = try await replay.stop()
+            XCTAssertFalse(replay.graph.registry.completeOutputSuspend(
+                .quiescent(replay.backend.lastProof!),
+                invocation: replay.backend.lastSuspendInvocation!,
+                backend: replay.backend),
+                "backend-kind opaque receipt 必须只能消费一次")
+            XCTAssertTrue(replay.coordinator.accept(receipt))
+        }
+        try await replayOwner.tearDown()
     }
 
     func testReview3LiveAACPrepareUsesWriterTerminalBindingAndNaturalEndConsumesExactEndpointAuthority()
         async throws {
-        let multiple = try await Task21Harness(additionalUnboundAACRendition: .init(rawValue: 202))
-        await XCTAssertThrowsErrorAsync(try await multiple.prepare(),
-            "任一 AAC participant 缺少强类型 writer terminal binding 都必须在 install/prepare 前拒绝")
-        XCTAssertEqual(multiple.driver.prerollCallCount, 0)
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let multipleOwner: Task21OwnedTestHarness
+        do {
+            let multiple = try await Task21Harness(additionalUnboundAACRendition: .init(rawValue: 202))
+            multipleOwner = Task21OwnedTestHarness(multiple, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await multipleOwner.tearDown() }
+            await XCTAssertThrowsErrorAsync(try await multiple.prepare(),
+                "任一 AAC participant 缺少强类型 writer terminal binding 都必须在 install/prepare 前拒绝")
+            XCTAssertEqual(multiple.driver.prerollCallCount, 0)
+        }
+        try await multipleOwner.tearDown()
 
-        let live = try await Task21Harness()
-        _ = try await live.prepare()
-        XCTAssertEqual(live.coordinator.phase, .prepared,
-                       "live writer 尚未 finished 时应凭 issuer binding 启动，不能提前索取 final receipt")
+        let liveOwner: Task21OwnedTestHarness
+        do {
+            let live = try await Task21Harness()
+            liveOwner = Task21OwnedTestHarness(live, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await liveOwner.tearDown() }
+            _ = try await live.prepare()
+            XCTAssertEqual(live.coordinator.phase, .prepared,
+                           "live writer 尚未 finished 时应凭 issuer binding 启动，不能提前索取 final receipt")
+        }
+        try await liveOwner.tearDown()
 
-        let nonAAC = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
-        _ = try await nonAAC.prepare()
+        let nonAACOwner: Task21OwnedTestHarness
+        do {
+            let nonAAC = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+            nonAACOwner = Task21OwnedTestHarness(nonAAC, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await nonAACOwner.tearDown() }
+            _ = try await nonAAC.prepare()
+        }
+        try await nonAACOwner.tearDown()
     }
 
     func testReview3NaturalEOSUsesStableDirectReadsWithoutSeekAndRejectsServedTrimMutations()
@@ -4662,7 +4779,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testReview3EOSAndPublicationRelaysCoalesceBurstsWithOneOwnedRunner() async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
         let harness = try await Task21Harness()
+        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
         _ = try await harness.prepare()
         for ordinal in 0..<256 {
             harness.evidence.completedRenditions = [
@@ -6470,6 +6590,23 @@ private final class Task21OwnedTestHarness {
         self.harness = nil
     }
 
+    func tearDownCallerForgedTransport() async throws {
+        try await releaseCallerForgedHarness()
+        try await tearDown()
+    }
+
+    private func releaseCallerForgedHarness() async throws {
+        guard let harness else { return }
+        if harness.backend.returnCallerForgedQuiescence {
+            try await harness.retireCallerForgedTestTransport()
+        } else {
+            // Setup can fail before the fault is enabled. Only that ordinary
+            // path may use its real successful quiescence/retirement proof.
+            try await harness.shutdown()
+        }
+        self.harness = nil
+    }
+
     private func releaseOwnedHarness() async throws {
         // Existing shutdown upgrades the exact owner, releases its retirement
         // gate, and joins the original task. Only success permits dropping it.
@@ -6754,6 +6891,30 @@ private final class Task21Harness {
         _ = await graph.registry.joinOutputBackendOperation(invocation.suspendTicket.task)
         backend.allowRetirementCompletion()
         try await authorityFixture.retireTransportAwaitingCompletion()
+    }
+
+    func retireCallerForgedTestTransport() async throws {
+        guard backend.returnCallerForgedQuiescence,
+              backend.lastProof == nil, backend.quiescenceReceipt == nil,
+              backend.lastRetiredEpoch == nil, coordinator.lastQuiescenceReceipt == nil,
+              let invocation = backend.lastSuspendInvocation else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        backend.allowRetirementCompletion()
+        // Registry records unconfirmed retirement as canceled, without closing
+        // the interval or accepting a quiescence receipt.
+        guard case .canceled = await graph.registry.joinOutputBackendOperation(invocation.suspendTicket.task)
+        else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        XCTAssertNotNil(graph.registry.outputResourceContextSnapshot()?.interval)
+        let cleanup = Task { try await authorityFixture.retireTransportAwaitingCompletion() }
+        try await cleanup.value
+        XCTAssertNotNil(graph.registry.outputResourceContextSnapshot()?.interval,
+                        "Transport retirement cannot repair the rejected quiescence proof")
+        XCTAssertNil(backend.lastProof)
+        XCTAssertNil(backend.quiescenceReceipt)
+        XCTAssertNil(coordinator.lastQuiescenceReceipt)
+        XCTAssertNil(backend.lastRetiredEpoch)
+        XCTAssertTrue(backend.returnCallerForgedQuiescence)
     }
 
     func reinstall() throws {

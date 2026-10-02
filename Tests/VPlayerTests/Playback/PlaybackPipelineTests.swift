@@ -7073,6 +7073,12 @@ final class PlaybackPipelineTests: XCTestCase {
                 generation: current,
                 randomAccess: true
             )))
+            // Generation advancement precedes the queued RAP/configure work.
+            // A decoder callback can only carry this generation's real identity
+            // after that configuration has reached the decoder.
+            try await eventually {
+                harness.decoder.snapshot().containsConfiguration(current)
+            }
             var callbacks = [
                 try PlaybackFakeMedia.decodedFrame(id: 1, generation: oldGeneration, pts: .zero, interlaced: false),
                 try PlaybackFakeMedia.decodedFrame(id: 2, generation: current, pts: .zero, interlaced: false),
