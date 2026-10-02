@@ -37,10 +37,17 @@ struct AACDefaultCalibrationObserver: AACCalibrationObserver {
     func cookie(_ value: Data, at stage: AACCookieStage) -> Data { value }
     func completedPass(_ pass: Int, lane: AACOwnedCallLane) {}
 }
+/// One bounded native-writer terminal action can be retained by an occupied lane.
+protocol AACOwnedWriterRetiring: AnyObject, Sendable {
+    func retireWriterResources()
+}
+
 final class AACOwnedCallLane: @unchecked Sendable {
     private let lock = NSLock()
     private var occupied = false
     private var cancelled = false
+    private var writerOwner: (any AACOwnedWriterRetiring)?
+    private var writerRetirementRequested = false
     private enum CleanupState { case idle, cleaning, completed }
     private var cleanupState = CleanupState.idle
     var cancelRequested: Bool { lock.withLock { cancelled } }
@@ -52,7 +59,43 @@ final class AACOwnedCallLane: @unchecked Sendable {
             occupied = true
         }
     }
-    func leave() { lock.withLock { occupied = false } }
+    func leave() {
+        let pending = lock.withLock { () -> (any AACOwnedWriterRetiring)? in
+            if writerRetirementRequested { return writerOwner }
+            occupied = false
+            return nil
+        }
+        if let pending { retireWriter(pending) }
+    }
+    func claimWriterOwnership(_ owner: any AACOwnedWriterRetiring) throws {
+        try lock.withLock {
+            guard !cancelled else { throw AACRenditionFailure.cancelled }
+            guard !occupied, writerOwner == nil else { throw AACRenditionFailure.busy }
+            writerOwner = owner
+        }
+    }
+    @discardableResult
+    func finishWriterOwnership(_ owner: any AACOwnedWriterRetiring) -> Bool {
+        let result = lock.withLock { () -> (accepted: Bool, immediate: Bool) in
+            guard writerOwner === owner, !writerRetirementRequested else { return (false, false) }
+            writerRetirementRequested = true
+            if occupied { return (true, false) }
+            occupied = true
+            return (true, true)
+        }
+        if result.immediate { retireWriter(owner) }
+        return result.accepted
+    }
+    private func retireWriter(_ owner: any AACOwnedWriterRetiring) {
+        // Never hold the mutex while native cancellation joins delegate callbacks.
+        // The permit and physical owner remain live until cleanup has returned.
+        owner.retireWriterResources()
+        lock.withLock {
+            writerOwner = nil
+            writerRetirementRequested = false
+            occupied = false
+        }
+    }
     func call<T>(_ body: () throws -> T) throws -> T {
         try enter(); defer { leave() }; return try body()
     }
@@ -70,7 +113,7 @@ final class AACOwnedCallLane: @unchecked Sendable {
     func requestCancel() { lock.withLock { cancelled = true } }
     @discardableResult func finishCancellation(_ body: () -> Void) -> Bool {
         let accepted = lock.withLock {
-            guard cancelled, !occupied, cleanupState == .idle else { return false }
+            guard cancelled, !occupied, writerOwner == nil, cleanupState == .idle else { return false }
             cleanupState = .cleaning; occupied = true; return true
         }
         guard accepted else { return false }
@@ -140,6 +183,20 @@ final class AACCalibrationWorkspace: @unchecked Sendable {
                 remaining -= bytes
                 return Lease(owner: owner, kind: kind, bytes: bytes)
             }
+        }
+
+        /// Return unused escrow once the producer can prove no further Fill is
+        /// possible, retaining the exact budget for its final pending emissions.
+        func reduceUnclaimed(to bytes: Int) throws {
+            let release = try lock.withLock { () throws -> (AACCalibrationWorkspace, Int) in
+                guard let owner, bytes >= 0, bytes <= remaining else {
+                    throw AACRenditionFailure.capacityExceeded
+                }
+                let released = remaining - bytes
+                remaining = bytes
+                return (owner, released)
+            }
+            release.0.release(kind, bytes: release.1)
         }
 
         func releaseUnclaimed() {
@@ -291,26 +348,32 @@ final class AACCallbackAccumulator: @unchecked Sendable {
 }
 // 仅用于 Task15 的临时校准/回环；正式 publisher 与 m4s 编排仍由后续任务负责。
 private final class AACProofSegmentDelegate: NSObject, AVAssetWriterDelegate, @unchecked Sendable {
-    let accumulator = AACCallbackAccumulator()
+    private final class Storage {
+        let accumulator = AACCallbackAccumulator()
+        let metadataLease: AACCalibrationWorkspace.Lease
+        let fileLease: AACCalibrationWorkspace.Lease
+        init(workspace: AACCalibrationWorkspace) throws {
+            metadataLease = try workspace.acquire(.nonPayload, bytes: 8_192)
+            fileLease = try workspace.acquire(.temporaryFile, bytes: 1_048_576)
+        }
+    }
     private let identity: AACEncoderIdentity
     private let observer: any AACCalibrationObserver
     private let lane: AACOwnedCallLane
     private let lock = NSLock()
     private var storedFailure: Error?
-    private let metadataLease: AACCalibrationWorkspace.Lease
-    let fileLease: AACCalibrationWorkspace.Lease
+    private var storage: Storage?
     init(identity: AACEncoderIdentity, workspace: AACCalibrationWorkspace, lane: AACOwnedCallLane, observer: any AACCalibrationObserver) throws {
         self.identity = identity; self.observer = observer; self.lane = lane
-        metadataLease = try workspace.acquire(.nonPayload, bytes: 8_192)
-        fileLease = try workspace.acquire(.temporaryFile, bytes: 1_048_576)
+        storage = try Storage(workspace: workspace)
     }
     func assetWriter(_ writer: AVAssetWriter, didOutputSegmentData segmentData: Data, segmentType: AVAssetSegmentType,
                      segmentReport: AVAssetSegmentReport?) {
         lock.withLock {
-            guard storedFailure == nil, !lane.cancelRequested else { return }
+            guard let storage, storedFailure == nil, !lane.cancelRequested else { return }
             do {
                 guard segmentType == .initialization || segmentType == .separable else { throw AACRenditionFailure.calibrationMismatch }
-                try accumulator.append(.init(writerIdentity: ObjectIdentifier(writer), encoderIdentity: identity,
+                try storage.accumulator.append(.init(writerIdentity: ObjectIdentifier(writer), encoderIdentity: identity,
                     initialization: segmentType == .initialization, payload: segmentData))
                 observer.writerSegment(initialization: segmentType == .initialization, writerIdentity: ObjectIdentifier(writer))
             } catch { storedFailure = error }
@@ -319,11 +382,63 @@ private final class AACProofSegmentDelegate: NSObject, AVAssetWriterDelegate, @u
     func materialize(at url: URL) throws {
         try lock.withLock {
             if let storedFailure { throw storedFailure }
-            try accumulator.materialize(at: url)
-            accumulator.releaseAll()
+            guard let storage else { throw AACRenditionFailure.cancelled }
+            try storage.accumulator.materialize(at: url)
+            storage.accumulator.releaseAll()
+        }
+    }
+    /// Called after native terminal/detachment and temporary-file cleanup. The
+    /// callback lock joins any entered callback; late callbacks see no storage.
+    /// Retiring physical storage, not only its lease, tolerates delayed shell ARC.
+    func retire() {
+        lock.withLock {
+            storage = nil
+            storedFailure = nil
         }
     }
 }
+/// State is accessed only during the lane's owned calls/terminal action. The
+/// single lane slot retains this owner across a rejected cleanup; no task chain
+/// or unbounded callback queue is created. Existing input metadata leases cover
+/// this fixed-size owner and its one lifetime closure.
+private final class AACLoopbackWriterRetirement: AACOwnedWriterRetiring, @unchecked Sendable {
+    private final class Storage {
+        let delegate: AACProofSegmentDelegate
+        let url: URL
+        let encoder: AACRenditionEncoder?
+        let keepInputAlive: () -> Void
+        var writer: AVAssetWriter?
+        init(delegate: AACProofSegmentDelegate, url: URL, encoder: AACRenditionEncoder?,
+             keepInputAlive: @escaping () -> Void) {
+            self.delegate = delegate; self.url = url; self.encoder = encoder
+            self.keepInputAlive = keepInputAlive
+        }
+    }
+    private var storage: Storage?
+    init(delegate: AACProofSegmentDelegate, url: URL, encoder: AACRenditionEncoder? = nil,
+         keepInputAlive: @escaping () -> Void) {
+        storage = Storage(delegate: delegate, url: url, encoder: encoder, keepInputAlive: keepInputAlive)
+    }
+    func install(_ writer: AVAssetWriter) { storage?.writer = writer }
+    func retireWriterResources() {
+        guard let storage else { return }
+        if let writer = storage.writer {
+            // Apple specifies synchronous cancellation joins the writing session.
+            if writer.status == .unknown || writer.status == .writing { writer.cancelWriting() }
+            writer.delegate = nil
+        }
+        try? FileManager.default.removeItem(at: storage.url)
+        storage.delegate.retire()
+        if let encoder = storage.encoder,
+           encoder.terminalFailure != nil || encoder.lane.cancelRequested {
+            // An earlier dispose may have been rejected by an occupied lane.
+            encoder.disposeWithBorrowedPermit()
+        }
+        self.storage = nil
+        storage.keepInputAlive()
+    }
+}
+
 final class AACCalibrationReceipt: @unchecked Sendable {
     let encoders: [AACRenditionEncoder]
     private let lane: AACOwnedCallLane
@@ -630,9 +745,12 @@ enum AACSystemLoopback {
         let metadataLease: AACCalibrationWorkspace.Lease
     }
     private static func makeWriter(format: CMAudioFormatDescription, delegate: AACProofSegmentDelegate,
-                                   lane: AACOwnedCallLane) throws -> (AVAssetWriter, AVAssetWriterInput.SampleBufferReceiver) {
-        let writer = try lane.call { AVAssetWriter(contentType: .mpeg4Movie) }
-        let receiver = try lane.call { () throws -> AVAssetWriterInput.SampleBufferReceiver in
+                                   owner: AACLoopbackWriterRetirement, lane: AACOwnedCallLane) throws
+        -> (AVAssetWriter, AVAssetWriterInput.SampleBufferReceiver) {
+        try lane.call {
+            let writer = AVAssetWriter(contentType: .mpeg4Movie)
+            // Install before any setup can throw; the claimed owner handles all exits.
+            owner.install(writer)
             writer.movieTimeScale = 48_000
             writer.outputFileTypeProfile = .mpeg4AppleHLS
             writer.preferredOutputSegmentInterval = CMTime(value: 1, timescale: 1)
@@ -644,9 +762,8 @@ enum AACSystemLoopback {
             let receiver = writer.inputReceiver(for: input)
             try writer.start()
             writer.startSession(atSourceTime: CMTime(value: 10, timescale: 1))
-            return receiver
+            return (writer, receiver)
         }
-        return (writer, receiver)
     }
     private static func readySample(copying sample: CMSampleBuffer) throws -> CMReadySampleBuffer<CMSampleBuffer.DynamicContent> {
         var copy: CMSampleBuffer?
@@ -768,13 +885,18 @@ enum AACSystemLoopback {
               let baseline = encoder.finalizedCookieEvidence else { throw AACRenditionFailure.invalidInput }
         let lane = encoder.lane, workspace = encoder.workspace
         let delegate = try AACProofSegmentDelegate(identity: encoder.identity, workspace: workspace, lane: lane, observer: encoder.observer)
+        var writerClaimed = false
+        defer { if !writerClaimed { delegate.retire() } }
         let formatLease = try workspace.acquire(.nonPayload, bytes: 8_192 + baseline.backing.data.count)
-        defer { withExtendedLifetime((delegate,formatLease)) {} }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("vplayer-aac-stream-\(UUID().uuidString).mp4")
-        defer { try? FileManager.default.removeItem(at: url) }
         let format = try encoder.makeFormat(asbd: frozen.actualASBD, cookie: baseline.backing.data)
-        let (writer,receiver) = try makeWriter(format: format, delegate: delegate, lane: lane)
-        defer { lane.cleanup { if writer.status == .writing { writer.cancelWriting() } } }
+        let owner = AACLoopbackWriterRetirement(delegate: delegate, url: url, encoder: encoder) {
+            withExtendedLifetime((formatLease, frozen, baseline)) {}
+        }
+        try lane.claimWriterOwnership(owner)
+        writerClaimed = true
+        defer { lane.finishWriterOwnership(owner) }
+        let (writer,receiver) = try makeWriter(format: format, delegate: delegate, owner: owner, lane: lane)
         var timing = AACWriterInputTimingAccumulator(leading: Int64(frozen.decodedLeadingSampleCount))
         let expected = AACReaderPacketInput(lane: lane, maximumPackets: 160)
         var payloadBytes = 0, bufferCount = 0
@@ -815,12 +937,17 @@ enum AACSystemLoopback {
         guard let first = epoch.buffers.first, let format = CMSampleBufferGetFormatDescription(first),
               epoch.buffers.count <= 64 else { throw AACRenditionFailure.invalidInput }
         let delegate = try AACProofSegmentDelegate(identity: epoch.identity, workspace: workspace, lane: lane, observer: observer)
+        var writerClaimed = false
+        defer { if !writerClaimed { delegate.retire() } }
         let inputLease = try workspace.acquire(.nonPayload, bytes: 8_192)
-        defer { withExtendedLifetime((delegate,inputLease)) {} }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("vplayer-aac-\(UUID().uuidString).mp4")
-        defer { try? FileManager.default.removeItem(at: url) }
-        let (writer,receiver) = try makeWriter(format: format, delegate: delegate, lane: lane)
-        defer { lane.cleanup { if writer.status == .writing { writer.cancelWriting() } } }
+        let owner = AACLoopbackWriterRetirement(delegate: delegate, url: url) {
+            withExtendedLifetime((inputLease, epoch)) {}
+        }
+        try lane.claimWriterOwnership(owner)
+        writerClaimed = true
+        defer { lane.finishWriterOwnership(owner) }
+        let (writer,receiver) = try makeWriter(format: format, delegate: delegate, owner: owner, lane: lane)
         let expected = AACReaderPacketInput(lane: lane)
         var timing = AACWriterInputTimingAccumulator(leading: Int64(epoch.leadingFrames))
         for buffer in epoch.buffers {

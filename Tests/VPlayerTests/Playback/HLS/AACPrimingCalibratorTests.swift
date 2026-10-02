@@ -829,6 +829,136 @@ final class AACPrimingCalibratorTests: XCTestCase {
         XCTAssertThrowsError(try receipt.encoder(for: receipt.encoders[0].identity))
     }
 
+    func testOccupiedLaneRetainsOneWriterUntilDeferredTerminalCompletes() throws {
+        let lane = AACOwnedCallLane()
+        let workspace = AACCalibrationWorkspace()
+        let record = AACWriterRetirementRecord()
+        var owner: AACWriterRetirementProbe? = AACWriterRetirementProbe(
+            lane: lane, lease: try workspace.acquire(.temporaryFile, bytes: 1_048_576), record: record)
+        weak var weakOwner = owner
+        try lane.claimWriterOwnership(try XCTUnwrap(owner))
+        XCTAssertThrowsError(try lane.claimWriterOwnership(
+            AACWriterRetirementProbe(lane: lane, lease: nil, record: record))) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        try lane.enter()
+        XCTAssertTrue(lane.finishWriterOwnership(try XCTUnwrap(owner)))
+        XCTAssertFalse(lane.finishWriterOwnership(try XCTUnwrap(owner)), "retirement is admitted once")
+        owner = nil
+        lane.requestCancel()
+        XCTAssertNotNil(weakOwner, "the occupied lane owns the deferred physical resources")
+        XCTAssertEqual(workspace.currentBytes, 1_048_576)
+        XCTAssertEqual(record.count, 0)
+        XCTAssertFalse(lane.finishCancellation { XCTFail("writer terminal has not completed") })
+        lane.leave()
+        XCTAssertEqual(record.count, 1)
+        XCTAssertTrue(record.wasExcludedDuringRetirement)
+        XCTAssertEqual(workspace.currentBytes, 0)
+        XCTAssertNil(weakOwner)
+        XCTAssertTrue(lane.finishCancellation {})
+    }
+
+    func testIdleLaneRetiresWriterImmediatelyAndAcceptsNextOwnership() throws {
+        let lane = AACOwnedCallLane()
+        let record = AACWriterRetirementRecord()
+        let first = AACWriterRetirementProbe(lane: lane, lease: nil, record: record)
+        try lane.claimWriterOwnership(first)
+        XCTAssertTrue(lane.finishWriterOwnership(first))
+        XCTAssertEqual(record.count, 1)
+        let second = AACWriterRetirementProbe(lane: lane, lease: nil, record: record)
+        try lane.claimWriterOwnership(second)
+        XCTAssertTrue(lane.finishWriterOwnership(second))
+        XCTAssertEqual(record.count, 2)
+        XCTAssertNoThrow(try lane.call {})
+    }
+
+    func testStreamingBusyCleanupRetainsNativeOwnerUntilPermitLeaves() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        var occupied = false
+        defer { if occupied { harness.calibrator.lane.leave() } }
+        do {
+            _ = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 8_192) {
+                try harness.calibrator.lane.enter()
+                occupied = true
+                throw NSError(domain: "AAC.OccupiedCleanup", code: -75)
+            }
+            XCTFail("source failure must propagate")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "AAC.OccupiedCleanup")
+            XCTAssertEqual((error as NSError).code, -75)
+        }
+        guard occupied else { return XCTFail("fixture must own the lane while cleanup is requested") }
+        XCTAssertGreaterThanOrEqual(harness.calibrator.workspace.currentBytes, 1_056_768,
+                                    "writer/delegate/file storage cannot disappear before native terminal")
+        XCTAssertThrowsError(try harness.calibrator.finishOnOwnedRunner()) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        harness.calibrator.lane.leave()
+        occupied = false
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+        XCTAssertNoThrow(try harness.calibrator.finishOnOwnedRunner())
+        XCTAssertTrue(String(reflecting: encoder.terminalFailure).contains("AAC.OccupiedCleanup"))
+    }
+
+    func testEOSRetiresOnlyUnusedReservationBeforeFinalCookieAllocation() throws {
+        let workspace = AACCalibrationWorkspace()
+        let file = try workspace.acquire(.temporaryFile, bytes: 1_048_576)
+        let metadata = try workspace.acquire(.nonPayload, bytes: 8_192)
+        let source = try workspace.acquire(.sourcePCM, bytes: 262_144)
+        let packets = try workspace.acquire(.aacPackets, bytes: 131_072)
+        let base = workspace.currentBytes
+        let reservation = try workspace.reserveAvailable(.aacPackets,
+            preferredBytes: AACCalibrationWorkspace.aacPacketCapacity, minimumBytes: 16_384)
+        let acceptedEmission = try reservation.claim(bytes: 4_096)
+        XCTAssertTrue(workspace.atSoftLimit)
+        XCTAssertThrowsError(try workspace.acquire(.nonPayload, bytes: 39))
+        let beforeRejectedTrim = workspace.currentBytes
+        XCTAssertThrowsError(try reservation.reduceUnclaimed(to: reservation.unclaimedBytes + 1))
+        XCTAssertEqual(workspace.currentBytes, beforeRejectedTrim)
+
+        try reservation.reduceUnclaimed(to: 8_192)
+        XCTAssertEqual(workspace.currentBytes, base + 4_096 + 8_192,
+                       "retire unused capacity only; accepted emission ownership is still charged")
+        XCTAssertEqual(reservation.unclaimedBytes, 8_192)
+        let finalCookie = try workspace.acquire(.nonPayload, bytes: 39)
+        let finalEmission = try reservation.claim(bytes: 8_192)
+        XCTAssertThrowsError(try reservation.claim(bytes: 1))
+        reservation.releaseUnclaimed()
+        reservation.releaseUnclaimed()
+        XCTAssertEqual(workspace.currentBytes, base + 4_096 + 8_192 + 39)
+        acceptedEmission.release(); finalEmission.release(); finalCookie.release()
+        file.release(); metadata.release(); source.release(); packets.release()
+        XCTAssertEqual(workspace.currentBytes, 0)
+        XCTAssertLessThanOrEqual(workspace.peakBytes, 4_194_304)
+    }
+
+    func testAsyncStreamEOSPreservesFinalEvidenceWhileWriterFileBudgetIsHeld() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        let file = try harness.calibrator.workspace.acquire(.temporaryFile, bytes: 1_048_576)
+        let metadata = try harness.calibrator.workspace.acquire(.nonPayload, bytes: 8_192)
+        let probe = AACCalibrationStreamProbe()
+        let summary = try await AACSystemLoopback.encodeStreamAwaitingAppend(
+            encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+        ) { buffer in _ = probe.recordAppend(buffer) }
+        XCTAssertNil(encoder.terminalFailure)
+        XCTAssertEqual(summary.realSampleCount, 65_536)
+        XCTAssertEqual(probe.appendedFrames, summary.totalDecodedFrames)
+        XCTAssertEqual(summary.totalDecodedFrames,
+                       Int64(summary.leadingFrames) + summary.realSampleCount + summary.trailingFrames)
+        XCTAssertLessThanOrEqual(summary.maximumRetainedPackets, 64)
+        XCTAssertGreaterThan(harness.calibrator.workspace.peakBytes, 3_145_728,
+                             "reproduce the high-water condition without relaxing the soft admission bound")
+        XCTAssertLessThanOrEqual(harness.calibrator.workspace.peakBytes, 4_194_304)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes,
+                       encoder.retainedEvidenceBytes + file.bytes + metadata.bytes)
+        file.release(); metadata.release()
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, encoder.retainedEvidenceBytes)
+    }
+
     func testStreamingFailureSnapshotPrecedesNativeAndTemporaryCleanup() async throws {
         let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
         let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
@@ -1357,5 +1487,32 @@ private final class AACCalibrationStreamProbe: @unchecked Sendable {
             frames += Int64(CMSampleBufferGetNumSamples(buffer)) * 1_024
             return appends
         }
+    }
+}
+
+private final class AACWriterRetirementRecord: @unchecked Sendable {
+    private let lock = NSLock()
+    private var retirements = 0
+    private var excluded = true
+    var count: Int { lock.withLock { retirements } }
+    var wasExcludedDuringRetirement: Bool { lock.withLock { excluded } }
+    func record(excluded: Bool) {
+        lock.withLock { retirements += 1; self.excluded = self.excluded && excluded }
+    }
+}
+
+private final class AACWriterRetirementProbe: AACOwnedWriterRetiring, @unchecked Sendable {
+    let lane: AACOwnedCallLane
+    let lease: AACCalibrationWorkspace.Lease?
+    let record: AACWriterRetirementRecord
+    init(lane: AACOwnedCallLane, lease: AACCalibrationWorkspace.Lease?, record: AACWriterRetirementRecord) {
+        self.lane = lane; self.lease = lease; self.record = record
+    }
+    func retireWriterResources() {
+        let excluded: Bool
+        do { try lane.call {}; excluded = false }
+        catch { excluded = true }
+        record.record(excluded: excluded)
+        lease?.release()
     }
 }

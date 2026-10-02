@@ -58,7 +58,9 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(accessUnit.confirmWriterTerminal(using: harness.coordinator), 0)
     }
 
-    func testAsyncAACBatchFinishWaitsForEveryAdmittedSample() async throws {
+    func testAsyncAACBatchFinishWaitsForEverySampleThenRejectsUnauthenticatedCallback() async throws {
+        // This inspection adapter can prove append/finish order, but cannot mint the
+        // native callback capsule required for a successful AAC publication terminal.
         let epoch = try Task17Fixtures.aacEpoch(bufferCount: 2)
         let factory = Task17FakeSystemWriterFactory()
         let writer = try Task17Fixtures.makeWriter(seed: 92_102, kind: .aac,
@@ -66,28 +68,99 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             factory: factory)
         let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
         try writer.start(at: CMTime(value: 10, timescale: 1))
+        let writerLane = try XCTUnwrap(Mirror(reflecting: writer).children.first {
+            $0.label == "lane"
+        }?.value as? DispatchQueue)
         let native = try XCTUnwrap(factory.lastWriter)
         native.setReadyForMoreMediaData(false)
-        let entered = expectation(description: "First batch sample waits for receiver")
-        entered.assertForOverFulfill = false
-        native.observeAsyncAppend(entered: { entered.fulfill() })
+        native.pauseBeforeAsyncAppend(ordinal: 2)
+        let firstEntered = expectation(description: "First batch sample waits for receiver")
+        let secondEntered = expectation(description: "Second batch sample waits for receiver")
+        let entries = Task17LockedCounter()
+        native.observeAsyncAppend(entered: {
+            entries.increment()
+            if entries.value == 1 { firstEntered.fulfill() }
+            else { secondEntered.fulfill() }
+        })
         let append = Task { try await writer.appendAACEncodedEpochAwaitingReadiness(epoch,
             coordinator: boundary) }
-        await fulfillment(of: [entered], timeout: 2)
-        let finishRequested = expectation(description: "Finish requested during admitted batch")
-        let finish = Task {
-            finishRequested.fulfill()
-            return try await writer.finish()
-        }
-        await fulfillment(of: [finishRequested], timeout: 2)
+        await fulfillment(of: [firstEntered], timeout: 2)
+        let finish = Task { try await writer.finish() }
+        // Observe registration itself, not merely entry into the caller Task. Every
+        // reflected mutable read is synchronized with the writer's existing lane.
+        let registrationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        var finishRegistered = false
+        repeat {
+            finishRegistered = try writerLane.sync {
+                try XCTUnwrap(Mirror(reflecting: writer).children.first {
+                    $0.label == "finishRequested"
+                }?.value as? Bool)
+            }
+            if finishRegistered { break }
+            try await Task.sleep(for: .milliseconds(1))
+        } while ContinuousClock.now < registrationDeadline
+        XCTAssertTrue(finishRegistered, "Finish must be registered before the first append resumes")
+        XCTAssertEqual(native.appendCount, 0)
         XCTAssertFalse(native.calls.contains(.markFinished))
+        XCTAssertFalse(native.calls.contains(.finish))
         native.setReadyForMoreMediaData(true)
+        await fulfillment(of: [secondEntered], timeout: 2)
+        XCTAssertEqual(native.appendCount, 1)
+        XCTAssertFalse(native.calls.contains(.markFinished),
+                       "Finishing the first sample must not close an admitted batch")
+        XCTAssertFalse(native.calls.contains(.finish))
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 2)
+        XCTAssertNil(writer.terminalReceipt)
+        native.setReadyForMoreMediaData(true)
+        try await append.value
+        await assertWriterThrowsError(try await finish.value) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .systemFailure,
+                           "Synthetic callbacks must not acquire native AAC publication authority")
+        }
+        let terminal = try XCTUnwrap(writer.terminalReceipt)
+        XCTAssertEqual(terminal.terminalReason, .failed)
+        XCTAssertEqual(terminal.inputCount, 2)
+        XCTAssertEqual(native.appendCount, 2)
+        XCTAssertEqual(native.calls, [.start, .append, .append, .markFinished, .finish, .cancel])
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+    }
+
+    func testRealAACBatchFinishPreservesSuccessfulTerminalAndAllAcceptedInputs() async throws {
+        let epoch = try await Task17Fixtures.realAACEncodedEpoch()
+        XCTAssertGreaterThan(epoch.buffers.count, 1)
+        let collector = Task17ObjectCollector()
+        let writer = try Task17Fixtures.makeWriter(seed: 92_106, kind: .aac,
+            sourceFormatHint: XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
+            collector: collector)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        defer { writer.requestCancellation() }
+        let append = Task { try await writer.appendAACEncodedEpochAwaitingReadiness(epoch,
+            coordinator: boundary) }
+        // Admission is observable without wrapping the native adapter or replacing its
+        // private provenance. Native appends may complete before finish is scheduled;
+        // the separate gated inspection test proves the exact suspended interleaving.
+        let admissionDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while writer.usage.retainedTerminalOwnershipCount == 0,
+              writer.terminalReceipt == nil, ContinuousClock.now < admissionDeadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertGreaterThan(writer.usage.retainedTerminalOwnershipCount, 0)
+        let finish = Task { try await writer.finish() }
         try await append.value
         let terminal = try await finish.value
         XCTAssertEqual(terminal.terminalReason, .finished)
-        XCTAssertEqual(terminal.inputCount, 2)
-        XCTAssertEqual(native.appendCount, 2)
-        XCTAssertEqual(Array(native.calls.suffix(4)), [.append, .append, .markFinished, .finish])
+        XCTAssertEqual(terminal.inputCount, epoch.buffers.count)
+        XCTAssertEqual(terminal.initializationCallbackCount, 1)
+        XCTAssertGreaterThan(terminal.mediaCallbackCount, 0)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+        let media = collector.objects.filter { $0.kind == .media }
+        XCTAssertEqual(media.count, terminal.mediaCallbackCount)
+        for object in media {
+            let evidence = try XCTUnwrap(object.publicationEvidence)
+            XCTAssertEqual(evidence.format.codec, "mp4a.40.2")
+            XCTAssertTrue(evidence.matches(object))
+        }
     }
 
     func testAsyncAACBatchBetweenSampleFailureFailsWaitingFinishWithoutClosingNativeInput() async throws {
@@ -7382,6 +7455,7 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SynchronousSystemWritin
     private var defersAsyncCancellationReturn = false
     private var asyncCancellationRequested = false
     private var asyncAppendFailure: (any Error)?
+    private var pausedAsyncAppendOrdinal: Int?
     private var storedResetDecoderAttachments: [Bool] = []
 
     init(
@@ -7487,6 +7561,10 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SynchronousSystemWritin
         lock.withLock { asyncAppendFailure = error }
     }
 
+    func pauseBeforeAsyncAppend(ordinal: Int) {
+        lock.withLock { pausedAsyncAppendOrdinal = ordinal }
+    }
+
     /// 模拟系统 receiver：只挂起媒体准入，真实 writer 的票据和账本仍由生产代码处理。
     func appendAwaitingReadiness(
         _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
@@ -7495,6 +7573,10 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SynchronousSystemWritin
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 let action = lock.withLock { () -> (Bool, Bool, (@Sendable () -> Void)?) in
                     precondition(asyncAppendContinuation == nil)
+                    if pausedAsyncAppendOrdinal == storedAppendCount + 1 {
+                        pausedAsyncAppendOrdinal = nil
+                        readyForMoreMediaData = false
+                    }
                     let cancelled = asyncCancellationRequested
                     let complete = (!cancelled && readyForMoreMediaData)
                         || (cancelled && !defersAsyncCancellationReturn)

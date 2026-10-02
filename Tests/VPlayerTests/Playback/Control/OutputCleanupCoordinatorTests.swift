@@ -2640,10 +2640,13 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let proof = try XCTUnwrap(registry.issueEmptyOutputResetDrainProof(root: root))
         XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
         let parent = try registry.admitPlaybackRequest(requestID: UUID())
-        let session = parent.value.identity.sessionIdentity
+        guard case .coldStart(let admittedParent) = parent else {
+            return XCTFail("fresh playback admission must supply its cold-start parent")
+        }
+        let session = admittedParent.identity.sessionIdentity
         XCTAssertFalse(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
-        XCTAssertGreaterThan(parent.value.cap, 32_000_000_000)
-        guard parent.value.cap > 32_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
+        XCTAssertGreaterThan(admittedParent.cap, 32_000_000_000)
+        guard admittedParent.cap > 32_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
         let acquire = try XCTUnwrap(registry.beginResetOutputAcquisition(session: session, parent: parent,
             admission: .init(proof: proof, mandatorySuffix: 30_000_000_000, inheritedRouteAvailabilityConstraint: nil)),
             "reset-mode admission必须一次安装原parent、唯一边界及binding")
@@ -4807,7 +4810,10 @@ struct ResetAcquiringOutputFixture {
         let parent: CurrentPlaybackOperationDeadlineTicket
         if freshUserPlayback {
             parent = try registry.admitPlaybackRequest(requestID: UUID())
-            parentIdentity = parent.value.identity
+            guard case .coldStart(let admittedParent) = parent else {
+                throw ControlTaskRegistry.Failure.invalidGroup
+            }
+            parentIdentity = admittedParent.identity
             XCTAssertEqual(registry.playbackRequestAdmissionSnapshot(), parent)
             XCTAssertFalse(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
         } else {
@@ -4817,12 +4823,16 @@ struct ResetAcquiringOutputFixture {
                 accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
         }
         let session = parentIdentity.sessionIdentity
-        XCTAssertGreaterThan(parent.value.cap, 30_000_000_000)
-        guard parent.value.cap > 30_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
+        let parentCap: UInt64
+        switch parent {
+        case .coldStart(let budget), .outputRecovery(let budget): parentCap = budget.cap
+        }
+        XCTAssertGreaterThan(parentCap, 30_000_000_000)
+        guard parentCap > 30_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
         acquire = try XCTUnwrap(registry.beginResetOutputAcquisition(session: session, parent: parent,
             admission: .init(proof: proof, mandatorySuffix: 30_000_000_000, inheritedRouteAvailabilityConstraint: nil)))
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
-        XCTAssertEqual(state.boundaryEffectiveElapsed, parent.value.cap - 30_000_000_000)
+        XCTAssertEqual(state.boundaryEffectiveElapsed, parentCap - 30_000_000_000)
         XCTAssertEqual(registry.phase(of: acquire), .queued)
         XCTAssertNil(registry.outputResourceContextSnapshot()?.acquisitionDeadline,
             "logical recovery authorization must not start an unclaimed physical acquire deadline")

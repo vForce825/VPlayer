@@ -3968,6 +3968,11 @@ private final class Task21FakeEvidenceSource: AVPlayerPreparationEvidenceProvidi
     ) async throws -> PlayerItemTimelineMappingAuthority? {
         guard mutation != .noCommonBoundary else { return nil }
         task21FixturePhase("prepare.timeline.begin", enabled: diagnosticPhases)
+        if diagnosticPhases {
+            traceTimelinePrerequisites(endpointAuthority: endpointAuthority,
+                itemURL: itemURL, item: item, publicationSequence: publicationSequence,
+                selection: selection)
+        }
         let result = try await source.consumePlayerItemTimelineMapping(
             endpointAuthority: endpointAuthority,
             itemURL: itemURL,
@@ -3976,6 +3981,52 @@ private final class Task21FakeEvidenceSource: AVPlayerPreparationEvidenceProvidi
             selection: selection)
         task21FixturePhase("prepare.timeline.returned", enabled: diagnosticPhases)
         return result
+    }
+
+    /// Synchronous, read-only views leave no additional authority root across
+    /// the mapping await. Do not call consume/freeze or populate a missing cache.
+    private func traceTimelinePrerequisites(
+        endpointAuthority: AACEffectiveEndpointAuthority?, itemURL: URL,
+        item: AVPlayerItemInstanceIdentity, publicationSequence: UInt64,
+        selection: LoopbackAudioMediaSelectionCapability?
+    ) {
+        let current = source.currentAudioSelectionCapability(itemURL: itemURL,
+            item: item, publicationSequence: publicationSequence)
+        let completed = source.retainedCompletedPublicationEvidence()
+        print("TASK21_TIMELINE_FACTS publication=\(publicationSequence) selectionPresent=\(selection != nil) currentSelectionPresent=\(current != nil) sameSelection=\(selection === current) cachedCompleted=\(completed != nil) endpointPresent=\(endpointAuthority != nil)")
+        guard let completed, let endpointAuthority else { return }
+        let receipt = endpointAuthority.receipt
+        let terminal = receipt.terminalMedia
+        let participant = completed.participants.first {
+            $0.participantID == receipt.binding.publicationParticipantID.rawValue
+                && $0.renditionIdentity == receipt.binding.renditionIdentity
+                && $0.mediaType == .audio
+        }
+        let advertised = LoopbackCompletedResourceCollection(owner: completed.preparationOwner,
+            participantID: receipt.binding.publicationParticipantID.rawValue, mode: 1)
+        let terminalAdvertised = advertised.contains {
+            $0.key == terminal.key && $0.backingIdentity == terminal.backingIdentity
+        }
+        let terminalCompleted = participant?.completedMedia.contains {
+            $0.key == terminal.key && $0.backingIdentity == terminal.backingIdentity
+        } ?? false
+        let preflight: String
+        do {
+            _ = try AVPlayerAACEndpointValidator.preflight(authority: endpointAuthority,
+                completedPublication: completed)
+            preflight = "ready"
+        } catch let failure as AVPlayerAACEndpointValidationFailure {
+            switch failure {
+            case .authorityAlreadyConsumed: preflight = "authorityAlreadyConsumed"
+            case .identityMismatch: preflight = "identityMismatch"
+            case .incompleteHTTPBody: preflight = "incompleteHTTPBody"
+            case .invalidTrim: preflight = "invalidTrim"
+            case .effectiveEndMismatch: preflight = "effectiveEndMismatch"
+            }
+        } catch {
+            preflight = "otherFixedFailure"
+        }
+        print("TASK21_TIMELINE_ENDPOINT cachedPublication=\(completed.publicationSequence) participantPresent=\(participant != nil) advertisedMediaCount=\(advertised.count) completedMediaCount=\(participant?.completedMedia.count ?? 0) authorityMediaCount=\(endpointAuthority.media.count) terminalSequence=\(terminal.key.logicalSequence) terminalAdvertised=\(terminalAdvertised) terminalCompleted=\(terminalCompleted) preflight=\(preflight)")
     }
 }
 
