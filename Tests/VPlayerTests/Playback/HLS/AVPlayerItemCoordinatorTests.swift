@@ -1753,7 +1753,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         addTeardownBlock { try await owner.tearDown() }
         let prepared = try await fixture.prepare()
         let physical = try XCTUnwrap(fixture.player.currentItem)
-        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        let group = try await fixture.audibleGroupForAssertion(physical)
         XCTAssertNil(group, "Native direct audio must prepare without an alternative selection group")
         XCTAssertFalse(fixture.hasVideoParticipant)
         XCTAssertEqual(fixture.player.rate, 0)
@@ -1771,7 +1771,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         addTeardownBlock { try await owner.tearDown() }
         let prepared = try await fixture.prepare()
         let physical = try XCTUnwrap(fixture.player.currentItem)
-        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        let group = try await fixture.audibleGroupForAssertion(physical)
         XCTAssertNotNil(group)
         XCTAssertTrue(fixture.hasVideoParticipant)
         XCTAssertFalse(prepared.coverageDependencies.isEmpty)
@@ -6506,6 +6506,7 @@ private final class Task21RealIntegrationFixture {
         private let resourceBaseline: Int
         private let applicationBaseline: Int
         private let callbackBaseline: Int
+        private let diagnosticScope: String
 
         init(_ fixture: Task21RealIntegrationFixture) {
             self.fixture = fixture
@@ -6513,12 +6514,15 @@ private final class Task21RealIntegrationFixture {
             resourceBaseline = fixture.resourceBaseline
             applicationBaseline = fixture.applicationBaseline
             callbackBaseline = fixture.callbackBaseline
+            diagnosticScope = fixture.diagnosticScope
         }
 
         func tearDown(file: StaticString = #filePath, line: UInt = #line) async throws {
+            fixture?.traceNativeStage("owner-release-begin")
             var cleanupError: (any Error)?
             do { try await releaseFixture() }
             catch { cleanupError = error }
+            reportOwnerStage("owner-release-return")
             let deadline = ContinuousClock.now.advanced(by: .seconds(2))
             while (driver != nil
                    || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline
@@ -6527,6 +6531,7 @@ private final class Task21RealIntegrationFixture {
                   ContinuousClock.now < deadline {
                 await Task21RealIntegrationFixture.awaitMainQueueTurn()
             }
+            reportOwnerStage("owner-alias-drain-return")
             if driver != nil || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline
                 || PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline
                 || HLSDeliveryApplicationChargeLedger.shared.chargedBytes != applicationBaseline {
@@ -6554,6 +6559,14 @@ private final class Task21RealIntegrationFixture {
             defer { fixture = nil }
             try await fixture?.shutdownThroughRegistry()
         }
+
+        private func reportOwnerStage(_ stage: String) {
+            print("NATIVE_OWNER_STAGE \(diagnosticScope) stage=\(stage) "
+                + "driverAlive=\(driver != nil) itemInstalled=\(driver?.currentItemIdentity != nil) "
+                + "callbacks=\(AVPlayerSDKCallbackLease.occupiedCount)/\(callbackBaseline) "
+                + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes)/\(resourceBaseline) "
+                + "applicationBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes)/\(applicationBaseline)")
+        }
     }
 
     struct PlaybackResult {
@@ -6577,6 +6590,72 @@ private final class Task21RealIntegrationFixture {
     private let applicationBaseline: Int
     private let callbackBaseline: Int
     private var prepared: PreparedAVPlayerItem?
+    private let diagnosticIdentity = UUID().uuidString
+    private var diagnosticStage = "installed"
+    private var diagnosticAttemptMarker: String?
+
+    private var diagnosticScope: String {
+        let session = item.outputLifecycleEpoch.backendIdentity.sessionIdentity
+        return "fixture=\(diagnosticIdentity) session=\(session.sessionID) "
+            + "request=\(session.requestID.uuidString) "
+            + "output=\(item.outputLifecycleEpoch.outputNonce) item=\(item.itemGeneration)"
+    }
+
+    func traceNativeStage(_ stage: String) {
+        diagnosticStage = stage
+        reportNativeStage(event: "stage")
+    }
+
+    func traceNativeFailure(_ event: String) {
+        reportNativeStage(event: event)
+    }
+
+    private func reportNativeStage(event: String) {
+        let context = graph.registry.outputResourceContextSnapshot()
+        let sourceTask = context?.sourceTask
+        let usage = server.usage
+        let owner = evidenceSource.preparationOwner
+        print("NATIVE_FIXTURE_STAGE \(diagnosticScope) event=\(event) stage=\(diagnosticStage) "
+            + "attempt=\(diagnosticAttemptMarker ?? "none") phase=\(coordinator.state.phase) prepared=\(prepared != nil) "
+            + "itemInstalled=\(driver.currentItemIdentity != nil) rate=\(driver.rate) status=\(driver.timeControlStatus.rawValue) "
+            + "disconnected=\(driver.disconnectedFromSystemAudio) waitActive=\(driver.prepareWait.isActive) deadlines=\(deadlineScheduler.activeSlotCount) "
+            + "terminal=\(String(describing: driver.naturalEndTerminalResult)) "
+            + "sourceTask=\(sourceTask.map { String($0.nonce) } ?? "nil") suspend=\(context?.suspend != nil) "
+            + "ownedCleanup=\(graph.registry.cleanupReservationSnapshot() != nil) "
+            + "suspendCalls=\(backend.suspendCallCount) retireCalls=\(backend.retireCallCount) "
+            + "ownerSlot=\(owner.slot) historyActive=\(owner.isHistoryActive) retired=\(owner.isRetired) frozen=\(owner.completionIsFrozen) "
+            + "connections=\(usage.connections) responses=\(usage.activeResponses) "
+            + "callbacks=\(AVPlayerSDKCallbackLease.occupiedCount)/\(callbackBaseline) "
+            + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes)/\(resourceBaseline) "
+            + "applicationBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes)/\(applicationBaseline)")
+        if event != "stage", let marker = diagnosticAttemptMarker {
+            let history = PlaybackDiagnosticTracker.shared.recentHistory
+            let suffix = history.range(of: marker, options: .backwards)
+                .map { String(history[$0.upperBound...]) } ?? "attempt_marker_not_retained"
+            print("NATIVE_FIXTURE_HISTORY \(diagnosticScope) attempt=\(marker) history=\(suffix)")
+        }
+    }
+
+    private func nativeStageWatchdog() -> Task<Void, Never> {
+        Task { @MainActor [weak self] in
+            // Read-only snapshots at 10, 20 and 30 seconds. Never keep a native
+            // fixture alive across sleep or alter the operation's own deadline.
+            for _ in 0..<3 {
+                do { try await Task.sleep(for: .seconds(10)) }
+                catch { return }
+                self?.reportNativeStage(event: "watchdog")
+            }
+        }
+    }
+
+    func audibleGroupForAssertion(_ physical: AVPlayerItem) async throws -> AVMediaSelectionGroup? {
+        traceNativeStage("assertion-audible-group-begin")
+        let watchdog = nativeStageWatchdog()
+        defer { watchdog.cancel() }
+        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        traceNativeStage("assertion-audible-group-return")
+        return group
+    }
 
     private init(publication: Task21RealHLSHarness, server: LoopbackHTTPServer,
                  player: AVPlayer, driver: SystemAVPlayerDriver,
@@ -6749,6 +6828,7 @@ private final class Task21RealIntegrationFixture {
         let sourceTask = graph.registry.outputResourceContextSnapshot()?.sourceTask
         let attemptIdentity = UUID().uuidString
         let attemptMarker = "native_prepare_begin_\(attemptIdentity)"
+        diagnosticAttemptMarker = attemptMarker
         let session = item.outputLifecycleEpoch.backendIdentity.sessionIdentity
         let attemptScope = "fixture=Task21RealIntegration session=\(session.sessionID) "
             + "request=\(session.requestID.uuidString) "
@@ -6757,18 +6837,27 @@ private final class Task21RealIntegrationFixture {
             + "sourceTask=\(sourceTask.map { String($0.nonce) } ?? "nil")"
         PlaybackDiagnosticTracker.shared.append(attemptMarker)
         print("NATIVE_PREPARE_ATTEMPT_BEGIN attempt=\(attemptIdentity) \(attemptScope)")
+        traceNativeStage("prepare-begin")
+        let watchdog = nativeStageWatchdog()
+        defer { watchdog.cancel() }
         reportNativePublication(stage: "prepare-begin", elapsed: .zero)
         let value: PreparedAVPlayerItem
         do {
             let ticket = try XCTUnwrap(sourceTask)
-            guard graph.registry.startOutputPrepareOperation(ticket),
-                  case .succeeded = await graph.registry.joinOutputBackendOperation(ticket),
+            guard graph.registry.startOutputPrepareOperation(ticket) else {
+                throw backend.lastError ?? AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            traceNativeStage("prepare-join-begin")
+            let completion = await graph.registry.joinOutputBackendOperation(ticket)
+            traceNativeStage("prepare-join-return")
+            guard case .succeeded = completion,
                   let result = backend.prepared else {
                 throw backend.lastError ?? AVPlayerItemCoordinatorFailure.staleIdentity
             }
             value = result
         }
         catch {
+            reportNativeStage(event: "prepare-failure")
             let failureItem = player.currentItem
             let failureItemTime = CMTimeGetSeconds(player.currentTime())
             reportNativePublication(stage: "prepare-failed",
@@ -6814,6 +6903,9 @@ private final class Task21RealIntegrationFixture {
                     + "accessEvents=\(accessEvents)；底层：\(error)"])
         }
         prepared = value
+        traceNativeStage("prepare-return")
+        print("NATIVE_PREPARE_ATTEMPT_RETURN attempt=\(attemptIdentity) \(attemptScope) "
+            + "elapsed=\(preparationStarted.duration(to: .now))")
         return value
     }
 
@@ -6837,11 +6929,14 @@ private final class Task21RealIntegrationFixture {
     }
 
     func playToEnd() async throws -> PlaybackResult {
+        let watchdog = nativeStageWatchdog()
+        defer { watchdog.cancel() }
         _ = try await prepare()
         guard let currentItem = player.currentItem else {
             throw AVPlayerItemCoordinatorFailure.noCurrentItem
         }
         let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        traceNativeStage("eos-activation-begin")
         guard let activationTicket = try graph.registry.beginOutputActivation(
             contextNonce: context.contextNonce
         ), graph.registry.startOutputActivationOperation(activationTicket),
@@ -6849,7 +6944,9 @@ private final class Task21RealIntegrationFixture {
               case .armed = backend.activationResult else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        traceNativeStage("eos-activation-return")
         let currentItemIdentity = ObjectIdentifier(currentItem)
+        traceNativeStage("eos-notification-wait-begin")
         let reachedEnd = try await withThrowingTaskGroup(of: Bool.self) { group in
             group.addTask {
                 for await notification in NotificationCenter.default.notifications(
@@ -6870,6 +6967,7 @@ private final class Task21RealIntegrationFixture {
             let first = try await group.next() ?? false
             return first
         }
+        traceNativeStage("eos-notification-wait-return")
         guard reachedEnd else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
         try await fireNaturalEndDeadline()
         guard case .success = try await naturalEndTerminalResult() else {
@@ -7098,6 +7196,7 @@ private final class Task21RealIntegrationFixture {
     }
 
     private func waitForNaturalEndDeadline() async throws {
+        traceNativeStage("eos-deadline-wait-begin")
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while deadlineScheduler.activeSlotCount == 0,
               driver.naturalEndTerminalResult == nil,
@@ -7106,27 +7205,34 @@ private final class Task21RealIntegrationFixture {
         }
         guard driver.naturalEndTerminalResult == nil,
               deadlineScheduler.activeSlotCount == 1 else {
+            reportNativeStage(event: "eos-deadline-wait-failure")
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
+        traceNativeStage("eos-deadline-wait-return")
     }
 
     private func fireNaturalEndDeadline() async throws {
         try await waitForNaturalEndDeadline()
         guard deadlineScheduler.fireNext() else {
+            reportNativeStage(event: "eos-deadline-fire-failure")
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
+        traceNativeStage("eos-deadline-fired")
     }
 
     private func naturalEndTerminalResult() async throws
         -> AVPlayerNaturalEndTerminalResult {
+        traceNativeStage("eos-terminal-wait-begin")
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while driver.naturalEndTerminalResult == nil,
               ContinuousClock.now < deadline {
             await Self.awaitMainQueueTurn()
         }
         guard let result = driver.naturalEndTerminalResult else {
+            reportNativeStage(event: "eos-terminal-wait-failure")
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
+        traceNativeStage("eos-terminal-wait-return")
         return result
     }
 
@@ -7251,6 +7357,9 @@ private final class Task21RealIntegrationFixture {
     }
 
     private func shutdownThroughRegistry() async throws {
+        traceNativeStage("owned-shutdown-begin")
+        let watchdog = nativeStageWatchdog()
+        defer { watchdog.cancel() }
         var cleanupError: (any Error)?
         do {
             try await stopAndRetireRegistryOutput()
@@ -7259,15 +7368,20 @@ private final class Task21RealIntegrationFixture {
                 throw AVPlayerItemCoordinatorFailure.operationInFlight
             }
         } catch {
+            reportNativeStage(event: "owned-shutdown-failure")
             cleanupError = error
             // A failed claim may still have an original registered runner. Join
             // that task before retiring this test's exact observation owners.
             await graph.registry.joinOwnedTerminalCleanup(
                 session: item.outputLifecycleEpoch.backendIdentity.sessionIdentity)
+            traceNativeStage("fallback-owned-join-return")
             driver.pause(item: item)
+            traceNativeStage("fallback-pause-return")
             driver.replaceCurrentItemWithNil(item: item)
+            traceNativeStage("fallback-detach-return")
             driver.removeObservers(item: item)
             evidenceSource.retirePreparation()
+            traceNativeStage("fallback-source-retire-return")
             // This fallback signs no quiescence receipt and retains the failure.
             // Native callbacks keep their leases until their actual completion.
         }
@@ -7278,20 +7392,27 @@ private final class Task21RealIntegrationFixture {
             else { XCTFail("Native fixture HTTP cleanup also failed: \(error)") }
         }
         if let cleanupError { throw cleanupError }
+        traceNativeStage("owned-shutdown-return")
     }
 
     private func closeAndRetireServer() async throws {
+        traceNativeStage("http-close-begin")
         let ticket = server.closeAdmission()
+        traceNativeStage("http-close-return")
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while (server.usage.connections != 0 || server.usage.activeResponses != 0),
               ContinuousClock.now < deadline {
             await Self.awaitMainQueueTurn()
         }
         guard server.usage.connections == 0, server.usage.activeResponses == 0 else {
+            reportNativeStage(event: "http-owner-drain-failure")
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
+        traceNativeStage("http-owner-drain-return")
         try server.drain(cleanupTicket: ticket)
+        traceNativeStage("http-drain-return")
         try server.retire(cleanupTicket: ticket)
+        traceNativeStage("http-retire-return")
         guard server.usage.distinctBackingBytes == 0,
               server.usage.parserAndStagingBytes == 0 else {
             throw AVPlayerItemCoordinatorFailure.operationInFlight
@@ -7302,6 +7423,9 @@ private final class Task21RealIntegrationFixture {
     /// quiescence/retirement 后才卸载 item；随后关闭 HTTP admission 并证明
     /// socket/send owner 全部归零。任何一层失败都向测试传播。
     func teardown() async throws {
+        traceNativeStage("eos-teardown-begin")
+        let watchdog = nativeStageWatchdog()
+        defer { watchdog.cancel() }
         try await stopAndRetireRegistryOutput()
         guard coordinator.currentItemIdentity == nil,
               coordinator.phase == .quiescent else {
@@ -7309,12 +7433,17 @@ private final class Task21RealIntegrationFixture {
         }
         let retainedMetadata = publication.store.preparationLeaseChargeSnapshot(
             ownerSlot: evidenceSource.preparationOwner.slot)
+        traceNativeStage("eos-http-close-begin")
         let ticket = server.closeAdmission()
+        traceNativeStage("eos-http-close-return")
         guard finalWaitUntil(timeout: 2, condition: {
             server.usage.connections == 0 && server.usage.activeResponses == 0
         }) else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        traceNativeStage("eos-http-owner-drain-return")
         try server.drain(cleanupTicket: ticket)
+        traceNativeStage("eos-http-drain-return")
         try server.retire(cleanupTicket: ticket)
+        traceNativeStage("eos-http-retire-return")
         guard server.usage.connections == 0,
               server.usage.activeResponses == 0,
               server.usage.distinctBackingBytes == 0,
@@ -7335,6 +7464,7 @@ private final class Task21RealIntegrationFixture {
               ContinuousClock.now < callbackDeadline {
             await Self.awaitMainQueueTurn()
         }
+        traceNativeStage("eos-callback-drain-return")
         XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline,
                        "physical SDK callback aliases must retire before checking settled escrow")
         // These are the exact original reservations still owned by this fixture:
@@ -7351,11 +7481,15 @@ private final class Task21RealIntegrationFixture {
                            + retainedFixtureContextBytes,
                        "retired sockets leave exactly the baseline plus this fixture's retained owners")
         inspectPreparationStorage(stage: "quiescent-external-owner")
+        traceNativeStage("eos-teardown-return")
         _ = publication
     }
 
     private func stopAndRetireRegistryOutput() async throws {
-        try await stopAndRetireTask21RegistryOutput(graph: graph, backend: backend)
+        traceNativeStage("registry-retirement-begin")
+        try await stopAndRetireTask21RegistryOutput(graph: graph, backend: backend,
+            diagnostic: { [weak self] stage in self?.traceNativeStage(stage) })
+        traceNativeStage("registry-retirement-return")
     }
 }
 
@@ -7363,7 +7497,8 @@ private final class Task21RealIntegrationFixture {
 /// backend→coordinator→source 留在原 runner 中，消耗后续测试的两 owner 准入。
 @MainActor
 private func stopAndRetireTask21RegistryOutput(
-    graph: OutputGraphFixture, backend: Task21RegistryBackend
+    graph: OutputGraphFixture, backend: Task21RegistryBackend,
+    diagnostic: (@MainActor (String) -> Void)? = nil
 ) async throws {
         guard let context = graph.registry.outputResourceContextSnapshot() else { return }
         // natural-end failure 可能已经登记 recovery suspend。必须在 join 原 runner
@@ -7376,6 +7511,7 @@ private func stopAndRetireTask21RegistryOutput(
             at: graph.registry.clock.nowNanoseconds,
             teardown: true
         ))
+        diagnostic?("registry-terminal-owner-claimed")
         let receiver = Task21FinalEOSCleanupReceiver(
             registry: graph.registry,
             audioLane: graph.lane
@@ -7389,8 +7525,11 @@ private func stopAndRetireTask21RegistryOutput(
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
         backend.allowRetirementCompletion()
+        diagnostic?("registry-owned-join-begin")
         await graph.registry.joinOwnedTerminalCleanup(session: context.sessionIdentity)
+        diagnostic?("registry-owned-join-return")
         try receiver.result()
+        diagnostic?("registry-cleanup-result-return")
         guard graph.registry.outputResourceContextSnapshot() == nil,
               graph.registry.ownedResourceSnapshot() == nil,
               graph.registry.cleanupReservationSnapshot() == nil else {
@@ -7405,13 +7544,17 @@ private func withFinalEOSFixture(
     let fixture = try await Task21RealIntegrationFixture.makePreparedForFinalEOS()
     var operationError: (any Error)?
     do {
+        fixture.traceNativeStage("eos-body-begin")
         try await body(fixture)
+        fixture.traceNativeStage("eos-body-return")
     } catch {
+        fixture.traceNativeFailure("eos-body-failure")
         operationError = error
     }
     do {
         try await fixture.teardown()
     } catch {
+        fixture.traceNativeFailure("eos-teardown-failure")
         if let operationError {
             XCTFail("EOS 主断言失败后 cleanup 也失败：\(error)")
             throw operationError

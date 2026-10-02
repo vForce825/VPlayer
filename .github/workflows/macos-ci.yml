@@ -1,4 +1,4 @@
-name: Paused window storage ownership validation
+name: Callback credit ownership and native phase validation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-paused-storage-${{ github.ref }}
+  group: macos-ci-callback-credit-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify capacity, store, startup and paused storage contracts
+      - name: Verify callback credit and capacity contracts
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -73,36 +73,57 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/PausedStorage.xcresult" \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests \
-            -only-testing:VPlayerTests/HLSResourceStoreTests \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests \
-            -only-testing:VPlayerTests/VPlayerAppStartupTests \
-            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests
-      - name: Report scoped paused storage failures
+            -resultBundlePath "$RUNNER_TEMP/CallbackCredits.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests \
+            -only-testing:VPlayerTests/HLSCapacityTests \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests
+      - name: Report scoped CallbackCredits failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorage.xcresult"
-      - name: Validate focused physical storage under Address Sanitizer
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CallbackCredits.xcresult"
+
+      - name: Locate native direct and master preparation callback phases
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/NativePhases.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27NativeMasterAVPreparationRetainsAlternativeSelection
+      - name: Report scoped NativePhases failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativePhases.xcresult"
+
+      - name: Isolate native final EOS callback phases
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/FinalEOS.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch
+      - name: Report scoped FinalEOS failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/FinalEOS.xcresult"
+
+      - name: Validate isolated credit and metadata ownership under Address Sanitizer
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild -help > "$RUNNER_TEMP/xcodebuild-help.txt" 2>&1
           grep -q -- '-enableAddressSanitizer' "$RUNNER_TEMP/xcodebuild-help.txt"
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath "$RUNNER_TEMP/PausedStorageASan" -enableAddressSanitizer YES \
+            -derivedDataPath "$RUNNER_TEMP/CallbackCreditASan" -enableAddressSanitizer YES \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/PausedStorageASan.xcresult" \
-            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedWindowRequiresItsOwnFrozenInitializationCompletion \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadOverflowClearsAllReferencesDuringConcurrentProducers \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingReleasesQueuedReferencesAndDeinitializesAfterJoin
+            -resultBundlePath "$RUNNER_TEMP/CallbackCreditASan.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests \
+            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests
       - name: Report scoped Address Sanitizer failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorageASan.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CallbackCreditASan.xcresult"

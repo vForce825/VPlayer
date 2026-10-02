@@ -5,6 +5,7 @@
 import AVFoundation
 import Darwin
 import Foundation
+import ObjectiveC
 import VPlayerCore
 import os
 
@@ -116,6 +117,23 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
     private let admission: AVPlayerDriverAdmission
     private let resourceContextReservation: PlaybackResourceContextReservation
     private let installationResourceContextReservation: PlaybackResourceContextReservation?
+    private let creditPool: AVPlayerSDKCallbackCreditPool?
+    private let creditBorrow: AVPlayerSDKCallbackCreditPool.Borrow?
+
+    fileprivate static func claimSlotLocked(admission: AVPlayerDriverAdmission) throws -> UInt8 {
+        guard let slot = (UInt8(0)..<8).first(where: { occupied & (1 << $0) == 0 }) else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        try SystemAVPlayerDriver.retainAdmissionLocked(admission)
+        occupied |= 1 << slot
+        return slot
+    }
+
+    fileprivate static func releaseSlotLocked(_ slot: UInt8, admission: AVPlayerDriverAdmission) {
+        precondition(occupied & (1 << slot) != 0)
+        occupied &= ~(1 << slot)
+        SystemAVPlayerDriver.releaseAdmissionLocked(admission)
+    }
 
     fileprivate static func reserve(_ kind: Kind, admission: AVPlayerDriverAdmission,
         installationResourceContextReservation: PlaybackResourceContextReservation?) throws
@@ -124,11 +142,7 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
             allocationIdentity: .stable(UUID()), bytes: kind == .logFetch ? 4 * 1_024 : 2 * 1_024)
         do {
             let lease = try SystemAVPlayerDriver.creationLock.withLock {
-                guard let slot = (UInt8(0)..<8).first(where: { occupied & (1 << $0) == 0 }) else {
-                    throw AVPlayerItemCoordinatorFailure.capacityExceeded
-                }
-                try SystemAVPlayerDriver.retainAdmissionLocked(admission)
-                occupied |= 1 << slot
+                let slot = try claimSlotLocked(admission: admission)
                 return AVPlayerSDKCallbackLease(slot: slot, kind: kind, admission: admission,
                     resourceContextReservation: resourceReservation,
                     installationResourceContextReservation: installationResourceContextReservation)
@@ -141,26 +155,34 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
             throw error
         }
     }
-    private init(slot: UInt8, kind: Kind, admission: AVPlayerDriverAdmission,
+    fileprivate init(slot: UInt8, kind: Kind, admission: AVPlayerDriverAdmission,
                  resourceContextReservation: PlaybackResourceContextReservation,
-                 installationResourceContextReservation: PlaybackResourceContextReservation?) {
+                 installationResourceContextReservation: PlaybackResourceContextReservation?,
+                 creditPool: AVPlayerSDKCallbackCreditPool? = nil,
+                 creditBorrow: AVPlayerSDKCallbackCreditPool.Borrow? = nil) {
         self.slot = slot; self.kind = kind; self.admission = admission
         self.resourceContextReservation = resourceContextReservation
         self.installationResourceContextReservation = installationResourceContextReservation
+        self.creditPool = creditPool
+        self.creditBorrow = creditBorrow
     }
     func assertRegistered() {
         SystemAVPlayerDriver.creationLock.withLock {
             precondition(Self.occupied & (1 << slot) != 0, "SDK callback 的原物理租约不可提前释放")
             precondition(SystemAVPlayerDriver.isAdmissionActiveLocked(admission))
+            if let creditPool, let creditBorrow { creditPool.assertBorrowedLocked(creditBorrow, slot: slot) }
         }
     }
     deinit {
-        SystemAVPlayerDriver.creationLock.withLock {
-            precondition(Self.occupied & (1 << slot) != 0)
-            Self.occupied &= ~(1 << slot)
-            SystemAVPlayerDriver.releaseAdmissionLocked(admission)
+        if let creditPool, let creditBorrow {
+            creditPool.returnFromPhysicalDeinit(creditBorrow, slot: slot,
+                reservation: resourceContextReservation)
+        } else {
+            SystemAVPlayerDriver.creationLock.withLock {
+                Self.releaseSlotLocked(slot, admission: admission)
+            }
+            PlaybackResourceContextLedger.shared.release(resourceContextReservation)
         }
-        PlaybackResourceContextLedger.shared.release(resourceContextReservation)
     }
 #if DEBUG
     nonisolated(unsafe) private static var diagnostics = false
@@ -182,6 +204,307 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
     }
 #else
     @inline(__always) func inspectRegistration() {}
+#endif
+}
+
+/// Prepaid callback capacity for one original driver/item. This object contains
+/// no task, timer, native callback, proof, or escaping closure. Its caller must
+/// retain it through registered cleanup; closing it is not quiescence evidence.
+final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
+    struct AllocationBreakdown: Sendable {
+        let poolBytes: Int
+        let contextReservationBytes: Int
+        let applicationReservationBytes: Int
+        let totalBytes: Int
+    }
+
+    fileprivate enum Role: UInt8, Sendable { case operation, rollback, observer }
+    fileprivate struct Borrow: Sendable {
+        let role: Role
+        let generation: UInt64
+    }
+    private struct Credit {
+        let slot: UInt8
+        var reservation: PlaybackResourceContextReservation?
+        var generation: UInt64 = 0
+        var borrowed = false
+        static var absent: Self { .init(slot: 8, reservation: nil) }
+    }
+
+    fileprivate let admission: AVPlayerDriverAdmission
+    fileprivate let itemIdentity: AVPlayerItemInstanceIdentity?
+    fileprivate let itemObjectIdentity: ObjectIdentifier?
+    private let resourceContextReservation: PlaybackResourceContextReservation
+    private var installationResourceContextReservation: PlaybackResourceContextReservation?
+    // All mutable fields are protected by the existing driver creation lock.
+    private var operation: Credit
+    private var rollback: Credit
+    private var observer: Credit
+    private var cancelled = false
+    private var closed = false
+    private var rollbackProtected = false
+
+    static func allocationBreakdown() throws -> AllocationBreakdown {
+        let pool = malloc_good_size(class_getInstanceSize(Self.self))
+        let context = malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self))
+        let application = malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+        return .init(poolBytes: pool, contextReservationBytes: context,
+            applicationReservationBytes: application,
+            totalBytes: try HLSChecked.add(try HLSChecked.add(pool, context), application))
+    }
+
+    fileprivate static func reserve(admission: AVPlayerDriverAdmission,
+        itemIdentity: AVPlayerItemInstanceIdentity?, itemObjectIdentity: ObjectIdentifier?,
+        includingObserver: Bool,
+        installationResourceContextReservation: PlaybackResourceContextReservation?) throws -> Self {
+        let layout = try allocationBreakdown()
+        let pool = try SystemAVPlayerDriver.creationLock.withLock {
+            guard SystemAVPlayerDriver.isAdmissionActiveLocked(admission) else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            let root = try PlaybackResourceContextLedger.shared.reserve(
+                allocationIdentity: .stable(UUID()), bytes: layout.totalBytes)
+            var operation = Credit.absent
+            var rollback = Credit.absent
+            var observer = Credit.absent
+            var transferred = false
+            defer {
+                if !transferred {
+                    releaseUnusedLocked(&observer, admission: admission)
+                    releaseUnusedLocked(&rollback, admission: admission)
+                    releaseUnusedLocked(&operation, admission: admission)
+                    PlaybackResourceContextLedger.shared.release(root)
+                }
+            }
+            operation = try reserveCreditLocked(admission: admission, layout: layout)
+            rollback = try reserveCreditLocked(admission: admission, layout: layout)
+            if includingObserver { observer = try reserveCreditLocked(admission: admission, layout: layout) }
+            let pool = Self(admission: admission, itemIdentity: itemIdentity,
+                itemObjectIdentity: itemObjectIdentity, root: root,
+                installationResourceContextReservation: installationResourceContextReservation,
+                operation: operation, rollback: rollback, observer: observer)
+            transferred = true
+            return pool
+        }
+        // No caller can borrow before all identities and measured roots validate.
+        try PlaybackResourceContextLedger.shared.rebind(pool.resourceContextReservation,
+            to: .object(ObjectIdentifier(pool)))
+        try pool.registerUnusedCreditIdentities()
+        guard let actual = pool.allocationUsage(), actual.pool <= layout.poolBytes,
+              actual.context <= layout.contextReservationBytes,
+              actual.application <= layout.applicationReservationBytes else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        return pool
+    }
+
+    private static func reserveCreditLocked(admission: AVPlayerDriverAdmission,
+        layout: AllocationBreakdown) throws -> Credit {
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: 2 * 1_024)
+        do {
+            let leaseBytes = malloc_good_size(class_getInstanceSize(AVPlayerSDKCallbackLease.self))
+            let tokenBytes = try HLSChecked.add(layout.contextReservationBytes, layout.applicationReservationBytes)
+            guard try HLSChecked.add(leaseBytes, tokenBytes) <= 2 * 1_024,
+                  let actual = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation),
+                  actual.context <= layout.contextReservationBytes,
+                  actual.application <= layout.applicationReservationBytes else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            let slot = try AVPlayerSDKCallbackLease.claimSlotLocked(admission: admission)
+            return .init(slot: slot, reservation: reservation)
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(admission: AVPlayerDriverAdmission,
+        itemIdentity: AVPlayerItemInstanceIdentity?, itemObjectIdentity: ObjectIdentifier?,
+        root: PlaybackResourceContextReservation,
+        installationResourceContextReservation: PlaybackResourceContextReservation?,
+        operation: Credit, rollback: Credit, observer: Credit) {
+        self.admission = admission
+        self.itemIdentity = itemIdentity
+        self.itemObjectIdentity = itemObjectIdentity
+        resourceContextReservation = root
+        self.installationResourceContextReservation = installationResourceContextReservation
+        self.operation = operation; self.rollback = rollback; self.observer = observer
+    }
+
+    private func withCredit<Result>(_ role: Role,
+        _ body: (inout Credit) throws -> Result) rethrows -> Result {
+        switch role {
+        case .operation: return try body(&operation)
+        case .rollback: return try body(&rollback)
+        case .observer: return try body(&observer)
+        }
+    }
+
+    private func registerUnusedCreditIdentities() throws {
+        try SystemAVPlayerDriver.creationLock.withLock {
+            try registerUnusedCreditIdentityLocked(.operation)
+            try registerUnusedCreditIdentityLocked(.rollback)
+            try registerUnusedCreditIdentityLocked(.observer)
+        }
+    }
+
+    private func registerUnusedCreditIdentityLocked(_ role: Role) throws {
+        try withCredit(role) { credit in
+            if let reservation = credit.reservation {
+                try PlaybackResourceContextLedger.shared.rebind(reservation,
+                    to: .owned(ObjectIdentifier(self), role.rawValue))
+            }
+        }
+    }
+
+    fileprivate func borrowOperation(_ kind: AVPlayerSDKCallbackLease.Kind) throws -> AVPlayerSDKCallbackLease {
+        switch kind {
+        case .ready, .seek, .loaded, .preroll, .systemAudio: break
+        default: throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        return try borrow(.operation, kind: kind)
+    }
+    fileprivate func borrowObserver() throws -> AVPlayerSDKCallbackLease {
+        try borrow(.observer, kind: .timeControl)
+    }
+    /// This transfers storage only. Returning/dropping this lease never proves
+    /// that a native disconnect ran or that registered cleanup accepted ownership.
+    fileprivate func borrowRollback() throws -> AVPlayerSDKCallbackLease {
+        try borrow(.rollback, kind: .systemAudio)
+    }
+
+    private func borrow(_ role: Role, kind: AVPlayerSDKCallbackLease.Kind) throws
+        -> AVPlayerSDKCallbackLease {
+        let claimed = try SystemAVPlayerDriver.creationLock.withLock {
+            guard SystemAVPlayerDriver.isAdmissionActiveLocked(admission),
+                  role == .rollback || (!cancelled && !closed) else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            let claim = try withCredit(role) { credit in
+                guard !credit.borrowed else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+                guard let reservation = credit.reservation else {
+                    throw AVPlayerItemCoordinatorFailure.capacityExceeded
+                }
+                let next = credit.generation.addingReportingOverflow(1)
+                guard !next.overflow else { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
+                credit.generation = next.partialValue
+                credit.borrowed = true
+                credit.reservation = nil
+                return (credit.slot, reservation, Borrow(role: role, generation: next.partialValue))
+            }
+            rollbackProtected = true
+            if role == .rollback { cancelled = true }
+            return (claim, installationResourceContextReservation)
+        }
+        let (claim, installation) = claimed
+        let lease = AVPlayerSDKCallbackLease(slot: claim.0, kind: kind, admission: admission,
+            resourceContextReservation: claim.1,
+            installationResourceContextReservation: installation,
+            creditPool: self, creditBorrow: claim.2)
+        guard Self.actualBytes(of: lease)
+            <= malloc_good_size(class_getInstanceSize(AVPlayerSDKCallbackLease.self)) else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        try PlaybackResourceContextLedger.shared.rebind(claim.1,
+            to: .object(ObjectIdentifier(lease)))
+        return lease
+    }
+
+    func cancel() { SystemAVPlayerDriver.creationLock.withLock { cancelled = true } }
+
+    /// Never-started admission can release everything. Once any borrower was
+    /// admitted, only an original-driver native readback can release rollback.
+    func close() {
+        SystemAVPlayerDriver.creationLock.withLock {
+            closed = true; cancelled = true
+            Self.releaseUnusedLocked(&operation, admission: admission)
+            Self.releaseUnusedLocked(&observer, admission: admission)
+            if !rollbackProtected {
+                Self.releaseUnusedLocked(&rollback, admission: admission)
+                installationResourceContextReservation = nil
+            }
+        }
+    }
+
+    fileprivate func resolveUnusedRollbackAfterDriverReadback() -> Bool {
+        SystemAVPlayerDriver.creationLock.withLock {
+            guard closed, rollbackProtected, !operation.borrowed, !rollback.borrowed,
+                  rollback.reservation != nil,
+                  SystemAVPlayerDriver.isAdmissionActiveLocked(admission) else { return false }
+            rollbackProtected = false
+            Self.releaseUnusedLocked(&rollback, admission: admission)
+            installationResourceContextReservation = nil
+            return true
+        }
+    }
+
+    fileprivate func assertBorrowedLocked(_ borrow: Borrow, slot: UInt8) {
+        withCredit(borrow.role) { credit in
+            precondition(credit.slot == slot && credit.borrowed
+                && credit.generation == borrow.generation && credit.reservation == nil,
+                "Only the exact outstanding physical callback owns this prepaid credit")
+        }
+    }
+
+    fileprivate func returnFromPhysicalDeinit(_ borrow: Borrow, slot: UInt8,
+        reservation: PlaybackResourceContextReservation) {
+        SystemAVPlayerDriver.creationLock.withLock {
+            assertBorrowedLocked(borrow, slot: slot)
+            let keepReserved = !closed || (borrow.role == .rollback && rollbackProtected)
+            withCredit(borrow.role) { credit in
+                credit.borrowed = false
+                if keepReserved {
+                    do {
+                        try PlaybackResourceContextLedger.shared.rebind(reservation,
+                            to: .owned(ObjectIdentifier(self), borrow.role.rawValue))
+                    } catch { preconditionFailure("The original exclusive callback reservation must rebind: \(error)") }
+                    credit.reservation = reservation
+                } else {
+                    AVPlayerSDKCallbackLease.releaseSlotLocked(slot, admission: admission)
+                    PlaybackResourceContextLedger.shared.release(reservation)
+                }
+            }
+        }
+    }
+
+    private static func releaseUnusedLocked(_ credit: inout Credit, admission: AVPlayerDriverAdmission) {
+        guard !credit.borrowed, let reservation = credit.reservation else { return }
+        credit.reservation = nil
+        AVPlayerSDKCallbackLease.releaseSlotLocked(credit.slot, admission: admission)
+        PlaybackResourceContextLedger.shared.release(reservation)
+    }
+
+    deinit {
+        // Every outstanding borrower retains this pool. The registered caller is
+        // responsible for retaining its own pool reference until cleanup resolves.
+        SystemAVPlayerDriver.creationLock.withLock {
+            precondition(!operation.borrowed && !rollback.borrowed && !observer.borrowed)
+            Self.releaseUnusedLocked(&operation, admission: admission)
+            Self.releaseUnusedLocked(&rollback, admission: admission)
+            Self.releaseUnusedLocked(&observer, admission: admission)
+        }
+        PlaybackResourceContextLedger.shared.release(resourceContextReservation)
+    }
+
+    private static func actualBytes(of object: AnyObject) -> Int {
+        malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(object).toOpaque()))
+    }
+    /// Sizes of this exact live registration, including its real application
+    /// token. Estimated allocator classes are never reported as measured bytes.
+    func allocationUsage() -> (pool: Int, context: Int, application: Int)? {
+        guard let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(
+            for: resourceContextReservation) else { return nil }
+        return (Self.actualBytes(of: self), tokens.context, tokens.application)
+    }
+#if DEBUG
+    func inspectAllocations(_ body: (String, UnsafeRawPointer, Int, Int) -> Void) {
+        guard let layout = try? Self.allocationBreakdown() else { return }
+        let pointer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        body("owned/callback credit pool", pointer, malloc_size(pointer), layout.poolBytes)
+        let token = UnsafeRawPointer(Unmanaged.passUnretained(resourceContextReservation).toOpaque())
+        body("owned/callback pool context reservation", token, malloc_size(token), layout.contextReservationBytes)
+    }
 #endif
 }
 
@@ -317,6 +640,47 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     func reserveSDKCallbackLease(_ kind: AVPlayerSDKCallbackLease.Kind) throws -> AVPlayerSDKCallbackLease {
         try .reserve(kind, admission: eventHub.admission,
             installationResourceContextReservation: installationResourceContextReservation)
+    }
+
+    /// Capacity only: no native method is invoked and no activation is authorized.
+    func reserveSDKCallbackCredits(includingObserver: Bool = false) throws -> AVPlayerSDKCallbackCreditPool {
+        guard player.currentItem === item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try .reserve(admission: eventHub.admission,
+            itemIdentity: currentItemIdentity, itemObjectIdentity: item.map(ObjectIdentifier.init),
+            includingObserver: includingObserver,
+            installationResourceContextReservation: installationResourceContextReservation)
+    }
+
+    private func ownsCurrentCallbackCreditPool(_ pool: AVPlayerSDKCallbackCreditPool) -> Bool {
+        pool.admission.generation == eventHub.admission.generation
+            && pool.itemIdentity == currentItemIdentity
+            && pool.itemObjectIdentity == item.map(ObjectIdentifier.init)
+            && pool.itemObjectIdentity == player.currentItem.map(ObjectIdentifier.init)
+    }
+
+    func borrowSDKOperationCredit(_ kind: AVPlayerSDKCallbackLease.Kind,
+        from pool: AVPlayerSDKCallbackCreditPool) throws -> AVPlayerSDKCallbackLease {
+        guard ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try pool.borrowOperation(kind)
+    }
+
+    func borrowSDKObserverCredit(from pool: AVPlayerSDKCallbackCreditPool) throws -> AVPlayerSDKCallbackLease {
+        guard ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try pool.borrowObserver()
+    }
+
+    func borrowSDKRollbackCredit(from pool: AVPlayerSDKCallbackCreditPool) throws -> AVPlayerSDKCallbackLease {
+        guard ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try pool.borrowRollback()
+    }
+
+    /// Only the original driver can retire unused rollback capacity. This is a
+    /// direct state check, not a stop receipt or authorization to resume playback.
+    func releaseUnusedSDKRollbackCreditIfDisconnected(_ pool: AVPlayerSDKCallbackCreditPool) -> Bool {
+        guard ownsCurrentCallbackCreditPool(pool),
+              !systemAudioTransitionInFlight, player.disconnectedFromSystemAudio,
+              player.rate == 0, player.timeControlStatus == .paused else { return false }
+        return pool.resolveUnusedRollbackAfterDriverReadback()
     }
 
     func retainInstallationResourceContext(_ reservation: PlaybackResourceContextReservation) {
