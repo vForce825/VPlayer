@@ -21,6 +21,17 @@ private final class WeakSystemAVPlayerDriverProbe {
 }
 
 @MainActor
+private final class WeakPreparedTimelineProbe {
+    weak var value: PlayerItemTimelineMappingAuthority?
+    let identity: ObjectIdentifier
+
+    init(_ value: PlayerItemTimelineMappingAuthority) {
+        self.value = value
+        identity = ObjectIdentifier(value)
+    }
+}
+
+@MainActor
 private final class NativeAudibleSelectionProgressProbe {
     weak var driver: SystemAVPlayerDriver?
     private var phase = "fixture"
@@ -1755,6 +1766,85 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         try await owner.tearDown()
     }
 
+    func testSuccessfulTimelineIdentitySurvivesDroppedReceiptsAndOwnedPauseUntilCleanup() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let original = try await self.prepareWithoutRetainingTimelineObservations(harness)
+            XCTAssertNotNil(original.value,
+                            "Production discards its returned PreparedAVPlayerItem")
+            XCTAssertEqual(original.value.map(ObjectIdentifier.init), original.identity)
+            let beforePause = PlaybackResourceContextLedger.shared.chargedBytes
+            _ = try await harness.activate()
+            let first = try await harness.stop()
+            XCTAssertNotNil(original.value)
+            XCTAssertEqual(original.value.map(ObjectIdentifier.init), original.identity)
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let resumed = try await harness.resumeThroughRegistry()
+            XCTAssertEqual(resumed, .armed(harness.activation))
+            XCTAssertNotNil(original.value)
+            XCTAssertEqual(original.value.map(ObjectIdentifier.init), original.identity)
+            XCTAssertFalse(harness.coordinator.accept(first))
+            let second = try await harness.stop()
+            XCTAssertNotNil(original.value)
+            print("PREPARED_TIMELINE_ALLOCATION coordinator=\(malloc_size(Unmanaged.passUnretained(harness.coordinator).toOpaque())) "
+                + "contextBeforePause=\(beforePause) contextPaused=\(PlaybackResourceContextLedger.shared.chargedBytes)")
+            try harness.coordinator.completeLifecycleCleanup(second)
+            XCTAssertNil(original.value,
+                "Physical cleanup must release the mapping while the coordinator remains alive")
+        }
+    }
+
+    func testFailedPreparationNeverRetainsAnUncommittedTimeline() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2),
+                                    prepareMutation: .prerollTimeout)
+        } body: { harness in
+            await XCTAssertThrowsErrorAsync(try await harness.prepare())
+            let original = try self.releaseObservedTimeline(harness)
+            XCTAssertNil(original.value,
+                "A mapping seen by seek/coverage is not a successful preparation")
+            XCTAssertNotEqual(harness.coordinator.phase, .prepared)
+        }
+    }
+
+    func testCurrentTimelineFailureClearsOnlyItsOwnSuccessfulMapping() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let original = try await self.prepareWithoutRetainingTimelineObservations(harness)
+            let malformed = try harness.malformedCurrentAuthorityURL()
+            let priorItem = AVPlayerItemInstanceIdentity(
+                outputLifecycleEpoch: harness.item.outputLifecycleEpoch,
+                itemGeneration: harness.item.itemGeneration - 1)
+            harness.coordinator.observeAccessLogURI(malformed, item: priorItem)
+            XCTAssertNotNil(original.value,
+                            "A late predecessor failure cannot erase the current mapping")
+            XCTAssertEqual(original.value.map(ObjectIdentifier.init), original.identity)
+            XCTAssertEqual(harness.coordinator.phase, .prepared)
+            harness.coordinator.observeAccessLogURI(malformed, item: harness.item)
+            XCTAssertNil(original.value,
+                         "Current failure retires resume metadata without waiting for cleanup")
+            XCTAssertEqual(harness.coordinator.phase, .stopping)
+        }
+    }
+
+    private func prepareWithoutRetainingTimelineObservations(_ harness: Task21Harness)
+        async throws -> WeakPreparedTimelineProbe {
+        _ = try await harness.prepare()
+        return try releaseObservedTimeline(harness)
+    }
+
+    private func releaseObservedTimeline(_ harness: Task21Harness) throws -> WeakPreparedTimelineProbe {
+        let probe = WeakPreparedTimelineProbe(try XCTUnwrap(
+            harness.driver.observedPlayheads.last?.timelineMappingAuthority))
+        harness.driver.observedPlayheads.removeAll()
+        harness.evidence.discardObservedPlayheads()
+        harness.backend.discardPreparedObservation()
+        return probe
+    }
+
     func testDirectAudioPreparationOmitsAlternativesButRequiresCompletedHTTPAuthority() async throws {
         try await withOwnedSelectionHarness {
             try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
@@ -2275,9 +2365,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make()
+        let fixture = try await Task21RealIntegrationFixture.make(startupPrefix: true)
         let owner = Task21RealIntegrationFixture.Owner(fixture)
         addTeardownBlock { try await owner.tearDown() }
+        try fixture.assertStartupPrefixPublication()
         let prepared = try await fixture.prepare()
         let physical = try XCTUnwrap(fixture.player.currentItem)
         let group = try await fixture.audibleGroupForAssertion(physical)
@@ -2293,9 +2384,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testTVOS27NativeMasterAVPreparationRetainsAlternativeSelection() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make(endList: true, includeVideo: true)
+        let fixture = try await Task21RealIntegrationFixture.make(includeVideo: true, startupPrefix: true)
         let owner = Task21RealIntegrationFixture.Owner(fixture)
         addTeardownBlock { try await owner.tearDown() }
+        try fixture.assertStartupPrefixPublication()
         let prepared = try await fixture.prepare()
         let physical = try XCTUnwrap(fixture.player.currentItem)
         let group = try await fixture.audibleGroupForAssertion(physical)
@@ -2415,9 +2507,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testRealAVMasterSelectedAudioAndVideoShareThreeSecondCompletedBodyCoverage() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make(endList: true, includeVideo: true)
-        defer { fixture.shutdown() }
-        try fixture.assertFiniteAVPublication()
+        let fixture = try await Task21RealIntegrationFixture.make(includeVideo: true, startupPrefix: true)
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
+        try fixture.assertStartupPrefixPublication()
         _ = try await fixture.prepare()
         XCTAssertTrue(fixture.hasVideoParticipant,
                       "本 selector 必须经过真实 master、video 与 selected audio participant")
@@ -3093,6 +3186,11 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             }
             let original = try XCTUnwrap(builder.prepareTicket)
             XCTAssertEqual(coordinator.phase, .prepared)
+            let originalTimeline = WeakPreparedTimelineProbe(try XCTUnwrap(
+                driver.observedPlayheads.last?.timelineMappingAuthority))
+            driver.observedPlayheads.removeAll()
+            XCTAssertNotNil(originalTimeline.value,
+                "The actual HLS backend has already discarded its prepared return value")
             // Only the SDK classification input is mocked here. The original
             // installed handler must claim real Registry replacement authority,
             // stop/retire the old physical item, and receive a new signed invocation.
@@ -3123,6 +3221,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(driver.playCallCount, 0)
             XCTAssertEqual(coordinator.state.stopCount, 1,
                            "Only the genuine old item needed physical stop")
+            XCTAssertNil(originalTimeline.value,
+                         "Owned replacement retirement must not retain the old mapping")
         } catch { operationError = error }
 
         let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
@@ -5735,6 +5835,7 @@ private final class Task21FakeEvidenceSource: AVPlayerPreparationEvidenceProvidi
     var masterPlaylistCompleted = true
     var videoParticipantCount = 1
     private(set) var observedPlayheads: [PreparedPlayheadIdentity] = []
+    func discardObservedPlayheads() { observedPlayheads.removeAll() }
     var deferCoverageUntilAwaited = false
     private(set) var awaitedCoverageCount = 0
     private var publicationEventHandler: (@Sendable (UInt64) -> Void)?
@@ -6693,6 +6794,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
         replacementAuthoritySlot
     }
     var prepared: PreparedAVPlayerItem? { lock.withLock { preparedValue } }
+    func discardPreparedObservation() { lock.withLock { preparedValue = nil } }
     var activationResult: BackendActivationResult? { lock.withLock { activationValue } }
     var quiescenceReceipt: AVPlayerQuiescenceReceipt? { lock.withLock { quiescenceValue } }
     var lastError: Error? { lock.withLock { errorValue } }
@@ -7140,6 +7242,7 @@ private final class Task21RealIntegrationFixture {
     private let applicationBaseline: Int
     private let callbackBaseline: Int
     private var prepared: PreparedAVPlayerItem?
+    private var startupProducer: Task<Void, Error>?
     private let diagnosticIdentity = UUID().uuidString
     private var diagnosticStage = "installed"
     private var diagnosticAttemptMarker: String?
@@ -7253,7 +7356,8 @@ private final class Task21RealIntegrationFixture {
         self.callbackBaseline = callbackBaseline
     }
 
-    static func make(endList: Bool = true, includeVideo: Bool = false) async throws
+    static func make(endList: Bool = true, includeVideo: Bool = false,
+                     startupPrefix: Bool = false) async throws
         -> Task21RealIntegrationFixture {
         // Registry 先冻结正式 output lifecycle；writer、publisher、server 与 item
         // 随后全部绑定这一身份，避免只比较 generation 的跨 lifecycle 拼接。
@@ -7263,7 +7367,8 @@ private final class Task21RealIntegrationFixture {
         let backend = Task21RegistryBackend()
         let graph = try OutputGraphFixture(backendObject: backend)
         let seed = try await Task21RealAACSeed.make(
-            outputLifecycleEpoch: graph.lifecycle)
+            outputLifecycleEpoch: graph.lifecycle,
+            retainRenditionBinding: startupPrefix && !includeVideo)
         let lifecycle = graph.lifecycle
         let avSeed = includeVideo ? try await Task21RealAVSeed.make(
             audio: seed, includeTerminalTail: endList) : nil
@@ -7271,9 +7376,9 @@ private final class Task21RealIntegrationFixture {
         let preparePublication: @Sendable (LoopbackSessionToken) async throws
             -> LoopbackPreparedPublication = { token in
                 let harness = try Task21RealHLSHarness(token: token, seed: seed,
-                    avSeed: avSeed, endList: endList)
+                    avSeed: avSeed, endList: endList, startupPrefix: startupPrefix)
                 box.value = harness
-                if includeVideo && endList { try await harness.publishFiniteAVEnd() }
+                if includeVideo && endList && !startupPrefix { try await harness.publishFiniteAVEnd() }
                 guard let snapshot = harness.publisher.visible else {
                     throw LoopbackHTTPServerError.invalidConfiguration
                 }
@@ -7306,7 +7411,7 @@ private final class Task21RealIntegrationFixture {
             evidenceSource: evidence, item: item,
             publicationSequence: snapshot.publicationSequence)
         try coordinator.install(preparation.request)
-        return Task21RealIntegrationFixture(publication: harness, server: server,
+        let fixture = Task21RealIntegrationFixture(publication: harness, server: server,
             player: player, driver: driver, deadlineScheduler: deadlineScheduler,
             coordinator: coordinator,
             evidenceSource: evidence,
@@ -7314,6 +7419,38 @@ private final class Task21RealIntegrationFixture {
             backend: backend, item: item, itemURL: preparation.request.itemURL,
             resourceBaseline: resourceBaseline, applicationBaseline: applicationBaseline,
             callbackBaseline: callbackBaseline)
+        if startupPrefix { fixture.startStartupProducer() }
+        return fixture
+    }
+
+    private func startStartupProducer() {
+        precondition(startupProducer == nil)
+        startupProducer = Task { [publication, weak coordinator, item] in
+            do { try await publication.advanceStartupPrefix() }
+            catch {
+                // Wake this exact native preparation if its real producer fails;
+                // owned teardown still joins the original task and reports it.
+                if !Task.isCancelled {
+                    print("NATIVE_PREFIX_PRODUCER_FAILURE error=\(error)")
+                    coordinator?.cancel(item: item)
+                }
+                throw error
+            }
+        }
+    }
+
+    private func stopStartupProducer() async throws {
+        guard let task = startupProducer else { return }
+        traceNativeStage("prefix-producer-join-begin")
+        task.cancel()
+        defer { startupProducer = nil }
+        do { try await task.value }
+        catch is CancellationError { /* The real clock waiter has joined. */ }
+        traceNativeStage("prefix-producer-join-return")
+    }
+
+    func assertStartupPrefixPublication(file: StaticString = #filePath, line: UInt = #line) throws {
+        try publication.assertStartupPrefix(file: file, line: line)
     }
 
     /// graph、writer、authority、listener、publisher、AVPlayer 与 prepare 全部在
@@ -7995,6 +8132,8 @@ private final class Task21RealIntegrationFixture {
         let watchdog = nativeStageWatchdog()
         defer { watchdog.cancel() }
         var cleanupError: (any Error)?
+        do { try await stopStartupProducer() }
+        catch { cleanupError = error }
         do {
             try await stopAndRetireRegistryOutput()
             guard coordinator.currentItemIdentity == nil,
@@ -8003,7 +8142,8 @@ private final class Task21RealIntegrationFixture {
             }
         } catch {
             reportNativeStage(event: "owned-shutdown-failure")
-            cleanupError = error
+            if cleanupError == nil { cleanupError = error }
+            else { XCTFail("Native fixture Registry cleanup also failed: \(error)") }
             // A failed claim may still have an original registered runner. Join
             // that task before retiring this test's exact observation owners.
             await graph.registry.joinOwnedTerminalCleanup(
@@ -8060,6 +8200,9 @@ private final class Task21RealIntegrationFixture {
         traceNativeStage("eos-teardown-begin")
         let watchdog = nativeStageWatchdog()
         defer { watchdog.cancel() }
+        var producerError: (any Error)?
+        do { try await stopStartupProducer() }
+        catch { producerError = error }
         try await stopAndRetireRegistryOutput()
         guard coordinator.currentItemIdentity == nil,
               coordinator.phase == .quiescent else {
@@ -8117,6 +8260,7 @@ private final class Task21RealIntegrationFixture {
         inspectPreparationStorage(stage: "quiescent-external-owner")
         traceNativeStage("eos-teardown-return")
         _ = publication
+        if let producerError { throw producerError }
     }
 
     private func stopAndRetireRegistryOutput() async throws {
@@ -8214,12 +8358,14 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
     let publisher: HLSPublicationCoordinator
     let declaration: HLSItemDeclaration
     private let finitePublicationClock: HLSNaturalEndPublicationClock?
+    private let startupPrefix: Bool
 
     init(token: LoopbackSessionToken, seed: Task21RealAACSeed,
-         avSeed: Task21RealAVSeed?, endList: Bool) throws {
+         avSeed: Task21RealAVSeed?, endList: Bool, startupPrefix: Bool = false) throws {
         self.seed = seed
         self.avSeed = avSeed
-        finitePublicationClock = avSeed != nil && endList
+        self.startupPrefix = startupPrefix
+        finitePublicationClock = startupPrefix || (avSeed != nil && endList)
             ? try HLSNaturalEndPublicationClock.make() : nil
         store = SealedMediaStore(loopbackSession: token, itemGeneration: 19)
         var declared = try Task19.declaration(audioOnly: avSeed == nil)
@@ -8255,7 +8401,9 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             // Live prefixes retain their original rendition mapping. The finite
             // batch uses the original sealed writer endpoint; this writer never
             // claimed an incremental rendition-final receipt.
-            aacRenditionBinding: endList ? nil : avSeed?.audioRenditionBinding
+            aacRenditionBinding: startupPrefix
+                ? (avSeed?.audioRenditionBinding ?? seed.renditionBinding)
+                : (endList ? nil : avSeed?.audioRenditionBinding)
         )]
         if let avSeed {
             participants.insert(.init(initialization: avSeed.videoInitialization,
@@ -8267,10 +8415,22 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             declaration: declared,
             anchor: .init(mediaOrigin: avSeed?.sourceOrigin ?? Task21Fixtures.time(0),
                           utcMilliseconds: 1_788_912_000_000),
+            initialWindowMinimumSeconds: startupPrefix ? 3 : 6,
             publicationClock: finitePublicationClock)
         let audioPackets = avSeed?.audioPackets ?? seed.packets
         let videoPackets = avSeed?.videoPackets ?? []
-        let packetCount = max(audioPackets.count, videoPackets.count)
+        let terminalSequence = (avSeed?.endpointAuthority ?? seed.endpointAuthority)
+            .receipt.terminalLogicalSequence
+        let packetCount = startupPrefix
+            ? audioPackets.prefix(while: { $0.object.logicalSequence < terminalSequence }).count
+            : max(audioPackets.count, videoPackets.count)
+        if startupPrefix {
+            guard packetCount >= 3, packetCount <= 7,
+                  avSeed == nil || (videoPackets.count >= packetCount
+                    && (0..<packetCount).allSatisfy({
+                        videoPackets[$0].object.logicalSequence == audioPackets[$0].object.logicalSequence
+                    })) else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
+        }
         for index in 0..<packetCount {
             let now: Int64 = try finitePublicationClock?.now().logical
                 ?? (index >= 6 ? 1_000_000_000 : 0)
@@ -8285,7 +8445,11 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
                     relay: packet.relay, ticket: publisher.ticket, now: now)
             }
         }
-        if avSeed != nil && !endList {
+        if startupPrefix {
+            guard publisher.visible != nil else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+        } else if avSeed != nil && !endList {
             // 首六段建立初始 master/media snapshot；第七段再由同一 publisher
             // 推进真实滑窗，使 requested 三秒后的下一解码段可被系统加载。
             _ = try publisher.publish(ticket: publisher.ticket,
@@ -8311,6 +8475,67 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
             }
         }
+    }
+
+    func assertStartupPrefix(file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertTrue(startupPrefix, file: file, line: line)
+        let clock = try XCTUnwrap(finitePublicationClock, file: file, line: line)
+        XCTAssertLessThanOrEqual(clock.knownAllocationUpperBoundBytes,
+                                HLSNaturalEndPublicationClock.reservationBytes, file: file, line: line)
+        let binding = try XCTUnwrap(avSeed?.audioRenditionBinding ?? seed.renditionBinding,
+                                    file: file, line: line)
+        let snapshot = try XCTUnwrap(publisher.visible, file: file, line: line)
+        let participant = binding.publicationParticipantID.rawValue
+        XCTAssertTrue(snapshot.aacRenditionBindings[participant] === binding, file: file, line: line)
+        XCTAssertNil(binding.endpointAuthority, file: file, line: line)
+        XCTAssertNil(binding.sealedHTTPReceipt, file: file, line: line)
+        XCTAssertTrue(snapshot.media.values.allSatisfy {
+            !$0.text.contains("#EXT-X-ENDLIST")
+        }, file: file, line: line)
+        let endpoint = (avSeed?.endpointAuthority ?? seed.endpointAuthority).receipt
+        XCTAssertFalse(snapshot.media[participant]?.resources.contains(endpoint.terminalMedia.key) == true,
+                       "Startup cannot depend on an unrequested legacy endpoint tail", file: file, line: line)
+    }
+
+    func advanceStartupPrefix() async throws {
+        guard startupPrefix, let clock = finitePublicationClock else {
+            throw AVPlayerItemCoordinatorFailure.invalidTimeline
+        }
+        defer { clock.stopWaiting() }
+        let initialPending = publisher.pendingLogicalSequenceCount
+        let initialSequence = try XCTUnwrap(publisher.visible?.publicationSequence)
+        guard initialPending <= 4 else { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
+        while publisher.pendingLogicalSequenceCount > 0 {
+            try Task.checkCancellation()
+            clock.consumeSignal()
+            let ticket = publisher.ticket
+            let instant = try clock.now()
+            let before = publisher.pendingLogicalSequenceCount
+            switch try publisher.publish(ticket: ticket, now: instant.logical) {
+            case .published:
+                XCTAssertEqual(publisher.pendingLogicalSequenceCount, before - 1)
+                print("NATIVE_PREFIX_ADVANCE publication=\(publisher.ticket.publicationSequence) "
+                    + "pending=\(publisher.pendingLogicalSequenceCount) logical=\(instant.logical)")
+            case .waiting:
+                let visible = try XCTUnwrap(publisher.visible)
+                let last = try XCTUnwrap(visible.media.values.first?.logicalSequences.last)
+                let nextSequence = try HLSChecked.increment(last)
+                let nextVideoDuration = avSeed?.videoPackets.first {
+                    $0.object.logicalSequence == nextSequence
+                }?.receipt.presentationRange.duration ?? HLSChecked.one
+                let interval = max(Int64(1_000_000_000), try HLSChecked.nanoseconds(nextVideoDuration))
+                let earliest = try HLSChecked.add(try XCTUnwrap(ticket.previousPublishInstant), interval)
+                let deadline = try XCTUnwrap(ticket.absoluteDeadline)
+                let next = instant.logical < earliest ? min(earliest, deadline) : deadline
+                guard next > instant.logical else { throw HLSPublicationFailure.deadlineExceeded }
+                try await clock.wait(until: clock.monotonicDeadline(for: next, from: instant))
+            case .accepted, .releasedOnly:
+                throw HLSPublicationFailure.invalidSequence
+            }
+        }
+        XCTAssertEqual(publisher.visible?.publicationSequence,
+                       initialSequence + UInt64(initialPending))
+        try assertStartupPrefix()
     }
 
     func publishFiniteAVEnd() async throws {
@@ -8368,6 +8593,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
     let proof: EpochFormatProof
     let packets: [Task19Packet]
     let endpointAuthority: AACEffectiveEndpointAuthority
+    let renditionBinding: AACRenditionTerminalBinding?
     var endpoint: AACEffectiveEndpointReceipt { endpointAuthority.receipt }
     let commonBoundaries: [ExactMediaTime]
     let liveEdge: ExactMediaTime
@@ -8377,12 +8603,14 @@ final class Task21RealAACSeed: @unchecked Sendable {
     fileprivate init(relay: SegmentReportRelay, initialization: SealedMediaObject,
                  proof: EpochFormatProof, packets: [Task19Packet],
                  endpointAuthority: AACEffectiveEndpointAuthority,
+                 renditionBinding: AACRenditionTerminalBinding?,
                  encodedBuffers: [CMSampleBuffer], streamSummary: AACStreamSummary) throws {
         self.relay = relay
         self.initialization = initialization
         self.proof = proof
         self.packets = packets
         self.endpointAuthority = endpointAuthority
+        self.renditionBinding = renditionBinding
         self.encodedBuffers = encodedBuffers
         self.streamSummary = streamSummary
         let effectiveEnd = endpointAuthority.receipt.lastEffectiveEnd
@@ -8399,11 +8627,12 @@ final class Task21RealAACSeed: @unchecked Sendable {
 
     static func make(itemGeneration: UInt64 = 19,
                      outputLifecycleEpoch: OutputLifecycleEpoch? = nil,
-                     layoutLabels: [RenditionChannelLabel] = [.l, .r]) async throws
+                     layoutLabels: [RenditionChannelLabel] = [.l, .r],
+                     retainRenditionBinding: Bool = false) async throws
         -> Task21RealAACSeed {
         try await makePending(itemGeneration: itemGeneration,
                               outputLifecycleEpoch: outputLifecycleEpoch,
-                              layoutLabels: layoutLabels).finish()
+                              layoutLabels: layoutLabels).finish(retainRenditionBinding: retainRenditionBinding)
     }
 
     /// 只等待不可变 bytes/format/timing 模板。这里不会创建 Registry、writer、
@@ -8571,9 +8800,10 @@ final class Task21RealAACSeed: @unchecked Sendable {
             encodedBuffers: coalesced, streamSummary: summary)
     }
 
-    fileprivate static func finish(_ pending: Task21PendingAACSeed) async throws
+    fileprivate static func finish(_ pending: Task21PendingAACSeed,
+                                   retainRenditionBinding: Bool = false) async throws
         -> Task21RealAACSeed {
-        try (await pending.finishWriter()).sealEndpoint()
+        try (await pending.finishWriter()).sealEndpoint(retainRenditionBinding: retainRenditionBinding)
     }
 
     /// 只在一个正式的一秒共同边界内部合并 packet；边界后的首个 AU 因而仍落在
@@ -8854,8 +9084,8 @@ private final class Task21PendingAACSeed: @unchecked Sendable {
         get throws { try XCTUnwrap(writer.aacTerminalBinding) }
     }
 
-    func finish() async throws -> Task21RealAACSeed {
-        try await Task21RealAACSeed.finish(self)
+    func finish(retainRenditionBinding: Bool = false) async throws -> Task21RealAACSeed {
+        try await Task21RealAACSeed.finish(self, retainRenditionBinding: retainRenditionBinding)
     }
 
     func finishWriter() async throws -> Task21FinishedAACSeed {
@@ -8908,13 +9138,14 @@ private final class Task21FinishedAACSeed: @unchecked Sendable {
         self.streamSummary = streamSummary
     }
 
-    func sealEndpoint() throws -> Task21RealAACSeed {
+    func sealEndpoint(retainRenditionBinding: Bool = false) throws -> Task21RealAACSeed {
         let authority = try writer.makeAACEffectiveEndpointAuthority(
             epoch: epoch, initializationObject: initialization,
             mediaObjects: media)
         return try Task21RealAACSeed(
             relay: relay, initialization: initialization, proof: proof,
             packets: packets, endpointAuthority: authority,
+            renditionBinding: retainRenditionBinding ? XCTUnwrap(writer.aacRenditionTerminalBinding) : nil,
             encodedBuffers: encodedBuffers, streamSummary: streamSummary)
     }
 }

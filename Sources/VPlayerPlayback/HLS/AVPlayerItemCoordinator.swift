@@ -963,6 +963,11 @@ final class AVPlayerItemCoordinator {
     private var authorizationArmed = false
     private var activationInFlight = false
     private var stopTask: OutputPlayerStopTask?
+    // Retain the exact successful mapping after the backend drops its returned
+    // PreparedAVPlayerItem. The wrapper remains charged to its original frozen
+    // owner; this alias is inside the coordinator's measured allocation.
+    // The owner's weak cache must stay weak to avoid mapping -> owner -> mapping.
+    private var preparedTimelineMapping: PlayerItemTimelineMappingAuthority?
     // Inline in the existing measured 12 KiB coordinator root; no new owner,
     // receipt field, callback, wait slot, reservation, or renewable budget.
     private var pausedCursorBinding: AVPlayerPausedCursorBinding?
@@ -1205,6 +1210,7 @@ final class AVPlayerItemCoordinator {
         preparationTicket = nil
         lastQuiescenceReceipt = nil
         pausedCursorBinding = nil
+        preparedTimelineMapping = nil
         publicationReadiness = nil
         invalidationFailure = nil
         runtimeFailureRelay = nil
@@ -1293,6 +1299,7 @@ final class AVPlayerItemCoordinator {
             .forQuiescentReplacement(request: installedRequest)
         request = nil
         pausedCursorBinding = nil
+        preparedTimelineMapping = nil
         runtimeFailureRelay = nil
         authorization = nil
         authorizationArmed = false
@@ -1467,8 +1474,10 @@ final class AVPlayerItemCoordinator {
         } catch {
             // Cancellation can be the physical wake-up for this current attempt.
             // Keep its first authenticated fault, without relabeling a successor.
-            if self.request?.item == request.item, preparationTicket == operationTicket,
-               let invalidationFailure { throw invalidationFailure }
+            if self.request?.item == request.item, preparationTicket == operationTicket {
+                preparedTimelineMapping = nil
+                if let invalidationFailure { throw invalidationFailure }
+            }
             throw error
         }
     }
@@ -1704,6 +1713,9 @@ final class AVPlayerItemCoordinator {
         let value = PreparedAVPlayerItem(item: request.item, identity: context.playhead,
             selectedRenditions: selectedRenditions, minimumCoverageDuration: context.requested.duration,
             coverageDependencies: dependencies)
+        // No await separates the final current-item fences from this commit.
+        // Ordinary pause keeps this original object and its unchanged origin.
+        preparedTimelineMapping = context.playhead.timelineMappingAuthority
         state.phase = .prepared
         return value
     }
@@ -1961,6 +1973,7 @@ final class AVPlayerItemCoordinator {
         (evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource)?.retirePreparation()
         request = nil
         pausedCursorBinding = nil
+        preparedTimelineMapping = nil
         runtimeFailureRelay = nil
         authorizationArmed = false
         retainedGraphReservation = .empty
@@ -2013,6 +2026,7 @@ final class AVPlayerItemCoordinator {
         catch {
             if invalidationFailure == nil { invalidationFailure = .identitySpaceExhausted }
             pausedCursorBinding = nil
+            preparedTimelineMapping = nil
             throw AVPlayerItemCoordinatorFailure.identitySpaceExhausted
         }
     }
@@ -2202,6 +2216,7 @@ final class AVPlayerItemCoordinator {
         guard !invalidated else { return }
         invalidationFailure = failure
         pausedCursorBinding = nil
+        preparedTimelineMapping = nil
         renditionSelectionSlot = .invalid
         if let next = try? Self.checkedIncrement(invalidationCount, allocator: allocator) {
             invalidationCount = next

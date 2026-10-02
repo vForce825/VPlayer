@@ -1,4 +1,4 @@
-name: Committed finality and natural EOS validation
+name: Bounded native startup prefix and mapping validation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-finality-eos-${{ github.ref }}
+  group: macos-ci-startup-prefix-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-test:
     name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
@@ -65,40 +65,55 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify final publication and snapshot capacity contracts
+      - name: Verify exact mapping alias lifetime and capacity
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
+          set -o pipefail
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/Finality.xcresult" \
-            -only-testing:VPlayerTests/HLSPublisherTests \
-            -only-testing:VPlayerTests/HLSResourceStoreTests \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests \
-            -only-testing:VPlayerTests/HLSCapacityTests \
+            -resultBundlePath "$RUNNER_TEMP/MappingAliases.xcresult" \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests \
-            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testAACContinuousBranchExceeds384SignedEmissionsAndFinalCoordinatorConsumesAutomaticHTTPSeal
-      - name: Report scoped Finality failures
+            -only-testing:VPlayerTests/HLSCapacityTests \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSuccessfulTimelineIdentitySurvivesDroppedReceiptsAndOwnedPauseUntilCleanup \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFailedPreparationNeverRetainsAnUncommittedTimeline \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testCurrentTimelineFailureClearsOnlyItsOwnSuccessfulMapping
+      - name: Report scoped MappingAliases failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/Finality.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/MappingAliases.xcresult"
 
-      - name: Verify separate native endpoint and paused relay ordering
+      - name: Verify three native bounded startup prefix cases
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
+          set -o pipefail
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/EOSOrdering.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesLaterPausedRelayAndRejectsChangedSecondRead \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeUnexpectedPauseWithoutEndpointNotificationStillRetires \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageOwnedEOSDeadlineSharesTimerAndStopRevokesPendingDelivery \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageSystemEOSPublicationAndStopRaceNeverPublishAfterClose \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch
-      - name: Report scoped EOSOrdering failures
+            -resultBundlePath "$RUNNER_TEMP/StartupPrefix.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27NativeMasterAVPreparationRetainsAlternativeSelection \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVMasterSelectedAudioAndVideoShareThreeSecondCompletedBodyCoverage 2>&1 | tee "$RUNNER_TEMP/startup-prefix.log"
+      - name: Report scoped StartupPrefix failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/EOSOrdering.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/StartupPrefix.xcresult"
 
+      - name: Require three executed native startup passes without skips
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          python3 - "$RUNNER_TEMP/startup-prefix.log" <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path(sys.argv[1]).read_text()
+          names = ["testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero","testTVOS27NativeMasterAVPreparationRetainsAlternativeSelection","testRealAVMasterSelectedAudioAndVideoShareThreeSecondCompletedBodyCoverage"]
+          for name in names:
+              pattern = r"Test Case '-\[VPlayerTests\.AVPlayerItemCoordinatorTests " + re.escape(name) + r"\]' (passed|failed|skipped|exceeded execution)"
+              states = re.findall(pattern, text)
+              if states != ["passed"]:
+                  raise SystemExit(f"STARTUP_PREFIX_GATE_FAILED case={name} outcomes={states}")
+          if not re.search(r"Executed 3 tests, with 0 failures", text):
+              raise SystemExit("STARTUP_PREFIX_GATE_FAILED missing exact three-case zero-failure summary")
+          print("STARTUP_PREFIX_GATE executed=3 passed=3 skipped=0")
+          PY
