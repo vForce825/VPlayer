@@ -8,6 +8,31 @@ import XCTest
 
 @MainActor
 final class AllocationReleaseTests: XCTestCase {
+    func testReleaseAACPublicationUsesEffectivePrimingBoundary() async throws {
+        let lifecycle = try ReleaseIdentityFixture.lifecycle(using: .init())
+        let fixture = try await ReleaseAACPublicationFixture.make(lifecycle: lifecycle)
+        defer { try? fixture.teardown() }
+        let seed = fixture.publication.seed
+        let first = try XCTUnwrap(seed.packets.first)
+        let boundary = try XCTUnwrap(first.object.publicationEvidence?.boundary)
+        let mapping = try XCTUnwrap(
+            fixture.endpointAuthority.terminalBinding.timelineMappingReceipt)
+        let endpoint = fixture.endpointAuthority.receipt
+
+        XCTAssertGreaterThan(endpoint.leadingFrames, 0,
+            "The real AAC fixture must exercise the physical/effective origin difference")
+        XCTAssertEqual(first.receipt.presentationRange.start, mapping.writtenPhysicalBase)
+        XCTAssertEqual(boundary.epochStart, mapping.writtenEffectiveBase)
+        XCTAssertEqual(boundary.commonStart, mapping.writtenEffectiveBase)
+        XCTAssertEqual(try mapping.writtenEffectiveBase.subtracting(mapping.writtenPhysicalBase),
+            ExactMediaTime(value: endpoint.leadingFrames, timescale: endpoint.sampleRate))
+        XCTAssertEqual(seed.packets.last?.receipt.logicalSequence, endpoint.terminalLogicalSequence,
+            "Correcting the origin must retain the real terminal tail")
+        XCTAssertTrue(try XCTUnwrap(fixture.publication.publisher.visible)
+            .media.values.allSatisfy { $0.text.hasSuffix("#EXT-X-ENDLIST\n") })
+        try fixture.teardown()
+    }
+
     func testOriginalBackingsLongestURLAndApplicationAliasTails() async throws {
         struct Observation {
             let role: String
@@ -68,14 +93,34 @@ final class AllocationReleaseTests: XCTestCase {
         XCTAssertTrue((1...5).contains(actualPortDigits))
 
         let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let driverCoreBytes = 12 * 1_024
+        let installationBytes = 12 * 1_024
+        let observerLeaseBytes = 2 * 1_024
+        let readyLeaseBytes = 2 * 1_024
         var driver: SystemAVPlayerDriver? = try .make(player: AVPlayer())
         var coordinator: AVPlayerItemCoordinator? = try .init(
             driver: try XCTUnwrap(driver), evidenceSource: try XCTUnwrap(fixture).source,
             allocator: allocator)
+        func assertResourceDelta(_ expectedDelta: Int, phase: String,
+                                 file: StaticString = #filePath, line: UInt = #line) {
+            let actual = PlaybackResourceContextLedger.shared.chargedBytes
+            if actual != resourceBaseline + expectedDelta {
+                print("TASK21_RELEASE_RESOURCE phase=\(phase) baseline=\(resourceBaseline) "
+                    + "actual=\(actual) expectedDelta=\(expectedDelta) "
+                    + "driverCore=\(driverCoreBytes) installation=\(installationBytes) "
+                    + "observerLease=\(observerLeaseBytes) readyLease=\(readyLeaseBytes) "
+                    + "soft=\(PlaybackResourceContextLedger.softBytes) "
+                    + "hard=\(PlaybackResourceContextLedger.hardBytes)")
+            }
+            XCTAssertEqual(actual, resourceBaseline + expectedDelta, phase,
+                           file: file, line: line)
+        }
         try coordinator?.install(try XCTUnwrap(fixture).request)
-        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 22 * 1_024,
-                       "driver/coordinator加安装时真实access-log SDK lease")
+        // There is no await from installation through observer removal. The log
+        // cache wake is queued on MainActor; its separate 4 KiB physical-reader
+        // lease cannot start until this synchronous phase yields below.
+        assertResourceDelta(driverCoreBytes + installationBytes + 2 * observerLeaseBytes,
+                            phase: "installed_with_access_and_error_observers")
 
         weak var retainedURLOwner: NSURL?
         var urlAllocationIdentities = Set<UInt>()
@@ -111,33 +156,33 @@ final class AllocationReleaseTests: XCTestCase {
         XCTAssertFalse(urlAllocationIdentities.isEmpty)
 
         var sdkTail: AVPlayerSDKCallbackLease? = try driver?.reserveSDKCallbackLease(.ready)
-        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 24 * 1_024)
+        assertResourceDelta(driverCoreBytes + installationBytes
+                            + 2 * observerLeaseBytes + readyLeaseBytes,
+                            phase: "ready_alias_retained")
         driver?.eventHub.receive(try XCTUnwrap(fixture).request.itemURL,
                                  item: try XCTUnwrap(fixture).request.item)
         let installedItem = try XCTUnwrap(fixture).request.item
         coordinator = nil
         driver?.replaceCurrentItemWithNil(item: installedItem)
         driver?.removeObservers(item: installedItem)
-        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 22 * 1_024,
-                       "SDK lease与已排队hub同时保留原12KiB安装票")
+        assertResourceDelta(driverCoreBytes + installationBytes + readyLeaseBytes,
+                            phase: "observers_removed_ready_and_queued_hub_retain_installation")
         sdkTail = nil
-        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 20 * 1_024,
-                       "SDK尾释放后仍由原queued delivery保留安装票")
+        assertResourceDelta(driverCoreBytes + installationBytes,
+                            phase: "ready_alias_released_queued_hub_retains_installation")
         let deliveryDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while PlaybackResourceContextLedger.shared.chargedBytes
-                != resourceBaseline + 8 * 1_024,
+                != resourceBaseline + driverCoreBytes,
               ContinuousClock.now < deliveryDeadline {
-            await Task.yield()
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
         }
-        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 8 * 1_024,
-                       "有界让出MainActor等待原queued delivery退出后只剩driver core")
+        // Exact equality also excludes a retained 4 KiB async log-reader lease;
+        // cancellation alone cannot count as completion of that physical work.
+        assertResourceDelta(driverCoreBytes, phase: "queued_and_native_tails_settled")
         driver = nil
-        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline)
+        assertResourceDelta(0, phase: "driver_released")
 
         try fixture?.teardown()
         fixture = nil

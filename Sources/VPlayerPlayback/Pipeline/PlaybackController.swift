@@ -900,7 +900,11 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         let requestID = controllerState.request?.id
         guard expectedRequestID == nil || expectedRequestID == requestID else { return }
         let stoppingRun = admittedRun
+        let stoppingPlayGeneration = playAdmissionGeneration
         let reservation = registry.cleanupReservationSnapshot()?.ticket
+        // Explicit Stop dismisses an already-settled failure's collector even
+        // when its request and physical cleanup reservation have both retired.
+        terminalMetricsProvider = nil
         guard requestID != nil || reservation != nil else { return }
         let presentationSession = registry.outputResourceContextSnapshot()?.sessionIdentity
         let originalCleanupTask: ControlTaskTicket?
@@ -935,6 +939,14 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             }
             if let session = presentationSession, let cleanupTask {
                 await registry.joinOwnedTerminalCleanup(session: session, task: cleanupTask)
+            }
+            // The original failure may have installed its terminal collector
+            // while Stop was suspended. Only that unchanged control/play scope
+            // may dismiss it; a replacement's retained metrics belong to it.
+            if playAdmissionGeneration == stoppingPlayGeneration,
+               userControlRevision == stoppingControlRevision,
+               controllerState.request == nil, admittedRun == nil {
+                terminalMetricsProvider = nil
             }
             return
         }

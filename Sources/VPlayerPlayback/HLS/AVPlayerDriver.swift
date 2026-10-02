@@ -338,7 +338,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard !systemAudioTransitionInFlight else { throw .operationInFlight }
         let lease: AVPlayerSDKCallbackLease
         do { lease = try reserveSDKCallbackLease(.systemAudio) }
-        catch { throw .capacityExceeded }
+        catch {
+#if DEBUG
+            print("NATIVE_ADMISSION system-audio-reserve-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount)")
+#endif
+            throw .capacityExceeded
+        }
         lease.inspectRegistration()
         systemAudioTransitionInFlight = true
         defer { systemAudioTransitionInFlight = false }

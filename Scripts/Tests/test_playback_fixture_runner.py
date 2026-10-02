@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "Scripts/run-playback-integration-tests.sh"
@@ -35,37 +36,62 @@ def run_probe(command, env, timeout=20):
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            # All post-failure diagnostics, escalation and reaping share the
-            # original 2s snapshot + 2s TERM + 2s KILL cleanup allowance.
+            # Reserve termination/reap time within the unchanged six-second
+            # post-failure ceiling; optional ps diagnostics get at most 0.5s.
             cleanup_deadline = time.monotonic() + 6
-            latest = error
+            stdout = (error.stdout or b"").decode(errors="replace")
+            stderr = (error.stderr or b"").decode(errors="replace")
             notes = []
-            try:
-                owned = "\n".join(owned_group_state(process.pid, 2))
-            except (OSError, subprocess.SubprocessError) as snapshot_error:
-                owned = f"unavailable: {snapshot_error}"
+            owned = "unavailable"
+            signal_denied = False
             for number in (signal.SIGTERM, signal.SIGKILL):
                 try:
-                    os.killpg(process.pid, number)
+                    members = owned_group_state(process.pid, 0.5)
+                    live = [line for line in members if not line.split(None, 4)[3].startswith("Z")]
+                    if number == signal.SIGTERM:
+                        owned = "\n".join(members)
+                except (OSError, subprocess.SubprocessError) as snapshot_error:
+                    live = None
+                    notes.append(f"owned-group state unavailable before signal: {snapshot_error}")
+                try:
+                    if live:
+                        os.killpg(process.pid, number)
+                    elif live is None and process.poll() is None:
+                        # Popen still owns this exact child even if ps failed.
+                        # Do not infer or signal an unverified descendant group.
+                        process.send_signal(number)
                 except ProcessLookupError:
                     pass
+                except PermissionError as signal_error:
+                    notes.append(f"owned-process signal was denied: {signal_error}")
+                    signal_denied = True
                 try:
                     stdout, stderr = process.communicate(
-                        timeout=max(0, min(2, cleanup_deadline - time.monotonic())))
+                        timeout=max(0, min(1.5, cleanup_deadline - time.monotonic())))
                 except subprocess.TimeoutExpired as drain_error:
-                    latest = drain_error
-                    stdout = (latest.stdout or b"").decode(errors="replace")
-                    stderr = (latest.stderr or b"").decode(errors="replace")
-                # Pipe EOF/direct-child exit do not prove that the owned group
-                # is empty: a TERM-ignoring child may have redirected its pipes.
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
+                    stdout = (drain_error.stdout or b"").decode(errors="replace")
+                    stderr = (drain_error.stderr or b"").decode(errors="replace")
+                if signal_denied:
                     break
+            # A failed optional snapshot must never strand the directly owned
+            # child. No fallback or escalation follows an actual signal denial.
+            if not signal_denied and process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except PermissionError as signal_error:
+                    notes.append(f"direct-child kill was denied: {signal_error}")
             try:
-                process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+                process.wait(timeout=max(0, min(1, cleanup_deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
                 notes.append("direct child could not be reaped within cleanup allowance")
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=max(0, min(0.25, cleanup_deadline - time.monotonic())))
+            except subprocess.TimeoutExpired as drain_error:
+                stdout = (drain_error.stdout or b"").decode(errors="replace")
+                stderr = (drain_error.stderr or b"").decode(errors="replace")
             try:
                 while True:
                     remaining = cleanup_deadline - time.monotonic()
@@ -109,6 +135,69 @@ def stop_marked_child_if_still_owned(marker):
 
 
 class RunnerTimeoutDiagnosticsTests(unittest.TestCase):
+    def test_root_exit_during_snapshot_retains_final_stderr(self):
+        original_snapshot = owned_group_state
+        with tempfile.TemporaryDirectory(prefix="vplayer final output ") as directory:
+            release = Path(directory) / "release"
+            calls = 0
+            def delayed_snapshot(group, timeout):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    release.touch()
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        members = original_snapshot(group, max(0.01, deadline - time.monotonic()))
+                        if all(line.split(None, 4)[3].startswith("Z") for line in members):
+                            return members
+                        time.sleep(0.01)
+                    raise AssertionError("controlled child did not exit after release")
+                return original_snapshot(group, timeout)
+            script = r"""
+import pathlib, sys, time
+print('initial', file=sys.stderr, flush=True)
+while not pathlib.Path(sys.argv[1]).exists():
+    time.sleep(0.01)
+print('late-root-exit', file=sys.stderr, flush=True)
+"""
+            with patch(__name__ + ".owned_group_state", side_effect=delayed_snapshot):
+                with self.assertRaises(AssertionError) as failure:
+                    run_probe([sys.executable, "-c", script, str(release)], os.environ.copy(), timeout=0.5)
+            captured_stderr = str(failure.exception).split("captured shell trace/stderr:\n", 1)[1]
+            self.assertIn("late-root-exit", captured_stderr)
+
+    def test_unavailable_process_snapshot_still_kills_and_reaps_owned_root(self):
+        original_popen = subprocess.Popen
+        roots = []
+        def popen(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            if kwargs.get("start_new_session"):
+                roots.append(process)
+            return process
+        script = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+        try:
+            with patch("subprocess.Popen", side_effect=popen), \
+                 patch(__name__ + ".owned_group_state", side_effect=OSError("ps unavailable")):
+                with self.assertRaises(AssertionError) as failure:
+                    run_probe([sys.executable, "-c", script], os.environ.copy(), timeout=0.5)
+            self.assertEqual(len(roots), 1)
+            self.assertIsNotNone(roots[0].poll(), "the directly owned child must be killed and reaped")
+            self.assertIn("owned-group state unavailable", str(failure.exception))
+        finally:
+            for process in roots:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=2)
+
+    def test_cleanup_uses_owned_process_state_when_signal_zero_is_not_permitted(self):
+        original_killpg = os.killpg
+        def killpg(group, number):
+            if number == 0:
+                raise PermissionError(1, "signal-zero probe denied for exited group")
+            return original_killpg(group, number)
+        with patch("os.killpg", side_effect=killpg):
+            self.test_timeout_reaps_root_and_retains_latest_output_without_killing_another_group()
+
     def test_timeout_retains_stage_output_and_stops_owned_descendant(self):
         with tempfile.TemporaryDirectory(prefix="vplayer timeout regression ") as directory:
             marker = Path(directory) / "child.pid"

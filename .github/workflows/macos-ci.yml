@@ -65,6 +65,19 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
+      - name: Validate real fixed-capacity storage and payload lifetimes
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/DebugCapacity.xcresult" \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests
+      - name: Report scoped capacity diagnostic failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugCapacity.xcresult"
       - name: Diagnose complete HLS classes without parallel workers
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
@@ -109,6 +122,7 @@ jobs:
             -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testResetOutsideInterruptionUsesSeparateFirstResetAnchor \
             -only-testing:VPlayerTests/HLSResourceStoreTests/testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic \
             -only-testing:VPlayerTests/Task9ProductionDeadlineTests \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testSuspendedStopClearsOnlyItsOriginalTerminalMetrics \
             -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testStopSuspendedAtWatchdogStillJoinsSameSessionTerminalCleanup \
             -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testObsoleteStopCannotJoinReplacementSessionTerminalCleanup \
             -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testPendingAcquisitionAudioKeysKeepAdmissionBoundaryAndHistoricalOrder \

@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import signal
+from socketserver import TCPServer
 import stat
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import unquote_to_bytes, urlsplit
 
 
@@ -138,6 +140,13 @@ class FixtureHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind performs reverse DNS via socket.getfqdn before
+        # returning. Fixtures bind a fixed numeric loopback address, so readiness
+        # must not depend on the host's resolver (which can block on macOS).
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 def create_server(root: Path, timeline_fixture: Path | None = None) -> FixtureHTTPServer:
     resolved = root.resolve(strict=True)
@@ -255,6 +264,17 @@ class FixtureServerContractTests(unittest.TestCase):
         connection.close()
         return response.status, headers, body
 
+    def test_numeric_loopback_startup_does_not_depend_on_reverse_dns(self) -> None:
+        # HTTPServer normally calls socket.getfqdn before publishing readiness.
+        # A stalled system resolver must not hold a numeric loopback fixture.
+        with patch("socket.getfqdn", side_effect=AssertionError("unexpected reverse DNS")):
+            server = create_server(self.root)
+        try:
+            self.assertEqual(server.server_name, "127.0.0.1")
+            self.assertEqual(server.server_port, server.server_address[1])
+        finally:
+            server.server_close()
+
     def test_binds_only_loopback_on_an_ephemeral_port(self) -> None:
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
         self.assertGreater(self.server.server_address[1], 0)
@@ -351,6 +371,7 @@ class FixtureServerContractTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+            process.stderr.close()
 
 
 def run_self_tests() -> int:

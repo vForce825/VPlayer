@@ -43,9 +43,7 @@ private protocol Task9NativeBufferObservation {
     var elementStrideForAllocation: Int { get }
     var storageIdentityForAllocation: UInt { get }
     var frozenTailAllocationBytes: Int { get }
-    var allocationHeaderBytes: Int { get }
-    var allocationSegmentCapacity: Int { get }
-    var allocationSegmentCount: Int { get }
+    var allocationRequests: [Int] { get }
     var secondStorageIdentityForAllocation: UInt? { get }
 }
 
@@ -59,28 +57,49 @@ extension Array: Task9NativeBufferObservation {
     fileprivate var frozenTailAllocationBytes: Int {
         malloc_good_size(32 + capacity * MemoryLayout<Element>.stride)
     }
-    fileprivate var allocationHeaderBytes: Int { 32 }
-    fileprivate var allocationSegmentCapacity: Int { capacity }
-    fileprivate var allocationSegmentCount: Int { 1 }
+    fileprivate var allocationRequests: [Int] { [32 + capacity * MemoryLayout<Element>.stride] }
     fileprivate var secondStorageIdentityForAllocation: UInt? { nil }
 }
 
 /// This is a borrowed original allocation base, not a copied Array or an element
 /// address with a guessed header. Only the production relay owns/deallocates it.
 private struct Task9PipelineBackingObservation: Task9NativeBufferObservation {
-    let base: UnsafeMutablePointer<PlaybackPipelineEvent>
-    let tail: UnsafeMutablePointer<PlaybackPipelineEvent>
+    let base: UnsafeMutableRawPointer
+    let tags: UnsafeMutablePointer<UInt16>
     var countForAllocation: Int { PlaybackSessionEventRelay.maximumCapacity }
     var capacityForAllocation: Int { PlaybackSessionEventRelay.maximumCapacity }
-    var elementStrideForAllocation: Int { MemoryLayout<PlaybackPipelineEvent>.stride }
+    var elementStrideForAllocation: Int { PlaybackPipelineEventStorage.payloadStride }
     var storageIdentityForAllocation: UInt { UInt(bitPattern: base) }
-    var frozenTailAllocationBytes: Int {
-        malloc_size(UnsafeRawPointer(base)) + malloc_size(UnsafeRawPointer(tail))
+    var frozenTailAllocationBytes: Int { malloc_size(base) + malloc_size(UnsafeRawPointer(tags)) }
+    var allocationRequests: [Int] {
+        [countForAllocation * PlaybackPipelineEventStorage.payloadStride,
+         countForAllocation * MemoryLayout<UInt16>.stride]
     }
-    var allocationHeaderBytes: Int { 0 }
-    var allocationSegmentCapacity: Int { PlaybackSessionEventRelay.backingSegmentCapacity }
-    var allocationSegmentCount: Int { 2 }
-    var secondStorageIdentityForAllocation: UInt? { UInt(bitPattern: tail) }
+    var secondStorageIdentityForAllocation: UInt? { UInt(bitPattern: tags) }
+}
+
+/// Owns only a test slot; production exercises the same typed storage operations.
+private final class Task9NativePayloadSlot {
+    let payload: UnsafeMutableRawPointer
+    let tag: UnsafeMutablePointer<UInt16>
+    init() {
+        PlaybackPipelineEventStorage.validateLayout()
+        payload = .allocate(byteCount: PlaybackPipelineEventStorage.payloadStride,
+            alignment: PlaybackPipelineEventStorage.payloadAlignment)
+        tag = .allocate(capacity: 1)
+        tag.initialize(to: PlaybackPipelineEventStorage.emptyTag)
+    }
+    func initialize(_ event: PlaybackPipelineEvent) {
+        PlaybackPipelineEventStorage.initialize(event, at: payload, tag: tag)
+    }
+    func move() -> PlaybackPipelineEvent { PlaybackPipelineEventStorage.move(at: payload, tag: tag) }
+    func clear() { PlaybackPipelineEventStorage.destroy(at: payload, tag: tag) }
+    deinit {
+        clear()
+        tag.deinitialize(count: 1)
+        tag.deallocate()
+        payload.deallocate()
+    }
 }
 
 private final class Task9WeakObjectProbe: @unchecked Sendable {
@@ -138,9 +157,9 @@ private func task9AnyObjectField(_ name: String, of value: Any) -> AnyObject? {
 
 private func task9ArrayField(_ name: String, of value: Any) -> (any Task9NativeBufferObservation)? {
     if name == "pending",
-       let pointer = task9Field(name, of: value) as? UnsafeMutablePointer<PlaybackPipelineEvent>,
-       let tail = task9Field("pendingTail", of: value) as? UnsafeMutablePointer<PlaybackPipelineEvent> {
-        return Task9PipelineBackingObservation(base: pointer, tail: tail)
+       let pointer = task9Field(name, of: value) as? UnsafeMutableRawPointer,
+       let tags = task9Field("pendingTags", of: value) as? UnsafeMutablePointer<UInt16> {
+        return Task9PipelineBackingObservation(base: pointer, tags: tags)
     }
     return task9Field(name, of: value) as? any Task9NativeBufferObservation
 }
@@ -151,9 +170,7 @@ private struct Task9ArrayAllocationSnapshot {
     let stride: Int
     let identity: UInt
     let bytes: Int
-    let allocationHeaderBytes: Int
-    let allocationSegmentCapacity: Int
-    let allocationSegmentCount: Int
+    let allocationRequests: [Int]
     let secondIdentity: UInt?
 }
 
@@ -162,21 +179,19 @@ private func task9ArraySnapshot(_ name: String, of value: Any) -> Task9ArrayAllo
     guard let array = task9ArrayField(name, of: value) else { return nil }
     return .init(count: array.countForAllocation, capacity: array.capacityForAllocation,
         stride: array.elementStrideForAllocation, identity: array.storageIdentityForAllocation,
-        bytes: array.frozenTailAllocationBytes, allocationHeaderBytes: array.allocationHeaderBytes,
-        allocationSegmentCapacity: array.allocationSegmentCapacity,
-        allocationSegmentCount: array.allocationSegmentCount,
+        bytes: array.frozenTailAllocationBytes, allocationRequests: array.allocationRequests,
         secondIdentity: array.secondStorageIdentityForAllocation)
 }
 
 private func task9PipelineBackingCharges(_ relay: PlaybackSessionEventRelay) throws -> [Task9AllocationCharge] {
-    let head = try XCTUnwrap(task9Field("pending", of: relay) as? UnsafeMutablePointer<PlaybackPipelineEvent>)
-    let tail = try XCTUnwrap(task9Field("pendingTail", of: relay) as? UnsafeMutablePointer<PlaybackPipelineEvent>)
-    XCTAssertNotEqual(UInt(bitPattern: head), UInt(bitPattern: tail), "Both original allocations must be distinct")
+    let payload = try XCTUnwrap(task9Field("pending", of: relay) as? UnsafeMutableRawPointer)
+    let tags = try XCTUnwrap(task9Field("pendingTags", of: relay) as? UnsafeMutablePointer<UInt16>)
+    XCTAssertNotEqual(UInt(bitPattern: payload), UInt(bitPattern: tags), "Both original allocations must be distinct")
     return [
-        .init(ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending.head",
-            allocationIdentity: UInt(bitPattern: head), bytes: malloc_size(UnsafeRawPointer(head))),
-        .init(ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending.tail",
-            allocationIdentity: UInt(bitPattern: tail), bytes: malloc_size(UnsafeRawPointer(tail)))
+        .init(ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending.payloads",
+            allocationIdentity: UInt(bitPattern: payload), bytes: malloc_size(payload)),
+        .init(ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending.tags",
+            allocationIdentity: UInt(bitPattern: tags), bytes: malloc_size(UnsafeRawPointer(tags)))
     ]
 }
 
@@ -4248,7 +4263,295 @@ final class Task9RuntimeCapacityTests: XCTestCase {
     private let presentationCap = 2 * 1_024
     private let globalCap = 96 * 1_024
 
-    func testPipelineRingUsesItsOriginalTypedAllocationWithinTheUnchangedFourKiBCap() throws {
+    func testFlattenedPlaybackFailureSchemaRequiresExplicitStorageReview() {
+        let failure = PlaybackFailure(code: "code", userMessage: "message", diagnosticCode: "diagnostic",
+            retryDisposition: .doNotRetry)
+        XCTAssertEqual(Set(Mirror(reflecting: failure).children.compactMap(\.label)),
+            Set(["code", "userMessage", "diagnosticCode", "retryDisposition"]),
+            "A stored PlaybackFailure field changed: review the native payload codec and every roundtrip")
+    }
+
+    func testPipelinePayloadGeometryFitsEveryTrueNativeTypeBeforeBinding() {
+        PlaybackPipelineEventStorage.validateLayout()
+        let layouts: [(String, Int, Int)] = [
+            ("presented", MemoryLayout<PlaybackPipelineEventStorage.PresentedPayload>.stride,
+                MemoryLayout<PlaybackPipelineEventStorage.PresentedPayload>.alignment),
+            ("media", MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.stride,
+                MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.alignment),
+            ("nil-generation media", MemoryLayout<PlaybackMediaInformation?>.stride,
+                MemoryLayout<PlaybackMediaInformation?>.alignment),
+            ("unexpected", MemoryLayout<PlaybackPipelineEventStorage.UnexpectedPayload>.stride,
+                MemoryLayout<PlaybackPipelineEventStorage.UnexpectedPayload>.alignment),
+            ("backend", MemoryLayout<PlaybackPipelineEventStorage.BackendPayload>.stride,
+                MemoryLayout<PlaybackPipelineEventStorage.BackendPayload>.alignment),
+            ("ffmpeg", MemoryLayout<PlaybackPipelineEventStorage.FFmpegPayload>.stride,
+                MemoryLayout<PlaybackPipelineEventStorage.FFmpegPayload>.alignment),
+            ("decoder", MemoryLayout<VideoDecoderFailure>.stride, MemoryLayout<VideoDecoderFailure>.alignment),
+            ("string", MemoryLayout<String>.stride, MemoryLayout<String>.alignment),
+            ("status", MemoryLayout<Int32>.stride, MemoryLayout<Int32>.alignment),
+            ("cycle", MemoryLayout<UInt64>.stride, MemoryLayout<UInt64>.alignment)
+        ]
+        for (name, stride, alignment) in layouts {
+            XCTAssertLessThanOrEqual(stride, PlaybackPipelineEventStorage.payloadStride, name)
+            XCTAssertEqual(PlaybackPipelineEventStorage.payloadStride % alignment, 0, name)
+            XCTAssertLessThanOrEqual(alignment, PlaybackPipelineEventStorage.payloadAlignment, name)
+        }
+        XCTAssertEqual(MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.stride, 48)
+        XCTAssertEqual(MemoryLayout<UInt16>.stride, 2)
+    }
+
+    func testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes() {
+        let diagnostic = ErrorDiagnosticSnapshot(typeName: "storage", message: "原始诊断📺")
+        var errors: [PlaybackCoreError] = [
+            .networkTimeout, .unsupportedVideoCodec, .unsupportedAudioCodec,
+            .hardwareDecoderUnavailable, .videoDecoderTransitionTimeout, .renderTextureMapping,
+            .cancelled, .controlEventCapacityExceeded, .outputActivationRejected,
+            .backendPublicationReplacementRejected,
+            .unexpected(stage: "", diagnostic: diagnostic),
+            .unexpected(stage: "阶段📺", diagnostic: diagnostic),
+            .videoDecoderFailure(.softwareDecoder), .videoDecoderFailure(.backpressureTimeout),
+            .videoDecoderFailure(.unexpected(diagnostic))
+        ]
+        let strings = ["", "ASCII", String(repeating: "长文本📺", count: 100),
+            NSString(string: "Foundation 字符串").description]
+        for value in strings {
+            errors += [.unsupportedProtocol(value), .videoSampleBuffer(value),
+                .videoRendererFailed(value), .audioRendererFailed(value), .metalCommand(value)]
+            for optional: String? in [nil, "", "诊断📺"] {
+                for retry: PlaybackRetryDisposition in [.retrySameRequest, .chooseAnotherChannel, .doNotRetry] {
+                    errors.append(.presented(.init(code: value, userMessage: value,
+                        diagnosticCode: optional, retryDisposition: retry)))
+                }
+            }
+        }
+        let kinds: [FFmpegFailureKind] = [.open, .read, .timeout, .unsupportedVideo, .unsupportedAudio]
+        let stages: [FFmpegFailureStage] = [.unspecified, .validation, .open, .streamInfo, .selection,
+            .bsfInit, .read, .bsfSend, .bsfReceive]
+        for status: Int32 in [.min, 0, .max] {
+            errors += [.demuxOpen(status), .demuxRead(status), .videoFormatDescription(status),
+                .videoDecode(status), .audioFormatDescription(status), .audioFallbackDecode(status),
+                .videoDecoderFailure(.sessionCreate(status)), .videoDecoderFailure(.badData(status)),
+                .videoDecoderFailure(.malfunction(status))]
+            for kind in kinds {
+                for stage in stages { errors.append(.ffmpegFailure(kind: kind, stage: stage, status: status)) }
+            }
+        }
+        let slot = Task9NativePayloadSlot()
+        for error in errors {
+            let event = PlaybackPipelineEvent.failed(error)
+            slot.initialize(event)
+            XCTAssertEqual(slot.move(), event)
+            XCTAssertEqual(slot.tag.pointee, PlaybackPipelineEventStorage.emptyTag)
+            // Rebind the same address from nontrivial payload to scalar and back.
+            slot.initialize(.ready(readinessCycle: .max))
+            XCTAssertEqual(slot.move(), .ready(readinessCycle: .max))
+            slot.initialize(event)
+            slot.clear()
+            slot.clear() // Empty clearing must neither release again nor read stale bytes.
+            slot.initialize(.stopped)
+            XCTAssertEqual(slot.move(), .stopped)
+        }
+    }
+
+    func testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits() {
+        let slot = Task9NativePayloadSlot()
+        for cycle: UInt64 in [0, .max] {
+            for phase: PlaybackPipelinePhase in [.buffering, .recovering] {
+                let event = PlaybackPipelineEvent.phase(phase, readinessCycle: cycle)
+                slot.initialize(event)
+                XCTAssertEqual(slot.move(), event)
+            }
+        }
+        let outputs: [Double?] = [nil, 0, -Double.zero, .infinity, -.infinity,
+            Double(bitPattern: 0x7ff8_0000_0000_0042), Double(bitPattern: 0xfff8_0000_0000_0099)]
+        let generations: [MediaGeneration?] = [nil, .init(rawValue: 0), .init(rawValue: .max)]
+        for generation in generations {
+            slot.initialize(.mediaInformation(nil, generation: generation))
+            XCTAssertEqual(slot.move(), .mediaInformation(nil, generation: generation))
+            for output in outputs {
+                for scan: PlaybackScanMode in [.progressive, .interlaced] {
+                    for enhanced in [false, true] {
+                        let information = PlaybackMediaInformation(width: .min, height: .max, scanMode: scan,
+                            sourceFrameRate: enhanced ? .init(num: .max, den: 1) : nil,
+                            outputFrameRate: output, isSmoothMotionEnhanced: enhanced)
+                        slot.initialize(.mediaInformation(information, generation: generation))
+                        guard case .mediaInformation(let actual, let actualGeneration) = slot.move() else {
+                            XCTFail("Media event kind changed"); return
+                        }
+                        XCTAssertEqual(actualGeneration, generation)
+                        XCTAssertEqual(actual?.width, information.width)
+                        XCTAssertEqual(actual?.height, information.height)
+                        XCTAssertEqual(actual?.scanMode, information.scanMode)
+                        XCTAssertEqual(actual?.sourceFrameRate, information.sourceFrameRate)
+                        XCTAssertEqual(actual?.outputFrameRate?.bitPattern, output?.bitPattern)
+                        XCTAssertEqual(actual?.isSmoothMotionEnhanced, enhanced)
+                        XCTAssertEqual(slot.tag.pointee, PlaybackPipelineEventStorage.emptyTag)
+                    }
+                }
+            }
+        }
+    }
+
+    func testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove() throws {
+        let fixture = try OutputGraphFixture()
+        let prepare = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(fixture.registry.claimStart(prepare))
+        XCTAssertTrue(fixture.registry.completeOutputPrepare(prepare))
+        let ticket = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.prepareTicket)
+        let scope = PlaybackBackendPrepareFailureScope(ticket: ticket)
+        let application = HLSDeliveryApplicationChargeLedger()
+        let ledger = PlaybackResourceContextLedger(applicationLedger: application)
+        let slot = Task9NativePayloadSlot()
+        let probes = try autoreleasepool { () throws -> (Task9WeakObjectProbe, Task9WeakObjectProbe) in
+            let owner = try HLSRuntimeFailureMetadataOwner.reserve(in: ledger)
+            let diagnostic = ErrorDiagnosticSnapshot(typeName: "backend", message: "failure📺")
+            let storage = try XCTUnwrap(task9AnyObjectField("storage", of: diagnostic))
+            slot.initialize(.backendFailed(diagnostic, prepareScope: scope, metadataOwner: owner))
+            return (Task9WeakObjectProbe(owner), Task9WeakObjectProbe(storage))
+        }
+        XCTAssertNotNil(probes.0.value)
+        XCTAssertNotNil(probes.1.value)
+        XCTAssertEqual(ledger.chargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+        autoreleasepool {
+            let event = slot.move()
+            guard case .backendFailed(let diagnostic, let actualScope, let owner) = event else {
+                XCTFail("Backend payload kind changed"); return
+            }
+            XCTAssertEqual(diagnostic, ErrorDiagnosticSnapshot(typeName: "backend", message: "failure📺"))
+            XCTAssertTrue(actualScope.matches(ticket))
+            XCTAssertTrue(owner === probes.0.value)
+            slot.clear()
+            XCTAssertNotNil(probes.0.value, "Moved event owns its metadata until the last alias disappears")
+            XCTAssertNotNil(probes.1.value)
+            withExtendedLifetime(event) {}
+        }
+        XCTAssertNil(probes.0.value)
+        XCTAssertNil(probes.1.value)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+        XCTAssertEqual(application.chargedBytes, 0)
+        for clearExplicitly in [false, true] {
+            var pending: Task9NativePayloadSlot? = Task9NativePayloadSlot()
+            let ownerProbe = try autoreleasepool { () throws -> Task9WeakObjectProbe in
+                let owner = try HLSRuntimeFailureMetadataOwner.reserve(in: ledger)
+                pending?.initialize(.backendFailed(ErrorDiagnosticSnapshot(typeName: "clear", message: "owner"),
+                    prepareScope: scope, metadataOwner: owner))
+                return Task9WeakObjectProbe(owner)
+            }
+            XCTAssertNotNil(ownerProbe.value)
+            if clearExplicitly {
+                pending?.clear()
+                XCTAssertNil(ownerProbe.value)
+                pending?.clear()
+            }
+            pending = nil
+            XCTAssertNil(ownerProbe.value)
+            XCTAssertEqual(ledger.chargedBytes, 0)
+            XCTAssertEqual(application.chargedBytes, 0)
+        }
+    }
+
+    func testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce() throws {
+        for nestedDecoder in [false, true] {
+            for clearExplicitly in [false, true] {
+                var slot: Task9NativePayloadSlot? = Task9NativePayloadSlot()
+                let probe = try autoreleasepool { () throws -> Task9WeakObjectProbe in
+                    let diagnostic = ErrorDiagnosticSnapshot(typeName: "release", message: "owned")
+                    let storage = try XCTUnwrap(task9AnyObjectField("storage", of: diagnostic))
+                    slot?.initialize(nestedDecoder ? .failed(.videoDecoderFailure(.unexpected(diagnostic))) :
+                        .failed(.unexpected(stage: "release", diagnostic: diagnostic)))
+                    return Task9WeakObjectProbe(storage)
+                }
+                XCTAssertNotNil(probe.value)
+                if clearExplicitly {
+                    slot?.clear()
+                    XCTAssertNil(probe.value)
+                    slot?.clear()
+                }
+                slot = nil
+                XCTAssertNil(probe.value)
+            }
+        }
+    }
+
+    func testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder() async throws {
+        let identity = PlaybackRunIdentity(sessionID: 102, requestID: UUID())
+        let first = Task9OperationGate()
+        let middle = Task9OperationGate()
+        let lapBoundary = Task9OperationGate()
+        let secondMiddle = Task9OperationGate()
+        let observed = PlaybackStreamRecorder<PlaybackPipelineEvent>()
+        let delivered = expectation(description: "64 events fill two rotated physical ring laps")
+        delivered.expectedFulfillmentCount = 64
+        let events = (0..<64).map { index -> PlaybackPipelineEvent in
+            let physicalSlot = index % 32
+            let lap = index / 32
+            // Rotate the native type on lap two: all32 physical slots must rebind.
+            if (physicalSlot + lap).isMultiple(of: 2) {
+                return .failed(.presented(.init(code: "\(index)", userMessage: "长消息📺\(index)",
+                    diagnosticCode: index.isMultiple(of: 3) ? nil : "", retryDisposition: .doNotRetry)))
+            }
+            return .mediaInformation(nil, generation: .init(rawValue: UInt64.max - UInt64(index)))
+        }
+        let relay = PlaybackSessionEventRelay(identity: identity) { actualIdentity, event in
+            XCTAssertEqual(actualIdentity, identity)
+            observed.append(event)
+            if event == events[0] { await first.enter() }
+            if event == events[15] { await middle.enter() }
+            if event == events[31] { await lapBoundary.enter() }
+            if event == events[47] { await secondMiddle.enter() }
+            delivered.fulfill()
+        }
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
+        relay.send(events[0])
+        await first.waitUntilEntered()
+        for event in events[1..<32] { relay.send(event) }
+        await first.release()
+        await middle.waitUntilEntered()
+        for event in events[32..<47] { relay.send(event) }
+        await middle.release()
+        await lapBoundary.waitUntilEntered()
+        // Keep the queue nonempty, so the index cannot reset before wrapping31→0.
+        for event in events[47..<63] { relay.send(event) }
+        await lapBoundary.release()
+        await secondMiddle.waitUntilEntered()
+        relay.send(events[63])
+        await secondMiddle.release()
+        await fulfillment(of: [delivered], timeout: 3)
+        XCTAssertEqual(observed.snapshot, events)
+        relay.deactivate()
+    }
+
+    func testPipelinePayloadOverflowClearsAllReferencesDuringConcurrentProducers() async throws {
+        let identity = PlaybackRunIdentity(sessionID: 103, requestID: UUID())
+        let gate = Task9OperationGate()
+        let failed = expectation(description: "Concurrent overflow yields one terminal")
+        failed.assertForOverFulfill = true
+        let relay = PlaybackSessionEventRelay(identity: identity) { _, event in
+            if event == .ready(readinessCycle: 0) { await gate.enter() }
+            if event == .failed(.controlEventCapacityExceeded) { failed.fulfill() }
+        }
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
+        relay.send(.ready(readinessCycle: 0))
+        await gate.waitUntilEntered()
+        let probes = try autoreleasepool { () throws -> [Task9WeakObjectProbe] in
+            try (1...31).map { index in
+                let diagnostic = ErrorDiagnosticSnapshot(typeName: "overflow", message: "\(index)")
+                let storage = try XCTUnwrap(task9AnyObjectField("storage", of: diagnostic))
+                relay.send(.failed(.unexpected(stage: "\(index)", diagnostic: diagnostic)))
+                return Task9WeakObjectProbe(storage)
+            }
+        }
+        XCTAssertTrue(probes.allSatisfy { $0.value != nil })
+        DispatchQueue.concurrentPerform(iterations: 64) { index in
+            relay.send(.failed(.presented(.init(code: "\(index)", userMessage: "并发📺"))))
+        }
+        XCTAssertTrue(probes.allSatisfy { $0.value == nil }, "Overflow must clear every initialized reference payload")
+        await gate.release()
+        await fulfillment(of: [failed], timeout: 3)
+        relay.deactivate()
+    }
+
+    func testPipelineRingChargesBothOriginalPayloadAndTagSlabsWithinTheUnchangedFourKiBCap() throws {
         let reservation = PlaybackRuntimeAllocationReservations.systemAndPipelineRelay
         XCTAssertLessThanOrEqual(reservation.total, 4 * 1_024)
         XCTAssertEqual(reservation.observerTokens, 5 * 64)
@@ -4263,34 +4566,29 @@ final class Task9RuntimeCapacityTests: XCTestCase {
             XCTAssertNotNil(task9Field(name, of: monitor), "All five observation registrations remain live")
         }
         let relay = PlaybackSessionEventRelay(identity: .init(sessionID: 98, requestID: UUID())) { _, _ in }
-        let base = try XCTUnwrap(task9Field("pending", of: relay)
-            as? UnsafeMutablePointer<PlaybackPipelineEvent>)
-        let tail = try XCTUnwrap(task9Field("pendingTail", of: relay)
-            as? UnsafeMutablePointer<PlaybackPipelineEvent>)
-        let segmentCapacity = PlaybackSessionEventRelay.backingSegmentCapacity
-        let headBuffer = UnsafeBufferPointer(start: base, count: segmentCapacity)
-        let tailBuffer = UnsafeBufferPointer(start: tail, count: segmentCapacity)
-        let headBytes = malloc_size(UnsafeRawPointer(base))
-        let tailBytes = malloc_size(UnsafeRawPointer(tail))
-        let actual = headBytes + tailBytes
-        XCTAssertNotEqual(UInt(bitPattern: base), UInt(bitPattern: tail))
-        XCTAssertEqual(headBuffer.count, 16)
-        XCTAssertEqual(tailBuffer.count, 16)
-        XCTAssertEqual(headBuffer.count + tailBuffer.count, 32)
-        XCTAssertTrue(headBuffer.allSatisfy { $0 == .stopped }, "Every head slot must be initialized")
-        XCTAssertTrue(tailBuffer.allSatisfy { $0 == .stopped }, "Every tail slot must be initialized")
+        let base = try XCTUnwrap(task9Field("pending", of: relay) as? UnsafeMutableRawPointer)
+        let tags = try XCTUnwrap(task9Field("pendingTags", of: relay) as? UnsafeMutablePointer<UInt16>)
+        let tagBuffer = UnsafeBufferPointer(start: tags, count: PlaybackSessionEventRelay.maximumCapacity)
+        let payloadBytes = malloc_size(base)
+        let tagBytes = malloc_size(UnsafeRawPointer(tags))
+        let actual = payloadBytes + tagBytes
+        XCTAssertNotEqual(UInt(bitPattern: base), UInt(bitPattern: tags))
+        XCTAssertEqual(tagBuffer.count, 32)
+        XCTAssertTrue(tagBuffer.allSatisfy { $0 == PlaybackPipelineEventStorage.emptyTag },
+            "Every tag must describe an empty, uninitialized payload slot")
+        XCTAssertEqual(UInt(bitPattern: base) % UInt(PlaybackPipelineEventStorage.payloadAlignment), 0)
         XCTAssertEqual(actual, reservation.pipelineBacking,
-            "Both typed bases are original allocations; neither is a guessed Array element address")
-        XCTAssertEqual(headBytes, malloc_good_size(segmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride))
-        XCTAssertEqual(tailBytes, malloc_good_size(segmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride))
+            "Both heterogeneous slabs must be charged from their original allocation bases")
+        XCTAssertEqual(payloadBytes, malloc_good_size(32 * PlaybackPipelineEventStorage.payloadStride))
+        XCTAssertEqual(tagBytes, malloc_good_size(32 * MemoryLayout<UInt16>.stride))
         XCTAssertNil(task9AnyObjectField("lock", of: relay))
         XCTAssertNil(task9AnyObjectField("lock", of: monitor))
         XCTAssertEqual(reservation.pipelineRelayLock, 0)
         XCTAssertEqual(reservation.monitorLock, 0)
         XCTAssertEqual(malloc_size(Unmanaged.passUnretained(relay).toOpaque()), reservation.pipelineRelayObject)
         XCTAssertEqual(malloc_size(Unmanaged.passUnretained(monitor).toOpaque()), reservation.monitorObject)
-        print("pipelineTypedBacking=\(actual), head=\(headBytes), tail=\(tailBytes), slots=32, " +
-            "stride=\(MemoryLayout<PlaybackPipelineEvent>.stride), " +
+        print("pipelinePayloadBacking=\(actual), payload=\(payloadBytes), tags=\(tagBytes), slots=32, " +
+            "payloadStride=\(PlaybackPipelineEventStorage.payloadStride), tagStride=\(MemoryLayout<UInt16>.stride), " +
             "pipelineObject=\(reservation.pipelineRelayObject), monitorObject=\(reservation.monitorObject), " +
             "systemAndPipelineTotal=\(reservation.total)/4096")
     }
@@ -4325,13 +4623,13 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         await fulfillment(of: [delivered], timeout: 3)
         XCTAssertEqual(observed.snapshot, events)
         let after = try XCTUnwrap(task9ArraySnapshot("pending", of: relay))
-        XCTAssertEqual(after.identity, before.identity, "Draining must retain the original head allocation")
-        XCTAssertEqual(after.secondIdentity, before.secondIdentity, "Draining must retain the original tail allocation")
+        XCTAssertEqual(after.identity, before.identity, "Draining must retain the original payload allocation")
+        XCTAssertEqual(after.secondIdentity, before.secondIdentity, "Draining must retain the original tag allocation")
         XCTAssertEqual(after.bytes, before.bytes)
         relay.deactivate()
     }
 
-    func testPipelineSplitRingPreservesOptionalMediaAndFullWidthGenerationsAcrossBothHalves() async throws {
+    func testPipelinePayloadRingPreservesOptionalMediaAndFullWidthGenerationsAcrossAllSlots() async throws {
         let identity = PlaybackRunIdentity(sessionID: 101, requestID: UUID())
         let gate = Task9OperationGate()
         let observed = PlaybackStreamRecorder<PlaybackPipelineEvent>()
@@ -4381,7 +4679,7 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         relay.deactivate()
     }
 
-    func testPipelineSplitRingReleasesQueuedReferencesAcrossTheSegmentBoundaryAndDeinitializesAfterJoin() async throws {
+    func testPipelinePayloadRingReleasesQueuedReferencesAndDeinitializesAfterJoin() async throws {
         let identity = PlaybackRunIdentity(sessionID: 100, requestID: UUID())
         let gate = Task9OperationGate()
         let relay = PlaybackSessionEventRelay(identity: identity) { _, _ in await gate.enter() }
@@ -4410,7 +4708,7 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         XCTAssertTrue(retained.allSatisfy { $0.value != nil }, "Queued slots must own their unchanged payloads")
         relay.deactivate()
         XCTAssertTrue(retained.allSatisfy { $0.value == nil },
-            "Clearing slots15,16,31 must release references on both sides of the physical boundary")
+            "Clearing slots15,16,31 must release references throughout the payload slab")
         await gate.release()
     }
 
@@ -4524,8 +4822,7 @@ final class Task9RuntimeCapacityTests: XCTestCase {
             XCTAssertEqual(array.count, expectedCount)
             XCTAssertGreaterThanOrEqual(array.capacity, expectedCount,
                 "公开capacity是本目标allocator事实，不能用count替代")
-            XCTAssertEqual(array.bytes, array.allocationSegmentCount *
-                malloc_good_size(array.allocationHeaderBytes + array.allocationSegmentCapacity * array.stride))
+            XCTAssertEqual(array.bytes, array.allocationRequests.reduce(0) { $0 + malloc_good_size($1) })
             if name == "commands" {
                 XCTAssertEqual(ControlTaskRegistry.commandBackingCapacity, array.count)
                 XCTAssertEqual(ControlTaskRegistry.controlAllocationReservation.commandBacking, array.bytes,
@@ -4830,8 +5127,11 @@ final class Task9RuntimeCapacityTests: XCTestCase {
             XCTAssertEqual(actual.count, 32)
             XCTAssertEqual(policyCount, actual.count,
                 "\(name)的类型化reservation策略只能冻结逻辑32请求，不能冻结某台模拟器公开capacity")
-            XCTAssertEqual(reservedBytes, actual.allocationSegmentCount *
-                malloc_good_size(actual.allocationHeaderBytes + (32 / actual.allocationSegmentCount) * actual.stride),
+            // Derive policy requests independently of the observed allocator capacity.
+            let logicalRequests = name == "pipeline"
+                ? [32 * 48, 32 * MemoryLayout<UInt16>.stride]
+                : [32 + 32 * actual.stride]
+            XCTAssertEqual(reservedBytes, logicalRequests.reduce(0) { $0 + malloc_good_size($1) },
                 "\(name)须按当前runtime对逻辑32请求得到的allocation class自适应计费")
             XCTAssertEqual(actual.bytes, reservedBytes,
                 "\(name)真实背板必须落在同一runtime allocation class")

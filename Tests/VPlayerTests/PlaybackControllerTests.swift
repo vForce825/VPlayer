@@ -938,6 +938,51 @@ final class PlaybackControllerTests: XCTestCase {
         XCTAssertNil(stoppedSnapshot)
     }
 
+    func testSuspendedStopClearsOnlyItsOriginalTerminalMetrics() async throws {
+        for replaceSession in [false, true] {
+            let firstMetrics = PlaybackMetrics(channelID: "first", now: { 10 },
+                residentMemoryProvider: { 211 })
+            let replacementMetrics = PlaybackMetrics(channelID: "replacement", now: { 10 },
+                residentMemoryProvider: { 422 })
+            let first = FakeControllerPipeline(metrics: firstMetrics)
+            let replacement = FakeControllerPipeline(metrics: replacementMetrics)
+            let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+            let controller = makeRoutedPlaybackController(
+                factory: FakeControllerPipelineFactory([first, replacement]), audioSessionOwner: owner)
+            let firstRequest = makeRequest(channelID: "metrics-original")
+            await controller.play(firstRequest)
+            let gate = ManualControllerAsyncGate()
+            defer { gate.open() }
+            await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
+                if checkpoint == .stopAfterWatchdog { await gate.wait() }
+            }
+            let stop = Task { await controller.stop(requestID: firstRequest.id) }
+            try await eventually { gate.waiterCount == 1 }
+            if replaceSession { await controller.play(makeRequest(channelID: "metrics-replacement")) }
+            (replaceSession ? replacement : first).emit(.failed(.demuxRead(-74)))
+            try await eventually {
+                if case .failed = await controller.currentStateForTesting {
+                    return owner.registry.cleanupReservationSnapshot() == nil
+                }
+                return false
+            }
+            let retained = await controller.playbackMetricsSnapshot(window: .seconds(60))
+            XCTAssertEqual(retained?.residentMemoryBytes, replaceSession ? 422 : 211)
+            gate.open()
+            await stop.value
+            let afterStop = await controller.playbackMetricsSnapshot(window: .seconds(60))
+            if replaceSession {
+                XCTAssertEqual(afterStop?.residentMemoryBytes, 422,
+                    "An obsolete Stop cannot clear a replacement's terminal collector")
+            } else {
+                XCTAssertNil(afterStop, "Stop must clear the original collector after failure wins its suspension")
+            }
+            await controller.stop()
+            let finalMetrics = await controller.playbackMetricsSnapshot(window: .seconds(60))
+            XCTAssertNil(finalMetrics)
+        }
+    }
+
     func testChannelReplacementReleasesRetiredAudioLeaseBeforeSuccessorAcquisition() async throws {
         let f = ControllerRecoveryFixture(channelID: "first", owner: RecordingPlaybackAudioSessionOwner())
         try await start(f)

@@ -152,12 +152,12 @@ final class ReleaseAACSeed: @unchecked Sendable {
         guard let firstEncoded = encoded.first else {
             throw AACRenditionFailure.invalidInput
         }
-        let firstPhysicalStart = CMSampleBufferGetPresentationTimeStamp(firstEncoded)
+        let firstEffectiveStart = CMSampleBufferGetOutputPresentationTimeStamp(firstEncoded)
         var secondBuckets: [[CMSampleBuffer]] = []
         for buffer in encoded {
             let relative = CMTimeSubtract(
-                CMSampleBufferGetPresentationTimeStamp(buffer),
-                firstPhysicalStart
+                CMSampleBufferGetOutputPresentationTimeStamp(buffer),
+                firstEffectiveStart
             )
             let second = max(0, Int(floor(CMTimeGetSeconds(relative))))
             while secondBuckets.count <= second { secondBuckets.append([]) }
@@ -228,10 +228,12 @@ final class ReleaseAACSeed: @unchecked Sendable {
             renditionIdentity: fallback.renditionIdentity,
             writerIdentity: fallback.writerIdentity)
         let boundary = try SegmentBoundaryCoordinator(
-            mode: .audioOnly(epochStart: physicalStart))
+            mode: .audioOnly(epochStart: effectiveStart))
         try boundary.registerAudioRendition(binding.renditionIdentity,
             accessUnit: .aac(sampleRate: 48_000),
-            firstEffectiveStart: physicalStart)
+            firstPhysicalStart: physicalStart,
+            startTrimSamples: Int64(summary.leadingFrames),
+            firstEffectiveStart: effectiveStart)
         let sink = ReleaseSystemSink()
         let relay = SegmentReportRelay(binding: binding, limits: .audio,
             capacity: 8, objectSink: sink.collect)

@@ -891,7 +891,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testAccessLogAndNonAudioURIsNeverBindOrInvalidateSelection() async throws {
-        let harness = try await Task21Harness()
+        let harness = try await Task21Harness(completeMediaBodies: false)
+        addTeardownBlock { try await harness.shutdown() }
+        XCTAssertTrue(harness.coordinator.selectedRenditions.isEmpty,
+            "The fixture must start before any audio media body selects a rendition")
         for uri in Task21Fixtures.uninformativeURIs {
             harness.coordinator.observeAccessLogURI(uri, item: harness.item)
         }
@@ -1814,39 +1817,83 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
-    func testReview2CoordinatorFixedCapacityRejectsBeforeAllocationAndTracksOneTimerTaskWaiter()
+    func testReview2CoordinatorFixedCapacityRejectsBeforeInstallationAndOwnsOneWaiterWithoutTimer()
         async throws {
-        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
-        let authorityHarness = try await Task21Harness()
-        let evidence = authorityHarness.evidence
-        let coordinator = try AVPlayerItemCoordinator(driver: driver, evidenceSource: evidence)
-        let item = AVPlayerItemInstanceIdentity(
-            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_003),
-            itemGeneration: 1
-        )
-        XCTAssertLessThanOrEqual(malloc_size(Unmanaged.passUnretained(coordinator).toOpaque()), 2_048)
-        XCTAssertNoThrow(try coordinator.install(Task21Fixtures.request(
-            item: item, liveEdge: Task21Fixtures.time(7),
-            boundaries: (0..<128).map { Task21Fixtures.time(Double($0) / 48_000) },
-            directAudioOnlyRendition: nil
-        )))
-        let overflow = try AVPlayerItemCoordinator(driver: Task21FakeDriver(), evidenceSource: evidence)
-        XCTAssertThrowsError(try overflow.install(Task21Fixtures.request(
-            item: item, liveEdge: Task21Fixtures.time(7),
-            boundaries: (0...128).map { Task21Fixtures.time(Double($0) / 48_000) },
-            directAudioOnlyRendition: nil
-        )))
+        let authorityFixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_003),
+            audioOnly: true)
+        defer { authorityFixture.shutdown() }
+        let item = authorityFixture.request.item
+        let playhead = try await authorityFixture.makePreparedPlayhead()
+        var driver: SystemAVPlayerDriver? = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let original = WeakSystemAVPlayerDriverProbe(driver)
+        var coordinator: AVPlayerItemCoordinator? = try AVPlayerItemCoordinator(
+            driver: XCTUnwrap(driver), evidenceSource: authorityFixture.source)
+        defer { driver?.replaceCurrentItemWithNil(item: item) }
+        XCTAssertLessThanOrEqual(malloc_size(Unmanaged.passUnretained(
+            try XCTUnwrap(coordinator)).toOpaque()), 2_048)
+        func request(participantCount: Int) -> AVPlayerItemPreparationRequest {
+            .init(itemURL: authorityFixture.request.itemURL, item: item,
+                publicationSequence: authorityFixture.request.publicationSequence,
+                audioParticipants: (0..<participantCount).map { index in
+                    .init(renditionIdentity: .init(rawValue: UInt64(index + 2)),
+                          codec: .explicitlyNonAAC)
+                }, directAudioOnlyRendition: nil)
+        }
+        XCTAssertNoThrow(try coordinator?.install(request(participantCount: 8)))
+        let overflowDriver = Task21FakeDriver()
+        let overflow = try AVPlayerItemCoordinator(driver: overflowDriver,
+            evidenceSource: authorityFixture.source)
+        XCTAssertThrowsError(try overflow.install(request(participantCount: 9))) { error in
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        XCTAssertNil(overflowDriver.currentItemIdentity,
+                     "the ninth participant must reject before installing a physical item")
+        XCTAssertEqual(coordinator?.additionalTaskCount, 0)
+        XCTAssertEqual(coordinator?.additionalTimerCount, 0,
+                       "the Registry owns deadlines; the native driver cannot add its own timer")
+        XCTAssertThrowsError(try SystemAVPlayerDriver.make()) { error in
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        try await driver?.setDisconnectedFromSystemAudio(true, item: item)
+        driver?.replaceCurrentItemWithNil(item: item)
+        XCTAssertThrowsError(try SystemAVPlayerDriver.make(),
+                             "physical retirement does not release a still-owned driver")
+        coordinator = nil
+        driver = nil
+        let releaseDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (original.value != nil || AVPlayerSDKCallbackLease.occupiedCount != 0),
+              ContinuousClock.now < releaseDeadline {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+        XCTAssertNil(original.value, "the original physical read and driver owners must finish")
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
 
         let waiting = try SystemAVPlayerDriver.make(player: AVPlayer())
-        try waiting.install(url: URL(string: "http://127.0.0.1:1/capacity.m3u8")!, identity: item)
-        let ready = Task { try await waiting.waitUntilReady(item: item) }
-        while waiting.activeWaiterCount == 0 { await Task.yield() }
+        try waiting.install(url: authorityFixture.request.itemURL, identity: item)
+        defer { waiting.replaceCurrentItemWithNil(item: item) }
+        // A range beyond this finite fixture cannot become covered before cancellation.
+        let requested = try FMP4PresentationRange(start: Task21Fixtures.time(3_600),
+                                                  duration: Task21Fixtures.time(3))
+        let waiter = Task {
+            try await waiting.waitForLoadedTimeRanges(item: item, playhead: playhead,
+                                                      covering: requested)
+        }
+        let waiterDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while waiting.activeWaiterCount == 0, ContinuousClock.now < waiterDeadline {
+            await Task.yield()
+        }
         XCTAssertEqual(waiting.activeWaiterCount, 1)
-        XCTAssertEqual(coordinator.additionalTaskCount, 0)
-        XCTAssertEqual(coordinator.additionalTimerCount, 1,
-                       "生产 waiters 必须共享一个可计数的固定 timer")
         waiting.replaceCurrentItemWithNil(item: item)
-        _ = try? await ready.value
+        await XCTAssertThrowsErrorAsync(try await waiter.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(waiting.activeWaiterCount, 0)
     }
 
     func testReview2TimeControlRelayCoalescesBurstIntoOnePendingMainDeliveryAndRevalidatesAuthority()
@@ -1871,28 +1918,75 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testReview2SystemWaitersUseProductionKVOAndFinishExactlyOnce() async throws {
-        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         let fixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_005),
-            audioOnly: false)
+            audioOnly: true)
         defer { fixture.shutdown() }
-        let item = fixture.request.item
-        try driver.install(url: fixture.request.itemURL, identity: item)
         let playhead = try await fixture.makePreparedPlayhead()
-        let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
-                                                   duration: Task21Fixtures.time(3))
-        let ready = Task { try await driver.waitUntilReady(item: item) }
-        let loaded = Task {
+        let item = fixture.request.item
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        try driver.install(url: fixture.request.itemURL, identity: item)
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+        let requested = try FMP4PresentationRange(start: Task21Fixtures.time(3_600),
+                                                  duration: Task21Fixtures.time(3))
+        let first = Task {
             try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
                                                      covering: requested)
         }
-        while driver.activeWaiterCount < 2 { await Task.yield() }
+        let firstDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while driver.activeWaiterCount == 0, ContinuousClock.now < firstDeadline {
+            await Task.yield()
+        }
+        guard driver.activeWaiterCount == 1 else {
+            first.cancel()
+            _ = try? await first.value
+            XCTFail("the original production KVO waiter did not occupy its one slot")
+            return
+        }
+        let overlapFinished = FinalLockedFlag()
+        let overlap = Task {
+            defer { overlapFinished.set() }
+            return try await driver.waitForLoadedTimeRanges(
+                item: item, playhead: playhead, covering: requested)
+        }
+        let overlapDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !overlapFinished.value, ContinuousClock.now < overlapDeadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(overlapFinished.value, "overlap must reject without waiting for a range")
+        if !overlapFinished.value { overlap.cancel() }
+        await XCTAssertThrowsErrorAsync(try await overlap.value) { error in
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .capacityExceeded,
+                           "overlap cannot allocate a second prepare waiter")
+        }
+        XCTAssertEqual(driver.activeWaiterCount, 1,
+                       "rejected overlap must leave the original KVO waiter registered")
+        first.cancel()
+        await XCTAssertThrowsErrorAsync(try await first.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(driver.activeWaiterCount, 0)
+
+        let successor = Task {
+            try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
+                                                     covering: requested)
+        }
+        let successorDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while driver.activeWaiterCount == 0, ContinuousClock.now < successorDeadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(driver.activeWaiterCount, 1)
+        first.cancel()
+        XCTAssertEqual(driver.activeWaiterCount, 1,
+                       "a retired task's repeated cancellation cannot retire its successor")
         driver.removeObservers(item: item)
         driver.replaceCurrentItemWithNil(item: item)
-        _ = try? await ready.value
-        _ = try? await loaded.value
+        driver.replaceCurrentItemWithNil(item: item)
+        await XCTAssertThrowsErrorAsync(try await successor.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
         XCTAssertEqual(driver.activeWaiterCount, 0,
-                       "生产 KVO waiter 的取消、替换与 observer teardown 必须恰好一次恢复")
+                       "cancel, repeated replacement, and observer teardown finish the one slot")
     }
 
     func testReview3PositiveRateCapabilityAtomicallyRevalidatesConsumesAndPerformsMainActorPlay()
@@ -4175,6 +4269,7 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
 
     static func make(lifecycle: OutputLifecycleEpoch,
                      audioOnly: Bool,
+                     completeMediaBodies: Bool = true,
                      diagnosticPhases: Bool = false) async throws -> Task21HarnessAuthorityFixture {
         task21FixturePhase("aac.seed.begin", enabled: diagnosticPhases)
         let seed = try await Task21RealAACSeed.make(
@@ -4220,7 +4315,9 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
         }
         for participantID in participantIDs {
             let media = try XCTUnwrap(snapshot.media[participantID])
-            urls += try (media.initializationResources + media.resources).map { key in
+            let resources = media.initializationResources
+                + (completeMediaBodies ? media.resources : [])
+            urls += try resources.map { key in
                 try XCTUnwrap(URL(string: server.path(for: key),
                                   relativeTo: server.baseURL)?.absoluteURL)
             }
@@ -4236,20 +4333,45 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
             }
         }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while server.currentAudioSelectionCapability(
-            itemGeneration: 19,
-            publicationSequence: bundle.request.publicationSequence
-        ) == nil, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
+        if completeMediaBodies {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while server.currentAudioSelectionCapability(
+                itemGeneration: 19,
+                publicationSequence: bundle.request.publicationSequence
+            ) == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard server.currentAudioSelectionCapability(
+                itemGeneration: 19,
+                publicationSequence: bundle.request.publicationSequence
+            ) != nil else {
+                // Read-only failure facts distinguish missing HTTP evidence from
+                // admission pressure. These separate snapshots do not reserve or
+                // consume publication/selection authority.
+                let requests = server.acceptedGETSnapshot()
+                let history = server.preparationHistoryFactCounts
+                let usage = server.usage
+                let resourceBytes = PlaybackResourceContextLedger.shared.chargedBytes
+                print("TASK21_SELECTION_FAILURE resourceBytes=\(resourceBytes) "
+                    + "soft=\(PlaybackResourceContextLedger.softBytes) "
+                    + "hard=\(PlaybackResourceContextLedger.hardBytes) "
+                    + "playlistGETs=\(requests.playlistCount) "
+                    + "initializationGETs=\(requests.initializationCount) "
+                    + "mediaGETs=\(requests.mediaCount) "
+                    + "historyAuthorities=\(history.authorities) "
+                    + "historyResources=\(history.resources) "
+                    + "historySelections=\(history.selections) "
+                    + "connections=\(usage.connections) responses=\(usage.activeResponses) "
+                    + "sdkCallbackSlots=\(AVPlayerSDKCallbackLease.occupiedCount)")
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            task21FixturePhase("selection.ready", enabled: diagnosticPhases)
+        } else {
+            XCTAssertNil(server.currentAudioSelectionCapability(
+                itemGeneration: 19,
+                publicationSequence: bundle.request.publicationSequence),
+                "Playlist and initialization bodies cannot select an audio rendition")
         }
-        guard server.currentAudioSelectionCapability(
-            itemGeneration: 19,
-            publicationSequence: bundle.request.publicationSequence
-        ) != nil else {
-            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
-        }
-        task21FixturePhase("selection.ready", enabled: diagnosticPhases)
         let timelineEndpoint: AACEffectiveEndpointAuthority?
         if let avSeed {
             timelineEndpoint = avSeed.audioRenditionBinding.endpointAuthority
@@ -4346,6 +4468,7 @@ private final class Task21Harness {
          prepareMutation: Task21PrepareMutation = .none,
          requiresAACEndpointAuthority: Bool = false,
          additionalUnboundAACRendition: AudioRenditionIdentity? = nil,
+         completeMediaBodies: Bool = true,
          diagnosticPhases: Bool = false) async throws {
         self.liveEdge = Task21Fixtures.time(liveEdge)
         self.boundaries = boundaries.map(Task21Fixtures.time)
@@ -4360,6 +4483,7 @@ private final class Task21Harness {
         lifecycle = graph.lifecycle
         authorityFixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: lifecycle, audioOnly: directAudioOnlyRendition != nil,
+            completeMediaBodies: completeMediaBodies,
             diagnosticPhases: diagnosticPhases)
         evidence = Task21FakeEvidenceSource(
             source: authorityFixture.source,
@@ -4661,6 +4785,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
             }
             return .quiescent(proof)
         } catch {
+            print("NATIVE_ADMISSION suspend-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount)")
             lock.withLock { errorValue = error }
             return .requiresRetirement
         }
@@ -5061,6 +5186,7 @@ private final class Task21RealIntegrationFixture {
             value = result
         }
         catch {
+            print("NATIVE_ADMISSION prepare-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount) phase=\(coordinator.phase) history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
             let ranges = player.currentItem?.loadedTimeRanges.map {
                 let value = $0.timeRangeValue
                 return "\(CMTimeGetSeconds(value.start))...\(CMTimeGetSeconds(value.end))"

@@ -14,12 +14,224 @@ struct PlaybackRunIdentity: Equatable, Sendable {
 }
 
 
+/// Fixed native payload storage. Tags describe exactly which value is initialized
+/// in a slot; no typed pointer survives a move/deinitialize followed by rebinding.
+/// PlaybackFailure's flattened fields are guarded by a schema regression test.
+enum PlaybackPipelineEventStorage {
+    static let payloadStride = 48
+    static let payloadAlignment = 8
+    static let emptyTag: UInt16 = 0
+
+    typealias PresentedPayload = (String, String, String?)
+    typealias MediaPayload = (PlaybackMediaInformation?, MediaGeneration)
+    typealias UnexpectedPayload = (String, ErrorDiagnosticSnapshot)
+    typealias BackendPayload = (ErrorDiagnosticSnapshot, PlaybackBackendPrepareFailureScope,
+        HLSRuntimeFailureMetadataOwner)
+    typealias FFmpegPayload = (FFmpegFailureKind, FFmpegFailureStage, Int32)
+
+    private enum Tag: UInt16 {
+        case empty, stopped, ready, buffering, recovering, mediaWithoutGeneration, mediaWithGeneration
+        case unsupportedProtocol, demuxOpen, demuxRead, ffmpegFailure, networkTimeout
+        case unsupportedVideoCodec, unsupportedAudioCodec, videoFormatDescription
+        case hardwareDecoderUnavailable, videoDecoderTransitionTimeout, videoDecode, videoDecoderFailure
+        case videoSampleBuffer, videoRendererFailed, audioFormatDescription, audioFallbackDecode
+        case audioRendererFailed, renderTextureMapping, metalCommand, cancelled
+        case controlEventCapacityExceeded, outputActivationRejected, backendPublicationReplacementRejected
+        case presentedRetry, presentedChooseChannel, presentedDoNotRetry, unexpected, backendFailed
+    }
+
+    /// Executed before allocation/binding in Release too. A changed SDK payload
+    /// fails closed instead of overwriting the next fixed slot.
+    static func validateLayout() {
+        validate(PresentedPayload.self)
+        validate(MediaPayload.self)
+        validate(PlaybackMediaInformation?.self)
+        validate(UnexpectedPayload.self)
+        validate(BackendPayload.self)
+        validate(FFmpegPayload.self)
+        validate(VideoDecoderFailure.self)
+        validate(String.self)
+        validate(Int32.self)
+        validate(UInt64.self)
+        precondition(MemoryLayout<UInt16>.stride == 2 && Tag.empty.rawValue == emptyTag)
+    }
+
+    private static func validate<T>(_ type: T.Type) {
+        precondition(MemoryLayout<T>.stride <= payloadStride &&
+            MemoryLayout<T>.alignment <= payloadAlignment &&
+            payloadStride.isMultiple(of: MemoryLayout<T>.alignment),
+            "pipeline event payload no longer fits its fixed slot; review storage schema")
+    }
+
+    private static func kind(_ tag: UnsafeMutablePointer<UInt16>) -> Tag {
+        guard let value = Tag(rawValue: tag.pointee) else {
+            preconditionFailure("invalid pipeline event payload tag")
+        }
+        return value
+    }
+
+    private static func put<T>(_ value: T, kind: Tag, at slot: UnsafeMutableRawPointer,
+        tag: UnsafeMutablePointer<UInt16>) {
+        validate(T.self)
+        precondition(UInt(bitPattern: slot).isMultiple(of: UInt(MemoryLayout<T>.alignment)))
+        // The caller proved this slot empty, so any prior binding is uninitialized.
+        slot.bindMemory(to: T.self, capacity: 1).initialize(to: value)
+        tag.pointee = kind.rawValue
+    }
+
+    private static func take<T>(_ type: T.Type, at slot: UnsafeMutableRawPointer,
+        tag: UnsafeMutablePointer<UInt16>) -> T {
+        let value = slot.assumingMemoryBound(to: T.self).move()
+        tag.pointee = emptyTag
+        return value
+    }
+
+    static func initialize(_ event: PlaybackPipelineEvent, at slot: UnsafeMutableRawPointer,
+        tag: UnsafeMutablePointer<UInt16>) {
+        precondition(kind(tag) == .empty, "pipeline payload initialized twice")
+        switch event {
+        case .stopped: tag.pointee = Tag.stopped.rawValue
+        case .ready(let cycle): put(cycle, kind: .ready, at: slot, tag: tag)
+        case .phase(let phase, let cycle):
+            switch phase {
+            case .buffering: put(cycle, kind: .buffering, at: slot, tag: tag)
+            case .recovering: put(cycle, kind: .recovering, at: slot, tag: tag)
+            }
+        case .mediaInformation(let info, let generation):
+            if let generation {
+                put((info, generation), kind: .mediaWithGeneration, at: slot, tag: tag)
+            } else {
+                put(info, kind: .mediaWithoutGeneration, at: slot, tag: tag)
+            }
+        case .backendFailed(let diagnostic, let scope, let owner):
+            put((diagnostic, scope, owner), kind: .backendFailed, at: slot, tag: tag)
+        case .failed(let error):
+            switch error {
+            case .unsupportedProtocol(let value): put(value, kind: .unsupportedProtocol, at: slot, tag: tag)
+            case .demuxOpen(let value): put(value, kind: .demuxOpen, at: slot, tag: tag)
+            case .demuxRead(let value): put(value, kind: .demuxRead, at: slot, tag: tag)
+            case .ffmpegFailure(let failureKind, let stage, let status):
+                put((failureKind, stage, status), kind: .ffmpegFailure, at: slot, tag: tag)
+            case .networkTimeout: tag.pointee = Tag.networkTimeout.rawValue
+            case .unsupportedVideoCodec: tag.pointee = Tag.unsupportedVideoCodec.rawValue
+            case .unsupportedAudioCodec: tag.pointee = Tag.unsupportedAudioCodec.rawValue
+            case .videoFormatDescription(let value): put(value, kind: .videoFormatDescription, at: slot, tag: tag)
+            case .hardwareDecoderUnavailable: tag.pointee = Tag.hardwareDecoderUnavailable.rawValue
+            case .videoDecoderTransitionTimeout: tag.pointee = Tag.videoDecoderTransitionTimeout.rawValue
+            case .videoDecode(let value): put(value, kind: .videoDecode, at: slot, tag: tag)
+            case .videoDecoderFailure(let value): put(value, kind: .videoDecoderFailure, at: slot, tag: tag)
+            case .videoSampleBuffer(let value): put(value, kind: .videoSampleBuffer, at: slot, tag: tag)
+            case .videoRendererFailed(let value): put(value, kind: .videoRendererFailed, at: slot, tag: tag)
+            case .audioFormatDescription(let value): put(value, kind: .audioFormatDescription, at: slot, tag: tag)
+            case .audioFallbackDecode(let value): put(value, kind: .audioFallbackDecode, at: slot, tag: tag)
+            case .audioRendererFailed(let value): put(value, kind: .audioRendererFailed, at: slot, tag: tag)
+            case .renderTextureMapping: tag.pointee = Tag.renderTextureMapping.rawValue
+            case .metalCommand(let value): put(value, kind: .metalCommand, at: slot, tag: tag)
+            case .cancelled: tag.pointee = Tag.cancelled.rawValue
+            case .controlEventCapacityExceeded: tag.pointee = Tag.controlEventCapacityExceeded.rawValue
+            case .outputActivationRejected: tag.pointee = Tag.outputActivationRejected.rawValue
+            case .backendPublicationReplacementRejected: tag.pointee = Tag.backendPublicationReplacementRejected.rawValue
+            case .presented(let failure):
+                let payload = (failure.code, failure.userMessage, failure.diagnosticCode)
+                switch failure.retryDisposition {
+                case .retrySameRequest: put(payload, kind: .presentedRetry, at: slot, tag: tag)
+                case .chooseAnotherChannel: put(payload, kind: .presentedChooseChannel, at: slot, tag: tag)
+                case .doNotRetry: put(payload, kind: .presentedDoNotRetry, at: slot, tag: tag)
+                }
+            case .unexpected(let stage, let diagnostic):
+                put((stage, diagnostic), kind: .unexpected, at: slot, tag: tag)
+            }
+        }
+    }
+
+    static func move(at slot: UnsafeMutableRawPointer,
+        tag: UnsafeMutablePointer<UInt16>) -> PlaybackPipelineEvent {
+        let storedKind = kind(tag)
+        switch storedKind {
+        case .empty: preconditionFailure("read from empty pipeline event slot")
+        case .stopped: tag.pointee = emptyTag; return .stopped
+        case .ready: return .ready(readinessCycle: take(UInt64.self, at: slot, tag: tag))
+        case .buffering: return .phase(.buffering, readinessCycle: take(UInt64.self, at: slot, tag: tag))
+        case .recovering: return .phase(.recovering, readinessCycle: take(UInt64.self, at: slot, tag: tag))
+        case .mediaWithoutGeneration:
+            return .mediaInformation(take(PlaybackMediaInformation?.self, at: slot, tag: tag), generation: nil)
+        case .mediaWithGeneration:
+            let payload = take(MediaPayload.self, at: slot, tag: tag)
+            return .mediaInformation(payload.0, generation: payload.1)
+        case .backendFailed:
+            let payload = take(BackendPayload.self, at: slot, tag: tag)
+            return .backendFailed(payload.0, prepareScope: payload.1, metadataOwner: payload.2)
+        case .unsupportedProtocol: return .failed(.unsupportedProtocol(take(String.self, at: slot, tag: tag)))
+        case .demuxOpen: return .failed(.demuxOpen(take(Int32.self, at: slot, tag: tag)))
+        case .demuxRead: return .failed(.demuxRead(take(Int32.self, at: slot, tag: tag)))
+        case .ffmpegFailure:
+            let payload = take(FFmpegPayload.self, at: slot, tag: tag)
+            return .failed(.ffmpegFailure(kind: payload.0, stage: payload.1, status: payload.2))
+        case .videoFormatDescription: return .failed(.videoFormatDescription(take(Int32.self, at: slot, tag: tag)))
+        case .videoDecode: return .failed(.videoDecode(take(Int32.self, at: slot, tag: tag)))
+        case .videoDecoderFailure: return .failed(.videoDecoderFailure(take(VideoDecoderFailure.self, at: slot, tag: tag)))
+        case .videoSampleBuffer: return .failed(.videoSampleBuffer(take(String.self, at: slot, tag: tag)))
+        case .videoRendererFailed: return .failed(.videoRendererFailed(take(String.self, at: slot, tag: tag)))
+        case .audioFormatDescription: return .failed(.audioFormatDescription(take(Int32.self, at: slot, tag: tag)))
+        case .audioFallbackDecode: return .failed(.audioFallbackDecode(take(Int32.self, at: slot, tag: tag)))
+        case .audioRendererFailed: return .failed(.audioRendererFailed(take(String.self, at: slot, tag: tag)))
+        case .metalCommand: return .failed(.metalCommand(take(String.self, at: slot, tag: tag)))
+        case .presentedRetry, .presentedChooseChannel, .presentedDoNotRetry:
+            let payload = take(PresentedPayload.self, at: slot, tag: tag)
+            let retry: PlaybackRetryDisposition
+            switch storedKind {
+            case .presentedRetry: retry = .retrySameRequest
+            case .presentedChooseChannel: retry = .chooseAnotherChannel
+            case .presentedDoNotRetry: retry = .doNotRetry
+            default: preconditionFailure("invalid presented failure tag")
+            }
+            return .failed(.presented(.init(code: payload.0, userMessage: payload.1,
+                diagnosticCode: payload.2, retryDisposition: retry)))
+        case .unexpected:
+            let payload = take(UnexpectedPayload.self, at: slot, tag: tag)
+            return .failed(.unexpected(stage: payload.0, diagnostic: payload.1))
+        case .networkTimeout: tag.pointee = emptyTag; return .failed(.networkTimeout)
+        case .unsupportedVideoCodec: tag.pointee = emptyTag; return .failed(.unsupportedVideoCodec)
+        case .unsupportedAudioCodec: tag.pointee = emptyTag; return .failed(.unsupportedAudioCodec)
+        case .hardwareDecoderUnavailable: tag.pointee = emptyTag; return .failed(.hardwareDecoderUnavailable)
+        case .videoDecoderTransitionTimeout: tag.pointee = emptyTag; return .failed(.videoDecoderTransitionTimeout)
+        case .renderTextureMapping: tag.pointee = emptyTag; return .failed(.renderTextureMapping)
+        case .cancelled: tag.pointee = emptyTag; return .failed(.cancelled)
+        case .controlEventCapacityExceeded: tag.pointee = emptyTag; return .failed(.controlEventCapacityExceeded)
+        case .outputActivationRejected: tag.pointee = emptyTag; return .failed(.outputActivationRejected)
+        case .backendPublicationReplacementRejected: tag.pointee = emptyTag; return .failed(.backendPublicationReplacementRejected)
+        }
+    }
+
+    static func destroy(at slot: UnsafeMutableRawPointer, tag: UnsafeMutablePointer<UInt16>) {
+        switch kind(tag) {
+        case .empty, .stopped, .networkTimeout, .unsupportedVideoCodec, .unsupportedAudioCodec,
+             .hardwareDecoderUnavailable, .videoDecoderTransitionTimeout, .renderTextureMapping,
+             .cancelled, .controlEventCapacityExceeded, .outputActivationRejected,
+             .backendPublicationReplacementRejected: break
+        case .ready, .buffering, .recovering: slot.assumingMemoryBound(to: UInt64.self).deinitialize(count: 1)
+        case .mediaWithoutGeneration: slot.assumingMemoryBound(to: PlaybackMediaInformation?.self).deinitialize(count: 1)
+        case .mediaWithGeneration: slot.assumingMemoryBound(to: MediaPayload.self).deinitialize(count: 1)
+        case .backendFailed: slot.assumingMemoryBound(to: BackendPayload.self).deinitialize(count: 1)
+        case .unsupportedProtocol, .videoSampleBuffer, .videoRendererFailed, .audioRendererFailed, .metalCommand:
+            slot.assumingMemoryBound(to: String.self).deinitialize(count: 1)
+        case .demuxOpen, .demuxRead, .videoFormatDescription, .videoDecode, .audioFormatDescription, .audioFallbackDecode:
+            slot.assumingMemoryBound(to: Int32.self).deinitialize(count: 1)
+        case .ffmpegFailure: slot.assumingMemoryBound(to: FFmpegPayload.self).deinitialize(count: 1)
+        case .videoDecoderFailure: slot.assumingMemoryBound(to: VideoDecoderFailure.self).deinitialize(count: 1)
+        case .presentedRetry, .presentedChooseChannel, .presentedDoNotRetry:
+            slot.assumingMemoryBound(to: PresentedPayload.self).deinitialize(count: 1)
+        case .unexpected: slot.assumingMemoryBound(to: UnexpectedPayload.self).deinitialize(count: 1)
+        }
+        tag.pointee = emptyTag
+    }
+}
+
 final class PlaybackSessionEventRelay: @unchecked Sendable {
     typealias Receiver = @Sendable (PlaybackRunIdentity, PlaybackPipelineEvent) async -> Void
     static let maximumCapacity = 32
-    /// Exactly 32 initialized elements; allocator rounding remains part of the reservation.
+    /// Exactly 32 logical slots; both original allocations are charged after rounding.
     static let fixedBackingCapacity = maximumCapacity
-    static let backingSegmentCapacity = maximumCapacity / 2
 
     struct SystemAndPipelineRelayAllocationReservation {
         let monitorObject: Int
@@ -59,7 +271,8 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
             observerCaptures: 5 * (32 + 48),
             pipelineRelayObject: object(PlaybackSessionEventRelay.self),
             pipelineRelayLock: 0,
-            pipelineBacking: 2 * malloc_good_size(backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride),
+            pipelineBacking: malloc_good_size(maximumCapacity * PlaybackPipelineEventStorage.payloadStride) +
+                malloc_good_size(maximumCapacity * MemoryLayout<UInt16>.stride),
             receiverCapture: 32 + 48,
             drainRunnerObject: object(OwnedPlaybackEventDrain.self),
             // Swift Task无稳定公开allocation identity；原/新drain各保守512B。
@@ -70,11 +283,10 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
 
     private let identity: PlaybackRunIdentity
     private let receiver: Receiver
-    // Two original 16-slot typed allocations avoid the allocator's 2048-byte
-    // class for one 1792-byte request. Together they own the same 32 event slots.
-    // There is no Array header, payload box, resizing, or copied backing.
-    private let pending: UnsafeMutablePointer<PlaybackPipelineEvent>
-    private let pendingTail: UnsafeMutablePointer<PlaybackPipelineEvent>
+    // Payload values retain their native Swift ownership. Only the separate tags
+    // describe their initialized types; both original allocations belong here.
+    private let pending: UnsafeMutableRawPointer
+    private let pendingTags: UnsafeMutablePointer<UInt16>
     // Executor由Registry持有；relay只能弱借用，避免Authority→relay→Cell→Authority环。
     private weak var ownedExecutor: PlaybackControlExecutor?
     private var pendingIndex = 0
@@ -89,33 +301,42 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     init(identity: PlaybackRunIdentity, receiver: @escaping Receiver) {
         self.identity = identity
         self.receiver = receiver
-        let head = UnsafeMutablePointer<PlaybackPipelineEvent>.allocate(capacity: Self.backingSegmentCapacity)
-        let tail = UnsafeMutablePointer<PlaybackPipelineEvent>.allocate(capacity: Self.backingSegmentCapacity)
-        head.initialize(repeating: .stopped, count: Self.backingSegmentCapacity)
-        tail.initialize(repeating: .stopped, count: Self.backingSegmentCapacity)
-        pending = head
-        pendingTail = tail
-        let segmentBytes = Self.backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride
-        precondition(2 * Self.backingSegmentCapacity == Self.maximumCapacity &&
-            malloc_size(UnsafeRawPointer(pending)) >= segmentBytes &&
-            malloc_size(UnsafeRawPointer(pendingTail)) >= segmentBytes,
+        PlaybackPipelineEventStorage.validateLayout()
+        let payloadBytes = Self.maximumCapacity * PlaybackPipelineEventStorage.payloadStride
+        pending = UnsafeMutableRawPointer.allocate(byteCount: payloadBytes,
+            alignment: PlaybackPipelineEventStorage.payloadAlignment)
+        pendingTags = UnsafeMutablePointer<UInt16>.allocate(capacity: Self.maximumCapacity)
+        pendingTags.initialize(repeating: PlaybackPipelineEventStorage.emptyTag, count: Self.maximumCapacity)
+        precondition(malloc_size(pending) >= payloadBytes &&
+            malloc_size(UnsafeRawPointer(pendingTags)) >= Self.maximumCapacity * MemoryLayout<UInt16>.stride,
             "pipeline relay固定背板逻辑槽数不一致")
         PlaybackRuntimeAllocationReservations.validateSystemAndPipelineAndGlobalCaps()
     }
 
     deinit {
-        pending.deinitialize(count: Self.backingSegmentCapacity)
-        pendingTail.deinitialize(count: Self.backingSegmentCapacity)
+        clearPending()
+        pendingTags.deinitialize(count: Self.maximumCapacity)
         pending.deallocate()
-        pendingTail.deallocate()
+        pendingTags.deallocate()
     }
 
-    /// Only called while the inline relay lock is held. The original logical
-    /// ring index and overflow rule remain independent of physical segmentation.
-    private func pendingSlot(at index: Int) -> UnsafeMutablePointer<PlaybackPipelineEvent> {
+    /// Mutating access requires the relay mutex, except exclusive initialization
+    /// and deinit after the owned drain's physical join.
+    private func pendingSlot(at index: Int) -> UnsafeMutableRawPointer {
         precondition((0..<Self.maximumCapacity).contains(index))
-        if index < Self.backingSegmentCapacity { return pending.advanced(by: index) }
-        return pendingTail.advanced(by: index - Self.backingSegmentCapacity)
+        return pending.advanced(by: index * PlaybackPipelineEventStorage.payloadStride)
+    }
+
+    private func store(_ event: PlaybackPipelineEvent, at index: Int) {
+        PlaybackPipelineEventStorage.initialize(event, at: pendingSlot(at: index),
+            tag: pendingTags.advanced(by: index))
+    }
+
+    private func clearPending() {
+        for index in 0..<Self.maximumCapacity {
+            PlaybackPipelineEventStorage.destroy(at: pendingSlot(at: index),
+                tag: pendingTags.advanced(by: index))
+        }
     }
 
     func bindOwnedExecutor(_ executor: PlaybackControlExecutor) -> Bool {
@@ -140,13 +361,13 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
             if pendingCount >= Self.maximumCapacity - (isDraining ? 1 : 0) {
                 // 不可折叠溢出成为一次终态；用原槽保存，不另排队或继续接纳。
                 overflowed = true
-                for index in 0..<Self.maximumCapacity { pendingSlot(at: index).pointee = .stopped }
+                clearPending()
                 pendingIndex = 0
-                pendingSlot(at: 0).pointee = .failed(.controlEventCapacityExceeded)
+                store(.failed(.controlEventCapacityExceeded), at: 0)
                 pendingCount = 1
                 return nil
             }
-            pendingSlot(at: (pendingIndex + pendingCount) % Self.maximumCapacity).pointee = event
+            store(event, at: (pendingIndex + pendingCount) % Self.maximumCapacity)
             pendingCount += 1
             guard !isDraining else { return nil }
             isDraining = true
@@ -160,7 +381,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
         lock.withLock { _ in
             guard isActive else { return }
             isActive = false
-            for index in 0..<Self.maximumCapacity { pendingSlot(at: index).pointee = .stopped }
+            clearPending()
             pendingIndex = 0
             pendingCount = 0
         }
@@ -176,7 +397,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     private func nextEvent() -> PlaybackPipelineEvent? {
         lock.withLock { _ in
             guard isActive else {
-                for index in 0..<Self.maximumCapacity { pendingSlot(at: index).pointee = .stopped }
+                clearPending()
                 pendingIndex = 0
                 pendingCount = 0
                 isDraining = false
@@ -187,9 +408,8 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
                 isDraining = false
                 return nil
             }
-            let slot = pendingSlot(at: pendingIndex)
-            let event = slot.pointee
-            slot.pointee = .stopped
+            let event = PlaybackPipelineEventStorage.move(at: pendingSlot(at: pendingIndex),
+                tag: pendingTags.advanced(by: pendingIndex))
             pendingIndex = (pendingIndex + 1) % Self.maximumCapacity
             pendingCount -= 1
             return event
@@ -481,8 +701,8 @@ enum PlaybackRuntimeAllocationReservations {
                 tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride), \
                 presentedPayloadStride=\(MemoryLayout<(String, String, String?)>.stride), \
                 presentedPayloadAlignment=\(MemoryLayout<(String, String, String?)>.alignment), \
-                mediaPayloadStride=\(MemoryLayout<(PlaybackMediaInformation?, UInt64)>.stride), \
-                mediaPayloadAlignment=\(MemoryLayout<(PlaybackMediaInformation?, UInt64)>.alignment), \
+                mediaPayloadStride=\(MemoryLayout<(PlaybackMediaInformation?, MediaGeneration)>.stride), \
+                mediaPayloadAlignment=\(MemoryLayout<(PlaybackMediaInformation?, MediaGeneration)>.alignment), \
                 videoFailurePayloadStride=\(MemoryLayout<VideoDecoderFailure>.stride), \
                 videoFailurePayloadAlignment=\(MemoryLayout<VideoDecoderFailure>.alignment), \
                 unexpectedPayloadStride=\(MemoryLayout<(String, ErrorDiagnosticSnapshot)>.stride), \
@@ -493,7 +713,8 @@ enum PlaybackRuntimeAllocationReservations {
                 ffmpegPayloadAlignment=\(MemoryLayout<(FFmpegFailureKind, FFmpegFailureStage, Int32)>.alignment), \
                 scalarPayloadStride=\(MemoryLayout<UInt64>.stride), \
                 scalarPayloadAlignment=\(MemoryLayout<UInt64>.alignment), \
-                segmentRequestClass=\(malloc_good_size(PlaybackSessionEventRelay.backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride)), \
+                payloadRequestClass=\(malloc_good_size(PlaybackSessionEventRelay.maximumCapacity * PlaybackPipelineEventStorage.payloadStride)), \
+                tagRequestClass=\(malloc_good_size(PlaybackSessionEventRelay.maximumCapacity * MemoryLayout<UInt16>.stride)), \
                 typedRequestClass=\(malloc_good_size(32 * MemoryLayout<PlaybackPipelineEvent>.stride)), \
                 arrayRequestClass=\(malloc_good_size(32 + 32 * MemoryLayout<PlaybackPipelineEvent>.stride))
                 """ + "\n"
