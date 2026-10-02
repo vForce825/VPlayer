@@ -11,6 +11,95 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class LoopbackHTTPServerTests: XCTestCase {
+    func testCurrentFinalProjectionRequiresCommittedFinalAndExactCompletedBodies() async throws {
+        let fixture = try await Task20HTTPFixture.start(terminalLogicalSequence: 5)
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let binding = try XCTUnwrap(fixture.task19.tracks[2]?.binding)
+        XCTAssertNil(store.currentFinalPublication(matching: binding))
+        XCTAssertEqual(try fixture.task19.publisher.publish(
+            ticket: fixture.task19.publisher.ticket, now: Task19.second,
+            naturalEnd: true), .published)
+        let snapshot = try XCTUnwrap(fixture.task19.publisher.visible?.media[2])
+        let terminal = try XCTUnwrap(snapshot.resources.last)
+        let initialization = try XCTUnwrap(snapshot.initializationResources.first)
+        XCTAssertNil(store.currentFinalPublication(matching: binding),
+            "A committed final playlist alone cannot prove completed media")
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: terminal)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: terminal)?.isComplete == true
+        })
+        XCTAssertNil(store.currentFinalPublication(matching: binding),
+            "The terminal body cannot replace initialization completion")
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: initialization)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.currentFinalPublication(matching: binding) != nil
+        })
+        let final = try XCTUnwrap(store.currentFinalPublication(matching: binding))
+        XCTAssertEqual(final.effectivePlaybackHorizon, snapshot.effectivePlaybackHorizon)
+        XCTAssertEqual(final.effectivePlaybackHorizon,
+                       fixture.task19.publisher.visible?.media[1]?.effectivePlaybackHorizon,
+                       "A/V endpoint metadata preserves the committed common video tail")
+        XCTAssertEqual(final.publicationSequence, snapshot.version)
+        XCTAssertEqual(final.terminalKey, terminal)
+        XCTAssertEqual(final.initializationKey, initialization)
+        XCTAssertTrue(final.initializationKey.authentication.isEmpty)
+        XCTAssertTrue(final.terminalKey.authentication.isEmpty)
+        XCTAssertThrowsError(try store.resourceURI(final.terminalKey),
+                             "Escaping final metadata must not retain routable authentication")
+        XCTAssertEqual(MemoryLayout.size(ofValue: final.initializationDigest), 32)
+        XCTAssertEqual(MemoryLayout.size(ofValue: final.terminalDigest), 32)
+        XCTAssertFalse(final.isAudioOnly)
+        XCTAssertTrue(store.validatesCurrentFinalPublication(final))
+
+        let wrongEpoch = Task19.binding(id: 2, epoch: binding.mediaEpoch.rawValue + 1)
+        XCTAssertNil(store.currentFinalPublication(matching: wrongEpoch))
+        let wrongRendition = FMP4WriterBinding(outputLifecycleEpoch: binding.outputLifecycleEpoch,
+            itemGeneration: binding.itemGeneration, mediaEpoch: binding.mediaEpoch,
+            publicationParticipantID: binding.publicationParticipantID,
+            renditionIdentity: .init(rawValue: 999), writerIdentity: binding.writerIdentity)
+        XCTAssertNil(store.currentFinalPublication(matching: wrongRendition))
+        let other = SealedMediaStore(token: Task19.token, itemGeneration: 19)
+        XCTAssertFalse(other.validatesCurrentFinalPublication(final))
+
+        try await fixture.task19.beginEpoch(binding.mediaEpoch.rawValue + 1)
+        XCTAssertNil(store.currentFinalPublication(matching: binding),
+            "An unbridged successor epoch invalidates the old final projection")
+        XCTAssertFalse(store.validatesCurrentFinalPublication(final))
+    }
+
+    func testCompressedFinalProjectionUsesCommittedCommonTailWithoutAACAuthority() async throws {
+        for codec in [HLSAudioCodec.ac3, .eac3] {
+            let fixture = try await Task21CompressedLifecycleHTTPFixture.start(codec: codec,
+                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 73_120))
+            defer { fixture.shutdown() }
+            do {
+                let publisher = fixture.publication.publisher
+                let binding = try XCTUnwrap(publisher.ticket.participantVector.first?.binding)
+                XCTAssertNil(fixture.publication.store.currentFinalPublication(matching: binding))
+                XCTAssertEqual(try publisher.publish(ticket: publisher.ticket,
+                    now: Task19.second, naturalEnd: true), .published)
+                XCTAssertTrue(try XCTUnwrap(publisher.visible?.media[2]).isFinal)
+                XCTAssertTrue(try XCTUnwrap(publisher.visible).aacTerminalBindings.isEmpty)
+                try await fixture.serveCompletedPublication()
+                XCTAssertTrue(waitUntil(timeout: 2) {
+                    fixture.publication.store.currentFinalPublication(matching: binding) != nil
+                })
+                let final = try XCTUnwrap(fixture.publication.store.currentFinalPublication(matching: binding))
+                XCTAssertTrue(final.isAudioOnly)
+                XCTAssertEqual(final.effectivePlaybackHorizon, Task19.time(6))
+                XCTAssertEqual(final.effectivePlaybackHorizon,
+                               publisher.visible?.media[2]?.effectivePlaybackHorizon)
+            } catch {
+                await fixture.shutdownWriter()
+                throw error
+            }
+            await fixture.shutdownWriter()
+        }
+    }
+
     func testPausedWindowRequiresItsOwnFrozenInitializationCompletion() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
@@ -5594,14 +5683,16 @@ private final class Task20HTTPFixture: @unchecked Sendable {
                       logger: @escaping @Sendable (String) -> Void = { _ in },
                       responseFailure: @escaping @Sendable (HLSResourceKey, CompletedMediaEvidenceError) -> Void = { _, _ in },
                       testing: LoopbackHTTPTestingConfiguration? = nil,
-                      audioCount: Int = 1) async throws -> Task20HTTPFixture {
+                      audioCount: Int = 1,
+                      terminalLogicalSequence: UInt64? = nil) async throws -> Task20HTTPFixture {
         let box = LockedHarness()
         let factory = testing.map { LoopbackHTTPSessionFactory(testing: $0) }
             ?? LoopbackHTTPSessionFactory()
         let server = try await factory.startPreparingAsynchronously(itemGeneration: 19, now: now,
             logger: logger, responseFailure: responseFailure) { token in
             let harness = try await Task19Harness(
-                loopbackSession: token, audioCount: audioCount)
+                loopbackSession: token, audioCount: audioCount,
+                terminalLogicalSequence: terminalLogicalSequence)
             try await harness.initial()
             box.value = harness
             var declaration = try Task19.declaration(audioCount: audioCount)

@@ -1,4 +1,4 @@
-name: Owned pause cursor and physical callback tail validation
+name: Committed finality and natural EOS validation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-cursor-tail-${{ github.ref }}
+  group: macos-ci-finality-eos-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -65,121 +65,40 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify cursor, credits and unchanged capacity contracts
+      - name: Verify final publication and snapshot capacity contracts
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
-          set -o pipefail
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/CursorCapacity.xcresult" \
-            -only-testing:VPlayerTests/Task9RuntimeCapacityTests \
-            -only-testing:VPlayerTests/HLSCapacityTests \
-            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorSystemReadRejectsInvalidTimeAndStaleNativeItemWithoutNewBudget \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorContractRejectsUnsettledConnectionAndNonpausedState \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorCapturesBeforeDisconnectAndRepeatedStopPreservesOriginalBinding \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorInvalidOrUnavailableReadDoesNotBlockPhysicalStopOrTeardown \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorCanceledCallerStillJoinsTheOriginalSuccessfulPhysicalStop \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorFailedOriginalStopCannotPublishOrRetryItsCapturedTime \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorCanceledPredecessorReadCannotCommitAgainstSuccessorItem \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorInvalidationDuringDisconnectCannotPublishTheLocalSample \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorFailureInvalidatesAcceptedBindingBeforeRetirement \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorPriorValidBindingCannotSurviveNewUnavailableCaptureOrReplay \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorAcceptedResumeRetiresPredecessorAndLateStopCannotOverwriteSuccessor \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2CoordinatorFixedCapacityRejectsBeforeInstallationAndOwnsOneWaiterWithoutTimer
-      - name: Report scoped CursorCapacity failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CursorCapacity.xcresult"
-
-      - name: Verify startup store and full loopback coverage contracts
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          set -o pipefail
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/CursorStore.xcresult" \
+            -resultBundlePath "$RUNNER_TEMP/Finality.xcresult" \
+            -only-testing:VPlayerTests/HLSPublisherTests \
             -only-testing:VPlayerTests/HLSResourceStoreTests \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests \
-            -only-testing:VPlayerTests/VPlayerAppStartupTests \
-            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests
-      - name: Report scoped CursorStore failures
+            -only-testing:VPlayerTests/HLSCapacityTests \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testAACContinuousBranchExceeds384SignedEmissionsAndFinalCoordinatorConsumesAutomaticHTTPSeal
+      - name: Report scoped Finality failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CursorStore.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/Finality.xcresult"
 
-      - name: Verify native callback tails in a fresh invocation
+      - name: Verify separate native endpoint and paused relay ordering
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
-          set -o pipefail
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeTails.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27NativePreparationCallbackTailsRetireBeforeNextOperation 2>&1 | tee "$RUNNER_TEMP/native-tails.log"
-      - name: Report scoped NativeTails failures
+            -resultBundlePath "$RUNNER_TEMP/EOSOrdering.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesLaterPausedRelayAndRejectsChangedSecondRead \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeUnexpectedPauseWithoutEndpointNotificationStillRetires \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageOwnedEOSDeadlineSharesTimerAndStopRevokesPendingDelivery \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageSystemEOSPublicationAndStopRaceNeverPublishAfterClose \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch
+      - name: Report scoped EOSOrdering failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeTails.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/EOSOrdering.xcresult"
 
-      - name: Require actual native callback-tail execution without skips
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          python3 - "$RUNNER_TEMP/native-tails.log" <<'PY'
-          import pathlib, re, sys
-          text = pathlib.Path(sys.argv[1]).read_text()
-          pattern = r"Test Case '-\[VPlayerTests\.AVPlayerItemCoordinatorTests testTVOS27NativePreparationCallbackTailsRetireBeforeNextOperation\]' (passed|failed|skipped|exceeded execution)"
-          states = re.findall(pattern, text)
-          if states != ["passed"] or not re.search(r"Executed 1 test, with 0 failures", text):
-              raise SystemExit(f"NATIVE_TAIL_GATE_FAILED outcomes={states}")
-          print("NATIVE_TAIL_GATE executed=1 passed=1 skipped=0")
-          PY
-
-      - name: Diagnose authenticated native direct preparation body completion
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          set -o pipefail
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeDirect.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero
-      - name: Report scoped NativeDirect failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeDirect.xcresult"
-
-      - name: Validate cursor, metadata and credits under Address Sanitizer
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild -help > "$RUNNER_TEMP/xcodebuild-help.txt" 2>&1
-          grep -q -- '-enableAddressSanitizer' "$RUNNER_TEMP/xcodebuild-help.txt"
-          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath "$RUNNER_TEMP/CursorASan" -enableAddressSanitizer YES \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/CursorASan.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests \
-            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorSystemReadRejectsInvalidTimeAndStaleNativeItemWithoutNewBudget \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorContractRejectsUnsettledConnectionAndNonpausedState \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorCapturesBeforeDisconnectAndRepeatedStopPreservesOriginalBinding \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorInvalidOrUnavailableReadDoesNotBlockPhysicalStopOrTeardown \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorCanceledCallerStillJoinsTheOriginalSuccessfulPhysicalStop \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorFailedOriginalStopCannotPublishOrRetryItsCapturedTime \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorCanceledPredecessorReadCannotCommitAgainstSuccessorItem \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorInvalidationDuringDisconnectCannotPublishTheLocalSample \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorFailureInvalidatesAcceptedBindingBeforeRetirement \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorPriorValidBindingCannotSurviveNewUnavailableCaptureOrReplay \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorAcceptedResumeRetiresPredecessorAndLateStopCannotOverwriteSuccessor
-      - name: Report scoped cursor Address Sanitizer failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CursorASan.xcresult"

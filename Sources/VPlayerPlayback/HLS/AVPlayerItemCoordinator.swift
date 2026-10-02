@@ -110,6 +110,8 @@ protocol AVPlayerDriving: AnyObject {
         _ capability: AVPlayerNaturalEndTerminalCapability,
         item: AVPlayerItemInstanceIdentity
     ) -> AVPlayerNaturalEndTerminalResult?
+    func hasPendingNaturalEndVerification(item: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool
     func replaceCurrentItemWithNil(item: AVPlayerItemInstanceIdentity)
     func removeObservers(item: AVPlayerItemInstanceIdentity)
     func preparationFenceReached(_ fence: AVPlayerPreparationFence,
@@ -118,6 +120,8 @@ protocol AVPlayerDriving: AnyObject {
 }
 
 extension AVPlayerDriving {
+    func hasPendingNaturalEndVerification(item: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool { false }
     var activeWaiterCount: Int { 0 }
     var fixedTimerCount: Int { 0 }
     var preferredForwardBufferDuration: TimeInterval { 3 }
@@ -1800,6 +1804,13 @@ final class AVPlayerItemCoordinator {
             publishedPlayingCount = next
             state.phase = .playing
         } else if status == .paused, authorizationArmed {
+            // A matching native endpoint notification may already own its
+            // bounded second direct read. Do not revoke that exact activation
+            // merely because its later paused KVO arrives in another batch.
+            // Every other pause still enters the existing replacement path.
+            if driver.hasPendingNaturalEndVerification(item: item, activation: activation) {
+                return
+            }
             // Registry 发起的暂停会先撤销 authorization，再调用 driver.pause；能走到
             // 这里的 paused 因而不是用户暂停。直播上游在 prepare 之后才 EOF 时，
             // AVPlayer 不一定有预先约束的终点能力，但会可靠地从 playing 转为

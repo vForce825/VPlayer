@@ -628,7 +628,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                         logicalSequences: segments.map { $0.receipt.logicalSequence }, resources: segments.map(\.key),
                         initializationResources: Array(Set(segments.map(\.initializationKey))),
                         bandwidth: try HLSBandwidth.measure(samples(segments)),
-                        effectivePlaybackHorizon: effectivePlaybackHorizons[id]!)
+                        effectivePlaybackHorizon: effectivePlaybackHorizons[id]!,
+                        isFinal: writesEndList)
                 }
                 let master = sequence == 0 ? try HLSPlaylistSerializer.master(declaration) : nil
                 let authority = CommitAuthority(publisher: self, ticket: ticket, reservation: reservation,

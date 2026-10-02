@@ -1223,6 +1223,25 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         DispatchQueue.main.async { [weak self] in self?.completeNaturalEndRead(identity: identity) }
     }
 
+    func hasPendingNaturalEndVerification(item identity: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              player.rate == 0, player.timeControlStatus == .paused,
+              endpointObservationIdentity != nil, endpointStabilityDeadline != nil,
+              !naturalEndTerminalIssued, naturalEndTerminalResult == nil,
+              let observation = naturalEndObservation, observation.item == identity,
+              observation.stableCurrentTime == nil,
+              observation.constrainedEndpoint == observation.expectedEndpoint,
+              let constraint = try? ExactMediaTime(item.forwardPlaybackEndTime),
+              constraint == observation.expectedEndpoint,
+              naturalEndAuthority?.activation == activation,
+              naturalEndAuthority?.revalidateCurrentAuthority() == true else { return false }
+        // Only the private matching notification installs the first observation
+        // and its original deadline. Completion, cancellation and owned pause
+        // clear that deadline; this query creates no grace period or EOS proof.
+        return true
+    }
+
     private func completeNaturalEndRead(identity: UUID) {
         guard endpointObservationIdentity == identity, endpointStabilityDeadline != nil else { return }
         defer { cancelNaturalEndDeadline() }

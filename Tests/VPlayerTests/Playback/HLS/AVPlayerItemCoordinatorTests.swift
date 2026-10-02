@@ -3992,6 +3992,19 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testNativeEndpointFirstReadSurvivesLaterPausedRelayAndRejectsChangedSecondRead()
+        async throws {
+        try await withFinalEOSFixture { fixture in
+            try await fixture.verifyEndpointReadAcrossLaterPausedRelay()
+        }
+    }
+
+    func testNativeUnexpectedPauseWithoutEndpointNotificationStillRetires() async throws {
+        try await withFinalEOSFixture { fixture in
+            try await fixture.verifyUnexpectedPauseWithoutEndpointNotification()
+        }
+    }
+
     func testFinalAlreadyCancelledReadyWaitCannotRetainObservationOrDeadlineSlot() async throws {
         let scheduler = FinalManualAVPlayerDeadlineScheduler()
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer(), deadlineScheduler: scheduler)
@@ -7625,6 +7638,69 @@ private final class Task21RealIntegrationFixture {
         XCTAssertEqual(driver.fixedTimerCount, 0)
         XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
         inspectPreparationStorage(stage: "closed-interval")
+    }
+
+    func verifyEndpointReadAcrossLaterPausedRelay() async throws {
+        try await activateForFinalEOSProbe()
+        guard case .armed(let activation) = backend.activationResult else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        let physical = try XCTUnwrap(player.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
+                                        object: physical)
+        try await waitForNaturalEndDeadline()
+        let firstRead = try XCTUnwrap(driver.naturalEndObservation).firstCurrentTime
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
+        XCTAssertNil(driver.naturalEndTerminalResult)
+        // The matching endpoint notification has already admitted its first
+        // direct read. Deliver paused in a separate native KVO/main-queue batch.
+        player.pause()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while coordinator.lastPublishedTimeControlStatus != .paused,
+              !hasRegisteredSuspend, ContinuousClock.now < deadline {
+            await Self.awaitMainQueueTurn()
+        }
+        XCTAssertEqual(coordinator.lastPublishedTimeControlStatus, .paused)
+        XCTAssertFalse(hasRegisteredSuspend,
+                       "An admitted endpoint read must retain its original bounded second read")
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
+        guard !hasRegisteredSuspend, deadlineScheduler.activeSlotCount == 1 else { return }
+        XCTAssertTrue(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(
+            item: Task21Fixtures.staleGenerationItem(from: item), activation: activation))
+        let staleActivation = ActivationEpoch(outputLifecycleEpoch: activation.outputLifecycleEpoch,
+            audioAdmissionFenceRevision: activation.audioAdmissionFenceRevision,
+            activationNonce: activation.activationNonce + 1)
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: staleActivation))
+        let changedTime = try firstRead.adding(Task21Fixtures.time(1))
+        XCTAssertLessThan(CMTimeCompare(changedTime.cmTime, try endpointItemTime.cmTime), 0)
+        let secondRead = try await seekAndAwaitCompletion(to: changedTime, expectedItem: physical)
+        XCTAssertNotEqual(secondRead, firstRead)
+        XCTAssertTrue(deadlineScheduler.fireNext())
+        let terminal = try await naturalEndTerminalResult()
+        XCTAssertEqual(terminal, .failure(.unstableDirectRead),
+                       "Deferring paused cannot turn a changed native second read into EOS success")
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        let retired = await waitForRegisteredSuspend()
+        XCTAssertTrue(retired)
+        XCTAssertEqual(backendRetireCount, 1)
+    }
+
+    func verifyUnexpectedPauseWithoutEndpointNotification() async throws {
+        try await activateForFinalEOSProbe()
+        guard case .armed(let activation) = backend.activationResult else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        XCTAssertNil(driver.naturalEndObservation)
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
+        player.pause()
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        let retired = await waitForRegisteredSuspend()
+        XCTAssertTrue(retired,
+                      "A finite endpoint alone must not exempt an unexpected native pause")
+        XCTAssertEqual(backendRetireCount, 1)
+        XCTAssertNil(driver.naturalEndObservation)
+        XCTAssertNil(driver.naturalEndTerminalResult)
     }
 
     private func inspectPreparationStorage(stage: String) {

@@ -182,9 +182,60 @@ struct HLSPlaylistSnapshot: Sendable {
     /// publisher 在同一 publication CAS 中冻结的有效播放终点。AAC 物理封装
     /// 可以结束于 Q，但 selection/EOS 只能使用去除 trailing trim 后的 N。
     let effectivePlaybackHorizon: ExactMediaTime?
+    /// 来自同一 publisher EOF 决定，必须随 horizon 一起通过 store commit CAS。
+    /// 这只是 publication 元数据；不能替代各参与者的 completed/decode coverage。
+    let isFinal: Bool
     var raw: Data { representation.raw }
     var gzip: Data { representation.gzip }
     var text: String { representation.text }
+}
+
+/// store 当前已提交终态的只读元数据，不是缩短播放覆盖区间的能力。
+/// 不持有新 owner、resource lease 或历史集合；使用方仍须在原 store domain
+/// 事务中复验 freshness，并核准所有必需 participant 的冻结完整覆盖。
+struct HLSCurrentFinalPublication: Sendable, Equatable {
+    fileprivate let storeIdentity: UUID
+    fileprivate let snapshotIdentity: UUID
+    let publicationSequence: UInt64
+    let binding: FMP4WriterBinding
+    let mediaType: FinalFMP4MediaType
+    let isAudioOnly: Bool
+    let effectivePlaybackHorizon: ExactMediaTime
+    /// 只有标量 lookup identity，authentication 始终为空；不能用于生成服务 URI。
+    let initializationKey: HLSResourceKey
+    let initializationBackingIdentity: SealedMediaBackingIdentity
+    let initializationDigest: FMP4Digest
+    let initializationByteCount: Int
+    let terminalKey: HLSResourceKey
+    let terminalBackingIdentity: SealedMediaBackingIdentity
+    let terminalDigest: FMP4Digest
+    let terminalByteCount: Int
+
+    fileprivate init(storeIdentity: UUID, snapshot: HLSPlaylistSnapshot,
+                     binding: FMP4WriterBinding, mediaType: FinalFMP4MediaType,
+                     isAudioOnly: Bool, effectivePlaybackHorizon: ExactMediaTime,
+                     initializationKey: HLSResourceKey, initialization: SealedMediaObject,
+                     terminalKey: HLSResourceKey, terminal: SealedMediaObject) throws {
+        self.storeIdentity = storeIdentity
+        snapshotIdentity = snapshot.identity
+        publicationSequence = snapshot.version
+        self.binding = binding
+        self.mediaType = mediaType
+        self.isAudioOnly = isAudioOnly
+        self.effectivePlaybackHorizon = effectivePlaybackHorizon
+        self.initializationKey = HLSResourceKey(itemGeneration: initializationKey.itemGeneration,
+            mediaEpoch: initializationKey.mediaEpoch, participantID: initializationKey.participantID,
+            logicalSequence: initializationKey.logicalSequence, kind: initializationKey.kind)
+        initializationBackingIdentity = initialization.backing.identity
+        initializationDigest = try FMP4Digest(rawDigest: initialization.digest)
+        initializationByteCount = initialization.byteRange.length
+        self.terminalKey = HLSResourceKey(itemGeneration: terminalKey.itemGeneration,
+            mediaEpoch: terminalKey.mediaEpoch, participantID: terminalKey.participantID,
+            logicalSequence: terminalKey.logicalSequence, kind: terminalKey.kind)
+        terminalBackingIdentity = terminal.backing.identity
+        terminalDigest = try FMP4Digest(rawDigest: terminal.digest)
+        terminalByteCount = terminal.byteRange.length
+    }
 }
 
 final class HLSMediaResponseLease: @unchecked Sendable {
@@ -688,6 +739,50 @@ final class SealedMediaStore: @unchecked Sendable {
         guard authentic(key) else { return nil }
         return resources[key]?.evidence.snapshot
     } }
+
+    func currentFinalPublication(matching binding: FMP4WriterBinding)
+        -> HLSCurrentFinalPublication? {
+        domain.sync { currentFinalPublicationLocked(matching: binding) }
+    }
+
+    /// 不执行外部回调；调用方在同一 domain 内把 freshness 与覆盖验证组合。
+    func validatesCurrentFinalPublication(_ value: HLSCurrentFinalPublication) -> Bool {
+        domain.sync {
+            value.storeIdentity == identity
+                && currentFinalPublicationLocked(matching: value.binding) == value
+        }
+    }
+
+    private func currentFinalPublicationLocked(matching binding: FMP4WriterBinding)
+        -> HLSCurrentFinalPublication? {
+        let id = binding.publicationParticipantID.rawValue
+        guard !closed, !retiredParticipants.contains(id),
+              let ticket = expectedTicket, ticket.publicationSequence == currentVersion,
+              let participant = ticket.participantVector.first(where: { $0.participantID == id }),
+              participant.binding == binding,
+              participant.expectedPreviousSnapshotVersion == currentVersion,
+              let snapshotID = currentSnapshots[id], let entry = snapshots[snapshotID],
+              entry.current, entry.snapshot.version == currentVersion, entry.snapshot.isFinal,
+              let horizon = entry.snapshot.effectivePlaybackHorizon,
+              let terminalKey = entry.snapshot.resources.last, authentic(terminalKey),
+              terminalKey.logicalSequence == entry.snapshot.logicalSequences.last,
+              let terminal = resources[terminalKey], terminal.visible,
+              terminal.object.binding == binding, terminal.object.kind == .media,
+              terminal.evidence.isComplete,
+              let rawInitializationKey = terminal.initializationKey,
+              let initializationKey = entry.snapshot.initializationResources.first(where: {
+                  $0 == rawInitializationKey && authentic($0)
+              }),
+              let initialization = resources[initializationKey],
+              initialization.object.kind == .initialization,
+              initialization.evidence.isComplete else { return nil }
+        return try? HLSCurrentFinalPublication(storeIdentity: identity, snapshot: entry.snapshot,
+            binding: binding, mediaType: terminal.proof.mediaType,
+            isAudioOnly: participant.declaration.video == nil,
+            effectivePlaybackHorizon: horizon, initializationKey: initializationKey,
+            initialization: initialization.object, terminalKey: terminalKey,
+            terminal: terminal.object)
+    }
 
     func aacPublicationAdmission(for key: HLSResourceKey)
         -> AACPublicationLeafAdmission? {
@@ -1864,7 +1959,8 @@ final class SealedMediaStore: @unchecked Sendable {
             if let master {
                 let snapshot = HLSPlaylistSnapshot(identity: UUID(), version: 0, representation: master,
                     logicalSequences: [], resources: [], initializationResources: [],
-                    bandwidth: .init(peak: 0, average: 0), effectivePlaybackHorizon: nil)
+                    bandwidth: .init(peak: 0, average: 0), effectivePlaybackHorizon: nil,
+                    isFinal: false)
                 masterIdentity = snapshot.identity
                 snapshots[snapshot.identity] = SnapshotEntry(snapshot: snapshot, current: true)
             }

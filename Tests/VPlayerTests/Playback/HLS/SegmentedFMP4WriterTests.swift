@@ -4363,6 +4363,16 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             }
         }
         try await serveNewMedia(try XCTUnwrap(harness.publisher.visible))
+        let originalSnapshot = try XCTUnwrap(harness.publisher.visible)
+        let originalMapping = try XCTUnwrap(originalSnapshot.aacTimelineMappings[2])
+        let originalTerminalBinding = try XCTUnwrap(originalSnapshot.aacTerminalBindings[2])
+        let originalKey = try XCTUnwrap(originalSnapshot.media[2]?.resources.last)
+        let originalAdmission = try XCTUnwrap(harness.store.aacPublicationAdmission(for: originalKey))
+        let originalPrefix = try XCTUnwrap(harness.renditionBinding.issuePrefixMapping(
+            publicationSequence: originalSnapshot.publicationSequence,
+            mapping: originalMapping, completedLeaf: originalAdmission.leaf,
+            admission: originalAdmission))
+        XCTAssertNil(harness.store.currentFinalPublication(matching: originalMapping.binding))
         let final = try await harness.finishStream(totalPCMInputs: 6_200) {
             try await serveNewMedia($0)
         }
@@ -4418,6 +4428,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                               relativeTo: server.baseURL)?.absoluteURL)
         })
         let terminalURL = try XCTUnwrap(mediaURLs.last)
+        XCTAssertNil(harness.store.currentFinalPublication(matching: renditionFinal.binding),
+                     "The final horizon cannot substitute for the unsent terminal body")
         let acceptedBeforePreparation = server.acceptedGETSnapshot()
         // 读取足够的历史媒体就可能签发准备就绪边沿，必须先安装监听。
         let completedPublication = expectation(description: "当前窗口的真实 HTTP 准备证据已就绪")
@@ -4475,6 +4487,27 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertTrue(terminalFirst.observePublication(publication))
         XCTAssertFalse(terminalFirst.observePublication(publication),
                        "同一组真实receipt只能取得一次finalization线性化点")
+        let authority = try XCTUnwrap(renditionBinding.endpointAuthority)
+        let currentFinal = try XCTUnwrap(harness.store.currentFinalPublication(
+            matching: authority.receipt.binding))
+        XCTAssertTrue(currentFinal.isAudioOnly)
+        XCTAssertEqual(currentFinal.effectivePlaybackHorizon, authority.receipt.lastEffectiveEnd)
+        let usageBeforePreflight = harness.store.usage
+        for _ in 0..<3 {
+            let resumedReceipt = try AVPlayerAACEndpointValidator.preflight(
+                authority: authority, currentFinalPublication: currentFinal,
+                store: harness.store, originalPrefix: originalPrefix,
+                originalTerminalBinding: originalTerminalBinding)
+            XCTAssertEqual(resumedReceipt, authority.receipt)
+        }
+        XCTAssertEqual(harness.store.usage.resourceCount, usageBeforePreflight.resourceCount)
+        XCTAssertEqual(harness.store.usage.snapshotCount, usageBeforePreflight.snapshotCount)
+        XCTAssertThrowsError(try AVPlayerAACEndpointValidator.preflight(
+            authority: authority, currentFinalPublication: currentFinal,
+            store: harness.store, originalPrefix: originalPrefix,
+            originalTerminalBinding: authority.terminalBinding),
+            "A later physical writer slot cannot replace the original prefix anchor")
+        XCTAssertEqual(originalPrefix.mapping, originalMapping)
         let finalPreparation = try await task22PrepareFinalThroughCoordinator(
             request: preparation.request,
             evidenceSource: evidenceSource,
@@ -4487,7 +4520,10 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             publicationSequence: snapshot.publicationSequence))
         let completed = try XCTUnwrap(
             evidenceSource.retainedCompletedPublicationEvidence())
-        let authority = try XCTUnwrap(renditionBinding.endpointAuthority)
+        XCTAssertEqual(try AVPlayerAACEndpointValidator.preflight(
+            authority: authority, currentFinalPublication: currentFinal,
+            store: harness.store, originalPrefix: originalPrefix,
+            originalTerminalBinding: originalTerminalBinding), authority.receipt)
         let verified = try AVPlayerAACEndpointValidator.preflight(
             authority: authority, completedPublication: completed)
         XCTAssertEqual(verified.lastEffectiveEnd, renditionFinal.lastEffectiveEnd)
@@ -7018,6 +7054,7 @@ private final class Task22LongRenditionHarness: @unchecked Sendable {
     private var pcmInputCount = 0
 
     var publisher: HLSPublicationCoordinator { sink.publisher! }
+    var store: SealedMediaStore { sink.store! }
     var declaration: HLSItemDeclaration { sink.declaration! }
     var itemIdentity: AVPlayerItemInstanceIdentity {
         .init(outputLifecycleEpoch: initialBinding.outputLifecycleEpoch,

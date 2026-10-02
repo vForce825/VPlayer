@@ -956,10 +956,21 @@ final class HLSPublisherTests: XCTestCase {
         for withSegment in [true, false] {
             let h = try await Task19Harness(terminalLogicalSequence: withSegment ? 6 : 5)
             try await h.initial()
+            XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { !$0.isFinal })
             if withSegment { try await h.offerBoth(count: 1) }
             XCTAssertNotNil(h.tracks[2]?.endpointAuthority)
             XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 999_999_999, naturalEnd: true), .waiting)
+            XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { !$0.isFinal },
+                "Knowing EOF before the publication gate does not commit finality")
             XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 1_000_000_000, naturalEnd: true), .published)
+            XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { $0.isFinal })
+            for id in h.tracks.keys {
+                let lease = try XCTUnwrap(h.store.acquireSnapshot(participantID: id, now: Task19.second))
+                XCTAssertEqual(lease.snapshot?.isFinal, true)
+                XCTAssertEqual(lease.snapshot?.effectivePlaybackHorizon,
+                               h.publisher.visible?.media[id]?.effectivePlaybackHorizon)
+                h.store.release(lease, completedAt: nil, now: Task19.second)
+            }
             XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { $0.text.hasSuffix("#EXT-X-ENDLIST\n") })
             XCTAssertThrowsError(try h.publisher.publish(ticket: h.publisher.ticket, now: 2_000_000_000, naturalEnd: true))
         }
@@ -968,6 +979,23 @@ final class HLSPublisherTests: XCTestCase {
         let bytes = h.publisher.visible!.media[1]!.raw
         h.publisher.close()
         XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("ENDLIST"))
+    }
+
+    func testStaleFinalPublicationDoesNotPromoteCommittedPrefix() async throws {
+        let h = try await Task19Harness(terminalLogicalSequence: 7)
+        try await h.initial()
+        let prefix = try XCTUnwrap(h.publisher.visible)
+        let stale = h.publisher.ticket
+        try await h.offerBoth(count: 1)
+        XCTAssertEqual(try h.publisher.publish(ticket: stale, now: Task19.second), .published)
+        try await h.offerBoth(count: 1, now: Task19.second)
+        XCTAssertThrowsError(try h.publisher.publish(ticket: stale,
+            now: 2 * Task19.second, naturalEnd: true))
+        XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { !$0.isFinal })
+        XCTAssertGreaterThan(h.publisher.visible!.publicationSequence, prefix.publicationSequence)
+        for track in h.tracks.values {
+            XCTAssertNil(h.store.currentFinalPublication(matching: track.binding))
+        }
     }
 
     func testOfflinePublicationBudgetKeepsTicketValidAfterRealtimeDeadline() async throws {
