@@ -76,13 +76,16 @@ final class LibraryChangeSignal {
         var iterator = stream.makeAsyncIterator()
         // Consume the initial value before returning to preparation; a burst of
         // saved changes cannot overwrite an as-yet unread comparison baseline.
-        guard let baseline = await iterator.next(), committedObservationID == id else { return }
+        guard let baseline = await iterator.next(isolation: MainActor.shared),
+              committedObservationID == id else { return }
         committedObservationTask?.cancel()
         committedObservationStore = store
         lastCommittedSnapshot = baseline
-        committedObservationTask = Task { @MainActor [weak self] in
+        // Hand the iterator to its sole remaining consumer after the baseline
+        // read completes. Keep every mutation on MainActor, including next().
+        committedObservationTask = Task { @MainActor [weak self, iterator] in
             var iterator = iterator
-            while let snapshot = await iterator.next() {
+            while let snapshot = await iterator.next(isolation: MainActor.shared) {
                 guard !Task.isCancelled, self?.committedObservationID == id else { return }
                 self?.consumeCommittedSnapshot(snapshot)
             }

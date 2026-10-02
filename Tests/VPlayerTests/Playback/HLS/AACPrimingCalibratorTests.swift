@@ -829,18 +829,53 @@ final class AACPrimingCalibratorTests: XCTestCase {
         XCTAssertThrowsError(try receipt.encoder(for: receipt.encoders[0].identity))
     }
 
+    func testStreamingFailureSnapshotPrecedesNativeAndTemporaryCleanup() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        harness.observer.beginStreamDiagnostics(encoder: encoder)
+        do {
+            _ = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 8_192) {
+                throw NSError(domain: "AAC.BeforeFileCleanup", code: -74,
+                    userInfo: [NSLocalizedDescriptionKey: "original source failure"])
+            }
+            XCTFail("source failure must propagate")
+        } catch {
+            harness.observer.recordCaughtStreamFailure(error, encoder: encoder)
+            XCTAssertEqual((error as NSError).domain, "AAC.BeforeFileCleanup")
+            XCTAssertEqual((error as NSError).code, -74)
+        }
+        let record = try XCTUnwrap(harness.observer.disposalRecords.first)
+        XCTAssertEqual(harness.observer.disposalRecords.count, 1)
+        XCTAssertGreaterThan(record.workspaceBytes, 0, "snapshot must precede resource cleanup")
+        let failure = try XCTUnwrap(record.failure)
+        let description = String(reflecting: failure)
+        XCTAssertTrue(description.contains("AAC.BeforeFileCleanup"), description)
+        XCTAssertTrue(description.contains("-74"), description)
+        XCTAssertTrue(description.contains("original source failure"), description)
+        XCTAssertEqual(failure, encoder.terminalFailure)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+    }
+
     func testStreamingLiveUsesBoundedTailAndIntegerClockBeyondCalibrationCap() async throws {
         let harness = try AACPrimingCalibratorTestHarness(labels: [.l,.r])
         defer { attachEvidence(harness) }
         let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
         let encoder = try XCTUnwrap(receipt.encoders.first)
+        harness.observer.beginStreamDiagnostics(encoder: encoder)
         var batches = 0
-        let decoded = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 102_400, nextPCM: {
-            guard batches < 100 else { return nil }
-            let start = batches * 1_024
-            batches += 1
-            return AACPrimingCalibratorTestHarness.indexedSignal(start: start, frames: 1_024, channels: 2)
-        })
+        let decoded: AACSystemLoopback.StreamEvidence
+        do {
+            decoded = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 102_400, nextPCM: {
+                guard batches < 100 else { return nil }
+                let start = batches * 1_024
+                batches += 1
+                return AACPrimingCalibratorTestHarness.indexedSignal(start: start, frames: 1_024, channels: 2)
+            })
+        } catch {
+            harness.observer.recordCaughtStreamFailure(error, encoder: encoder)
+            throw error
+        }
         let summary = decoded.summary
         XCTAssertEqual(summary.realSampleCount, 102_400)
         XCTAssertEqual(decoded.rawFrameCount, summary.totalDecodedFrames, "raw Q 与 effective N 是两个独立域")
@@ -1197,11 +1232,62 @@ private final class AACCookieBoundaryFixture: AACCalibrationObserver, @unchecked
     private let lock = NSLock()
     private var records: [String] = []
     private var formats: [String] = []
+    struct DisposalRecord: Sendable {
+        let failure: AACRenditionFailure?
+        let workspaceBytes: Int
+    }
+    private weak var streamingEncoder: AACRenditionEncoder?
+    private var streamPhases: [String] = []
+    private var streamDisposals: [DisposalRecord] = []
+    var disposalRecords: [DisposalRecord] { lock.withLock { streamDisposals } }
     var evidence: [String] { lock.withLock { records } }
     var formatEvidence: [String] { lock.withLock { formats } }
     init(mutation: AACBoundaryMutation) { self.mutation = mutation }
+    func beginStreamDiagnostics(encoder: AACRenditionEncoder) {
+        lock.withLock {
+            streamingEncoder = encoder
+            streamPhases.removeAll(keepingCapacity: true)
+            streamDisposals.removeAll(keepingCapacity: true)
+        }
+    }
+    func loopbackPhase(_ phase: AACLoopbackPhase, lane: AACOwnedCallLane) {
+        lock.withLock {
+            if streamingEncoder != nil, streamPhases.count < 32 {
+                streamPhases.append(String(describing: phase))
+            }
+        }
+    }
+    func writerSegment(initialization: Bool, writerIdentity: ObjectIdentifier) {
+        lock.withLock {
+            if streamingEncoder != nil, streamPhases.count < 32 {
+                streamPhases.append("writer=\(writerIdentity) init=\(initialization)")
+            }
+        }
+    }
+    func willDispose() {
+        guard let encoder = lock.withLock({ streamingEncoder }) else { return }
+        let record = DisposalRecord(failure: encoder.terminalFailure,
+                                    workspaceBytes: encoder.workspace.currentBytes)
+        let phases = lock.withLock { () -> [String] in
+            if streamDisposals.count < 4 { streamDisposals.append(record) }
+            return streamPhases
+        }
+        // terminalFailure was already snapshotted by the encoder, before this
+        // disposal hook and before native writer cancellation / file cleanup.
+        print("AAC_STREAM_PRE_NATIVE_CLEANUP terminal=\(String(reflecting: record.failure)) workspace=\(record.workspaceBytes) phases=\(phases)")
+    }
+    func recordCaughtStreamFailure(_ error: any Error, encoder: AACRenditionEncoder) {
+        let caught = AACRenditionFailure(error)
+        let phases = lock.withLock { streamPhases }
+        // Print bounded primitive snapshots before XCTest tries NSError serialization.
+        // The original error is still rethrown by the test, preserving its assertion.
+        print("AAC_STREAM_CAUGHT snapshot=\(String(reflecting: caught)) terminal=\(String(reflecting: encoder.terminalFailure)) workspace=\(encoder.workspace.currentBytes) peak=\(encoder.workspace.peakBytes) phases=\(phases)")
+    }
     func cookie(_ value: Data, at stage: AACCookieStage) -> Data {
         lock.withLock {
+            if streamingEncoder != nil, streamPhases.count < 32 {
+                streamPhases.append("cookie=\(stage) bytes=\(value.count)")
+            }
             if records.count < 8 { records.append("\(stage):\(value.map { String(format: "%02x", $0) }.joined())") }
         }
         switch (stage, mutation) {

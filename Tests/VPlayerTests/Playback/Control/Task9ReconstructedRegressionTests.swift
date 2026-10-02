@@ -2624,8 +2624,11 @@ final class Task9ProductionDeadlineTests: XCTestCase {
 
     func testPlayWaitingForRealCleanupCannotConsumeANewerResetGate() async throws {
         let gate = Task9OperationGate()
-        let fixture = try Task9RuntimeFixture()
-        await fixture.controller.play(fixture.request())
+        let clock = ManualPlaybackClock(100)
+        let fixture = try Task9RuntimeFixture(clock: clock)
+        let initial = Task { await fixture.controller.play(fixture.request()) }
+        await establishStableRoute(fixture, clock: clock)
+        await initial.value
         let previous = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
         let receiver = Task9OrphanCleanupReceiver(controller: fixture.controller, gate: gate)
         XCTAssertTrue(fixture.registry.cancelPlaybackRequest(previous.sessionIdentity))
@@ -2671,7 +2674,39 @@ final class Task9ProductionDeadlineTests: XCTestCase {
         XCTAssertEqual(fixture.sdk.lock.withLock { fixture.sdk.activateCallCount }, 1)
         XCTAssertEqual(fixture.factory.backends.count, 1)
         await settle { await fixture.controller.currentStateForTesting == .paused(replacementRequest) }
+        let remaining = try XCTUnwrap(pending.acquisitionDeadline).remainingNanoseconds(at: clock.nowNanoseconds)
+        XCTAssertNil(fixture.registry.playbackDeadlineScheduleSnapshot().acquisition)
+        clock.advance(nanoseconds: 120_000_000_000)
+        fixture.registry.executor.sync {}
+        XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.acquisitionDeadline?
+            .remainingNanoseconds(at: clock.nowNanoseconds), remaining,
+            "Manual user waiting cannot consume or refill the remaining physical-call allowance")
+        await assertFailed(fixture.controller, expected: false)
+        await fixture.controller.setPaused(true)
+        await fixture.controller.setPaused(true)
+        clock.advance(nanoseconds: 60_000_000_000)
+        fixture.registry.executor.sync {}
+        XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.acquisitionDeadline?
+            .remainingNanoseconds(at: clock.nowNanoseconds), remaining,
+            "Repeated pause while physically parked cannot refill the acquisition allowance")
+        let activationEntered = expectation(description: "Manual resume claimed its exact physical activation")
+        let activationGate = DispatchSemaphore(value: 0)
+        fixture.sdk.lock.withLock {
+            fixture.sdk.onActivate = { activationEntered.fulfill(); activationGate.wait() }
+        }
+        defer { activationGate.signal() }
         await fixture.controller.setPaused(false)
+        await fulfillment(of: [activationEntered], timeout: 2)
+        let resumedDeadline = try XCTUnwrap(fixture.registry.playbackDeadlineScheduleSnapshot().acquisition)
+        XCTAssertFalse(resumedDeadline.isParked)
+        XCTAssertEqual(resumedDeadline.remainingNanoseconds(at: clock.nowNanoseconds), remaining)
+        let scheduler = try XCTUnwrap(task9ObjectField("deadlineScheduler", of: fixture.registry,
+            as: PlaybackDeadlineScheduler.self))
+        XCTAssertEqual(scheduler.acquisitionDeadlineSnapshot(), resumedDeadline,
+            "The real physical claim must rearm the original scheduler with the unspent allowance")
+        fixture.sdk.lock.withLock { fixture.sdk.onActivate = nil }
+        activationGate.signal()
+        await establishStableRoute(fixture, clock: clock)
         await replacement.value
         XCTAssertFalse(fixture.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
         XCTAssertEqual(fixture.sdk.lock.withLock { fixture.sdk.activateCallCount }, 2)
@@ -2752,6 +2787,51 @@ final class Task9ProductionDeadlineTests: XCTestCase {
         XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 0)
         await controller.stop()
         await play.value
+    }
+
+    func testFreshPostResetPhysicalConfigurationStillTimesOutAtItsOriginalDeadline() async throws {
+        let entered = expectation(description: "Physical configuration remains in flight")
+        let sdk = Task9SDKGate(categoryOrdinal: 1, entered: { entered.fulfill() })
+        let clock = ManualPlaybackClock(100)
+        let registry = ControlTaskRegistry(clock: clock)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: Task9PreparedFactory())
+        owner.monitor.emit(.mediaServicesWereReset)
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "reset-timeout",
+            streamURL: URL(string: "http://localhost/reset.m3u8")!, title: "Reset timeout")
+        let play = Task { await controller.play(request) }
+        await fulfillment(of: [entered], timeout: 2)
+        defer { sdk.gate.signal() }
+        let deadline = try XCTUnwrap(registry.outputResourceContextSnapshot()?.acquisitionDeadline)
+        XCTAssertFalse(deadline.isParked)
+        clock.set(deadline.deadlineInstant)
+        registry.executor.sync {}
+        await settle { await self.failed(controller) }
+        await assertFailed(controller, expected: true)
+        XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 0)
+        sdk.gate.signal()
+        await play.value
+        await controller.stop()
+    }
+
+    func testAcquisitionPhysicalAllowanceDoesNotRefillAcrossRepeatedManualWaits() throws {
+        let registry = ControlTaskRegistry()
+        let admission = try registry.admitPlaybackRequest(requestID: UUID())
+        let acquisition = try XCTUnwrap(registry.beginOutputAcquisition(admission: admission,
+            resetRecoveryMandatorySuffix: 3_000_000_000))
+        var deadline = try AudioSessionAcquisitionDeadline(acquisitionTicket: acquisition, anchorInstant: 100)
+        deadline.park(at: 2_000_000_100)
+        deadline.park(at: 100_000_000_100)
+        XCTAssertEqual(deadline.remainingNanoseconds(at: 100_000_000_100), 3_000_000_000)
+        XCTAssertFalse(deadline.isExpired(at: 100_000_000_100))
+        try deadline.resume(at: 100_000_000_100)
+        deadline.park(at: 101_000_000_100)
+        XCTAssertEqual(deadline.remainingNanoseconds(at: 200_000_000_100), 2_000_000_000)
+        try deadline.resume(at: 200_000_000_100)
+        XCTAssertEqual(deadline.remainingNanoseconds(at: 201_000_000_100), 1_000_000_000)
+        XCTAssertTrue(deadline.isExpired(at: 202_000_000_100))
     }
 
     func testAdmissionKeepsResetGateAndBudgetFrozenWhenOriginalActionEpochIsObsolete() throws {

@@ -1633,7 +1633,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }
             switch action {
             case .acquisitionTimer(let expected):
-                guard let context = outputContext, context.acquisitionDeadline == expected else {
+                guard let context = outputContext, context.acquisitionDeadline == expected, !expected.isParked else {
                     return .application(.budget(.rejected))
                 }
                 if instant < expected.deadlineInstant {
@@ -3729,7 +3729,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             guard let context = authority.outputContext, !context.poisoned,
                   authority.snapshot.failure == nil else { return .init() }
             var value = PlaybackDeadlineScheduleSnapshot()
-            value.acquisition = context.acquisitionDeadline
+            value.acquisition = context.acquisitionDeadline.flatMap { $0.isParked ? nil : $0 }
             value.cleanup = context.budget
             if case .pending(let pending) = authority.routeObservationState {
                 value.ordinaryRoute = pending.ordinaryDeadlineState?.arm
@@ -5368,6 +5368,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
         switch executor.performUserControl(request) {
         case .acceptedAndPrepared(let ticket): return ticket
         case .acceptedWaiting:
+            if context.phase == .pendingLeaseAcquisition {
+                return try? beginOutputAcquisitionActivation(contextNonce: context.contextNonce)
+            }
             return try? beginOutputResetConfigurationActivation(contextNonce: context.contextNonce)
         default: return nil
         }
@@ -5719,6 +5722,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                authority.outputContext?.phase == .pendingLeaseAcquisition {
                 authority.outputContext?.acquisitionDeadline = try .init(acquisitionTicket: ticket,
                     anchorInstant: self.instant)
+            } else if record.audioPolicy != nil,
+                      authority.outputContext?.phase == .pendingLeaseAcquisition {
+                // A physical SDK call must never inherit a parked user-wait clock.
+                try authority.outputContext?.acquisitionDeadline?.resume(at: self.instant)
             }
             authority.commands[index]?.phase = .running
             return true
@@ -5850,7 +5857,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
         func beginOutputAcquisitionActivation(contextNonce: UInt64, output: inout PlaybackOutputSafetyState) throws -> ControlTaskTicket? {
             guard try !expireOutputAcquisitionLocked(output: &output) else { return nil }
-            guard case .acquiringLease(let context, .awaitingActivation(let configured)) = authority.resourceState,
+            guard case .acquiringLease(var context, .awaitingActivation(let configured)) = authority.resourceState,
                   context.contextNonce == contextNonce, context.disposition != .releaseAfterTeardown,
                   context.pendingReset == nil, !context.poisoned,
                   context.pendingActivationCall == nil, var phase = authority.audioPhase,
@@ -5858,7 +5865,16 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   phase.processReceipt == configured.processReceipt,
                   phase.configuredReceipt == configured.configuredReceipt,
                   configured.processReceipt.identity.mediaServicesEpoch == authority.snapshot.mediaServicesEpoch else { return nil }
-            if authority.snapshot.interruptionVeto { return nil }
+            if authority.snapshot.interruptionVeto || authority.snapshot.userPaused {
+                if authority.snapshot.mediaServicesResumeRequired || authority.snapshot.userPaused,
+                   authority.audioSessionPermit == nil {
+                    // Actual configuration completed and no physical call remains.
+                    // Keep its spent time while this admitted request awaits user intent.
+                    context.acquisitionDeadline?.park(at: self.instant)
+                    authority.resourceState = .acquiringLease(context, .awaitingActivation(configured))
+                }
+                return nil
+            }
             phase.policy = .activate(purpose: .activateAcquiredConfiguredGeneration(sessionIdentity: context.sessionIdentity,
                 committedGeneration: configured.processReceipt.identity.configurationGeneration,
                 acquisitionOwnershipProof: configured.acquired.proof), interruptionEpoch: authority.snapshot.interruptionEpoch,
@@ -6250,7 +6266,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 guard var context = authority.outputContext, context.phase == .pendingLeaseAcquisition,
                       let deadline = context.acquisitionDeadline, let reservation = authority.cleanupReservation else { return false }
                 let instant = self.instant
-                guard instant >= deadline.deadlineInstant else { return false }
+                guard deadline.isExpired(at: instant) else { return false }
                 if context.poisoned { return true }
                 let budget = try context.budget ?? CleanupBudgetTicket(predecessorIdentity: reservation.ticket.ownerGroup.resourceIdentity,
                     anchorInstant: instant, nonce: reservation.ticket.nonce)

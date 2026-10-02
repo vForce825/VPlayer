@@ -102,6 +102,8 @@ jobs:
               "-only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests",
               "-only-testing:VPlayerTests/SampleBufferBackendTests",
               "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests",
+              "-only-testing:VPlayerTests/ChannelProgrammeLayoutTests",
+              "-only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity",
               "CODE_SIGNING_ALLOWED=NO",
           ]
           process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
@@ -114,6 +116,8 @@ jobs:
           def emit(line):
               global completed_at
               print(line, flush=True)
+              if re.search(r"Test Suite .* started at|Test Case .* started\\.", line):
+                  completed_at = None
               if re.search(r"Test Suite 'Selected tests' (passed|failed) at", line):
                   completed_at = time.monotonic()
                   print("CI_POST_SUITE_WATCHDOG: suite completion observed; allowing 180 seconds for finalization", flush=True)

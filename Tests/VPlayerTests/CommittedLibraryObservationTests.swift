@@ -21,13 +21,13 @@ final class CommittedLibraryObservationTests: XCTestCase {
         XCTAssertEqual(initialProfiles.first?.name, "Home")
         let stream = try await store.committedChanges()
         var iterator = stream.makeAsyncIterator()
-        let firstSnapshot = await iterator.next()
+        let firstSnapshot = await iterator.next(isolation: MainActor.shared)
         let baseline = try XCTUnwrap(firstSnapshot)
         let signal = LibraryChangeSignal()
         let changed = expectation(description: "External committed profile observed")
         let task = Task { @MainActor in
             var iterator = iterator
-            if let snapshot = await iterator.next(), let change = snapshot.change(since: baseline) {
+            if let snapshot = await iterator.next(isolation: MainActor.shared), let change = snapshot.change(since: baseline) {
                 signal.notify(change)
                 changed.fulfill()
             }
@@ -51,14 +51,14 @@ final class CommittedLibraryObservationTests: XCTestCase {
         let store = SwiftDataLibraryStore(modelContainer: container)
         let stream = try await store.committedChanges()
         var iterator = stream.makeAsyncIterator()
-        let firstSnapshot = await iterator.next()
+        let firstSnapshot = await iterator.next(isolation: MainActor.shared)
         let baseline = try XCTUnwrap(firstSnapshot)
         let signal = LibraryChangeSignal()
         let claim = signal.claimPersistedRefreshes(profileID: profile.id, resources: [.playlist])
         let changed = expectation(description: "Only committed pointer produces a change")
         let task = Task { @MainActor in
             var iterator = iterator
-            if let next = await iterator.next(), let change = next.change(since: baseline) {
+            if let next = await iterator.next(isolation: MainActor.shared), let change = next.change(since: baseline) {
                 XCTAssertEqual(change, .refreshes([profile.id: [.playlist]]))
                 signal.notify(change)
                 changed.fulfill()
@@ -87,15 +87,82 @@ final class CommittedLibraryObservationTests: XCTestCase {
         let store = SwiftDataLibraryStore(modelContainer: container)
         let signal = LibraryChangeSignal()
         try await signal.observeCommittedChanges(in: store)
+        XCTAssertEqual(signal.generation, 0, "Subscription consumes its baseline before preparation starts")
         let context = ModelContext(container)
-        context.insert(profile())
+        let profile = profile()
+        context.insert(profile)
         try context.save()
+        for index in 0..<20 {
+            profile.name = "Immediate burst \(index)"
+            try context.save()
+        }
         for _ in 0..<200 {
             if signal.generation > 0 { break }
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTAssertGreaterThan(signal.generation, 0)
         XCTAssertEqual(signal.reloadScope(after: 0), .full)
+    }
+
+    func testProductionBridgeRebindingStartsNewBaselineAndRetainsLatestBufferedGeneration() async throws {
+        let firstContainer = try VPlayerModelContainer.make(inMemory: true)
+        let firstContext = ModelContext(firstContainer)
+        let firstProfile = profile()
+        firstContext.insert(firstProfile)
+        try firstContext.save()
+        let firstStore = SwiftDataLibraryStore(modelContainer: firstContainer)
+        // Make the first store's revision larger than the new store's. Rebinding
+        // must replace its comparison baseline, including its revision domain.
+        for _ in 0..<3 {
+            try await firstStore.recordSuccess(profileID: firstProfile.id, resource: .playlist,
+                                               at: .now, attemptID: UUID())
+            _ = try await firstStore.committedObservationBoundary()
+        }
+        let signal = LibraryChangeSignal()
+        try await signal.observeCommittedChanges(in: firstStore)
+        XCTAssertEqual(signal.generation, 0)
+
+        let nextContainer = try VPlayerModelContainer.make(inMemory: true)
+        let nextContext = ModelContext(nextContainer)
+        let nextProfile = profile()
+        nextContext.insert(nextProfile)
+        try nextContext.save()
+        let nextStore = SwiftDataLibraryStore(modelContainer: nextContainer)
+        try await signal.observeCommittedChanges(in: nextStore)
+        XCTAssertEqual(signal.generation, 0, "Rebinding consumes the new baseline without announcing it as a change")
+        let changes = signal.changes(after: 0)
+
+        try await firstStore.recordSuccess(profileID: firstProfile.id, resource: .epg,
+                                           at: .now, attemptID: UUID())
+        _ = try await firstStore.committedObservationBoundary()
+        let acceptedOldFence = await signal.flushCommittedChanges(in: firstStore)
+        XCTAssertFalse(acceptedOldFence, "A retired observation cannot move the new baseline")
+
+        for resource in [RefreshResource.playlist, .epg] {
+            try await nextStore.recordSuccess(profileID: nextProfile.id, resource: resource,
+                                              at: .now, attemptID: UUID())
+            _ = try await nextStore.committedObservationBoundary()
+        }
+        let expectedScope = LibraryChangeSignal.ReloadScope.refreshes([nextProfile.id: [.playlist, .epg]])
+        for _ in 0..<200 {
+            if signal.reloadScope(after: 0) == expectedScope { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(signal.reloadScope(after: 0), expectedScope)
+        guard signal.generation > 0 else {
+            XCTFail("The replacement stream must deliver its post-baseline changes")
+            return
+        }
+        // The downstream stream stays unread across the burst, so its only
+        // buffered value must be the newest generation, with both reload scopes.
+        var iterator = changes.makeAsyncIterator()
+        let latest = await iterator.next(isolation: MainActor.shared)
+        XCTAssertEqual(latest, signal.generation)
+        let generation = signal.generation
+        try await signal.observeCommittedChanges(in: nextStore)
+        let acceptedCurrentFence = await signal.flushCommittedChanges()
+        XCTAssertTrue(acceptedCurrentFence)
+        XCTAssertEqual(signal.generation, generation, "Same-store binding and revision replay remain idempotent")
     }
 
     func testFailedLocalSaveDoesNotPublishRolledBackMetadata() async throws {
@@ -110,7 +177,7 @@ final class CommittedLibraryObservationTests: XCTestCase {
         })
         let stream = try await store.committedChanges()
         var iterator = stream.makeAsyncIterator()
-        _ = await iterator.next()
+        _ = await iterator.next(isolation: MainActor.shared)
         let updated = try SourceProfileInput(
             name: "Must roll back", m3uURLString: profile.m3uURLString,
             epgURLString: profile.epgURLString, m3uRefreshInterval: .manual,
@@ -124,7 +191,7 @@ final class CommittedLibraryObservationTests: XCTestCase {
         let profileID = profile.id
         let task = Task { @MainActor in
             var iterator = iterator
-            if let snapshot = await iterator.next() {
+            if let snapshot = await iterator.next(isolation: MainActor.shared) {
                 XCTAssertEqual(snapshot.profiles[profileID]?.configuration.name, "Committed externally")
                 changed.fulfill()
             }
@@ -145,7 +212,7 @@ final class CommittedLibraryObservationTests: XCTestCase {
         let store = SwiftDataLibraryStore(modelContainer: container)
         let stream = try await store.committedChanges()
         var iterator = stream.makeAsyncIterator()
-        let first = await iterator.next()
+        let first = await iterator.next(isolation: MainActor.shared)
         let baseline = try XCTUnwrap(first)
         let signal = LibraryChangeSignal()
         signal.consumeCommittedSnapshot(baseline)
@@ -161,7 +228,7 @@ final class CommittedLibraryObservationTests: XCTestCase {
         XCTAssertTrue(fenced)
         signal.stopClaimingPersistedRefreshes(claim)
         signal.releasePersistedRefreshes(claim, publishesPendingChanges: false)
-        let held = await iterator.next()
+        let held = await iterator.next(isolation: MainActor.shared)
         signal.consumeCommittedSnapshot(try XCTUnwrap(held))
         XCTAssertEqual(signal.generation, 0, "Delayed delivery of the same committed revision must not schedule a second reload")
 
@@ -170,7 +237,7 @@ final class CommittedLibraryObservationTests: XCTestCase {
         let changed = expectation(description: "A newer external commit remains observable")
         let task = Task { @MainActor in
             var iterator = iterator
-            while let snapshot = await iterator.next() {
+            while let snapshot = await iterator.next(isolation: MainActor.shared) {
                 signal.consumeCommittedSnapshot(snapshot)
                 if signal.generation > 0 { changed.fulfill(); return }
             }
