@@ -1,4 +1,4 @@
-name: Native selection and ownership precursor diagnostic
+name: Isolated native direct audio evidence diagnostic
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-precursor-${{ github.ref }}
+  group: macos-ci-direct-evidence-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -79,119 +79,3 @@ jobs:
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DirectAudio.xcresult"
 
-      - name: Verify cleanup precursor subset in native XCTest class order
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/CleanupPrecursors.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointMutationTableRejectsDeletedTrimPlusMinusOneAndPrematureNonfinalTrim \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointReceiptRequiresSameWriterProofPlaylistHTTPBackingAndEffectiveEnd \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2AVParticipantCardinalityTimeoutTaxonomyAndCheckedCountersFailClosed \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2BackendQuiescenceProofClosesRegistryIntervalOnlyForExactDirectPausedIdentity \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2CoordinatorFixedCapacityRejectsBeforeInstallationAndOwnsOneWaiterWithoutTimer \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2EveryAACParticipantRequiresWriterEndpointAuthorityWhileExplicitNonAACMayProceed \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2LoopbackTerminalRenditionConflictAutomaticallyStartsRegistrySingleFlightStopAndReprepare \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2RegistryCapabilityIsConsumedOnceAtMainActorPlayBoundaryAndRevalidatedForPlayingRelay \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalLoopbackTimelineTerminationFailsCurrentAndFutureCoordinatorWaiters
-      - name: Report scoped CleanupPrecursors failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CleanupPrecursors.xcresult"
-
-      - name: Isolate native final EOS preparation
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/FinalEOS.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch
-      - name: Report scoped FinalEOS failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/FinalEOS.xcresult"
-
-      - name: Verify complete loopback HTTP regression class
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/LoopbackFull.xcresult" \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests
-      - name: Report scoped LoopbackFull failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/LoopbackFull.xcresult"
-
-  fixture-validation:
-    name: HTTP playback and full-length 4K timeline fixtures
-    runs-on: xcode-27
-    timeout-minutes: 45
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
-      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_ANALYTICS: "1"
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Verify toolchain
-        run: |
-          xcodebuild -version
-          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
-      - name: Install build and fixture tooling
-        run: brew install mint jq ripgrep ffmpeg
-      - name: Build and audit pinned application FFmpeg
-        run: ./ci_scripts/ci_post_clone.sh
-      - name: Verify committed project and licenses
-        run: |
-          ./Scripts/bootstrap.sh --check
-          ./Scripts/verify-licenses.sh
-          python3 Scripts/Tests/test_tvos27_deployment.py
-      - name: Check fixture runner, server and generator contracts
-        run: |
-          python3 Scripts/Tests/test_playback_fixture_runner.py
-          python3 Scripts/Tests/test_timeline_fixture.py
-          python3 Scripts/Support/fixture_server.py --self-test
-          ./Scripts/run-playback-integration-tests.sh --self-test
-          ./Scripts/generate-playback-fixtures.sh --self-test
-      - name: Run exact paused native reconnect and reseek controls
-        run: |
-          set -o pipefail
-          ./Scripts/run-playback-integration-tests.sh \
-            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests/testRawHTTPHLSBecomesReadyWhilePausedAndConnected \
-            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests/testRawHTTPHLSDisconnectedPreparationBecomesReadyAfterReconnect \
-            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests/testRawHTTPHLSReseekAfterReconnectRestoresExactPausedTarget \
-            -- -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 \
-            2>&1 | tee "$RUNNER_TEMP/raw-http-readiness.log"
-      - name: Require all three native cases executed without skips
-        if: ${{ always() }}
-        run: |
-          python3 - "$RUNNER_TEMP/raw-http-readiness.log" <<'PY'
-          import pathlib, re, sys
-          text = pathlib.Path(sys.argv[1]).read_text()
-          names = [
-              "testRawHTTPHLSBecomesReadyWhilePausedAndConnected",
-              "testRawHTTPHLSDisconnectedPreparationBecomesReadyAfterReconnect",
-              "testRawHTTPHLSReseekAfterReconnectRestoresExactPausedTarget",
-          ]
-          for name in names:
-              pattern = r"Test Case '-\[VPlayerTests\.PlaybackFixtureIntegrationTests " + re.escape(name) + r"\]' (passed|failed|skipped|exceeded execution)"
-              states = re.findall(pattern, text)
-              if states != ["passed"]:
-                  raise SystemExit(f"RAW_HTTP_EXECUTION_GATE_FAILED case={name} outcomes={states}")
-          if not re.search(r"Executed 3 tests, with 0 failures", text):
-              raise SystemExit("RAW_HTTP_EXECUTION_GATE_FAILED missing exact three-case zero-failure summary")
-          if re.search(r"Executed 3 tests, with [1-9]\d* tests? skipped", text):
-              raise SystemExit("RAW_HTTP_EXECUTION_GATE_FAILED skipped cases")
-          print("RAW_HTTP_EXECUTION_GATE executed=3 passed=3 skipped=0 failed=0")
-          PY

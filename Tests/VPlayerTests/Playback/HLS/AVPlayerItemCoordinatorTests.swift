@@ -412,6 +412,48 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             progress.mark("audio-tracks")
             let tracks = try await physical.asset.loadTracks(withMediaType: .audio)
             print("NATIVE_AUDIBLE_SELECTION groupPresent=\(group != nil) optionCount=\(group?.options.count ?? 0) audioTrackCount=\(tracks.count)")
+            progress.mark("item-tracks")
+            do {
+                // HLS item tracks can differ from its source asset's metadata.
+                // Inspect a bounded snapshot without selecting, enabling, or playing it.
+                let itemTracks = physical.tracks
+                let selection = fixture.source.currentAudioSelectionCapability(
+                    itemURL: fixture.request.itemURL, item: item,
+                    publicationSequence: fixture.request.publicationSequence)
+                let direct = fixture.request.directAudioOnlyRendition
+                print("NATIVE_AUDIBLE_AUTHORITY direct=\(direct != nil) "
+                    + "requirements=\(fixture.request.audioParticipants.count) "
+                    + "selectionPresent=\(selection != nil) "
+                    + "selectionMatchesDirect=\(selection?.renditionIdentity == direct) "
+                    + "selectionMatchesItem=\(selection?.outputLifecycleEpoch == item.outputLifecycleEpoch && selection?.itemGeneration == item.itemGeneration)")
+                print("NATIVE_AUDIBLE_ITEM_TRACKS count=\(itemTracks.count) "
+                    + "enabled=\(itemTracks.filter(\.isEnabled).count) "
+                    + "missingAssetTrack=\(itemTracks.filter { $0.assetTrack == nil }.count) "
+                    + "sameItem=\(driver.player.currentItem === physical) status=\(physical.status.rawValue)")
+                for (index, itemTrack) in itemTracks.prefix(4).enumerated() {
+                    guard let assetTrack = itemTrack.assetTrack else { continue }
+                    print("NATIVE_AUDIBLE_ITEM_TRACK index=\(index) "
+                        + "mediaType=\(assetTrack.mediaType.rawValue) enabled=\(itemTrack.isEnabled)")
+                    do {
+                        let (playable, formats) = try await assetTrack.load(
+                            .isPlayable, .formatDescriptions)
+                        print("NATIVE_AUDIBLE_ITEM_FORMAT index=\(index) "
+                            + "playable=\(playable) formatCount=\(formats.count)")
+                        for format in formats.prefix(2) {
+                            let audio = CMFormatDescriptionGetMediaType(format) == kCMMediaType_Audio
+                                ? CMAudioFormatDescriptionGetStreamBasicDescription(format) : nil
+                            print("NATIVE_AUDIBLE_FORMAT index=\(index) "
+                                + "subtype=\(CMFormatDescriptionGetMediaSubType(format)) "
+                                + "sampleRate=\(audio?.pointee.mSampleRate ?? 0) "
+                                + "channels=\(audio?.pointee.mChannelsPerFrame ?? 0)")
+                        }
+                    } catch {
+                        let failure = error as NSError
+                        print("NATIVE_AUDIBLE_ITEM_FORMAT_FAILED index=\(index) "
+                            + "domain=\(failure.domain) code=\(failure.code)")
+                    }
+                }
+            }
             XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
             XCTAssertEqual(tracks.count, 1,
                            "a missing selection group is only valid here with one real audio track")
