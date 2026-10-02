@@ -1272,12 +1272,11 @@ final class VideoToolboxDecoderTests: XCTestCase {
             "Sources/VPlayerPlayback/Video/VideoFormatMetadataReader.swift",
             "Sources/VPlayerPlayback/Video/VideoFrameProcessing.swift",
         ]
-        let existingSources = paths.compactMap { path -> String? in
+        let sources = try paths.map { path in
             let url = repository.appendingPathComponent(path)
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            return try? String(contentsOf: url, encoding: .utf8)
+            return try String(contentsOf: url, encoding: .utf8)
         }
-        let combined = existingSources.joined(separator: "\n")
+        let combined = sources.joined(separator: "\n")
 
         XCTAssertNil(combined.range(of: "ya" + "dif", options: .caseInsensitive))
     }

@@ -58,11 +58,65 @@ jobs:
           python3 Scripts/Tests/test_tvos27_deployment.py
           ./Scripts/Tests/test_precompiled_metal_library.sh
 
-      - name: Compile and run unit and UI tests
+      - name: Compile complete Debug test targets for diagnostic isolation
+        id: debug_build
         run: |
-          ./Scripts/test.sh -collect-test-diagnostics never -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
+      - name: Diagnose complete HLS classes without parallel workers
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/DebugHLS.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests \
+            -only-testing:VPlayerTests/HLSPublisherTests
+      - name: Report scoped HLS diagnostic failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugHLS.xcresult"
+      - name: Diagnose control deadlines, original Stop joins and native PCM
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/DebugControl.xcresult" \
+            -only-testing:VPlayerTests/VPlayerAppStartupTests/testChannelLogoCacheCancelsChunkedTransferAtFirstOverflowChunk \
+            -only-testing:VPlayerTests/PlaybackAudioRouteServiceTests/testDestroyedSystemMonitorUnregistersItsOriginalObservers \
+            -only-testing:VPlayerTests/VideoToolboxDecoderTests/testSourceGateHasNoYADIFImplementation \
+            -only-testing:VPlayerTests/AudioServiceLeaseTests/testAuthoritativeProofEscrowExhaustsAt3472UntilLastRetiredAliasDeinitializes \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testActivateContinuityIslandFlushesAndCannotReplayPreviousIsland \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testFlushDuringFallbackRemovalNeverResurrectsFailedRendererAndCompletesPCM \
+            -only-testing:VPlayerTests/Task10ControllerReviewTests/testMediaServicesResetPublishesNilBeforeOwnerRetiresThenPublishesDelayedSuccessor \
+            -only-testing:VPlayerTests/Task10ControllerReviewTests/testPrepareFinalCommitPreemptedByResetOrInterruptionHandsOffWithoutDemuxTerminal \
+            -only-testing:VPlayerTests/AudioOnlyItemSelectorTests/testBackendIntegrationWithAudioOnlySelector \
+            -only-testing:VPlayerTests/PlaybackPipelineTests/testCompressedRetryBeforeSharedGateOpenRequiresReplacementAudioPreroll \
+            -only-testing:VPlayerTests/PlaybackPipelineTests/testControllerMetricsProviderRetainsFailedSessionCollectorUntilExplicitStop \
+            -only-testing:VPlayerTests/Task9ProductionDeadlineTests/testPlayWaitingForRealCleanupCannotConsumeANewerResetGate \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testExplicitStopClearsMetricsRetainedAfterFailure \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testUserResumeDuringInterruptionKeepsSystemPauseUntilOwnerEndsIt \
+            -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testControlEventFieldsUseTheirRegisteredIndependentDomains \
+            -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testEndedWithoutResumeKeepsVetoButEndsPhysicalInterruption \
+            -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testResetFoldPreservesFirstAnchorAndLatestRoot \
+            -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testResetOutsideInterruptionUsesSeparateFirstResetAnchor \
+            -only-testing:VPlayerTests/HLSResourceStoreTests/testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic \
+            -only-testing:VPlayerTests/Task9ProductionDeadlineTests \
+            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testStopSuspendedAtWatchdogStillJoinsSameSessionTerminalCleanup \
+            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testObsoleteStopCannotJoinReplacementSessionTerminalCleanup \
+            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testPendingAcquisitionAudioKeysKeepAdmissionBoundaryAndHistoricalOrder \
+            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests/testPauseAndResumeDuringPhysicalAcquisitionDoNotCreateBackendCleanupOwner \
+            -only-testing:VPlayerTests/NativeReceiverAdapterTests/testRealSDKPCMAudioReceiverEOFRegistrationResumeFlushAndRemoval
+      - name: Report scoped control diagnostic failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugControl.xcresult"
 
   release-validation:
     name: Release boundaries and cold startup
@@ -94,17 +148,23 @@ jobs:
           python3 Scripts/Tests/test_tvos27_deployment.py
       - name: Run Release boundary suite
         run: |
-          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests -resultBundlePath "$RUNNER_TEMP/ReleaseBoundary.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
             -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300
+      - name: Report scoped Release boundary failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseBoundary.xcresult"
       - name: Run Release startup suite
         if: ${{ !cancelled() && steps.release_preflight.outcome == 'success' }}
         run: |
-          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests -resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
             -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300
+      - name: Report scoped Release startup failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseStartup.xcresult"
       - name: Check six Release cold starts including allocator accounting
         if: ${{ !cancelled() && steps.release_preflight.outcome == 'success' }}
         run: |
@@ -156,6 +216,8 @@ jobs:
           ./Scripts/test-bootstrap-check.sh
           ./Scripts/test-device-acceptance-signal.sh
           ./Scripts/test-device-acceptance-signing.sh
+          python3 Scripts/Tests/test_release_startup_diagnostics.py
+          python3 Scripts/Tests/test_xcresult_failure_report.py
 
   fixture-validation:
     name: HTTP playback and full-length 4K timeline fixtures

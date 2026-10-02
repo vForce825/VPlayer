@@ -6,6 +6,7 @@ import Darwin
 import Foundation
 import ObjectiveC
 import Synchronization
+import VPlayerCore
 
 struct PlaybackRunIdentity: Equatable, Sendable {
     let sessionID: UInt64
@@ -458,27 +459,50 @@ enum PlaybackRuntimeAllocationReservations {
     }
     static func validateSystemAndPipelineAndGlobalCaps() {
         let reservation = systemAndPipelineRelay
-        precondition(reservation.total <= systemAndPipelineRelayHardCap, """
-            system/pipeline relay allocation超出4KiB: total=\(reservation.total), \
-            monitor=\(reservation.monitorObject), monitorLock=\(reservation.monitorLock), \
-            tokens=\(reservation.observerTokens), observerCaptures=\(reservation.observerCaptures), \
-            pipeline=\(reservation.pipelineRelayObject), pipelineLock=\(reservation.pipelineRelayLock), \
-            backing=\(reservation.pipelineBacking), receiver=\(reservation.receiverCapture), \
-            drain=\(reservation.drainRunnerObject), tasks=\(reservation.relayTaskSlabs), \
-            taskCaptures=\(reservation.drainTaskCaptures), weak=\(reservation.weakTargetAllocationCharges), \
-            monitorInstance=\(class_getInstanceSize(SystemAudioEventMonitor.self)), \
-            pipelineInstance=\(class_getInstanceSize(PlaybackSessionEventRelay.self)), \
-            drainInstance=\(class_getInstanceSize(OwnedPlaybackEventDrain.self)), \
-            lockInstance=\(class_getInstanceSize(NSLock.self)), \
-            pipelineStride=\(MemoryLayout<PlaybackPipelineEvent>.stride), \
-            coreErrorStride=\(MemoryLayout<PlaybackCoreError>.stride), \
-            mediaStride=\(MemoryLayout<PlaybackMediaInformation?>.stride), \
-            generationStride=\(MemoryLayout<MediaGeneration?>.stride), \
-            tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride), \
-            segmentRequestClass=\(malloc_good_size(PlaybackSessionEventRelay.backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride)), \
-            typedRequestClass=\(malloc_good_size(32 * MemoryLayout<PlaybackPipelineEvent>.stride)), \
-            arrayRequestClass=\(malloc_good_size(32 + 32 * MemoryLayout<PlaybackPipelineEvent>.stride))
-            """)
+        if reservation.total > systemAndPipelineRelayHardCap {
+            // Release may strip precondition message evaluation. Emit only the
+            // already-fatal path's fixed scalar evidence before the unchanged cap.
+            let diagnostic = """
+                system/pipeline relay allocation超出4KiB: total=\(reservation.total), cap=\(systemAndPipelineRelayHardCap), \
+                monitor=\(reservation.monitorObject), monitorLock=\(reservation.monitorLock), \
+                tokens=\(reservation.observerTokens), observerCaptures=\(reservation.observerCaptures), \
+                pipeline=\(reservation.pipelineRelayObject), pipelineLock=\(reservation.pipelineRelayLock), \
+                backing=\(reservation.pipelineBacking), receiver=\(reservation.receiverCapture), \
+                drain=\(reservation.drainRunnerObject), tasks=\(reservation.relayTaskSlabs), \
+                taskCaptures=\(reservation.drainTaskCaptures), weak=\(reservation.weakTargetAllocationCharges), \
+                monitorInstance=\(class_getInstanceSize(SystemAudioEventMonitor.self)), \
+                pipelineInstance=\(class_getInstanceSize(PlaybackSessionEventRelay.self)), \
+                drainInstance=\(class_getInstanceSize(OwnedPlaybackEventDrain.self)), \
+                lockInstance=\(class_getInstanceSize(NSLock.self)), \
+                pipelineStride=\(MemoryLayout<PlaybackPipelineEvent>.stride), \
+                coreErrorStride=\(MemoryLayout<PlaybackCoreError>.stride), \
+                mediaStride=\(MemoryLayout<PlaybackMediaInformation?>.stride), \
+                generationStride=\(MemoryLayout<MediaGeneration?>.stride), \
+                tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride), \
+                presentedPayloadStride=\(MemoryLayout<(String, String, String?)>.stride), \
+                presentedPayloadAlignment=\(MemoryLayout<(String, String, String?)>.alignment), \
+                mediaPayloadStride=\(MemoryLayout<(PlaybackMediaInformation?, UInt64)>.stride), \
+                mediaPayloadAlignment=\(MemoryLayout<(PlaybackMediaInformation?, UInt64)>.alignment), \
+                videoFailurePayloadStride=\(MemoryLayout<VideoDecoderFailure>.stride), \
+                videoFailurePayloadAlignment=\(MemoryLayout<VideoDecoderFailure>.alignment), \
+                unexpectedPayloadStride=\(MemoryLayout<(String, ErrorDiagnosticSnapshot)>.stride), \
+                unexpectedPayloadAlignment=\(MemoryLayout<(String, ErrorDiagnosticSnapshot)>.alignment), \
+                backendPayloadStride=\(MemoryLayout<(ErrorDiagnosticSnapshot, PlaybackBackendPrepareFailureScope, HLSRuntimeFailureMetadataOwner)>.stride), \
+                backendPayloadAlignment=\(MemoryLayout<(ErrorDiagnosticSnapshot, PlaybackBackendPrepareFailureScope, HLSRuntimeFailureMetadataOwner)>.alignment), \
+                ffmpegPayloadStride=\(MemoryLayout<(FFmpegFailureKind, FFmpegFailureStage, Int32)>.stride), \
+                ffmpegPayloadAlignment=\(MemoryLayout<(FFmpegFailureKind, FFmpegFailureStage, Int32)>.alignment), \
+                scalarPayloadStride=\(MemoryLayout<UInt64>.stride), \
+                scalarPayloadAlignment=\(MemoryLayout<UInt64>.alignment), \
+                segmentRequestClass=\(malloc_good_size(PlaybackSessionEventRelay.backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride)), \
+                typedRequestClass=\(malloc_good_size(32 * MemoryLayout<PlaybackPipelineEvent>.stride)), \
+                arrayRequestClass=\(malloc_good_size(32 + 32 * MemoryLayout<PlaybackPipelineEvent>.stride))
+                """ + "\n"
+            diagnostic.withCString { message in
+                _ = Darwin.write(STDERR_FILENO, message, Darwin.strlen(message))
+            }
+        }
+        precondition(reservation.total <= systemAndPipelineRelayHardCap,
+            "system/pipeline relay allocation超出4KiB")
         validateGlobalCap()
     }
     static func validateRouteAndGlobalCaps() {

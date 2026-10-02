@@ -4724,7 +4724,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// stop/new-play在启动任何后继前真实join；只有同一handle的尾部可被原CAS清除。
-    func joinOwnedTerminalCleanup(session: PlaybackSessionIdentity? = nil) async {
+    func joinOwnedTerminalCleanup(session: PlaybackSessionIdentity? = nil,
+        task expectedTask: ControlTaskTicket? = nil) async {
         defer { notifyPlaybackProgress() }
         for index in 0..<32 {
             var wake: CheckedContinuation<Void, Never>?
@@ -4732,6 +4733,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 guard let record = authority.commands[index],
                       case .controllerCleanup(let runner) = record.payload else { return nil }
                 if let session, record.groupTicket.resourceIdentity != .session(session) { return nil }
+                if let expectedTask, record.controlTaskTicket != expectedTask { return nil }
                 runner.joinRequested = true
                 wake = runner.dispositionWaiter
                 runner.dispositionWaiter = nil

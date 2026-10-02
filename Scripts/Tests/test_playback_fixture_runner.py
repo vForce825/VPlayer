@@ -7,12 +7,216 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "Scripts/run-playback-integration-tests.sh"
+
+
+def owned_group_state(group, timeout):
+    snapshot = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,pgid=,state=,command="],
+        capture_output=True, text=True, timeout=timeout, check=True)
+    return [line for line in snapshot.stdout.splitlines()
+            if len(line.split(None, 4)) >= 4 and line.split(None, 4)[2] == str(group)]
+
+
+def run_probe(command, env, timeout=20):
+    # Each probe owns a separate POSIX session. subprocess.run kills only the
+    # immediate shell on timeout, leaving its HTTP server holding captured pipes.
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            # All post-failure diagnostics, escalation and reaping share the
+            # original 2s snapshot + 2s TERM + 2s KILL cleanup allowance.
+            cleanup_deadline = time.monotonic() + 6
+            latest = error
+            notes = []
+            try:
+                owned = "\n".join(owned_group_state(process.pid, 2))
+            except (OSError, subprocess.SubprocessError) as snapshot_error:
+                owned = f"unavailable: {snapshot_error}"
+            for number in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(process.pid, number)
+                except ProcessLookupError:
+                    pass
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=max(0, min(2, cleanup_deadline - time.monotonic())))
+                except subprocess.TimeoutExpired as drain_error:
+                    latest = drain_error
+                    stdout = (latest.stdout or b"").decode(errors="replace")
+                    stderr = (latest.stderr or b"").decode(errors="replace")
+                # Pipe EOF/direct-child exit do not prove that the owned group
+                # is empty: a TERM-ignoring child may have redirected its pipes.
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+            try:
+                process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                notes.append("direct child could not be reaped within cleanup allowance")
+            try:
+                while True:
+                    remaining = cleanup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        notes.append("owned-group termination verification exceeded cleanup allowance")
+                        break
+                    survivors = [line for line in owned_group_state(process.pid, remaining)
+                                 if not line.split(None, 4)[3].startswith("Z")]
+                    if not survivors:
+                        break
+                    if remaining < 0.02:
+                        notes.append("live owned processes remain: " + "\n".join(survivors))
+                        break
+                    time.sleep(0.01)
+            except (OSError, subprocess.SubprocessError) as snapshot_error:
+                notes.append(f"final owned-group state unavailable: {snapshot_error}")
+            raise AssertionError(
+                f"fixture runner exceeded its unchanged {timeout}s deadline\n"
+                f"owned process state at timeout:\n{owned[-8000:]}\n"
+                f"cleanup diagnostics: {('; '.join(notes) or 'no live owned processes remain')[-8000:]}\n"
+                f"captured stdout:\n{stdout[-8000:]}\n"
+                f"captured shell trace/stderr:\n{stderr[-16000:]}"
+            ) from error
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        process.stdout.close()
+        process.stderr.close()
+
+
+def stop_marked_child_if_still_owned(marker):
+    if not marker.exists():
+        return
+    pid, group = json.loads(marker.read_text())
+    snapshot = subprocess.run(["ps", "-o", "pid=,pgid=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=1)
+    if snapshot.stdout.split() == [str(pid), str(group)]:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class RunnerTimeoutDiagnosticsTests(unittest.TestCase):
+    def test_timeout_retains_stage_output_and_stops_owned_descendant(self):
+        with tempfile.TemporaryDirectory(prefix="vplayer timeout regression ") as directory:
+            marker = Path(directory) / "child.pid"
+            script = r"""
+import json, os, pathlib, signal, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+pathlib.Path(sys.argv[1]).write_text(json.dumps([child.pid, os.getpgrp()]))
+def stop(_number, _frame):
+    child.wait(timeout=2)
+    raise SystemExit(143)
+signal.signal(signal.SIGTERM, stop)
+print("fixture server started", flush=True)
+print("waiting for fake xcodebuild", file=sys.stderr, flush=True)
+signal.pause()
+"""
+            cleaned = False
+            try:
+                with self.assertRaises(AssertionError) as failure:
+                    run_probe([sys.executable, "-c", script, str(marker)], os.environ.copy(), timeout=0.5)
+                message = str(failure.exception)
+                self.assertIn("fixture server started", message)
+                self.assertIn("waiting for fake xcodebuild", message)
+                self.assertIn("owned process state", message)
+                child_pid, _group = json.loads(marker.read_text())
+                self.assertIn(str(child_pid), message)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+                cleaned = True
+            finally:
+                if not cleaned:
+                    stop_marked_child_if_still_owned(marker)
+
+    def test_timeout_kills_term_ignoring_child_after_parent_and_pipes_exit(self):
+        with tempfile.TemporaryDirectory(prefix="vplayer detached pipes ") as directory:
+            marker = Path(directory) / "child.pid"
+            child_script = (
+                "import json,os,pathlib,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "pathlib.Path(" + repr(str(marker)) + ").write_text(json.dumps([os.getpid(),os.getpgrp()])); "
+                "time.sleep(60)"
+            )
+            parent_script = (
+                "import subprocess,sys,time; "
+                "subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(60)"
+            )
+            cleaned = False
+            try:
+                with self.assertRaises(AssertionError):
+                    run_probe([sys.executable, "-c", parent_script, child_script],
+                              os.environ.copy(), timeout=0.5)
+                self.assertTrue(marker.exists(), "child must establish its TERM-ignore state")
+                child_pid, _group = json.loads(marker.read_text())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    snapshot = subprocess.run(["ps", "-o", "state=", "-p", str(child_pid)],
+                                              capture_output=True, text=True, timeout=1)
+                    state = snapshot.stdout.strip()
+                    if not state or state.startswith("Z"):
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(not state or state.startswith("Z"),
+                                f"owned child {child_pid} survived cleanup in state {state}")
+                cleaned = True
+            finally:
+                if not cleaned:
+                    stop_marked_child_if_still_owned(marker)
+
+
+    def test_timeout_reaps_root_and_retains_latest_output_without_killing_another_group(self):
+        with tempfile.TemporaryDirectory(prefix="vplayer escaped pipe ") as directory:
+            marker = Path(directory) / "child.pid"
+            child_script = (
+                "import json,os,pathlib,time; "
+                "pathlib.Path(" + repr(str(marker)) +
+                ").write_text(json.dumps([os.getpid(),os.getpgrp()])); time.sleep(60)"
+            )
+            parent_script = r"""
+import os, signal, subprocess, sys, time
+subprocess.Popen([sys.executable, '-c', sys.argv[1]], start_new_session=True)
+def stop(_number, _frame):
+    print("root-exit-marker", file=sys.stderr, flush=True)
+    raise SystemExit(143)
+signal.signal(signal.SIGTERM, stop)
+print("root=" + str(os.getpid()), flush=True)
+time.sleep(60)
+"""
+            try:
+                with self.assertRaises(AssertionError) as failure:
+                    run_probe([sys.executable, "-c", parent_script, child_script],
+                              os.environ.copy(), timeout=0.5)
+                message = str(failure.exception)
+                captured_stderr = message.split("captured shell trace/stderr:\n", 1)[1]
+                self.assertIn("root-exit-marker", captured_stderr,
+                              "must keep output captured after the initial timeout")
+                root_pid = int(next(line[5:] for line in message.splitlines() if line.startswith("root=")))
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(root_pid, 0)
+                child_pid, child_group = json.loads(marker.read_text())
+                self.assertEqual(child_pid, child_group)
+                snapshot = subprocess.run(["ps", "-o", "state=", "-p", str(child_pid)],
+                                          capture_output=True, text=True, timeout=1, check=True)
+                state = snapshot.stdout.strip()
+                self.assertTrue(state and not state.startswith("Z"),
+                                "the helper must leave the other session alive, not merely unreaped")
+            finally:
+                stop_marked_child_if_still_owned(marker)
+
 
 
 class PlaybackFixtureRunnerTests(unittest.TestCase):
@@ -59,10 +263,11 @@ else:
             selectors = ["VPlayerTests/PlaybackFixtureIntegrationTests", "VPlayerTests/HLSTimelineTests"]
             flags = ["-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
                      "-maximum-test-execution-time-allowance", "300"]
-            command = [str(RUNNER), "--timeline-fixture", str(timeline)]
+            # Preserve phase evidence on failure without flooding successful CI logs.
+            command = ["bash", "-x", str(RUNNER), "--timeline-fixture", str(timeline)]
             for selector in selectors:
                 command += ["--only-testing", selector]
-            result = subprocess.run(command + ["--"] + flags, env=env, capture_output=True, text=True, timeout=20)
+            result = run_probe(command + ["--"] + flags, env=env)
             self.assertEqual(result.returncode, status, result.stdout + result.stderr)
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
             self.assertEqual(len(calls), 2)

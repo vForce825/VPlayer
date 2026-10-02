@@ -781,6 +781,136 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
             "bothCallersReturned={\(afterBothCallers)}; SDK={\(calls)}")
     }
 
+    func testStopSuspendedAtWatchdogStillJoinsSameSessionTerminalCleanup() async throws {
+        let registry = ControlTaskRegistry(allocator: .init())
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let deactivationEntered = expectation(description: "Same-session terminal cleanup reached the SDK")
+        let deactivationGate = DispatchSemaphore(value: 0)
+        defer { deactivationGate.signal() }
+        sdk.lock.withLock {
+            sdk.onDeactivate = { deactivationEntered.fulfill(); deactivationGate.wait() }
+        }
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: Task9PreparedFactory())
+        let requested = request()
+        await controller.play(requested)
+        let original = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let stopGate = Task9OperationGate()
+        addTeardownBlock { await stopGate.release() }
+        await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
+            if checkpoint == .stopAfterWatchdog { await stopGate.enter() }
+        }
+        let stopReturned = Task9CompletionObservation()
+        let stop = Task {
+            await controller.stop(requestID: requested.id)
+            stopReturned.complete()
+        }
+        await stopGate.waitUntilEntered()
+        owner.monitor.emit(.recoveryFailed(stage: .eventRelayCapacity))
+        await fulfillment(of: [deactivationEntered], timeout: 2)
+        XCTAssertNil(registry.playbackRequestAdmissionSnapshot())
+        XCTAssertEqual(registry.cleanupReservationSnapshot()?.ticket, original.reservation)
+        XCTAssertNotNil(registry.ownedResourceSnapshot())
+        let cleanupRecord = try XCTUnwrap(task9OwnedRecords(registry).first {
+            if case .controllerCleanup = $0.payload { return true }
+            return false
+        })
+        guard case .controllerCleanup(let runner) = cleanupRecord.payload else {
+            return XCTFail("The same session must retain its original physical cleanup task")
+        }
+        let originalCleanup = try XCTUnwrap(registry.executor.sync { runner.task })
+        XCTAssertFalse(registry.executor.sync { runner.joinRequested },
+            "The completed play caller cannot supply Stop's required join")
+        let decision = expectation(description: "Stop either joins its original cleanup or returns")
+        let observer = Task {
+            while !Task.isCancelled {
+                if stopReturned.value || registry.executor.sync({ runner.joinRequested }) {
+                    decision.fulfill()
+                    return
+                }
+                await Task.yield()
+            }
+        }
+        await stopGate.release()
+        await fulfillment(of: [decision], timeout: 2)
+        observer.cancel()
+        await observer.value
+        XCTAssertFalse(stopReturned.value,
+            "Same-session invalidation during watchdog disarm cannot let Stop return before physical cleanup")
+        XCTAssertTrue(registry.executor.sync { runner.joinRequested },
+            "Stop must join the exact original session task without adopting a replacement")
+        XCTAssertEqual(registry.cleanupReservationSnapshot()?.ticket, original.reservation)
+        deactivationGate.signal()
+        await stop.value
+        await originalCleanup.value
+        await registry.joinOwnedTerminalCleanup(session: original.sessionIdentity)
+        XCTAssertNil(registry.ownedResourceSnapshot())
+        XCTAssertNil(registry.cleanupReservationSnapshot())
+        XCTAssertEqual(sdk.lock.withLock { sdk.deactivateCallCount }, 1)
+    }
+
+    func testObsoleteStopCannotJoinReplacementSessionTerminalCleanup() async throws {
+        let registry = ControlTaskRegistry(allocator: .init())
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: Task9PreparedFactory())
+        let first = request()
+        await controller.play(first)
+        let original = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let stopGate = Task9OperationGate()
+        addTeardownBlock { await stopGate.release() }
+        await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
+            if checkpoint == .stopAfterWatchdog { await stopGate.enter() }
+        }
+        let stopReturned = expectation(description: "Old Stop returns without joining replacement cleanup")
+        let obsoleteStop = Task {
+            await controller.stop(requestID: first.id)
+            stopReturned.fulfill()
+        }
+        await stopGate.waitUntilEntered()
+        await controller.play(request())
+        let replacement = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        XCTAssertNotEqual(replacement.sessionIdentity, original.sessionIdentity)
+        XCTAssertNotEqual(replacement.reservation, original.reservation)
+        let deactivationEntered = expectation(description: "Replacement cleanup reached its own SDK call")
+        let deactivationGate = DispatchSemaphore(value: 0)
+        defer { deactivationGate.signal() }
+        sdk.lock.withLock {
+            sdk.onDeactivate = { deactivationEntered.fulfill(); deactivationGate.wait() }
+        }
+        owner.monitor.emit(.recoveryFailed(stage: .eventRelayCapacity))
+        await fulfillment(of: [deactivationEntered], timeout: 2)
+        let cleanupRecord = try XCTUnwrap(task9OwnedRecords(registry).first {
+            if case .controllerCleanup = $0.payload { return true }
+            return false
+        })
+        guard case .controllerCleanup(let runner) = cleanupRecord.payload else {
+            return XCTFail("Replacement must retain its own physical cleanup task")
+        }
+        let replacementCleanup = try XCTUnwrap(registry.executor.sync { runner.task })
+        let replacementOwner = registry.outputResourceContextSnapshot()?.owner
+        let replacementFailure = registry.playbackStateSnapshot()
+        await stopGate.release()
+        await fulfillment(of: [stopReturned], timeout: 2)
+        XCTAssertFalse(registry.executor.sync { runner.joinRequested },
+            "An obsolete Stop cannot wait on a newer session's cleanup task")
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.sessionIdentity, replacement.sessionIdentity)
+        XCTAssertEqual(registry.cleanupReservationSnapshot()?.ticket, replacement.reservation)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, replacementOwner)
+        XCTAssertEqual(registry.playbackStateSnapshot(), replacementFailure)
+        deactivationGate.signal()
+        await replacementCleanup.value
+        await obsoleteStop.value
+        await registry.joinOwnedTerminalCleanup(session: replacement.sessionIdentity)
+        XCTAssertNil(registry.ownedResourceSnapshot())
+        XCTAssertNil(registry.cleanupReservationSnapshot())
+        XCTAssertEqual(sdk.lock.withLock { sdk.deactivateCallCount }, 2)
+    }
+
     func testPlayDuringResetConfigurationIsRetainedUntilExactlyThatConfigurationCompletes() async throws {
         try await assertPlayDuringResetConfiguration(invalidation: nil)
     }
@@ -3078,6 +3208,63 @@ final class Task9ProductionDeadlineTests: XCTestCase {
         XCTAssertEqual(fixture.factory.backends.last?.activationCount, 1)
         XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.sessionIdentity.requestID, replacementRequest.id)
         await fixture.controller.stop()
+    }
+
+    func testPauseAndResumeDuringPhysicalAcquisitionDoNotCreateBackendCleanupOwner() async throws {
+        let categoryEntered = expectation(description: "Original acquisition configuration is physically in flight")
+        let sdk = Task9SDKGate(categoryOrdinal: 1, entered: { categoryEntered.fulfill() })
+        defer { sdk.gate.signal() }
+        let registry = ControlTaskRegistry(allocator: .init())
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let factory = Task9PreparedFactory()
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: factory)
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "pause-acquisition",
+            streamURL: URL(string: "http://localhost/pause-acquisition.m3u8")!, title: "Pending acquisition")
+        let play = Task { await controller.play(request) }
+        await fulfillment(of: [categoryEntered], timeout: 2)
+        let original = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        XCTAssertEqual(original.phase, .pendingLeaseAcquisition)
+        XCTAssertNil(original.owner)
+        let configuration = try XCTUnwrap(task9OwnedRecords(registry).first {
+            $0.slot == .audioSessionRecovery && $0.phase == .running
+        }?.controlTaskTicket)
+        func physicalPermitNonce() -> UInt64? {
+            registry.executor.sync {
+                let authority = task9Field("authority", of: registry)!
+                guard let permit = task9Field("audioSessionPermit", of: authority) else { return nil }
+                return task9Field("recordNonce", of: permit) as? UInt64
+            }
+        }
+        XCTAssertEqual(physicalPermitNonce(), configuration.nonce)
+        for paused in [true, true, false] {
+            await controller.setPaused(paused)
+            let pending = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            XCTAssertEqual(pending.sessionIdentity, original.sessionIdentity)
+            XCTAssertEqual(pending.sourceTask, original.sourceTask)
+            XCTAssertEqual(pending.phase, .pendingLeaseAcquisition)
+            XCTAssertNil(pending.owner, "Pending intent cannot leave a phantom pause owner for cold-start preparation")
+            XCTAssertNil(pending.suspend)
+            XCTAssertEqual(registry.executor.safetyIngress.snapshot.userPaused, paused)
+            XCTAssertFalse(try XCTUnwrap(pending.acquisitionDeadline).isParked,
+                "User pause cannot freeze an in-flight physical configuration call")
+            XCTAssertEqual(registry.phase(of: configuration), .running)
+            XCTAssertEqual(physicalPermitNonce(), configuration.nonce,
+                "Intent updates cannot fabricate completion of the original physical call")
+            XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 0)
+            XCTAssertTrue(factory.backends.isEmpty)
+        }
+        sdk.gate.signal()
+        await play.value
+        XCTAssertEqual(factory.backends.count, 1)
+        XCTAssertEqual(factory.backends.first?.activationCount, 1)
+        XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 1)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.sessionIdentity, original.sessionIdentity)
+        XCTAssertNil(registry.outputResourceContextSnapshot()?.owner)
+        await controller.stop()
+        XCTAssertNil(registry.ownedResourceSnapshot())
+        XCTAssertNil(registry.cleanupReservationSnapshot())
     }
 
     func testPostResetNewPlayRebuildsConfigurationOnlyAfterOriginalCleanupReturns() async throws {

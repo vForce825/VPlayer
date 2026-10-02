@@ -809,6 +809,13 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard controllerState.userPaused != paused else { return }
         controllerState.userPaused = paused
         advanceReadinessCycle()
+        if context.phase == .pendingLeaseAcquisition {
+            // Registry already folded intent and canceled any pending activation.
+            // The original acquisition caller still owns physical settlement and
+            // preparation; there is no backend to suspend or pause owner to create.
+            publish(paused ? .paused(request) : (systemPauseRequired ? .recovering(request) : .preparing(request)))
+            return
+        }
         if context.phase == .pendingSuccessorLease {
             publish(paused ? .paused(request) : .recovering(request))
             guard !paused, let run = admittedRun else { return }
@@ -896,6 +903,12 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         let reservation = registry.cleanupReservationSnapshot()?.ticket
         guard requestID != nil || reservation != nil else { return }
         let presentationSession = registry.outputResourceContextSnapshot()?.sessionIdentity
+        let originalCleanupTask: ControlTaskTicket?
+        if let session = presentationSession, let context = registry.outputResourceContextSnapshot(),
+           context.sessionIdentity == session, context.reservation == reservation,
+           let owner = context.owner, owner.reason.releasesLease {
+            originalCleanupTask = registry.outputCleanupOwnerTask(owner)
+        } else { originalCleanupTask = nil }
         userControlRevision &+= 1
         let stoppingControlRevision = userControlRevision
         recoveryCoordinator.cancelCurrentRecovery()
@@ -907,9 +920,24 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         #endif
         // The watchdog call is a real actor suspension. Do not read a replacement
         // request and accidentally adopt it as the target of this earlier Stop.
-        guard expectedRequestID == nil || !Task.isCancelled,
-              controllerState.request?.id == requestID, admittedRun == stoppingRun,
-              stoppingRun != nil || registry.cleanupReservationSnapshot()?.ticket == reservation else { return }
+        guard expectedRequestID == nil || !Task.isCancelled else { return }
+        guard controllerState.request?.id == requestID, admittedRun == stoppingRun,
+              stoppingRun != nil || registry.cleanupReservationSnapshot()?.ticket == reservation else {
+            // A same-session failure may already have revoked admission. Stop
+            // still owes that original physical join, without adopting a newer
+            // request or publishing state after its control scope became stale.
+            var cleanupTask = originalCleanupTask
+            if cleanupTask == nil, let session = presentationSession, let reservation,
+               let context = registry.outputResourceContextSnapshot(),
+               context.sessionIdentity == session, context.reservation == reservation,
+               let owner = context.owner, owner.reason.releasesLease {
+                cleanupTask = registry.outputCleanupOwnerTask(owner)
+            }
+            if let session = presentationSession, let cleanupTask {
+                await registry.joinOwnedTerminalCleanup(session: session, task: cleanupTask)
+            }
+            return
+        }
         terminalMetricsProvider = nil
         if let stoppingRun {
             _ = registry.cancelPlaybackRequest(.init(sessionID: stoppingRun.sessionID, requestID: stoppingRun.requestID))
