@@ -1,4 +1,4 @@
-name: Coalesced native EOS event diagnostic
+name: Paused coverage workspace validation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-eos-batch-${{ github.ref }}
+  group: macos-ci-paused-workspace-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-test:
     name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
@@ -65,7 +65,7 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify coalesced EOS and current fault ordering
+      - name: Verify workspace, store and physical capacity contracts
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -73,29 +73,45 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/EOSBatch.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesCoalescedPausedRelayAndRejectsChangedSecondRead \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesLaterPausedRelayAndRejectsChangedSecondRead \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeCoalescedCurrentAccessFaultWinsOverEndpointAndPausedRelay \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeCurrentItemAccessFaultCancelsPendingEndpointVerification \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeUnexpectedPauseWithoutEndpointNotificationStillRetires \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageOwnedEOSDeadlineSharesTimerAndStopRevokesPendingDelivery
-      - name: Report scoped EOSBatch failures
+            -resultBundlePath "$RUNNER_TEMP/PausedStorage.xcresult" \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests \
+            -only-testing:VPlayerTests/HLSResourceStoreTests \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests \
+            -only-testing:VPlayerTests/HLSCapacityTests
+      - name: Report scoped paused storage failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/EOSBatch.xcresult"
-
-      - name: Observe original native EOS batch and authority rejection
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorage.xcresult"
+      - name: Validate focused physical storage under Address Sanitizer
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+          xcodebuild -help > "$RUNNER_TEMP/xcodebuild-help.txt" 2>&1
+          grep -q -- '-enableAddressSanitizer' "$RUNNER_TEMP/xcodebuild-help.txt"
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/PausedStorageASan" -enableAddressSanitizer YES \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeEOSBatch.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageSystemEOSPublicationAndStopRaceNeverPublishAfterClose
-      - name: Report scoped NativeEOSBatch failures
+            -resultBundlePath "$RUNNER_TEMP/PausedStorageASan.xcresult" \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceRejectsExpandedPinsAndInvalidCapacities \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderMatchesExistingNestedReorderedAndHeldFragments \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceRejectsReentryWithoutInvalidatingOuterScope \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceHardCapacityFailureDoesNotAllocateOrLosePins \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderRejectsMissingCommonSampleAndRAPPrefixBytes \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow \
+            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedWindowRequiresItsOwnFrozenInitializationCompletion \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadOverflowClearsAllReferencesDuringConcurrentProducers \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingReleasesQueuedReferencesAndDeinitializesAfterJoin
+      - name: Report scoped Address Sanitizer failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeEOSBatch.xcresult"
-
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorageASan.xcresult"

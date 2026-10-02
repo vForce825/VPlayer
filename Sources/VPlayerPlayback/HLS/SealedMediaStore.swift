@@ -5,6 +5,8 @@
 import Foundation
 import CryptoKit
 import CoreMedia
+import Darwin
+import ObjectiveC
 
 struct HLSResourceKey: Sendable, Hashable {
     var itemGeneration: UInt64
@@ -88,6 +90,354 @@ struct SealedCoverageInput: @unchecked Sendable {
     let media: CompletedBodyEvidenceSnapshot
     let map: SealedDecodeCoverageMap
     let initialization: CompletedBodyEvidenceSnapshot
+}
+
+/// Capacity for one paused lease's exact pinned map set. This owns no current
+/// source/finality/native authority. Only its store's linearization domain may
+/// mutate its cursors; keeping this object across waits keeps admission live.
+final class PausedCoverageWorkspace: @unchecked Sendable {
+    private struct MapCursor {
+        var slot: UInt16 = 0
+        var offset: UInt16 = 0
+        var count: UInt16 = 0
+        var position: UInt16 = 0
+        var identity: SealedMediaBackingIdentity?
+        var eligibility = PausedDecodeCoverageEligibility()
+        var next: FMP4PresentationRange?
+        var selected = false
+        var input: SealedCoverageInput?
+    }
+
+    struct AllocationLimits {
+        let root: Int
+        let ordinals: Int
+        let cursors: Int
+        let heap: Int
+        let context: Int
+        let application: Int
+        var total: Int { root + ordinals + cursors + heap + context + application }
+    }
+
+    fileprivate let store: SealedMediaStore
+    private let owner: PausedWindowCoverageLease
+    private let reservation: PlaybackResourceContextReservation
+    let mapCount: Int
+    let sampleCount: Int
+    private let ordinals: UnsafeMutablePointer<UInt8>
+    private let cursors: UnsafeMutablePointer<MapCursor>
+    private let heap: UnsafeMutablePointer<UInt8>
+    private var heapCount = 0
+    private var inUse = false
+    let reservationBytes: Int
+
+    static func allocationLimits(mapCount: Int, sampleCount: Int) throws -> AllocationLimits {
+        guard (1...128).contains(mapCount), sampleCount >= mapCount,
+              sampleCount <= mapCount * 256 else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        return .init(root: malloc_good_size(class_getInstanceSize(Self.self)),
+            ordinals: malloc_good_size(sampleCount * MemoryLayout<UInt8>.stride),
+            cursors: malloc_good_size(mapCount * MemoryLayout<MapCursor>.stride),
+            heap: malloc_good_size(mapCount * MemoryLayout<UInt8>.stride),
+            context: malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self)),
+            application: malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self)))
+    }
+
+    var actualAllocationBytes: AllocationLimits? {
+        guard let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation)
+            else { return nil }
+        return .init(root: malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())),
+            ordinals: malloc_size(UnsafeRawPointer(ordinals)),
+            cursors: malloc_size(UnsafeRawPointer(cursors)), heap: malloc_size(UnsafeRawPointer(heap)),
+            context: tokens.context, application: tokens.application)
+    }
+
+    var knownAllocationBytes: Int {
+        guard let actual = actualAllocationBytes else {
+            preconditionFailure("Paused workspace lost its registered allocation tokens")
+        }
+        return actual.total
+    }
+
+    /// Domain-bound scope for a complete verification. Recursive use is rejected
+    /// before changing any state, including the outer operation's cleanup duty.
+    func withExclusiveUse<Result>(_ operation: () throws -> Result) throws -> Result {
+        try store.domain.sync {
+            guard !inUse else { throw CompletedMediaEvidenceError.identityMismatch }
+            inUse = true
+            defer {
+                for index in 0..<mapCount {
+                    cursors[index].input = nil
+                    cursors[index].next = nil
+                    cursors[index].eligibility = .init()
+                    cursors[index].selected = false
+                }
+                heapCount = 0
+                inUse = false
+            }
+            return try operation()
+        }
+    }
+
+    /// Called while the store domain is held, before any HTTP completion freeze.
+    fileprivate static func reserve(store: SealedMediaStore, owner: PausedWindowCoverageLease) throws -> Self {
+        guard owner.metadataStore === store else { throw CompletedMediaEvidenceError.identityMismatch }
+        var maps = 0
+        var samples = 0
+        for slot in 0..<300 {
+            guard let map = store.pausedWorkspaceMap(slot: slot, owner: owner) else { continue }
+            maps += 1
+            samples = try HLSChecked.add(samples, map.samples.count)
+            guard maps <= 128, samples <= 32_768 else {
+                throw CompletedMediaEvidenceError.capacityExceeded
+            }
+        }
+        let limits = try allocationLimits(mapCount: maps, sampleCount: samples)
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: limits.total)
+        do {
+            let workspace = Self(store: store, owner: owner, reservation: reservation,
+                mapCount: maps, sampleCount: samples, reservationBytes: limits.total)
+            try PlaybackResourceContextLedger.shared.rebind(reservation,
+                to: .object(ObjectIdentifier(workspace)))
+            guard let actual = workspace.actualAllocationBytes,
+                  actual.root <= limits.root, actual.ordinals <= limits.ordinals,
+                  actual.cursors <= limits.cursors, actual.heap <= limits.heap,
+                  actual.context <= limits.context, actual.application <= limits.application else {
+                throw LoopbackHTTPReservationError.hardCapacityExceeded
+            }
+            var index = 0
+            var offset = 0
+            for slot in 0..<300 {
+                guard let map = store.pausedWorkspaceMap(slot: slot, owner: owner) else { continue }
+                workspace.cursors[index].slot = UInt16(slot)
+                workspace.cursors[index].offset = UInt16(offset)
+                workspace.cursors[index].count = UInt16(map.samples.count)
+                workspace.cursors[index].identity = map.resourceIdentity
+                try PausedDecodeCoverageOrder.prepare(map: map,
+                    ordinals: .init(start: workspace.ordinals + offset, count: map.samples.count))
+                index += 1
+                offset += map.samples.count
+            }
+            return workspace
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(store: SealedMediaStore, owner: PausedWindowCoverageLease,
+                 reservation: PlaybackResourceContextReservation, mapCount: Int,
+                 sampleCount: Int, reservationBytes: Int) {
+        self.store = store
+        self.owner = owner
+        self.reservation = reservation
+        self.mapCount = mapCount
+        self.sampleCount = sampleCount
+        self.reservationBytes = reservationBytes
+        ordinals = .allocate(capacity: sampleCount)
+        ordinals.initialize(repeating: 0, count: sampleCount)
+        cursors = .allocate(capacity: mapCount)
+        cursors.initialize(repeating: MapCursor(), count: mapCount)
+        heap = .allocate(capacity: mapCount)
+        heap.initialize(repeating: 0, count: mapCount)
+    }
+
+    private func validateMembership() throws {
+        guard owner.metadataStore === store else { throw CompletedMediaEvidenceError.identityMismatch }
+        var index = 0
+        for slot in 0..<300 {
+            guard let map = store.pausedWorkspaceMap(slot: slot, owner: owner) else { continue }
+            guard index < mapCount, cursors[index].slot == slot,
+                  cursors[index].identity == map.resourceIdentity,
+                  Int(cursors[index].count) == map.samples.count else {
+                throw CompletedMediaEvidenceError.identityMismatch
+            }
+            index += 1
+        }
+        guard index == mapCount else { throw CompletedMediaEvidenceError.identityMismatch }
+    }
+
+    private func order(at index: Int) -> UnsafeBufferPointer<UInt8> {
+        .init(start: ordinals + Int(cursors[index].offset), count: Int(cursors[index].count))
+    }
+
+    private func intersection(_ map: SealedDecodeCoverageMap, at index: Int,
+                              requested: FMP4PresentationRange) throws -> FMP4PresentationRange? {
+        try PausedDecodeCoverageOrder.intersection(map: map, ordinals: order(at: index), requested: requested)
+    }
+
+    private func insertHeap(_ index: Int) throws {
+        try PausedCoverageTimeHeap.insert(UInt8(index),
+            storage: .init(start: heap, count: mapCount), count: &heapCount,
+            rangeAt: { self.cursors[$0].next! })
+    }
+
+    private func popHeap() throws -> Int {
+        Int(try PausedCoverageTimeHeap.pop(storage: .init(start: heap, count: mapCount),
+            count: &heapCount, rangeAt: { self.cursors[$0].next! }))
+    }
+
+    private func advance(_ index: Int, view: ServedCoverageDependencies,
+                         requested: FMP4PresentationRange) throws {
+        guard let input = cursors[index].input else {
+            throw CompletedMediaEvidenceError.identityMismatch
+        }
+        var position = Int(cursors[index].position)
+        cursors[index].next = try PausedDecodeCoverageOrder.nextRange(map: input.map,
+            ordinals: order(at: index), cursor: &position, requested: requested,
+            eligibility: cursors[index].eligibility)
+        cursors[index].position = UInt16(position)
+    }
+
+    /// Drains all eligible ranges, including after coverage reaches the end, so
+    /// checked arithmetic failures in later samples cannot be hidden by early exit.
+    private func covers(requested: FMP4PresentationRange, view: ServedCoverageDependencies,
+                        samples: Bool) throws -> Bool {
+        heapCount = 0
+        for index in 0..<mapCount where cursors[index].selected {
+            cursors[index].position = 0
+            if samples { try advance(index, view: view, requested: requested) }
+            else {
+                guard let input = cursors[index].input else {
+                    throw CompletedMediaEvidenceError.identityMismatch
+                }
+                cursors[index].next = try intersection(input.map, at: index, requested: requested)
+            }
+            if cursors[index].next != nil { try insertHeap(index) }
+        }
+        var cursor = requested.start
+        var gap = false
+        while heapCount > 0 {
+            let index = try popHeap()
+            let range = cursors[index].next!
+            if try HLSChecked.compare(range.start, cursor) > 0 { gap = true }
+            if !gap, try HLSChecked.compare(range.end, cursor) > 0 { cursor = range.end }
+            if samples {
+                try advance(index, view: view, requested: requested)
+                if cursors[index].next != nil { try insertHeap(index) }
+            }
+        }
+        return try !gap && HLSChecked.compare(cursor, requested.end) >= 0
+    }
+
+    fileprivate func receipt(authority: SealedCoverageIssuanceAuthority, itemGeneration: UInt64,
+                             rendition: AudioRenditionIdentity, requested: FMP4PresentationRange) throws
+        -> FrozenRenditionCoverageReceipt? {
+        try withExclusiveUse {
+            try receiptLocked(authority: authority, itemGeneration: itemGeneration,
+                rendition: rendition, requested: requested)
+        }
+    }
+
+    private func receiptLocked(authority: SealedCoverageIssuanceAuthority, itemGeneration: UInt64,
+                               rendition: AudioRenditionIdentity, requested: FMP4PresentationRange) throws
+        -> FrozenRenditionCoverageReceipt? {
+        try validateMembership()
+        guard owner.completionIsFrozen else { return nil }
+        var existingIndex: UInt8?
+        for index in UInt8(0)..<2 {
+            if let coverage = owner.coverage(at: index),
+               coverage.rendition == rendition, coverage.requested == requested { existingIndex = index }
+        }
+        if existingIndex == nil, owner.coverage(at: 1) != nil {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        let coverageIndex = existingIndex ?? (owner.coverage(at: 0) == nil ? UInt8(0) : UInt8(1))
+        let view = owner.dependencies(at: coverageIndex)
+        var indices = FrozenCoverageIndices()
+        for index in 0..<mapCount {
+            cursors[index].selected = false
+            cursors[index].next = nil
+            guard let input = view.input(at: Int(cursors[index].slot)),
+                  input.media.renditionIdentity == rendition,
+                  let clipped = try intersection(input.map, at: index, requested: requested) else { continue }
+            cursors[index].input = input
+            let eligibility = try PausedDecodeCoverageOrder.eligibility(map: input.map, evidence: input.media)
+            cursors[index].eligibility = eligibility
+            var position = 0
+            var contributes = false
+            while try PausedDecodeCoverageOrder.nextRange(map: input.map, ordinals: order(at: index),
+                cursor: &position, requested: clipped, eligibility: eligibility) != nil { contributes = true }
+            guard contributes else { continue }
+            cursors[index].selected = true
+            let candidate = view.dependency(input)
+            var insertion = Int(indices.count)
+            while insertion > 0 {
+                let previous = Int(indices[insertion - 1])
+                guard ServedCoverageDependencies.precedes(candidate,
+                    view.dependency(cursors[previous].input!)) else { break }
+                indices[insertion] = indices[insertion - 1]
+                insertion -= 1
+            }
+            indices[insertion] = UInt16(index)
+            indices.count += 1
+        }
+        let previousCount = existingIndex == nil ? owner.coverage(at: 0).map { Int($0.count) } ?? 0 : 0
+        guard previousCount + Int(indices.count) <= 128 else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        guard indices.count > 0, try covers(requested: requested, view: view, samples: true),
+              try covers(requested: requested, view: view, samples: false) else { return nil }
+        var resourceSlots = FrozenCoverageIndices()
+        resourceSlots.count = indices.count
+        for ordinal in 0..<Int(indices.count) {
+            resourceSlots[ordinal] = cursors[Int(indices[ordinal])].slot
+        }
+        if let existingIndex {
+            guard owner.coverage(at: existingIndex)?.count == indices.count else {
+                throw CompletedMediaEvidenceError.identityMismatch
+            }
+            for ordinal in 0..<Int(indices.count) {
+                guard owner.coverageResource(at: ordinal, coverage: existingIndex) == resourceSlots[ordinal] else {
+                    throw CompletedMediaEvidenceError.identityMismatch
+                }
+            }
+        } else {
+            owner.setCoverage(.init(rendition: rendition, requested: requested,
+                offset: UInt8(previousCount), count: indices.count), indices: resourceSlots, at: coverageIndex)
+        }
+        var hash = SHA256()
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var bigEndian = value.bigEndian
+            withUnsafeBytes(of: &bigEndian) { hash.update(bufferPointer: $0) }
+        }
+        func appendUUID(_ value: UUID) {
+            withUnsafeBytes(of: value.uuid) { hash.update(bufferPointer: $0) }
+        }
+        func appendDigest(_ value: Data) { append(UInt64(value.count)); hash.update(data: value) }
+        append(itemGeneration)
+        append(rendition.rawValue)
+        for ordinal in view.indices {
+            // Hash in canonical dependency order, independently of the time heap.
+            let index = Int(indices[ordinal])
+            let input = cursors[index].input!
+            let dependency = view.dependency(input)
+            let range = try intersection(input.map, at: index, requested: requested)!
+            append(dependency.mediaEpoch)
+            appendUUID(dependency.epochProofIdentity)
+            appendUUID(dependency.segmentReceiptIdentity)
+            appendUUID(dependency.initializationBackingIdentity.rawValue)
+            appendUUID(dependency.mediaBackingIdentity.rawValue)
+            appendUUID(dependency.initializationEvidenceIdentity)
+            appendUUID(dependency.mediaEvidenceIdentity)
+            appendDigest(input.initialization.sealedDigest)
+            appendDigest(input.media.sealedDigest)
+            append(range.start.value)
+            append(UInt64(range.start.timescale))
+            append(range.end.value)
+            append(UInt64(range.end.timescale))
+        }
+        return .init(authority: authority, renditionIdentity: rendition, itemGeneration: itemGeneration,
+            canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested, dependencies: view)
+    }
+
+    deinit {
+        heap.deinitialize(count: mapCount); heap.deallocate()
+        cursors.deinitialize(count: mapCount); cursors.deallocate()
+        ordinals.deinitialize(count: sampleCount); ordinals.deallocate()
+        PlaybackResourceContextLedger.shared.release(reservation)
+    }
 }
 
 /// 只有 store 自身能构造的签发权；coverage 类型虽可见，外部无法创建有效 receipt。
@@ -980,6 +1330,31 @@ final class SealedMediaStore: @unchecked Sendable {
                 renditionIdentity: verified.renditionIdentity, itemGeneration: verified.itemGeneration,
                 canonicalCoverageDigest: verified.canonicalCoverageDigest,
                 presentationRange: verified.presentationRange, dependencies: verified.dependencies)
+        }
+    }
+
+    /// This admission is only for the exact pinned sealed maps. It is valid
+    /// before completion freezes and conveys no playback or publication authority.
+    func reservePausedCoverageWorkspace(owner: PausedWindowCoverageLease) throws -> PausedCoverageWorkspace {
+        try domain.sync { try PausedCoverageWorkspace.reserve(store: self, owner: owner) }
+    }
+
+    fileprivate func pausedWorkspaceMap(slot: Int, owner: PausedWindowCoverageLease)
+        -> SealedDecodeCoverageMap? {
+        guard owner.metadataStore === self else { return nil }
+        return resources.values.first(where: {
+            $0.preparationPins & owner.slot != 0 && Int($0.preparationSlot) == slot
+                && $0.object.kind == .media
+        })?.decodeMap
+    }
+
+    func pausedWindowCoverageReceipt(workspace: PausedCoverageWorkspace,
+                                     rendition: AudioRenditionIdentity,
+                                     requested: FMP4PresentationRange) throws -> FrozenRenditionCoverageReceipt? {
+        try domain.sync {
+            guard workspace.store === self else { throw CompletedMediaEvidenceError.identityMismatch }
+            return try workspace.receipt(authority: coverageAuthority, itemGeneration: itemGeneration,
+                rendition: rendition, requested: requested)
         }
     }
 

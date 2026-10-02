@@ -667,6 +667,179 @@ struct SealedDecodeCoverageMap: Sendable {
 
 }
 
+/// Paused verification orders immutable sample ordinals in caller-owned storage.
+/// It neither constructs Array backing nor changes the startup coverage path.
+struct PausedDecodeCoverageEligibility {
+    private var bits = SIMD4<UInt64>(repeating: 0)
+    var videoHold: ExactMediaTime?
+
+    func contains(_ ordinal: Int) -> Bool {
+        bits[ordinal / 64] & (UInt64(1) << (ordinal % 64)) != 0
+    }
+    mutating func insert(_ ordinal: Int) {
+        bits[ordinal / 64] |= UInt64(1) << (ordinal % 64)
+    }
+}
+
+/// A fixed UInt8 minheap; ranges stay in the caller's already charged records.
+/// The nonescaping projection is never stored and no element backing is created.
+enum PausedCoverageTimeHeap {
+    private static func precedes(_ left: UInt8, _ right: UInt8,
+                                 rangeAt: (Int) -> FMP4PresentationRange) throws -> Bool {
+        let lhs = rangeAt(Int(left))
+        let rhs = rangeAt(Int(right))
+        let start = try HLSChecked.compare(lhs.start, rhs.start)
+        if start != 0 { return start < 0 }
+        return try HLSChecked.compare(lhs.end, rhs.end) < 0
+    }
+
+    static func insert(_ index: UInt8, storage: UnsafeMutableBufferPointer<UInt8>,
+                       count: inout Int, rangeAt: (Int) -> FMP4PresentationRange) throws {
+        precondition(count < storage.count)
+        var child = count
+        count += 1
+        storage[child] = index
+        while child > 0 {
+            let parent = (child - 1) / 2
+            guard try precedes(storage[child], storage[parent], rangeAt: rangeAt) else { break }
+            storage.swapAt(parent, child)
+            child = parent
+        }
+    }
+
+    static func pop(storage: UnsafeMutableBufferPointer<UInt8>, count: inout Int,
+                    rangeAt: (Int) -> FMP4PresentationRange) throws -> UInt8 {
+        precondition(count > 0)
+        let result = storage[0]
+        count -= 1
+        guard count > 0 else { return result }
+        storage[0] = storage[count]
+        var parent = 0
+        while parent * 2 + 1 < count {
+            var child = parent * 2 + 1
+            if child + 1 < count,
+               try precedes(storage[child + 1], storage[child], rangeAt: rangeAt) { child += 1 }
+            guard try precedes(storage[child], storage[parent], rangeAt: rangeAt) else { break }
+            storage.swapAt(parent, child)
+            parent = child
+        }
+        return result
+    }
+}
+
+enum PausedDecodeCoverageOrder {
+    /// O(n log n) heapsort, with constant auxiliary storage. UInt8 encodes
+    /// ordinals 0...255; counts and positions must remain wider than UInt8.
+    static func prepare(map: SealedDecodeCoverageMap,
+                        ordinals: UnsafeMutableBufferPointer<UInt8>) throws {
+        guard ordinals.count == map.samples.count, (1...256).contains(ordinals.count) else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        for index in ordinals.indices { ordinals[index] = UInt8(index) }
+        func precedes(_ left: UInt8, _ right: UInt8) throws -> Bool {
+            let lhs = map.samples[Int(left)].presentationRange
+            let rhs = map.samples[Int(right)].presentationRange
+            let start = try HLSChecked.compare(lhs.start, rhs.start)
+            if start != 0 { return start < 0 }
+            return try HLSChecked.compare(lhs.end, rhs.end) < 0
+        }
+        func sift(_ root: Int, _ end: Int) throws {
+            var parent = root
+            while parent * 2 + 1 < end {
+                var child = parent * 2 + 1
+                if child + 1 < end, try precedes(ordinals[child], ordinals[child + 1]) {
+                    child += 1
+                }
+                guard try precedes(ordinals[parent], ordinals[child]) else { return }
+                ordinals.swapAt(parent, child)
+                parent = child
+            }
+        }
+        if ordinals.count > 1 {
+            for root in stride(from: ordinals.count / 2 - 1, through: 0, by: -1) {
+                try sift(root, ordinals.count)
+            }
+            for end in stride(from: ordinals.count - 1, through: 1, by: -1) {
+                ordinals.swapAt(0, end)
+                try sift(0, end)
+            }
+        }
+    }
+
+    static func intersection(map: SealedDecodeCoverageMap,
+                             ordinals: UnsafeBufferPointer<UInt8>,
+                             requested: FMP4PresentationRange) throws -> FMP4PresentationRange? {
+        guard ordinals.count == map.samples.count, let first = ordinals.first,
+              let last = ordinals.last else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        let firstRange = map.samples[Int(first)].presentationRange
+        let lastRange = map.samples[Int(last)].presentationRange
+        let start = try HLSChecked.compare(firstRange.start, requested.start) > 0
+            ? firstRange.start : requested.start
+        // Preserve the existing lexicographic-last end, including nested ranges.
+        let end = try HLSChecked.compare(lastRange.end, requested.end) < 0
+            ? lastRange.end : requested.end
+        guard try HLSChecked.compare(start, end) < 0 else { return nil }
+        return try .init(start: start, duration: end.subtracting(start))
+    }
+
+    static func videoHold(map: SealedDecodeCoverageMap) throws -> ExactMediaTime? {
+        guard map.mediaType == .video, let first = map.samples.first else { return nil }
+        var maximum = first.presentationRange.duration
+        for sample in map.samples.dropFirst() {
+            if try HLSChecked.compare(sample.presentationRange.duration, maximum) > 0 {
+                maximum = sample.presentationRange.duration
+            }
+        }
+        let multiplied = maximum.value.multipliedReportingOverflow(by: 3)
+        guard !multiplied.overflow else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        return .init(value: multiplied.partialValue, timescale: maximum.timescale)
+    }
+
+    /// Every required byte span is queried once. A video prefix is complete iff
+    /// no missing decode ordinal is at or after this sample's nearest RAP.
+    static func eligibility(map: SealedDecodeCoverageMap,
+                            evidence: CompletedBodyEvidenceSnapshot) throws
+        -> PausedDecodeCoverageEligibility {
+        var result = PausedDecodeCoverageEligibility()
+        guard map.commonByteSpans.allSatisfy(evidence.covers) else { return result }
+        result.videoHold = try videoHold(map: map)
+        var lastMissing = -1
+        for index in map.samples.indices {
+            let sample = map.samples[index]
+            let complete = evidence.covers(sample.byteSpan)
+            if !complete { lastMissing = index }
+            if map.mediaType == .audio ? complete
+                : Int(sample.nearestRandomAccessOrdinal) > lastMissing {
+                result.insert(index)
+            }
+        }
+        return result
+    }
+
+    /// Emits individual eligible clipped intervals in nondecreasing start order.
+    /// A global heap may merge them without materializing per-map unions.
+    static func nextRange(map: SealedDecodeCoverageMap,
+                          ordinals: UnsafeBufferPointer<UInt8>, cursor: inout Int,
+                          requested: FMP4PresentationRange,
+                          eligibility: PausedDecodeCoverageEligibility) throws -> FMP4PresentationRange? {
+        while cursor < ordinals.count {
+            let ordinal = Int(ordinals[cursor])
+            cursor += 1
+            guard eligibility.contains(ordinal) else { continue }
+            let range = map.samples[ordinal].presentationRange
+            guard try HLSChecked.compare(range.start, requested.end) < 0,
+                  try HLSChecked.compare(requested.start, range.end) < 0 else { continue }
+            let start = try HLSChecked.compare(range.start, requested.start) < 0
+                ? requested.start : range.start
+            let heldEnd = try eligibility.videoHold.map { try range.end.adding($0) } ?? range.end
+            let end = try HLSChecked.compare(heldEnd, requested.end) > 0 ? requested.end : heldEnd
+            guard try HLSChecked.compare(start, end) < 0 else { continue }
+            return try .init(start: start, duration: end.subtracting(start))
+        }
+        return nil
+    }
+}
+
 /// 只读遍历已封口 init/fragment；保存最终固定上限的 sample 表，不复制媒体或物化 box 树。
 private enum FMP4DecodeMapParser {
     private struct Box {

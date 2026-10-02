@@ -209,6 +209,501 @@ final class LoopbackHTTPServerTests: XCTestCase {
             startup.canonicalCoverageDigest)
     }
 
+    func testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        let media = try XCTUnwrap(playlist.resources.first)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let initialization = try XCTUnwrap(playlist.initializationResources.first)
+        let requested = try XCTUnwrap(map.samples.first).presentationRange
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        for _ in 0..<3 {
+            var owner: PausedWindowCoverageLease? = try .reserve()
+            _ = try XCTUnwrap(owner).retainMetadata(in: store, key: media)
+            _ = try XCTUnwrap(owner).retainMetadata(in: store, key: initialization)
+            var workspace: PausedCoverageWorkspace? = try store.reservePausedCoverageWorkspace(
+                owner: XCTUnwrap(owner))
+            let admitted = try XCTUnwrap(workspace)
+            XCTAssertEqual(admitted.mapCount, 1)
+            XCTAssertEqual(admitted.sampleCount, map.samples.count)
+            XCTAssertLessThanOrEqual(admitted.knownAllocationBytes, admitted.reservationBytes)
+            XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: admitted,
+                rendition: .init(rawValue: 1), requested: requested))
+            for key in [media, initialization] {
+                XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                    target: fixture.server.path(for: key)).status, 200)
+            }
+            XCTAssertTrue(waitUntil(timeout: 2) {
+                store.completedEvidenceSnapshot(for: media)?.isComplete == true
+                    && store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+            })
+            try XCTUnwrap(owner).freezeCompletedResources()
+            let receipt = try XCTUnwrap(store.pausedWindowCoverageReceipt(workspace: admitted,
+                rendition: .init(rawValue: 1), requested: requested))
+            // A distinct owner has no cached descriptor, so legacy selection
+            // and union validation run independently rather than taking its cache hit.
+            let legacy = try PausedWindowCoverageLease.reserve()
+            _ = try legacy.retainMetadata(in: store, key: media)
+            _ = try legacy.retainMetadata(in: store, key: initialization)
+            try legacy.freezeCompletedResources()
+            XCTAssertNil(legacy.coverage(at: 0))
+            let legacyReceipt = try XCTUnwrap(store.pausedWindowCoverageReceipt(owner: legacy,
+                rendition: .init(rawValue: 1), requested: requested))
+            XCTAssertEqual(receipt.canonicalCoverageDigest, legacyReceipt.canonicalCoverageDigest)
+            XCTAssertEqual(receipt.dependencies, legacyReceipt.dependencies)
+            owner = nil
+            workspace = nil
+            withExtendedLifetime((admitted, receipt, legacy, legacyReceipt)) {}
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testPausedCoverageWorkspaceRejectsExpandedPinsAndInvalidCapacities() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        XCTAssertGreaterThanOrEqual(playlist.resources.count, 2)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: playlist.resources[0])
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        _ = try owner.retainMetadata(in: store, key: playlist.resources[1])
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: playlist.resources[0]))
+        XCTAssertThrowsError(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: XCTUnwrap(map.samples.first).presentationRange))
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        for dimensions in [(0, 0), (129, 129), (1, 257), (128, 32_769)] {
+            XCTAssertThrowsError(try PausedCoverageWorkspace.allocationLimits(
+                mapCount: dimensions.0, sampleCount: dimensions.1))
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testPausedDecodeOrderMatchesExistingNestedReorderedAndHeldFragments() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            fixture.server.completedEvidence(for: key)?.isComplete == true
+        })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        XCTAssertTrue(evidence.isComplete)
+        func range(_ start: Int64, _ duration: Int64) throws -> FMP4PresentationRange {
+            try .init(start: .init(value: start, timescale: 100),
+                      duration: .init(value: duration, timescale: 100))
+        }
+        // The latest start has a smaller end than the containing earlier sample.
+        // intersection must preserve lexicographic-last semantics, not max(end).
+        let ranges = try [range(9, 1), range(0, 20), range(8, 2), range(0, 2)]
+        let samples = ranges.enumerated().map { index, range in
+            SealedDecodeSampleEntry(decodeOrdinal: UInt16(index), presentationRange: range,
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
+                isRandomAccess: index == 0, containsInBandConfiguration: false)
+        }
+        let map = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8], samples: samples)
+        let request = try range(0, 30)
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256) { storage in
+            let order = UnsafeMutableBufferPointer(rebasing: storage[..<samples.count])
+            try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+            let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
+            XCTAssertEqual(try PausedDecodeCoverageOrder.intersection(
+                map: map, ordinals: UnsafeBufferPointer(order), requested: request),
+                try map.intersection(with: request))
+            var cursor = 0
+            var actual: [FMP4PresentationRange] = []
+            while let next = try PausedDecodeCoverageOrder.nextRange(map: map,
+                ordinals: UnsafeBufferPointer(order), cursor: &cursor,
+                requested: request, eligibility: eligibility) {
+                if let previous = actual.last, CMTimeCompare(next.start.cmTime, previous.end.cmTime) <= 0 {
+                    let end = CMTimeCompare(next.end.cmTime, previous.end.cmTime) > 0
+                        ? next.end : previous.end
+                    actual[actual.count - 1] = try .init(start: previous.start,
+                        duration: end.subtracting(previous.start))
+                } else { actual.append(next) }
+            }
+            XCTAssertEqual(actual, try map.coveredFragments(by: evidence, intersecting: request))
+        }
+        let nearLimit = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+            samples: [.init(decodeOrdinal: 0,
+                presentationRange: .init(start: Task19.time(Int64.max - 3), duration: Task19.time(1)),
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
+                isRandomAccess: true, containsInBandConfiguration: false)])
+        let nearLimitRequest = nearLimit.samples[0].presentationRange
+        XCTAssertThrowsError(try nearLimit.coveredFragments(by: evidence, intersecting: nearLimitRequest))
+        XCTAssertThrowsError(try pausedFragments(nearLimit, evidence: evidence, requested: nearLimitRequest))
+    }
+
+    func testPausedCoverageWorkspaceRejectsReentryWithoutInvalidatingOuterScope() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        let request = try XCTUnwrap(store.decodeCoverageMap(for: media)?.samples.first).presentationRange
+        let charged = PlaybackResourceContextLedger.shared.chargedBytes
+        try workspace.withExclusiveUse {
+            XCTAssertThrowsError(try store.pausedWindowCoverageReceipt(workspace: workspace,
+                rendition: .init(rawValue: 1), requested: request))
+            XCTAssertThrowsError(try workspace.withExclusiveUse { XCTFail("Nested body must not run") })
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+        }
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: request))
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+    }
+
+    func testPausedCoverageWorkspaceHardCapacityFailureDoesNotAllocateOrLosePins() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        let ledger = PlaybackResourceContextLedger.shared
+        let baseline = ledger.chargedBytes
+        let blocker = try ledger.reserve(allocationIdentity: .stable(UUID()),
+            bytes: PlaybackResourceContextLedger.hardBytes - baseline)
+        XCTAssertThrowsError(try store.reservePausedCoverageWorkspace(owner: owner)) { error in
+            XCTAssertEqual(error as? LoopbackHTTPReservationError, .hardCapacityExceeded)
+        }
+        XCTAssertEqual(ledger.chargedBytes, PlaybackResourceContextLedger.hardBytes)
+        ledger.release(blocker)
+        XCTAssertEqual(ledger.chargedBytes, baseline)
+        XCTAssertFalse(store.preparationLeaseChargeSnapshot(ownerSlot: owner.slot).identities.isEmpty)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        XCTAssertEqual(workspace.mapCount, 1)
+    }
+
+    func testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        let media = try XCTUnwrap(playlist.resources.first)
+        let initialization = try XCTUnwrap(playlist.initializationResources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        _ = try owner.retainMetadata(in: store, key: initialization)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: media)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) { store.completedEvidenceSnapshot(for: media)?.isComplete == true })
+        try owner.freezeCompletedResources()
+        let request = try XCTUnwrap(store.decodeCoverageMap(for: media)?.samples.first).presentationRange
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: request))
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: initialization)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+        })
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: request))
+        XCTAssertNil(owner.coverage(at: 0))
+    }
+
+    private func pausedFragments(_ map: SealedDecodeCoverageMap,
+                                 evidence: CompletedBodyEvidenceSnapshot,
+                                 requested: FMP4PresentationRange) throws -> [FMP4PresentationRange] {
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: map.samples.count) { order in
+            try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+            let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
+            var cursor = 0
+            var ranges: [FMP4PresentationRange] = []
+            while let next = try PausedDecodeCoverageOrder.nextRange(map: map,
+                ordinals: UnsafeBufferPointer(order), cursor: &cursor,
+                requested: requested, eligibility: eligibility) {
+                if let previous = ranges.last,
+                   CMTimeCompare(next.start.cmTime, previous.end.cmTime) <= 0 {
+                    let end = CMTimeCompare(next.end.cmTime, previous.end.cmTime) > 0 ? next.end : previous.end
+                    ranges[ranges.count - 1] = try .init(start: previous.start,
+                        duration: end.subtracting(previous.start))
+                } else { ranges.append(next) }
+            }
+            return ranges
+        }
+    }
+
+    func testPausedDecodeOrderRejectsMissingCommonSampleAndRAPPrefixBytes() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key), headers: ["Range": "bytes=16-23"]).status, 206)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            fixture.server.completedEvidence(for: key)?.covers(16..<24) == true
+        })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        XCTAssertFalse(evidence.covers(0..<16))
+        func sample(_ ordinal: UInt16, span: Range<Int>, start: Int64) throws -> SealedDecodeSampleEntry {
+            .init(decodeOrdinal: ordinal,
+                presentationRange: try .init(start: Task19.time(start, 100), duration: Task19.time(2, 100)),
+                byteSpan: span, nearestRandomAccessOrdinal: 0, isRandomAccess: ordinal == 0,
+                containsInBandConfiguration: false)
+        }
+        let missingCommon = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+            samples: [sample(0, span: 16..<24, start: 0)])
+        let missingSample = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [16..<24],
+            samples: [sample(0, span: 8..<16, start: 0)])
+        let missingRAP = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [16..<24],
+            samples: [sample(0, span: 8..<16, start: 0), sample(1, span: 16..<24, start: 2)])
+        let request = try FMP4PresentationRange(start: Task19.time(0, 100), duration: Task19.time(4, 100))
+        for map in [missingCommon, missingSample, missingRAP] {
+            XCTAssertEqual(try pausedFragments(map, evidence: evidence, requested: request), [])
+            XCTAssertEqual(try pausedFragments(map, evidence: evidence, requested: request),
+                           try map.coveredFragments(by: evidence, intersecting: request))
+        }
+        // A held frame that ends at the requested start cannot supply coverage.
+        let before = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [16..<24],
+            samples: [sample(0, span: 16..<24, start: 0)])
+        let following = try FMP4PresentationRange(start: Task19.time(2, 100), duration: Task19.time(2, 100))
+        XCTAssertEqual(try pausedFragments(before, evidence: evidence, requested: following), [])
+    }
+
+    func testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap() throws {
+        func range(_ start: Int64, _ duration: Int64) throws -> FMP4PresentationRange {
+            try .init(start: Task19.time(start, 100), duration: Task19.time(duration, 100))
+        }
+        let firstMap = try [range(0, 8), range(20, 4)]
+        let complement = try [range(8, 8), range(16, 8)]
+        let realGap = try [range(9, 7), range(16, 8)]
+        let requested = try range(0, 24)
+        for (other, expected) in [(complement, true), (realGap, false)] {
+            let maps = [firstMap, other]
+            var positions = [0, 0]
+            var current = [maps[0][0], maps[1][0]]
+            try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 2) { heap in
+                var count = 0
+                for index in 0..<2 {
+                    try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                        count: &count, rangeAt: { current[$0] })
+                }
+                var cursor = requested.start
+                var gap = false
+                var emitted = 0
+                while count > 0 {
+                    let index = Int(try PausedCoverageTimeHeap.pop(storage: heap,
+                        count: &count, rangeAt: { current[$0] }))
+                    let next = current[index]
+                    if CMTimeCompare(next.start.cmTime, cursor.cmTime) > 0 { gap = true }
+                    if !gap, CMTimeCompare(next.end.cmTime, cursor.cmTime) > 0 { cursor = next.end }
+                    emitted += 1
+                    positions[index] += 1
+                    if positions[index] < maps[index].count {
+                        current[index] = maps[index][positions[index]]
+                        try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                            count: &count, rangeAt: { current[$0] })
+                    }
+                }
+                XCTAssertEqual(emitted, 4, "Every dependency stream must be drained")
+                XCTAssertEqual(!gap && cursor == requested.end, expected)
+            }
+        }
+    }
+
+    func testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents() async throws {
+        let fixture = try await Task20HTTPFixture.start(audioCount: 3)
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
+        let owner = try PausedWindowCoverageLease.reserve()
+        // All genuine currently published video/audio maps, not an authority-bypassing fixture.
+        for playlist in snapshot.media.values {
+            for key in playlist.initializationResources + playlist.resources {
+                _ = try owner.retainMetadata(in: store, key: key)
+                XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                    target: fixture.server.path(for: key)).status, 200)
+            }
+        }
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            snapshot.media.values.allSatisfy { playlist in
+                (playlist.initializationResources + playlist.resources).allSatisfy {
+                    store.completedEvidenceSnapshot(for: $0)?.isComplete == true
+                }
+            }
+        })
+        let admissionStart = ContinuousClock.now
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        let admissionDuration = admissionStart.duration(to: .now)
+        try owner.freezeCompletedResources()
+        let video = try XCTUnwrap(snapshot.media[1])
+        let firstMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(video.resources.first)))
+        let lastMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(video.resources.last)))
+        let audio = try XCTUnwrap(snapshot.media[2])
+        let firstAudioMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(audio.resources.first)))
+        let lastAudioMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(audio.resources.last)))
+        let videoStart = try XCTUnwrap(firstMap.samples.min {
+            CMTimeCompare($0.presentationRange.start.cmTime, $1.presentationRange.start.cmTime) < 0
+        }).presentationRange.start
+        let audioStart = try XCTUnwrap(firstAudioMap.samples.min {
+            CMTimeCompare($0.presentationRange.start.cmTime, $1.presentationRange.start.cmTime) < 0
+        }).presentationRange.start
+        let videoEnd = try XCTUnwrap(lastMap.samples.max {
+            CMTimeCompare($0.presentationRange.end.cmTime, $1.presentationRange.end.cmTime) < 0
+        }).presentationRange.end
+        let audioEnd = try XCTUnwrap(lastAudioMap.samples.max {
+            CMTimeCompare($0.presentationRange.end.cmTime, $1.presentationRange.end.cmTime) < 0
+        }).presentationRange.end
+        let start = CMTimeCompare(videoStart.cmTime, audioStart.cmTime) > 0 ? videoStart : audioStart
+        let end = CMTimeCompare(videoEnd.cmTime, audioEnd.cmTime) < 0 ? videoEnd : audioEnd
+        XCTAssertGreaterThan(CMTimeCompare(end.cmTime, start.cmTime), 0)
+        let requested = try FMP4PresentationRange(start: start, duration: end.subtracting(start))
+        let verificationStart = ContinuousClock.now
+        let videoReceipt = try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: requested)
+        let videoVerified = ContinuousClock.now
+        let audioReceipt = try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 2), requested: requested)
+        let audioVerified = ContinuousClock.now
+        XCTAssertNotNil(videoReceipt)
+        XCTAssertNotNil(audioReceipt)
+        XCTAssertEqual(owner.coverage(at: 0)?.rendition, .init(rawValue: 1))
+        XCTAssertEqual(owner.coverage(at: 1)?.rendition, .init(rawValue: 2))
+        let actual = try XCTUnwrap(workspace.actualAllocationBytes)
+        print("PAUSED_WORKSPACE maps=\(workspace.mapCount) samples=\(workspace.sampleCount) "
+            + "root=\(actual.root) ordinals=\(actual.ordinals) cursors=\(actual.cursors) heap=\(actual.heap) "
+            + "context=\(actual.context) application=\(actual.application) reserved=\(workspace.reservationBytes) "
+            + "serializedAdmission=\(admissionDuration) "
+            + "videoVerification=\(verificationStart.duration(to: videoVerified)) "
+            + "audioVerification=\(videoVerified.duration(to: audioVerified)) "
+            + "sequentialVerification=\(verificationStart.duration(to: audioVerified)) "
+            + "sourceMappingAuthorityProven=false")
+        let ceiling = try PausedCoverageWorkspace.allocationLimits(mapCount: 128, sampleCount: 32_768)
+        print("PAUSED_WORKSPACE_BOUND maps=128 samples=32768 root=\(ceiling.root) "
+            + "ordinals=\(ceiling.ordinals) cursors=\(ceiling.cursors) heap=\(ceiling.heap) "
+            + "context=\(ceiling.context) application=\(ceiling.application) total=\(ceiling.total) "
+            + "actualAllocation=false actualAdmissionAttempt=false")
+        // This is a report, not a timing success gate or a 128x256 full-store claim.
+    }
+
+    func testPausedDecodeKernelReports128By256ReverseOverlapAndGapWorkloads() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) { fixture.server.completedEvidence(for: key)?.isComplete == true })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        XCTAssertTrue(evidence.isComplete)
+        for scenario in ["reverse", "overlap", "gaps"] {
+            let maps = try (0..<128).map { mapIndex in
+                try SealedDecodeCoverageMap(mediaType: .video,
+                    sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+                    samples: (0..<256).map { index in
+                        let base = scenario == "overlap" ? 0 : mapIndex * 256
+                        let tick = (base + 255 - index) * (scenario == "gaps" ? 5 : 1)
+                        return SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
+                            presentationRange: try .init(start: Task19.time(Int64(tick), 100),
+                                duration: Task19.time(1, 100)), byteSpan: 8..<16,
+                            nearestRandomAccessOrdinal: 0, isRandomAccess: index == 0,
+                            containsInBandConfiguration: false)
+                    })
+            }
+            let requestedTicks: Int64 = scenario == "overlap" ? 256
+                : scenario == "gaps" ? 163_840 : 32_768
+            let request = try FMP4PresentationRange(start: Task19.time(0, 100),
+                duration: Task19.time(requestedTicks, 100))
+            let storage = UnsafeMutablePointer<UInt8>.allocate(capacity: 32_768)
+            storage.initialize(repeating: 0, count: 32_768)
+            defer { storage.deinitialize(count: 32_768); storage.deallocate() }
+            let begin = ContinuousClock.now
+            for index in maps.indices {
+                try PausedDecodeCoverageOrder.prepare(map: maps[index],
+                    ordinals: .init(start: storage + index * 256, count: 256))
+            }
+            let sorted = ContinuousClock.now
+            let eligibility = try maps.map {
+                try PausedDecodeCoverageOrder.eligibility(map: $0, evidence: evidence)
+            }
+            let eligibilityComputed = ContinuousClock.now
+            var positions = Array(repeating: 0, count: 128)
+            var current = Array<FMP4PresentationRange?>(repeating: nil, count: 128)
+            let heapBacking = UnsafeMutablePointer<UInt8>.allocate(capacity: 128)
+            heapBacking.initialize(repeating: 0, count: 128)
+            defer { heapBacking.deinitialize(count: 128); heapBacking.deallocate() }
+            let heap = UnsafeMutableBufferPointer(start: heapBacking, count: 128)
+            var heapCount = 0
+            func advance(_ index: Int) throws {
+                current[index] = try PausedDecodeCoverageOrder.nextRange(map: maps[index],
+                    ordinals: .init(start: storage + index * 256, count: 256), cursor: &positions[index],
+                    requested: request, eligibility: eligibility[index])
+            }
+            for index in maps.indices {
+                try advance(index)
+                if current[index] != nil {
+                    try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                        count: &heapCount, rangeAt: { current[$0]! })
+                }
+            }
+            XCTAssertEqual(heapCount, 128)
+            var cursor = request.start
+            var gap = false
+            var emitted = 0
+            while heapCount > 0 {
+                let index = Int(try PausedCoverageTimeHeap.pop(storage: heap,
+                    count: &heapCount, rangeAt: { current[$0]! }))
+                let range = try XCTUnwrap(current[index])
+                if CMTimeCompare(range.start.cmTime, cursor.cmTime) > 0 { gap = true }
+                if !gap, CMTimeCompare(range.end.cmTime, cursor.cmTime) > 0 { cursor = range.end }
+                emitted += 1
+                try advance(index)
+                if current[index] != nil {
+                    try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                        count: &heapCount, rangeAt: { current[$0]! })
+                }
+            }
+            let end = ContinuousClock.now
+            XCTAssertEqual(emitted, 32_768)
+            XCTAssertTrue(positions.allSatisfy { $0 == 256 })
+            XCTAssertEqual(!gap && cursor == request.end, scenario != "gaps")
+            print("PAUSED_KERNEL scenario=\(scenario) maps=128 samples=32768 "
+                + "ordinalBacking=\(malloc_size(storage)) heapBacking=\(malloc_size(heapBacking)) "
+                + "sort=\(begin.duration(to: sorted)) "
+                + "eligibility=\(sorted.duration(to: eligibilityComputed)) "
+                + "heapMergeAndIteration=\(eligibilityComputed.duration(to: end)) "
+                + "syntheticHeapMergeMeasured=true authenticatedStore=false domainHoldMeasured=false "
+                + "admissionProven=false")
+        }
+    }
+
+    func testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow() throws {
+        let samples = try (0..<256).map { index in
+            SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
+                presentationRange: try .init(start: .init(value: Int64(255 - index), timescale: 100),
+                    duration: .init(value: 1, timescale: 100)), byteSpan: 8..<16,
+                nearestRandomAccessOrdinal: 0, isRandomAccess: index == 0,
+                containsInBandConfiguration: false)
+        }
+        let map = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
+            commonByteSpans: [0..<8], samples: samples)
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256) { storage in
+            try PausedDecodeCoverageOrder.prepare(map: map, ordinals: storage)
+            XCTAssertEqual(Array(storage), Array((0...255).reversed()).map(UInt8.init))
+        }
+        let overflow = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
+            commonByteSpans: [0..<8], samples: [.init(decodeOrdinal: 0,
+                presentationRange: .init(start: .init(value: 0, timescale: 1),
+                    duration: .init(value: Int64.max / 2, timescale: 1)),
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
+                isRandomAccess: true, containsInBandConfiguration: false)])
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1) { storage in
+            try PausedDecodeCoverageOrder.prepare(map: overflow, ordinals: storage)
+            XCTAssertThrowsError(try PausedDecodeCoverageOrder.videoHold(map: overflow))
+        }
+    }
+
     func testResourcePathFailurePreservesPublicationErrorTypeAndReason() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
