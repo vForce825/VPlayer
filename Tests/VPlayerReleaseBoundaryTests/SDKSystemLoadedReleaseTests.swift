@@ -253,3 +253,214 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         try fixture.teardown()
     }
 }
+
+/// Stores only KVO scalars, never the observed item or its URL.
+private final class ReleaseReadinessKVOFacts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callbackCount = 0
+    private var lastStatus = -1
+    private var terminalStatus = -1
+
+    func record(_ status: AVPlayerItem.Status?) -> Bool {
+        lock.withLock {
+            callbackCount += 1
+            lastStatus = status?.rawValue ?? -1
+            guard terminalStatus == -1,
+                  status == .readyToPlay || status == .failed else { return false }
+            terminalStatus = lastStatus
+            return true
+        }
+    }
+
+    var summary: String {
+        lock.withLock {
+            "kvoCount=\(callbackCount) kvoLastStatus=\(lastStatus) kvoTerminalStatus=\(terminalStatus)"
+        }
+    }
+
+    var firstTerminalStatus: Int { lock.withLock { terminalStatus } }
+}
+
+@MainActor
+private final class ReleaseReadinessTaskProgress {
+    var completed = false
+}
+
+@MainActor
+final class SDKReadinessReferenceReleaseTests: XCTestCase {
+    // These independent controls leave the original 120-second native tests
+    // untouched. A control must reach its expected terminal result; observing
+    // unknown or cancelling a stuck operation is a test failure, never a skip.
+    private let observationTimeout: TimeInterval = 15
+
+    func testRawMissingItemObservedBeforeAttachmentFails() async throws {
+        try await checkRawMissingItem(observeBeforeAttachment: true)
+    }
+
+    func testRawMissingItemObservedAfterAttachmentFails() async throws {
+        try await checkRawMissingItem(observeBeforeAttachment: false)
+    }
+
+    private func checkRawMissingItem(observeBeforeAttachment: Bool) async throws {
+        let label = observeBeforeAttachment ? "raw.before_attach" : "raw.after_attach"
+        let player = AVPlayer()
+        let item = AVPlayerItem(url: missingLocalURL())
+        // Match install's media settings in both references. Only KVO ordering
+        // differs; neither reference creates a driver, log reader, or event hub.
+        player.pause()
+        player.automaticallyWaitsToMinimizeStalling = true
+        item.preferredForwardBufferDuration = 3
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        let terminal = expectation(description: "\(label) missing item reaches terminal status")
+        let facts = ReleaseReadinessKVOFacts()
+        var observation: NSKeyValueObservation?
+        defer {
+            observation?.invalidate()
+            player.replaceCurrentItem(with: nil)
+        }
+        let observe = {
+            item.observe(\.status, options: [.initial, .new]) { _, change in
+                if facts.record(change.newValue) { terminal.fulfill() }
+            }
+        }
+        if observeBeforeAttachment { observation = observe() }
+        player.replaceCurrentItem(with: item)
+        if !observeBeforeAttachment { observation = observe() }
+        print("READINESS_REFERENCE stage=\(label).attached \(facts.summary)")
+
+        await fulfillment(of: [terminal], timeout: observationTimeout)
+        print("READINESS_REFERENCE stage=\(label).observed \(Self.playerFact(player)) \(facts.summary)")
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+        XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.failed.rawValue)
+        XCTAssertEqual(item.status, .failed, "A missing local file must fail, not become ready")
+        XCTAssertNotNil(item.error)
+    }
+
+    func testFreshDriverMissingItemFails() async throws {
+        let allocator = PlaybackIdentityAllocator()
+        let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
+        let identity = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: lifecycle,
+            itemGeneration: try allocator.next(in: .outputItem))
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        try driver.install(url: missingLocalURL(), identity: identity)
+        defer {
+            driver.replaceCurrentItemWithNil(item: identity)
+            driver.removeObservers(item: identity)
+        }
+        let item = try XCTUnwrap(driver.player.currentItem)
+        let terminal = expectation(description: "Fresh driver rejects a missing local item")
+        let progress = ReleaseReadinessTaskProgress()
+        let task = Task { @MainActor in
+            let result: Result<AVPlayerItemInstanceIdentity, Error>
+            do { result = .success(try await driver.waitUntilReady(item: identity)) }
+            catch { result = .failure(error) }
+            progress.completed = true
+            terminal.fulfill()
+            return result
+        }
+        defer { task.cancel() }
+
+        await fulfillment(of: [terminal], timeout: observationTimeout)
+        let completedBeforeCancellation = progress.completed
+        print("READINESS_REFERENCE stage=driver.observed \(Self.playerFact(driver.player)) "
+            + "completedBeforeCancellation=\(completedBeforeCancellation) "
+            + "waitPhase=\(driver.prepareWait.activePhase.map { String(describing: $0) } ?? "none") "
+            + "waiterCount=\(driver.activeWaiterCount)")
+        // Join the owned operation before releasing the driver. The production
+        // wait has a cancellation handler; the outer XCTest limit still applies.
+        task.cancel()
+        let result = await task.value
+        XCTAssertTrue(completedBeforeCancellation)
+        XCTAssertEqual(item.status, .failed)
+        XCTAssertNotNil(item.error)
+        XCTAssertEqual(driver.rate, 0)
+        XCTAssertEqual(driver.timeControlStatus, .paused)
+        XCTAssertEqual(driver.activeWaiterCount, 0)
+        switch result {
+        case .success:
+            XCTFail("A missing local item must not produce a ready identity")
+        case .failure(let error):
+            print("READINESS_REFERENCE stage=driver.returned error=\(Self.errorFact(error as NSError))")
+            XCTAssertFalse(error is CancellationError,
+                           "Diagnostic cancellation is not native item failure")
+            let nativeError = try XCTUnwrap(item.error)
+            XCTAssertEqual(PlaybackErrorDiagnostics.snapshot(error),
+                           PlaybackErrorDiagnostics.snapshot(nativeError),
+                           "The wait must report this item's native failure")
+        }
+    }
+
+    func testIndependentMissingAssetLoadCompletesWithoutPlayableContent() async throws {
+        // A separate asset and URL prevent this explicit load from preparing
+        // an item in another control. Asset loading is not item readiness.
+        let asset = AVURLAsset(url: missingLocalURL())
+        let terminal = expectation(description: "Independent missing asset load reaches a terminal result")
+        let progress = ReleaseReadinessTaskProgress()
+        let task = Task { @MainActor in
+            let result: Result<Bool, Error>
+            do { result = .success(try await asset.load(.isPlayable)) }
+            catch { result = .failure(error) }
+            progress.completed = true
+            terminal.fulfill()
+            return result
+        }
+        defer { task.cancel(); asset.cancelLoading() }
+
+        await fulfillment(of: [terminal], timeout: observationTimeout)
+        let completedBeforeCancellation = progress.completed
+        print("READINESS_REFERENCE stage=asset.observed "
+            + "assetPlayableState=\(Self.playableFact(asset)) "
+            + "completedBeforeCancellation=\(completedBeforeCancellation)")
+        // cancelLoading is the asset's supported physical cancellation API.
+        // Join even after a diagnostic timeout. If SDK cancellation cannot
+        // complete, the original outer XCTest timeout remains authoritative.
+        asset.cancelLoading()
+        task.cancel()
+        let result = await task.value
+        XCTAssertTrue(completedBeforeCancellation)
+        switch result {
+        case .success(let playable):
+            print("READINESS_REFERENCE stage=asset.returned playable=\(playable)")
+            // A loaded false value is a completed suitability query, not an
+            // error and not evidence that any AVPlayerItem reached readiness.
+            XCTAssertFalse(playable, "A nonexistent file cannot contain playable content")
+        case .failure(let error):
+            print("READINESS_REFERENCE stage=asset.returned error=\(Self.errorFact(error as NSError))")
+            XCTAssertFalse(error is CancellationError,
+                           "Diagnostic cancellation is not native asset failure")
+        }
+    }
+
+    private func missingLocalURL() -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("VPlayer-readiness-reference-\(UUID().uuidString).m3u8")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        return url
+    }
+
+    private static func playerFact(_ player: AVPlayer) -> String {
+        let item = player.currentItem
+        return "playerStatus=\(player.status.rawValue) playerError=\(errorFact(player.error as NSError?)) "
+            + "itemStatus=\(item?.status.rawValue ?? -1) itemError=\(errorFact(item?.error as NSError?)) "
+            + "assetPlayableState=\(item.map { playableFact($0.asset) } ?? "no_item") "
+            + "rate=\(player.rate) timeControlStatus=\(player.timeControlStatus.rawValue) "
+            + "disconnected=\(player.disconnectedFromSystemAudio)"
+    }
+
+    private static func playableFact(_ asset: AVAsset) -> String {
+        switch asset.status(of: .isPlayable) {
+        case .notYetLoaded: return "notYetLoaded"
+        case .loading: return "loading"
+        case .loaded(let value): return "loaded:\(value)"
+        case .failed(let error): return "failed:\(errorFact(error))"
+        }
+    }
+
+    private static func errorFact(_ error: NSError?) -> String {
+        guard let error else { return "none" }
+        return "\(String(error.domain.prefix(96))):\(error.code)"
+    }
+}

@@ -5412,6 +5412,8 @@ private final class Task21RealIntegrationFixture {
 
     func prepare() async throws -> PreparedAVPlayerItem {
         if let prepared { return prepared }
+        let preparationStarted = ContinuousClock.now
+        reportNativePublication(stage: "prepare-begin", elapsed: .zero)
         let value: PreparedAVPlayerItem
         do {
             let ticket = try XCTUnwrap(
@@ -5425,26 +5427,64 @@ private final class Task21RealIntegrationFixture {
             value = result
         }
         catch {
+            let failureItem = player.currentItem
+            let failureItemTime = CMTimeGetSeconds(player.currentTime())
+            reportNativePublication(stage: "prepare-failed",
+                elapsed: preparationStarted.duration(to: .now))
             print("NATIVE_ADMISSION prepare-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount) phase=\(coordinator.phase) history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
-            let ranges = player.currentItem?.loadedTimeRanges.map {
+            let ranges = failureItem?.loadedTimeRanges.map {
                 let value = $0.timeRangeValue
                 return "\(CMTimeGetSeconds(value.start))...\(CMTimeGetSeconds(value.end))"
             }.joined(separator: ",") ?? "nil"
-            let seekable = player.currentItem?.seekableTimeRanges.map {
+            let seekable = failureItem?.seekableTimeRanges.map {
                 let value = $0.timeRangeValue
                 return "\(CMTimeGetSeconds(value.start))...\(CMTimeGetSeconds(value.end))"
             }.joined(separator: ",") ?? "nil"
-            let duration = player.currentItem.map { CMTimeGetSeconds($0.duration) } ?? .nan
-            let accessLog = await player.currentItem?.accessLog
+            let duration = failureItem.map { CMTimeGetSeconds($0.duration) } ?? .nan
+            let errorLog = await failureItem?.errorLog
+            let errorEvents = errorLog?.events ?? []
+            print("NATIVE_ITEM_ERROR_LOG count=\(errorEvents.count)")
+            for event in errorEvents.suffix(4) {
+                // This fixture only serves generated loopback media. Keep the
+                // bounded diagnostic free of URLs, paths, and session tokens.
+                let comment = (event.errorComment ?? "none").replacingOccurrences(
+                    of: publication.declaration.token, with: "<session>")
+                let safeComment = String(comment.prefix(512)).split(whereSeparator: \.isWhitespace)
+                    .map { word in
+                        word.contains("/") || word.contains("\\") ? "<resource>" : String(word)
+                    }.joined(separator: " ")
+                print("NATIVE_ITEM_ERROR domain=\(String(event.errorDomain.prefix(96))) "
+                    + "status=\(event.errorStatusCode) comment=\(safeComment)")
+            }
+            let accessLog = await failureItem?.accessLog
             let accessEvents = accessLog?.events.count ?? 0
             throw NSError(domain: "Task21RealIntegration", code: 1,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "AVPlayer 准备失败；itemTime=\(CMTimeGetSeconds(player.currentTime()))；"
+                    "AVPlayer 准备失败；itemTime=\(failureItemTime)；"
                     + "loaded=\(ranges)；seekable=\(seekable)；duration=\(duration)；"
                     + "accessEvents=\(accessEvents)；底层：\(error)"])
         }
         prepared = value
         return value
+    }
+
+    private func reportNativePublication(stage: String, elapsed: Duration) {
+        guard let snapshot = publication.publisher.visible else { return }
+        let requests = server.acceptedGETSnapshot()
+        for participant in snapshot.media.keys.sorted().prefix(2) {
+            guard let media = snapshot.media[participant] else { continue }
+            let prefix = "#EXT-X-TARGETDURATION:"
+            let targetDuration = media.text.split(separator: "\n")
+                .first(where: { $0.hasPrefix(prefix) })
+                .flatMap { Int($0.dropFirst(prefix.count)) } ?? -1
+            print("NATIVE_PUBLICATION stage=\(stage) elapsed=\(elapsed) "
+                + "publication=\(snapshot.publicationSequence) participant=\(participant) "
+                + "first=\(media.logicalSequences.first ?? 0) last=\(media.logicalSequences.last ?? 0) "
+                + "segments=\(media.resources.count) targetDuration=\(targetDuration) "
+                + "endList=\(media.text.hasSuffix("#EXT-X-ENDLIST\n")) "
+                + "playlistGETs=\(requests.playlistCount) initializationGETs=\(requests.initializationCount) "
+                + "mediaGETs=\(requests.mediaCount)")
+        }
     }
 
     func playToEnd() async throws -> PlaybackResult {
