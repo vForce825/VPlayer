@@ -60,8 +60,8 @@ jobs:
           print(host)
           PY
           )"
-          xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
-            -destination "$TVOS_TEST_DESTINATION" -derivedDataPath "$AB_DD" \
+          xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -target VPlayerReleaseBoundaryTests \
+            -configuration Release -sdk appletvsimulator \
             CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES TEST_HOST="$APP_HOST" BUNDLE_LOADER='$(TEST_HOST)' \
             > "$BOUNDARY_SETTINGS"
           python3 - "$BOUNDARY_SETTINGS" "$APP_HOST" <<'PY'
