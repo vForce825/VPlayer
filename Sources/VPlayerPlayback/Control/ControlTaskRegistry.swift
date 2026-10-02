@@ -3847,6 +3847,21 @@ final class ControlTaskRegistry: @unchecked Sendable {
         projection { authority.publicState }
     }
 
+    /// Called only for the just-applied budget result while its executor is still
+    /// held. Rejected/early arms have no publication authority; the accepted route
+    /// timeout must retain its semantic failure even before a runtime is bound.
+    func publishPlaybackBudgetTerminal(_ action: PlaybackBudgetControlAction,
+        application: OutputControlApplication) {
+        precondition(executor.isIsolated)
+        guard case .ordinaryRouteTimer = action, application == .terminated,
+              let owner = projection({ () -> OutputTransitionOwnerTicket? in
+                  guard let context = authority.outputContext, context.poisoned else { return nil }
+                  return context.owner
+              }) else { return }
+        publishOwnedTerminalFailure(owner: owner, failure: PlaybackController.routeUnavailableFailure,
+            permitsPoisonedRecoveryOwner: true)
+    }
+
     /// 任意Cell fail-closed或准确预算终态都通过这一个锁外入口消费原预留owner。
     private func consumeAutomaticTerminal() {
         guard let receiver = terminalReceiver else { return }
@@ -4538,11 +4553,16 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// 首错先于任何异步清理发布；准确 owner/session 防止旧任务覆盖新播放。
-    private func publishOwnedTerminalFailure(owner: OutputTransitionOwnerTicket, failure: PlaybackFailure) {
+    private func publishOwnedTerminalFailure(owner: OutputTransitionOwnerTicket, failure: PlaybackFailure,
+        permitsPoisonedRecoveryOwner: Bool = false) {
         executor.sync {
             let subscription: PlaybackStateSubscription? = try? transaction { _ in
                 guard let context = authority.outputContext, context.owner == owner,
-                      owner.reason.releasesLease, context.disposition == .releaseAfterTeardown else { return nil }
+                      context.disposition == .releaseAfterTeardown else { return nil }
+                // Accepted budget termination preserves an existing recovery
+                // runner until its Task exits; publication must not replace it.
+                guard owner.reason.releasesLease ||
+                    (permitsPoisonedRecoveryOwner && context.poisoned && owner.reason == .recovery) else { return nil }
                 if case .coldStart(let admission) = authority.playbackRequestAdmission,
                    admission.identity.sessionIdentity != context.sessionIdentity { return nil }
                 if case .failed = authority.publicState { return nil }

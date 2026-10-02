@@ -1,4 +1,4 @@
-name: Control deadlines and fixture ownership validation
+name: Complete tvOS 27 migration regression
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-control-ownership-${{ github.ref }}
-  cancel-in-progress: true
+  group: macos-ci-complete-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   build-and-test:
     name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
@@ -54,69 +54,216 @@ jobs:
         run: xcodebuild -downloadComponent MetalToolchain
 
       - name: Check deployment floors and precompiled Metal reproducibility
+        id: debug_preflight
         run: |
           python3 Scripts/Tests/test_tvos27_deployment.py
           ./Scripts/Tests/test_precompiled_metal_library.sh
 
-      - name: Compile complete Debug test targets for diagnostic isolation
-        id: debug_build
+      - name: Inspect public HLS output API declarations
+        run: |
+          python3 - "$(xcrun --sdk appletvsimulator --show-sdk-path)" <<'PYSDK'
+          import pathlib, re, sys
+          root = pathlib.Path(sys.argv[1]) / "System/Library/Frameworks"
+          paths = list((root / "AVFoundation.framework/Headers").glob("AVPlayerItem*Output*.h"))
+          paths += [root / "AVFoundation.framework/Headers/AVAudioMix.h",
+                    root / "MediaToolbox.framework/Headers/MTAudioProcessingTap.h"]
+          wanted = re.compile(r"AVPlayerItemSampleBufferOutput|requestedAudioFormat|copyNextSampleBuffer|AVAudioMixInputParametersTrackMixID|MTAudioProcessingTapCreateWithPreferredFormat|MTAudioProcessingTapProcessCallback|MTAudioProcessingTapGetSourceAudio")
+          remaining = 160
+          for path in paths:
+              if not path.is_file():
+                  print(path.name + ": unavailable")
+                  continue
+              text = re.sub(r"/\*.*?\*/", "", path.read_text(), flags=re.S)
+              text = re.sub(r"//[^\n]*", "", text)
+              lines = text.splitlines()
+              selected = set()
+              for index, line in enumerate(lines):
+                  if wanted.search(line):
+                      selected.update(range(max(0,index-2), min(len(lines),index+12)))
+              if selected:
+                  print("PUBLIC_API_HEADER=" + path.name)
+              for index in sorted(selected):
+                  if remaining <= 0:
+                      break
+                  if lines[index].strip():
+                      print(lines[index])
+                      remaining -= 1
+          PYSDK
+
+      - name: Verify route deadlines and recovery on this source
+        run: |
+          ./Scripts/test.sh -resultBundlePath "$RUNNER_TEMP/ControlDeadlines.xcresult" \
+            -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 \
+            -only-testing:VPlayerTests/PlaybackDeadlineTests \
+            -only-testing:VPlayerTests/PlaybackRecoveryTests
+      - name: Report route deadline failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlDeadlines.xcresult"
+
+      - name: Compile and run complete unit and UI tests
+        if: ${{ !cancelled() && steps.debug_preflight.outcome == 'success' }}
+        run: |
+          ./Scripts/test.sh -resultBundlePath "$RUNNER_TEMP/DebugFull.xcresult" -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+
+      - name: Report complete Debug failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugFull.xcresult"
+
+  release-validation:
+    name: Release boundaries and cold startup
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        id: release_preflight
         run: |
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
-          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify route deadlines and recovery
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Run Release boundary suite
         run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/ControlDeadlines.xcresult" \
-            -only-testing:VPlayerTests/PlaybackDeadlineTests \
-            -only-testing:VPlayerTests/PlaybackRecoveryTests
-      - name: Report scoped ControlDeadlines failures
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
+            -configuration Release ENABLE_TESTABILITY=YES \
+            -resultBundlePath "$RUNNER_TEMP/ReleaseBoundary.xcresult" \
+            -parallel-testing-enabled NO -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Report complete optimized Release boundary failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlDeadlines.xcresult"
-      - name: Verify randomized callback isolation
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseBoundary.xcresult"
+      - name: Run Release startup suite
+        if: ${{ !cancelled() && steps.release_preflight.outcome == 'success' }}
         run: |
-          xcodebuild -help > "$RUNNER_TEMP/repeat-help.txt" 2>&1
-          repeat_args=()
-          if grep -q -- '-test-iterations' "$RUNNER_TEMP/repeat-help.txt"; then
-            repeat_args=(-test-iterations 3)
-            echo CI_RANDOMIZED_REPEAT_COUNT=3
-          else
-            echo CI_RANDOMIZED_REPEAT_COUNT=1
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
+            -configuration Release -resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -collect-test-diagnostics never -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Report Release startup failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseStartup.xcresult"
+      - name: Check six Release cold starts including allocator accounting
+        if: ${{ !cancelled() && steps.release_preflight.outcome == 'success' }}
+        run: |
+          TVOS_SIMULATOR_UDID="$(xcrun simctl list devices available -j | jq -er '
+            .devices["com.apple.CoreSimulator.SimRuntime.tvOS-27-0"][] |
+            select(.name == "Apple TV 4K (3rd generation)") | .udid' | head -n 1)"
+          export TVOS_SIMULATOR_UDID
+          simulator_state="$(xcrun simctl list devices available -j | jq -er --arg id "$TVOS_SIMULATOR_UDID" '
+            .devices[][] | select(.udid == $id) | .state')"
+          if [[ "$simulator_state" != "Booted" ]]; then
+            xcrun simctl boot "$TVOS_SIMULATOR_UDID"
           fi
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            "${repeat_args[@]}" -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/RandomizedCallback.xcresult" \
-            -only-testing:VPlayerTests/PlaybackPipelineTests/testOneHundredRandomizedOldCallbacksNeverReachPresentation
-      - name: Report scoped RandomizedCallback failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/RandomizedCallback.xcresult"
-      - name: Verify same-process fixture ownership and Loopback successors
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+          xcrun simctl bootstatus "$TVOS_SIMULATOR_UDID" -b
+          ./Scripts/test-release-startup.sh
+
+  artifact-validation:
+    name: FFmpeg audit and reproducibility regressions
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
         run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/OwnershipLoopback.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2SystemLoadedRangeWaiterMergesAdjacentRangesAndFinishesOnceForCancelReplaceTimeout \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3PositiveRateCapabilityAtomicallyRevalidatesConsumesAndPerformsMainActorPlay \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3PlayingRelayRejectsAuthorityRevokedAfterPlayReturns \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3BackendQuiescenceReceiptRequiresExactPrivateIssuerIdentityAndSingleConsumption \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3LiveAACPrepareUsesWriterTerminalBindingAndNaturalEndConsumesExactEndpointAuthority \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3CapacityChargesRetainedGraphAndFifthDeadlineFailsClosed \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3EOSAndPublicationRelaysCoalesceBurstsWithOneOwnedRunner \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests
-      - name: Report scoped OwnershipLoopback failures
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Run dependency lock, tamper, promotion and reproducibility regressions
+        run: |
+          ./Scripts/Tests/test_ffmpeg_lock.sh
+          ./Scripts/Tests/test_ffmpeg_audit.sh
+      - name: Test bootstrap and device-acceptance runner contracts without hardware
+        run: |
+          ./Scripts/test-bootstrap-check.sh
+          ./Scripts/test-device-acceptance-signal.sh
+          ./Scripts/test-device-acceptance-signing.sh
+
+  fixture-validation:
+    name: HTTP playback and full-length 4K timeline fixtures
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build and fixture tooling
+        run: brew install mint jq ripgrep ffmpeg
+      - name: Build and audit pinned application FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Check fixture runner, server and generator contracts
+        run: |
+          python3 Scripts/Tests/test_playback_fixture_runner.py
+          python3 Scripts/Tests/test_timeline_fixture.py
+          python3 Scripts/Support/fixture_server.py --self-test
+          ./Scripts/run-playback-integration-tests.sh --self-test
+          ./Scripts/generate-playback-fixtures.sh --self-test
+      - name: Run HTTP playback and 900-second 4K timeline coverage
+        timeout-minutes: 30
+        run: |
+          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/vplayer-timeline.XXXXXX")"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 Scripts/generate-timeline-fixture.py "$fixture_dir/timeline.ts"
+          ./Scripts/run-playback-integration-tests.sh \
+            --timeline-fixture "$fixture_dir/timeline.ts" \
+            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
+            --only-testing VPlayerTests/HLSTimelineTests \
+            -- -resultBundlePath "$RUNNER_TEMP/HTTPFixtures.xcresult" -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+
+      - name: Report HTTP fixture failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/OwnershipLoopback.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/HTTPFixtures.xcresult"
