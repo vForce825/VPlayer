@@ -1232,19 +1232,26 @@ struct ServedCoverageDependencies: RandomAccessCollection, Sendable, Equatable {
     enum Storage: Sendable {
         case explicit([ServedRenditionCoverageDependency])
         case frozen(owner: FrozenPreparationOwner, coverageIndex: UInt8)
+        case paused(owner: PausedWindowCoverageLease, coverageIndex: UInt8)
     }
     let storage: Storage
-    var startIndex: Int { 0 }
-    var endIndex: Int {
+    private var ownerProjection: (owner: FrozenCompletedCoverageOwner, index: UInt8)? {
         switch storage {
-        case .explicit(let values): return values.count
-        case .frozen(let owner, let index): return Int(owner.coverage(at: index)!.count)
+        case .explicit: return nil
+        case .frozen(let owner, let index): return (.startup(owner), index)
+        case .paused(let owner, let index): return (.paused(owner), index)
         }
     }
+    var startIndex: Int { 0 }
+    var endIndex: Int {
+        if case .explicit(let values) = storage { return values.count }
+        let projection = ownerProjection!
+        return Int(projection.owner.coverage(at: projection.index)!.count)
+    }
     func input(at slot: Int) -> SealedCoverageInput? {
-        guard case .frozen(let owner, _) = storage,
+        guard let (owner, _) = ownerProjection,
               owner.containsCompletedResource(slot),
-              let input = owner.metadataStore?.preparationCoverageInput(slot: slot, ownerSlot: owner.slot),
+              let input = owner.metadataStore?.preparationCoverageInput(slot: slot, owner: owner),
               input.map.epochProofIdentity != nil, input.map.segmentReceiptIdentity != nil,
               input.map.initializationBackingIdentity != nil else {
             return nil
@@ -1274,25 +1281,34 @@ struct ServedCoverageDependencies: RandomAccessCollection, Sendable, Equatable {
     }
     subscript(index: Int) -> ServedRenditionCoverageDependency {
         if case .explicit(let values) = storage { return values[index] }
-        guard case .frozen(let owner, let coverageIndex) = storage else { preconditionFailure() }
+        guard let (owner, coverageIndex) = ownerProjection else { preconditionFailure() }
         return dependency(input(at: Int(owner.coverageResource(at: index, coverage: coverageIndex)))!)
     }
     func input(atOrdinal ordinal: Int) -> SealedCoverageInput? {
-        guard case .frozen(let owner, let coverageIndex) = storage else { return nil }
+        guard let (owner, coverageIndex) = ownerProjection else { return nil }
         return input(at: Int(owner.coverageResource(at: ordinal, coverage: coverageIndex)))
     }
     static func frozen(owner: FrozenPreparationOwner, rendition: AudioRenditionIdentity,
                        requested: FMP4PresentationRange) throws -> Self? {
+        try frozen(owner: .startup(owner), rendition: rendition, requested: requested)
+    }
+    static func frozen(owner: PausedWindowCoverageLease, rendition: AudioRenditionIdentity,
+                       requested: FMP4PresentationRange) throws -> Self? {
+        try frozen(owner: .paused(owner), rendition: rendition, requested: requested)
+    }
+    static func frozen(owner: FrozenCompletedCoverageOwner, rendition: AudioRenditionIdentity,
+                       requested: FMP4PresentationRange) throws -> Self? {
+        guard owner.completionIsFrozen else { return nil }
         var indices = FrozenCoverageIndices()
         for index in UInt8(0)..<2 {
             if let existing = owner.coverage(at: index),
                existing.rendition == rendition, existing.requested == requested {
-                return .init(storage: .frozen(owner: owner, coverageIndex: index))
+                return owner.dependencies(at: index)
             }
         }
         guard owner.coverage(at: 1) == nil else { throw CompletedMediaEvidenceError.capacityExceeded }
         let coverageIndex: UInt8 = owner.coverage(at: 0) == nil ? 0 : 1
-        let view = Self(storage: .frozen(owner: owner, coverageIndex: coverageIndex))
+        let view = owner.dependencies(at: coverageIndex)
         for slot in 0..<300 {
             guard let input = view.input(at: slot), input.media.renditionIdentity == rendition,
                   let intersection = try input.map.intersection(with: requested),

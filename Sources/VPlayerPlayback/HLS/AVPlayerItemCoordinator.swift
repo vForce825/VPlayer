@@ -2277,6 +2277,59 @@ struct TimelineMappingRetryState {
     }
 }
 
+/// Coverage views retain their exact metadata owner. The restricted resume owner
+/// exposes no startup publication, timeline or history authority through this view.
+enum FrozenCompletedCoverageOwner: Sendable {
+    case startup(FrozenPreparationOwner)
+    case paused(PausedWindowCoverageLease)
+
+    var slot: UInt8 {
+        switch self { case .startup(let owner): owner.slot; case .paused(let owner): owner.slot }
+    }
+    var metadataStore: SealedMediaStore? {
+        switch self {
+        case .startup(let owner): owner.metadataStore
+        case .paused(let owner): owner.metadataStore
+        }
+    }
+    var completionIsFrozen: Bool {
+        switch self {
+        case .startup(let owner): owner.completionIsFrozen
+        case .paused(let owner): owner.completionIsFrozen
+        }
+    }
+    func containsCompletedResource(_ index: Int) -> Bool {
+        switch self {
+        case .startup(let owner): owner.containsCompletedResource(index)
+        case .paused(let owner): owner.containsCompletedResource(index)
+        }
+    }
+    func coverage(at index: UInt8) -> FrozenCoverageStorage? {
+        switch self {
+        case .startup(let owner): owner.coverage(at: index)
+        case .paused(let owner): owner.coverage(at: index)
+        }
+    }
+    func coverageResource(at ordinal: Int, coverage index: UInt8) -> UInt16 {
+        switch self {
+        case .startup(let owner): owner.coverageResource(at: ordinal, coverage: index)
+        case .paused(let owner): owner.coverageResource(at: ordinal, coverage: index)
+        }
+    }
+    func setCoverage(_ value: FrozenCoverageStorage, indices: FrozenCoverageIndices, at index: UInt8) {
+        switch self {
+        case .startup(let owner): owner.setCoverage(value, indices: indices, at: index)
+        case .paused(let owner): owner.setCoverage(value, indices: indices, at: index)
+        }
+    }
+    func dependencies(at index: UInt8) -> ServedCoverageDependencies {
+        switch self {
+        case .startup(let owner): owner.dependencies(at: index)
+        case .paused(let owner): owner.dependencies(at: index)
+        }
+    }
+}
+
 /// 两个不同准备事务共享进程准入；cleanup不能提前归还外部冻结视图仍持有的槽。
 final class FrozenPreparationOwner: @unchecked Sendable {
     private static let admissionLock = PreparationStorageLock()
@@ -2329,6 +2382,9 @@ final class FrozenPreparationOwner: @unchecked Sendable {
         }
         if index == 0 { precondition(firstCoverage == nil); firstCoverage = value }
         else { precondition(secondCoverage == nil); secondCoverage = value }
+    }
+    func dependencies(at index: UInt8) -> ServedCoverageDependencies {
+        .init(storage: .frozen(owner: self, coverageIndex: index))
     }
     private var completedResources: (UInt64, UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0, 0)
 
@@ -2400,20 +2456,23 @@ final class FrozenPreparationOwner: @unchecked Sendable {
         let reservation = try PlaybackResourceContextLedger.shared.reserve(
             allocationIdentity: .stable(UUID()), bytes: 19 * 1_024)
         do {
-            let owner = try admissionLock.withLock { () throws -> FrozenPreparationOwner in
-                let slot: UInt8
-                if admissionReferences.0 == 0 { slot = 1; admissionReferences.0 = 1 }
-                else if admissionReferences.1 == 0 { slot = 2; admissionReferences.1 = 1 }
-                else { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
-                return FrozenPreparationOwner(slot: slot,
-                    resourceContextReservation: reservation)
-            }
+            let slot = try reserveCoverageAdmissionSlot()
+            let owner = FrozenPreparationOwner(slot: slot,
+                resourceContextReservation: reservation)
             try PlaybackResourceContextLedger.shared.rebind(
                 reservation, to: .object(ObjectIdentifier(owner)))
             return owner
         } catch {
             PlaybackResourceContextLedger.shared.release(reservation)
             throw error
+        }
+    }
+
+    fileprivate static func reserveCoverageAdmissionSlot() throws -> UInt8 {
+        try admissionLock.withLock {
+            if admissionReferences.0 == 0 { admissionReferences.0 = 1; return 1 }
+            if admissionReferences.1 == 0 { admissionReferences.1 = 1; return 2 }
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
         }
     }
 
@@ -2472,6 +2531,154 @@ final class FrozenPreparationOwner: @unchecked Sendable {
         timelineStorage = nil
         Self.releaseAdmission(slot: slot)
         PlaybackResourceContextLedger.shared.release(resourceContextReservation)
+    }
+}
+
+/// Storage-only prerequisite for a separately authenticated paused-window issuer.
+/// It cannot create startup publication/timeline authority or activate history.
+/// Mutations run in the original serialized server/store issuance operation;
+/// returned dependency views keep this exact lease and its pins alive.
+final class PausedWindowCoverageLease: @unchecked Sendable {
+    static let indexCapacity = 128
+    var indexCapacity: Int { Self.indexCapacity }
+    let slot: UInt8
+    private let reservation: PlaybackResourceContextReservation
+    private(set) var metadataStore: SealedMediaStore?
+    private(set) var completionIsFrozen = false
+    private var completedResources: (UInt64, UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0, 0)
+    private var firstCoverage: FrozenCoverageStorage?
+    private var secondCoverage: FrozenCoverageStorage?
+    private let coverageIndices: UnsafeMutablePointer<UInt16>
+
+    /// Only the roots this restricted type actually allocates are included. New
+    /// asynchronous issuer/callback frames require their own measured admission.
+    static var allocationLimits: (root: Int, indices: Int, context: Int, application: Int) {
+        (
+            malloc_good_size(class_getInstanceSize(Self.self)),
+            malloc_good_size(indexCapacity * MemoryLayout<UInt16>.stride),
+            malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self)),
+            malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+        )
+    }
+
+    static var reservationBytes: Int {
+        let limits = allocationLimits
+        guard let total = try? HLSChecked.add(try HLSChecked.add(limits.root, limits.indices),
+            try HLSChecked.add(limits.context, limits.application)) else {
+            preconditionFailure("Fixed paused-window allocation sizes overflow")
+        }
+        return total
+    }
+
+    var actualAllocationBytes: (root: Int, indices: Int, context: Int, application: Int)? {
+        guard let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation)
+            else { return nil }
+        return (
+            malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())),
+            malloc_size(UnsafeRawPointer(coverageIndices)),
+            tokens.context, tokens.application
+        )
+    }
+
+    var knownAllocationBytes: Int {
+        guard let actual = actualAllocationBytes else {
+            preconditionFailure("Paused-window allocation must retain its exact registered tokens")
+        }
+        return actual.root + actual.indices + actual.context + actual.application
+    }
+
+    static func reserve() throws -> PausedWindowCoverageLease {
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: reservationBytes)
+        do {
+            let slot = try FrozenPreparationOwner.reserveCoverageAdmissionSlot()
+            let lease = PausedWindowCoverageLease(slot: slot, reservation: reservation)
+            try PlaybackResourceContextLedger.shared.rebind(
+                reservation, to: .object(ObjectIdentifier(lease)))
+            let limits = allocationLimits
+            guard let actual = lease.actualAllocationBytes,
+                  actual.root <= limits.root, actual.indices <= limits.indices,
+                  actual.context <= limits.context, actual.application <= limits.application else {
+                throw LoopbackHTTPReservationError.hardCapacityExceeded
+            }
+            return lease
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(slot: UInt8, reservation: PlaybackResourceContextReservation) {
+        self.slot = slot
+        self.reservation = reservation
+        coverageIndices = .allocate(capacity: Self.indexCapacity)
+        coverageIndices.initialize(repeating: 0, count: Self.indexCapacity)
+    }
+
+    @discardableResult
+    func retainMetadata(in store: SealedMediaStore, key: HLSResourceKey) throws -> Int {
+        guard !completionIsFrozen, metadataStore == nil || metadataStore === store else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        let index = try store.retainPreparationResource(key, ownerSlot: slot, requiresCompleted: false)
+        metadataStore = store
+        return index
+    }
+
+    func freezeCompletedResources() throws {
+        guard !completionIsFrozen, let store = metadataStore else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        for index in 0..<300 {
+            guard let resource = store.preparationResource(slot: index, ownerSlot: slot),
+                  store.preparationResourceIsComplete(slot: index, ownerSlot: slot) else { continue }
+            let retained = try store.retainPreparationResource(resource.key, ownerSlot: slot)
+            guard retained == index else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+            withUnsafeMutableBytes(of: &completedResources) { bytes in
+                bytes.bindMemory(to: UInt64.self)[index / 64] |= UInt64(1) << (index % 64)
+            }
+        }
+        completionIsFrozen = true
+    }
+
+    func containsCompletedResource(_ index: Int) -> Bool {
+        guard (0..<300).contains(index) else { return false }
+        return withUnsafeBytes(of: completedResources) { bytes in
+            bytes.bindMemory(to: UInt64.self)[index / 64] & (UInt64(1) << (index % 64)) != 0
+        }
+    }
+
+    func coverage(at index: UInt8) -> FrozenCoverageStorage? {
+        precondition(index < 2)
+        return index == 0 ? firstCoverage : secondCoverage
+    }
+
+    func coverageResource(at ordinal: Int, coverage index: UInt8) -> UInt16 {
+        let descriptor = coverage(at: index)!
+        precondition(ordinal >= 0 && ordinal < descriptor.count)
+        return coverageIndices[Int(descriptor.offset) + ordinal]
+    }
+
+    func setCoverage(_ value: FrozenCoverageStorage, indices: FrozenCoverageIndices, at index: UInt8) {
+        precondition(completionIsFrozen && index < 2)
+        precondition(Int(value.offset) + Int(value.count) <= Self.indexCapacity)
+        for ordinal in 0..<Int(value.count) {
+            coverageIndices[Int(value.offset) + ordinal] = indices[ordinal]
+        }
+        if index == 0 { precondition(firstCoverage == nil); firstCoverage = value }
+        else { precondition(secondCoverage == nil); secondCoverage = value }
+    }
+
+    func dependencies(at index: UInt8) -> ServedCoverageDependencies {
+        .init(storage: .paused(owner: self, coverageIndex: index))
+    }
+
+    deinit {
+        metadataStore?.releasePreparationMetadata(ownerSlot: slot)
+        coverageIndices.deinitialize(count: Self.indexCapacity)
+        coverageIndices.deallocate()
+        FrozenPreparationOwner.releaseAdmission(slot: slot)
+        PlaybackResourceContextLedger.shared.release(reservation)
     }
 }
 

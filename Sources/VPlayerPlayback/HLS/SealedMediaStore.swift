@@ -748,15 +748,18 @@ final class SealedMediaStore: @unchecked Sendable {
         }
     }
 
-    func preparationCoverageInput(slot: Int, ownerSlot: UInt8) -> SealedCoverageInput? {
+    func preparationCoverageInput(slot: Int, owner: FrozenCompletedCoverageOwner) -> SealedCoverageInput? {
         domain.sync {
-            guard let resource = resources.values.first(where: {
+            let ownerSlot = owner.slot
+            guard owner.metadataStore === self, owner.containsCompletedResource(slot),
+                  let resource = resources.values.first(where: {
                 $0.preparationPins & ownerSlot != 0 && Int($0.preparationSlot) == slot
             }), resource.object.kind == .media, let map = resource.decodeMap,
                   let initialization = resources.values.first(where: {
                       $0.preparationPins & ownerSlot != 0
                         && $0.object.backing.identity == map.initializationBackingIdentity
-                  }) else { return nil }
+                  }), owner.containsCompletedResource(Int(initialization.preparationSlot)),
+                  map.initializationStateIdentity == initialization.evidence.stateIdentity else { return nil }
             let count = ownerSlot == 1 ? resource.preparationCompletionCounts.0
                 : resource.preparationCompletionCounts.1
             let initCount = ownerSlot == 1 ? initialization.preparationCompletionCounts.0
@@ -865,6 +868,13 @@ final class SealedMediaStore: @unchecked Sendable {
                                     context: LoopbackCoverageContext,
                                     requested: FMP4PresentationRange) throws
         -> ServedRenditionCoverageReceipt? {
+        try preparationCoverageReceipt(owner: .startup(owner), context: context, requested: requested)
+    }
+
+    func preparationCoverageReceipt(owner: FrozenCompletedCoverageOwner,
+                                    context: LoopbackCoverageContext,
+                                    requested: FMP4PresentationRange) throws
+        -> ServedRenditionCoverageReceipt? {
         try domain.sync {
             guard owner.metadataStore === self,
                   context.preparedPlayheadIdentity.itemGeneration == itemGeneration else { return nil }
@@ -929,6 +939,14 @@ final class SealedMediaStore: @unchecked Sendable {
     /// 并复用正式 decode-map 闭包算法；不签发 receipt，也不改变 owner 状态。
     func preparationCoverageCanFreeze(
         owner: FrozenPreparationOwner,
+        rendition: AudioRenditionIdentity,
+        requested: FMP4PresentationRange
+    ) throws -> Bool {
+        try preparationCoverageCanFreeze(owner: .startup(owner), rendition: rendition, requested: requested)
+    }
+
+    func preparationCoverageCanFreeze(
+        owner: FrozenCompletedCoverageOwner,
         rendition: AudioRenditionIdentity,
         requested: FMP4PresentationRange
     ) throws -> Bool {

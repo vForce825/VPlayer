@@ -464,3 +464,135 @@ private final class Task19LeaseBox: @unchecked Sendable {
     var values: [HLSMediaResponseLease] { lock.withLock { storage } }
     func append(_ value: HLSMediaResponseLease) { lock.withLock { storage.append(value) } }
 }
+
+final class PausedWindowCoverageLeaseTests: XCTestCase {
+    func testResumeLeaseSharesTheExistingTwoSlotAdmission() throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        var original: FrozenPreparationOwner? = try .reserve()
+        let originalSlot = try XCTUnwrap(original).slot
+        let withOriginal = PlaybackResourceContextLedger.shared.chargedBytes
+        var resumed: PausedWindowCoverageLease? = try .reserve()
+        XCTAssertNotEqual(try XCTUnwrap(resumed).slot, originalSlot)
+        XCTAssertThrowsError(try PausedWindowCoverageLease.reserve()) {
+            XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        XCTAssertThrowsError(try FrozenPreparationOwner.reserve()) {
+            XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
+            withOriginal + PausedWindowCoverageLease.reservationBytes)
+        resumed = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, withOriginal)
+        XCTAssertEqual(try XCTUnwrap(original).slot, originalSlot)
+        original = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testResumeLeaseDerivesItsOwnedAllocationCharge() throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        try withLease { lease in
+            XCTAssertEqual(lease.indexCapacity, 128)
+            XCTAssertGreaterThan(lease.knownAllocationBytes, 128 * MemoryLayout<UInt16>.stride)
+            XCTAssertLessThanOrEqual(lease.knownAllocationBytes,
+                PausedWindowCoverageLease.reservationBytes)
+            let actual = try XCTUnwrap(lease.actualAllocationBytes)
+            let limits = PausedWindowCoverageLease.allocationLimits
+            XCTAssertLessThanOrEqual(actual.root, limits.root)
+            XCTAssertLessThanOrEqual(actual.indices, limits.indices)
+            XCTAssertLessThanOrEqual(actual.context, limits.context)
+            XCTAssertLessThanOrEqual(actual.application, limits.application)
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
+                baseline + PausedWindowCoverageLease.reservationBytes)
+            XCTAssertNil(lease.metadataStore)
+            XCTAssertFalse(lease.completionIsFrozen)
+            XCTAssertNil(lease.coverage(at: 0))
+            XCTAssertNil(lease.coverage(at: 1))
+            print("PAUSED_WINDOW_ALLOCATION actual=\(lease.knownAllocationBytes) "
+                + "reserved=\(PausedWindowCoverageLease.reservationBytes) "
+                + "root=\(actual.root) indices=\(actual.indices) "
+                + "contextToken=\(actual.context) applicationToken=\(actual.application) "
+                + "indexCapacity=\(lease.indexCapacity)")
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testRepeatedResumeLeaseRetirementReturnsExactBaseline() throws {
+        let original = try FrozenPreparationOwner.reserve()
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        for _ in 0..<32 {
+            try withLease { lease in
+                XCTAssertNotEqual(lease.slot, original.slot)
+                XCTAssertLessThanOrEqual(lease.knownAllocationBytes,
+                    PausedWindowCoverageLease.reservationBytes)
+            }
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+        }
+        withExtendedLifetime(original) {}
+    }
+
+    func testResumeMetadataPinsCannotChangeTheOriginalOwner() async throws {
+        let harness = try await Task19Harness()
+        try await harness.initial()
+        defer { harness.publisher.close() }
+        let key = try XCTUnwrap(harness.publisher.visible?.media[1]?.resources.first)
+        let original = try FrozenPreparationOwner.reserve()
+        _ = try original.retainMetadata(in: harness.store, key: key)
+        let originalPins = harness.store.preparationLeaseChargeSnapshot(ownerSlot: original.slot)
+        var resumed: PausedWindowCoverageLease? = try .reserve()
+        let resumedSlot = try XCTUnwrap(resumed).slot
+        let metadataSlot = try XCTUnwrap(resumed).retainMetadata(in: harness.store, key: key)
+        XCTAssertFalse(try XCTUnwrap(resumed).containsCompletedResource(metadataSlot))
+        let otherStore = SealedMediaStore(token: Task19.token, itemGeneration: 19)
+        XCTAssertThrowsError(try XCTUnwrap(resumed).retainMetadata(in: otherStore, key: key)) {
+            XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .staleIdentity)
+        }
+        let beforeFreeze = try ServedCoverageDependencies.frozen(
+            owner: XCTUnwrap(resumed), rendition: .init(rawValue: 1),
+            requested: FMP4PresentationRange(start: Task19.time(0), duration: Task19.time(1)))
+        XCTAssertNil(beforeFreeze, "An unfrozen or partly failed attempt cannot issue dependencies")
+        try XCTUnwrap(resumed).freezeCompletedResources()
+        XCTAssertTrue(try XCTUnwrap(resumed).completionIsFrozen)
+        XCTAssertFalse(try XCTUnwrap(resumed).containsCompletedResource(metadataSlot),
+            "Metadata presence cannot manufacture completed HTTP evidence")
+        XCTAssertThrowsError(try XCTUnwrap(resumed).retainMetadata(in: harness.store, key: key))
+        XCTAssertThrowsError(try XCTUnwrap(resumed).freezeCompletedResources())
+        XCTAssertFalse(harness.store.preparationLeaseChargeSnapshot(ownerSlot: resumedSlot).identities.isEmpty)
+        resumed = nil
+        XCTAssertTrue(harness.store.preparationLeaseChargeSnapshot(ownerSlot: resumedSlot).identities.isEmpty)
+        let after = harness.store.preparationLeaseChargeSnapshot(ownerSlot: original.slot)
+        XCTAssertEqual(Set(after.identities), Set(originalPins.identities))
+        XCTAssertEqual(after.charge, originalPins.charge)
+        XCTAssertTrue(after.charge.allReservationsRegistered)
+        withExtendedLifetime(original) {}
+    }
+
+    func testRetainedCoverageOwnerAliasKeepsItsAdmissionAndPins() async throws {
+        let harness = try await Task19Harness()
+        try await harness.initial()
+        defer { harness.publisher.close() }
+        let key = try XCTUnwrap(harness.publisher.visible?.media[1]?.resources.first)
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let slot = try retainCoverageAlias(in: harness.store, key: key)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+        XCTAssertTrue(harness.store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+    }
+
+    @inline(never)
+    private func retainCoverageAlias(in store: SealedMediaStore, key: HLSResourceKey) throws -> UInt8 {
+        var lease: PausedWindowCoverageLease? = try .reserve()
+        _ = try XCTUnwrap(lease).retainMetadata(in: store, key: key)
+        let alias = FrozenCompletedCoverageOwner.paused(try XCTUnwrap(lease))
+        let charged = PlaybackResourceContextLedger.shared.chargedBytes
+        lease = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+        XCTAssertFalse(store.preparationLeaseChargeSnapshot(ownerSlot: alias.slot).identities.isEmpty)
+        withExtendedLifetime(alias) {}
+        return alias.slot
+    }
+
+    @inline(never)
+    private func withLease(_ body: (PausedWindowCoverageLease) throws -> Void) throws {
+        let lease = try PausedWindowCoverageLease.reserve()
+        try body(lease)
+    }
+}

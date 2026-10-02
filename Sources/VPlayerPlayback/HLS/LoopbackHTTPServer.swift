@@ -162,6 +162,21 @@ final class PlaybackResourceContextLedger: @unchecked Sendable {
     var chargedBytes: Int { lock.withLock { chargedBytesLocked } }
     var maximumChargedBytes: Int { lock.withLock { maximum } }
     var shouldBackpressure: Bool { chargedBytes >= Self.softBytes }
+    /// Read only the exact registered token allocations. No token or authority
+    /// escapes the ledger lock, and an inactive/foreign reservation has no result.
+    func reservationAllocationBytes(for reservation: PlaybackResourceContextReservation)
+        -> (context: Int, application: Int)? {
+        lock.withLock {
+            guard reservation.ledger === self, reservation.isActive,
+                  let index = index(of: reservation.allocationIdentity),
+                  allocations[index].references > 0,
+                  let application = allocations[index].applicationReservation else { return nil }
+            return (
+                malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(reservation).toOpaque())),
+                malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(application).toOpaque()))
+            )
+        }
+    }
     var bootstrapActualBytes: Int {
         let object = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
         let lockObject = UnsafeRawPointer(Unmanaged.passUnretained(lock).toOpaque())

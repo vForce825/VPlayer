@@ -11,6 +11,67 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class LoopbackHTTPServerTests: XCTestCase {
+    func testPausedWindowRequiresItsOwnFrozenInitializationCompletion() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        try fixture.beginPreparationHistory()
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        let media = try XCTUnwrap(playlist.resources.first)
+        XCTAssertEqual(playlist.initializationResources.count, 1)
+        let initialization = try XCTUnwrap(playlist.initializationResources.first)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let requested = try XCTUnwrap(map.samples.first).presentationRange
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: media)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: media)?.isComplete == true
+        })
+        XCTAssertFalse(store.completedEvidenceSnapshot(for: initialization)?.isComplete == true)
+
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        var frozen: PausedWindowCoverageLease? = try .reserve()
+        let slot = try XCTUnwrap(frozen).slot
+        let mediaSlot = try XCTUnwrap(frozen).retainMetadata(in: store, key: media)
+        let initSlot = try XCTUnwrap(frozen).retainMetadata(in: store, key: initialization)
+        try XCTUnwrap(frozen).freezeCompletedResources()
+        XCTAssertTrue(try XCTUnwrap(frozen).containsCompletedResource(mediaSlot))
+        XCTAssertFalse(try XCTUnwrap(frozen).containsCompletedResource(initSlot))
+        XCTAssertNil(try ServedCoverageDependencies.frozen(owner: XCTUnwrap(frozen),
+            rendition: .init(rawValue: 1), requested: requested),
+            "Completed media cannot certify a merely pinned initialization")
+
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: initialization)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+        })
+        XCTAssertFalse(try XCTUnwrap(frozen).containsCompletedResource(initSlot))
+        XCTAssertNil(try ServedCoverageDependencies.frozen(owner: XCTUnwrap(frozen),
+            rendition: .init(rawValue: 1), requested: requested),
+            "Later HTTP completion cannot rewrite an already frozen lease")
+        frozen = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+
+        var renewed: PausedWindowCoverageLease? = try .reserve()
+        XCTAssertEqual(try XCTUnwrap(renewed).slot, slot)
+        _ = try XCTUnwrap(renewed).retainMetadata(in: store, key: media)
+        _ = try XCTUnwrap(renewed).retainMetadata(in: store, key: initialization)
+        try XCTUnwrap(renewed).freezeCompletedResources()
+        var dependencies = try ServedCoverageDependencies.frozen(owner: XCTUnwrap(renewed),
+            rendition: .init(rawValue: 1), requested: requested)
+        XCTAssertNotNil(dependencies)
+        XCTAssertTrue(dependencies?.input(atOrdinal: 0)?.initialization.isComplete == true)
+        XCTAssertTrue(dependencies?.input(atOrdinal: 0)?.media.isComplete == true)
+        renewed = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
+            baseline + PausedWindowCoverageLease.reservationBytes)
+        XCTAssertFalse(store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+        dependencies = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+        XCTAssertTrue(store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+    }
+
     func testResourcePathFailurePreservesPublicationErrorTypeAndReason() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
