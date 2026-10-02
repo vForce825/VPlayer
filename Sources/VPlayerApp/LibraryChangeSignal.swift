@@ -51,6 +51,53 @@ final class LibraryChangeSignal {
     @ObservationIgnored
     private var refreshCompletionClaimByKey: [RefreshKey: UUID] = [:]
 
+    @ObservationIgnored
+    private var committedObservationTask: Task<Void, Never>?
+
+    @ObservationIgnored
+    private var committedObservationStore: SwiftDataLibraryStore?
+
+    @ObservationIgnored
+    private var committedObservationID: UUID?
+
+    deinit { committedObservationTask?.cancel() }
+
+    /// Subscribe before library preparation so profile restoration and external
+    /// context commits flow through the same generation/coalescing machinery.
+    /// Only immutable snapshots cross from the store's model actor to MainActor.
+    func observeCommittedChanges(in store: SwiftDataLibraryStore) async throws {
+        guard committedObservationStore !== store else { return }
+        let id = UUID()
+        committedObservationID = id
+        let stream = try await store.committedChanges()
+        var iterator = stream.makeAsyncIterator()
+        // Consume the initial value before returning to preparation; a burst of
+        // saved changes cannot overwrite an as-yet unread comparison baseline.
+        guard let baseline = await iterator.next(), committedObservationID == id else { return }
+        committedObservationTask?.cancel()
+        committedObservationStore = store
+        committedObservationTask = Task { @MainActor [weak self] in
+            var iterator = iterator
+            var previous = baseline
+            while let snapshot = await iterator.next() {
+                guard !Task.isCancelled, self?.committedObservationID == id else { return }
+                if let change = snapshot.change(since: previous) { self?.notify(change) }
+                previous = snapshot
+            }
+        }
+    }
+
+    func notify(_ change: CommittedLibraryChange) {
+        switch change {
+        case .full:
+            notify()
+        case let .refreshes(resourcesByProfile):
+            for (profileID, resources) in resourcesByProfile {
+                for resource in resources { notify(profileID: profileID, resource: resource) }
+            }
+        }
+    }
+
     func notify() {
         generation &+= 1
         latestFullReloadGeneration = generation

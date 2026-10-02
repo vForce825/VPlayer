@@ -4401,6 +4401,12 @@ private final class Review2LoopbackCoordinatorHarness {
 
 @MainActor
 private final class Review2LoopbackDriver: AVPlayerDriving {
+    var disconnectedFromSystemAudio = false
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == item else { throw .staleIdentity }
+        disconnectedFromSystemAudio = disconnected
+    }
     var seekAction: (() throws -> Void)?
     var rate: Float = 0
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused

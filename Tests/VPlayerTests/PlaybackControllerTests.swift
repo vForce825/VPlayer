@@ -691,11 +691,12 @@ final class PlaybackControllerTests: XCTestCase {
         let play = Task { await controller.play(request) }
         try await eventually { factory.isPending(callID: 1) }
         _ = owner.monitor.emit(.mediaServicesWereReset)
-        try await eventually { await controller.currentStateForTesting == .recovering(request) }
+        try await eventually { await controller.currentStateForTesting == .paused(request) }
         XCTAssertEqual(owner.sdk.categoryCallCount, 1)
         factory.succeed(callID: 1, with: first)
         await play.value
         try await eventually { first.snapshot().completedStopCount == 1 }
+        try await resumeResetAfterReconfiguration(controller, owner: owner)
         try await eventually { factory.isPending(callID: 2) }
         factory.succeed(callID: 2, with: successor)
         try await eventually { successor.snapshot().starts.count == 1 }
@@ -890,10 +891,11 @@ final class PlaybackControllerTests: XCTestCase {
         await f.controller.stop()
     }
 
-    func testPlayingMediaServicesResetRunsRecoveryAndMatchingReadyReturnsToPlaying() async throws {
+    func testPlayingMediaServicesResetWaitsForUserResumeAndMatchingReadyReturnsToPlaying() async throws {
         let f = ControllerRecoveryFixture(channelID: "reset-recovery", owner: RecordingPlaybackAudioSessionOwner())
         try await start(f)
         _ = f.owner.monitor.emit(.mediaServicesWereReset)
+        try await resumeResetAfterReconfiguration(f.controller, owner: f.owner)
         try await eventually { f.successor.snapshot().starts.count == 1 }
         XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
         XCTAssertEqual(f.factory.makeCountSnapshot, 2)
@@ -920,6 +922,7 @@ final class PlaybackControllerTests: XCTestCase {
         XCTAssertEqual(f.owner.sdk.activateCallCount, 1, "reset不能越过真实began")
         XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
         _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        try await resumeResetAfterReconfiguration(f.controller, owner: f.owner)
         try await eventually { f.successor.snapshot().starts.count == 1 }
         XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
         XCTAssertEqual(f.factory.makeCountSnapshot, 2)
@@ -1262,6 +1265,16 @@ final class PlaybackControllerTests: XCTestCase {
         f.successor.emit(.ready(readinessCycle: 2))
         try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
         await f.controller.stop()
+    }
+
+    private func resumeResetAfterReconfiguration(_ controller: PlaybackController,
+        owner: RecordingPlaybackAudioSessionOwner) async throws {
+        try await eventually {
+            owner.registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt != nil
+        }
+        XCTAssertTrue(owner.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        XCTAssertNil(owner.registry.outputResourceContextSnapshot()?.sessionReceipts?.active)
+        await controller.setPaused(false)
     }
 
     private func start(_ fixture: ControllerRecoveryFixture) async throws {

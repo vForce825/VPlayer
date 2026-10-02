@@ -2041,7 +2041,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         try fixture.configureAndHandoff()
         let registry = fixture.registry
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
-        let activation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce))
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry, contextNonce: context.contextNonce))
         let request = try claimGraphAudioCall(registry, lane: fixture.lane, activation)
         XCTAssertEqual(try allocator.next(in: .audioSessionConfigurationGeneration), 1)
         let completion = try completeGraphAudioCall(registry, lane: fixture.lane, request, .activation(nil))
@@ -2084,7 +2084,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let registry = fixture.registry
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
         let binding = try XCTUnwrap(context.systemRecoveryBinding)
-        let activation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce),
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry, contextNonce: context.contextNonce),
             "inactive交接后必须由独立reset-purpose activation前进")
         let request = try claimGraphAudioCall(registry, lane: fixture.lane, activation)
         XCTAssertNil(registry.processAudioSessionReceiptSnapshot(), "未返回的调用不能提升inactive候选")
@@ -2490,7 +2490,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             return XCTFail("首reset inactive交接失败")
         }
         let firstContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
-        let firstActivation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(
+        let firstActivation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
             contextNonce: firstContext.contextNonce))
         let firstActivationRequest = try claimGraphAudioCall(registry, lane: ordinary.lane, firstActivation)
         let firstActivationCompletion = try completeGraphAudioCall(registry, lane: ordinary.lane, firstActivationRequest, .activation(nil))
@@ -4637,8 +4637,8 @@ func graphOwnedDeactivation(_ registry: ControlTaskRegistry) -> AudioSessionDeac
 private final class GraphAudioSessionSDK: PlaybackAudioSessionSDK, Sendable {
     func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {}
     func setSupportsMultichannelContent() throws {}
-    func activate() throws {}
-    func deactivate() throws {}
+    func activate() async throws -> Bool { true }
+    func deactivate() async throws -> Bool { true }
     func currentRoute() -> any AudioSessionRouteSnapshot { GraphEmptyRoute() }
     func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool {
         guard let base = bytes.baseAddress else { return false }
@@ -4701,6 +4701,15 @@ func completeGraphRoute(_ registry: ControlTaskRegistry, _ call: GraphRouteCall,
     return try completeGraphAudioCall(registry, lane: call.lane, call.request, .route(evidence))
 }
 
+/// Tests that need an active reset generation explicitly admit the user action first.
+func prepareGraphResetActivationAfterUserResume(_ registry: ControlTaskRegistry,
+    contextNonce: UInt64) throws -> ControlTaskTicket? {
+    let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+    XCTAssertEqual(context.contextNonce, contextNonce)
+    let lease = try XCTUnwrap(registry.audioSessionLease(session: context.sessionIdentity))
+    return registry.prepareExplicitResume(for: lease)
+}
+
 struct ResetAcquiringOutputFixture {
     let clock: OutputTestClock
     let registry: ControlTaskRegistry
@@ -4745,7 +4754,7 @@ struct ResetAcquiringOutputFixture {
     @discardableResult
     func activateResetAndCommit() throws -> ControlTaskTicket {
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
-        let activation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce))
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry, contextNonce: context.contextNonce))
         let completion = try graphAudioCall(registry, lane: lane, activation, .activation(nil))
         XCTAssertEqual(completion.disposition, .accepted)
         let sampler = try XCTUnwrap(completion.followUp)
@@ -4890,7 +4899,7 @@ struct ActualAudioActivationFixture {
             registry = fixture.registry
             lane = fixture.lane
             if kind == 1 {
-                ticket = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(
+                ticket = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
                     contextNonce: try XCTUnwrap(registry.outputResourceContextSnapshot()).contextNonce))
             } else {
                 let previous = try fixture.activateResetAndCommit()

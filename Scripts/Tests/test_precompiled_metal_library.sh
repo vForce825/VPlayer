@@ -25,9 +25,9 @@ cmp "$artifact_directory/VPlayerPlayback-tvsimulator.metallib" \
   "$temporary/VPlayerPlayback-tvsimulator.metallib"
 
 strings "$artifact_directory/VPlayerPlayback-tvos.metallib" \
-  | grep -Fq 'apple-tvos26.0.0'
+  | grep -Fq 'apple-tvos27.0.0'
 strings "$artifact_directory/VPlayerPlayback-tvsimulator.metallib" \
-  | grep -Fq 'apple-tvos26.0.0-simulator'
+  | grep -Fq 'apple-tvos27.0.0-simulator'
 
 if grep -Fq 'YADIF.metal in Sources' "$root/VPlayer.xcodeproj/project.pbxproj" \
   || grep -Fq 'ScanProbe.metal in Sources' "$root/VPlayer.xcodeproj/project.pbxproj"; then

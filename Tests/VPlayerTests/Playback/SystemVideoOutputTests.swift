@@ -8,6 +8,85 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SystemVideoOutputTests: XCTestCase {
+    func testReceiverSuspensionDoesNotCompleteVideoAcceptanceEarly() throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let harness = makeHarness(backend: backend)
+        let receipt = VideoReceiptBox()
+        harness.output.enqueue([try frame(sequence: 1, pts: 1)]) {
+            receipt.value = try? $0.get()
+        }
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.heldEnqueueCount, 1)
+        XCTAssertNil(receipt.value)
+        backend.completeEnqueue()
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(receipt.value?.sequenceNumbers, [1])
+    }
+
+    func testReceiverLateVideoAcceptanceAfterResetIsIgnored() throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let harness = makeHarness(backend: backend)
+        let receipt = VideoReceiptBox()
+        harness.output.enqueue([try frame(sequence: 1, pts: 1)]) {
+            receipt.value = try? $0.get()
+        }
+        harness.output.waitUntilIdleForTesting()
+        harness.output.flush(to: MediaGeneration(rawValue: 1))
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue()
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertNil(receipt.value)
+        XCTAssertEqual(backend.heldEnqueueCount, 0)
+    }
+
+    func testAcceptedVideoWithDecodeWarningStillCompletesReceipt() throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let failures = VideoResetResultBox()
+        let harness = makeHarness(backend: backend,
+            failureSink: { error, _ in failures.record(.failure(error)) })
+        let receipt = VideoReceiptBox()
+        harness.output.enqueue([try frame(sequence: 1, pts: 1)]) {
+            receipt.value = try? $0.get()
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue()
+        backend.emit(.decodeFailure(NSError(domain: "Receiver.DecodeWarning", code: -1)))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(receipt.value?.sequenceNumbers, [1])
+        XCTAssertEqual(failures.count, 1)
+    }
+
+    func testOldReceiverEventAfterResetCannotFailNewVideoEpisode() throws {
+        let backend = FakeVideoRendererBackend()
+        let failures = VideoResetResultBox()
+        let harness = makeHarness(backend: backend,
+            failureSink: { error, _ in failures.record(.failure(error)) })
+        let oldHandler = backend.captureEventHandler()
+        harness.output.flush(to: MediaGeneration(rawValue: 1))
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        oldHandler?(.failed(NSError(domain: "Receiver.OldEpisode", code: -1)))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(failures.count, 0)
+    }
+
+    func testDelayedReceiverFailureAfterFinalVideoEnqueueStillRequestsRecovery() throws {
+        let backend = FakeVideoRendererBackend()
+        let recoveries = VideoOutputEventBox()
+        let harness = makeHarness(backend: backend, recoverySink: { _ in recoveries.record() })
+        harness.output.enqueue(try frame(sequence: 1, pts: 1))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.finishedEnqueuingCount, 1)
+        backend.requiresFlushToResumeDecoding = true
+        backend.emit(.requiresFlushToResumeDecoding)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(recoveries.count, 1)
+    }
+
     func testRendererFailurePreservesOriginalErrorDetails() throws {
         let backend = FakeVideoRendererBackend()
         let failures = VideoResetResultBox()
@@ -580,6 +659,29 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
 
     var isReadyForMoreMediaData: Bool { lock.withLock { ready } }
 
+    var holdEnqueueCompletions = false
+    private var heldEnqueues: [@Sendable (Result<Void, any Error>) -> Void] = []
+    var heldEnqueueCount: Int { lock.withLock { heldEnqueues.count } }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void) {
+        if holdEnqueueCompletions {
+            lock.withLock { heldEnqueues.append(completion) }
+        } else {
+            enqueue(sampleBuffer)
+            completion(.success(()))
+        }
+    }
+
+    func completeEnqueue() {
+        let completion = lock.withLock { heldEnqueues.isEmpty ? nil : heldEnqueues.removeFirst() }
+        completion?(.success(()))
+    }
+
+    func cancelPendingEnqueue() {}
+    private(set) var finishedEnqueuingCount = 0
+    func finishedEnqueuing() { lock.withLock { finishedEnqueuingCount += 1 } }
+
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
         lock.withLock {
             enqueuedPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value)
@@ -642,6 +744,10 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     func completePerformanceMetrics(_ snapshot: VideoRendererPerformanceSnapshot?) {
         let completion = lock.withLock { performanceMetricsCompletions.removeFirst() }
         completion(snapshot)
+    }
+
+    func captureEventHandler() -> (@Sendable (VideoRendererBackendEvent) -> Void)? {
+        lock.withLock { eventHandler }
     }
 
     func emit(_ event: VideoRendererBackendEvent) {

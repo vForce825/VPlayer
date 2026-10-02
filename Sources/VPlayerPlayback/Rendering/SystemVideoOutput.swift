@@ -32,7 +32,7 @@ final class SystemVideoOutput: @unchecked Sendable {
     typealias Acceptance = @Sendable (Result<VideoEnqueueReceipt, PlaybackCoreError>) -> Void
     typealias RendererRemoval = @Sendable (@escaping @Sendable (Bool) -> Void) -> Void
 
-    private struct PendingFrame {
+    private struct PendingFrame: Sendable {
         let frame: VideoPresentationFrame
         let acceptanceID: UInt64?
     }
@@ -73,6 +73,9 @@ final class SystemVideoOutput: @unchecked Sendable {
     private var stopFlushOperationID: UInt64 = 0
     private var requestToken: UInt64 = 0
     private var requestArmed = false
+    private var eventEpoch: UInt64 = 0
+    private var activeFrame: PendingFrame?
+    private var draining = false
     private var inFlightFlush: (operationID: UInt64, transaction: ResetTransaction)?
     private var pendingReset: ResetTransaction?
     private var stopped = false
@@ -102,9 +105,7 @@ final class SystemVideoOutput: @unchecked Sendable {
         self.recoverySink = recoverySink
         self.failureSink = failureSink
         stateQueue.setSpecific(key: queueKey, value: 1)
-        backend.startObserving { [weak self] event in
-            self?.stateQueue.async { [weak self] in self?.handleBackendEventIsolated(event) }
-        }
+        installBackendObservationIsolated()
     }
 
     convenience init(
@@ -115,15 +116,12 @@ final class SystemVideoOutput: @unchecked Sendable {
         recoverySink: @escaping @Sendable (MediaGeneration) -> Void,
         failureSink: @escaping @Sendable (PlaybackCoreError, MediaGeneration) -> Void
     ) {
-        let removal = SystemVideoRendererRemoval(
-            renderer: renderer,
-            synchronizer: synchronizer
-        )
+        let backend = VideoRendererBackend(renderer: renderer, synchronizer: synchronizer)
         self.init(
-            backend: VideoRendererBackend(renderer: renderer),
+            backend: backend,
             ledger: ledger,
             metrics: metrics,
-            removeRenderer: removal.remove,
+            removeRenderer: backend.remove,
             recoverySink: recoverySink,
             failureSink: failureSink
         )
@@ -209,8 +207,11 @@ final class SystemVideoOutput: @unchecked Sendable {
 
     func advanceDecoderGeneration(to generation: MediaGeneration) {
         stateQueue.async { [self] in
-            guard !stopped else { return }
+            guard !stopped, self.generation != generation else { return }
+            stopRequestIsolated()
+            clearPendingIsolated(reason: "renderer.generation")
             self.generation = generation
+            installBackendObservationIsolated()
         }
     }
 
@@ -333,27 +334,58 @@ final class SystemVideoOutput: @unchecked Sendable {
               token == requestToken,
               inFlightFlush == nil,
               pendingReset == nil else { return }
-        while backend.isReadyForMoreMediaData, !pending.isEmpty {
+        guard !draining else { return }
+        draining = true
+        defer { draining = false }
+        while activeFrame == nil, backend.isReadyForMoreMediaData, !pending.isEmpty {
             let next = pending.removeFirst()
             do {
-                backend.enqueue(try builder.make(frame: next.frame))
-                if recoveryCompletedWithoutProgress, !recoveryRequestInFlight {
-                    recoveryCompletedWithoutProgress = false
+                let sample = try builder.make(frame: next.frame)
+                activeFrame = next
+                backend.enqueue(sample) { [weak self] result in
+                    guard let self else { return }
+                    if DispatchQueue.getSpecific(key: queueKey) != nil {
+                        completeEnqueueIsolated(next, token: token, result: result)
+                    } else {
+                        stateQueue.async { [weak self] in
+                            self?.completeEnqueueIsolated(next, token: token, result: result)
+                        }
+                    }
                 }
-                ledger.release(next.frame)
-                completeAcceptanceFrameIsolated(next)
-            } catch let error as PlaybackCoreError {
-                ledger.release(next.frame)
-                rejectIsolated(next.frame, acceptanceID: next.acceptanceID, error: error)
-                failureSink(error, generation)
             } catch {
                 ledger.release(next.frame)
-                let failure = PlaybackCoreError.unexpected(stage: "video.sample-buffer", diagnostic: .init(error))
+                let failure = (error as? PlaybackCoreError) ?? .unexpected(
+                    stage: "video.sample-buffer", diagnostic: .init(error))
                 rejectIsolated(next.frame, acceptanceID: next.acceptanceID, error: failure)
                 failureSink(failure, generation)
             }
         }
-        if pending.isEmpty { stopRequestIsolated() }
+        if pending.isEmpty, activeFrame == nil {
+            stopRequestIsolated()
+            backend.finishedEnqueuing()
+        }
+    }
+
+    private func completeEnqueueIsolated(_ next: PendingFrame, token: UInt64,
+        result: Result<Void, any Error>) {
+        guard !stopped, requestArmed, token == requestToken,
+              next.frame.generation == generation,
+              activeFrame?.frame.sequenceNumber == next.frame.sequenceNumber,
+              inFlightFlush == nil, pendingReset == nil else { return }
+        activeFrame = nil
+        ledger.release(next.frame)
+        switch result {
+        case .success:
+            if recoveryCompletedWithoutProgress, !recoveryRequestInFlight {
+                recoveryCompletedWithoutProgress = false
+            }
+            completeAcceptanceFrameIsolated(next)
+        case let .failure(error):
+            let failure = Self.rendererFailure(error)
+            rejectIsolated(next.frame, acceptanceID: next.acceptanceID, error: failure)
+            if !(error is CancellationError) { failureSink(failure, generation) }
+        }
+        if !draining { drainIsolated(token: token) }
     }
 
     private func stopRequestIsolated() {
@@ -361,6 +393,7 @@ final class SystemVideoOutput: @unchecked Sendable {
         requestArmed = false
         requestToken &+= 1
         backend.stopRequestingMediaData()
+        backend.cancelPendingEnqueue()
     }
 
     private func startResetIsolated(
@@ -368,6 +401,8 @@ final class SystemVideoOutput: @unchecked Sendable {
         clearPending: Bool
     ) {
         stopRequestIsolated()
+        eventEpoch += 1
+        backend.stopObserving()
         generation = transaction.request.generation
         if clearPending {
             clearPendingIsolated(reason: "renderer.reset")
@@ -427,6 +462,7 @@ final class SystemVideoOutput: @unchecked Sendable {
             startResetIsolated(latest, clearPending: false)
             return
         }
+        installBackendObservationIsolated()
         let transaction = finished.transaction
         let seeds = transaction.request.seedFrames
         if seeds.isEmpty {
@@ -535,6 +571,17 @@ final class SystemVideoOutput: @unchecked Sendable {
         for waiter in waiters { waiter.resume() }
     }
 
+    private func installBackendObservationIsolated() {
+        eventEpoch += 1
+        let epoch = eventEpoch
+        backend.startObserving { [weak self] event in
+            self?.stateQueue.async { [weak self] in
+                guard let self, eventEpoch == epoch else { return }
+                handleBackendEventIsolated(event)
+            }
+        }
+    }
+
     private func handleBackendEventIsolated(_ event: VideoRendererBackendEvent) {
         guard !stopped else { return }
         let shouldRecover: Bool
@@ -543,7 +590,7 @@ final class SystemVideoOutput: @unchecked Sendable {
         case .requiresFlushToResumeDecoding:
             shouldRecover = true
             observedFailure = nil
-        case let .failed(error):
+        case let .failed(error), let .decodeFailure(error):
             observedFailure = Self.rendererFailure(error)
             shouldRecover = backend.requiresFlushToResumeDecoding
                 || backend.status == .failed
@@ -627,6 +674,10 @@ final class SystemVideoOutput: @unchecked Sendable {
     }
 
     private func clearPendingIsolated(reason: String) {
+        if let activeFrame {
+            ledger.release(activeFrame.frame)
+            self.activeFrame = nil
+        }
         let frames = pending
         pending.removeAll(keepingCapacity: true)
         for pendingFrame in frames { ledger.release(pendingFrame.frame) }
@@ -672,33 +723,5 @@ final class SystemVideoOutput: @unchecked Sendable {
 
     var pendingSequenceNumbersForTesting: [UInt64] {
         stateQueue.sync { pending.map(\.frame.sequenceNumber) }
-    }
-}
-
-private final class SystemVideoRendererRemoval: @unchecked Sendable {
-    private let renderer: AVSampleBufferVideoRenderer
-    private let synchronizer: AVSampleBufferRenderSynchronizer
-
-    init(
-        renderer: AVSampleBufferVideoRenderer,
-        synchronizer: AVSampleBufferRenderSynchronizer
-    ) {
-        self.renderer = renderer
-        self.synchronizer = synchronizer
-    }
-
-    lazy var remove: SystemVideoOutput.RendererRemoval = { [self] completion in
-        synchronizer.removeRenderer(
-            renderer,
-            at: .invalid,
-            completionHandler: { [self] didRemove in
-                let isStillAttached = synchronizer.renderers.contains { candidate in
-                    (candidate as AnyObject) === renderer
-                }
-                // AVFoundation returns false when the renderer was never added;
-                // that still satisfies our teardown barrier because it is absent.
-                completion(didRemove || !isStillAttached)
-            }
-        )
     }
 }

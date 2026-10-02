@@ -10,6 +10,66 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
+    func testDelayedReceiverFailureAfterFinalAudioEnqueueStillRebuildsRenderer() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        XCTAssertGreaterThan(renderer.finishedEnqueuingCount, 0)
+        renderer.emit(.failed("Receiver.Delayed:-1"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReceiverSuggestedFlushStillCountsAsAcceptedCoverage() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.configureEnqueueResults([.acceptedWithSuggestedFlush])
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+        }
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 1)
+        XCTAssertNotNil(harness.pipeline.acceptedCoverage)
+        XCTAssertEqual(harness.pipeline.diagnostics.pendingSampleCount, 0)
+    }
+
+    func testReceiverSuspensionKeepsOnlyOneAudioSubmissionInFlight() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.holdEnqueueCompletions = true
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            try harness.pipeline.enqueue(try self.makeSample(id: 2,
+                pts: CMTime(value: 1, timescale: 1)))
+        }
+        XCTAssertEqual(renderer.heldEnqueueCount, 1)
+        XCTAssertNil(harness.pipeline.acceptedCoverage)
+        renderer.completeEnqueue(.accepted)
+        drain(harness.executor)
+        XCTAssertEqual(renderer.heldEnqueueCount, 1)
+        XCTAssertNotNil(harness.pipeline.acceptedCoverage)
+    }
+
+    func testReceiverLateAcceptanceAfterFlushCannotRestoreAudioCoverage() throws {
+        let harness = try makeHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.holdEnqueueCompletions = true
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1))
+            harness.pipeline.flush(to: MediaGeneration(rawValue: 2))
+        }
+        renderer.completeEnqueue(.accepted)
+        drain(harness.executor)
+        XCTAssertNil(harness.pipeline.acceptedCoverage)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+    }
+
     func testNativeAudioRendererRepeatedFailuresKeepFirstDiagnosticAcrossObservationRestart() throws {
         let renderer = SystemAudioRenderer(identity: .init(rawValue: 1), mediaKind: .compressed)
         let firstError = NSError(domain: "AudioRenderer.First", code: -84,
@@ -1316,63 +1376,15 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
-    func testSystemRendererReportsNotReadyAsBackpressure() throws {
-        let underlying = AlwaysBackpressuredAVSampleBufferAudioRenderer()
-        let renderer = SystemAudioRenderer(
-            identity: AudioRendererIdentity(rawValue: 99),
-            mediaKind: .compressed,
-            renderer: underlying
-        )
-        let sample = try makeSample(id: 1)
-
-        XCTAssertEqual(try renderer.enqueue(sample.sampleBuffer), .backpressured)
-        XCTAssertEqual(underlying.enqueueCount, 0)
-    }
-
-    func testSystemRendererDoesNotReregisterActiveMediaRequest() {
-        let underlying = AlwaysBackpressuredAVSampleBufferAudioRenderer()
-        let renderer = SystemAudioRenderer(
-            identity: AudioRendererIdentity(rawValue: 100),
-            mediaKind: .compressed,
-            renderer: underlying
-        )
-
-        renderer.requestMediaDataWhenReady {}
-        renderer.requestMediaDataWhenReady {}
-
-        XCTAssertEqual(underlying.requestCount, 1)
-        XCTAssertEqual(underlying.stopRequestCount, 0)
-
-        renderer.stopRequestingMediaData()
-        renderer.stopRequestingMediaData()
-
-        XCTAssertEqual(underlying.stopRequestCount, 1)
-    }
-
-    func testSystemRendererForwardsDemandCallbackButEnqueueIsNotAcknowledgement() throws {
-        let underlying = ControllableAVSampleBufferAudioRenderer()
-        let renderer = SystemAudioRenderer(
-            identity: AudioRendererIdentity(rawValue: 101),
-            mediaKind: .compressed,
-            renderer: underlying
-        )
-        let callbacks = LockedAudioCompletionCount()
-        renderer.requestMediaDataWhenReady { callbacks.increment() }
-
-        XCTAssertEqual(callbacks.value, 0)
-        XCTAssertEqual(
-            try renderer.enqueue(makeSample(id: 1).sampleBuffer),
-            .accepted
-        )
-        XCTAssertEqual(underlying.enqueueCount, 1)
-        XCTAssertEqual(
-            callbacks.value,
-            0,
-            "enqueue acceptance is not a renderer-consumption acknowledgement"
-        )
-
-        underlying.fireReady()
-        XCTAssertEqual(callbacks.value, 1)
+    func testUnattachedSystemReceiverReportsBackpressureWithoutAccepting() throws {
+        let renderer = SystemAudioRenderer(identity: .init(rawValue: 99), mediaKind: .compressed)
+        let finished = expectation(description: "unattached receiver result")
+        renderer.enqueue(try makeSample(id: 1).sampleBuffer) { result in
+            XCTAssertEqual(try? result.get(), .backpressured)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 1)
+        XCTAssertFalse(renderer.isReadyForMoreMediaData)
     }
 
     func testSynchronizerRejectsNonSystemRendererInsteadOfSilentlyAttaching() {
@@ -6862,6 +6874,13 @@ private final class ResetAttachmentAudioRenderer: AudioRenderer, @unchecked Send
         lock.withLock { enqueueResults = results }
     }
 
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void) {
+        completion(Result { try enqueue(sampleBuffer) })
+    }
+    func cancelPendingEnqueue() {}
+    func finishedEnqueuing() {}
+
     func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
         let resetDecoder = CMGetAttachment(
             sampleBuffer,
@@ -6921,81 +6940,6 @@ private final class ResetAttachmentAudioRenderer: AudioRenderer, @unchecked Send
     var stopRequestCountSnapshot: Int { lock.withLock { stopRequestCount } }
 }
 
-private final class ControllableAVSampleBufferAudioRenderer:
-    AVSampleBufferAudioRenderer,
-    @unchecked Sendable
-{
-    private let lock = NSLock()
-    private var storedEnqueueCount = 0
-    private var readyHandler: (@Sendable () -> Void)?
-
-    override var isReadyForMoreMediaData: Bool { true }
-
-    override func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        _ = sampleBuffer
-        lock.withLock { storedEnqueueCount += 1 }
-    }
-
-    override func requestMediaDataWhenReady(
-        on queue: dispatch_queue_t,
-        using block: @escaping @Sendable () -> Void
-    ) {
-        _ = queue
-        lock.withLock { readyHandler = block }
-    }
-
-    override func stopRequestingMediaData() {
-        lock.withLock { readyHandler = nil }
-    }
-
-    func fireReady() {
-        lock.withLock { readyHandler }?()
-    }
-
-    var enqueueCount: Int { lock.withLock { storedEnqueueCount } }
-}
-
-private final class AlwaysBackpressuredAVSampleBufferAudioRenderer:
-    AVSampleBufferAudioRenderer,
-    @unchecked Sendable
-{
-    private let lock = NSLock()
-    private var storedEnqueueCount = 0
-    private var storedRequestCount = 0
-    private var storedStopRequestCount = 0
-
-    override var isReadyForMoreMediaData: Bool { false }
-
-    override func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        _ = sampleBuffer
-        lock.withLock { storedEnqueueCount += 1 }
-    }
-
-    override func requestMediaDataWhenReady(
-        on queue: dispatch_queue_t,
-        using block: @escaping @Sendable () -> Void
-    ) {
-        _ = queue
-        _ = block
-        lock.withLock { storedRequestCount += 1 }
-    }
-
-    override func stopRequestingMediaData() {
-        lock.withLock { storedStopRequestCount += 1 }
-    }
-
-    var enqueueCount: Int {
-        lock.withLock { storedEnqueueCount }
-    }
-
-    var requestCount: Int {
-        lock.withLock { storedRequestCount }
-    }
-
-    var stopRequestCount: Int {
-        lock.withLock { storedStopRequestCount }
-    }
-}
 
 private struct AudioHarness {
     let executor: PlaybackSerialExecutor

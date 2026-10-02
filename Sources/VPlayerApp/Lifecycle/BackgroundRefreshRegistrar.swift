@@ -19,7 +19,7 @@ protocol BackgroundRefreshScheduling: AnyObject, Sendable {
         handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void
     ) -> Bool
     func cancel(identifier: String)
-    func submit(identifier: String, earliestBeginDate: Date) throws
+    func submit(identifier: String, earliestBeginDate: Date) async throws
 }
 
 @MainActor
@@ -42,6 +42,20 @@ final class BackgroundRefreshRegistrar {
     private let reportStatus: ReportStatus
     private var isRegistered = false
     private var schedulingTask: Task<Void, Never>?
+    private var submissionTask: Task<Void, any Error>?
+    private var schedulingRevision = UUID()
+    private var prefersReducedResourceUsage = false
+
+    func setPrefersReducedResourceUsage(_ preferred: Bool) {
+        // Signal changes must not launch a refresh or another submission.
+        prefersReducedResourceUsage = preferred
+    }
+
+    private func beginScheduling() -> UUID {
+        let revision = UUID()
+        schedulingRevision = revision
+        return revision
+    }
 
     init(
         scheduler: any BackgroundRefreshScheduling = SystemBackgroundRefreshScheduler(),
@@ -77,56 +91,44 @@ final class BackgroundRefreshRegistrar {
 
     func scheduleNext() {
         schedulingTask?.cancel()
-
-        let scheduler = scheduler
-        let loadProfiles = loadProfiles
-        let planner = planner
-        let now = now
-        let reportStatus = reportStatus
-        schedulingTask = Task { @MainActor in
+        let revision = beginScheduling()
+        schedulingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             do {
                 let profiles = try await loadProfiles()
                 try Task.checkCancellation()
-                try Self.submitNext(
-                    profiles: profiles,
-                    scheduler: scheduler,
-                    planner: planner,
-                    now: now()
-                )
+                try await submitNext(profiles: profiles, revision: revision)
             } catch is CancellationError {
                 return
             } catch {
+                guard revision == schedulingRevision, !Task.isCancelled else { return }
                 reportStatus(Self.sanitizedSchedulingError(error))
             }
         }
     }
 
     private func handle(_ task: any BackgroundRefreshTask) {
-        let scheduler = scheduler
         let loadProfiles = loadProfiles
         let refresh = refresh
         let planner = planner
         let now = now
         let reportStatus = reportStatus
+        let revision = beginScheduling()
         let execution = BackgroundRefreshExecution(task: task)
         task.setExpirationHandler {
             execution.expire()
         }
-        execution.start {
+        execution.start { [weak self] in
+            guard let self else { return false }
             do {
                 let profiles = try await loadProfiles()
                 try Task.checkCancellation()
 
                 var succeeded = true
                 do {
-                    try await MainActor.run {
-                        try Self.submitNext(
-                            profiles: profiles,
-                            scheduler: scheduler,
-                            planner: planner,
-                            now: now()
-                        )
-                    }
+                    try await self.submitNext(profiles: profiles, revision: revision)
+                } catch is CancellationError {
+                    try Task.checkCancellation()
                 } catch {
                     succeeded = false
                     await MainActor.run {
@@ -137,6 +139,7 @@ final class BackgroundRefreshRegistrar {
                 let refreshDate = now()
                 for profile in profiles {
                     try Task.checkCancellation()
+                    if await self.prefersReducedResourceUsage { break }
                     let resources = planner.dueResources(for: profile, now: refreshDate)
                     guard !resources.isEmpty else { continue }
                     let outcomes = await refresh(profile.id, resources, .background)
@@ -154,17 +157,38 @@ final class BackgroundRefreshRegistrar {
         }
     }
 
-    private static func submitNext(
-        profiles: [SourceProfile],
-        scheduler: any BackgroundRefreshScheduling,
-        planner: RefreshSchedulePlanner,
-        now: Date
-    ) throws {
-        scheduler.cancel(identifier: identifier)
-        guard let earliestBeginDate = planner.nextBackgroundDate(for: profiles, now: now) else {
-            return
+    private func submitNext(profiles: [SourceProfile], revision: UUID) async throws {
+        guard revision == schedulingRevision else { throw CancellationError() }
+        // Coalesce callers onto the one physical operation; obsolete revisions
+        // never create a chain of queued native submission tasks.
+        while let previous = submissionTask {
+            _ = try? await previous.value
+            try Task.checkCancellation()
+            guard revision == schedulingRevision else { throw CancellationError() }
         }
-        try scheduler.submit(identifier: identifier, earliestBeginDate: earliestBeginDate)
+        let submission = Task { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            defer { self.submissionTask = nil }
+            guard revision == self.schedulingRevision else { throw CancellationError() }
+            self.scheduler.cancel(identifier: Self.identifier)
+            let now = self.now()
+            guard var date = self.planner.nextBackgroundDate(for: profiles, now: now) else {
+                return
+            }
+            if self.prefersReducedResourceUsage {
+                date = max(date, now.addingTimeInterval(60 * 60))
+            }
+            try await self.scheduler.submit(identifier: Self.identifier, earliestBeginDate: date)
+            guard revision == self.schedulingRevision else {
+                // No successor can submit until this task settles, so this
+                // cancellation cannot remove a newer successfully submitted request.
+                self.scheduler.cancel(identifier: Self.identifier)
+                throw CancellationError()
+            }
+        }
+        submissionTask = submission
+        try await submission.value
+        try Task.checkCancellation()
     }
 
     private static func sanitizedSchedulingError(_ error: any Error) -> String {
@@ -233,10 +257,10 @@ private final class SystemBackgroundRefreshScheduler: BackgroundRefreshSchedulin
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: identifier)
     }
 
-    func submit(identifier: String, earliestBeginDate: Date) throws {
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
         let request = BGAppRefreshTaskRequest(identifier: identifier)
         request.earliestBeginDate = earliestBeginDate
-        try BGTaskScheduler.shared.submit(request)
+        try await BGTaskScheduler.shared.submitTaskRequest(request)
     }
 }
 

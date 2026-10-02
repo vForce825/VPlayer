@@ -109,7 +109,7 @@ struct AVPlayerDriverAdmission: Sendable {
 
 /// 实际交给SDK的callback持有本租约；执行、取消和driver退休均不提前归还。
 final class AVPlayerSDKCallbackLease: @unchecked Sendable {
-    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll }
+    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio }
     nonisolated(unsafe) private static var occupied: UInt8 = 0
     private let slot: UInt8
     let kind: Kind
@@ -121,7 +121,7 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
         installationResourceContextReservation: PlaybackResourceContextReservation?) throws
         -> AVPlayerSDKCallbackLease {
         let resourceReservation = try PlaybackResourceContextLedger.shared.reserve(
-            allocationIdentity: .stable(UUID()), bytes: 2 * 1_024)
+            allocationIdentity: .stable(UUID()), bytes: kind == .logFetch ? 4 * 1_024 : 2 * 1_024)
         do {
             let lease = try SystemAVPlayerDriver.creationLock.withLock {
                 guard let slot = (UInt8(0)..<8).first(where: { occupied & (1 << $0) == 0 }) else {
@@ -194,12 +194,14 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             body(role, pointer, malloc_size(pointer))
         }
         object("HLS/原 SystemAVPlayerDriver 壳", self)
+        logSnapshotCache.inspectPreparationAllocations(body)
         inspectNativePreparationWeakSideTable("driver", self, body)
         Self.creationLock.inspect("owned/单 driver 准入锁", body)
         eventHub.inspectPreparationAllocations(body)
         prepareWait.inspectPreparationAllocations(body)
         if let timeControlObservation { object("owned/公开 timeControl KVO wrapper", timeControlObservation) }
         if let accessLogObserver { object("owned/公开 accessLog notification wrapper", accessLogObserver) }
+        if let errorLogObserver { object("owned/公开 errorLog notification wrapper", errorLogObserver) }
         if let endpointObserver { object("owned/公开 endpoint notification wrapper", endpointObserver) }
     }
 #endif
@@ -227,8 +229,11 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)? = nil,
         preferredForwardBufferDuration: TimeInterval = 3
     ) throws -> SystemAVPlayerDriver {
+        // Existing core 8 KiB plus a fixed 4 KiB envelope for scalar cache/lock,
+        // notification wake and connection-state bookkeeping. The physical log
+        // reader separately retains a 4 KiB callback lease until SDK completion.
         let resourceReservation = try PlaybackResourceContextLedger.shared.reserve(
-            allocationIdentity: .stable(UUID()), bytes: 8 * 1_024)
+            allocationIdentity: .stable(UUID()), bytes: 12 * 1_024)
         var resourceTransferred = false
         defer {
             if !resourceTransferred {
@@ -270,7 +275,11 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private let resourceContextReservation: PlaybackResourceContextReservation
     private var installationResourceContextReservation: PlaybackResourceContextReservation?
     private var timeControlObservation: NSKeyValueObservation?
+    nonisolated let logSnapshotCache = AVPlayerLogSnapshotCache()
     private var accessLogObserver: NSObjectProtocol?
+    private var errorLogObserver: NSObjectProtocol?
+    private var logRefreshTask: Task<Void, Never>?
+    private var systemAudioTransitionInFlight = false
     private var endpointObserver: NSObjectProtocol?
     private var endpointStabilityDeadline: UUID?
     private var endpointObservationIdentity: UUID?
@@ -307,6 +316,37 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         eventHub.retainInstallationResourceContext(reservation)
     }
 
+    var disconnectedFromSystemAudio: Bool {
+        !systemAudioTransitionInFlight && player.disconnectedFromSystemAudio
+    }
+
+    /// Cancellation cannot complete this physical transition early. The signed
+    /// prepare/activation/stop runner keeps ownership until AVFoundation calls back.
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item identity: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else {
+            throw .staleIdentity
+        }
+        guard !systemAudioTransitionInFlight else { throw .operationInFlight }
+        let lease: AVPlayerSDKCallbackLease
+        do { lease = try reserveSDKCallbackLease(.systemAudio) }
+        catch { throw .capacityExceeded }
+        lease.inspectRegistration()
+        systemAudioTransitionInFlight = true
+        defer { systemAudioTransitionInFlight = false }
+        await withCheckedContinuation { continuation in
+            player.setDisconnectedFromSystemAudio(disconnected) {
+                lease.assertRegistered()
+                continuation.resume()
+            }
+        }
+        guard currentItemIdentity == identity, self.item === item,
+              player.currentItem === item else { throw .staleIdentity }
+        guard player.disconnectedFromSystemAudio == disconnected else {
+            throw .systemAudioConnectionNotConfirmed
+        }
+    }
+
     var rate: Float { player.rate }
     var timeControlStatus: AVPlayer.TimeControlStatus { player.timeControlStatus }
     var activeWaiterCount: Int {
@@ -315,6 +355,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     var fixedTimerCount: Int { 0 }
 
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
+        guard !systemAudioTransitionInFlight else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
         cancelAllWaiters()
         installationResourceContextReservation = nil
         eventHub.releaseInstallationResourceContext()
@@ -327,6 +370,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         item = installed
         currentItemIdentity = identity
         eventHub.activate(identity)
+        logSnapshotCache.activate(item: identity, objectIdentity: ObjectIdentifier(installed))
     }
 
     func preparationFenceReached(_ fence: AVPlayerPreparationFence,
@@ -525,7 +569,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func play(invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
               item identity: AVPlayerItemInstanceIdentity) async throws {
-        guard currentItemIdentity == identity,
+        guard currentItemIdentity == identity, !systemAudioTransitionInFlight,
+              !player.disconnectedFromSystemAudio,
               let snapshot = invocation.currentSnapshot,
               snapshot.interval.outputLifecycle == identity.outputLifecycleEpoch,
               snapshot.interval.itemGeneration == identity.itemGeneration else {
@@ -566,22 +611,84 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         handler: @escaping @MainActor @Sendable (AccessLogURIClassification, AVPlayerItemInstanceIdentity) -> Void
     ) throws {
         guard currentItemIdentity == identity, let item,
-              accessLogObserver == nil else {
+              accessLogObserver == nil, errorLogObserver == nil else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
-        let callbackLease = try reserveSDKCallbackLease(.accessLog)
-        let hub = eventHub
-        hub.installAccessLog(classify: classify, handler: handler)
-        let callback: @Sendable (Notification) -> Void = { [weak item, weak hub] _ in
-            callbackLease.assertRegistered()
-            guard let value = item?.accessLog()?.events.last?.uri,
-                  let url = URL(string: value) else { return }
-            hub?.receive(url, item: identity)
-        }
-        callbackLease.inspectRegistration()
+        // Reserve both observers before installation so a capacity failure cannot
+        // leave an untracked observer or an unbudgeted callback behind.
+        let accessLease = try reserveSDKCallbackLease(.accessLog)
+        let errorLease = try reserveSDKCallbackLease(.errorLog)
+        accessLease.inspectRegistration()
+        errorLease.inspectRegistration()
+        let cache = logSnapshotCache
+        let objectIdentity = ObjectIdentifier(item)
+        eventHub.installAccessLog(classify: classify, handler: handler)
         accessLogObserver = NotificationCenter.default.addObserver(
-            forName: AVPlayerItem.newAccessLogEntryNotification,
-            object: item, queue: nil, using: callback)
+            forName: AVPlayerItem.newAccessLogEntryNotification, object: item, queue: nil
+        ) { _ in
+            accessLease.assertRegistered()
+            cache.requestRefresh(item: identity, objectIdentity: objectIdentity)
+        }
+        errorLogObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.newErrorLogEntryNotification, object: item, queue: nil
+        ) { _ in
+            errorLease.assertRegistered()
+            cache.requestRefresh(item: identity, objectIdentity: objectIdentity)
+        }
+        // activate() already marked an initial read pending. Installing the wake
+        // now starts it even when no log notification was emitted after observation.
+        cache.installWake { [weak self] in self?.startLogRefresh() }
+    }
+
+    private func startLogRefresh() {
+        guard logRefreshTask == nil else { return }
+        let lease: AVPlayerSDKCallbackLease
+        do { lease = try reserveSDKCallbackLease(.logFetch) }
+        catch { logSnapshotCache.deferRefresh(); return }
+        lease.inspectRegistration()
+        logRefreshTask = Task { [self, lease] in
+            defer { logRefreshTask = nil }
+            while let ticket = logSnapshotCache.beginRefresh() {
+                lease.assertRegistered()
+                guard let item, currentItemIdentity == ticket.scope.item,
+                      ObjectIdentifier(item) == ticket.scope.objectIdentity,
+                      player.currentItem === item else {
+                    logSnapshotCache.complete(ticket, snapshot: .empty)
+                    continue
+                }
+                let accessCount = await readAccessLog(item, ticket: ticket)
+                guard logSnapshotCache.isCurrent(ticket), self.item === item,
+                      player.currentItem === item else {
+                    logSnapshotCache.complete(ticket, snapshot: .empty)
+                    continue
+                }
+                let errorCount = await Self.readErrorLogCount(item)
+                guard self.item === item, player.currentItem === item else {
+                    logSnapshotCache.complete(ticket, snapshot: .empty)
+                    continue
+                }
+                logSnapshotCache.complete(ticket, snapshot: .init(
+                    accessEventCount: accessCount, errorEventCount: errorCount))
+            }
+        }
+    }
+
+    /// Raw SDK logs and URLs die in this scope before the next asynchronous read.
+    /// Both classification and the later metrics commit use the original ticket.
+    private func readAccessLog(_ item: AVPlayerItem,
+                               ticket: AVPlayerLogSnapshotCache.Ticket) async -> Int {
+        let log = await item.accessLog
+        guard logSnapshotCache.isCurrent(ticket), self.item === item,
+              player.currentItem === item else { return 0 }
+        if let rawURI = log?.events.last?.uri, let url = URL(string: rawURI) {
+            eventHub.receive(url, item: ticket.scope.item)
+        }
+        return log?.events.count ?? 0
+    }
+
+    private static func readErrorLogCount(_ item: AVPlayerItem) async -> Int {
+        let log = await item.errorLog
+        return log?.events.count ?? 0
     }
 
     func cancelPendingPrerolls(item identity: AVPlayerItemInstanceIdentity) {
@@ -759,7 +866,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     func replaceCurrentItemWithNil(item identity: AVPlayerItemInstanceIdentity) {
-        guard currentItemIdentity == identity else { return }
+        guard currentItemIdentity == identity, !systemAudioTransitionInFlight else { return }
         cancelAllWaiters()
         player.replaceCurrentItem(with: nil)
         item = nil
@@ -774,11 +881,14 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     private func cancelAllWaiters() {
+        logSnapshotCache.invalidate()
         prepareWait.cancelCurrent()
         timeControlObservation?.invalidate()
         timeControlObservation = nil
         if let accessLogObserver { NotificationCenter.default.removeObserver(accessLogObserver) }
         accessLogObserver = nil
+        if let errorLogObserver { NotificationCenter.default.removeObserver(errorLogObserver) }
+        errorLogObserver = nil
         eventHub.cancel()
         removeEndpointObserver()
         naturalEndTerminalHandler = nil

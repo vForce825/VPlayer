@@ -23,7 +23,13 @@ struct ChannelLogoView: View {
     }
 }
 
+private struct LogoLoadIdentity: Hashable {
+    let url: URL
+    let reducedResourceUsage: Bool
+}
+
 private struct CachedChannelLogo: View {
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     let url: URL
     let imagePadding: CGFloat
     let placeholderVerticalPadding: CGFloat
@@ -40,8 +46,10 @@ private struct CachedChannelLogo: View {
                 ChannelLogoPlaceholder(verticalPadding: placeholderVerticalPadding)
             }
         }
-        .task(id: url) {
-            image = nil
+        .task(id: LogoLoadIdentity(url: url, reducedResourceUsage: prefersReducedResourceUsage)) {
+            image = ChannelLogoCache.shared.memoryCachedImage(for: url)
+            // Keep already decoded artwork. Defer optional network/disk decode work.
+            guard !prefersReducedResourceUsage else { return }
             let loadedImage = await ChannelLogoCache.shared.image(for: url)
             guard !Task.isCancelled else { return }
             image = loadedImage

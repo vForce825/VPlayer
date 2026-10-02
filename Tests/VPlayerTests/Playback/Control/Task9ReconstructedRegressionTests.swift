@@ -365,8 +365,8 @@ private final class Task9SDKGate: PlaybackAudioSessionSDK, @unchecked Sendable {
         if base.lock.withLock({ base.categoryCallCount == categoryOrdinal }) { entered(); gate.wait() }
     }
     func setSupportsMultichannelContent() throws { try base.setSupportsMultichannelContent() }
-    func activate() throws { try base.activate() }
-    func deactivate() throws { try base.deactivate() }
+    func activate() async throws -> Bool { try await base.activate() }
+    func deactivate() async throws -> Bool { try await base.deactivate() }
     func currentRoute() -> any AudioSessionRouteSnapshot { base.currentRoute() }
     func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool { base.fillRandomBytes(bytes) }
 }
@@ -399,8 +399,8 @@ private final class Task9RouteGetterGateSDK: PlaybackAudioSessionSDK, @unchecked
         try base.setPlaybackCategory(policy: policy)
     }
     func setSupportsMultichannelContent() throws { try base.setSupportsMultichannelContent() }
-    func activate() throws { try base.activate() }
-    func deactivate() throws { try base.deactivate() }
+    func activate() async throws -> Bool { try await base.activate() }
+    func deactivate() async throws -> Bool { try await base.deactivate() }
     func currentRoute() -> any AudioSessionRouteSnapshot {
         let ordinal = lock.withLock { routeCalls += 1; return routeCalls }
         if ordinal == 1 {
@@ -738,6 +738,7 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
             }
         }
         owner.monitor.emit(.mediaServicesWereReset)
+        if activationInFlight { try await resumeResetAfterReconfiguration(controller, registry: registry) }
         await fulfillment(of: [entered], timeout: 2)
         let originalPhase = try XCTUnwrap(registry.registeredAudioSessionPhase())
         let originalEpoch = registry.executor.safetyIngress.snapshot.interruptionEpoch
@@ -761,6 +762,7 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         XCTAssertNil(registry.outputResourceContextSnapshot()?.sessionReceipts?.active)
         XCTAssertEqual(registry.registeredOutputDrainProof(), proof)
         owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        if !activationInFlight { try await resumeResetAfterReconfiguration(controller, registry: registry) }
         for _ in 0..<1000 {
             if factory.backends.count == 2, factory.backends.last?.activationCount == 1 { break }
             try await Task.sleep(nanoseconds: 2_000_000)
@@ -909,6 +911,7 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
             }
         }
         owner.monitor.emit(.mediaServicesWereReset)
+        try await resumeResetAfterReconfiguration(controller, registry: registry)
         await fulfillment(of: [completed], timeout: 2)
         let envelope = try XCTUnwrap(receiptLock.withLock { returned })
         let receipt = try XCTUnwrap(envelope.reactivationReceipt)
@@ -937,6 +940,17 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         await controller.stop()
         XCTAssertNil(registry.ownedResourceSnapshot())
         XCTAssertNil(registry.cleanupReservationSnapshot())
+    }
+
+    private func resumeResetAfterReconfiguration(_ controller: PlaybackController,
+        registry: ControlTaskRegistry) async throws {
+        for _ in 0..<1_000 {
+            if registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt != nil { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        _ = try XCTUnwrap(registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt)
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        await controller.setPaused(false)
     }
 
     func testProductionBeganEndedResetDrainsOnceAndCreatesOneResetSuccessor() async throws {
@@ -994,6 +1008,7 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
             XCTAssertEqual(factory.backends.count, 1)
             owner.monitor.emit(.interruptionEnded(shouldResume: true))
         }
+        try await resumeResetAfterReconfiguration(controller, registry: registry)
         for _ in 0..<750 {
             if sdk.lock.withLock({ sdk.activateCallCount == 2 }) { break }
             try await Task.sleep(nanoseconds: 2_000_000)

@@ -424,6 +424,7 @@ struct AppDependencies {
     let refresh: Refresh
     let prepare: Prepare
     let playbackSettings: PlaybackSettingsStore
+    let nowPlaying: PlaybackNowPlayingCoordinator
     let channelBrowsingSettings: ChannelBrowsingSettingsStore
     let playbackEngine: any PlaybackEngine
     let playbackPresentationController: (any PlaybackPresentationControlling)?
@@ -470,8 +471,16 @@ struct AppDependencies {
         self.libraryUnavailableDiagnostic = libraryUnavailableDiagnostic
         self.repository = repository
         self.refresh = refresh
-        self.prepare = prepare
+        if let store = repository as? SwiftDataLibraryStore {
+            self.prepare = {
+                try await libraryChanges.observeCommittedChanges(in: store)
+                try await prepare()
+            }
+        } else {
+            self.prepare = prepare
+        }
         self.playbackSettings = playbackSettings
+        self.nowPlaying = PlaybackNowPlayingCoordinator()
         self.channelBrowsingSettings = channelBrowsingSettings
         let resolvedPlaybackEngine: any PlaybackEngine
         if let playbackEngine {
@@ -900,7 +909,7 @@ private final class InertBackgroundRefreshScheduler: BackgroundRefreshScheduling
         _ = identifier
     }
 
-    func submit(identifier: String, earliestBeginDate: Date) throws {
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
         _ = identifier
         _ = earliestBeginDate
     }

@@ -6,6 +6,21 @@ import XCTest
 
 final class VPlayerUITests: XCTestCase {
     @MainActor
+    func testAccessibilityLargeTextReducesGridDensity() {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-ui-fixture", "seeded", "-uiTestResetPlaybackSettings",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"
+        ]
+        app.launch()
+        let channel = app.buttons["channel.http"]
+        XCTAssertTrue(channel.waitForExistence(timeout: 5))
+        XCTAssertGreaterThanOrEqual(channel.frame.width, 500,
+            "Accessibility text needs fewer, wider channel columns")
+        XCTAssertTrue(channel.isHittable)
+    }
+
+    @MainActor
     func testSeededLaunchExposesSourceChannelAndSettingsFlow() {
         let app = launchSeededApp()
 

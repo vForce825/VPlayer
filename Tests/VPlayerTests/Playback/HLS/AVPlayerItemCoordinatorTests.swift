@@ -12,6 +12,148 @@ import XCTest
 
 @MainActor
 final class AVPlayerItemCoordinatorTests: XCTestCase {
+    func testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate() async throws {
+        let harness = try await Task21Harness()
+        _ = try await harness.prepare()
+        XCTAssertEqual(harness.driver.audioConnectionChanges, [true])
+        XCTAssertTrue(harness.driver.systemAudioDisconnected)
+        _ = try await harness.activate()
+        XCTAssertEqual(harness.driver.audioConnectionChanges, [true, false])
+        XCTAssertFalse(harness.driver.playedWhileDisconnected)
+        _ = try await harness.stop()
+        XCTAssertEqual(harness.driver.audioConnectionChanges, [true, false, true])
+        XCTAssertTrue(harness.driver.systemAudioDisconnected)
+    }
+
+    func testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt() async throws {
+        let harness = try await Task21Harness()
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        harness.driver.holdAudioConnectionCompletion = true
+        let stopping = Task { try await harness.stop() }
+        guard await harness.driver.waitForHeldAudioConnection() else {
+            XCTFail("The coordinator never requested the physical connection transition")
+            return
+        }
+        XCTAssertFalse(harness.driver.systemAudioDisconnected)
+        XCTAssertNil(harness.backend.quiescenceReceipt)
+        harness.driver.releaseAudioConnection()
+        let receipt = try await stopping.value
+        XCTAssertTrue(harness.driver.systemAudioDisconnected)
+        XCTAssertTrue(harness.coordinator.accept(receipt))
+    }
+
+    func testTVOS27DisconnectCallbackWithoutDisconnectedStateCannotSignReceipt() async throws {
+        let harness = try await Task21Harness()
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        harness.driver.ignoreDisconnectStateChange = true
+        await XCTAssertThrowsErrorAsync(try await harness.stop())
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        XCTAssertFalse(harness.driver.systemAudioDisconnected)
+    }
+
+    func testTVOS27ReconnectDuringDirectPauseReadCannotSignReceipt() async throws {
+        let harness = try await Task21Harness()
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        let priorReads = harness.driver.directStateCallCount
+        harness.driver.holdDirectPausedRead = true
+        let stopping = Task { try await harness.stop() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while harness.driver.directStateCallCount == priorReads,
+              ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertGreaterThan(harness.driver.directStateCallCount, priorReads)
+        // Simulate a changed physical state at the final async proof boundary.
+        harness.driver.systemAudioDisconnected = false
+        harness.driver.releaseDirectPausedRead(rate: 0, status: .paused)
+        await XCTAssertThrowsErrorAsync(try await stopping.value)
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+    }
+
+    func testTVOS27CancelledReconnectSettlesBeforeStopAndCannotPlay() async throws {
+        let harness = try await Task21Harness()
+        _ = try await harness.prepare()
+        harness.driver.holdAudioConnectionCompletion = true
+        let activation = Task { try await harness.activate() }
+        guard await harness.driver.waitForHeldAudioConnection() else {
+            XCTFail("The coordinator never requested the physical connection transition")
+            return
+        }
+        let stopping = Task { try await harness.stop() }
+        let stopDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while harness.graph.registry.outputResourceContextSnapshot()?.owner == nil,
+              ContinuousClock.now < stopDeadline { await Task.yield() }
+        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.owner,
+            "Revoke the activation before releasing the delayed connection callback")
+        XCTAssertEqual(harness.driver.playCallCount, 0)
+        harness.driver.holdAudioConnectionCompletion = false
+        harness.driver.releaseAudioConnection()
+        _ = try? await activation.value
+        _ = try await stopping.value
+        XCTAssertEqual(harness.driver.playCallCount, 0)
+        XCTAssertTrue(harness.driver.systemAudioDisconnected)
+    }
+
+    func testTVOS27FailedPreparationRetainsInstalledOwnerUntilPhysicalRetirement() async throws {
+        for failsDuringInstallation in [false, true] {
+            let forwarding = Task27HLSBackendForwarder()
+            let graph = try OutputGraphFixture(backendObject: forwarding)
+            let fixture = try await Task21HarnessAuthorityFixture.make(
+                lifecycle: graph.lifecycle, audioOnly: false)
+            defer { fixture.shutdown() }
+            let driver = Task21FakeDriver()
+            driver.prepareMutation = .readyTimeout
+            driver.failAccessLogObservation = failsDuringInstallation
+            let coordinator = try AVPlayerItemCoordinator(driver: driver,
+                evidenceSource: fixture.source,
+                backendPublicationReplacementAuthoritySlot:
+                    forwarding.backendPublicationReplacementAuthoritySlot)
+            let replacement = AVPlayerItemReplacementBundle(
+                request: fixture.request, evidenceSource: fixture.source)
+            let builder = Task27FixedHLSBundleBuilder(replacement: replacement)
+            let backend = HLSAVPlayerPlaybackBackend(identity: graph.lifecycle.backendIdentity,
+                coordinator: coordinator, bundleBuilder: builder,
+                replacementSlot: forwarding.backendPublicationReplacementAuthoritySlot)
+            forwarding.attach(backend)
+            let prepare = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+            XCTAssertTrue(graph.registry.startOutputPrepareOperation(prepare))
+            _ = await graph.registry.joinOutputBackendOperation(prepare)
+            XCTAssertEqual(backend.outputItemGeneration, fixture.request.item.itemGeneration,
+                "An installed failed item must retain its bundle and coordinator cleanup owner")
+            let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+            let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+                reason: .stop, at: graph.registry.clock.nowNanoseconds))
+            let joined = await graph.registry.joinOutputBackendOperations(owner: owner)
+            XCTAssertTrue(joined)
+            let suspend = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
+            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner))
+            _ = await graph.registry.joinOutputBackendOperation(suspend.task)
+            let retired = await backend.retireOutput(epoch: graph.lifecycle)
+            XCTAssertEqual(retired, .confirmedLocalOutputStopped)
+            XCTAssertNil(driver.currentItemIdentity)
+            XCTAssertTrue(driver.systemAudioDisconnected)
+        }
+    }
+
+    func testTVOS27SystemDriverWaitsForNativeConnectionState() async throws {
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let item = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_099),
+            itemGeneration: 1)
+        try driver.install(url: URL(fileURLWithPath: "/tmp/VPlayer-native-connection-test.m3u8"),
+            identity: item)
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+        try await driver.setDisconnectedFromSystemAudio(true, item: item)
+        XCTAssertTrue(driver.player.disconnectedFromSystemAudio)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        try await driver.setDisconnectedFromSystemAudio(false, item: item)
+        XCTAssertFalse(driver.player.disconnectedFromSystemAudio)
+        XCTAssertFalse(driver.disconnectedFromSystemAudio)
+        try await driver.setDisconnectedFromSystemAudio(true, item: item)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+    }
+
     func testSDKFixedStopStorageAndGapRejection() async throws {
         XCTAssertLessThanOrEqual(malloc_good_size(class_getInstanceSize(OutputPlayerStopTask.self)), 96,
                                 "固定错误不能保留任意 Error 图")
@@ -2018,7 +2160,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         for _ in 0..<7 { leases.append(try driver!.reserveSDKCallbackLease(.seek)) }
         var last: AVPlayerSDKCallbackLease? = try driver!.reserveSDKCallbackLease(.accessLog)
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 8 * 1_024 + 8 * 2 * 1_024,
+                       resourceBaseline + 12 * 1_024 + 8 * 2 * 1_024,
                        "driver core与八个物理SDK callback租约必须分别强持原context escrow")
         for lease in leases + [try XCTUnwrap(last)] {
             lease.inspectAllocations { role, pointer, bytes in
@@ -2079,8 +2221,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let player = AVPlayer()
         var driver: SystemAVPlayerDriver? = try SystemAVPlayerDriver.make(player: player)
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 8 * 1_024,
-                       "System driver必须在制造AVPlayer/driver/hub前取得8KiB core escrow")
+                       resourceBaseline + 12 * 1_024,
+                       "System driver必须在制造AVPlayer/driver/hub/cache前取得12KiB core escrow")
         let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch:
             AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 23_399), itemGeneration: 1)
         try driver!.install(url: URL(string: "http://127.0.0.1:1/queued-hub-tail.m3u8")!, identity: item)
@@ -2093,7 +2235,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         driver = nil
         XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
-                       resourceBaseline + 8 * 1_024,
+                       resourceBaseline + 12 * 1_024,
                        "driver销毁后排队hub尾仍须强持同一core charge")
         XCTAssertThrowsError(try SystemAVPlayerDriver.make(),
             "同一MainActor turn尚未出队的原hub尾，不能在driver deinit时释放准入")
@@ -2983,6 +3125,46 @@ private enum Task21DriverOperation: Equatable {
 
 @MainActor
 private final class Task21FakeDriver: AVPlayerDriving {
+    var failAccessLogObservation = false
+    var ignoreDisconnectStateChange = false
+    var systemAudioDisconnected = false
+    var disconnectedFromSystemAudio: Bool {
+        pendingAudioConnection == nil && systemAudioDisconnected
+    }
+    var audioConnectionChanges: [Bool] = []
+    var playedWhileDisconnected = false
+    var holdAudioConnectionCompletion = false
+    private var pendingAudioConnection: (Bool, CheckedContinuation<Void, Never>)?
+
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == item else { throw .staleIdentity }
+        audioConnectionChanges.append(disconnected)
+        if holdAudioConnectionCompletion {
+            await withCheckedContinuation { continuation in
+                pendingAudioConnection = (disconnected, continuation)
+            }
+        }
+        guard currentItemIdentity == item else { throw .staleIdentity }
+        if !disconnected || !ignoreDisconnectStateChange {
+            systemAudioDisconnected = disconnected
+        }
+    }
+
+    func waitForHeldAudioConnection() async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while pendingAudioConnection == nil, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        return pendingAudioConnection != nil
+    }
+
+    func releaseAudioConnection() {
+        let pending = pendingAudioConnection
+        pendingAudioConnection = nil
+        pending?.1.resume()
+    }
+
     var rate: Float = 0
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     var automaticallyWaitsToMinimizeStalling = false
@@ -3161,6 +3343,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
         // 一旦进入 Registry safety cell，调用方再无可插入窗口。
         afterPositiveRateCapabilityConsumeBeforeSideEffect?(invocation)
         guard invocation.performPositiveRateSideEffect({
+            playedWhileDisconnected = systemAudioDisconnected
             operations.append(.play); playCallCount += 1
             rate = 1; timeControlStatus = .waitingToPlayAtSpecifiedRate
         }) else {
@@ -3235,7 +3418,9 @@ private final class Task21FakeDriver: AVPlayerDriving {
         item: AVPlayerItemInstanceIdentity,
         classify: @escaping @Sendable (URL) -> AccessLogURIClassification,
         handler: @escaping @MainActor @Sendable (AccessLogURIClassification, AVPlayerItemInstanceIdentity) -> Void
-    ) throws {}
+    ) throws {
+        if failAccessLogObservation { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
+    }
 
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item: AVPlayerItemInstanceIdentity) throws {
@@ -3360,6 +3545,12 @@ private final class Task21PrepareCancellationGate: @unchecked Sendable {
 /// 故意只实现协议当前强制的方法，用行为测试证明安全关键方法不得由默认空实现代替。
 @MainActor
 private final class Task21UnsafeDefaultDriver: AVPlayerDriving {
+    var disconnectedFromSystemAudio = false
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == item else { throw .staleIdentity }
+        disconnectedFromSystemAudio = disconnected
+    }
     var rate: Float = 0
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     var currentItemIdentity: AVPlayerItemInstanceIdentity?
@@ -4591,7 +4782,8 @@ private final class Task21RealIntegrationFixture {
                 return "\(CMTimeGetSeconds(value.start))...\(CMTimeGetSeconds(value.end))"
             }.joined(separator: ",") ?? "nil"
             let duration = player.currentItem.map { CMTimeGetSeconds($0.duration) } ?? .nan
-            let accessEvents = player.currentItem?.accessLog()?.events.count ?? 0
+            let accessLog = await player.currentItem?.accessLog
+            let accessEvents = accessLog?.events.count ?? 0
             throw NSError(domain: "Task21RealIntegration", code: 1,
                 userInfo: [NSLocalizedDescriptionKey:
                     "AVPlayer 准备失败；itemTime=\(CMTimeGetSeconds(player.currentTime()))；"
@@ -7034,4 +7226,46 @@ private enum Task21Fixtures {
               lastEffectiveEnd: end,
               terminalPhysicalEnd: value.terminalPhysicalEnd)
     }
+}
+
+private struct Task27FixedHLSBundleBuilder: HLSOutputItemBundleBuilding {
+    let replacement: AVPlayerItemReplacementBundle
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation)
+        async throws -> HLSOutputItemBundle {
+        HLSOutputItemBundle(replacement: replacement,
+            startProducer: { replacement }, retireProducer: { true })
+    }
+}
+
+private final class Task27HLSBackendForwarder: PlaybackBackend,
+    BackendPublicationReplacementAuthorityInstalling, @unchecked Sendable {
+    let backendPublicationReplacementAuthoritySlot =
+        ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
+    private let lock = NSLock()
+    private var target: HLSAVPlayerPlaybackBackend?
+    func attach(_ target: HLSAVPlayerPlaybackBackend) { lock.withLock { self.target = target } }
+    private var backend: HLSAVPlayerPlaybackBackend { lock.withLock { target! } }
+    var identity: PlaybackBackendIdentity {
+        lock.withLock { target?.identity } ?? .init(
+            sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0)
+    }
+    var presentation: PlaybackPresentation? { nil }
+    var outputItemGeneration: UInt64? { lock.withLock { target?.outputItemGeneration } }
+    func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        try await backend.prepare(invocation: invocation)
+    }
+    func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        try await backend.reprepare(invocation: invocation)
+    }
+    func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
+        try await backend.activateOutput(invocation: invocation)
+    }
+    func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async
+        -> BackendSuspendResult {
+        await backend.suspendOutput(invocation: invocation)
+    }
+    func retireOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
+        await backend.retireOutput(epoch: epoch)
+    }
+    func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? { nil }
 }

@@ -157,6 +157,46 @@ final class RefreshLifecycleTests: XCTestCase {
         driver.deactivate()
     }
 
+    func testNewScheduleWaitsForOldPhysicalSubmissionBeforeReplacingIt() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [profile] },
+            refresh: { _, _, _ in [] }, now: { now }, reportStatus: { _ in }
+        )
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 || !scheduler.submissions.isEmpty }
+        registrar.scheduleNext()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1, "Native submission must remain serialized")
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.asyncSubmissionCount == 2 || scheduler.submissions.count == 2 }
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 2)
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.submissions.count == 2 }
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+    }
+
+    func testBackgroundSchedulingAwaitsNativeAsyncSubmission() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [profile] },
+            refresh: { _, _, _ in [] }, now: { now }, reportStatus: { _ in }
+        )
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 || !scheduler.submissions.isEmpty }
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+        XCTAssertTrue(scheduler.submissions.isEmpty, "Submission must await the native async completion")
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.submissions.count == 1 }
+        XCTAssertEqual(scheduler.submissions.count, 1)
+    }
+
     func testBackgroundRegistrationIsIdempotentAndSchedulesBeforeRefreshing() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(now: now)
@@ -661,6 +701,28 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
     private(set) var cancelledIdentifiers: [String] = []
     private(set) var submissions: [Submission] = []
     var submitError: NSError?
+    var holdsAsyncSubmission = false
+    private(set) var asyncSubmissionCount = 0
+    private var inFlightSubmissions = 0
+    private(set) var maximumInFlightSubmissions = 0
+    private var submissionContinuation: CheckedContinuation<Void, Never>?
+
+    func completeAsyncSubmission() {
+        submissionContinuation?.resume()
+        submissionContinuation = nil
+    }
+
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
+        asyncSubmissionCount += 1
+        inFlightSubmissions += 1
+        maximumInFlightSubmissions = max(maximumInFlightSubmissions, inFlightSubmissions)
+        defer { inFlightSubmissions -= 1 }
+        if holdsAsyncSubmission {
+            await withCheckedContinuation { submissionContinuation = $0 }
+        }
+        if let submitError { throw submitError }
+        submissions.append(Submission(identifier: identifier, earliestBeginDate: earliestBeginDate))
+    }
     private var handler: (@MainActor @Sendable (any BackgroundRefreshTask) -> Void)?
 
     func register(
@@ -674,14 +736,6 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
 
     func cancel(identifier: String) {
         cancelledIdentifiers.append(identifier)
-    }
-
-    func submit(identifier: String, earliestBeginDate: Date) throws {
-        if let submitError { throw submitError }
-        submissions.append(Submission(
-            identifier: identifier,
-            earliestBeginDate: earliestBeginDate
-        ))
     }
 
     func launch(_ task: any BackgroundRefreshTask) throws {

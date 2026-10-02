@@ -51,8 +51,8 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
             monitorObject: object(SystemAudioEventMonitor.self),
             monitorLock: object(NSLock.self),
             // 私有token当前目标实测32B/个；跨tvOS runtime按64B/个保守，framework其余opaque内部仍是盲区。
-            observerTokens: 2 * 64,
-            observerCaptures: 2 * (32 + 48),
+            observerTokens: 5 * 64,
+            observerCaptures: 5 * (32 + 48),
             pipelineRelayObject: object(PlaybackSessionEventRelay.self),
             pipelineRelayLock: object(NSLock.self),
             pipelineBacking: malloc_good_size(32 + fixedBackingCapacity * MemoryLayout<PlaybackPipelineEvent>.stride),

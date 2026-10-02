@@ -64,7 +64,7 @@ bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.p
 sdk="$(xcrun --sdk appletvsimulator --show-sdk-path)"
 probe="$evidence/tvos_allocator_budget_probe.dylib"
 xcrun clang -O2 -Wall -Wextra -Werror -dynamiclib \
-    -target "$(uname -m)-apple-tvos26.0-simulator" -isysroot "$sdk" \
+    -target "$(uname -m)-apple-tvos27.0-simulator" -isysroot "$sdk" \
     "$repository_root/Scripts/Support/tvos_allocator_budget_probe.c" -o "$probe"
 codesign --force --sign - "$probe" > "$evidence/probe-sign.log" 2>&1
 xcrun simctl install "$simulator_udid" "$app" || fail '安装模拟器 App 失败'

@@ -55,11 +55,11 @@ compile_library() {
 
 compile_library \
   appletvos \
-  air64-apple-tvos26.0 \
+  air64-apple-tvos27.0 \
   VPlayerPlayback-tvos.metallib
 compile_library \
   appletvsimulator \
-  air64-apple-tvos26.0-simulator \
+  air64-apple-tvos27.0-simulator \
   VPlayerPlayback-tvsimulator.metallib
 
 mkdir -p "$output_directory"

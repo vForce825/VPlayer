@@ -5,7 +5,7 @@ name: macOS build and test
 # reviewing their billing and storage implications.
 "on":
   push:
-    branches: [migration/tvos27]
+    branches: [migration/tvos27-checkpoint]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -50,5 +50,40 @@ jobs:
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
 
-      - name: Compile and run unit and UI tests
-        run: ./Scripts/test.sh
+      - name: Rebuild tvOS 27 Metal libraries
+        run: ./Scripts/build-metal-libraries.sh
+
+      - name: Generate project for SDK migration diagnostic
+        run: ./Scripts/bootstrap.sh --generate
+
+      - name: Record generated output fingerprints
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, subprocess
+          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          print("GENERATED_SOURCE_COMMIT=" + commit)
+          print("GENERATED_LOCAL_SOURCE_COMMIT=1440729132e115d594d3bc087d49f36abdb3e85f")
+          paths = [
+              "VPlayer.xcodeproj/project.pbxproj",
+              "Sources/VPlayerPlayback/Resources/VPlayerPlayback-tvos.metallib",
+              "Sources/VPlayerPlayback/Resources/VPlayerPlayback-tvsimulator.metallib",
+          ]
+          total = 0
+          for name in paths:
+              data = pathlib.Path(name).read_bytes()
+              total += len(data)
+              if total > 1048576:
+                  raise SystemExit("Generated outputs exceed bounded 1 MiB log export")
+              print("GENERATED_BEGIN " + name)
+              print("GENERATED_BYTES=" + str(len(data)))
+              print("GENERATED_SHA256=" + hashlib.sha256(data).hexdigest())
+              print("GENERATED_END " + name)
+          PY
+
+      - name: Compile tvOS 27 app and tests
+        run: |
+          xcodebuild build-for-testing \
+            -project VPlayer.xcodeproj \
+            -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO

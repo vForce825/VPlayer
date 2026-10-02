@@ -1272,7 +1272,9 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 _ = registry.startOwnedInterruptionCleanup(owner: owner, receiver: self)
             }
         case .mediaServicesWereReset:
+            interruptionActive = registry.executor.safetyIngress.snapshot.interruptionState == .began
             systemPauseRequired = true
+            resumeVetoRequired = true
             advanceReadinessCycle()
             clearPresentation()
             if !controllerState.userPaused {
@@ -1282,9 +1284,10 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         case let .interruptionEnded(shouldResume):
             interruptionActive = false
             resumeRequestInFlight = false
-            resumeVetoRequired = !shouldResume
+            let requiresUserResume = registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired
+            resumeVetoRequired = !shouldResume || requiresUserResume
             systemPauseRequired = true
-            if !controllerState.userPaused { publish(shouldResume ? .recovering(request) : .paused(request)) }
+            if !controllerState.userPaused { publish(resumeVetoRequired ? .paused(request) : .recovering(request)) }
             if registry.outputResourceContextSnapshot()?.pendingReset != nil {
                 await continueResetRecovery(identity: identity)
                 return
@@ -1297,10 +1300,11 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             guard shouldResume, !controllerState.userPaused,
                   let lease = registry.audioSessionLease(session: context.sessionIdentity) else { return }
             _ = try? registry.finishRetainedOutputCleanup(owner: owner)
-            resumeRequestInFlight = audioSessionOwner.requestResume(for: lease)
+            resumeRequestInFlight = audioSessionOwner.requestAutomaticResume(for: lease)
         case .explicitResumeSucceeded, .resetConfigurationSucceeded:
             resumeRequestInFlight = false
             guard systemPauseRequired, !interruptionActive,
+                  !registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
                   let run = admittedRun, let context = registry.outputResourceContextSnapshot() else { return }
             resumeVetoRequired = false
             systemPauseRequired = false

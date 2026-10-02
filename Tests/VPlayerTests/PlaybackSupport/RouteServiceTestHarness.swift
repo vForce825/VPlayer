@@ -239,7 +239,7 @@ final class FakeAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
         lock.withLock { calls.append(.multichannel) }
     }
     
-    func activate() throws {
+    func activate() async throws -> Bool {
         let (cb, err) = lock.withLock { () -> ((@Sendable () -> Void)?, (any Error)?) in
             activateCallCount += 1
             calls.append(.activate)
@@ -248,14 +248,16 @@ final class FakeAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
         }
         cb?()
         if let err { throw err }
+        return true
     }
-    func deactivate() throws {
+    func deactivate() async throws -> Bool {
         let cb = lock.withLock { () -> (@Sendable () -> Void)? in
             deactivateCallCount += 1
             calls.append(.deactivate)
             return onDeactivate
         }
         cb?()
+        return true
     }
     
     func currentRoute() -> any AudioSessionRouteSnapshot {

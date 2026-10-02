@@ -9,6 +9,7 @@ import Foundation
 
 enum VideoRendererBackendEvent: @unchecked Sendable {
     case failed(any Error)
+    case decodeFailure(any Error)
     case requiresFlushToResumeDecoding
 }
 
@@ -26,7 +27,10 @@ protocol SampleBufferVideoRenderingBackend: AnyObject, Sendable {
     var error: (any Error)? { get }
     var requiresFlushToResumeDecoding: Bool { get }
 
-    func enqueue(_ sampleBuffer: CMSampleBuffer)
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void)
+    func cancelPendingEnqueue()
+    func finishedEnqueuing()
     func requestMediaDataWhenReady(
         on queue: DispatchQueue,
         using block: @escaping @Sendable () -> Void
@@ -46,50 +50,141 @@ protocol SampleBufferVideoRenderingBackend: AnyObject, Sendable {
 final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked Sendable {
     let renderer: AVSampleBufferVideoRenderer
 
-    private let notificationCenter: NotificationCenter
-    private var statusObservation: NSKeyValueObservation?
-    private var notificationTokens: [NSObjectProtocol] = []
+    private let synchronizer: AVSampleBufferRenderSynchronizer
+    private let owner: VideoReceiverOwner
+    private let lock = NSLock()
+    private var feedTask: Task<Void, Never>?
+    private var controlTask: Task<Void, Never>?
+    private var readiness: (@Sendable () -> Void)?
+    private var eventHandler: (@Sendable (VideoRendererBackendEvent) -> Void)?
+    private var observedError: (any Error)?
+    private var flushRequired = false
+    private var removed = false
+    private var removalResult: Bool?
+    private var revision: UInt64 = 0
 
-    init(
-        renderer: AVSampleBufferVideoRenderer,
-        notificationCenter: NotificationCenter = .default
-    ) {
+    init(renderer: AVSampleBufferVideoRenderer, synchronizer: AVSampleBufferRenderSynchronizer) {
         self.renderer = renderer
-        self.notificationCenter = notificationCenter
+        self.synchronizer = synchronizer
+        owner = VideoReceiverOwner(receiver: synchronizer.sampleBufferReceiver(adding: renderer))
     }
 
-    deinit {
-        stopObserving()
+    deinit { feedTask?.cancel(); controlTask?.cancel() }
+
+    var isReadyForMoreMediaData: Bool { lock.withLock { !removed && feedTask == nil && !flushRequired && observedError == nil } }
+    var status: AVQueuedSampleBufferRenderingStatus {
+        lock.withLock { observedError == nil ? .unknown : .failed }
+    }
+    var error: (any Error)? { lock.withLock { observedError } }
+    var requiresFlushToResumeDecoding: Bool { lock.withLock { flushRequired } }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void) {
+        let sample = RendererReceiverSample(buffer: sampleBuffer)
+        let started = lock.withLock { () -> Bool in
+            guard !removed, feedTask == nil else { return false }
+            let barrier = controlTask
+            let submissionRevision = revision
+            feedTask = Task { [weak self, owner] in
+                await barrier?.value
+                let outcome: Result<VideoReceiverOutcome, any Error>
+                do {
+                    try Task.checkCancellation()
+                    outcome = .success(try await owner.enqueue(sample))
+                } catch { outcome = .failure(error) }
+                guard let self else { return }
+                let state = lock.withLock { () -> (Bool, (@Sendable () -> Void)?) in
+                    feedTask = nil
+                    return (revision == submissionRevision, readiness)
+                }
+                guard state.0 else {
+                    completion(.failure(CancellationError()))
+                    state.1?()
+                    return
+                }
+                switch outcome {
+                case let .success(value):
+                    lock.withLock {
+                        for event in value.events {
+                            switch event {
+                            case let .failed(error): observedError = error
+                            case .requiresFlushToResumeDecoding: flushRequired = true
+                            case .decodeFailure: break
+                            }
+                        }
+                    }
+                    completion(value.accepted ? .success(()) : .failure(CancellationError()))
+                    for event in value.events { emit(event, revision: submissionRevision) }
+                case let .failure(error): completion(.failure(error))
+                }
+                state.1?()
+            }
+            return true
+        }
+        if !started { completion(.failure(CancellationError())) }
     }
 
-    var isReadyForMoreMediaData: Bool { renderer.isReadyForMoreMediaData }
-    var status: AVQueuedSampleBufferRenderingStatus { renderer.status }
-    var error: (any Error)? { renderer.error }
-    var requiresFlushToResumeDecoding: Bool { renderer.requiresFlushToResumeDecoding }
-
-    func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        renderer.enqueue(sampleBuffer)
+    func cancelPendingEnqueue() {
+        let needsCancel = lock.withLock { () -> Bool in
+            guard let feedTask else { return false }
+            feedTask.cancel()
+            return true
+        }
+        if needsCancel { flush(removeDisplayedImage: false) {} }
     }
 
-    func requestMediaDataWhenReady(
-        on queue: DispatchQueue,
-        using block: @escaping @Sendable () -> Void
-    ) {
-        renderer.requestMediaDataWhenReady(on: queue, using: block)
+    func requestMediaDataWhenReady(on queue: DispatchQueue,
+        using block: @escaping @Sendable () -> Void) {
+        lock.withLock { readiness = { queue.async(execute: block) } }
+    }
+    func stopRequestingMediaData() { lock.withLock { readiness = nil } }
+
+    func flush(removeDisplayedImage: Bool, completion: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            revision += 1
+            feedTask?.cancel()
+            let previous = controlTask
+            let feed = feedTask
+            controlTask = Task { [weak self, owner] in
+                await previous?.value
+                await owner.flush(removeDisplayedImage: removeDisplayedImage)
+                await feed?.value
+                self?.lock.withLock { self?.flushRequired = false; self?.observedError = nil }
+                completion()
+            }
+        }
     }
 
-    func stopRequestingMediaData() {
-        renderer.stopRequestingMediaData()
+    func finishedEnqueuing() {
+        lock.withLock {
+            let previous = controlTask
+            let eventRevision = revision
+            controlTask = Task { [weak self, owner] in
+                await previous?.value
+                await owner.finishedEnqueuing { [weak self] event in
+                    self?.emit(event, revision: eventRevision)
+                }
+            }
+        }
     }
 
-    func flush(
-        removeDisplayedImage: Bool,
-        completion: @escaping @Sendable () -> Void
-    ) {
-        renderer.flush(
-            removingDisplayedImage: removeDisplayedImage,
-            completionHandler: completion
-        )
+    func remove(completion: @escaping @Sendable (Bool) -> Void) {
+        lock.withLock {
+            if let removalResult { completion(removalResult); return }
+            removed = true
+            revision += 1
+            feedTask?.cancel()
+            let previous = controlTask
+            let feed = feedTask
+            controlTask = Task { [self, owner, synchronizer] in
+                await previous?.value
+                await owner.flush(removeDisplayedImage: true)
+                await feed?.value
+                let result = await owner.remove(from: synchronizer)
+                lock.withLock { removalResult = result }
+                completion(result)
+            }
+        }
     }
 
     func loadPerformanceMetrics(
@@ -119,43 +214,107 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     }
 
     func startObserving(_ handler: @escaping @Sendable (VideoRendererBackendEvent) -> Void) {
-        stopObserving()
-        statusObservation = renderer.observe(\.status, options: [.new]) { renderer, _ in
-            guard renderer.status == .failed else { return }
-            handler(.failed(renderer.error ?? RendererObservationError.unknown))
-        }
-        let decodeFailure = notificationCenter.addObserver(
-            forName: AVSampleBufferVideoRenderer.didFailToDecodeNotification,
-            object: renderer,
-            queue: nil
-        ) { notification in
-            let error = notification.userInfo?[
-                AVSampleBufferVideoRenderer.didFailToDecodeNotificationErrorKey
-            ] as? NSError ?? RendererObservationError.unknown as NSError
-            handler(.failed(error))
-        }
-        let requiresFlush = notificationCenter.addObserver(
-            forName: AVSampleBufferVideoRenderer
-                .requiresFlushToResumeDecodingDidChangeNotification,
-            object: renderer,
-            queue: nil
-        ) { [weak self] _ in
-            guard self?.renderer.requiresFlushToResumeDecoding == true else { return }
-            handler(.requiresFlushToResumeDecoding)
-        }
-        notificationTokens = [decodeFailure, requiresFlush]
+        lock.withLock { eventHandler = handler }
     }
+    func stopObserving() { lock.withLock { eventHandler = nil } }
 
-    func stopObserving() {
-        statusObservation?.invalidate()
-        statusObservation = nil
-        for token in notificationTokens {
-            notificationCenter.removeObserver(token)
+    private func emit(_ event: VideoRendererBackendEvent, revision expected: UInt64) {
+        let handler = lock.withLock { () -> (@Sendable (VideoRendererBackendEvent) -> Void)? in
+            guard revision == expected else { return nil }
+            switch event {
+            case let .failed(error): observedError = error
+            case .requiresFlushToResumeDecoding: flushRequired = true
+            case .decodeFailure: break
+            }
+            return eventHandler
         }
-        notificationTokens.removeAll(keepingCapacity: false)
+        handler?(event)
     }
 }
 
-private enum RendererObservationError: Int, Error {
-    case unknown = -1
+private struct VideoReceiverOutcome: Sendable {
+    let accepted: Bool
+    let events: [VideoRendererBackendEvent]
+}
+
+private actor VideoReceiverOwner {
+    private var receiver: AVSampleBufferVideoRenderer.Receiver?
+    private var isEnqueuing = false
+    private var events: Task<Void, Never>?
+
+    init(receiver: sending AVSampleBufferVideoRenderer.Receiver) { self.receiver = receiver }
+
+    func enqueue(_ sample: RendererReceiverSample) async throws -> VideoReceiverOutcome {
+        await stopEvents()
+        guard !isEnqueuing, receiver != nil else { throw CancellationError() }
+        isEnqueuing = true
+        defer { isEnqueuing = false }
+        return try await performEnqueue(sample)
+    }
+
+    private func performEnqueue(_ sample: RendererReceiverSample) async throws -> VideoReceiverOutcome {
+        guard let receiver else { throw CancellationError() }
+        try Task.checkCancellation()
+        let ready = try sample.makeReady()
+        do {
+            return try await enqueueReady(ready, into: receiver)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .init(accepted: false, events: [.failed(error)])
+        }
+    }
+
+    private func enqueueReady(_ sample: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>,
+        into receiver: AVSampleBufferVideoRenderer.Receiver) async throws -> VideoReceiverOutcome {
+        switch try await receiver.enqueue(sample) {
+        case .enqueued: return .init(accepted: true, events: [])
+        case let .enqueuedWithDecodeFailures(errors):
+            return .init(accepted: true, events: errors.map { .decodeFailure($0) })
+        case .cancelledDueToFlush: return .init(accepted: false, events: [])
+        case .cancelledDueToFlushRequiredToResume:
+            return .init(accepted: false, events: [.requiresFlushToResumeDecoding])
+        case let .cancelledDueToError(error):
+            return .init(accepted: false, events: [.failed(error)])
+        @unknown default: throw CancellationError()
+        }
+    }
+
+    func flush(removeDisplayedImage: Bool) async {
+        await stopEvents()
+        await receiver?.flush(removingDisplayedImage: removeDisplayedImage)
+    }
+
+    func finishedEnqueuing(_ eventSink: @escaping @Sendable (VideoRendererBackendEvent) -> Void) {
+        guard !isEnqueuing, events == nil, let receiver else { return }
+        let sequence = receiver.renderingEventsAfterFinishedEnqueuing
+        events = Task {
+            for await event in sequence {
+                guard !Task.isCancelled else { break }
+                switch event {
+                case let .didFailToDecode(errors):
+                    for error in errors { eventSink(.decodeFailure(error)) }
+                case .requiresFlushToResumeDecoding: eventSink(.requiresFlushToResumeDecoding)
+                case let .failed(error): eventSink(.failed(error))
+                @unknown default: break
+                }
+            }
+        }
+    }
+
+    private func stopEvents() async {
+        let previous = events
+        events = nil
+        previous?.cancel()
+        await previous?.value
+    }
+
+    func remove(from synchronizer: AVSampleBufferRenderSynchronizer) async -> Bool {
+        await flush(removeDisplayedImage: true)
+        guard let value = receiver else { return false }
+        receiver = nil
+        // Enqueue and event tasks have settled; no actor-owned alias remains.
+        nonisolated(unsafe) let removed = value
+        return await synchronizer.removeReceiver(removed, at: .invalid)
+    }
 }

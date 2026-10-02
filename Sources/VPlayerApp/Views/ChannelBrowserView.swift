@@ -6,6 +6,8 @@ import SwiftUI
 import VPlayerCore
 
 struct ChannelBrowserView: View {
+    @ScaledMetric(relativeTo: .subheadline) private var minimumTileWidth: CGFloat = 300
+    @ScaledMetric(relativeTo: .subheadline) private var maximumTileWidth: CGFloat = 420
     @Bindable var model: AppModel
     @Bindable var browsingSettings: ChannelBrowsingSettingsStore
     @State private var mappingChannel: Channel?
@@ -17,9 +19,10 @@ struct ChannelBrowserView: View {
     /// Tiles fill the whole canvas: adaptive sizing yields five logo-led
     /// columns on a 1080p screen and still degrades gracefully under larger
     /// dynamic type.
-    private static let gridColumns = [
-        GridItem(.adaptive(minimum: 300, maximum: 420), spacing: 40)
-    ]
+    private var gridColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: min(minimumTileWidth, 780),
+                            maximum: max(minimumTileWidth, maximumTileWidth)), spacing: 40)]
+    }
 
     var body: some View {
         Group {
@@ -117,7 +120,7 @@ struct ChannelBrowserView: View {
                         staleEPGBanner(coverageEnd: staleCoverageEnd)
                             .padding(.top, 16)
                     }
-                    LazyVGrid(columns: Self.gridColumns, alignment: .leading, spacing: 40) {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 40) {
                         ForEach(sections) { section in
                             Section {
                                 ForEach(section.channels) { channel in

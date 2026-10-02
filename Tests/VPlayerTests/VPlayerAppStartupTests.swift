@@ -1193,7 +1193,7 @@ private final class StartupBackgroundSchedulerSpy: BackgroundRefreshScheduling {
         cancelledIdentifiers.append(identifier)
     }
 
-    func submit(identifier: String, earliestBeginDate: Date) throws {
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
         _ = identifier
         _ = earliestBeginDate
     }

@@ -7,12 +7,12 @@ import CoreFoundation
 import Foundation
 import Security
 
-/// 只替代最底层同步SDK；步骤准入及真实结果提升属于Registry。
+/// 只替代底层SDK；异步调用的准入、物理完成及结果提升仍属于唯一Registry。
 protocol PlaybackAudioSessionSDK: AnyObject, Sendable {
     func setPlaybackCategory(policy: AudioSessionActualPolicy) throws
     func setSupportsMultichannelContent() throws
-    func activate() throws
-    func deactivate() throws
+    func activate() async throws -> Bool
+    func deactivate() async throws -> Bool
     func currentRoute() -> any AudioSessionRouteSnapshot
     func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool
 }
@@ -26,8 +26,10 @@ final class SystemPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked S
             policy: policy == .longFormAudio ? .longFormAudio : .default, options: [])
     }
     func setSupportsMultichannelContent() throws { try session.setSupportsMultichannelContent(true) }
-    func activate() throws { try session.setActive(true) }
-    func deactivate() throws { try session.setActive(false, options: .notifyOthersOnDeactivation) }
+    func activate() async throws -> Bool { try await session.activate(options: []) }
+    func deactivate() async throws -> Bool {
+        try await session.deactivate(options: .notifyOthersOnDeactivation)
+    }
     func currentRoute() -> any AudioSessionRouteSnapshot {
         // 路由及时序只在同一次授权 SDK 调用内读取，随后由原 sampler 的完成 CAS 提升。
         let route = session.currentRoute
@@ -150,6 +152,12 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
         return invoke(ticket, receiver: self) == .started
     }
 
+    @discardableResult
+    func requestAutomaticResume(for lease: PlaybackAudioSessionLease) -> Bool {
+        guard let ticket = registry.prepareExplicitResume(for: lease, userInitiated: false) else { return false }
+        return invoke(ticket, receiver: self) == .started
+    }
+
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit,
         completion: AudioSessionBlockingCallCompletion) {
         guard permit.operation == .activate, completion.disposition == .accepted,
@@ -251,8 +259,8 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
 final class NullPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
     func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {}
     func setSupportsMultichannelContent() throws {}
-    func activate() throws {}
-    func deactivate() throws {}
+    func activate() async throws -> Bool { true }
+    func deactivate() async throws -> Bool { true }
     func currentRoute() -> any AudioSessionRouteSnapshot {
         NullAudioSessionRouteSnapshot()
     }

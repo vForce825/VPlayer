@@ -57,6 +57,9 @@ enum AVPlayerPreparationFence: String, Sendable, CaseIterable {
 
 @MainActor
 protocol AVPlayerDriving: AnyObject {
+    var disconnectedFromSystemAudio: Bool { get }
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure)
     var rate: Float { get }
     var timeControlStatus: AVPlayer.TimeControlStatus { get }
     var preferredForwardBufferDuration: TimeInterval { get }
@@ -444,6 +447,7 @@ enum AVPlayerItemCoordinatorFailure: Error, Equatable {
     case loadedRangeMismatch
     case prerollFailed
     case directPauseNotConfirmed
+    case systemAudioConnectionNotConfirmed
     case invalidTimeline
     case operationInFlight
     case capacityExceeded
@@ -903,6 +907,9 @@ final class AVPlayerItemCoordinator {
     }
 
     private let driver: any AVPlayerDriving
+    var logSnapshotCache: AVPlayerLogSnapshotCache? {
+        (driver as? SystemAVPlayerDriver)?.logSnapshotCache
+    }
     private var evidenceSource: any AVPlayerPreparationEvidenceProviding
     private var evidenceSourceIdentity: UInt64
     private let allocator: PlaybackIdentityAllocator
@@ -1210,11 +1217,14 @@ final class AVPlayerItemCoordinator {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         let item = installedRequest.item
+        guard driver.disconnectedFromSystemAudio else {
+            throw AVPlayerItemCoordinatorFailure.systemAudioConnectionNotConfirmed
+        }
         driver.cancelPendingPrerolls(item: item)
         driver.pause(item: item)
         let direct = try await driver.directState(item: item)
         guard direct.item == item, direct.rate == 0,
-              direct.timeControlStatus == .paused else {
+              direct.timeControlStatus == .paused, driver.disconnectedFromSystemAudio else {
             throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
         }
         driver.replaceCurrentItemWithNil(item: item)
@@ -1293,6 +1303,13 @@ final class AVPlayerItemCoordinator {
         let operationTicket = try beginPreparation(request)
         defer {
             if preparationTicket == operationTicket { preparationTicket = nil }
+        }
+        try await driver.setDisconnectedFromSystemAudio(true, item: request.item)
+        try Task.checkCancellation()
+        guard self.request?.item == request.item,
+              preparationTicket == operationTicket, !invalidated,
+              driver.disconnectedFromSystemAudio else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         PlaybackDiagnosticTracker.shared.append("avprep_wait_ready")
         guard try await driver.waitUntilReady(item: request.item) == request.item else {
@@ -1586,7 +1603,7 @@ final class AVPlayerItemCoordinator {
     private func validatePreparationDirect(_ direct: AVPlayerDirectState,
                                            item: AVPlayerItemInstanceIdentity) throws {
         guard direct.item == item, direct.rate == 0,
-              direct.timeControlStatus != .playing else {
+              direct.timeControlStatus != .playing, driver.disconnectedFromSystemAudio else {
             throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
         }
     }
@@ -1645,7 +1662,28 @@ final class AVPlayerItemCoordinator {
         defer {
             activationInFlight = false
         }
-        try await driver.play(invocation: invocation, item: item)
+        do {
+            try Task.checkCancellation()
+            guard invocation.revalidateCurrentAuthority() else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            try await driver.setDisconnectedFromSystemAudio(false, item: item)
+            try Task.checkCancellation()
+            guard self.request?.item == item, authorization == invocation, !invalidated,
+                  state.phase != .stopping, state.phase != .quiescent,
+                  invocation.revalidateCurrentAuthority() else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            try revalidateCompletedPublication(for: request)
+            try await driver.play(invocation: invocation, item: item)
+        } catch {
+            // This is still the original signed activation runner. Stop joins it;
+            // task cancellation must not abandon a late physical reconnect.
+            driver.cancelPendingPrerolls(item: item)
+            driver.pause(item: item)
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            throw error
+        }
         guard self.request?.item == item, authorization == invocation, !invalidated,
               state.phase != .stopping, state.phase != .quiescent,
               invocation.revalidateCurrentAuthority() else { return .rejected }
@@ -1761,6 +1799,10 @@ final class AVPlayerItemCoordinator {
             #endif
             driver.cancelPendingPrerolls(item: item)
             driver.pause(item: item)
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            guard driver.disconnectedFromSystemAudio else {
+                throw AVPlayerItemCoordinatorFailure.systemAudioConnectionNotConfirmed
+            }
             let direct = try await driver.directState(item: item)
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append(
@@ -1768,7 +1810,7 @@ final class AVPlayerItemCoordinator {
             )
             #endif
             guard direct.item == item, direct.rate == 0,
-                  direct.timeControlStatus == .paused else {
+                  direct.timeControlStatus == .paused, driver.disconnectedFromSystemAudio else {
                 throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
             }
             let receipt = AVPlayerQuiescenceReceipt(item: item,
@@ -1818,7 +1860,8 @@ final class AVPlayerItemCoordinator {
     }
 
     func accept(_ receipt: AVPlayerQuiescenceReceipt) -> Bool {
-        guard lastQuiescenceReceipt === receipt.identity else { return false }
+        guard lastQuiescenceReceipt === receipt.identity,
+              driver.disconnectedFromSystemAudio else { return false }
         if let close = receipt.closeClaim {
             return receipt.matches(item: receipt.item,
                                    suspendTicket: receipt.suspendTicket,

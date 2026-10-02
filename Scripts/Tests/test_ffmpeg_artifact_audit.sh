@@ -169,12 +169,12 @@ printf 'void vplayer_audit_tvos17_object(void) {}\n' | \
 /usr/bin/xcrun --sdk appletvos ar -r \
   "$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a" "$case_root/tvos17.o"
 /usr/bin/xcrun --sdk appletvos ranlib "$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
-assert_rejected "$case_root" "Mach-O platform or minimum OS differs from tvOS 18.0" "a real tvOS 17 Mach-O member"
+assert_rejected "$case_root" "Mach-O platform or minimum OS differs from tvOS 27.0" "a real tvOS 17 Mach-O member"
 
 case_root="$(new_case unexpected-symbol)"
 materialize_device_install "$case_root"
 printf 'extern void vplayer_audit_unexpected_symbol(void); void vplayer_audit_symbol_probe(void) { vplayer_audit_unexpected_symbol(); }\n' | \
-  "$cc" -target arm64-apple-tvos18.0 -fapplication-extension -x c -c -o "$case_root/unexpected.o" -
+  "$cc" -target arm64-apple-tvos27.0 -fapplication-extension -x c -c -o "$case_root/unexpected.o" -
 device_install_archive="$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
 /usr/bin/xcrun --sdk appletvos ar -r "$device_install_archive" "$case_root/unexpected.o"
 /usr/bin/xcrun --sdk appletvos ranlib "$device_install_archive"
@@ -189,7 +189,7 @@ assert_rejected "$case_root" "_vplayer_audit_unexpected_symbol" "an unexpected u
 case_root="$(new_case optional-system-symbol)"
 materialize_device_install "$case_root"
 printf 'extern unsigned long vplayer_test_wcslen(const void *) __asm("_wcslen"); unsigned long vplayer_audit_optional_probe(const void *value) { return vplayer_test_wcslen(value); }\n' | \
-  "$cc" -target arm64-apple-tvos18.0 -fapplication-extension -x c -c -o "$case_root/optional.o" -
+  "$cc" -target arm64-apple-tvos27.0 -fapplication-extension -x c -c -o "$case_root/optional.o" -
 device_install_archive="$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
 /usr/bin/xcrun --sdk appletvos ar -r "$device_install_archive" "$case_root/optional.o"
 /usr/bin/xcrun --sdk appletvos ranlib "$device_install_archive"

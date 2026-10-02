@@ -75,6 +75,28 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         withLock { enqueueResults = results }
     }
 
+    var holdEnqueueCompletions = false
+    private var heldEnqueues: [@Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void] = []
+    var heldEnqueueCount: Int { withLock { heldEnqueues.count } }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void) {
+        if withLock({ holdEnqueueCompletions }) {
+            withLock { heldEnqueues.append(completion) }
+        } else {
+            completion(Result { try enqueue(sampleBuffer) })
+        }
+    }
+
+    func completeEnqueue(_ result: AudioRendererEnqueueResult) {
+        let completion = withLock { heldEnqueues.isEmpty ? nil : heldEnqueues.removeFirst() }
+        completion?(.success(result))
+    }
+
+    func cancelPendingEnqueue() {}
+    private(set) var finishedEnqueuingCount = 0
+    func finishedEnqueuing() { withLock { finishedEnqueuingCount += 1 } }
+
     func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
         let formatID = CMSampleBufferGetFormatDescription(sampleBuffer)
             .map(CMFormatDescriptionGetMediaSubType) ?? 0
@@ -97,7 +119,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
             enqueuedPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             pendingPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             enqueuesSinceReadyCallback += 1
-            return .accepted
+            return scriptedResult ?? .accepted
         }
     }
 

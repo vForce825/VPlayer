@@ -277,6 +277,7 @@ struct OutputUserControlRequest: Sendable, Equatable {
     let mediaServicesEpoch: UInt64
     let resetPreRouteBinding: ResetPreRouteTicketBinding?
     var explicitResumeLease: PlaybackAudioSessionLease? = nil
+    var userInitiated = true
 }
 enum OutputUserControlResult: Sendable, Equatable {
     case rejected, acceptedWaiting
@@ -285,6 +286,7 @@ enum OutputUserControlResult: Sendable, Equatable {
 struct OutputUserControlSafetyUpdate: Sendable, Equatable {
     let userPaused: Bool
     let interruptionVeto: Bool
+    let mediaServicesResumeRequired: Bool
     let freezeGeneration: UInt64
 }
 
