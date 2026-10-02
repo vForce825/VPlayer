@@ -1,0 +1,54 @@
+name: macOS build and test
+
+# Standard GitHub-hosted runners are free for this public repository.
+# Do not add larger runners, artifact uploads, or persistent caches without
+# reviewing their billing and storage implications.
+"on":
+  push:
+    branches: [migration/tvos27]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Xcode 27.0 / tvOS 27.0
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode and simulator runtime
+        run: |
+          xcodebuild -version
+          xcrun --sdk appletvsimulator --show-sdk-version
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+
+      - name: Compile and run unit and UI tests
+        run: ./Scripts/test.sh
