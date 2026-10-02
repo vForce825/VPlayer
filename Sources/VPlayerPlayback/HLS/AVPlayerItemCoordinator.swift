@@ -1366,8 +1366,13 @@ final class AVPlayerItemCoordinator {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
             PlaybackDiagnosticTracker.shared.append("avprep_ready")
-            try await driver.selectAudibleMedia(item: request.item)
-            PlaybackDiagnosticTracker.shared.append("avprep_audio_selected")
+            // A server-derived direct audio playlist has no alternative group.
+            // This only omits that platform operation; completed HTTP authority
+            // must still prove the exact sole rendition before preparation succeeds.
+            if request.directAudioOnlyRendition == nil {
+                try await driver.selectAudibleMedia(item: request.item)
+                PlaybackDiagnosticTracker.shared.append("avprep_audio_selected")
+            }
             try await driver.primeMediaData(item: request.item)
             PlaybackDiagnosticTracker.shared.append("avprep_media_primed")
             try await awaitCompletedPublicationBinding(for: request)

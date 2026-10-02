@@ -384,7 +384,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
-    func testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup()
+    func testTVOS27RawDriverRejectsMissingAlternativeGroupWithoutInferringAudioSelection()
         async throws {
         let progress = NativeAudibleSelectionProgressProbe()
         defer { progress.stop() }
@@ -455,15 +455,11 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 }
             }
             XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
-            XCTAssertEqual(tracks.count, 1,
-                           "a missing selection group is only valid here with one real audio track")
-            let soleTrack = try XCTUnwrap(tracks.first)
-            let isPlayable = try await soleTrack.load(.isPlayable)
-            XCTAssertTrue(isPlayable,
-                          "the direct playlist fallback requires its sole audio track to be playable")
 
             progress.mark("production-selection")
-            try await driver.selectAudibleMedia(item: item)
+            await XCTAssertThrowsErrorAsync(try await driver.selectAudibleMedia(item: item)) {
+                XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .insufficientCoverage)
+            }
             progress.mark("complete")
 
             XCTAssertTrue(driver.player.currentItem === physical)
@@ -1217,6 +1213,145 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.coordinator.selectionRevision, 1)
     }
 
+    private func withOwnedSelectionHarness(
+        _ make: @MainActor () async throws -> Task21Harness,
+        body: @MainActor (Task21Harness) async throws -> Void
+    ) async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let owner: Task21OwnedTestHarness
+        do {
+            let harness = try await make()
+            owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+            addTeardownBlock { try await owner.tearDown() }
+            try await body(harness)
+        }
+        try await owner.tearDown()
+    }
+
+    func testDirectAudioPreparationOmitsAlternativesButRequiresCompletedHTTPAuthority() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            harness.driver.audibleSelectionFailure = .insufficientCoverage
+            let prepared = try await harness.prepare()
+            XCTAssertEqual(prepared.item, harness.item)
+            XCTAssertEqual(harness.coordinator.selectedRenditions, [.init(rawValue: 2)])
+            XCTAssertTrue(prepared.coverageDependencies.allSatisfy {
+                $0.initializationBodyCompleted && $0.mediaBodyCompleted
+            })
+            XCTAssertFalse(prepared.coverageDependencies.isEmpty)
+            XCTAssertEqual(harness.driver.audibleSelectionCallCount, 0)
+            XCTAssertEqual(harness.driver.primeMediaCallCount, 1)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+        }
+    }
+
+    func testMasterAudioPreparationStillRequiresAlternativeSelectionBeforePriming() async throws {
+        for missingGroup in [false, true] {
+            try await withOwnedSelectionHarness { try await Task21Harness() } body: { harness in
+                if missingGroup { harness.driver.audibleSelectionFailure = .insufficientCoverage }
+                if missingGroup {
+                    await XCTAssertThrowsErrorAsync(try await harness.prepare()) {
+                        XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .insufficientCoverage)
+                    }
+                    XCTAssertNotEqual(harness.coordinator.phase, .prepared)
+                    XCTAssertEqual(harness.driver.primeMediaCallCount, 0)
+                } else {
+                    _ = try await harness.prepare()
+                    XCTAssertEqual(harness.driver.primeMediaCallCount, 1)
+                }
+                XCTAssertEqual(harness.driver.audibleSelectionCallCount, 1)
+                XCTAssertEqual(harness.driver.playCallCount, 0)
+            }
+        }
+    }
+
+    func testForgedDirectFieldCannotAuthorizeGenuineMasterAVPublication() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(forgedDirectAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            await XCTAssertThrowsErrorAsync(try await harness.prepare()) {
+                XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .insufficientCoverage)
+            }
+            XCTAssertNotEqual(harness.coordinator.phase, .prepared)
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+        }
+    }
+
+    func testDirectAudioPreparationRejectsConflictingPublicationShapeAndRendition() async throws {
+        for mutation in 0..<4 {
+            try await withOwnedSelectionHarness {
+                try await Task21Harness(
+                    directAudioOnlyRendition: .init(rawValue: 2),
+                    forgedDirectAudioOnlyRendition: mutation == 3 ? .init(rawValue: 999) : nil)
+            } body: { harness in
+                switch mutation {
+                case 0: harness.evidence.masterPlaylistCompleted = true
+                case 1: harness.evidence.videoParticipantCount = 1
+                case 2: harness.evidence.completedRenditions.append(.init(rawValue: 202))
+                default: break
+                }
+                await XCTAssertThrowsErrorAsync(try await harness.prepare())
+                XCTAssertNotEqual(harness.coordinator.phase, .prepared)
+                XCTAssertEqual(harness.driver.playCallCount, 0)
+            }
+        }
+    }
+
+    func testDirectAudioPreparationRejectsMissingHTTPBodyAndWrongPublicationIdentity() async throws {
+        for mutation in [Task21FakeEvidenceSource.ReadinessIdentityMutation.none, .url, .generation, .sequence] {
+            try await withOwnedSelectionHarness {
+                try await Task21Harness(
+                    directAudioOnlyRendition: .init(rawValue: 2),
+                    completeMediaBodies: mutation != .none)
+            } body: { harness in
+                harness.evidence.readinessIdentityMutation = mutation
+                await XCTAssertThrowsErrorAsync(try await harness.prepare()) {
+                    XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .insufficientCoverage)
+                }
+                XCTAssertNotEqual(harness.coordinator.phase, .prepared)
+                XCTAssertEqual(harness.driver.playCallCount, 0)
+            }
+        }
+    }
+
+    func testDirectAudioPreparationRejectsReplacedItemDuringPriming() async throws {
+        for changeLifecycle in [false, true] {
+            let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+            let owner: Task21OwnedTestHarness
+            do {
+                let harness = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+                owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+                addTeardownBlock {
+                    try await owner.tearDownFailedTransport()
+                    try await owner.tearDown()
+                }
+                let original = harness.item
+                let replacement = changeLifecycle ? Task21Fixtures.staleLifecycleItem(from: original)
+                    : Task21Fixtures.staleGenerationItem(from: original)
+                harness.driver.onPrimeMediaData = { [weak driver = harness.driver] in
+                    driver?.currentItemIdentity = replacement
+                }
+                await XCTAssertThrowsErrorAsync(try await harness.prepare()) {
+                    XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .staleIdentity)
+                }
+                XCTAssertNotEqual(harness.coordinator.phase, .prepared)
+                XCTAssertEqual(harness.driver.primeMediaCallCount, 1)
+                XCTAssertEqual(harness.driver.playCallCount, 0)
+                try await owner.tearDownFailedTransport()
+                XCTAssertEqual(harness.driver.currentItemIdentity, replacement,
+                    "Cleanup must preserve the replaced item instead of manufacturing an original-item proof")
+                XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+                XCTAssertNil(harness.backend.quiescenceReceipt)
+                XCTAssertNil(harness.backend.lastRetiredEpoch)
+            }
+            // The local alias is gone. Check weak owners and the original ledger
+            // baseline before admitting the next fixture, without another proof.
+            try await owner.tearDown()
+        }
+    }
+
     func testStaleItemLifecycleAndPrerollCompletionsCannotPrepare() async throws {
         for mutation in [Task21PrepareMutation.wrongLifecycle, .wrongItemGeneration, .stalePreroll] {
             let harness = try await Task21Harness(prepareMutation: mutation)
@@ -1614,8 +1749,13 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero() async throws {
         let fixture = try await Task21RealIntegrationFixture.make()
-        defer { fixture.shutdown() }
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
         let prepared = try await fixture.prepare()
+        let physical = try XCTUnwrap(fixture.player.currentItem)
+        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        XCTAssertNil(group, "Native direct audio must prepare without an alternative selection group")
+        XCTAssertFalse(fixture.hasVideoParticipant)
         XCTAssertEqual(fixture.player.rate, 0)
         XCTAssertTrue(prepared.coverageDependencies.contains { $0.initializationBodyCompleted })
         XCTAssertTrue(prepared.coverageDependencies.contains { $0.mediaBodyCompleted })
@@ -1623,6 +1763,19 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
         XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
         XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
+    }
+
+    func testTVOS27NativeMasterAVPreparationRetainsAlternativeSelection() async throws {
+        let fixture = try await Task21RealIntegrationFixture.make(endList: true, includeVideo: true)
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
+        let prepared = try await fixture.prepare()
+        let physical = try XCTUnwrap(fixture.player.currentItem)
+        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        XCTAssertNotNil(group)
+        XCTAssertTrue(fixture.hasVideoParticipant)
+        XCTAssertFalse(prepared.coverageDependencies.isEmpty)
+        XCTAssertEqual(fixture.player.rate, 0)
     }
 
     func testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations() async throws {
@@ -2815,21 +2968,23 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         )
         let authorityOwner: Task21OwnedTestHarness
         do {
-            let authorityHarness = try await Task21Harness()
+            let authorityHarness = try await Task21Harness(coordinatorAllocator: exhaustedAllocator)
             authorityOwner = Task21OwnedTestHarness(authorityHarness, resourceBaseline: resourceBaseline)
             addTeardownBlock { try await authorityOwner.tearDown() }
-            let exhausted = try AVPlayerItemCoordinator(driver: Task21FakeDriver(),
-                evidenceSource: authorityHarness.evidence, allocator: exhaustedAllocator)
-            let exhaustedItem = AVPlayerItemInstanceIdentity(
-                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_006),
-                itemGeneration: 1
-            )
-            try exhausted.install(Task21Fixtures.request(item: exhaustedItem,
-                liveEdge: Task21Fixtures.time(7), boundaries: [Task21Fixtures.time(4)],
-                directAudioOnlyRendition: nil))
-            await XCTAssertThrowsErrorAsync(try await exhausted.prepareCurrentItem()) { error in
+            // Keep the genuine request and its original source together. The
+            // prepare namespace remains available; only the later playhead
+            // nonce allocation is at its checked boundary.
+            XCTAssertFalse(exhaustedAllocator.isExhausted)
+            await XCTAssertThrowsErrorAsync(try await authorityHarness.prepare()) { error in
                 XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .identitySpaceExhausted)
             }
+            XCTAssertTrue(exhaustedAllocator.isExhausted,
+                          "The real nonce allocator must reach its checked overflow")
+            XCTAssertEqual(authorityHarness.driver.readyConnectionStates, [false],
+                           "The separate prepare ticket must admit the genuine request")
+            XCTAssertNil(authorityHarness.driver.requestedSeekTime)
+            XCTAssertEqual(authorityHarness.driver.prerollCallCount, 0)
+            XCTAssertEqual(authorityHarness.driver.playCallCount, 0)
         }
         try await authorityOwner.tearDown()
     }
@@ -4523,6 +4678,10 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var playCallCount = 0
     var pauseCallCount = 0
     var prerollCallCount = 0
+    var audibleSelectionCallCount = 0
+    var audibleSelectionFailure: AVPlayerItemCoordinatorFailure?
+    var primeMediaCallCount = 0
+    var onPrimeMediaData: (() -> Void)?
     var manualLatencyShiftCallCount = 0
     var requestedSeekTime: ExactMediaTime?
     var constrainedPlaybackEnd: ExactMediaTime?
@@ -4568,6 +4727,20 @@ private final class Task21FakeDriver: AVPlayerDriving {
         return prepareMutation == .wrongLifecycle ? Task21Fixtures.staleLifecycleItem(from: item)
             : prepareMutation == .wrongItemGeneration ? Task21Fixtures.staleGenerationItem(from: item)
             : item
+    }
+
+    func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws {
+        audibleSelectionCallCount += 1
+        if let audibleSelectionFailure { throw audibleSelectionFailure }
+    }
+
+    func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws {
+        primeMediaCallCount += 1
+        if let onPrimeMediaData {
+            await Task.yield()
+            onPrimeMediaData()
+        }
+        guard currentItemIdentity == item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
     }
 
     func seek(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity,
@@ -5594,6 +5767,18 @@ private final class Task21OwnedTestHarness {
             file: file, line: line)
     }
 
+    func tearDownFailedTransport() async throws {
+        guard let harness else { return }
+        // Attempt the original owned terminal cleanup with the mismatch intact.
+        // Its failure cannot issue a valid quiescence or retirement proof.
+        await XCTAssertThrowsErrorAsync(try await harness.shutdown())
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        XCTAssertNil(harness.backend.quiescenceReceipt)
+        XCTAssertNil(harness.backend.lastRetiredEpoch)
+        try await harness.retireFailedTestTransport()
+        self.harness = nil
+    }
+
     private func releaseOwnedHarness() async throws {
         // Existing shutdown upgrades the exact owner, releases its retirement
         // gate, and joins the original task. Only success permits dropping it.
@@ -5635,11 +5820,13 @@ private final class Task21Harness {
 
     init(liveEdge: Double = 7, boundaries: [Double] = [1, 2, 3, 4],
          directAudioOnlyRendition: AudioRenditionIdentity? = nil,
+         forgedDirectAudioOnlyRendition: AudioRenditionIdentity? = nil,
          prepareMutation: Task21PrepareMutation = .none,
          requiresAACEndpointAuthority: Bool = false,
          additionalUnboundAACRendition: AudioRenditionIdentity? = nil,
          completeMediaBodies: Bool = true,
-         diagnosticPhases: Bool = false) async throws {
+         diagnosticPhases: Bool = false,
+         coordinatorAllocator: PlaybackIdentityAllocator = .shared) async throws {
         self.liveEdge = Task21Fixtures.time(liveEdge)
         self.boundaries = boundaries.map(Task21Fixtures.time)
         self.directAudioOnlyRendition = directAudioOnlyRendition
@@ -5671,7 +5858,7 @@ private final class Task21Harness {
             evidence.completedRenditions.append(additionalUnboundAACRendition)
         }
         coordinator = try AVPlayerItemCoordinator(
-            driver: driver, evidenceSource: evidence,
+            driver: driver, evidenceSource: evidence, allocator: coordinatorAllocator,
             backendPublicationReplacementAuthoritySlot:
                 backend.backendPublicationReplacementAuthoritySlot)
         backend.attach(coordinator, physicalDriver: driver)
@@ -5699,6 +5886,12 @@ private final class Task21Harness {
                 audioParticipants: Array(preparation.audioParticipants) + [
                     .init(renditionIdentity: additionalUnboundAACRendition, codec: .aac)
                 ], directAudioOnlyRendition: preparation.directAudioOnlyRendition)
+        }
+        if let forgedDirectAudioOnlyRendition {
+            preparation = .init(itemURL: preparation.itemURL, item: preparation.item,
+                publicationSequence: preparation.publicationSequence,
+                audioParticipants: preparation.audioParticipants,
+                directAudioOnlyRendition: forgedDirectAudioOnlyRendition)
         }
         try coordinator.install(preparation)
     }

@@ -1,4 +1,4 @@
-name: Isolated native direct audio evidence diagnostic
+name: Direct publication selection and native preparation validation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-direct-evidence-${{ github.ref }}
+  group: macos-ci-selection-green-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -65,7 +65,21 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Isolate native direct audio selection
+      - name: Verify complete capacity and actual allocation contracts
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/Capacity.xcresult" \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests
+      - name: Report scoped Capacity failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/Capacity.xcresult"
+
+      - name: Verify direct and master publication selection contracts
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -74,8 +88,115 @@ jobs:
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
             -resultBundlePath "$RUNNER_TEMP/DirectAudio.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testDirectAudioPreparationOmitsAlternativesButRequiresCompletedHTTPAuthority \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testMasterAudioPreparationStillRequiresAlternativeSelectionBeforePriming \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testForgedDirectFieldCannotAuthorizeGenuineMasterAVPublication \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testDirectAudioPreparationRejectsConflictingPublicationShapeAndRendition \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testDirectAudioPreparationRejectsMissingHTTPBodyAndWrongPublicationIdentity \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testDirectAudioPreparationRejectsReplacedItemDuringPriming \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27RawDriverRejectsMissingAlternativeGroupWithoutInferringAudioSelection \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27NativeMasterAVPreparationRetainsAlternativeSelection
       - name: Report scoped DirectAudio failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DirectAudio.xcresult"
 
+      - name: Verify cleanup precursor subset in native XCTest class order
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/CleanupPrecursors.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointMutationTableRejectsDeletedTrimPlusMinusOneAndPrematureNonfinalTrim \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointReceiptRequiresSameWriterProofPlaylistHTTPBackingAndEffectiveEnd \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2AVParticipantCardinalityTimeoutTaxonomyAndCheckedCountersFailClosed \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2BackendQuiescenceProofClosesRegistryIntervalOnlyForExactDirectPausedIdentity \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2CoordinatorFixedCapacityRejectsBeforeInstallationAndOwnsOneWaiterWithoutTimer \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2EveryAACParticipantRequiresWriterEndpointAuthorityWhileExplicitNonAACMayProceed \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2LoopbackTerminalRenditionConflictAutomaticallyStartsRegistrySingleFlightStopAndReprepare \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2RegistryCapabilityIsConsumedOnceAtMainActorPlayBoundaryAndRevalidatedForPlayingRelay \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalLoopbackTimelineTerminationFailsCurrentAndFutureCoordinatorWaiters
+      - name: Report scoped CleanupPrecursors failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CleanupPrecursors.xcresult"
+
+      - name: Isolate native final EOS preparation
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/FinalEOS.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch
+      - name: Report scoped FinalEOS failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/FinalEOS.xcresult"
+
+  release-validation:
+    name: Release boundaries and cold startup
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+      - name: Verify committed project and licenses
+        id: release_preflight
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_tvos27_deployment.py
+      - name: Build optimized native test target once
+        id: release_build
+        run: |
+          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
+            -configuration Release -destination "$TVOS_TEST_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES
+      - name: Verify original optimized preparation pair and reference controls
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
+            -configuration Release -destination "$TVOS_TEST_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/ReleaseSelectionPair.xcresult" \
+            -only-testing:VPlayerReleaseBoundaryTests/SDKSystemLoadedReleaseTests \
+            -only-testing:VPlayerReleaseBoundaryTests/SDKReadinessReferenceReleaseTests
+      - name: Report scoped ReleaseSelectionPair failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseSelectionPair.xcresult"
+      - name: Verify original loaded receipt in fresh invocation
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
+            -configuration Release -destination "$TVOS_TEST_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/ReleaseLoadedFresh.xcresult" \
+            -only-testing:VPlayerReleaseBoundaryTests/SDKSystemLoadedReleaseTests/testSystemLoopbackLoadedReceiptAndItemFailure
+      - name: Report scoped ReleaseLoadedFresh failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseLoadedFresh.xcresult"
