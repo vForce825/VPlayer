@@ -719,6 +719,10 @@ final class AudioServiceLeaseTests: XCTestCase {
         throws {
         let harness = try AudioServiceLeaseTestHarness(codec: .ac3)
         let admission = harness.directAdmission()
+        // CRC synthesis brute-forces a16-bit patch. Reuse immutable encoded
+        // bytes, while every iteration still creates and validates fresh unit,
+        // backing, ownership and authoritative proof identities.
+        let encodedBytes = AssemblerTestFixtures.syntheticAC3Frame(bsmod: 0)
         var escapedProofs: [AdmittedAudioServiceInputUnitProof] = []
         escapedProofs.reserveCapacity(AudioServiceRegistryCapacity.authoritativeAdmittedProofs)
 
@@ -730,7 +734,7 @@ final class AudioServiceLeaseTests: XCTestCase {
                     + "retained=\(escapedProofs.count)")
             }
             let proof = index == 0 ? harness.admitted
-                : try harness.admitNextUnit(rawValue: UInt64(400_000 + index))
+                : try harness.admitNextUnit(rawValue: UInt64(400_000 + index), encodedBytes: encodedBytes)
             XCTAssertTrue(try harness.coordinator.registerEligibleCompressedPlan(
                 admission, for: proof))
             let lease = try XCTUnwrap(try harness.coordinator.issueAudioServiceBranchLease(
@@ -753,13 +757,13 @@ final class AudioServiceLeaseTests: XCTestCase {
         }
         XCTAssertEqual(harness.coordinator.audioServiceRegistryUsage.admittedProofs, 0,
                        "语义索引已空，但外部proof alias仍须持有费用信用")
-        XCTAssertThrowsError(try harness.admitNextUnit(rawValue: 900_000)) {
+        XCTAssertThrowsError(try harness.admitNextUnit(rawValue: 900_000, encodedBytes: encodedBytes)) {
             XCTAssertEqual($0 as? AudioServiceSemanticFailure, .registryCapacityExceeded)
         }
 
         print("PROOF_ESCROW_PROGRESS phase=release_last elapsed=\(diagnosticStart.duration(to: .now))")
         escapedProofs.removeLast()
-        let reused = try harness.admitNextUnit(rawValue: 900_001)
+        let reused = try harness.admitNextUnit(rawValue: 900_001, encodedBytes: encodedBytes)
         XCTAssertTrue(harness.coordinator.retireAdmittedProof(reused))
         print("PROOF_ESCROW_PROGRESS phase=complete elapsed=\(diagnosticStart.duration(to: .now))")
     }
@@ -1553,13 +1557,17 @@ final class AudioServiceLeaseTestHarness: @unchecked Sendable {
         return lease.identity
     }
 
-    func admitNextUnit(rawValue: UInt64) throws -> AdmittedAudioServiceInputUnitProof {
+    func admitNextUnit(rawValue: UInt64, encodedBytes: Data? = nil) throws -> AdmittedAudioServiceInputUnitProof {
         let bytes: Data
-        switch codec {
-        case .aac: bytes = Data([0x21, 0x22])
-        case .ac3: bytes = AssemblerTestFixtures.syntheticAC3Frame(bsmod: 0)
-        case .eac3: bytes = syntheticEAC3Frame()
-        case .mp1, .mp2, .mp3: throw AudioServiceSemanticFailure.invalidInputUnit
+        if let encodedBytes {
+            bytes = encodedBytes
+        } else {
+            switch codec {
+            case .aac: bytes = Data([0x21, 0x22])
+            case .ac3: bytes = AssemblerTestFixtures.syntheticAC3Frame(bsmod: 0)
+            case .eac3: bytes = syntheticEAC3Frame()
+            case .mp1, .mp2, .mp3: throw AudioServiceSemanticFailure.invalidInputUnit
+            }
         }
         let unit = try AudioServiceInputUnit(
             identity: .init(rawValue: rawValue),

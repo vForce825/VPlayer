@@ -303,6 +303,34 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup()
+        async throws {
+        let fixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_122),
+            audioOnly: true)
+        defer { fixture.shutdown() }
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let item = fixture.request.item
+        try driver.install(url: fixture.request.itemURL, identity: item)
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+        try await driver.setDisconnectedFromSystemAudio(true, item: item)
+        let ready = try await driver.waitUntilReady(item: item)
+        XCTAssertEqual(ready, item)
+        let physical = try XCTUnwrap(driver.player.currentItem)
+        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        let tracks = try await physical.asset.loadTracks(withMediaType: .audio)
+        print("NATIVE_AUDIBLE_SELECTION groupPresent=\(group != nil) optionCount=\(group?.options.count ?? 0) audioTrackCount=\(tracks.count)")
+        XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
+        XCTAssertEqual(tracks.count, 1,
+                       "a missing selection group is only valid here with one real audio track")
+
+        try await driver.selectAudibleMedia(item: item)
+
+        XCTAssertTrue(driver.player.currentItem === physical)
+        XCTAssertEqual(driver.rate, 0)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+    }
+
     func testTVOS27SystemDriverWaitsForNativeConnectionState() async throws {
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         let item = AVPlayerItemInstanceIdentity(
@@ -1684,6 +1712,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview2NaturalEOSRecordsStableCurrentTimeWithoutSeekingAndValidatesServedTrimMutationTable()
         async throws {
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
         let player = AVPlayer()
         let driver = try SystemAVPlayerDriver.make(player: player)
         let identity = AVPlayerItemInstanceIdentity(
@@ -1692,13 +1721,20 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         )
         try driver.install(url: URL(string: "http://127.0.0.1:1/eos.m3u8")!,
                            identity: identity)
+        defer {
+            driver.replaceCurrentItemWithNil(item: identity)
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline,
+                "the test must unregister the actual endpoint callback before its next native owner")
+        }
         await player.seek(to: CMTime(seconds: 1, preferredTimescale: 48_000),
                           toleranceBefore: .zero, toleranceAfter: .zero)
         let before = CMTimeGetSeconds(player.currentTime())
         try driver.constrainPlaybackEnd(to: Task21Fixtures.time(2), item: identity)
         NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
                                         object: player.currentItem)
-        for _ in 0..<8 { await Task.yield() }
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
         let after = CMTimeGetSeconds(player.currentTime())
 
         XCTAssertEqual(after, before, accuracy: Task21Fixtures.oneSample,

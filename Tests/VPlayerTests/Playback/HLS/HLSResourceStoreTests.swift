@@ -153,9 +153,15 @@ final class HLSResourceStoreTests: XCTestCase {
             XCTAssertEqual(store.usage.resourceCount, 0)
             XCTAssertEqual(store.usage.residentBytes, 0)
         }
-        for bytes in [65_535, 65_536, 65_537] {
+        let initializationEvidenceBytes = 16 * 1_024
+        XCTAssertEqual(LoopbackStorageLayout.current.initEvidenceAllocationBytes,
+                       initializationEvidenceBytes)
+        XCTAssertEqual(LoopbackStorageLayout.current.initMaximumBodyBytes
+                       + initializationEvidenceBytes, 64 * 1_024)
+        for totalBytes in [65_535, 65_536, 65_537] {
+            let bytes = totalBytes - initializationEvidenceBytes
             let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
-            if bytes == 65_537 {
+            if totalBytes == 65_537 {
                 XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .initialization, bodyBytes: bytes))
             } else {
                 let reservation = try store.reserveMedia(binding: Task19.binding(), kind: .initialization, bodyBytes: bytes)
@@ -168,6 +174,9 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media,
             bodyBytes: 688 * 1_024 * 1_024),
             "Payload alone at the hard limit must still charge its evidence and reject atomically")
+        XCTAssertEqual(store.usage.reservedBytes, 0)
+        XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .initialization,
+            bodyBytes: 64 * 1_024), "The64KiB initialization cap includes its16KiB evidence")
         XCTAssertEqual(store.usage.reservedBytes, 0)
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: .max))
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: -1))

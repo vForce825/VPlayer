@@ -1,143 +1,84 @@
-name: Release native host-context diagnostic
+name: Control and native audio selection diagnostic
+
+# Standard GitHub-hosted runners are free for this public repository.
+# Do not add larger runners, artifact uploads, or persistent caches without
+# reviewing their billing and storage implications.
 "on":
   push:
     branches: [migration/tvos27]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
-  group: macos-ci-release-host-ab-${{ github.ref }}
+  group: macos-ci-control-native-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
-  release-host-ab:
-    name: Optimized Release native app-host comparison
+  build-and-test:
+    name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
-      - name: Check out exact source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-          ref: f262d5877216c05ee05d1b4eba3d18ae830dc61e
-      - name: Verify pinned SDK and source provenance
+
+      - name: Verify Xcode and simulator runtime
         run: |
-          git rev-parse HEAD
           xcodebuild -version
-          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
-          echo 'SOURCE_PROVENANCE=70a1e12ca8a341e8f7cb2f7f7bc9b3be4522451c'
+          xcrun --sdk appletvsimulator --show-sdk-version
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+
       - name: Install build tooling
         run: brew install mint jq ripgrep
+
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
-      - name: Verify committed generated project and licenses
+
+      - name: Install Apple Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Check deployment floors and precompiled Metal reproducibility
+        run: |
+          python3 Scripts/Tests/test_tvos27_deployment.py
+          ./Scripts/Tests/test_precompiled_metal_library.sh
+
+      - name: Compile complete Debug test targets for diagnostic isolation
+        id: debug_build
         run: |
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
-      - name: Compare unchanged native tests in verified optimized app host
+          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
+      - name: Verify bounded control fixes and native audio selection
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
-          #!/usr/bin/env bash
-          set -euo pipefail
-          : "${RUNNER_TEMP:?}" "${TVOS_TEST_DESTINATION:?}"
-          AB_DD="$RUNNER_TEMP/ReleaseHostedDerivedData"
-          APP_SETTINGS="$RUNNER_TEMP/ReleaseHostedAppSettings.json"
-          BOUNDARY_SETTINGS="$RUNNER_TEMP/ReleaseHostedBoundarySettings.json"
-          xcodebuild build -project VPlayer.xcodeproj -scheme VPlayer -configuration Release \
-            -destination "$TVOS_TEST_DESTINATION" -derivedDataPath "$AB_DD" \
-            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES
-          xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -scheme VPlayer \
-            -configuration Release -destination "$TVOS_TEST_DESTINATION" -derivedDataPath "$AB_DD" \
-            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES > "$APP_SETTINGS"
-          APP_HOST="$(python3 - "$APP_SETTINGS" <<'PY'
-          import json,sys
-          from pathlib import Path
-          settings=next(x['buildSettings'] for x in json.load(open(sys.argv[1])) if x.get('target')=='VPlayer')
-          assert settings['CONFIGURATION']=='Release'
-          host=Path(settings['TARGET_BUILD_DIR']) / settings['EXECUTABLE_PATH']
-          assert host.is_file() and host.parent.name=='VPlayer.app' and host.name=='VPlayer'
-          print(host)
-          PY
-          )"
-          cp VPlayer.xcodeproj/project.pbxproj "$RUNNER_TEMP/ReleaseHosted.original.pbxproj"
-          trap 'cp "$RUNNER_TEMP/ReleaseHosted.original.pbxproj" VPlayer.xcodeproj/project.pbxproj' EXIT
-          python3 - "$APP_HOST" <<'PATCHPY'
-          import copy,json,re,subprocess,sys
-          from pathlib import Path
-          project=Path('VPlayer.xcodeproj/project.pbxproj')
-          host=sys.argv[1]
-          def parsed():
-              return json.loads(subprocess.check_output(['plutil','-convert','json','-o','-',str(project)]))
-          before=parsed()
-          objects=before['objects']
-          targets=[o for o in objects.values() if o.get('isa')=='PBXNativeTarget' and o.get('name')=='VPlayerReleaseBoundaryTests']
-          assert len(targets)==1
-          ids=objects[targets[0]['buildConfigurationList']]['buildConfigurations']
-          configs=[i for i in ids if objects[i].get('name')=='Release']
-          assert len(configs)==1
-          config_id=configs[0]
-          settings=objects[config_id]['buildSettings']
-          assert 'TEST_HOST' not in settings and 'BUNDLE_LOADER' not in settings, 'unexpected preexisting hosting settings'
-          source=project.read_text()
-          pattern=r'(?ms)(^\s*'+re.escape(config_id)+r' /\* Release \*/ = \{.*?\bbuildSettings = \{)'
-          assert len(re.findall(pattern,source))==1
-          addition='\n\t\t\t\tTEST_HOST = '+json.dumps(host)+';\n\t\t\t\tBUNDLE_LOADER = "$(TEST_HOST)";'
-          modified=re.sub(pattern,lambda m:m.group(1)+addition,source,count=1)
-          project.write_text(modified)
-          after=parsed()
-          expected=copy.deepcopy(before)
-          expected['objects'][config_id]['buildSettings'].update(TEST_HOST=host,BUNDLE_LOADER='$(TEST_HOST)')
-          assert after==expected, 'project changed outside exact target Release host settings'
-          print('RELEASE_HOST_AB project_diff_verified=1 target=VPlayerReleaseBoundaryTests configuration=Release changed_settings=TEST_HOST,BUNDLE_LOADER other_objects_unchanged=1')
-          PATCHPY
-          xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -target VPlayerReleaseBoundaryTests \
-            -configuration Release -sdk appletvsimulator \
-            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
-            > "$BOUNDARY_SETTINGS"
-          python3 - "$BOUNDARY_SETTINGS" "$APP_HOST" <<'PY'
-          import json,sys
-          s=next(x['buildSettings'] for x in json.load(open(sys.argv[1])) if x.get('target')=='VPlayerReleaseBoundaryTests')
-          assert s['CONFIGURATION']=='Release' and s['TEST_HOST']==sys.argv[2]
-          assert s.get('BUNDLE_LOADER') in (sys.argv[2], '$(TEST_HOST)')
-          assert s.get('SWIFT_OPTIMIZATION_LEVEL') not in (None,'-Onone')
-          print('RELEASE_HOST_AB settings_verified=1 configuration=Release optimization='+s['SWIFT_OPTIMIZATION_LEVEL'])
-          PY
-          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
-            -destination "$TVOS_TEST_DESTINATION" -derivedDataPath "$AB_DD" \
-            CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
-            -only-testing:VPlayerReleaseBoundaryTests/SDKSystemLoadedReleaseTests
-          XCTESTRUN="$(python3 - "$AB_DD" "$APP_HOST" <<'PY'
-          import plistlib,sys
-          from pathlib import Path
-          products=Path(sys.argv[1])/'Build/Products'
-          app=Path(sys.argv[2]).parent.resolve()
-          verified=[]
-          for path in products.glob('*.xctestrun'):
-           d=plistlib.loads(path.read_bytes())
-           targets=[t for config in d.get('TestConfigurations',[]) for t in config.get('TestTargets',[])]
-           if not targets: targets=[v for k,v in d.items() if k!='__xctestrun_metadata__' and isinstance(v,dict)]
-           for t in targets:
-            if t.get('BlueprintName')!='VPlayerReleaseBoundaryTests': continue
-            host=t.get('TestHostPath','').replace('__TESTROOT__',str(products))
-            resolved=Path(host).resolve()
-            assert resolved in (app,Path(sys.argv[2]).resolve()), 'generated bundle does not host the exact app'
-            assert t.get('IsAppHostedTestBundle',True) is True
-            assert not t.get('IsUITestBundle',False)
-            verified.append(path)
-          assert len(verified)==1, 'expected one exact verified app-hosted boundary bundle'
-          print(verified[0])
-          PY
-          )"
-          echo 'RELEASE_HOST_AB generated_xctestrun_exact_app_host_verified=1'
-          xcodebuild test-without-building -xctestrun "$XCTESTRUN" \
-            -destination "$TVOS_TEST_DESTINATION" -parallel-testing-enabled NO \
-            -collect-test-diagnostics never -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/ReleaseHostedNativeAB.xcresult" \
-            -only-testing:VPlayerReleaseBoundaryTests/SDKSystemLoadedReleaseTests
-          
-      - name: Report scoped hosted native failures
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/ControlNative.xcresult" \
+            -only-testing:VPlayerTests/AudioServiceLeaseTests/testAuthoritativeProofEscrowExhaustsAt3472UntilLastRetiredAliasDeinitializes \
+            -only-testing:VPlayerTests/HLSResourceStoreTests/testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic \
+            -only-testing:VPlayerTests/PlaybackAudioRouteServiceTests/testDestroyedSystemMonitorUnregistersItsOriginalObservers \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2NaturalEOSRecordsStableCurrentTimeWithoutSeekingAndValidatesServedTrimMutationTable
+      - name: Report scoped control and native failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseHostedNativeAB.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlNative.xcresult"
