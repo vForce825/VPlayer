@@ -546,11 +546,11 @@ final class HLSPublisherTests: XCTestCase {
         let ledger = PlaybackResourceContextLedger(applicationLedger: application)
         let clock = Task19HeldPublicationClock()
         var timing: HLSNaturalEndPublicationClock? = try HLSNaturalEndPublicationClock.make(clock: clock, ledger: ledger)
-        weak var weakTiming = timing
+        let weakTiming = Task19WeakPublicationClock(try XCTUnwrap(timing))
         XCTAssertEqual(ledger.chargedBytes, HLSNaturalEndPublicationClock.reservationBytes)
         timing?.stopWaiting()
         timing = nil
-        XCTAssertNil(weakTiming, "The source handler must not strongly retain its owner")
+        XCTAssertNil(weakTiming.value, "The source handler must not strongly retain its owner")
         XCTAssertTrue(clock.timer.cancelled)
         XCTAssertEqual(ledger.chargedBytes, HLSNaturalEndPublicationClock.reservationBytes,
             "Cancellation does not retire the physically held callback capture")
@@ -564,7 +564,7 @@ final class HLSPublisherTests: XCTestCase {
         let ledger = PlaybackResourceContextLedger(applicationLedger: application)
         let other = try ledger.reserve(allocationIdentity: .stable(UUID()), bytes: 17)
         var timing: HLSNaturalEndPublicationClock? = try HLSNaturalEndPublicationClock.make(ledger: ledger)
-        weak var weakTiming = timing
+        let weakTiming = Task19WeakPublicationClock(try XCTUnwrap(timing))
         let measured = try XCTUnwrap(timing).knownAllocationUpperBoundBytes
         print("HLS_EOF_CLOCK_ALLOCATION measuredObjectsPlusFixedABI=\(measured) reserved=\(HLSNaturalEndPublicationClock.reservationBytes) nativeSourceAllowance=128")
         XCTAssertGreaterThan(measured, 0)
@@ -573,7 +573,7 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertEqual(application.chargedBytes, ledger.chargedBytes)
         timing?.stopWaiting()
         timing = nil
-        await assertNaturalEndEventually { weakTiming == nil && ledger.chargedBytes == 17 }
+        await assertNaturalEndEventually { weakTiming.value == nil && ledger.chargedBytes == 17 }
         XCTAssertEqual(application.chargedBytes, 17)
         ledger.release(other)
         XCTAssertEqual(application.chargedBytes, 0)
@@ -2658,4 +2658,9 @@ private final class Task19NaturalEndScope: HLSNaturalEndPublicationScope, @unche
             return result
         }
     }
+}
+
+private final class Task19WeakPublicationClock {
+    weak var value: HLSNaturalEndPublicationClock?
+    init(_ value: HLSNaturalEndPublicationClock) { self.value = value }
 }

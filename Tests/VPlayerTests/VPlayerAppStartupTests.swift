@@ -143,25 +143,47 @@ final class VPlayerAppStartupTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
         let logoURL = try XCTUnwrap(URL(string: "https://images.example/chunked-too-large.png"))
         let limit = 8 * 1_024 * 1_024
+        let tailAttempted = expectation(description: "withheld tail rechecks cancellation")
+        let tailGate = StubURLProtocol.ChunkDeliveryGate {
+            tailAttempted.fulfill()
+        }
+        defer { tailGate.release() }
         StubURLProtocol.enqueue(.init(
             chunks: [
                 Data(repeating: 0x41, count: limit),
                 Data([0x42]),
                 Data("must-not-be-delivered".utf8),
             ],
-            callbackDelay: 0.02
+            callbackDelay: 0.02,
+            chunkDeliveryGates: [2: tailGate]
         ))
         let cache = ChannelLogoCache(
             dataLoader: logoDataLoader(downloadsDirectory: downloadsDirectory),
             cacheDirectory: cacheDirectory
         )
 
-        let image = await cache.image(for: logoURL)
+        let imageTask = Task { await cache.image(for: logoURL) }
+        // didLoad queues work for the URLSession delegate and stream consumer; a
+        // fixed delay cannot acknowledge that the preceding 8 MiB was processed.
+        // Withhold the tail until the first overflowing chunk stops the protocol.
         await waitForLogoProtocolCancellation()
+        XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 2)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+
+        tailGate.release()
+        await fulfillment(of: [tailAttempted], timeout: 2)
+        let image = await imageTask.value
 
         XCTAssertNil(image)
         XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 2)
-        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: downloadsDirectory.path),
+            []
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path),
+            []
+        )
     }
 
     func testLastLogoDownloadWaiterCancellationReleasesSlotAndTemporaryFile() async throws {

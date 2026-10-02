@@ -75,7 +75,8 @@ jobs:
             -maximum-test-execution-time-allowance 300 \
             -resultBundlePath "$RUNNER_TEMP/EOFGreen.xcresult" \
             -only-testing:VPlayerTests/HLSPublisherTests \
-            -only-testing:VPlayerTests/HLSResourceStoreTests
+            -only-testing:VPlayerTests/HLSResourceStoreTests \
+            -only-testing:VPlayerTests/VPlayerAppStartupTests
       - name: Report scoped EOF and resource-store failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/EOFGreen.xcresult"
