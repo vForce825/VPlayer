@@ -99,6 +99,12 @@ final class HLSRuntimeFailureRelay: @unchecked Sendable {
     }
 
     func close() { lock.withLock { state = .closed } }
+
+    /// A failed prepare closes delivery before joining producer retirement. Its
+    /// already recorded first diagnostic still belongs to that same attempt.
+    var closedFailureDiagnostic: ErrorDiagnosticSnapshot? {
+        lock.withLock { state == .closed ? firstFailure : nil }
+    }
 }
 
 /// HLS item 的唯一资源图 owner。它不复制 AVPlayer request，也不把 producer 的
@@ -219,6 +225,13 @@ final class HLSOutputItemBundle: @unchecked Sendable {
     /// The coordinator retains only an alias to this already charged attempt relay.
     /// No callback capture, extra owner, or alternate failure scope is created.
     var runtimeFailureRelay: HLSRuntimeFailureRelay? { runtimeFailure }
+
+    /// Call after retireProducerGraph has closed the relay. Reading its fixed
+    /// slot neither arms runtime delivery nor changes the retirement result.
+    func preservingFirstPreparationFailure(_ error: any Error) -> any Error {
+        if let diagnostic = runtimeFailure?.closedFailureDiagnostic { return diagnostic }
+        return error
+    }
 
     /// 只有 backend 完成该 attempt 的最后一个准备 await 后启用；已到首错锁外回放。
     func armRuntimeFailure() { runtimeFailure?.arm() }

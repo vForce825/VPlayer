@@ -1,41 +1,137 @@
-name: Foundation URL host round-trip diagnostic
+name: URI and HLS ownership regression diagnostic
+
+# Standard GitHub-hosted runners are free for this public repository.
+# Do not add larger runners, artifact uploads, or persistent caches without
+# reviewing their billing and storage implications.
 "on":
   push:
     branches: [migration/tvos27]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
-  group: macos-ci-host-roundtrip-${{ github.ref }}
+  group: macos-ci-uri-ownership-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
-  host-roundtrip:
+  build-and-test:
+    name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 10
+    timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
     steps:
-      - name: Verify toolchain
-        run: xcodebuild -version
-      - name: Measure fixed synthetic Foundation URL round trips
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode and simulator runtime
         run: |
-          cat > "$RUNNER_TEMP/host-roundtrip.swift" <<'SWIFT'
-          import Foundation
-          let original = URL(string: "http://127.0.0.1:12345/fixed")!
-          let encodedHost = "%31%32%37.0.0.1"
-          var parts = URLComponents(url: original, resolvingAgainstBaseURL: false)!
-          parts.percentEncodedHost = encodedHost
-          let assignedEncoded = parts.percentEncodedHost == encodedHost
-          guard let componentURL = parts.url,
-                let literalURL = URL(string: "http://%31%32%37.0.0.1:12345/fixed") else {
-              fatalError("fixed synthetic URL construction failed")
-          }
-          func report(_ label: String, _ url: URL, _ assigned: Bool) {
-              let absolute = url.absoluteString
-              let roundTrip = URLComponents(string: absolute)!
-              let literalHost = roundTrip.percentEncodedHost == "127.0.0.1"
-              print("URI_HOST_ROUNDTRIP construction=\(label) assignedEncoded=\(assigned) absoluteRetainsEncoded=\(absolute.contains(encodedHost)) ingressLiteralHost=\(literalHost) urlEqualsOriginal=\(url == original) absoluteEqualsOriginal=\(absolute == original.absoluteString)")
-          }
-          report("components", componentURL, assignedEncoded)
-          report("literal", literalURL, URLComponents(string: "http://%31%32%37.0.0.1:12345/fixed")!.percentEncodedHost == encodedHost)
-          SWIFT
-          xcrun swift "$RUNNER_TEMP/host-roundtrip.swift"
+          xcodebuild -version
+          xcrun --sdk appletvsimulator --show-sdk-version
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+
+      - name: Install build tooling
+        run: brew install mint jq ripgrep
+
+      - name: Build and audit pinned FFmpeg
+        run: ./ci_scripts/ci_post_clone.sh
+
+      - name: Install Apple Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Check deployment floors and precompiled Metal reproducibility
+        run: |
+          python3 Scripts/Tests/test_tvos27_deployment.py
+          ./Scripts/Tests/test_precompiled_metal_library.sh
+
+      - name: Compile complete Debug test targets for diagnostic isolation
+        id: debug_build
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
+      - name: Verify complete capacity and actual allocation contracts
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/Capacity.xcresult" \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests
+      - name: Report scoped Capacity failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/Capacity.xcresult"
+
+      - name: Verify URI transport fixes and first-cause ordering
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/URIOwnership.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testCurrentAuthorityMalformedAccessLogFailsClosedThroughDirectAndInstalledObserver \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testMalformedCurrentAuthorityLogDuringPrepareReportsItemFailureBeforePreroll \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testMalformedCurrentResourceUsesOriginalRuntimeRelayAndOneTerminalCleanupWithoutReprepare \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testProducerFailureWinsRaceWithMalformedResourceInOriginalAttemptRelay \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testQueuedCurrentLogFaultBlocksOwnedNativePlayBeforeDeliveryButStaleFaultDoesNot \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview2AccessLogURIClassifierV1ClassifiesAndAppliesMatchingConflictingInvalidLocalResource \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRepreparePreservesProducerFirstDiagnosticAfterOwnedReplacementRetirement \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReprepareWithoutRecordedFailurePreservesOriginalThrownDiagnostic \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testProducerFirstWhilePreparingPreservesDiagnosticThroughFailedPrepareCleanup \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testURIFirstWhilePreparingPreservesDiagnosticThroughFailedPrepareCleanup \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testClosedIndependentOwnerRelayAndOldItemCannotAffectCurrentPreparation \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testCurrentRelayRejectsFrozenOldPrepareScopeAndAcceptsCurrentFailure \
+            -only-testing:VPlayerTests/BackendOwnershipTests/testRetirementRequirementDoesNotSkipSuspendOnNewLifecycle
+      - name: Report scoped URIOwnership failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/URIOwnership.xcresult"
+
+      - name: Run complete loopback HTTP server regression class
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/LoopbackFull.xcresult" \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests
+      - name: Report scoped LoopbackFull failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/LoopbackFull.xcresult"
+
+      - name: Verify repaired terminal AAC and quiescence fixtures
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/FinalFixtures.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalLiveAACRequiresWriterIssuedRetainedTerminalBindingAndInstallsEOSConstraintAfterFinish \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testQuiescenceReceiptRemainsVerifiableAfterCleanupAndDirectStateMatchesInstalledItem
+      - name: Report scoped FinalFixtures failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/FinalFixtures.xcresult"
+

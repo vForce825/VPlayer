@@ -279,7 +279,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 latestReceipt = nil
             }
             throw HLSPrepareAttemptFailure(
-                underlying: error,
+                underlying: next.preservingFirstPreparationFailure(error),
                 producerRetirementConfirmed: producerRetirementConfirmed,
                 playerInstallationAttempted: playerInstallationAttempted)
         }
@@ -365,7 +365,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 lifecycle: invocation.outputLifecycleEpoch,
                 producerRetirementConfirmed: producerRetirementConfirmed,
                 playerInstallationAttempted: playerInstallationAttempted)
-            throw error
+            throw next.preservingFirstPreparationFailure(error)
         }
     }
 

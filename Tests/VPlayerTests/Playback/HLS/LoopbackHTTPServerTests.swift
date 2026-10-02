@@ -637,8 +637,33 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
         let oldReceipt = try XCTUnwrap(fixture.server.coverageReceipt(
             for: context, adding: oldRange))
-        XCTAssertEqual(Mirror(reflecting: oldReceipt).displayStyle, .class,
-                       "coverage receipt 必须是无 memberwise initializer 的 opaque capability")
+        // The immutable value is opaque because construction requires the store's
+        // private issuance authority; reference-type shape is not its trust boundary.
+        XCTAssertEqual(oldReceipt.preparedPlayheadIdentity, context.preparedPlayheadIdentity)
+        XCTAssertEqual(oldReceipt.observedRenditionSetReceiptIdentity,
+                       context.observedRenditionSetReceipt.identity)
+        XCTAssertEqual(oldReceipt.renditionIdentity, context.renditionIdentity)
+        XCTAssertEqual(oldReceipt.itemGeneration, oldMedia.itemGeneration)
+        XCTAssertEqual(oldReceipt.presentationRange, oldRange)
+        XCTAssertTrue(oldReceipt.preparedPlayheadIdentity.audioSelectionCapability
+            === timeline.selection)
+        XCTAssertTrue(oldReceipt.preparedPlayheadIdentity.timelineMappingAuthority
+            === timeline.authority)
+        XCTAssertEqual(oldReceipt.dependencies.count, 1)
+        let dependency = try XCTUnwrap(oldReceipt.dependencies.first)
+        let mediaEvidence = try XCTUnwrap(fixture.server.completedEvidence(for: oldMedia))
+        let initializationEvidence = try XCTUnwrap(fixture.server.completedEvidence(for: oldInit))
+        XCTAssertEqual(dependency.mediaEpoch, oldMedia.mediaEpoch)
+        XCTAssertEqual(dependency.epochProofIdentity, oldMap.epochProofIdentity)
+        XCTAssertEqual(dependency.segmentReceiptIdentity, oldMap.segmentReceiptIdentity)
+        XCTAssertEqual(dependency.mediaBackingIdentity, mediaEvidence.resourceIdentity)
+        XCTAssertEqual(dependency.initializationBackingIdentity, initializationEvidence.resourceIdentity)
+        XCTAssertEqual(dependency.mediaEvidenceIdentity, mediaEvidence.stateIdentity)
+        XCTAssertEqual(dependency.initializationEvidenceIdentity, initializationEvidence.stateIdentity)
+        let copiedReceipt = oldReceipt
+        let originalDigest = oldReceipt.canonicalCoverageDigest
+        XCTAssertEqual(try fixture.server.coverageReceipt(for: context, adding: oldRange), oldReceipt,
+                       "同一真实 completed-body 集合的重复查询必须保留同一签发事实")
 
         try await fixture.task19.beginEpoch(2)
         try await fixture.task19.offerBoth(count: 1)
@@ -661,6 +686,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
             duration: newEnd.subtracting(oldRange.start))
         XCTAssertNil(try fixture.server.coverageReceipt(for: context, adding: spanning),
                      "每次签发必须在 store 域复验全部既有 dependency，不能携带退休旧代")
+        XCTAssertEqual(copiedReceipt, oldReceipt)
+        XCTAssertEqual(copiedReceipt.canonicalCoverageDigest, originalDigest)
+        XCTAssertEqual(Array(copiedReceipt.dependencies), [dependency],
+                       "复制的旧 receipt 必须保留原 proof/backing/evidence，不能被后继 epoch 改写")
     }
 
     func testLifecycleRequiresMatchingTicketDrainAndLoggerMayReenterWithoutDeadlock() async throws {
@@ -2485,45 +2514,101 @@ final class LoopbackHTTPServerTests: XCTestCase {
         defer { harness.driver.releasePauseCompletion(); harness.shutdownReplacement() }
         let server = try XCTUnwrap(harness.finalServer)
         let first = try XCTUnwrap(harness.finalSnapshot)
+        let originalB = try XCTUnwrap(first.media[4])
+        let originalBDeclaration = try XCTUnwrap(first.participantVector.first {
+            $0.participantID == 4
+        }?.declaration)
+        // Advertise B under N without completing any B media. Its later body
+        // terminals must remain attributable to the installed N authority.
+        XCTAssertEqual(try rawRequest(port: server.port,
+            target: originalBDeclaration.playlistURI(participantID: 4)).status, 200)
+        for key in originalB.initializationResources {
+            XCTAssertEqual(try rawRequest(port: server.port,
+                target: server.path(for: key)).status, 200)
+        }
         XCTAssertEqual(try rawRequest(port: server.port, target: server.masterPath).status, 200)
         try serveParticipant(1, snapshot: first, server: server)
         try serveParticipant(2, snapshot: first, server: server)
         try await harness.prepareAndActivate()
         XCTAssertEqual(harness.coordinator.phase, .playing)
         XCTAssertEqual(harness.driver.playCallCount, 1)
-        harness.driver.holdPauseCompletion = true
+        let originalSelection = try XCTUnwrap(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: first.publicationSequence))
+        XCTAssertEqual(originalSelection.publicationSequence, first.publicationSequence)
+        XCTAssertEqual(originalSelection.renditionIdentity, .init(rawValue: 2))
+        let originalItem = try XCTUnwrap(harness.currentItemIdentity)
 
         let second = try harness.advanceFinalPublication()
         XCTAssertGreaterThan(second.publicationSequence, first.publicationSequence)
-        let audio = try XCTUnwrap(second.media[2])
-        let declaration = try XCTUnwrap(second.participantVector.first {
-            $0.participantID == 2
-        }?.declaration)
-        XCTAssertEqual(try rawRequest(port: server.port,
-            target: declaration.playlistURI(participantID: 2)).status, 200)
-        for key in audio.initializationResources + audio.resources {
+        XCTAssertEqual(try rawRequest(port: server.port, target: server.masterPath).status, 200)
+        try serveParticipant(1, snapshot: second, server: server)
+        try serveParticipant(2, snapshot: second, server: server)
+        XCTAssertTrue(waitUntil { server.usage.activeResponses == 0 })
+        let rolledSelection = try XCTUnwrap(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: second.publicationSequence))
+        XCTAssertEqual(rolledSelection.publicationSequence, second.publicationSequence)
+        XCTAssertEqual(rolledSelection.renditionIdentity, .init(rawValue: 2))
+        XCTAssertFalse(rolledSelection === originalSelection)
+        XCTAssertTrue(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: first.publicationSequence) === originalSelection)
+        // Reading phase drains the production relay. A complete ordinary N+1
+        // rollover must not invalidate the immutable prepared selection from N.
+        XCTAssertEqual(harness.coordinator.phase, .playing)
+        XCTAssertEqual(harness.currentItemIdentity, originalItem)
+        XCTAssertEqual(harness.coordinator.selectedRenditions, [.init(rawValue: 2)])
+        XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 0)
+        XCTAssertFalse(harness.hasRegisteredSuspend)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+
+        let conflictingKey = try XCTUnwrap(originalB.resources.last)
+        let conflictingPath = try server.path(for: conflictingKey)
+        let conflictingURL = try XCTUnwrap(URL(string: conflictingPath,
+            relativeTo: server.baseURL)?.absoluteURL)
+        XCTAssertEqual(server.classifyAccessLogURI(conflictingURL,
+            itemGeneration: 19, publicationSequence: first.publicationSequence,
+            selected: .init(rawValue: 2)), .conflicting,
+            "N 的真实 B resource 必须仍属于 retained advertised authority")
+        XCTAssertFalse(server.completedEvidence(for: conflictingKey)?.isComplete ?? false)
+        harness.driver.holdPauseCompletion = true
+        for key in originalB.resources {
             XCTAssertEqual(try rawRequest(port: server.port,
                 target: server.path(for: key)).status, 200)
         }
-        let conflictingPath = try server.path(for: XCTUnwrap(audio.resources.last))
+        let conflictSelection = try XCTUnwrap(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: first.publicationSequence))
+        XCTAssertEqual(conflictSelection.publicationSequence, first.publicationSequence)
+        XCTAssertEqual(conflictSelection.renditionIdentity, .init(rawValue: 4))
+        XCTAssertFalse(conflictSelection === originalSelection)
+        XCTAssertTrue(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: second.publicationSequence) === rolledSelection,
+            "B terminal 必须精确归属 N，不能误写为 N+1 的选择")
         for _ in 0..<80 {
             XCTAssertEqual(try rawRequest(port: server.port, target: conflictingPath).status, 200)
         }
         let stopped = await waitUntilOnMainActor {
             harness.coordinator.phase == .stopping && harness.hasRegisteredSuspend
+                && harness.driver.hasHeldPauseCompletion
         }
-        XCTAssertTrue(stopped, "真实 success terminal 必须自动撤销旧 readiness/activation")
+        XCTAssertTrue(stopped, "N 的真实 B success terminal 必须自动撤销原 A readiness/activation")
         XCTAssertEqual(harness.coordinator.invalidationCount, 1)
         XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.backendRetireCount, 0)
+        XCTAssertEqual(harness.backendReprepareCount, 0)
+        XCTAssertEqual(harness.driver.rate, 0)
         XCTAssertEqual(harness.driver.playCallCount, 1,
                        "Registry quiescence 完成前不能产生新的正 rate")
         harness.driver.releasePauseCompletion()
         let reprepared = await waitUntilOnMainActor(timeout: .seconds(8)) {
             harness.currentItemGeneration == 20 && harness.coordinator.phase == .authorized
+                && harness.driver.playCallCount == 2
         }
         XCTAssertTrue(reprepared, harness.backendErrorDescription)
         XCTAssertEqual(harness.backendReprepareCount, 1)
         XCTAssertEqual(harness.backendRetireCount, 1)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.driver.playCallCount, 2)
     }
 
     func testReview2PublicationAuthorityBindsActualServedVersionBeforeFirstGETAndAcrossHorizon()

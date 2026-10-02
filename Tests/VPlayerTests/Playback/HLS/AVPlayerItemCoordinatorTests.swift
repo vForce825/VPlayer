@@ -2116,14 +2116,113 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(attempt.builder.metadataChargedBytes, 0)
     }
 
-    func testRetiredPriorAttemptCannotReplaceCurrentPreparingFailureOrEmitRuntimeEvent() async throws {
-        let allocator = PlaybackIdentityAllocator()
-        let prior = try await checkPreparingLogFirstCause(producerFailureFirst: false, allocator: allocator)
+    func testRepreparePreservesProducerFirstDiagnosticAfterOwnedReplacementRetirement() async throws {
+        try await checkReprepareFirstCause(recordEarlierProducerFailure: true)
+    }
+
+    func testReprepareWithoutRecordedFailurePreservesOriginalThrownDiagnostic() async throws {
+        try await checkReprepareFirstCause(recordEarlierProducerFailure: false)
+    }
+
+    private func checkReprepareFirstCause(recordEarlierProducerFailure: Bool) async throws {
+        let forwarding = Task27HLSBackendForwarder()
+        let graph = try OutputGraphFixture(backendObject: forwarding)
+        let fixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: graph.lifecycle, audioOnly: true)
+        let transport = Task21LogTransportOwner(fixture: fixture)
+        addTeardownBlock { try await transport.retire() }
+        let driver = Task21FakeDriver()
+        let coordinator = try AVPlayerItemCoordinator(driver: driver,
+            evidenceSource: fixture.source,
+            backendPublicationReplacementAuthoritySlot:
+                forwarding.backendPublicationReplacementAuthoritySlot)
+        let first = ErrorDiagnosticSnapshot(typeName: "fixture.reprepare.producer",
+            code: "first-cause", message: "Original failure from the replacement producer")
+        let thrown = ErrorDiagnosticSnapshot(typeName: "fixture.reprepare.unwind",
+            code: "second-cause", message: "Replacement producer unwinding error")
+        let builder = Task21LogFailureBundleBuilder(replacement: .init(
+            request: fixture.request, evidenceSource: fixture.source),
+            replacementFailure: (recordEarlierProducerFailure ? first : nil, thrown),
+            retireProducer: {
+                do { try await transport.retire(); return true }
+                catch { XCTFail("Reprepare fixture transport did not retire: \(error)"); return false }
+            })
+        let backend = HLSAVPlayerPlaybackBackend(identity: graph.lifecycle.backendIdentity,
+            coordinator: coordinator, bundleBuilder: builder,
+            replacementSlot: forwarding.backendPublicationReplacementAuthoritySlot)
+        forwarding.attach(backend)
+        var operationError: (any Error)?
+        do {
+            let source = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+            XCTAssertTrue(graph.registry.startOutputPrepareOperation(source))
+            guard case .succeeded = await graph.registry.joinOutputBackendOperation(source) else {
+                throw AVPlayerItemCoordinatorFailure.itemFailed
+            }
+            let original = try XCTUnwrap(builder.prepareTicket)
+            XCTAssertEqual(coordinator.phase, .prepared)
+            // Only the SDK classification input is mocked here. The original
+            // installed handler must claim real Registry replacement authority,
+            // stop/retire the old physical item, and receive a new signed invocation.
+            // Genuine advertised-rendition ingress is covered by the URI fixture.
+            XCTAssertTrue(driver.emitClassifiedAccessLogForTesting(.conflicting))
+            let stop = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
+            _ = await graph.registry.joinOutputBackendOperation(stop.task)
+            let current = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+            let replacement = try XCTUnwrap(current.prepareTicket)
+            XCTAssertEqual(replacement.backendIdentity, original.backendIdentity)
+            XCTAssertNotEqual(replacement.prepareNonce, original.prepareNonce)
+            XCTAssertFalse(PlaybackBackendPrepareFailureScope(ticket: original).matches(replacement))
+            XCTAssertEqual(builder.prepareTicket, replacement)
+            let prepare = try XCTUnwrap(current.sourceTask)
+            guard case .failed(let failure) = await graph.registry.joinOutputBackendOperation(prepare) else {
+                XCTFail("The real Registry reprepare runner must fail with its original fixed diagnostic")
+                throw AVPlayerItemCoordinatorFailure.itemFailed
+            }
+            XCTAssertEqual(PlaybackErrorDiagnostics.snapshot(failure),
+                           recordEarlierProducerFailure ? first : thrown)
+            XCTAssertEqual(builder.buildCount, 2)
+            XCTAssertEqual(builder.retireCount, 2)
+            XCTAssertEqual(builder.eventCount, 0,
+                           "The replacement failed before installation; its runtime relay must stay dormant")
+            XCTAssertNil(builder.event)
+            XCTAssertNil(driver.currentItemIdentity)
+            XCTAssertTrue(driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(driver.playCallCount, 0)
+            XCTAssertEqual(coordinator.state.stopCount, 1,
+                           "Only the genuine old item needed physical stop")
+        } catch { operationError = error }
+
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .terminal, at: graph.registry.clock.nowNanoseconds, teardown: true))
+        let receiver = Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+        XCTAssertTrue(graph.registry.startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+            terminalState: .failed(.init(code: "test.reprepare-first-cause", userMessage: "fixture"))))
+        await graph.registry.joinOwnedTerminalCleanup(session: context.sessionIdentity)
+        try receiver.result()
+        XCTAssertNil(graph.registry.ownedResourceSnapshot())
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(builder.buildCount, 2)
+        XCTAssertEqual(builder.retireCount, 2)
+        builder.relay?.record(first)
+        XCTAssertEqual(builder.eventCount, 0)
+        XCTAssertEqual(builder.metadataChargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+        builder.releaseObservedFailure()
+        XCTAssertEqual(builder.metadataChargedBytes, 0)
+        try await transport.retire()
+        if let operationError { throw operationError }
+    }
+
+    func testClosedIndependentOwnerRelayAndOldItemCannotAffectCurrentPreparation() async throws {
+        // Each Registry owns its entire allocator/configuration-generation domain.
+        // This case covers closed-relay delivery and exact old-item rejection;
+        // nonce-scoped events within one Registry have separate controller coverage.
+        let prior = try await checkPreparingLogFirstCause(producerFailureFirst: false)
         defer { prior.builder.releaseObservedFailure() }
-        let current = try await checkPreparingLogFirstCause(producerFailureFirst: false,
-            allocator: allocator, prior: prior)
+        let current = try await checkPreparingLogFirstCause(producerFailureFirst: false, prior: prior)
         XCTAssertNotEqual(prior.ticket, current.ticket)
-        XCTAssertFalse(PlaybackBackendPrepareFailureScope(ticket: prior.ticket).matches(current.ticket))
+        XCTAssertNotEqual(prior.item, current.item)
         XCTAssertEqual(prior.builder.eventCount, 0)
         XCTAssertEqual(prior.builder.retireCount, 1)
         prior.builder.releaseObservedFailure()
@@ -2133,10 +2232,9 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     private func checkPreparingLogFirstCause(producerFailureFirst: Bool,
-        allocator: PlaybackIdentityAllocator = .init(),
         prior: Task21RetiredPreparationLogAttempt? = nil) async throws -> Task21RetiredPreparationLogAttempt {
         let forwarding = Task27HLSBackendForwarder()
-        let graph = try OutputGraphFixture(allocator: allocator, backendObject: forwarding)
+        let graph = try OutputGraphFixture(backendObject: forwarding)
         let fixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: graph.lifecycle, audioOnly: true)
         let transport = Task21LogTransportOwner(fixture: fixture)
@@ -4382,6 +4480,12 @@ private final class Task21FakeDriver: AVPlayerDriving {
         return classification
     }
 
+    func emitClassifiedAccessLogForTesting(_ classification: AccessLogURIClassification) -> Bool {
+        guard let item = accessLogItem, let handler = accessLogHandler else { return false }
+        handler(classification, item)
+        return true
+    }
+
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item: AVPlayerItemInstanceIdentity) throws {
         guard currentItemIdentity == item else {
@@ -5317,9 +5421,21 @@ private final class Task21Harness {
         let port = try XCTUnwrap(original.port)
         changed.port = port == 65_535 ? 65_534 : port + 1
         values.append(("foreign-port", try XCTUnwrap(changed.url)))
-        changed = original
-        changed.percentEncodedHost = "%31%32%37.0.0.1"
-        values.append(("encoded-host-spelling", try XCTUnwrap(changed.url)))
+        // Darwin URLComponents normalizes a percentEncodedHost assignment before
+        // producing a URL. Construct the literal authority to test actual encoded
+        // input at the classifier boundary, and prove the spelling survived.
+        let originalURL = try XCTUnwrap(original.url)
+        let literalAuthority = "http://127.0.0.1:\(port)"
+        XCTAssertTrue(originalURL.absoluteString.hasPrefix(literalAuthority + "/"))
+        let encodedAuthority = "http://%31%32%37.0.0.1:\(port)"
+        let encodedHostURL = try XCTUnwrap(URL(string: encodedAuthority
+            + String(originalURL.absoluteString.dropFirst(literalAuthority.count))))
+        XCTAssertTrue(encodedHostURL.absoluteString.hasPrefix(encodedAuthority + "/"))
+        let encodedIngress = try XCTUnwrap(URLComponents(url: encodedHostURL, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(encodedIngress.percentEncodedHost, "%31%32%37.0.0.1")
+        XCTAssertFalse(encodedHostURL.absoluteString == originalURL.absoluteString,
+                       "The encoded-host control must reach ingress with a distinct spelling")
+        values.append(("encoded-host-spelling", encodedHostURL))
         for host in ["localhost", "127.1"] {
             changed = original
             changed.host = host
@@ -8949,6 +9065,7 @@ private final class Task21LogFailureBundleBuilder: HLSOutputItemBundleBuilding, 
         var retireCount = 0
     }
     private let replacement: AVPlayerItemReplacementBundle
+    private let replacementFailure: (first: ErrorDiagnosticSnapshot?, thrown: ErrorDiagnosticSnapshot)?
     private let retireProducer: HLSOutputItemBundle.ProducerRetirement
     private let events = Events()
     private let lock = NSLock()
@@ -8968,8 +9085,10 @@ private final class Task21LogFailureBundleBuilder: HLSOutputItemBundleBuilding, 
     var retireCount: Int { events.lock.withLock { events.retireCount } }
 
     init(replacement: AVPlayerItemReplacementBundle,
+         replacementFailure: (first: ErrorDiagnosticSnapshot?, thrown: ErrorDiagnosticSnapshot)? = nil,
          retireProducer: @escaping HLSOutputItemBundle.ProducerRetirement) {
         self.replacement = replacement
+        self.replacementFailure = replacementFailure
         self.retireProducer = retireProducer
     }
 
@@ -8991,7 +9110,23 @@ private final class Task21LogFailureBundleBuilder: HLSOutputItemBundleBuilding, 
                 }
             }
         }
-        lock.withLock { storedRelay = relay; storedPrepareTicket = invocation.ticket; builds += 1 }
+        let build = lock.withLock { () -> Int in
+            storedRelay = relay
+            storedPrepareTicket = invocation.ticket
+            builds += 1
+            return builds
+        }
+        if build == 2, let replacementFailure {
+            // No replacement graph is installed or started in this producer-error
+            // fixture. The original graph already retired through its real callback.
+            return HLSOutputItemBundle(startProducer: {
+                if let first = replacementFailure.first { relay.record(first) }
+                throw replacementFailure.thrown
+            }, retireProducer: {
+                events.lock.withLock { events.retireCount += 1 }
+                return true
+            }, runtimeFailure: relay)
+        }
         let replacement = replacement
         let retireProducer = retireProducer
         return HLSOutputItemBundle(replacement: replacement, startProducer: { replacement },
