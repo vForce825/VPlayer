@@ -56,6 +56,7 @@ jobs:
           ./Scripts/verify-licenses.sh
 
       - name: Compile tvOS 27 app and tests
+        id: build
         run: |
           xcodebuild build-for-testing \
             -project VPlayer.xcodeproj \
@@ -63,54 +64,26 @@ jobs:
             -destination "$TVOS_TEST_DESTINATION" \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Verify bounded XCTest timeout options
+      - name: Verify bounded XCTest timeout and diagnostics options
         run: |
           help="$(xcodebuild -help 2>&1)"
           for option in -collect-test-diagnostics -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
             printf '%s\n' "$help" | grep -F -- "$option"
           done
 
-      - name: Run bounded focused migration and writer regression suites
+      - name: Prepare bounded test runner
+        id: prepare_tests
         run: |
-          ./Scripts/bootstrap.sh --check
-          ./Scripts/verify-licenses.sh
-          python3 - <<'PY'
+          cat > "$RUNNER_TEMP/vplayer-bounded-tests.py" <<'PY'
           import os, re, selectors, signal, subprocess, sys, time
           
           command = [
               "xcodebuild", "test-without-building", "-project", "VPlayer.xcodeproj",
               "-scheme", "VPlayer", "-destination", os.environ["TVOS_TEST_DESTINATION"],
-              "-parallel-testing-enabled", "NO", "-collect-test-diagnostics", "never", "-test-timeouts-enabled", "YES",
-              "-default-test-execution-time-allowance", "120",
+              "-parallel-testing-enabled", "NO", "-collect-test-diagnostics", "never",
+              "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
               "-maximum-test-execution-time-allowance", "300",
-              "-only-testing:VPlayerTests/AudioSessionLifecycleTests",
-              "-only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests",
-              "-only-testing:VPlayerTests/NativeReceiverAdapterTests",
-              "-only-testing:VPlayerTests/AudioRendererRecoveryProgressTests",
-              "-only-testing:VPlayerTests/SystemVideoOutputTests",
-              "-only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests",
-              "-only-testing:VPlayerTests/AVPlayerLogSnapshotCacheTests",
-              "-only-testing:VPlayerTests/RefreshLifecycleTests",
-              "-only-testing:VPlayerTests/NowPlayingIntegrationTests",
-              "-only-testing:VPlayerTests/CommittedLibraryObservationTests",
-              "-only-testing:VPlayerTests/ReducedResourceUsageTests",
-              "-only-testing:VPlayerTests/SegmentedFMP4WriterTests",
-              "-only-testing:VPlayerTests/AACPrimingCalibratorTests",
-              "-only-testing:VPlayerTests/OutputCleanupCoordinatorTests",
-              "-only-testing:VPlayerTests/PlaybackDeadlineTests",
-              "-only-testing:VPlayerTests/Task9ReconstructedRegressionTests",
-              "-only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests",
-              "-only-testing:VPlayerTests/SampleBufferBackendTests",
-              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testActivationCallsPlayExactlyOnceOnlyForMatchingPermit",
-              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries",
-              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSystemDriverUsesConfiguredStartupBufferForHomePodHLS",
-              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate",
-              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt",
-              "-only-testing:VPlayerTests/ChannelProgrammeLayoutTests",
-              "-only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity",
-              "-only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts",
-              "CODE_SIGNING_ALLOWED=NO",
-          ]
+          ] + sys.argv[1:] + ["CODE_SIGNING_ALLOWED=NO"]
           process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
           selector = selectors.DefaultSelector()
           selector.register(process.stdout, selectors.EVENT_READ)
@@ -188,3 +161,48 @@ jobs:
                   raise SystemExit(124)
           
           PY
+          python3 -m py_compile "$RUNNER_TEMP/vplayer-bounded-tests.py"
+
+      - name: Core, ownership, observation and Large Text regressions
+        id: core_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
+        run: |
+          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
+            -only-testing:VPlayerTests/AudioSessionLifecycleTests \
+            -only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests \
+            -only-testing:VPlayerTests/NativeReceiverAdapterTests \
+            -only-testing:VPlayerTests/AudioRendererRecoveryProgressTests \
+            -only-testing:VPlayerTests/SystemVideoOutputTests \
+            -only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests \
+            -only-testing:VPlayerTests/AVPlayerLogSnapshotCacheTests \
+            -only-testing:VPlayerTests/RefreshLifecycleTests \
+            -only-testing:VPlayerTests/NowPlayingIntegrationTests \
+            -only-testing:VPlayerTests/CommittedLibraryObservationTests \
+            -only-testing:VPlayerTests/ReducedResourceUsageTests \
+            -only-testing:VPlayerTests/OutputCleanupCoordinatorTests \
+            -only-testing:VPlayerTests/PlaybackDeadlineTests \
+            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests \
+            -only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests \
+            -only-testing:VPlayerTests/SampleBufferBackendTests \
+            -only-testing:VPlayerTests/ChannelProgrammeLayoutTests \
+            -only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity
+
+      - name: AAC and native writer regressions
+        id: writer_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
+        run: |
+          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests \
+            -only-testing:VPlayerTests/AACPrimingCalibratorTests
+
+      - name: Representative HLS lifecycle and cancellation regressions
+        id: hls_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
+        run: |
+          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testActivationCallsPlayExactlyOnceOnlyForMatchingPermit \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSystemDriverUsesConfiguredStartupBufferForHomePodHLS \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts

@@ -60,10 +60,11 @@ final class NowPlayingIntegrationTests: XCTestCase {
     func testSessionDoesNotRetainPlaybackOwner() async {
         let coordinator = PlaybackNowPlayingCoordinator { _ in TestNowPlayingSession() }
         var target: TestNowPlayingTarget? = TestNowPlayingTarget()
-        weak var weakTarget = target
+        let weakTarget = WeakNowPlayingTargetProbe(target)
         _ = coordinator.begin(owner: target!, presentation: presentation("Channel"))
+        XCTAssertNotNil(weakTarget.value)
         target = nil
-        XCTAssertNil(weakTarget)
+        XCTAssertNil(weakTarget.value)
         await coordinator.current?.setPaused(true)
     }
 
@@ -158,6 +159,15 @@ final class NowPlayingIntegrationTests: XCTestCase {
     private func request(_ title: String) -> PlaybackRequest {
         .init(sourceProfileID: UUID(), channelID: title,
               streamURL: URL(string: "https://example.invalid/live")!, title: title)
+    }
+}
+
+@MainActor
+private final class WeakNowPlayingTargetProbe {
+    weak var value: TestNowPlayingTarget?
+
+    init(_ value: TestNowPlayingTarget?) {
+        self.value = value
     }
 }
 

@@ -11,6 +11,15 @@ import XCTest
 @testable import VPlayerPlayback
 
 @MainActor
+private final class WeakSystemAVPlayerDriverProbe {
+    weak var value: SystemAVPlayerDriver?
+
+    init(_ value: SystemAVPlayerDriver?) {
+        self.value = value
+    }
+}
+
+@MainActor
 final class AVPlayerItemCoordinatorTests: XCTestCase {
     func testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries() async throws {
         let encoded = try await Task21RealAACSeed.makeEncodedInput()
@@ -260,7 +269,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         for keepsMetricsAlias in [false, true] {
             let baseline = PlaybackResourceContextLedger.shared.chargedBytes
             var driver: SystemAVPlayerDriver? = try SystemAVPlayerDriver.make(player: AVPlayer())
-            weak var originalDriver = driver
+            let originalDriver = WeakSystemAVPlayerDriverProbe(driver)
+            XCTAssertNotNil(originalDriver.value)
             var metricsAlias: AVPlayerLogSnapshotCache? = driver!.logSnapshotCache
             let item = AVPlayerItemInstanceIdentity(
                 outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_121),
@@ -270,7 +280,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 classify: { _ in .unrelated }, handler: { _, _ in })
             driver!.replaceCurrentItemWithNil(item: item)
             driver = nil
-            XCTAssertNil(originalDriver, "The wake must own escrow without retaining the retired driver")
+            XCTAssertNil(originalDriver.value, "The wake must own escrow without retaining the retired driver")
             if !keepsMetricsAlias { metricsAlias = nil }
             XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
             XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline + 12 * 1_024)
