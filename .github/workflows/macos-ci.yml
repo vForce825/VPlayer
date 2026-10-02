@@ -81,6 +81,20 @@ jobs:
       - name: Report scoped paused storage failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorage.xcresult"
+      - name: Verify remaining native endpoint presentation cases
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/NativeEndpointPair.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerEOSStabilizesAtAACEffectiveEndpoint \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations
+      - name: Report scoped native endpoint failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeEndpointPair.xcresult"
       - name: Validate focused physical storage under Address Sanitizer
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |

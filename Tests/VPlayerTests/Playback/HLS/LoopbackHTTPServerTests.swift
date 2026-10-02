@@ -572,14 +572,18 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(owner.coverage(at: 0)?.rendition, .init(rawValue: 1))
         XCTAssertEqual(owner.coverage(at: 1)?.rendition, .init(rawValue: 2))
         let actual = try XCTUnwrap(workspace.actualAllocationBytes)
-        print("PAUSED_WORKSPACE maps=\(workspace.mapCount) samples=\(workspace.sampleCount) "
-            + "root=\(actual.root) ordinals=\(actual.ordinals) cursors=\(actual.cursors) heap=\(actual.heap) "
-            + "context=\(actual.context) application=\(actual.application) reserved=\(workspace.reservationBytes) "
-            + "serializedAdmission=\(admissionDuration) "
-            + "videoVerification=\(verificationStart.duration(to: videoVerified)) "
-            + "audioVerification=\(videoVerified.duration(to: audioVerified)) "
-            + "sequentialVerification=\(verificationStart.duration(to: audioVerified)) "
-            + "sourceMappingAuthorityProven=false")
+        let videoDuration = verificationStart.duration(to: videoVerified)
+        let audioDuration = videoVerified.duration(to: audioVerified)
+        let sequentialDuration = verificationStart.duration(to: audioVerified)
+        var report = "PAUSED_WORKSPACE maps=\(workspace.mapCount) samples=\(workspace.sampleCount) "
+        report += "root=\(actual.root) ordinals=\(actual.ordinals) cursors=\(actual.cursors) heap=\(actual.heap) "
+        report += "context=\(actual.context) application=\(actual.application) reserved=\(workspace.reservationBytes) "
+        report += "serializedAdmission=\(admissionDuration) "
+        report += "videoVerification=\(videoDuration) "
+        report += "audioVerification=\(audioDuration) "
+        report += "sequentialVerification=\(sequentialDuration) "
+        report += "sourceMappingAuthorityProven=false"
+        print(report)
         let ceiling = try PausedCoverageWorkspace.allocationLimits(mapCount: 128, sampleCount: 32_768)
         print("PAUSED_WORKSPACE_BOUND maps=128 samples=32768 root=\(ceiling.root) "
             + "ordinals=\(ceiling.ordinals) cursors=\(ceiling.cursors) heap=\(ceiling.heap) "

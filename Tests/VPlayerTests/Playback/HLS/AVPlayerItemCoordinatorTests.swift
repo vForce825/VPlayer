@@ -2398,13 +2398,13 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make(endList: true)
-        defer { fixture.shutdown() }
-        let result = try await fixture.playToEnd()
-        XCTAssertEqual(result.presentedEnd, result.endpointEnd,
-                       accuracy: Task21Fixtures.oneSample)
-        XCTAssertThrowsError(try fixture.validateEndpoint(),
-                             "Task17/20 authority 已由 production admission 消费，不得重放")
+        try await withFinalEOSFixture { fixture in
+            let result = try await fixture.playToEnd()
+            XCTAssertEqual(result.presentedEnd, result.endpointEnd,
+                           accuracy: Task21Fixtures.oneSample)
+            XCTAssertThrowsError(try fixture.validateEndpoint(),
+                                 "Task17/20 authority 已由 production admission 消费，不得重放")
+        }
     }
 
     func testPositiveRateAdmissionConsumesRegistryActivationCapabilityAndRevalidatesAfterPlayReturn() async throws {
@@ -2756,16 +2756,16 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testRealAVPlayerEOSStabilizesAtAACEffectiveEndpoint() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make(endList: true)
-        defer { fixture.shutdown() }
-        let result = try await fixture.playToEnd()
-        XCTAssertTrue(result.didReachStableEnd,
-                      "crossing currentTime 不能替代 AVPlayer EOS 与稳定最终时间")
-        XCTAssertGreaterThanOrEqual(result.presentedEnd, result.endpointEnd,
-                                    "系统可在有效 N 之后、物理 Q 附近才报告自然结束")
-        XCTAssertEqual(fixture.naturalEndObservation?.constrainedEndpoint,
-                       try fixture.endpointItemTime,
-                       "精确 endpoint 必须来自同一 item 冻结的 forwardPlaybackEndTime")
+        try await withFinalEOSFixture { fixture in
+            let result = try await fixture.playToEnd()
+            XCTAssertTrue(result.didReachStableEnd,
+                          "crossing currentTime 不能替代 AVPlayer EOS 与稳定最终时间")
+            XCTAssertGreaterThanOrEqual(result.presentedEnd, result.endpointEnd,
+                                        "系统可在有效 N 之后、物理 Q 附近才报告自然结束")
+            XCTAssertEqual(fixture.naturalEndObservation?.constrainedEndpoint,
+                           try fixture.endpointItemTime,
+                           "精确 endpoint 必须来自同一 item 冻结的 forwardPlaybackEndTime")
+        }
     }
 
     func testSystemDriverIdentityRelayCancelsReadyLoadedAndPrerollWaitersExactlyOnce() async throws {
