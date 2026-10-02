@@ -61,38 +61,144 @@ jobs:
           }
           struct Rational { let num: Int32; let den: Int32 }
           enum Scan { case progressive, interlaced }
+          enum Phase { case buffering, recovering }
           struct Info { let width: Int32; let height: Int32; let scan: Scan; let source: Rational?; let output: Double?; let enhanced: Bool }
           struct PackedInfo { let output: Double; let width: Int32; let height: Int32; let sourceNum: Int32; let sourceDen: Int32; let flags: UInt8 }
           struct PackedBoolInfo { let output: Double; let width: Int32; let height: Int32; let sourceNum: Int32; let sourceDen: Int32; let scan: Scan; let sourcePresent: Bool; let outputPresent: Bool; let enhanced: Bool }
           struct Generation { let raw: UInt64 }
-          final class Diagnostic { let value = 0 }
+          final class DiagnosticStorage { let value = 0 }
+          struct Diagnostic { let storage: DiagnosticStorage }
           final class Owner { let value = 0 }
-          // These cover every maximum-alignment payload from the real CoreError.
-          enum CoreError { case text(String), fixed(Int32), stage(String, Diagnostic), presented(Failure), empty }
-          enum PackedCoreError { case text(String), fixed(Int32), stage(String, Diagnostic), presented(PackedFailure), empty }
-          enum Event { case ready(UInt64), phase(Bool, UInt64), media(Info?, Generation?), stopped, failed(CoreError), backend(Diagnostic, UInt64, Owner) }
-          enum PackedFailureEvent { case ready(UInt64), phase(Bool, UInt64), media(Info?, Generation?), stopped, failed(PackedCoreError), backend(Diagnostic, UInt64, Owner) }
-          enum PackedMediaEvent { case ready(UInt64), phase(Bool, UInt64), media(PackedInfo?, Generation?), stopped, failed(CoreError), backend(Diagnostic, UInt64, Owner) }
-          enum PackedEvent { case ready(UInt64), phase(Bool, UInt64), media(PackedInfo?, Generation?), stopped, failed(PackedCoreError), backend(Diagnostic, UInt64, Owner) }
-          enum PackedBoolMediaEvent { case ready(UInt64), phase(Bool, UInt64), media(PackedBoolInfo?, Generation?), stopped, failed(CoreError), backend(Diagnostic, UInt64, Owner) }
+          enum FFmpegFailureKind: String { case open, read, timeout, unsupportedVideo, unsupportedAudio }
+          enum FFmpegFailureStage: String { case unspecified, validation, open, streamInfo, selection, bsfInit, read, bsfSend, bsfReceive }
+          enum VideoDecoderFailure { case sessionCreate(Int32), softwareDecoder, badData(Int32), malfunction(Int32), backpressureTimeout, unexpected(Diagnostic) }
+          enum CoreError {
+              case unsupportedProtocol(String)
+              case demuxOpen(Int32)
+              case demuxRead(Int32)
+              case ffmpegFailure(kind: FFmpegFailureKind, stage: FFmpegFailureStage, status: Int32)
+              case networkTimeout
+              case unsupportedVideoCodec
+              case unsupportedAudioCodec
+              case videoFormatDescription(Int32)
+              case hardwareDecoderUnavailable
+              case videoDecoderTransitionTimeout
+              case videoDecode(Int32)
+              case videoDecoderFailure(VideoDecoderFailure)
+              case videoSampleBuffer(String)
+              case videoRendererFailed(String)
+              case audioFormatDescription(Int32)
+              case audioFallbackDecode(Int32)
+              case audioRendererFailed(String)
+              case renderTextureMapping
+              case metalCommand(String)
+              case cancelled
+              case controlEventCapacityExceeded
+              case outputActivationRejected
+              case backendPublicationReplacementRejected
+              case presented(Failure)
+              case unexpected(stage: String, diagnostic: Diagnostic)
+          }
+          enum PackedCoreError {
+              case unsupportedProtocol(String)
+              case demuxOpen(Int32)
+              case demuxRead(Int32)
+              case ffmpegFailure(kind: FFmpegFailureKind, stage: FFmpegFailureStage, status: Int32)
+              case networkTimeout
+              case unsupportedVideoCodec
+              case unsupportedAudioCodec
+              case videoFormatDescription(Int32)
+              case hardwareDecoderUnavailable
+              case videoDecoderTransitionTimeout
+              case videoDecode(Int32)
+              case videoDecoderFailure(VideoDecoderFailure)
+              case videoSampleBuffer(String)
+              case videoRendererFailed(String)
+              case audioFormatDescription(Int32)
+              case audioFallbackDecode(Int32)
+              case audioRendererFailed(String)
+              case renderTextureMapping
+              case metalCommand(String)
+              case cancelled
+              case controlEventCapacityExceeded
+              case outputActivationRejected
+              case backendPublicationReplacementRejected
+              case presented(PackedFailure)
+              case unexpected(stage: String, diagnostic: Diagnostic)
+          }
+          enum OtherCoreError {
+              case unsupportedProtocol(String)
+              case demuxOpen(Int32)
+              case demuxRead(Int32)
+              case ffmpegFailure(kind: FFmpegFailureKind, stage: FFmpegFailureStage, status: Int32)
+              case networkTimeout
+              case unsupportedVideoCodec
+              case unsupportedAudioCodec
+              case videoFormatDescription(Int32)
+              case hardwareDecoderUnavailable
+              case videoDecoderTransitionTimeout
+              case videoDecode(Int32)
+              case videoDecoderFailure(VideoDecoderFailure)
+              case videoSampleBuffer(String)
+              case videoRendererFailed(String)
+              case audioFormatDescription(Int32)
+              case audioFallbackDecode(Int32)
+              case audioRendererFailed(String)
+              case renderTextureMapping
+              case metalCommand(String)
+              case cancelled
+              case controlEventCapacityExceeded
+              case outputActivationRejected
+              case backendPublicationReplacementRejected
+              case unexpected(stage: String, diagnostic: Diagnostic)
+          }
+          enum Event { case ready(UInt64), phase(Phase, UInt64), media(Info?, Generation?), stopped, failed(CoreError), backend(Diagnostic, UInt64, Owner) }
+          enum PackedFailureEvent { case ready(UInt64), phase(Phase, UInt64), media(Info?, Generation?), stopped, failed(PackedCoreError), backend(Diagnostic, UInt64, Owner) }
+          enum PackedMediaEvent { case ready(UInt64), phase(Phase, UInt64), media(PackedInfo?, Generation?), stopped, failed(CoreError), backend(Diagnostic, UInt64, Owner) }
+          enum PackedBoolMediaEvent { case ready(UInt64), phase(Phase, UInt64), media(PackedBoolInfo?, Generation?), stopped, failed(CoreError), backend(Diagnostic, UInt64, Owner) }
+          enum PackedEvent { case ready(UInt64), phase(Phase, UInt64), media(PackedInfo?, Generation?), stopped, failed(PackedCoreError), backend(Diagnostic, UInt64, Owner) }
+          enum PackedBoolEvent { case ready(UInt64), phase(Phase, UInt64), media(PackedBoolInfo?, Generation?), stopped, failed(PackedCoreError), backend(Diagnostic, UInt64, Owner) }
+          enum FlattenedEvent {
+              case ready(UInt64), phase(Phase, UInt64), media(PackedBoolInfo?, Generation?), stopped
+              case otherFailure(OtherCoreError)
+              case presentedSame(String, String, String?)
+              case presentedChannel(String, String, String?)
+              case presentedNever(String, String, String?)
+              case backend(Diagnostic, UInt64, Owner)
+          }
+          // Only payload geometry for a possible separately charged fixed-tag fallback.
+          // All presence/enum tags would need explicit side storage; these are not standalone events.
+          typealias SplitStringPayload = (String, String, String?)
+          struct SplitMediaPayload { let generation: UInt64; let output: Double; let width: Int32; let height: Int32; let sourceNum: Int32; let sourceDen: Int32 }
+          typealias SplitBackendPayload = (Diagnostic, UInt64, Owner)
           @_cdecl("layoutFailure") public func layoutFailure() -> Int { MemoryLayout<Failure>.stride }
           @_cdecl("layoutPackedFailure") public func layoutPackedFailure() -> Int { MemoryLayout<PackedFailure>.stride }
           @_cdecl("layoutInfo") public func layoutInfo() -> Int { MemoryLayout<Info>.stride }
           @_cdecl("layoutPackedInfo") public func layoutPackedInfo() -> Int { MemoryLayout<PackedInfo>.stride }
+          @_cdecl("layoutPackedBoolInfo") public func layoutPackedBoolInfo() -> Int { MemoryLayout<PackedBoolInfo>.stride }
           @_cdecl("layoutCoreError") public func layoutCoreError() -> Int { MemoryLayout<CoreError>.stride }
           @_cdecl("layoutPackedCoreError") public func layoutPackedCoreError() -> Int { MemoryLayout<PackedCoreError>.stride }
+          @_cdecl("layoutOtherCoreError") public func layoutOtherCoreError() -> Int { MemoryLayout<OtherCoreError>.stride }
           @_cdecl("layoutEvent") public func layoutEvent() -> Int { MemoryLayout<Event>.stride }
           @_cdecl("layoutPackedFailureEvent") public func layoutPackedFailureEvent() -> Int { MemoryLayout<PackedFailureEvent>.stride }
           @_cdecl("layoutPackedMediaEvent") public func layoutPackedMediaEvent() -> Int { MemoryLayout<PackedMediaEvent>.stride }
-          @_cdecl("layoutPackedEvent") public func layoutPackedEvent() -> Int { MemoryLayout<PackedEvent>.stride }
-          @_cdecl("layoutPackedBoolInfo") public func layoutPackedBoolInfo() -> Int { MemoryLayout<PackedBoolInfo>.stride }
           @_cdecl("layoutPackedBoolMediaEvent") public func layoutPackedBoolMediaEvent() -> Int { MemoryLayout<PackedBoolMediaEvent>.stride }
+          @_cdecl("layoutPackedEvent") public func layoutPackedEvent() -> Int { MemoryLayout<PackedEvent>.stride }
+          @_cdecl("layoutPackedBoolEvent") public func layoutPackedBoolEvent() -> Int { MemoryLayout<PackedBoolEvent>.stride }
+          @_cdecl("layoutFlattenedEvent") public func layoutFlattenedEvent() -> Int { MemoryLayout<FlattenedEvent>.stride }
+          @_cdecl("layoutSplitStringPayload") public func layoutSplitStringPayload() -> Int { MemoryLayout<SplitStringPayload>.stride }
+          @_cdecl("layoutSplitMediaPayload") public func layoutSplitMediaPayload() -> Int { MemoryLayout<SplitMediaPayload>.stride }
+          @_cdecl("layoutSplitBackendPayload") public func layoutSplitBackendPayload() -> Int { MemoryLayout<SplitBackendPayload>.stride }
           @_cdecl("optionalInfo") public func optionalInfo() -> Int { MemoryLayout<Info?>.stride }
           @_cdecl("sizeInfo") public func sizeInfo() -> Int { MemoryLayout<Info>.size }
           @_cdecl("optionalPackedInfo") public func optionalPackedInfo() -> Int { MemoryLayout<PackedInfo?>.stride }
           @_cdecl("sizePackedInfo") public func sizePackedInfo() -> Int { MemoryLayout<PackedInfo>.size }
           @_cdecl("optionalPackedBoolInfo") public func optionalPackedBoolInfo() -> Int { MemoryLayout<PackedBoolInfo?>.stride }
           @_cdecl("sizePackedBoolInfo") public func sizePackedBoolInfo() -> Int { MemoryLayout<PackedBoolInfo>.size }
+          @_cdecl("alignmentEvent") public func alignmentEvent() -> Int { MemoryLayout<Event>.alignment }
+          @_cdecl("alignmentFlattenedEvent") public func alignmentFlattenedEvent() -> Int { MemoryLayout<FlattenedEvent>.alignment }
+          @_cdecl("alignmentSplitStringPayload") public func alignmentSplitStringPayload() -> Int { MemoryLayout<SplitStringPayload>.alignment }
+          @_cdecl("alignmentSplitMediaPayload") public func alignmentSplitMediaPayload() -> Int { MemoryLayout<SplitMediaPayload>.alignment }
           SWIFT
           xcrun swiftc -O -emit-ir -target arm64-apple-tvos27.0-simulator -sdk "$(xcrun --sdk appletvsimulator --show-sdk-path)" "$RUNNER_TEMP/layout.swift" -o "$RUNNER_TEMP/layout.ll"
           python3 - "$RUNNER_TEMP/layout.ll" <<'PY'
