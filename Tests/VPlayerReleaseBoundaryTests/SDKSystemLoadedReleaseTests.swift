@@ -259,12 +259,14 @@ private final class ReleaseReadinessKVOFacts: @unchecked Sendable {
     private let lock = NSLock()
     private var callbackCount = 0
     private var lastStatus = -1
+    private var lastChangeStatus = -1
     private var terminalStatus = -1
 
-    func record(_ status: AVPlayerItem.Status?) -> Bool {
+    func record(_ status: AVPlayerItem.Status, changeStatus: AVPlayerItem.Status?) -> Bool {
         lock.withLock {
             callbackCount += 1
-            lastStatus = status?.rawValue ?? -1
+            lastStatus = status.rawValue
+            lastChangeStatus = changeStatus?.rawValue ?? -1
             guard terminalStatus == -1,
                   status == .readyToPlay || status == .failed else { return false }
             terminalStatus = lastStatus
@@ -274,7 +276,8 @@ private final class ReleaseReadinessKVOFacts: @unchecked Sendable {
 
     var summary: String {
         lock.withLock {
-            "kvoCount=\(callbackCount) kvoLastStatus=\(lastStatus) kvoTerminalStatus=\(terminalStatus)"
+            "kvoCount=\(callbackCount) kvoLastStatus=\(lastStatus) "
+                + "kvoLastChangeStatus=\(lastChangeStatus) kvoTerminalStatus=\(terminalStatus)"
         }
     }
 
@@ -291,27 +294,44 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
     // These independent controls leave the original 120-second native tests
     // untouched. A control must reach its expected terminal result; observing
     // unknown or cancelling a stuck operation is a test failure, never a skip.
+    // Prior nonexistent file-scheme .m3u8 controls stayed unknown in both raw
+    // players and the driver, while independent isPlayable returned true:
+    // https://github.com/vForce825/VPlayer/actions/runs/37005698567
+    // That HLS URL shape and suitability query are not file-readability oracles.
+    // Use byte-verified malformed file media before replacing any original fixture.
     private let observationTimeout: TimeInterval = 15
+    private static let corruptMP4Bytes = Data("VPlayer deliberately malformed MP4 fixture\n".utf8)
 
-    func testRawMissingItemObservedBeforeAttachmentFails() async throws {
-        try await checkRawMissingItem(observeBeforeAttachment: true)
+    func testObservedStatusDrivesTerminalWhenTypedChangeValueIsAbsent() {
+        let facts = ReleaseReadinessKVOFacts()
+        XCTAssertFalse(facts.record(.unknown, changeStatus: nil))
+        XCTAssertTrue(facts.record(.failed, changeStatus: nil))
+        XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.failed.rawValue)
+        XCTAssertFalse(facts.record(.failed, changeStatus: .failed))
     }
 
-    func testRawMissingItemObservedAfterAttachmentFails() async throws {
-        try await checkRawMissingItem(observeBeforeAttachment: false)
+    func testRawCorruptMP4ObservedBeforeAttachmentFails() async throws {
+        try await checkRawCorruptMP4(observeBeforeAttachment: true)
     }
 
-    private func checkRawMissingItem(observeBeforeAttachment: Bool) async throws {
+    func testRawCorruptMP4ObservedAfterAttachmentFails() async throws {
+        try await checkRawCorruptMP4(observeBeforeAttachment: false)
+    }
+
+    private func checkRawCorruptMP4(observeBeforeAttachment: Bool) async throws {
         let label = observeBeforeAttachment ? "raw.before_attach" : "raw.after_attach"
+        let url = try createCorruptMP4File()
+        defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: url)) }
+        try verifyCorruptMP4File(url)
         let player = AVPlayer()
-        let item = AVPlayerItem(url: missingLocalURL())
+        let item = AVPlayerItem(url: url)
         // Match install's media settings in both references. Only KVO ordering
         // differs; neither reference creates a driver, log reader, or event hub.
         player.pause()
         player.automaticallyWaitsToMinimizeStalling = true
         item.preferredForwardBufferDuration = 3
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-        let terminal = expectation(description: "\(label) missing item reaches terminal status")
+        let terminal = expectation(description: "\(label) corrupt MP4 reaches terminal status")
         let facts = ReleaseReadinessKVOFacts()
         var observation: NSKeyValueObservation?
         defer {
@@ -319,8 +339,12 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
             player.replaceCurrentItem(with: nil)
         }
         let observe = {
-            item.observe(\.status, options: [.initial, .new]) { _, change in
-                if facts.record(change.newValue) { terminal.fulfill() }
+            item.observe(\.status, options: [.initial, .new]) { observed, change in
+                // The typed enum newValue was nil even for the initial callback
+                // on tvOS27. Read the observed status as the production waiter does.
+                if facts.record(observed.status, changeStatus: change.newValue) {
+                    terminal.fulfill()
+                }
             }
         }
         if observeBeforeAttachment { observation = observe() }
@@ -334,24 +358,27 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
         XCTAssertEqual(player.rate, 0)
         XCTAssertEqual(player.timeControlStatus, .paused)
         XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.failed.rawValue)
-        XCTAssertEqual(item.status, .failed, "A missing local file must fail, not become ready")
+        XCTAssertEqual(item.status, .failed, "Malformed MP4 bytes must fail, not become ready")
         XCTAssertNotNil(item.error)
     }
 
-    func testFreshDriverMissingItemFails() async throws {
+    func testFreshDriverCorruptMP4Fails() async throws {
+        let url = try createCorruptMP4File()
+        defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: url)) }
+        try verifyCorruptMP4File(url)
         let allocator = PlaybackIdentityAllocator()
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
         let identity = AVPlayerItemInstanceIdentity(
             outputLifecycleEpoch: lifecycle,
             itemGeneration: try allocator.next(in: .outputItem))
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
-        try driver.install(url: missingLocalURL(), identity: identity)
+        try driver.install(url: url, identity: identity)
         defer {
             driver.replaceCurrentItemWithNil(item: identity)
             driver.removeObservers(item: identity)
         }
         let item = try XCTUnwrap(driver.player.currentItem)
-        let terminal = expectation(description: "Fresh driver rejects a missing local item")
+        let terminal = expectation(description: "Fresh driver rejects malformed MP4 bytes")
         let progress = ReleaseReadinessTaskProgress()
         let task = Task { @MainActor in
             let result: Result<AVPlayerItemInstanceIdentity, Error>
@@ -381,7 +408,7 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
         XCTAssertEqual(driver.activeWaiterCount, 0)
         switch result {
         case .success:
-            XCTFail("A missing local item must not produce a ready identity")
+            XCTFail("Malformed MP4 bytes must not produce a ready identity")
         case .failure(let error):
             print("READINESS_REFERENCE stage=driver.returned error=\(Self.errorFact(error as NSError))")
             XCTAssertFalse(error is CancellationError,
@@ -393,15 +420,18 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
         }
     }
 
-    func testIndependentMissingAssetLoadCompletesWithoutPlayableContent() async throws {
+    func testIndependentCorruptMP4DurationLoadFails() async throws {
         // A separate asset and URL prevent this explicit load from preparing
         // an item in another control. Asset loading is not item readiness.
-        let asset = AVURLAsset(url: missingLocalURL())
-        let terminal = expectation(description: "Independent missing asset load reaches a terminal result")
+        let url = try createCorruptMP4File()
+        defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: url)) }
+        try verifyCorruptMP4File(url)
+        let asset = AVURLAsset(url: url)
+        let terminal = expectation(description: "Malformed MP4 duration load fails")
         let progress = ReleaseReadinessTaskProgress()
         let task = Task { @MainActor in
-            let result: Result<Bool, Error>
-            do { result = .success(try await asset.load(.isPlayable)) }
+            let result: Result<CMTime, Error>
+            do { result = .success(try await asset.load(.duration)) }
             catch { result = .failure(error) }
             progress.completed = true
             terminal.fulfill()
@@ -412,7 +442,7 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
         await fulfillment(of: [terminal], timeout: observationTimeout)
         let completedBeforeCancellation = progress.completed
         print("READINESS_REFERENCE stage=asset.observed "
-            + "assetPlayableState=\(Self.playableFact(asset)) "
+            + "assetDurationState=\(Self.durationFact(asset)) "
             + "completedBeforeCancellation=\(completedBeforeCancellation)")
         // cancelLoading is the asset's supported physical cancellation API.
         // Join even after a diagnostic timeout. If SDK cancellation cannot
@@ -422,11 +452,8 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
         let result = await task.value
         XCTAssertTrue(completedBeforeCancellation)
         switch result {
-        case .success(let playable):
-            print("READINESS_REFERENCE stage=asset.returned playable=\(playable)")
-            // A loaded false value is a completed suitability query, not an
-            // error and not evidence that any AVPlayerItem reached readiness.
-            XCTAssertFalse(playable, "A nonexistent file cannot contain playable content")
+        case .success(let duration):
+            XCTFail("Malformed MP4 unexpectedly loaded duration=\(Self.timeFact(duration))")
         case .failure(let error):
             print("READINESS_REFERENCE stage=asset.returned error=\(Self.errorFact(error as NSError))")
             XCTAssertFalse(error is CancellationError,
@@ -434,11 +461,37 @@ final class SDKReadinessReferenceReleaseTests: XCTestCase {
         }
     }
 
-    private func missingLocalURL() -> URL {
+    private func createCorruptMP4File() throws -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("VPlayer-readiness-reference-\(UUID().uuidString).m3u8")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            .appendingPathComponent("VPlayer-readiness-reference-\(UUID().uuidString).mp4")
+        try Self.corruptMP4Bytes.write(to: url, options: .atomic)
         return url
+    }
+
+    private func verifyCorruptMP4File(_ url: URL) throws {
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        let bytes = try Data(contentsOf: url)
+        let matches = bytes == Self.corruptMP4Bytes
+        print("READINESS_REFERENCE fixture=corrupt_mp4 exists=\(exists) "
+            + "bytes=\(bytes.count) contentMatches=\(matches)")
+        XCTAssertTrue(exists)
+        XCTAssertTrue(matches)
+        guard exists, matches else {
+            throw NSError(domain: "ReleaseReadinessFixture", code: 1)
+        }
+    }
+
+    private static func durationFact(_ asset: AVAsset) -> String {
+        switch asset.status(of: .duration) {
+        case .notYetLoaded: return "notYetLoaded"
+        case .loading: return "loading"
+        case .loaded(let time): return "loaded:\(timeFact(time))"
+        case .failed(let error): return "failed:\(errorFact(error))"
+        }
+    }
+
+    private static func timeFact(_ time: CMTime) -> String {
+        "\(time.value)/\(time.timescale):flags\(time.flags.rawValue)"
     }
 
     private static func playerFact(_ player: AVPlayer) -> String {

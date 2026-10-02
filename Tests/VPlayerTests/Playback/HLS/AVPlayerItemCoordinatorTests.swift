@@ -1406,6 +1406,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(forgedResult, .rejected,
                        "调用方自构造的 authorization 不能取得正 rate 权限")
         XCTAssertEqual(forged.driver.playCallCount, 0)
+        try await forged.shutdown()
 
         let invalidated = try await Task21Harness()
         _ = try await invalidated.prepare()
@@ -1419,12 +1420,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let invalidatedResult = try await activation.value
         XCTAssertEqual(invalidatedResult, .rejected,
                        "play 返回后必须重新核验失效状态")
+        try await invalidated.shutdown()
     }
 
     func testResponseTerminalCapabilityAloneBindsRenditionAndConflictClosesReadinessBeforeStop() async throws {
-        let premature = try await Task21Harness()
+        let premature = try await Task21Harness(completeMediaBodies: false)
         XCTAssertTrue(premature.coordinator.selectedRenditions.isEmpty,
                       "裸 ingress 不能替代 Task20 全 body send terminal capability")
+        try await premature.shutdown()
 
         let active = try await Task21Harness()
         _ = try await active.prepare()
@@ -1435,6 +1438,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                        "正 rate 后的 rendition 冲突必须进入同一 stop 链")
         XCTAssertEqual(active.coordinator.stopTaskCount, 1,
                        "真实 terminal 冲突必须投递唯一 Registry stop/reprepare 请求")
+        try await active.shutdown()
     }
 
     func testAuthorizedLivePlaybackUnexpectedPauseStartsSingleReplacement() async throws {
@@ -1476,12 +1480,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(try await unboundEvidence.prepare())
         XCTAssertEqual(unboundEvidence.driver.prerollCallCount, 0,
                        "没有同一 loopback publication/server capability 时不得 ready")
+        try await unboundEvidence.shutdown()
 
         for mutation in [Task21PrepareMutation.headOnly, .incompleteBody, .wrongDigest,
                          .wrongItemGeneration] {
             let harness = try await Task21Harness(prepareMutation: mutation)
             await XCTAssertThrowsErrorAsync(try await harness.prepare(), "\(mutation)")
             XCTAssertEqual(harness.driver.playCallCount, 0)
+            try await harness.shutdown()
         }
     }
 
@@ -1517,45 +1523,61 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testQuiescenceReceiptRemainsVerifiableAfterCleanupAndDirectStateMatchesInstalledItem() async throws {
-        let completed = try await Task21Harness()
-        _ = try await completed.prepare()
-        _ = try await completed.activate()
-        let receipt = try await completed.stop()
-        try completed.coordinator.completeLifecycleCleanup(receipt)
-        XCTAssertTrue(completed.coordinator.accept(receipt),
-                      "request 清空后仍必须验收已签发的完整 receipt")
-        let invocation = try XCTUnwrap(completed.backend.lastSuspendInvocation)
-        let joined = try await completed.coordinator.stop(invocation)
-        XCTAssertTrue(joined.identity === receipt.identity,
-                      "清理后同票必须领取原 receipt identity")
-        XCTAssertEqual(joined, receipt)
+        do {
+            let completed = try await Task21Harness()
+            _ = try await completed.prepare()
+            _ = try await completed.activate()
+            let receipt = try await completed.stop()
+            try completed.coordinator.completeLifecycleCleanup(receipt)
+            XCTAssertNil(completed.driver.currentItemIdentity)
+            XCTAssertEqual(completed.coordinator.phase, .quiescent)
+            XCTAssertTrue(completed.coordinator.accept(receipt),
+                          "request 清空后仍必须验收已签发的完整 receipt")
+            let invocation = try XCTUnwrap(completed.backend.lastSuspendInvocation)
+            let joined = try await completed.coordinator.stop(invocation)
+            XCTAssertTrue(joined.identity === receipt.identity,
+                          "清理后同票必须领取原 receipt identity")
+            XCTAssertEqual(joined, receipt)
+            try await completed.shutdown()
 
-        let retired = try await Task21Harness()
-        _ = try await retired.prepare()
-        _ = try await retired.activate()
-        let retiredReceipt = try await retired.stop()
-        let retiredInvocation = try XCTUnwrap(retired.backend.lastSuspendInvocation)
-        retired.evidence.completedRenditions.append(.init(rawValue: 202))
-        for _ in 0..<32 { await Task.yield() }
-        try await retired.coordinator.retireForReplacement(retired.item.outputLifecycleEpoch)
-        let retiredJoin = try await retired.coordinator.stop(retiredInvocation)
-        XCTAssertTrue(retiredJoin.identity === retiredReceipt.identity,
-                      "replacement retirement 清 request 后也须 join 原停止终态")
-        XCTAssertEqual(retiredJoin, retiredReceipt)
-
+            let foreign = try await Task21Harness()
+            _ = try await foreign.prepare()
+            _ = try await foreign.activate()
+            _ = try await foreign.stop()
+            let foreignInvocation = try XCTUnwrap(foreign.backend.lastSuspendInvocation)
+            await XCTAssertThrowsErrorAsync(try await completed.coordinator.stop(foreignInvocation),
+                "独立 Registry 复用数值 nonce 的外来票也不能领取旧 receipt")
+            try await foreign.shutdown()
+        }
+        do {
+            let retired = try await Task21Harness()
+            _ = try await retired.prepare()
+            _ = try await retired.activate()
+            let retiredReceipt = try await retired.stop()
+            let retiredInvocation = try XCTUnwrap(retired.backend.lastSuspendInvocation)
+            retired.evidence.completedRenditions.append(.init(rawValue: 202))
+            for _ in 0..<32 { await Task.yield() }
+            try await retired.coordinator.retireForReplacement(retired.item.outputLifecycleEpoch)
+            XCTAssertNil(retired.driver.currentItemIdentity)
+            let retiredJoin = try await retired.coordinator.stop(retiredInvocation)
+            XCTAssertTrue(retiredJoin.identity === retiredReceipt.identity,
+                          "replacement retirement 清 request 后也须 join 原停止终态")
+            XCTAssertEqual(retiredJoin, retiredReceipt)
+            try await retired.shutdown()
+        }
         let mismatched = try await Task21Harness()
         _ = try await mismatched.prepare()
         _ = try await mismatched.activate()
-        let foreign = try await Task21Harness()
-        _ = try await foreign.prepare()
-        _ = try await foreign.activate()
-        _ = try await foreign.stop()
-        let foreignInvocation = try XCTUnwrap(foreign.backend.lastSuspendInvocation)
-        await XCTAssertThrowsErrorAsync(try await completed.coordinator.stop(foreignInvocation),
-            "独立 Registry 复用数值 nonce 的外来票也不能领取旧 receipt")
         mismatched.driver.currentItemIdentity = Task21Fixtures.staleGenerationItem(from: mismatched.item)
         await XCTAssertThrowsErrorAsync(try await mismatched.stop(),
                                         "direct state 必须来自实际 current item")
+        let corruptedIdentity = mismatched.driver.currentItemIdentity
+        XCTAssertNil(mismatched.backend.quiescenceReceipt)
+        try await mismatched.retireFailedTestTransport()
+        XCTAssertEqual(mismatched.driver.currentItemIdentity, corruptedIdentity,
+                       "cleanup must not restore the injected identity to manufacture quiescence")
+        XCTAssertNil(mismatched.coordinator.lastQuiescenceReceipt)
+        XCTAssertNil(mismatched.backend.quiescenceReceipt)
     }
 
     func testInstallPrepareAndStopTicketsAreSingleFlightAcrossAwaitCancellationAndTimeout() async throws {
@@ -1564,6 +1586,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let second = try await prepare.prepare()
         XCTAssertEqual(first.identity, second.identity,
                        "同一 item 的 prepare 必须加入原 operation ticket")
+        try await prepare.shutdown()
 
         let stop = try await Task21Harness()
         _ = try await stop.prepare()
@@ -1578,6 +1601,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         stop.driver.releaseDirectPausedRead(rate: 0, status: .paused)
         _ = try? await pending.value
         XCTAssertEqual(stop.driver.pauseCallCount, 1)
+        try await stop.shutdown()
     }
 
     func testStorageConcurrentRegistryStopJoinsOriginalRunnerWhileLeafRejectsReentry() async throws {
@@ -1695,11 +1719,31 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let lifecycle = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 21_999)
         let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: lifecycle,
                                                 itemGeneration: 1)
-        let boundaries = (0...256).map { Task21Fixtures.time(Double($0) / 48_000.0) }
-        XCTAssertThrowsError(try coordinator.install(Task21Fixtures.request(
-            item: item, liveEdge: Task21Fixtures.time(7), boundaries: boundaries,
-            directAudioOnlyRendition: nil
-        )), "边界、participant、dependency 与 KVO backing 必须有硬上限")
+        func request(participantCount: Int) -> AVPlayerItemPreparationRequest {
+            .init(itemURL: URL(string: "http://127.0.0.1:49152/capacity.m3u8")!,
+                item: item, publicationSequence: 7,
+                audioParticipants: (0..<participantCount).map {
+                    .init(renditionIdentity: .init(rawValue: UInt64($0 + 1)),
+                          codec: .explicitlyNonAAC)
+                }, directAudioOnlyRendition: nil)
+        }
+        // The old helper discarded its `boundaries` argument. Installation owns
+        // the participant backing; authenticated timeline boundaries are checked later.
+        XCTAssertEqual(AVPlayerItemCoordinator.renditionCapacity, 8)
+        XCTAssertThrowsError(try coordinator.install(request(participantCount: 9))) { error in
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        XCTAssertNil(coordinator.currentItemIdentity)
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertFalse(driver.operations.contains(.install),
+                       "overflow must reject before the physical installation side effect")
+        XCTAssertNoThrow(try coordinator.install(request(participantCount: 8)))
+        XCTAssertEqual(coordinator.currentItemIdentity, item)
+        XCTAssertEqual(driver.currentItemIdentity, item)
+        XCTAssertEqual(driver.operations.filter { $0 == .install }.count, 1)
+        XCTAssertLessThanOrEqual(coordinator.retainedGraphCapacitySnapshot.applicationChargeableBytes,
+                                AVPlayerRetainedGraphCapacityLedger.maximumBytes)
+        try await authorityHarness.shutdown()
     }
 
     func testReview2RegistryCapabilityIsConsumedOnceAtMainActorPlayBoundaryAndRevalidatedForPlayingRelay()
@@ -2700,7 +2744,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 publicationSequence: fixture.publicationSequence + 1, selection: nil)
         }
         for _ in 0..<128 where !driver.prepareWait.isActive { await Task.yield() }
-        try fixture.publishNaturalEnd(seed: seed)
+        try await fixture.publishNaturalEnd(seed: seed)
         try await fixture.serveCompletedPublication()
         XCTAssertFalse(nextFinished.value, "旧publication/selection retry不能完成新阶段")
         driver.cancelPendingPrerolls(item: item)
@@ -2939,7 +2983,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             driver: driver, evidenceSource: evidence,
             backendPublicationReplacementAuthoritySlot:
                 backend.backendPublicationReplacementAuthoritySlot)
-        backend.attach(coordinator)
+        backend.attach(coordinator, physicalDriver: driver)
         let item = authorityFixture.request.item
         backend.configure(identity: graph.lifecycle.backendIdentity,
                           itemGeneration: item.itemGeneration)
@@ -2996,7 +3040,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertNil(terminalBinding.endpointAuthority,
                      "writer terminal 与 endpoint authority 封存必须是两个可验证阶段")
         let seed = try finished.sealEndpoint()
-        try http.publishNaturalEnd(seed: seed)
+        try await http.publishNaturalEnd(seed: seed)
         let endpoint = seed.endpoint
         XCTAssertEqual(endpoint.sampleRate, 48_000)
         XCTAssertEqual(endpoint.totalDecodedFrames, 387_072,
@@ -3046,6 +3090,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(driver.constrainedPlaybackEnd, expectedItemEnd,
                        "HTTP backing 验真后 coordinator 才能安装真实 AAC EOS constraint")
 
+        http.shutdown()
         // 单独使用一份真实 writer/server authority 证明：server 已有 selection 时，
         // nil expected identity 必须在 endpoint consume 之前立即 invalid。
         let rejectedItem = AVPlayerItemInstanceIdentity(
@@ -3059,7 +3104,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         defer { rejectedHTTP.shutdown() }
         let rejectedFinished = try await rejectedHTTP.finishWriter()
         let rejectedSeed = try rejectedFinished.sealEndpoint()
-        try rejectedHTTP.publishNaturalEnd(seed: rejectedSeed)
+        try await rejectedHTTP.publishNaturalEnd(seed: rejectedSeed)
         try await rejectedHTTP.serveCompletedPublication()
         let rejectedCapability = try XCTUnwrap(
             rejectedHTTP.server.completedPublicationCapability(
@@ -4511,6 +4556,25 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
         try? server.retire(cleanupTicket: ticket)
     }
 
+    func retireTransportAwaitingCompletion() async throws {
+        source.retirePreparation()
+        let ticket = server.closeAdmission()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (server.usage.connections != 0 || server.usage.activeResponses != 0
+                || FrozenPreparationOwner.activeHistoryServer === server),
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        guard server.usage.connections == 0, server.usage.activeResponses == 0,
+              FrozenPreparationOwner.activeHistoryServer !== server else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
+        try server.drain(cleanupTicket: ticket)
+        try server.retire(cleanupTicket: ticket)
+        XCTAssertEqual(server.usage.distinctBackingBytes, 0)
+        XCTAssertEqual(server.usage.parserAndStagingBytes, 0)
+    }
+
     func makePreparedPlayhead() async throws -> PreparedPlayheadIdentity {
         let readiness = try XCTUnwrap(source.consumeCompletedPublication(
             itemURL: request.itemURL, item: request.item,
@@ -4671,7 +4735,7 @@ private final class Task21Harness {
             driver: driver, evidenceSource: evidence,
             backendPublicationReplacementAuthoritySlot:
                 backend.backendPublicationReplacementAuthoritySlot)
-        backend.attach(coordinator)
+        backend.attach(coordinator, physicalDriver: driver)
         authorityEvents.handler = nil
         item = authorityFixture.request.item
         oldItem = item
@@ -4784,6 +4848,17 @@ private final class Task21Harness {
         authorityFixture.shutdown()
     }
 
+    func retireFailedTestTransport() async throws {
+        guard backend.quiescenceReceipt == nil, backend.lastError != nil,
+              let invocation = backend.lastSuspendInvocation else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        // Join the original failed operation; no new output proof is issued.
+        _ = await graph.registry.joinOutputBackendOperation(invocation.suspendTicket.task)
+        backend.allowRetirementCompletion()
+        try await authorityFixture.retireTransportAwaitingCompletion()
+    }
+
     func reinstall() throws {
         if let latestReceipt {
             try coordinator.completeLifecycleCleanup(latestReceipt)
@@ -4815,6 +4890,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
     private var configuredIdentity = PlaybackBackendIdentity(
         sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0
     )
+    private weak var physicalDriver: (any AVPlayerDriving)?
     private var configuredItemGeneration: UInt64?
     private var preparedValue: PreparedAVPlayerItem?
     private var activationValue: BackendActivationResult?
@@ -4841,13 +4917,15 @@ private final class Task21RegistryBackend: PlaybackBackend,
     }
 
     @MainActor
-    func attach(_ coordinator: AVPlayerItemCoordinator) {
+    func attach(_ coordinator: AVPlayerItemCoordinator,
+                physicalDriver: (any AVPlayerDriving)? = nil) {
         precondition(coordinatorValue == nil,
                      "真实 Registry backend 只能绑定一个 coordinator")
         precondition(coordinator.backendPublicationReplacementAuthoritySlot
                         === replacementAuthoritySlot,
                      "Registry 与 coordinator 必须共享同一个 replacement authority 槽")
         coordinatorValue = coordinator
+        self.physicalDriver = physicalDriver
     }
 
     var identity: PlaybackBackendIdentity { lock.withLock { configuredIdentity } }
@@ -4971,15 +5049,31 @@ private final class Task21RegistryBackend: PlaybackBackend,
                   let receipt = quiescenceValue,
                   receipt.item.outputLifecycleEpoch == epoch,
                   receipt.suspendTicket.lifecycle == epoch,
-                  lastSuspendInvocation?.lifecycle == epoch else { return nil }
+                  let invocation = lastSuspendInvocation,
+                  invocation.lifecycle == epoch,
+                  invocation.suspendTicket == receipt.suspendTicket,
+                  invocation.closeClaim == receipt.closeClaim else { return nil }
             return (coordinator, receipt)
         }
         guard let cleanup else { return .unconfirmed }
         let unloaded = await MainActor.run { () -> Bool in
             do {
-                try cleanup.0.completeLifecycleCleanup(cleanup.1)
+                // The original lifecycle owner may already have detached this exact
+                // item. Revalidate its retained receipt instead of invoking the
+                // one-shot detach leaf a second time or inventing a new receipt.
+                guard cleanup.0.accept(cleanup.1) else { return false }
+                if cleanup.0.currentItemIdentity != nil {
+                    try cleanup.0.completeLifecycleCleanup(cleanup.1)
+                } else {
+                    guard let physicalDriver = self.physicalDriver,
+                          physicalDriver.currentItemIdentity == nil,
+                          physicalDriver.rate == 0,
+                          physicalDriver.timeControlStatus == .paused,
+                          physicalDriver.disconnectedFromSystemAudio else { return false }
+                }
                 return cleanup.0.currentItemIdentity == nil
                     && cleanup.0.phase == .quiescent
+                    && cleanup.0.accept(cleanup.1)
             } catch {
                 return false
             }
@@ -5339,7 +5433,7 @@ private final class Task21RealIntegrationFixture {
             driver: driver, evidenceSource: evidence,
             backendPublicationReplacementAuthoritySlot:
                 backend.backendPublicationReplacementAuthoritySlot)
-        backend.attach(coordinator)
+        backend.attach(coordinator, physicalDriver: driver)
         let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: lifecycle,
                                                 itemGeneration: 19)
         backend.configure(identity: lifecycle.backendIdentity,
@@ -6757,12 +6851,14 @@ private final class FinalWriterTerminalHTTPFixture: @unchecked Sendable {
                       item: AVPlayerItemInstanceIdentity) async throws
         -> FinalWriterTerminalHTTPFixture {
         let box = FinalLockedValue<FinalWriterTerminalPublicationHarness>()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 19, now: { 0 }, logger: { _ in },
             responseFailure: { _, _ in }
         ) { token in
             let publication = try FinalWriterTerminalPublicationHarness(
-                token: token, pending: pending)
+                token: token, pending: pending,
+                publicationClock: HLSNaturalEndPublicationClock.make())
+            try await publication.publishMaterializedPrefix()
             box.value = publication
             return LoopbackPreparedPublication(
                 store: publication.store,
@@ -6814,9 +6910,9 @@ private final class FinalWriterTerminalHTTPFixture: @unchecked Sendable {
         try await publication.finishWriter()
     }
 
-    func publishNaturalEnd(seed: Task21RealAACSeed) throws {
-        try publication.publishNaturalEnd(seed: seed,
-                                          expectedSequence: publicationSequence)
+    func publishNaturalEnd(seed: Task21RealAACSeed) async throws {
+        try await publication.publishNaturalEnd(seed: seed,
+                                                expectedSequence: publicationSequence)
     }
 
     func serveCompletedPublication() async throws {
@@ -6877,6 +6973,7 @@ private final class FinalWriterTerminalHTTPFixture: @unchecked Sendable {
         _ = finalWaitUntil(timeout: 2) {
             server.usage.connections == 0 && server.usage.activeResponses == 0
         }
+        bundle.evidenceSource.retirePreparation()
         let ticket = server.closeAdmission()
         try? server.drain(cleanupTicket: ticket)
         try? server.retire(cleanupTicket: ticket)
@@ -6887,6 +6984,8 @@ private final class FinalWriterTerminalPublicationHarness: @unchecked Sendable {
     let store: SealedMediaStore
     let declaration: HLSItemDeclaration
     let publisher: HLSPublicationCoordinator
+    private let publicationClock: HLSNaturalEndPublicationClock?
+    private var publishedLogicalSequences: [UInt64] = []
     private let pending: Task21PendingAACSeed
     private let initialization: SealedMediaObject
     private let proof: EpochFormatProof
@@ -6895,8 +6994,10 @@ private final class FinalWriterTerminalPublicationHarness: @unchecked Sendable {
     private var packets: [Task19Packet]
 
     init(token: LoopbackSessionToken, pending: Task21PendingAACSeed,
-         includeRenditionBinding: Bool = false) throws {
+         includeRenditionBinding: Bool = false,
+         publicationClock: HLSNaturalEndPublicationClock? = nil) throws {
         self.pending = pending
+        self.publicationClock = publicationClock
         initialization = try XCTUnwrap(pending.sink.take(.initialization))
         var initialMedia: [SealedMediaObject] = []
         while let object = pending.sink.take(.media) { initialMedia.append(object) }
@@ -6937,7 +7038,8 @@ private final class FinalWriterTerminalPublicationHarness: @unchecked Sendable {
                     ? pending.writer.aacRenditionTerminalBinding : nil)],
             declaration: declaration,
             anchor: .init(mediaOrigin: Task21Fixtures.time(0),
-                          utcMilliseconds: 1_788_912_000_000))
+                          utcMilliseconds: 1_788_912_000_000),
+            publicationClock: publicationClock)
         for (index, packet) in packets.enumerated() {
             _ = try publisher.offer(
                 packet.object, receipt: packet.receipt, relay: pending.relay,
@@ -6950,10 +7052,48 @@ private final class FinalWriterTerminalPublicationHarness: @unchecked Sendable {
         }
     }
 
+    func publishMaterializedPrefix() async throws {
+        let clock = try XCTUnwrap(publicationClock)
+        publishedLogicalSequences = try XCTUnwrap(publisher.visible?.media[2]?.logicalSequences)
+        while publisher.pendingLogicalSequenceCount > 0 {
+            try Task.checkCancellation()
+            clock.consumeSignal()
+            let ticket = publisher.ticket
+            let before = publisher.pendingLogicalSequenceCount
+            let instant = try clock.now()
+            switch try publisher.publish(ticket: ticket, now: instant.logical) {
+            case .published:
+                let sequence = try XCTUnwrap(publisher.visible?.media[2]?.logicalSequences.last)
+                XCTAssertEqual(sequence, try XCTUnwrap(publishedLogicalSequences.last) + 1)
+                XCTAssertEqual(publisher.pendingLogicalSequenceCount, before - 1)
+                XCTAssertFalse(publisher.visible!.media[2]!.text.contains("#EXT-X-ENDLIST"))
+                publishedLogicalSequences.append(sequence)
+            case .waiting:
+                // This factory has no HTTP leases yet; only the real one-second
+                // audio publication gate may delay its already-materialized prefix.
+                XCTAssertEqual(store.capacityWaiterCount, 0)
+                let earliest = try HLSChecked.add(try XCTUnwrap(ticket.previousPublishInstant), 1_000_000_000)
+                let deadline = try XCTUnwrap(ticket.absoluteDeadline)
+                let next = min(earliest, deadline)
+                guard next > instant.logical else { throw HLSPublicationFailure.deadlineExceeded }
+                try await clock.wait(until: clock.monotonicDeadline(for: next, from: instant))
+            case .accepted, .releasedOnly:
+                throw HLSPublicationFailure.invalidSequence
+            }
+        }
+        XCTAssertEqual(publishedLogicalSequences, packets.map { $0.object.logicalSequence })
+        XCTAssertNil(try pending.terminalBinding.endpointAuthority,
+                     "The pre-EOF prefix must not manufacture a writer terminal authority")
+    }
+
     func finishWriter() async throws -> Task21FinishedAACSeed {
         _ = try await pending.writer.finish()
         var tail: [SealedMediaObject] = []
         while let object = pending.sink.take(.media) { tail.append(object) }
+        if publicationClock != nil {
+            XCTAssertEqual(tail.count, 1,
+                "The exact next-publication reservation is valid only for this real single terminal tail")
+        }
         let tailPackets = try tail.map { object in
             Task19Packet(object: object,
                 receipt: try timeline.validate(object, using: proof),
@@ -6974,18 +7114,30 @@ private final class FinalWriterTerminalPublicationHarness: @unchecked Sendable {
     }
 
     func publishNaturalEnd(seed: Task21RealAACSeed,
-                           expectedSequence: UInt64) throws {
-        guard seed.endpointAuthority.terminalBinding === (try pending.terminalBinding) else {
+                           expectedSequence: UInt64) async throws {
+        guard seed.endpointAuthority.terminalBinding === (try pending.terminalBinding),
+              publicationClock != nil else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
-        _ = try publisher.publish(ticket: publisher.ticket,
-                                  now: 3_000_000_000,
-                                  naturalEnd: true)
+        XCTAssertEqual(publisher.pendingLogicalSequenceCount, 1)
+        let result = try await publisher.drainNaturalEnd()
+        XCTAssertEqual(result, .endListPublished)
+        let terminal = try XCTUnwrap(publisher.visible?.media[2]?.logicalSequences.last)
+        publishedLogicalSequences.append(terminal)
+        XCTAssertEqual(publishedLogicalSequences, packets.map { $0.object.logicalSequence },
+                       "Every accepted real segment must become visible in logical order")
+        XCTAssertEqual(terminal, seed.endpoint.terminalLogicalSequence)
+        XCTAssertEqual(publisher.pendingLogicalSequenceCount, 0)
         guard publisher.visible?.publicationSequence == expectedSequence,
               publisher.visible?.media.values.allSatisfy({
                   $0.text.hasSuffix("#EXT-X-ENDLIST\n")
               }) == true else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        XCTAssertThrowsError(try publisher.publish(ticket: publisher.ticket,
+            now: publisher.ticket.previousPublishInstant!, naturalEnd: true)) { error in
+            XCTAssertEqual(error as? HLSPublicationFailure, .closed,
+                           "The real terminal transaction must be unique")
         }
     }
 }
