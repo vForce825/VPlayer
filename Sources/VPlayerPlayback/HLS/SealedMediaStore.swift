@@ -360,6 +360,7 @@ final class SealedMediaStore: @unchecked Sendable {
     private struct CapacityWaiter {
         let owner: HLSPublicationOwner
         let ticket: PlaylistPublishTicket
+        let publicationClock: HLSNaturalEndPublicationClock?
         let wake: (Int64) -> Void
     }
     private var capacityWaiter: CapacityWaiter?
@@ -638,10 +639,14 @@ final class SealedMediaStore: @unchecked Sendable {
         }
     } }
     func waitForSnapshotCapacity(owner value: HLSPublicationOwner, ticket: PlaylistPublishTicket,
+                                publicationClock: HLSNaturalEndPublicationClock? = nil,
                                 wake: @escaping (Int64) -> Void) throws { try domain.sync {
         try validatePublication(ticket, owner: value)
         guard capacityWaiter == nil || capacityWaiter?.ticket == ticket else { throw HLSPublicationFailure.staleTicket }
-        if capacityWaiter == nil { capacityWaiter = CapacityWaiter(owner: value, ticket: ticket, wake: wake) }
+        if capacityWaiter == nil {
+            capacityWaiter = CapacityWaiter(owner: value, ticket: ticket,
+                publicationClock: publicationClock, wake: wake)
+        }
     } }
     func cancelCapacityWait(owner value: HLSPublicationOwner, ticket: PlaylistPublishTicket? = nil) { domain.sync {
         guard capacityWaiter?.owner === value, ticket == nil || capacityWaiter?.ticket == ticket else { return }
@@ -1716,12 +1721,28 @@ final class SealedMediaStore: @unchecked Sendable {
 
     private func wakeCapacityWaiter() {
         guard let waiter = capacityWaiter else { return }
-        if closed || expectedTicket != waiter.ticket || waiter.ticket.absoluteDeadline.map({ instant > $0 }) == true {
-            capacityWaiter = nil; pendingSnapshotGeneration.removeAll(keepingCapacity: true); return
+        if closed || expectedTicket != waiter.ticket {
+            capacityWaiter = nil; pendingSnapshotGeneration.removeAll(keepingCapacity: true)
+            waiter.publicationClock?.signal()
+            return
+        }
+        // EOF 的票使用 publisher logical clock，HTTP release 的 store uptime
+        // 只用于 residency，不能拿它误判 publication deadline。
+        let publicationInstant: Int64
+        do { publicationInstant = try waiter.publicationClock?.now().logical ?? instant }
+        catch {
+            capacityWaiter = nil; pendingSnapshotGeneration.removeAll(keepingCapacity: true)
+            waiter.publicationClock?.signal()
+            return
+        }
+        if waiter.ticket.absoluteDeadline.map({ publicationInstant > $0 }) == true {
+            capacityWaiter = nil; pendingSnapshotGeneration.removeAll(keepingCapacity: true)
+            waiter.publicationClock?.signal()
+            return
         }
         guard pendingSnapshotGeneration.isEmpty else { return }
         capacityWaiter = nil
-        waiter.wake(instant)
+        waiter.wake(publicationInstant)
     }
 
     func reserveSnapshotBatch(mediaCount: Int, includeMaster: Bool) throws -> HLSSnapshotBatchReservation? { try domain.sync {

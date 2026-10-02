@@ -5162,6 +5162,9 @@ private final class Task21RealIntegrationFixture {
     private let backend: Task21RegistryBackend
     private let item: AVPlayerItemInstanceIdentity
     private let itemURL: URL
+    private let resourceBaseline: Int
+    private let applicationBaseline: Int
+    private let callbackBaseline: Int
     private var prepared: PreparedAVPlayerItem?
 
     private init(publication: Task21RealHLSHarness, server: LoopbackHTTPServer,
@@ -5170,7 +5173,9 @@ private final class Task21RealIntegrationFixture {
                  coordinator: AVPlayerItemCoordinator,
                  evidenceSource: LoopbackAVPlayerPreparationEvidenceSource,
                  graph: OutputGraphFixture, backend: Task21RegistryBackend,
-                 item: AVPlayerItemInstanceIdentity, itemURL: URL) {
+                 item: AVPlayerItemInstanceIdentity, itemURL: URL,
+                 resourceBaseline: Int, applicationBaseline: Int,
+                 callbackBaseline: Int) {
         self.publication = publication
         self.server = server
         self.player = player
@@ -5182,12 +5187,18 @@ private final class Task21RealIntegrationFixture {
         self.backend = backend
         self.item = item
         self.itemURL = itemURL
+        self.resourceBaseline = resourceBaseline
+        self.applicationBaseline = applicationBaseline
+        self.callbackBaseline = callbackBaseline
     }
 
     static func make(endList: Bool = true, includeVideo: Bool = false) async throws
         -> Task21RealIntegrationFixture {
         // Registry 先冻结正式 output lifecycle；writer、publisher、server 与 item
         // 随后全部绑定这一身份，避免只比较 generation 的跨 lifecycle 拼接。
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
         let backend = Task21RegistryBackend()
         let graph = try OutputGraphFixture(backendObject: backend)
         let seed = try await Task21RealAACSeed.make(
@@ -5237,7 +5248,9 @@ private final class Task21RealIntegrationFixture {
             coordinator: coordinator,
             evidenceSource: evidence,
             graph: graph,
-            backend: backend, item: item, itemURL: preparation.request.itemURL)
+            backend: backend, item: item, itemURL: preparation.request.itemURL,
+            resourceBaseline: resourceBaseline, applicationBaseline: applicationBaseline,
+            callbackBaseline: callbackBaseline)
     }
 
     /// graph、writer、authority、listener、publisher、AVPlayer 与 prepare 全部在
@@ -5766,8 +5779,30 @@ private final class Task21RealIntegrationFixture {
         XCTAssertEqual(Set(remainingMetadata.identities), Set(retainedMetadata.identities),
                        "夹具仍持 prepared/mapping 原 owner，真实退役不能抢退其 metadata 租约")
         XCTAssertEqual(remainingMetadata.charge, retainedMetadata.charge)
-        XCTAssertEqual(server.usage.applicationChargedBytes, remainingMetadata.charge.chargedBytes,
-                       "socket 全退后只可保留准确原 owner 的 reservation，不能漏掉额外尾")
+        XCTAssertTrue(remainingMetadata.charge.allReservationsRegistered)
+        // usage.applicationChargedBytes is the process-wide ledger, not this
+        // store's metadata alone. The fixture still owns driver/coordinator,
+        // frozen preparation, and selection escrows after physical socket retirement.
+        let callbackDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline,
+              ContinuousClock.now < callbackDeadline {
+            await Self.awaitMainQueueTurn()
+        }
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline,
+                       "physical SDK callback aliases must retire before checking settled escrow")
+        // These are the exact original reservations still owned by this fixture:
+        // driver core 12 KiB, coordinator 12 KiB, frozen preparation 19 KiB,
+        // and its one completed audio-selection capability 1 KiB.
+        let retainedFixtureContextBytes = (12 + 12 + 19 + 1) * 1_024
+        let expectedContextBytes = resourceBaseline + retainedFixtureContextBytes
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, expectedContextBytes,
+                       "a retired SDK callback or server-history owner must not hide in the subtotal")
+        // The captured application baseline already includes global bookkeeping
+        // and any preexisting context or metadata; count each allocation once.
+        XCTAssertEqual(server.usage.applicationChargedBytes,
+                       applicationBaseline + remainingMetadata.charge.chargedBytes
+                           + retainedFixtureContextBytes,
+                       "retired sockets leave exactly the baseline plus this fixture's retained owners")
         inspectPreparationStorage(stage: "quiescent-external-owner")
         _ = publication
     }

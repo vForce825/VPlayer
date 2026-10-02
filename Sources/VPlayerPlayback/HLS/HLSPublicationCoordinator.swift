@@ -211,6 +211,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     private let anchor: HLSProgramDateAnchor
     private let publicationDeadlineNanoseconds: Int64
     private let initialWindowMinimumSeconds: Int
+    private let publicationClock: HLSNaturalEndPublicationClock?
+    private var naturalEndDrainInProgress = false
     private var participants: [UInt64: HLSInitialParticipant] = [:]
     private var initializationKeys: [UInt64: HLSResourceKey] = [:]
     private var records: [UInt64: [HLSValidatedSegment]] = [:]
@@ -245,7 +247,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     init(store: SealedMediaStore, participants: [HLSInitialParticipant], declaration: HLSItemDeclaration,
          anchor: HLSProgramDateAnchor,
          publicationDeadlineNanoseconds: Int64 = 3_000_000_000,
-         initialWindowMinimumSeconds: Int = 6) throws {
+         initialWindowMinimumSeconds: Int = 6,
+         publicationClock: HLSNaturalEndPublicationClock? = nil) throws {
         guard publicationDeadlineNanoseconds > 0,
               [3, 6].contains(initialWindowMinimumSeconds) else {
             throw HLSPublicationFailure.invalidDuration
@@ -255,6 +258,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         self.anchor = anchor
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
         self.initialWindowMinimumSeconds = initialWindowMinimumSeconds
+        self.publicationClock = publicationClock
         participantGeneration = try PlaybackIdentityAllocator.shared.next(in: .admissionFence)
         owner = try store.claimPublicationOwner()
         do { try store.domain.sync {
@@ -448,7 +452,15 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
 
     @discardableResult
     func publish(ticket: PlaylistPublishTicket, now: Int64, naturalEnd: Bool = false) throws -> HLSPublicationResult {
+        try publish(ticket: ticket, now: now, naturalEnd: naturalEnd, ownedNaturalEndDrain: false)
+    }
+
+    private func publish(ticket: PlaylistPublishTicket, now: Int64, naturalEnd: Bool,
+                         ownedNaturalEndDrain: Bool) throws -> HLSPublicationResult {
         try store.domain.sync {
+            guard !naturalEndDrainInProgress || ownedNaturalEndDrain else {
+                throw HLSPublicationFailure.staleTicket
+            }
             try revalidate(ticket, now: now)
             guard !ended else { throw HLSPublicationFailure.closed }
             if naturalEnd, eofLastSequence == nil {
@@ -514,10 +526,9 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     return .waiting
                 }
                 if finishing && !ready && pendingCount != 0 { throw HLSPublicationFailure.invalidSequence }
-                // natural-end 是同一 writer terminal 的一次 publication CAS；把已验收的
-                // 连续尾段整体冻结，不能让调用方预猜要经过几个中间版本才能见到 ENDLIST。
-                lastSequence = finishing ? eofLastSequence!
-                    : (ready ? nextLogicalSequence : nextLogicalSequence - 1)
+                // EOF 只冻结终点，不跳过尚未公开的 prefix。每个 gate 最多增加一个
+                // 已验收共同 segment；准确终段才附加唯一 ENDLIST。
+                lastSequence = ready ? nextLogicalSequence : nextLogicalSequence - 1
                 let available = records.mapValues { $0.filter { $0.receipt.logicalSequence <= lastSequence } }
                 if initialWindowMinimumSeconds == 6 {
                     let six = available.mapValues { Array($0.suffix(6)) }
@@ -576,10 +587,16 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             let ticketNonce = try PlaybackIdentityAllocator.shared.next(in: .nonce)
             guard let reservation = try store.reserveSnapshotBatch(mediaCount: participants.count, includeMaster: sequence == 0 && declaration.video != nil) else {
                 if ticket.absoluteDeadline.map({ now >= $0 }) == true { _closed = true; throw HLSPublicationFailure.deadlineExceeded }
-                try store.waitForSnapshotCapacity(owner: owner, ticket: ticket) { [weak self] instant in
+                try store.waitForSnapshotCapacity(owner: owner, ticket: ticket,
+                    publicationClock: naturalEndDrainInProgress ? publicationClock : nil) { [weak self] instant in
                     guard let self else { return }
-                    do { _ = try self.publish(ticket: ticket, now: instant) }
-                    catch { self.store.cancelCapacityWait(owner: self.owner, ticket: ticket) }
+                    if self.naturalEndDrainInProgress {
+                        // 同一容量槽只唤醒原 finish runner；它会重读真实 clock 与准确 ticket。
+                        self.publicationClock?.signal()
+                    } else {
+                        do { _ = try self.publish(ticket: ticket, now: instant) }
+                        catch { self.store.cancelCapacityWait(owner: self.owner, ticket: ticket) }
+                    }
                 }
                 return .waiting
             }
@@ -616,6 +633,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 let master = sequence == 0 ? try HLSPlaylistSerializer.master(declaration) : nil
                 let authority = CommitAuthority(publisher: self, ticket: ticket, reservation: reservation,
                     media: media, master: master, records: normalized, now: now)
+                let clockAnchor = try publicationClock?.prepareCommit(logical: now)
                 try store.commit(authority)
                 sequence = newSequence
                 nextLogicalSequence = nextSequence
@@ -660,11 +678,102 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     aacTerminalBindings: aacTerminalBindings,
                     aacTimelineMappings: aacTimelineMappings,
                     aacRenditionBindings: aacRenditionBindings)
+                if let clockAnchor { publicationClock?.didCommit(clockAnchor) }
                 return .published
             } catch {
                 store.cancel(reservation)
                 throw error
             }
+        }
+    }
+
+    private enum NaturalEndStep {
+        case complete, insufficientInitialCoverage, published
+        case wait(UInt64)
+    }
+
+    /// 只由既有 media graph worker 调用。真实 terminal authority 冻结一次后，
+    /// 逐票 drain 至 ENDLIST；等待不占用 store executor，也不制造新 Task runner。
+    func drainNaturalEnd(scope: (any HLSNaturalEndPublicationScope)? = nil) async throws
+        -> HLSNaturalEndPublicationResult {
+        guard let publicationClock else { throw HLSPublicationFailure.identityMismatch }
+        var expected = try store.domain.sync { () -> PlaylistPublishTicket in
+            guard !naturalEndDrainInProgress else { throw HLSPublicationFailure.staleTicket }
+            try revalidate(_ticket, now: nil)
+            guard !ended else { throw HLSPublicationFailure.closed }
+            if sequence > 0, pendingCount > 8 { throw HLSPublicationFailure.capacityExceeded }
+            // 接管时准确撤销 ordinary auto-publication，不与它并行提交。
+            store.cancelCapacityWait(owner: owner)
+            naturalEndDrainInProgress = true
+            return _ticket
+        }
+        defer {
+            store.domain.sync {
+                store.cancelCapacityWait(owner: owner, ticket: expected)
+                naturalEndDrainInProgress = false
+            }
+            publicationClock.stopWaiting()
+        }
+        while true {
+            try Task.checkCancellation()
+            publicationClock.consumeSignal()
+            // graph 调用方在同步 scope 内持有自己的 condition，然后才取 store 域。
+            // 失败 ingress 与这一笔 CAS 由同一 graph→store 锁序排序；await 在 scope 外。
+            let step: NaturalEndStep
+            if let scope {
+                step = try scope.withActivePublication {
+                    try naturalEndStep(expected: &expected, clock: publicationClock)
+                }
+            } else {
+                step = try naturalEndStep(expected: &expected, clock: publicationClock)
+            }
+            switch step {
+            case .complete: return .endListPublished
+            case .insufficientInitialCoverage: return .insufficientInitialCoverage
+            case .published: continue
+            case .wait(let instant): try await publicationClock.wait(until: instant)
+            }
+        }
+    }
+
+    private func naturalEndStep(expected: inout PlaylistPublishTicket,
+                                clock publicationClock: HLSNaturalEndPublicationClock) throws -> NaturalEndStep {
+        try store.domain.sync {
+            try revalidate(expected, now: nil)
+            let instant = try publicationClock.now()
+            let previousSequence = sequence
+            let previousPending = pendingCount
+            let result = try publish(ticket: expected, now: instant.logical,
+                naturalEnd: true, ownedNaturalEndDrain: true)
+            if result == .published {
+                _ = try publicationClock.now()
+                // 初始 prefix 可一次首发；steady EOF 每次只能消费一个实际 backlog。
+                if previousSequence > 0 {
+                    guard pendingCount == max(0, previousPending - 1) else {
+                        throw HLSPublicationFailure.invalidSequence
+                    }
+                }
+                expected = _ticket
+                return ended ? .complete : .published
+            }
+            guard sequence > 0 else { return .insufficientInitialCoverage }
+            guard let previousInstant = expected.previousPublishInstant,
+                  let deadline = expected.absoluteDeadline else {
+                throw HLSPublicationFailure.identityMismatch
+            }
+            let nextVideoDuration = declaration.video.flatMap { video in
+                records[video.participantID]?.first {
+                    $0.receipt.logicalSequence == nextLogicalSequence
+                }?.commonDuration ?? records[video.participantID]?.last?.commonDuration
+            } ?? HLSChecked.one
+            let interval = max(Int64(1_000_000_000), try HLSChecked.nanoseconds(nextVideoDuration))
+            let earliest = try HLSChecked.add(previousInstant, interval)
+            let wake = instant.logical < earliest ? min(earliest, deadline) : deadline
+            guard wake > instant.logical else {
+                _ = try self.deadline(ticket: expected, now: instant.logical)
+                throw HLSPublicationFailure.deadlineExceeded
+            }
+            return .wait(try publicationClock.monotonicDeadline(for: wake, from: instant))
         }
     }
 
@@ -830,6 +939,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         guard let deadline = ticket.absoluteDeadline, now >= deadline else { return .waiting }
         _closed = true
         store.cancelCapacityWait(owner: owner)
+        publicationClock?.signal()
         throw HLSPublicationFailure.deadlineExceeded
     } }
 
@@ -997,6 +1107,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             retirements[nonce] = reconfiguration
             if participants.isEmpty { _closed = true; store.close(); _ticket = ticket }
             else { _ticket = try makeTicket(); try bindStoreTicket() }
+            publicationClock?.signal()
             return reconfiguration
         }
     }
@@ -1025,6 +1136,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     } }
     func close() { store.domain.sync {
         _closed = true
+        publicationClock?.signal()
         for (id, participant) in participants {
             installRetirementFence(participant.proof.binding); retiredParticipantIDs.insert(id)
         }
@@ -1128,6 +1240,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             }
             participantGeneration = generation
             _ticket = next
+            publicationClock?.signal()
             for input in inputs {
                 let source = input.initialization.publicationEvidence!.writerSource
                 // observer 只持有弱 publisher；准确 source/relay receipt 的一次性 CAS 不依赖 caller terminal 值。
@@ -1144,12 +1257,14 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         if let now, let deadline = ticket.absoluteDeadline, now > deadline {
             _closed = true
             store.cancelCapacityWait(owner: owner)
+            publicationClock?.signal()
             throw HLSPublicationFailure.deadlineExceeded
         }
     }
     private func bindStoreTicket() throws {
         try store.bindPublication(_ticket, owner: owner,
             declarations: Dictionary(uniqueKeysWithValues: participants.keys.map { ($0, declarationFor($0)) }))
+        publicationClock?.signal()
     }
     private func declarationFor(_ id: UInt64) -> HLSItemDeclaration { participants[id]?.candidate?.declaration ?? declaration }
     private func peakEnvelope(for id: UInt64) -> UInt64 {

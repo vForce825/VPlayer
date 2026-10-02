@@ -8,6 +8,7 @@ import Foundation
 import UniformTypeIdentifiers
 import CoreVideo
 import XCTest
+import VPlayerCore
 import zlib
 @testable import VPlayerPlayback
 
@@ -246,6 +247,397 @@ final class HLSPublisherTests: XCTestCase {
         try await unequal.offer(participant: 2, count: 1)
         XCTAssertThrowsError(try unequal.publisher.publish(ticket: unequal.publisher.ticket, now: Task19.second, naturalEnd: true))
         XCTAssertFalse(unequal.publisher.visible!.media.values.contains { $0.text.contains("ENDLIST") })
+    }
+
+    func testNaturalEndOwnedDrainWaitsForEachRealGateAndPublishesAllEightTails() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(terminalLogicalSequence: 13, publicationClock: timing)
+        try await h.initial()
+        try await h.offerBoth(count: 8)
+        let finished = Task19Counter()
+        let task = Task { let result = try await h.publisher.drainNaturalEnd(); finished.add(); return result }
+        defer { task.cancel(); h.publisher.close() }
+        await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+        clock.set(100 + UInt64(Task19.second) - 1)
+        clock.fireDeadlineTimerEarly()
+        await Task.yield()
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, 5)
+        XCTAssertEqual(finished.value, 0)
+        for offset in 1...8 {
+            clock.set(100 + UInt64(offset) * UInt64(Task19.second))
+            await assertNaturalEndEventually {
+                h.publisher.visible?.media[1]?.logicalSequences.last == UInt64(5 + offset)
+            }
+            XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 8 - offset)
+            XCTAssertEqual(h.publisher.visible!.media.values.allSatisfy {
+                $0.text.contains("#EXT-X-ENDLIST")
+            }, offset == 8)
+            if offset < 8 {
+                XCTAssertEqual(finished.value, 0)
+                await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+            }
+        }
+        let result = try await task.value
+        XCTAssertEqual(result, .endListPublished)
+        XCTAssertEqual(finished.value, 1)
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 9)
+        XCTAssertEqual(clock.deadlineTimerHandlerInstallationCount, 1)
+        XCTAssertEqual(h.store.capacityWaiterCount, 0)
+        XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+    }
+
+    func testNaturalEndEntryUsesElapsedTimeSinceCommitAndNeverRenewsExpiredBudget() async throws {
+        for elapsed in [UInt64(999_999_999), UInt64(3_000_000_001)] {
+            let clock = ManualPlaybackClock(100)
+            let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+            let h = try await Task19Harness(terminalLogicalSequence: 6, publicationClock: timing)
+            try await h.initial()
+            try await h.offerBoth(count: 1)
+            clock.set(100 + elapsed)
+            let task = Task { try await h.publisher.drainNaturalEnd() }
+            defer { task.cancel(); h.publisher.close() }
+            if elapsed < UInt64(Task19.second) {
+                await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+                XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+                clock.set(100 + UInt64(Task19.second))
+                let result = try await task.value
+                XCTAssertEqual(result, .endListPublished)
+                XCTAssertEqual(h.publisher.visible?.publicationSequence, 2)
+            } else {
+                do { _ = try await task.value; XCTFail("EOF entry must not renew an expired publication ticket") }
+                catch { XCTAssertEqual(error as? HLSPublicationFailure, .deadlineExceeded) }
+                XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+            }
+        }
+    }
+
+    func testNaturalEndCancellationCloseAndParticipantFenceCannotPublishLateTail() async throws {
+        for terminal in 0..<3 {
+            let clock = ManualPlaybackClock(100)
+            let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+            let h = try await Task19Harness(audioOnly: true, audioCount: 2,
+                terminalLogicalSequence: 6, publicationClock: timing)
+            try await h.initial()
+            try await h.offerBoth(count: 1)
+            let task = Task { try await h.publisher.drainNaturalEnd() }
+            defer { task.cancel(); h.publisher.close() }
+            await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+            let ticket = h.publisher.ticket
+            if terminal == 0 { task.cancel() }
+            else if terminal == 1 { h.publisher.close() }
+            else { _ = try h.publisher.reconfigure(retiring: [3], ticket: ticket) }
+            do { _ = try await task.value; XCTFail("Retired EOF wait must fail") }
+            catch {
+                if terminal == 0 { XCTAssertTrue(error is CancellationError) }
+                else { XCTAssertEqual(error as? HLSPublicationFailure, terminal == 1 ? .closed : .staleTicket) }
+            }
+            clock.set(100 + UInt64(Task19.second))
+            XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+            XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertEqual(h.store.capacityWaiterCount, 0)
+            XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+        }
+    }
+
+    func testNaturalEndFailureWakeKeepsOriginalDiagnosticAndDoesNotPublish() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(terminalLogicalSequence: 6, publicationClock: timing)
+        try await h.initial()
+        try await h.offerBoth(count: 1)
+        let scope = Task19NaturalEndScope()
+        let original = ErrorDiagnosticSnapshot(NSError(domain: "HLS.EOF.Original", code: -91))
+        let task = Task { try await h.publisher.drainNaturalEnd(scope: scope) }
+        defer { task.cancel(); h.publisher.close() }
+        await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+        scope.fail(original)
+        timing.signal()
+        do { _ = try await task.value; XCTFail("The original graph failure must interrupt its EOF wait") }
+        catch { XCTAssertEqual(error as? ErrorDiagnosticSnapshot, original) }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+        XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+        XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+    }
+
+    func testNaturalEndFailureScopeRejectsTheDuePublicationBeforeItsCAS() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(terminalLogicalSequence: 6, publicationClock: timing)
+        try await h.initial()
+        try await h.offerBoth(count: 1)
+        clock.set(100 + UInt64(Task19.second))
+        let failure = ErrorDiagnosticSnapshot(NSError(domain: "HLS.EOF.BeforeCAS", code: -92))
+        let scope = Task19NaturalEndScope()
+        scope.fail(failure)
+        do {
+            _ = try await h.publisher.drainNaturalEnd(scope: scope)
+            XCTFail("A failure holding the graph publication scope must win before a due CAS")
+        } catch { XCTAssertEqual(error as? ErrorDiagnosticSnapshot, failure) }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 1)
+        XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+        XCTAssertEqual(h.store.capacityWaiterCount, 0)
+        h.publisher.close()
+    }
+
+    func testNaturalEndCommittedSnapshotSurvivesLaterFailureWithoutReportingSuccess() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(terminalLogicalSequence: 6, publicationClock: timing)
+        try await h.initial()
+        try await h.offerBoth(count: 1)
+        clock.set(100 + UInt64(Task19.second))
+        let failure = ErrorDiagnosticSnapshot(NSError(domain: "HLS.EOF.AfterCAS", code: -93))
+        let scope = Task19NaturalEndScope(failAfterOperation: failure)
+        let successes = Task19Counter()
+        do {
+            _ = try await h.publisher.drainNaturalEnd(scope: scope)
+            successes.add()
+            XCTFail("A later first failure must prevent a successful terminal result")
+        } catch { XCTAssertEqual(error as? ErrorDiagnosticSnapshot, failure) }
+        XCTAssertEqual(successes.value, 0)
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 2)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, 6)
+        XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { $0.text.contains("#EXT-X-ENDLIST") },
+            "The failure cannot retroactively rewrite the already committed immutable snapshot")
+        XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+        h.publisher.close()
+    }
+
+    func testNaturalEndCapacityWakeUsesOneSlotAndCommitAnchorIncludesOrdinaryWake() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(audioCount: 3, terminalLogicalSequence: 8, publicationClock: timing)
+        try await h.initial()
+        let old = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0)) }
+        try await h.offerBoth(count: 1)
+        clock.set(100 + UInt64(Task19.second))
+        _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
+        try await h.offerBoth(count: 1, now: Task19.second)
+        clock.set(100 + 2 * UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 2 * Task19.second), .waiting)
+        XCTAssertEqual(h.store.capacityWaiterCount, 1)
+        for lease in old { h.store.release(lease, completedAt: nil, now: 2 * Task19.second) }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 3,
+            "The ordinary capacity callback must still publish without an external retry")
+        let pinned = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 2 * Task19.second)) }
+        try await h.offerBoth(count: 1, now: 2 * Task19.second)
+        let task = Task { try await h.publisher.drainNaturalEnd() }
+        defer { task.cancel(); h.publisher.close() }
+        await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+        clock.set(100 + 3 * UInt64(Task19.second) - 1)
+        clock.fireDeadlineTimerEarly()
+        await Task.yield()
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 3,
+            "The auto-publication at logical 2s must own the new monotonic anchor")
+        clock.set(100 + 3 * UInt64(Task19.second))
+        let result = try await task.value
+        XCTAssertEqual(result, .endListPublished)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, 8)
+        for lease in pinned { h.store.release(lease, completedAt: nil, now: 3 * Task19.second) }
+    }
+
+    func testNaturalEndCapacityReleaseDeadlineAndCancellationKeepOneOwnedWait() async throws {
+        for outcome in 0..<3 {
+            let clock = ManualPlaybackClock(100)
+            let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+            let h = try await Task19Harness(audioCount: 3, terminalLogicalSequence: 8, publicationClock: timing)
+            try await h.initial()
+            let old = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0)) }
+            try await h.offerBoth(count: 1)
+            clock.set(100 + UInt64(Task19.second))
+            _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
+            try await h.offerBoth(count: 2, now: Task19.second)
+            let finished = Task19Counter()
+            let task = Task { let result = try await h.publisher.drainNaturalEnd(); finished.add(); return result }
+            defer { task.cancel(); h.publisher.close() }
+            await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+            clock.set(100 + 2 * UInt64(Task19.second))
+            await assertNaturalEndEventually { h.store.capacityWaiterCount == 1 }
+            XCTAssertEqual(h.publisher.visible?.publicationSequence, 2)
+            XCTAssertEqual(h.publisher.ticket.absoluteDeadline, 4 * Task19.second)
+            XCTAssertEqual(finished.value, 0)
+            if outcome == 1 { clock.set(100 + 4 * UInt64(Task19.second) + 1) }
+            if outcome == 2 { task.cancel() }
+            if outcome == 0 {
+                for lease in old.dropLast() {
+                    h.store.release(lease, completedAt: nil, now: 90_000 * Task19.second)
+                    XCTAssertEqual(h.publisher.visible?.publicationSequence, 2)
+                    XCTAssertEqual(h.store.capacityWaiterCount, 1)
+                }
+                h.store.release(old.last!, completedAt: nil, now: 90_000 * Task19.second)
+                await assertNaturalEndEventually { h.publisher.visible?.publicationSequence == 3 }
+                XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, 7)
+                XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 1)
+                XCTAssertEqual(finished.value, 0)
+                await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+                clock.set(100 + 3 * UInt64(Task19.second))
+                let result = try await task.value
+                XCTAssertEqual(result, .endListPublished)
+                XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, 8)
+            } else {
+                do { _ = try await task.value; XCTFail("Blocked terminal publication must not complete") }
+                catch {
+                    if outcome == 1 { XCTAssertEqual(error as? HLSPublicationFailure, .deadlineExceeded) }
+                    else { XCTAssertTrue(error is CancellationError) }
+                }
+                for lease in old { h.store.release(lease, completedAt: nil, now: 4 * Task19.second + 1) }
+                XCTAssertEqual(h.publisher.visible?.publicationSequence, 2,
+                    "A late capacity release must not resurrect the cancelled finish runner")
+            }
+            XCTAssertEqual(h.store.capacityWaiterCount, 0)
+            XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+        }
+    }
+
+    func testNaturalEndShortPrefixIsExplicitlyIncompleteAndEndListOnlyUsesTheGate() async throws {
+        let shortClock = ManualPlaybackClock(100)
+        let shortTiming = try HLSNaturalEndPublicationClock.make(clock: shortClock)
+        let short = try await Task19Harness(terminalLogicalSequence: 1, publicationClock: shortTiming)
+        try await short.offerBoth(count: 2)
+        let shortResult = try await short.publisher.drainNaturalEnd()
+        XCTAssertEqual(shortResult, .insufficientInitialCoverage)
+        XCTAssertNil(short.publisher.visible,
+            "Real writer EOF below initial coverage cannot claim a playable prefix or ENDLIST")
+        XCTAssertFalse(shortClock.hasScheduledDeadlineTimer)
+        short.publisher.close()
+
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(terminalLogicalSequence: 5, publicationClock: timing)
+        try await h.initial()
+        let task = Task { try await h.publisher.drainNaturalEnd() }
+        defer { task.cancel(); h.publisher.close() }
+        await assertNaturalEndEventually { clock.hasScheduledDeadlineTimer }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+        XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+        clock.set(100 + UInt64(Task19.second))
+        let result = try await task.value
+        XCTAssertEqual(result, .endListPublished)
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 2)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, 5)
+        XCTAssertTrue(h.publisher.visible!.media.values.allSatisfy { $0.text.contains("#EXT-X-ENDLIST") })
+        XCTAssertThrowsError(try h.publisher.publish(ticket: h.publisher.ticket, now: 2 * Task19.second, naturalEnd: true))
+    }
+
+    func testNaturalEndAnchorStartsAtCompletedCommitAndRejectsClockFaultInsideCommit() throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let prepared = try timing.prepareCommit(logical: Task19.second)
+        clock.set(200)
+        timing.didCommit(prepared)
+        clock.set(250)
+        XCTAssertEqual(try timing.now().logical, Task19.second + 50,
+            "Time spent committing must not let the next gate become visible early")
+        let next = try timing.prepareCommit(logical: 2 * Task19.second)
+        clock.set(249)
+        timing.didCommit(next)
+        clock.set(300)
+        XCTAssertThrowsError(try timing.now()) { error in
+            XCTAssertEqual(error as? HLSPublicationFailure, .arithmeticOverflow,
+                "Returning past the old timestamp cannot erase a clock fault during commit")
+        }
+        timing.stopWaiting()
+    }
+
+    func testNaturalEndClockChargeSurvivesCancelledTimerHandlerUntilPhysicalRelease() throws {
+        let application = PlaybackApplicationChargeLedger()
+        let ledger = PlaybackResourceContextLedger(applicationLedger: application)
+        let clock = Task19HeldPublicationClock()
+        var timing: HLSNaturalEndPublicationClock? = try HLSNaturalEndPublicationClock.make(clock: clock, ledger: ledger)
+        weak var weakTiming = timing
+        XCTAssertEqual(ledger.chargedBytes, HLSNaturalEndPublicationClock.reservationBytes)
+        timing?.stopWaiting()
+        timing = nil
+        XCTAssertNil(weakTiming, "The source handler must not strongly retain its owner")
+        XCTAssertTrue(clock.timer.cancelled)
+        XCTAssertEqual(ledger.chargedBytes, HLSNaturalEndPublicationClock.reservationBytes,
+            "Cancellation does not retire the physically held callback capture")
+        clock.timer.releaseHandler()
+        XCTAssertEqual(ledger.chargedBytes, 0)
+        XCTAssertEqual(application.chargedBytes, 0)
+    }
+
+    func testNaturalEndClockAccountsRealObjectsAndReleasesOnlyItsOwnedReservation() async throws {
+        let application = PlaybackApplicationChargeLedger()
+        let ledger = PlaybackResourceContextLedger(applicationLedger: application)
+        let other = try ledger.reserve(allocationIdentity: .stable(UUID()), bytes: 17)
+        var timing: HLSNaturalEndPublicationClock? = try HLSNaturalEndPublicationClock.make(ledger: ledger)
+        weak var weakTiming = timing
+        let measured = try XCTUnwrap(timing).knownAllocationUpperBoundBytes
+        print("HLS_EOF_CLOCK_ALLOCATION measuredObjectsPlusFixedABI=\(measured) reserved=\(HLSNaturalEndPublicationClock.reservationBytes) nativeSourceAllowance=128")
+        XCTAssertGreaterThan(measured, 0)
+        XCTAssertLessThanOrEqual(measured, HLSNaturalEndPublicationClock.reservationBytes)
+        XCTAssertEqual(ledger.chargedBytes, HLSNaturalEndPublicationClock.reservationBytes + 17)
+        XCTAssertEqual(application.chargedBytes, ledger.chargedBytes)
+        timing?.stopWaiting()
+        timing = nil
+        await assertNaturalEndEventually { weakTiming == nil && ledger.chargedBytes == 17 }
+        XCTAssertEqual(application.chargedBytes, 17)
+        ledger.release(other)
+        XCTAssertEqual(application.chargedBytes, 0)
+    }
+
+    func testNaturalEndWaitKeepsSignalBeforeInstallAndRejectsOldTimerAfterRearm() async throws {
+        let clock = Task19HeldPublicationClock()
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        timing.consumeSignal()
+        timing.signal() // capacity changes after state read, before continuation installation.
+        try await timing.wait(until: 200)
+        XCTAssertNil(clock.timer.deadline)
+
+        let first = Task { try await timing.wait(until: 200) }
+        await assertNaturalEndEventually { clock.timer.deadline == 200 }
+        let oldDelivery = try XCTUnwrap(clock.timer.captureHandler())
+        timing.signal()
+        try await first.value
+        timing.consumeSignal()
+        let completions = Task19Counter()
+        let second = Task { try await timing.wait(until: 300); completions.add() }
+        await assertNaturalEndEventually { clock.timer.deadline == 300 }
+        clock.set(200)
+        oldDelivery()
+        XCTAssertEqual(completions.value, 0)
+        XCTAssertEqual(clock.timer.deadline, 300,
+            "A callback from the previous schedule must preserve the current later deadline")
+        clock.set(300)
+        oldDelivery()
+        try await second.value
+        XCTAssertEqual(completions.value, 1)
+        timing.stopWaiting()
+        do { try await timing.wait(until: 400); XCTFail("A retired wait owner cannot be reused") }
+        catch { XCTAssertEqual(error as? HLSPublicationFailure, .closed) }
+        XCTAssertThrowsError(try timing.now()) { error in
+            XCTAssertEqual(error as? HLSPublicationFailure, .closed)
+        }
+        clock.timer.releaseHandler()
+    }
+
+    func testNaturalEndClockRejectsBackwardsTimeAndOverflowWithoutPublishing() async throws {
+        for backwards in [true, false] {
+            let origin: UInt64 = backwards ? 100 : UInt64.max - 10
+            let clock = ManualPlaybackClock(origin)
+            let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+            let h = try await Task19Harness(terminalLogicalSequence: 6, publicationClock: timing)
+            try await h.initial()
+            try await h.offerBoth(count: 1)
+            if backwards { clock.set(99) }
+            do { _ = try await h.publisher.drainNaturalEnd(); XCTFail("An invalid clock must not authorize publication") }
+            catch { XCTAssertEqual(error as? HLSPublicationFailure, .arithmeticOverflow) }
+            XCTAssertEqual(h.publisher.visible?.publicationSequence, 1)
+            XCTAssertEqual(h.store.capacityWaiterCount, 0)
+            h.publisher.close()
+        }
+    }
+
+    private func assertNaturalEndEventually(
+        file: StaticString = #filePath, line: UInt = #line,
+        _ condition: () -> Bool
+    ) async {
+        let deadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+        while !condition(), DispatchTime.now().uptimeNanoseconds < deadline { await Task.yield() }
+        XCTAssertTrue(condition(), file: file, line: line)
     }
 
     func testReviewI4RejectsUnboundReportsWholeOffsetAndIllegalFirstShortWindow() async throws {
@@ -1493,6 +1885,7 @@ final class Task19Harness: @unchecked Sendable {
          publicationDeadlineNanoseconds: Int64 = 3_000_000_000,
          initialWindowMinimumSeconds: Int = 6,
          terminalLogicalSequence: UInt64? = nil,
+         publicationClock: HLSNaturalEndPublicationClock? = nil,
          initialFormatVariants: [UInt64: Task19.FormatVariant] = [:]) async throws {
         let sessionToken = loopbackSession?.value ?? token
         store = loopbackSession.map { SealedMediaStore(loopbackSession: $0, itemGeneration: 19) }
@@ -1545,7 +1938,8 @@ final class Task19Harness: @unchecked Sendable {
             declaration: declaration,
             anchor: .init(mediaOrigin: Task19.time(0), utcMilliseconds: 1_788_912_000_000),
             publicationDeadlineNanoseconds: publicationDeadlineNanoseconds,
-            initialWindowMinimumSeconds: initialWindowMinimumSeconds)
+            initialWindowMinimumSeconds: initialWindowMinimumSeconds,
+            publicationClock: publicationClock)
     }
     static func detachedParticipants() async throws -> [HLSInitialParticipant] {
         var participants: [HLSInitialParticipant] = []
@@ -2222,4 +2616,46 @@ private func assertTask19ThrowsError<T>(
         _ = try await expression()
         XCTFail("Expected an error. \(message())", file: file, line: line)
     } catch {}
+}
+
+/// A native timer may retain its installed handler beyond cancel. This fake holds that exact
+/// physical tail until the test releases it; it never signs a publication or alters a ticket.
+private final class Task19HeldPublicationClock: PlaybackMonotonicClock, @unchecked Sendable {
+    let timer = Task19HeldPublicationTimer()
+    private let lock = NSLock()
+    private var instant: UInt64 = 100
+    var nowNanoseconds: UInt64 { lock.withLock { instant } }
+    func set(_ instant: UInt64) { lock.withLock { self.instant = instant } }
+    func makeDeadlineTimer(deliveryQueue: DispatchQueue) -> any PlaybackDeadlineTimer { timer }
+}
+
+private final class Task19HeldPublicationTimer: PlaybackDeadlineTimer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable () -> Void)?
+    private var storedCancelled = false
+    private var storedDeadline: UInt64?
+    var cancelled: Bool { lock.withLock { storedCancelled } }
+    var deadline: UInt64? { lock.withLock { storedDeadline } }
+    func setEventHandler(_ handler: @escaping @Sendable () -> Void) { lock.withLock { self.handler = handler } }
+    func schedule(notAfterInstant: UInt64?) { lock.withLock { storedDeadline = notAfterInstant } }
+    func activate() {}
+    func cancel() { lock.withLock { storedCancelled = true; storedDeadline = nil } }
+    func captureHandler() -> (@Sendable () -> Void)? { lock.withLock { handler } }
+    func releaseHandler() { lock.withLock { handler = nil } }
+}
+
+private final class Task19NaturalEndScope: HLSNaturalEndPublicationScope, @unchecked Sendable {
+    private let lock = NSLock()
+    private var failure: ErrorDiagnosticSnapshot?
+    private let failAfterOperation: ErrorDiagnosticSnapshot?
+    init(failAfterOperation: ErrorDiagnosticSnapshot? = nil) { self.failAfterOperation = failAfterOperation }
+    func fail(_ error: ErrorDiagnosticSnapshot) { lock.withLock { if failure == nil { failure = error } } }
+    func withActivePublication<T>(_ operation: () throws -> T) throws -> T {
+        try lock.withLock {
+            if let failure { throw failure }
+            let result = try operation()
+            if let failAfterOperation { failure = failAfterOperation; throw failAfterOperation }
+            return result
+        }
+    }
 }

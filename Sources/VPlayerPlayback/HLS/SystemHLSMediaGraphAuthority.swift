@@ -1691,11 +1691,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             }
             _ = try await videoWriter.finish()
         }
-        try publication.finishNaturalEnd()
+        let publicationResult = try await publication.finishNaturalEnd()
         setDiagnosticStage("naturalEOF.complete")
         condition.withLock {
             guard state != .failed, state != .retiring, state != .retired else { return }
-            terminalResult = true
+            terminalResult = publicationResult == .endListPublished
             condition.broadcast()
         }
     }
