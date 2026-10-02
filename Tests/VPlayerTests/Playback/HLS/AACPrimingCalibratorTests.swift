@@ -10,6 +10,89 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AACPrimingCalibratorTests: XCTestCase {
+    func testAwaitedReaderValueDistinguishesEOFAndOriginalFailure() async throws {
+        let lane = AACOwnedCallLane()
+        let sample: Int? = try await lane.callAwaiting { 7 }
+        XCTAssertEqual(sample, 7)
+        let eof: Int? = try await lane.callAwaiting { nil }
+        XCTAssertNil(eof)
+        do {
+            let _: Int? = try await lane.callAwaiting {
+                throw NSError(domain: "AAC.NativeReader", code: -73,
+                    userInfo: [NSLocalizedDescriptionKey: "reader failure is not EOF"])
+            }
+            XCTFail("reader failure must not become nil")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "AAC.NativeReader")
+            XCTAssertEqual((error as NSError).code, -73)
+        }
+        XCTAssertNoThrow(try lane.call {})
+    }
+
+    func testAwaitedReaderDiscardsLateSampleAfterCancellation() async throws {
+        let lane = AACOwnedCallLane()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "provider next is suspended")
+        let read = Task {
+            try await lane.callAwaiting { () async throws -> Int? in
+                entered.fulfill()
+                await gate.wait()
+                return 7
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        lane.requestCancel()
+        XCTAssertFalse(lane.finishCancellation { XCTFail("reader still owns its permit") })
+        await gate.open()
+        do {
+            _ = try await read.value
+            XCTFail("a late reader sample cannot enter the decoder after cancellation")
+        } catch {
+            XCTAssertEqual(error as? AACRenditionFailure, .cancelled)
+        }
+        XCTAssertTrue(lane.finishCancellation {})
+    }
+
+    func testOwnedReaderSamplePreservesPacketsAndBothAttachmentModes() throws {
+        let calibrator = AACPrimingCalibrator()
+        let request = try AACPrimingCalibratorTestHarness.request([.c])
+        let plan = try AACCalibrationPlan.build([request])
+        let encoder = try AACRenditionEncoder(
+            identity: .init(plan: plan, ordinal: 0, request: request, nonce: ConverterInstanceNonce()),
+            lane: calibrator.lane, workspace: calibrator.workspace,
+            observer: AACDefaultCalibrationObserver(), presentationTerminal: calibrator.presentationTerminal)
+        defer { encoder.dispose() }
+        let pass = try encoder.encodePass(
+            AACPrimingCalibratorTestHarness.signal(frames: 4_096, channels: 1),
+            cookieStage: .finalizedPass(1))
+        let epoch = try encoder.makeEpoch(pass: pass, realFrames: pass.totalFrames, leading: 0)
+        let original = try XCTUnwrap(epoch.buffers.first)
+        let propagated = "VPlayer.Reader.Propagated" as CFString
+        let privateKey = "VPlayer.Reader.NonPropagated" as CFString
+        CMSetAttachment(original, key: propagated, value: kCFBooleanTrue,
+                        attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        CMSetAttachment(original, key: privateKey, value: kCFBooleanTrue,
+                        attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        let ready = try makeReadyWriterFixtureSample(copying: original)
+        let owned = try AACSystemLoopback.ownedReaderSample(copying: ready)
+        XCTAssertNotEqual(ObjectIdentifier(owned), ObjectIdentifier(original))
+        XCTAssertNotEqual(ObjectIdentifier(owned), ready.withUnsafeSampleBuffer { ObjectIdentifier($0) })
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(owned), CMSampleBufferGetPresentationTimeStamp(original))
+        XCTAssertEqual(CMSampleBufferGetDuration(owned), CMSampleBufferGetDuration(original))
+        XCTAssertEqual(try AACPrimingCalibratorTestHarness.packetIdentity([owned]),
+                       try AACPrimingCalibratorTestHarness.packetIdentity([original]))
+        for (key, mode) in [(propagated, kCMAttachmentMode_ShouldPropagate),
+                            (privateKey, kCMAttachmentMode_ShouldNotPropagate)] {
+            var actualMode = kCMAttachmentMode_ShouldPropagate
+            XCTAssertNotNil(CMGetAttachment(owned, key: key, attachmentModeOut: &actualMode))
+            XCTAssertEqual(actualMode, mode)
+            CMRemoveAttachment(owned, key: key)
+            XCTAssertTrue(ready.withUnsafeSampleBuffer {
+                CMGetAttachment($0, key: key, attachmentModeOut: nil) != nil
+            }, "owned header edits must not mutate the provider header")
+        }
+    }
+
     func testAwaitedOwnedCallRejectsOverlapAndLateSuccessAfterCancellation() async throws {
         let lane = AACOwnedCallLane()
         let gate = AACCalibrationAppendGate()

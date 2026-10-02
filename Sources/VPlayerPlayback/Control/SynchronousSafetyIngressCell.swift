@@ -360,10 +360,11 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         }
     }
 
-    func performPlaybackAdmission(requestID: UUID) -> PlaybackSafetyBarrierResult<PlaybackRequestAdmissionResult> {
-        switch performOutputControl(.playbackAdmission(requestID)) {
+    func performPlaybackAdmission(requestID: UUID,
+        originalActionEpoch: AudioSessionLifecycleEpoch) -> PlaybackSafetyBarrierResult<PlaybackRequestAdmissionResult> {
+        switch performOutputControl(.playbackAdmission(requestID, originalActionEpoch: originalActionEpoch)) {
         case .retry: .retry
-        case .performed(.playbackAdmitted(let admission, _, _)): .performed(.admitted(admission))
+        case .performed(.playbackAdmitted(let admission, _, _, _)): .performed(.admitted(admission))
         case .performed(.playbackAdmissionNeedsCleanupJoin): .performed(.needsCleanupJoin)
         default: .rejected
         }
@@ -388,8 +389,10 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         if descriptor == .resourceOwnership, state.failure != nil { return .rejected }
         let application = applyOutputControl(request, state)
         switch application {
-        case .playbackAdmitted(_, let output, let freeze):
-            if state.mediaServicesResumeRequired {
+        case .playbackAdmitted(_, let output, let freeze, let clearsMediaServicesResume):
+            // Mirror only the original action's authorization accepted by Authority
+            // under this lock; admission itself does not authorize a newer reset.
+            if clearsMediaServicesResume {
                 state.mediaServicesResumeRequired = false
                 if state.interruptionState != .began { state.interruptionVeto = false }
             }

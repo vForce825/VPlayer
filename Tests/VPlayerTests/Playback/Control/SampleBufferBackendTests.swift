@@ -20,10 +20,22 @@ final class SampleBufferBackendTests: XCTestCase {
     func testFinalSampleBufferRateZeroRequiresPrivateIssuerAndRejectsBooleanReplayAndWrongIncarnation()
         async throws {
         let sticky = try await FinalSampleBufferBackendProbe.make(honorsRateZero: false)
-        let stickyResult = await sticky.runSuspend()
-        if case .succeeded = stickyResult {
-            XCTFail("pipeline 忽略 rate=0 时，caller bool/普通 proof 不能关闭 interval")
+        let stickyOwner = try await sticky.beginSuspend()
+        let stickyCleanup = try XCTUnwrap(sticky.graph.registry.claimOutputBackendCleanup(
+            stickyOwner.suspend.task, owner: stickyOwner.owner))
+        let stickyInvocation = try XCTUnwrap(stickyCleanup.suspendInvocation)
+        XCTAssertFalse(sticky.graph.coordinator.completeSuspend(.init(
+            suspendTicket: stickyOwner.suspend, closeClaim: stickyInvocation.closeClaim,
+            directlyConfirmedRateZero: true, preparedPreserved: true)),
+            "caller Boolean 即使匹配准确 close claim 也不能关闭 interval")
+        // Inspect the suspend phase before the registered runner can perform
+        // its legitimate retirement fallback and close the interval by teardown.
+        let stickyResult = await sticky.backend.suspendOutput(invocation: stickyInvocation)
+        guard case .requiresRetirement = stickyResult else {
+            return XCTFail("pipeline 忽略 rate=0 时不能签发静止证明，必须要求 retirement")
         }
+        XCTAssertTrue(sticky.graph.registry.completeOutputSuspend(stickyResult,
+            invocation: stickyInvocation, backend: sticky.backend))
         XCTAssertEqual(sticky.backend.physicalRate, 1,
                        "拒绝路径必须保持真实 SampleBuffer pipeline 物理时钟非零")
         XCTAssertNotNil(sticky.graph.registry.outputResourceContextSnapshot()?.interval)
@@ -221,14 +233,6 @@ private extension FinalSampleBufferBackendProbe {
             return (owner, suspend)
         }
 
-        func runSuspend() async -> PlaybackBackendOperationResult {
-            guard let pair = try? await beginSuspend(),
-                  graph.registry.startOutputSuspendOperation(pair.suspend.task,
-                                                            owner: pair.owner) else {
-                return .canceled
-            }
-            return await graph.registry.joinOutputBackendOperation(pair.suspend.task)
-        }
     }
 
     static func make(honorsRateZero: Bool, holdQuiescenceProof: Bool = false)

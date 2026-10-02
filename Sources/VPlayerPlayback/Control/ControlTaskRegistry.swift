@@ -1049,7 +1049,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             allocator: PlaybackIdentityAllocator, instant: UInt64) -> OutputControlApplication {
             precondition(!resourceTransactionActive, "具名控制不能重入资源CAS")
             switch request {
-            case .playbackAdmission(let requestID):
+            case .playbackAdmission(let requestID, let originalActionEpoch):
                 guard resourceState != nil || !commands.contains(where: {
                     if case .controllerCleanup = $0?.payload { return true }; return false
                 }) else { return .playbackAdmissionNeedsCleanupJoin }
@@ -1058,8 +1058,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     var budget = PlaybackProgressBudgetTicket.coldStart(sessionIdentity: session,
                         originInstant: instant, nonce: try allocator.next(in: .deadline),
                         freezeGeneration: try allocator.next(in: .freezeGeneration))
-                    if !incoming.interruptionVeto ||
-                        (incoming.mediaServicesResumeRequired && incoming.interruptionState != .began) {
+                    let clearsMediaServicesResume = incoming.mediaServicesResumeRequired &&
+                        originalActionEpoch == AudioSessionLifecycleEpoch(incoming)
+                    if incoming.interruptionState != .began,
+                       !incoming.mediaServicesResumeRequired || clearsMediaServicesResume,
+                       !incoming.interruptionVeto || clearsMediaServicesResume {
                         budget.resume(at: instant, freezeGeneration: budget.freezeGeneration)
                     }
                     var output = incoming.output
@@ -1071,15 +1074,17 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     }
                     let admission = CurrentPlaybackOperationDeadlineTicket.coldStart(budget)
                     playbackRequestAdmission = admission
-                    // 新播放请求是用户动作，可清reset手动恢复门；真实began仍保持否决。
-                    if incoming.mediaServicesResumeRequired {
+                    // Retain the latest request even if reset changed while it awaited
+                    // cleanup. Only a user action from this exact epoch clears its gate.
+                    if clearsMediaServicesResume {
                         snapshot.mediaServicesResumeRequired = false
                         if incoming.interruptionState != .began { snapshot.interruptionVeto = false }
                     }
                     snapshot.userPaused = false
                     snapshot.output = output
                     snapshot.freezeGeneration = budget.freezeGeneration
-                    return .playbackAdmitted(admission, output, freezeGeneration: budget.freezeGeneration)
+                    return .playbackAdmitted(admission, output, freezeGeneration: budget.freezeGeneration,
+                        clearsMediaServicesResume: clearsMediaServicesResume)
                 } catch let failure as PlaybackSafetyFailure { return .failed(failure) }
                 catch PlaybackIdentityAllocationError.identitySpaceExhausted { return .failed(.identitySpaceExhausted) }
                 catch { return .failed(.invalidEvidence) }
@@ -7191,12 +7196,15 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// 用户请求准入与旧输出撤权同锁提交；在任何前驱等待、SDK调用或factory之前冻结真实起点。
-    func admitPlaybackRequest(requestID: UUID) throws -> CurrentPlaybackOperationDeadlineTicket {
+    func admitPlaybackRequest(requestID: UUID,
+        expectedEpoch: AudioSessionLifecycleEpoch? = nil) throws -> CurrentPlaybackOperationDeadlineTicket {
+        let originalActionEpoch = expectedEpoch ?? AudioSessionLifecycleEpoch(executor.safetyIngress.snapshot)
         var admission: CurrentPlaybackOperationDeadlineTicket?
         var needsJoin = false
         executor.sync {
             while true {
-                switch executor.safetyIngress.performPlaybackAdmission(requestID: requestID) {
+                switch executor.safetyIngress.performPlaybackAdmission(requestID: requestID,
+                    originalActionEpoch: originalActionEpoch) {
                 case .retry: continue
                 case .rejected: return
                 case .performed(.admitted(let value)): admission = value; return
@@ -7231,7 +7239,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   case .coldStart(let budget) = admission,
                   try !budget.isExpired(at: monotonicClock.nowNanoseconds) else { return nil }
             return try beginOutputAcquisitionLocked(session: budget.identity.sessionIdentity,
-                parent: admission, resetRecoveryMandatorySuffix: resetRecoveryMandatorySuffix)
+                parent: admission, resetRecoveryMandatorySuffix: resetRecoveryMandatorySuffix,
+                freshPlaybackAdmission: true)
         }
     }
 
@@ -7246,13 +7255,23 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     private func beginOutputAcquisitionLocked(session: PlaybackSessionIdentity,
-        parent: CurrentPlaybackOperationDeadlineTicket, resetRecoveryMandatorySuffix: UInt64) throws -> ControlTaskTicket? {
+        parent: CurrentPlaybackOperationDeadlineTicket, resetRecoveryMandatorySuffix: UInt64,
+        freshPlaybackAdmission: Bool = false) throws -> ControlTaskTicket? {
             let parentValue: PlaybackProgressBudgetTicket
             switch parent { case .coldStart(let value), .outputRecovery(let value): parentValue = value }
             let parentIdentity = parentValue.identity
             guard resetRecoveryMandatorySuffix > 0, resetRecoveryMandatorySuffix < parentValue.cap else { return nil }
             guard parentIdentity.sessionIdentity == session else { return nil }
-            guard authority.currentResetRoot == nil ||
+            // A new admitted session may rebuild configuration after the predecessor's
+            // final owned task has returned. This is checked in the same resource CAS,
+            // not inferred from outputContext == nil while cleanup still owns a tail.
+            // Configuration has its own current-epoch permit; this never clears the
+            // manual-resume gate or manufactures a reset recovery drain proof.
+            let freshEmptyAdmission = freshPlaybackAdmission && authority.playbackRequestAdmission == parent &&
+                authority.resourceState == nil && authority.cleanupReservation == nil &&
+                authority.audioSessionPermit == nil && authority.commands.allSatisfy({ $0 == nil }) &&
+                authority.groups.allSatisfy({ $0 == nil })
+            guard authority.currentResetRoot == nil || freshEmptyAdmission ||
                   authority.processConfigurationReceipt?.identity.mediaServicesEpoch == authority.snapshot.mediaServicesEpoch else { return nil }
             guard authority.cleanupReservation == nil, authority.outputContext == nil,
                   authority.ownedResource == nil else { return nil }

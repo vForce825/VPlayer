@@ -332,7 +332,7 @@ enum PlaybackBudgetControlResult: Sendable, Equatable {
     case playbackOperationRearmed(PlaybackDeadlineRearm<PlaybackOperationDeadlineArmTicket>)
 }
 enum OutputControlRequest: Sendable, Equatable {
-    case playbackAdmission(UUID)
+    case playbackAdmission(UUID, originalActionEpoch: AudioSessionLifecycleEpoch)
     case audioEventRelayLookup
     case audioRelayOverflow(recordNonce: UInt64)
     case audioSessionCall(AudioSessionBlockingCallAction)
@@ -345,7 +345,8 @@ enum OutputControlRequest: Sendable, Equatable {
 }
 enum OutputControlApplication: Sendable, Equatable {
     case playbackAdmissionNeedsCleanupJoin
-    case playbackAdmitted(CurrentPlaybackOperationDeadlineTicket, PlaybackOutputSafetyState, freezeGeneration: UInt64)
+    case playbackAdmitted(CurrentPlaybackOperationDeadlineTicket, PlaybackOutputSafetyState,
+        freezeGeneration: UInt64, clearsMediaServicesResume: Bool)
     case audioEventRelay(PlaybackAudioSessionEventRelay)
     case audioSessionCall(AudioSessionBlockingCallApplication)
     case registrationValidated

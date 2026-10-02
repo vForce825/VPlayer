@@ -37,6 +37,34 @@ final class SystemVideoOutput: @unchecked Sendable {
         let acceptanceID: UInt64?
     }
 
+    // The queue's existing ledger reference transfers into this lease while a
+    // native enqueue is in flight. Reset can revoke the logical receipt, but the
+    // callback still retains the surface until physical completion is delivered.
+    private final class Submission: @unchecked Sendable {
+        private let lock = NSLock()
+        private let ledger: VideoSurfaceBudgetLedger
+        private var retainedFrame: PendingFrame?
+
+        init(_ frame: PendingFrame, ledger: VideoSurfaceBudgetLedger) {
+            retainedFrame = frame
+            self.ledger = ledger
+        }
+
+        deinit { release() }
+
+        func takeFrame() -> PendingFrame? {
+            lock.withLock {
+                let frame = retainedFrame
+                retainedFrame = nil
+                return frame
+            }
+        }
+
+        func release() {
+            if let retained = takeFrame() { ledger.release(retained.frame) }
+        }
+    }
+
     private struct PendingAcceptance {
         let generation: MediaGeneration
         let allSequenceNumbers: Set<UInt64>
@@ -351,13 +379,15 @@ final class SystemVideoOutput: @unchecked Sendable {
             do {
                 let sample = try builder.make(frame: next.frame)
                 activeFrame = next
-                backend.enqueue(sample) { [weak self] result in
-                    guard let self else { return }
+                let submission = Submission(next, ledger: ledger)
+                backend.enqueue(sample) { [weak self, submission] result in
+                    guard let self else { submission.release(); return }
                     if DispatchQueue.getSpecific(key: queueKey) != nil {
-                        completeEnqueueIsolated(next, token: token, result: result)
+                        completeEnqueueIsolated(submission, token: token, result: result)
                     } else {
-                        stateQueue.async { [weak self] in
-                            self?.completeEnqueueIsolated(next, token: token, result: result)
+                        stateQueue.async { [weak self, submission] in
+                            guard let self else { submission.release(); return }
+                            completeEnqueueIsolated(submission, token: token, result: result)
                         }
                     }
                 }
@@ -375,12 +405,16 @@ final class SystemVideoOutput: @unchecked Sendable {
         }
     }
 
-    private func completeEnqueueIsolated(_ next: PendingFrame, token: UInt64,
+    private func completeEnqueueIsolated(_ submission: Submission, token: UInt64,
         result: Result<VideoRendererEnqueueResult, any Error>) {
+        guard let next = submission.takeFrame() else { return }
         guard !stopped, requestArmed, token == requestToken,
               activeFrame?.frame.generation == next.frame.generation,
               activeFrame?.frame.sequenceNumber == next.frame.sequenceNumber,
-              inFlightFlush == nil, pendingReset == nil else { return }
+              inFlightFlush == nil, pendingReset == nil else {
+            ledger.release(next.frame)
+            return
+        }
         activeFrame = nil
         switch result {
         case .success(.accepted):
@@ -448,12 +482,17 @@ final class SystemVideoOutput: @unchecked Sendable {
         }
         sortPendingIsolated()
         stopRequestIsolated()
-        backend.flush(removeDisplayedImage: false) { [weak self] in
+        backend.flush(removeDisplayedImage: false) { [weak self] settled in
             self?.stateQueue.async { [weak self] in
                 guard let self, !stopped, receiverRecoveryInFlight,
                       receiverRecoveryOperationID == operationID,
                       inFlightFlush == nil, pendingReset == nil else { return }
                 receiverRecoveryInFlight = false
+                guard settled else {
+                    clearPendingIsolated(reason: "renderer.recovery-flush-superseded")
+                    failureSink(.videoRendererFailed("renderer.recovery-flush-superseded"), generation)
+                    return
+                }
                 armRequestIfNeededIsolated()
                 drainIsolated(token: requestToken)
             }
@@ -494,9 +533,9 @@ final class SystemVideoOutput: @unchecked Sendable {
         inFlightFlush = (operationID, transaction)
         backend.flush(
             removeDisplayedImage: transaction.request.removeDisplayedImage
-        ) { [weak self] in
+        ) { [weak self] settled in
             self?.stateQueue.async { [weak self] in
-                self?.physicalFlushCompletedIsolated(operationID: operationID)
+                self?.physicalFlushCompletedIsolated(operationID: operationID, settled: settled)
             }
         }
         stateQueue.asyncAfter(deadline: .now() + .seconds(2)) { [weak self] in
@@ -520,10 +559,20 @@ final class SystemVideoOutput: @unchecked Sendable {
         }
     }
 
-    private func physicalFlushCompletedIsolated(operationID: UInt64) {
+    private func physicalFlushCompletedIsolated(operationID: UInt64, settled: Bool) {
         guard let finished = inFlightFlush,
               finished.operationID == operationID else { return }
         inFlightFlush = nil
+        guard settled else {
+            finishResetIsolated(finished.transaction,
+                result: .failure(.videoRendererFailed("renderer.flush-superseded")))
+            if stopped { startStopFlushIsolated() }
+            else if let latest = pendingReset {
+                pendingReset = nil
+                startResetIsolated(latest, clearPending: false)
+            } else { clearPendingIsolated(reason: "renderer.flush-superseded") }
+            return
+        }
         if stopped {
             finishResetIsolated(
                 finished.transaction,
@@ -590,7 +639,8 @@ final class SystemVideoOutput: @unchecked Sendable {
         stopFlushInProgress = true
         stopFlushOperationID &+= 1
         let operationID = stopFlushOperationID
-        backend.flush(removeDisplayedImage: true) { [weak self] in
+        backend.flush(removeDisplayedImage: true) { [weak self] settled in
+            guard settled else { return }
             self?.stateQueue.async { [weak self] in
                 self?.completeStopFlushIsolated(operationID: operationID)
             }
@@ -762,10 +812,9 @@ final class SystemVideoOutput: @unchecked Sendable {
     }
 
     private func clearPendingIsolated(reason: String) {
-        if let activeFrame {
-            ledger.release(activeFrame.frame)
-            self.activeFrame = nil
-        }
+        // The callback's Submission owns this charge until native settlement.
+        // Pending receipts are rejected below without freeing its live surface.
+        activeFrame = nil
         let frames = pending
         pending.removeAll(keepingCapacity: true)
         for pendingFrame in frames { ledger.release(pendingFrame.frame) }

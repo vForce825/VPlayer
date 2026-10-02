@@ -58,13 +58,14 @@ final class AACOwnedCallLane: @unchecked Sendable {
     }
     /// An awaited framework call keeps the same permit until its actual terminal.
     /// Cancellation only revokes the result; it cannot free in-flight backing.
-    func callAwaiting(_ body: () async throws -> Void) async throws {
+    func callAwaiting<Value: Sendable>(_ body: () async throws -> Value) async throws -> Value {
         try Task.checkCancellation()
         try enter()
         defer { leave() }
-        try await body()
+        let value = try await body()
         guard !cancelRequested else { throw AACRenditionFailure.cancelled }
         try Task.checkCancellation()
+        return value
     }
     func requestCancel() { lock.withLock { cancelled = true } }
     @discardableResult func finishCancellation(_ body: () -> Void) -> Bool {
@@ -848,6 +849,39 @@ enum AACSystemLoopback {
             rawReaderFormat: raw.rawReaderFormat, rawReaderCookie: raw.rawReaderCookie, writerCookieEvidence: writerEvidence,
             didDrainNaturally: true, lease: raw.decodedLease, metadataLease: raw.metadataLease)
     }
+    /// The provider's unsafe borrow cannot escape. Own a new legacy header for
+    /// the AudioConverter input; its shared, read-only backing survives the borrow.
+    static func ownedReaderSample(
+        copying ready: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+    ) throws -> CMSampleBuffer {
+        try ready.withUnsafeSampleBuffer { sample in
+            var copy: CMSampleBuffer?
+            try AACRenditionEncoder.check(CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault,
+                sampleBuffer: sample, sampleBufferOut: &copy))
+            guard let copy, ObjectIdentifier(copy) != ObjectIdentifier(sample), CMSampleBufferDataIsReady(copy) else {
+                throw AACRenditionFailure.calibrationMismatch
+            }
+            for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+                if let attachments = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                    target: sample, attachmentMode: mode) {
+                    CMSetAttachments(copy, attachments: attachments, attachmentMode: mode)
+                }
+            }
+            // The C out-pointer lacks fresh-header ownership annotations.
+            // Only this copy leaves the borrow; no provider-owned header escapes.
+            nonisolated(unsafe) let ownedHeader = copy
+            return ownedHeader
+        }
+    }
+    private static func nextReaderSample(
+        from provider: AVAssetReaderOutput.Provider<CMReadySampleBuffer<CMSampleBuffer.DynamicContent>>,
+        lane: AACOwnedCallLane
+    ) async throws -> CMSampleBuffer? {
+        let ready = try await lane.callAwaiting { try await provider.next() }
+        // nil means EOF; a native read error is propagated above, never folded into EOF.
+        guard let ready else { return nil }
+        return try lane.call { try ownedReaderSample(copying: ready) }
+    }
     private static func decodeRaw(url: URL, format expectedFormat: CMAudioFormatDescription,
                                   expectedIdentity: AACPacketSequenceEvidence, expectedFrames: Int64, channels: Int,
                                   maximumBufferBytes: Int, windowStarts: [Int64], lane: AACOwnedCallLane,
@@ -870,15 +904,15 @@ enum AACSystemLoopback {
             return try AVAssetReader(asset: asset)
         }
         defer { lane.cleanup { if reader.status == .reading { reader.cancelReading() } } }
-        let output = try lane.call { () throws -> AVAssetReaderTrackOutput in
-            let value = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            value.alwaysCopiesSampleData = false
-            guard reader.canAdd(value) else { throw AACRenditionFailure.calibrationMismatch }
-            reader.add(value)
-            guard reader.startReading() else { throw reader.error ?? AACRenditionFailure.calibrationMismatch }
-            return value
+        let provider = try lane.call {
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            guard reader.canAdd(output) else { throw AACRenditionFailure.calibrationMismatch }
+            // outputProvider attaches the output exactly once.
+            let provider = reader.outputProvider(for: output)
+            try reader.start()
+            return provider
         }
-        var current = try lane.call { output.copyNextSampleBuffer() }
+        var current = try await nextReaderSample(from: provider, lane: lane)
         guard let format = current.flatMap(CMSampleBufferGetFormatDescription),
               let inputDescription = CMAudioFormatDescriptionGetStreamBasicDescription(format),
               let expectedDescription = CMAudioFormatDescriptionGetStreamBasicDescription(expectedFormat) else {
@@ -930,7 +964,7 @@ enum AACSystemLoopback {
                     }
                     emptyMarkers += 1
                     current = nil
-                    current = try lane.call { output.copyNextSampleBuffer() }
+                    current = try await nextReaderSample(from: provider, lane: lane)
                     continue
                 }
                 guard let currentFormat = CMSampleBufferGetFormatDescription(buffer),
@@ -984,7 +1018,7 @@ enum AACSystemLoopback {
             if drained { break }
             guard paused, !input.ended else { throw AACRenditionFailure.capacityExceeded }
             current = nil
-            current = try lane.call { output.copyNextSampleBuffer() }
+            current = try await nextReaderSample(from: provider, lane: lane)
         }
         guard input.evidence == expectedIdentity, consumedFrames == expectedFrames, decodedFrames == expectedFrames,
               observations.allSatisfy({ $0.count == width * channels }), let firstPTS, endPTS.isNumeric else {

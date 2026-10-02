@@ -83,6 +83,7 @@ struct ClassifierAndTimingEdgeResult: Sendable {
     var repeatFieldNormalizedDurations: [CMTime] = []
     var repeatFieldRoute = DeinterlaceRoute.rawWhileClassifying
     var repeatFieldMetadataReachedProcessor = false
+    var initialInterlacedGOPWasRejected = false
 }
 
 struct GPUCommandErrorRegressionResult: Sendable {
@@ -353,6 +354,19 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         )
         repeatCoordinator.replaceFormat(repeatFormat)
         let repeatGeneration = repeatHost.generation
+        // Production intentionally discards the first interlaced H.264 GOP.
+        // That rejected input must not manufacture a decoder callback. The
+        // following random-access unit starts the measured repeat-field trace.
+        let startupAccepted = repeatCoordinator.handle(accessUnit: try makeAccessUnit(
+            id: 199,
+            generation: repeatGeneration,
+            format: repeatFormat,
+            duration: CMTime(value: 1, timescale: 25),
+            parser: traceInterlacedParser(parity: .top, sourcePTS90k: 0)
+        ))
+        guard !startupAccepted, !repeatDecoder.hasConfiguration(for: repeatGeneration) else {
+            throw DeterministicTraceError.pipelineFailure
+        }
         for index in 0..<3 {
             let parser = VideoParserMetadata(
                 fieldOrder: .tt,
@@ -392,7 +406,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             repeatFieldNormalizedDurations: repeatYADIF.snapshot().map(\.frameDuration),
             repeatFieldRoute: repeatCoordinator.route,
             repeatFieldMetadataReachedProcessor: repeatYADIF.snapshot().first?
-                .frame.parserMetadata.repeatFirstField == true
+                .frame.parserMetadata.repeatFirstField == true,
+            initialInterlacedGOPWasRejected: !startupAccepted
         )
     }
 
@@ -699,6 +714,20 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             duration: CMTime(value: 1, timescale: 1)
         )))
 
+        // Each generation starts with the deliberately discarded interlaced
+        // startup GOP. Keep its identity outside the measured frame IDs.
+        pipeline.receive(video: .accessUnit(try makeAccessUnit(
+            id: accessUnitIDOffset,
+            generation: generation,
+            format: trace.formatDescription,
+            duration: trace.nominalFrameDuration,
+            parser: trace.frames[0].parserMetadata
+        )))
+        _ = await pipeline.debugSnapshot()
+        guard !decoder.hasConfiguration(for: generation) else {
+            throw DeterministicTraceError.pipelineFailure
+        }
+
         let sources = trace.frames + makeFlushFrames(for: trace, generation: generation)
         for source in sources {
             let frame = source.rebased(
@@ -712,10 +741,9 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
                 duration: frame.duration,
                 parser: frame.parserMetadata
             )))
-            // The first random-access unit of a generation owns the async
-            // configure transition. Cross the executor before constructing
-            // its callback so the fake can attach the exact session identity.
-            _ = await pipeline.debugSnapshot()
+            // Wait for this generation's actual configure receipt, not merely
+            // an executor turn, before constructing a callback with its identity.
+            try await waitUntil { decoder.hasConfiguration(for: generation) }
             pipeline.receive(decoder: decoder.frameEvent(frame))
         }
         _ = await pipeline.debugSnapshot()
@@ -1463,6 +1491,10 @@ private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable 
         let identity = lock.withLock { identities[frame.generation] }
         precondition(identity != nil, "frame emitted before decoder configure completed")
         return .frame(frame, identity: identity!)
+    }
+
+    func hasConfiguration(for generation: MediaGeneration) -> Bool {
+        lock.withLock { identities[generation] != nil }
     }
 
     func decode(

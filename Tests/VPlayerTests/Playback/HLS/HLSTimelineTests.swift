@@ -640,8 +640,48 @@ final class HLSTimelineTests: XCTestCase {
         ))
     }
 
+    func testConfigured4KFixtureUsesManagedLoopbackURL() throws {
+        let raw = "http://127.0.0.1:49152/timeline-4k-15m.ts"
+        XCTAssertEqual(try timelineFixtureURL(environment: [
+            "VPLAYER_TIMELINE_FIXTURE_URL": raw,
+        ]).absoluteString, raw)
+    }
+
+    func testConfiguredInvalid4KFixtureFailsRatherThanSkipping() {
+        for raw in ["", "file:///tmp/test_4k_15m.ts", "https://example.com/fixture.ts",
+                    "http://127.0.0.1/timeline-4k-15m.ts", "http://127.0.0.1:49152/other.ts"] {
+            XCTAssertThrowsError(try timelineFixtureURL(environment: [
+                "VPLAYER_TIMELINE_FIXTURE_URL": raw,
+            ])) { error in
+                XCTAssertEqual((error as NSError).domain, "HLSTimelineFixture")
+            }
+        }
+    }
+
+    private func timelineFixtureURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> URL {
+        if let raw = environment["VPLAYER_TIMELINE_FIXTURE_URL"] {
+            guard let url = URL(string: raw), url.scheme == "http", url.host == "127.0.0.1",
+                  url.port != nil, url.path == "/timeline-4k-15m.ts",
+                  url.query == nil, url.fragment == nil, url.user == nil, url.password == nil else {
+                throw NSError(domain: "HLSTimelineFixture", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "Configured 4K fixture must use the managed loopback HTTP URL",
+                ])
+            }
+            return url
+        }
+        let path = "/tmp/test_4k_15m.ts"
+        guard FileManager.default.isReadableFile(atPath: path) else {
+            throw XCTSkip("Run Scripts/run-playback-integration-tests.sh with --timeline-fixture")
+        }
+        return URL(fileURLWithPath: path)
+    }
+
     func testReal4KDemuxAndTimelineOrigin() throws {
-        let logURL = URL(fileURLWithPath: "/tmp/4k_test.log")
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("4k-timeline-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: logURL) }
         func log(_ str: String) {
             if let data = (str + "\n").data(using: .utf8) {
                 if FileManager.default.fileExists(atPath: logURL.path) {
@@ -656,19 +696,46 @@ final class HLSTimelineTests: XCTestCase {
             }
         }
         log("=== testReal4KDemuxAndTimelineOrigin START ===")
-        let path = "/tmp/test_4k_15m.ts"
-        log("Checking path: \(path), exists=\(FileManager.default.fileExists(atPath: path))")
-        guard FileManager.default.fileExists(atPath: path) else {
-            log("SKIP: /tmp/test_4k_15m.ts not found")
-            throw XCTSkip("/tmp/test_4k_15m.ts not found")
+        let fixtureURL = try timelineFixtureURL()
+        let server: LoopbackHTTPFixtureServer?
+        if fixtureURL.isFileURL {
+            server = try LoopbackHTTPFixtureServer(fileURL: fixtureURL)
+        } else {
+            server = nil
         }
-        log("File found, starting loopback HTTP server...")
-        let server = try LoopbackHTTPFixtureServer(fileURL: URL(fileURLWithPath: path))
-        defer { server.stop() }
+        defer { server?.stop() }
         let recorder = DemuxEventRecorder()
         let demuxer = FFmpegDemuxer()
-        try demuxer.start(url: server.sourceURL, sink: recorder.record)
+        try demuxer.start(url: server?.sourceURL ?? fixtureURL, sink: recorder.record)
+        defer { demuxer.cancel() }
         let events = recorder.waitForTerminal(timeout: 10)
+        XCTAssertTrue(events.contains { if case .endOfStream = $0 { true } else { false } },
+                      "The full 15-minute fixture must reach EOF, not merely yield a playable prefix")
+        let tracks = try XCTUnwrap(events.compactMap { event -> DemuxTrackSet? in
+            if case let .tracks(value) = event { return value }
+            return nil
+        }.first)
+        let actualVideo = try XCTUnwrap(tracks.video)
+        XCTAssertEqual(actualVideo.width, 3_840)
+        XCTAssertEqual(actualVideo.height, 2_160)
+        XCTAssertEqual(actualVideo.codec, .h264)
+        XCTAssertEqual(actualVideo.frameRate, MediaRational(num: 25, den: 1))
+        let actualAudio = try XCTUnwrap(tracks.audio)
+        XCTAssertEqual(actualAudio.codec, .aac)
+        XCTAssertEqual(actualAudio.sampleRate, 48_000)
+        let videoPackets = events.compactMap { event -> DemuxPacket? in
+            if case let .packet(packet) = event, packet.streamIndex == actualVideo.streamIndex {
+                return packet
+            }
+            return nil
+        }
+        XCTAssertEqual(videoPackets.count, 22_500, "The fixture must contain every 25fps frame for 900 seconds")
+        let firstPacket = try XCTUnwrap(videoPackets.first)
+        let lastPacket = try XCTUnwrap(videoPackets.last)
+        let videoSpan = CMTimeSubtract(
+            CMTimeAdd(lastPacket.presentationTimeStamp, lastPacket.duration),
+            firstPacket.presentationTimeStamp)
+        XCTAssertEqual(CMTimeGetSeconds(videoSpan), 900, accuracy: 0.001)
         log("[TEST_4K] events count: \(events.count)")
         let coordinator = HLSTimelineCoordinator()
         var originEvents: [HLSTimelineEvent] = []
@@ -755,19 +822,24 @@ final class HLSTimelineTests: XCTestCase {
         }
         log("[TEST_4K] Finished: origins=\(originEvents.count), videoSamples=\(videoSampleCount), audioSamples=\(audioSampleCount)")
         XCTAssertFalse(originEvents.isEmpty, "4K stream must establish origin!")
+        XCTAssertGreaterThan(videoSampleCount, 0)
+        XCTAssertGreaterThan(audioSampleCount, 0)
+        XCTAssertNotNil(videoBuilder, "4K fixture must obtain a real remux admission and submission builder")
     }
 
     func testReal4KProductionMediaGraph() async throws {
-        let path = "/tmp/test_4k_15m.ts"
-        guard FileManager.default.fileExists(atPath: path) else {
-            throw XCTSkip("/tmp/test_4k_15m.ts not found")
+        let fixtureURL = try timelineFixtureURL()
+        let server: LoopbackHTTPFixtureServer?
+        if fixtureURL.isFileURL {
+            server = try LoopbackHTTPFixtureServer(fileURL: fixtureURL)
+        } else {
+            server = nil
         }
-        let server = try LoopbackHTTPFixtureServer(fileURL: URL(fileURLWithPath: path))
-        defer { server.stop() }
+        defer { server?.stop() }
         let lifecycle = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 99_001)
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
         let assembler = HLSMediaGraphAssembler(
-            sourceURL: server.sourceURL,
+            sourceURL: server?.sourceURL ?? fixtureURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
             graph: SystemHLSDeliveryGraph(authority: authority))
         do {

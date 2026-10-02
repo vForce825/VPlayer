@@ -44,6 +44,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(accessUnits.count, buckets.reduce(0) {
                 $0 + CMSampleBufferGetNumSamples($1)
             })
+            XCTAssertLessThan(accessUnits.count, 384,
+                "The finite lifecycle fixture must fit its existing ownership hard cap")
+            let ownership = try Task21RealAVSeed.finiteSeedOwnershipLimits(
+                submissionCounts: [accessUnits.count])
+            XCTAssertGreaterThan(ownership.rolloverThreshold, accessUnits.count,
+                "Every planned AU must fit before this finite seed requests rollover")
+            XCTAssertLessThan(ownership.rolloverThreshold, ownership.hardCapacity)
+            XCTAssertEqual(ownership.hardCapacity, 384)
             XCTAssertEqual(try payload(accessUnits), try payload(buckets))
             XCTAssertEqual(Task21RealAACSeed.trimTime(first,
                 key: kCMSampleBufferAttachmentKey_TrimDurationAtStart), originalTrim,
@@ -81,6 +89,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 }
             }
             XCTAssertGreaterThanOrEqual(flushCount, bucketCount - 1)
+        }
+        XCTAssertThrowsError(try Task21RealAVSeed.finiteSeedOwnershipLimits(
+            submissionCounts: [384])) { error in
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
         }
     }
 
@@ -6577,10 +6589,9 @@ final class Task21RealAVSeed: @unchecked Sendable {
         audioSink.relay = audioRelay
         videoSink.relay = videoRelay
         additionalAudioSink?.relay = additionalAudioRelay
-        let ownership = SegmentedFMP4WriterOwnershipLimits(
-            rolloverThreshold: 256,
-            hardCapacity: 384
-        )
+        let ownership = try finiteSeedOwnershipLimits(submissionCounts: [
+            retimedAudio.count, videoOutputs.count,
+        ] + (additionalRetimedAudio.map { [$0.count] } ?? []))
         let audioWriter = try SegmentedFMP4Writer(binding: audioBinding,
             trackKind: .aac, sourceFormatHint: audioFormat,
             boundarySession: boundary.session, compressedFormatConfiguration: nil,
@@ -6868,6 +6879,20 @@ final class Task21RealAVSeed: @unchecked Sendable {
             commonBoundaries: commonBoundaries, liveEdge: liveEdge,
             videoDimensions: dimensions, videoCodec: codec,
             additionalAudio: additionalAudio)
+    }
+
+    fileprivate static func finiteSeedOwnershipLimits(submissionCounts: [Int]) throws
+        -> SegmentedFMP4WriterOwnershipLimits {
+        let hardCapacity = 384
+        guard let maximum = submissionCounts.max(), maximum > 0,
+              submissionCounts.allSatisfy({ $0 > 0 }), maximum < hardCapacity - 1 else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        // This finite seed supports lifecycle assertions and never rolls over.
+        // Splitting real AAC buckets retains one ownership per AU, so reserve
+        // one soft-threshold slot beyond the exact largest track, while keeping
+        // the fixture's existing hard cap. Production defaults are unchanged.
+        return .init(rolloverThreshold: maximum + 1, hardCapacity: hardCapacity)
     }
 
     fileprivate static func retimedAudioAccessUnits(

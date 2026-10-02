@@ -8,6 +8,70 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SystemVideoOutputTests: XCTestCase {
+    func testSupersededPhysicalFlushCannotCertifyResetOrAdmitSeeds() throws {
+        let backend = FakeVideoRendererBackend()
+        let harness = makeHarness(backend: backend)
+        let result = VideoResetResultBox()
+        harness.output.reset(.init(generation: .init(rawValue: 1), reason: .timelineDiscontinuity,
+            removeDisplayedImage: true,
+            seedFrames: [try frame(sequence: 1, pts: 1, generation: .init(rawValue: 1))])) {
+            result.record($0)
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0, settled: false)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(result.count, 1)
+        XCTAssertNotNil(result.error)
+        XCTAssertTrue(backend.submittedPTS.isEmpty)
+    }
+
+    func testLatestResetContinuesAfterOlderPhysicalFlushIsSuperseded() throws {
+        let backend = FakeVideoRendererBackend()
+        let harness = makeHarness(backend: backend)
+        let old = VideoResetResultBox()
+        let latest = VideoReceiptBox()
+        harness.output.reset(.init(generation: .init(rawValue: 1), reason: .timelineDiscontinuity,
+            removeDisplayedImage: false, seedFrames: [])) { old.record($0) }
+        harness.output.reset(.init(generation: .init(rawValue: 2), reason: .timelineDiscontinuity,
+            removeDisplayedImage: true,
+            seedFrames: [try frame(sequence: 2, pts: 2, generation: .init(rawValue: 2))])) {
+            latest.value = try? $0.get()
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0, settled: false)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(old.count, 1)
+        XCTAssertNotNil(old.error)
+        XCTAssertNil(latest.value)
+        XCTAssertEqual(backend.flushCount, 2)
+        XCTAssertTrue(backend.submittedPTS.isEmpty)
+        backend.completeFlush(at: 1)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(latest.value?.generation, .init(rawValue: 2))
+        XCTAssertEqual(latest.value?.sequenceNumbers, [2])
+    }
+
+    func testSupersededRecoveryFlushFailsReceiptWithoutRetryAdmission() throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let ledger = VideoSurfaceBudgetLedger()
+        let failures = VideoResetResultBox()
+        let receipt = VideoResetResultBox()
+        let harness = makeHarness(backend: backend, ledger: ledger,
+            failureSink: { error, _ in failures.record(.failure(error)) })
+        harness.output.enqueue([try frame(sequence: 1, pts: 1)]) { receipt.record($0) }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.requiresRecovery(.requiresFlushToResumeDecoding))
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0, settled: false)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(receipt.count, 1)
+        XCTAssertNotNil(receipt.error)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(backend.submittedPTS, [1])
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+    }
+
     func testCapacityEvictedReceiptStillRecoversCurrentFlushRequiredRenderer() throws {
         try verifyRecoveryAfterReceiptCapacityEviction(.requiresFlushToResumeDecoding)
     }
@@ -874,7 +938,7 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     private(set) var enqueuedPTS: [Int64] = []
     private(set) var submittedPTS: [Int64] = []
     private var readiness: (@Sendable () -> Void)?
-    private var flushCompletions: [@Sendable () -> Void] = []
+    private var flushCompletions: [@Sendable (Bool) -> Void] = []
     private var eventHandler: (@Sendable (VideoRendererBackendEvent) -> Void)?
     private var performanceMetricsCompletions: [
         @Sendable (VideoRendererPerformanceSnapshot?) -> Void
@@ -945,7 +1009,7 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
 
     func flush(
         removeDisplayedImage: Bool,
-        completion: @escaping @Sendable () -> Void
+        completion: @escaping @Sendable (Bool) -> Void
     ) {
         _ = removeDisplayedImage
         lock.withLock {
@@ -975,16 +1039,16 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
         lock.withLock { readiness }?()
     }
 
-    func completeFlush(at index: Int) {
+    func completeFlush(at index: Int, settled: Bool = true) {
         let completion = lock.withLock {
-            if latchesRecoveryUntilFlush {
+            if settled, latchesRecoveryUntilFlush {
                 health = .noKnownFailure
                 error = nil
                 requiresFlushToResumeDecoding = false
             }
             return flushCompletions[index]
         }
-        completion()
+        completion(settled)
     }
 
     func completePerformanceMetrics(_ snapshot: VideoRendererPerformanceSnapshot?) {

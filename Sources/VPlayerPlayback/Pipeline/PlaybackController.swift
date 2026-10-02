@@ -304,6 +304,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     public func play(_ request: PlaybackRequest) async {
+        let originalActionEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
         let (generation, overflow) = playAdmissionGeneration.addingReportingOverflow(1)
         guard !overflow else { return }
         playAdmissionGeneration = generation
@@ -325,7 +326,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         let parentDeadline: CurrentPlaybackOperationDeadlineTicket
         do {
             diagnosticStage = "admitting_request"
-            parentDeadline = try await admitAfterJoiningCleanup(requestID: request.id, generation: generation)
+            parentDeadline = try await admitAfterJoiningCleanup(requestID: request.id, generation: generation,
+                originalActionEpoch: originalActionEpoch)
             guard case .coldStart(let budget) = parentDeadline else { diagnosticStage = "parentDeadline_not_coldStart"; return }
             sessionIdentity = budget.identity.sessionIdentity
         } catch {
@@ -506,11 +508,12 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
 
-    private func admitAfterJoiningCleanup(requestID: UUID, generation: UInt64) async throws -> CurrentPlaybackOperationDeadlineTicket {
+    private func admitAfterJoiningCleanup(requestID: UUID, generation: UInt64,
+        originalActionEpoch: AudioSessionLifecycleEpoch) async throws -> CurrentPlaybackOperationDeadlineTicket {
         while true {
             guard playAdmissionGeneration == generation else { throw CancellationError() }
             do {
-                let admission = try registry.admitPlaybackRequest(requestID: requestID)
+                let admission = try registry.admitPlaybackRequest(requestID: requestID, expectedEpoch: originalActionEpoch)
                 if case .coldStart(let budget) = admission {
                     latestAdmittedSession = budget.identity.sessionIdentity
                 }

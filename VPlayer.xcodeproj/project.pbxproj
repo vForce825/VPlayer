@@ -331,6 +331,7 @@
 		B1B9C10AC736737BC1272DD8 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 0B493CE54CC5A173AD759949 /* PrivacyInfo.xcprivacy */; };
 		B1C67D0EF9EE280554E2B812 /* task22-fixtures.json in Resources */ = {isa = PBXBuildFile; fileRef = 729D7A62E27F0C8816C772DC /* task22-fixtures.json */; };
 		B2CE40B0631C512279F0AADF /* HLSPublisherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A12BAE9CF4654882D7E8CBC /* HLSPublisherTests.swift */; };
+		B368C27AE714CEF9884BDCAA /* HLSWriterFixtureSamples.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EA57CB052D3BE07BFB1E017 /* HLSWriterFixtureSamples.swift */; };
 		B4C91A6F995C4A766F353514 /* PlaybackAudioSessionRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E9059206E4D05DDF15FE7D0 /* PlaybackAudioSessionRegistration.swift */; };
 		B54482F4CF0B87B038C4D469 /* SealedMediaObject.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE85FEB1BD360D7A0B9C86E1 /* SealedMediaObject.swift */; };
 		B578075FE8C04C1C323CAEEA /* ac3-48k-5point1.mov in Resources */ = {isa = PBXBuildFile; fileRef = 0363801747B5BADEF13760CB /* ac3-48k-5point1.mov */; };
@@ -793,6 +794,7 @@
 		7D40021745926C5F48C68F32 /* VPLoadedRangeCoverage.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = VPLoadedRangeCoverage.h; sourceTree = "<group>"; };
 		7D6AAD4FCE5CC250AEAF8DD4 /* MediaTimestamp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaTimestamp.swift; sourceTree = "<group>"; };
 		7D98FDBCA4A67C018465639F /* SampleBufferVideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleBufferVideoView.swift; sourceTree = "<group>"; };
+		7EA57CB052D3BE07BFB1E017 /* HLSWriterFixtureSamples.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSWriterFixtureSamples.swift; sourceTree = "<group>"; };
 		7F6EA8E449CEB8EFB532EB0E /* VPFFmpegParser.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = VPFFmpegParser.c; sourceTree = "<group>"; };
 		7F7DCDFD043AD016D2B3456E /* AudioSessionControlIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSessionControlIdentity.swift; sourceTree = "<group>"; };
 		80B4BA5D82A3CDBA418A7709 /* PlaybackSignposts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSignposts.swift; sourceTree = "<group>"; };
@@ -1413,6 +1415,7 @@
 				8BDE8C2C1B9E4B5C67EC5C5D /* DemuxEventRecorder.swift */,
 				6F9BF07AF1CED62B0FC33ADB /* FakeAudioRenderer.swift */,
 				17153F8A2EA0B10C1B911578 /* FakeVideoToolboxAPI.swift */,
+				7EA57CB052D3BE07BFB1E017 /* HLSWriterFixtureSamples.swift */,
 				BFE0CB1A4C8F3B401C36CC94 /* ManualPlaybackClock.swift */,
 				D066E780F5CE04C55575C105 /* PlaybackComponentFakes.swift */,
 				873D75FAB456918AA0D38B47 /* RouteServiceTestHarness.swift */,
@@ -2308,6 +2311,7 @@
 				4CADAC0431E7882F1CCC1BD0 /* HLSTimelineTests.swift in Sources */,
 				43A0A8D9363794B81AEBBDD9 /* HLSVideoIntegrationTests.swift in Sources */,
 				7FA9748628B0E2CE4EEAA2BD /* HLSVideoTranscodeBranchTests.swift in Sources */,
+				B368C27AE714CEF9884BDCAA /* HLSWriterFixtureSamples.swift in Sources */,
 				8E763F73EE32A4D0C8D56043 /* HTTPRangeTests.swift in Sources */,
 				54116705E65AF0CF71259DA9 /* LoopbackHTTPServerTests.swift in Sources */,
 				07C2100BA21FC019DEF50DD3 /* LumaScanProbeTests.swift in Sources */,

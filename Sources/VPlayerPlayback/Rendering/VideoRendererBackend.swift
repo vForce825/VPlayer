@@ -51,7 +51,7 @@ protocol SampleBufferVideoRenderingBackend: AnyObject, Sendable {
     func stopRequestingMediaData()
     func flush(
         removeDisplayedImage: Bool,
-        completion: @escaping @Sendable () -> Void
+        completion: @escaping @Sendable (Bool) -> Void
     )
     func loadPerformanceMetrics(
         completion: @escaping @Sendable (VideoRendererPerformanceSnapshot?) -> Void
@@ -68,6 +68,19 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     private let lock = NSLock()
     private var feedTask: Task<Void, Never>?
     private var controlTask: Task<Void, Never>?
+    private var pendingFlushImageRemoval: Bool?
+    private var pendingFlushCompletion: (@Sendable (Bool) -> Void)?
+    private var activeFlushHasCompletion = false
+    private var pendingObservationRevision: UInt64?
+    private var observingRevision: UInt64?
+    private var pendingRemoval = false
+
+    private enum ControlOperation {
+        case flush(UInt64, Bool, Task<Void, Never>?, (@Sendable (Bool) -> Void)?)
+        case observe(UInt64)
+        case remove
+        case idle((@Sendable () -> Void)?)
+    }
     private var readiness: (@Sendable () -> Void)?
     private var eventHandler: (@Sendable (VideoRendererBackendEvent) -> Void)?
     private var observedError: (any Error)?
@@ -88,7 +101,7 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
 
     deinit { feedTask?.cancel(); controlTask?.cancel() }
 
-    var isReadyForMoreMediaData: Bool { lock.withLock { !removed && feedTask == nil && !flushRequired && observedError == nil } }
+    var isReadyForMoreMediaData: Bool { lock.withLock { !removed && feedTask == nil && controlTask == nil && !flushRequired && observedError == nil } }
     var health: VideoRendererHealth {
         lock.withLock { observedError == nil ? .noKnownFailure : .failed }
     }
@@ -99,11 +112,10 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
         completion: @escaping @Sendable (Result<VideoRendererEnqueueResult, any Error>) -> Void) {
         let sample = RendererReceiverSample(buffer: sampleBuffer)
         let started = lock.withLock { () -> Bool in
-            guard !removed, feedTask == nil else { return false }
-            let barrier = controlTask
+            guard !removed, feedTask == nil, controlTask == nil else { return false }
+            observingRevision = nil
             let submissionRevision = revision
             feedTask = Task { [weak self, owner] in
-                await barrier?.value
                 let outcome: Result<VideoReceiverOutcome, any Error>
                 do {
                     try Task.checkCancellation()
@@ -144,12 +156,10 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     }
 
     func cancelPendingEnqueue() {
-        let needsCancel = lock.withLock { () -> Bool in
-            guard let feedTask else { return false }
-            feedTask.cancel()
-            return true
+        lock.withLock {
+            guard !removed, feedTask != nil else { return }
+            _ = queueFlushLocked(removeDisplayedImage: false, completion: nil)
         }
-        if needsCancel { flush(removeDisplayedImage: false) {} }
     }
 
     func requestMediaDataWhenReady(on queue: DispatchQueue,
@@ -158,70 +168,123 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     }
     func stopRequestingMediaData() { lock.withLock { readiness = nil } }
 
-    func flush(removeDisplayedImage: Bool, completion: @escaping @Sendable () -> Void) {
-        lock.withLock {
-            revision += 1
-            let flushRevision = revision
-            feedTask?.cancel()
-            let previous = controlTask
-            let feed = feedTask
-            controlTask = Task { [weak self, owner] in
-                await previous?.value
-                await owner.flush(removeDisplayedImage: removeDisplayedImage)
-                await feed?.value
-                if let self {
-                    lock.withLock {
-                        guard revision == flushRevision else { return }
-                        flushRequired = false
-                        observedError = nil
-                    }
-                }
-                completion()
-            }
+    // True means the requested physical barrier settled. A superseded pending
+    // request completes false; it must never certify a renderer reset.
+    func flush(removeDisplayedImage: Bool, completion: @escaping @Sendable (Bool) -> Void) {
+        let superseded = lock.withLock { () -> (@Sendable (Bool) -> Void)? in
+            guard !removed else { return completion }
+            return queueFlushLocked(removeDisplayedImage: removeDisplayedImage, completion: completion)
         }
+        superseded?(false)
+    }
+
+    private func queueFlushLocked(removeDisplayedImage: Bool,
+        completion: (@Sendable (Bool) -> Void)?) -> (@Sendable (Bool) -> Void)? {
+        revision += 1
+        feedTask?.cancel()
+        pendingFlushImageRemoval = (pendingFlushImageRemoval ?? false) || removeDisplayedImage
+        pendingObservationRevision = nil
+        observingRevision = nil
+        // Cancellation adds a physical intent without replacing a caller's
+        // completion. Public requests keep only the newest pending waiter.
+        let superseded = completion == nil ? nil : pendingFlushCompletion
+        if let completion { pendingFlushCompletion = completion }
+        startControlWorkerLocked()
+        return superseded
     }
 
     func finishedEnqueuing() {
         lock.withLock {
-            let previous = controlTask
-            let eventRevision = revision
-            controlTask = Task { [weak self, owner] in
-                await previous?.value
-                await owner.finishedEnqueuing { [weak self] event in
-                    self?.emit(event, revision: eventRevision)
+            guard !removed, feedTask == nil else { return }
+            guard observingRevision != revision, pendingObservationRevision != revision else { return }
+            pendingObservationRevision = revision
+            startControlWorkerLocked()
+        }
+    }
+
+    func remove(completion: @escaping @Sendable (Bool) -> Void) {
+        var superseded: (@Sendable (Bool) -> Void)?
+        let settled = lock.withLock { () -> Bool? in
+            if let removalResult { return removalResult }
+            if removalWaiters.count == 2 { superseded = removalWaiters.removeLast() }
+            removalWaiters.append(completion)
+            guard !removalInFlight else { return nil }
+            removalInFlight = true
+            removed = true
+            pendingRemoval = true
+            _ = queueFlushLocked(removeDisplayedImage: true, completion: nil)
+            return nil
+        }
+        superseded?(false)
+        if let settled { completion(settled) }
+    }
+
+    private func startControlWorkerLocked() {
+        guard controlTask == nil else { return }
+        controlTask = Task { [self, owner] in
+            while true {
+                let operation = lock.withLock { () -> ControlOperation in
+                    if let removeImage = pendingFlushImageRemoval {
+                        pendingFlushImageRemoval = nil
+                        let completion = pendingFlushCompletion
+                        pendingFlushCompletion = nil
+                        activeFlushHasCompletion = completion != nil
+                        return .flush(revision, removeImage, feedTask, completion)
+                    }
+                    if pendingRemoval {
+                        pendingRemoval = false
+                        return .remove
+                    }
+                    if let expected = pendingObservationRevision {
+                        pendingObservationRevision = nil
+                        observingRevision = expected
+                        return .observe(expected)
+                    }
+                    controlTask = nil
+                    return .idle(readiness)
+                }
+                switch operation {
+                case let .flush(expected, removeImage, feed, completion):
+                    await owner.flush(removeDisplayedImage: removeImage)
+                    await feed?.value
+                    lock.withLock {
+                        activeFlushHasCompletion = false
+                        if revision == expected {
+                            flushRequired = false
+                            observedError = nil
+                        }
+                    }
+                    completion?(true)
+                case let .observe(expected):
+                    await owner.finishedEnqueuing { [weak self] event in
+                        self?.emit(event, revision: expected)
+                    }
+                case .remove:
+                    let result = await owner.remove(from: synchronizer)
+                    let waiters = lock.withLock {
+                        removalResult = result
+                        removalInFlight = false
+                        let waiters = removalWaiters
+                        removalWaiters.removeAll()
+                        return waiters
+                    }
+                    for waiter in waiters { waiter(result) }
+                case let .idle(ready):
+                    ready?()
+                    return
                 }
             }
         }
     }
 
-    func remove(completion: @escaping @Sendable (Bool) -> Void) {
-        let settled = lock.withLock { () -> Bool? in
-            if let removalResult { return removalResult }
-            removalWaiters.append(completion)
-            guard !removalInFlight else { return nil }
-            removalInFlight = true
-            removed = true
-            revision += 1
-            feedTask?.cancel()
-            let previous = controlTask
-            let feed = feedTask
-            controlTask = Task { [self, owner, synchronizer] in
-                await previous?.value
-                await owner.flush(removeDisplayedImage: true)
-                await feed?.value
-                let result = await owner.remove(from: synchronizer)
-                let waiters = lock.withLock {
-                    removalResult = result
-                    removalInFlight = false
-                    let waiters = removalWaiters
-                    removalWaiters.removeAll()
-                    return waiters
-                }
-                for waiter in waiters { waiter(result) }
-            }
-            return nil
+    var controlWorkSnapshot: (workers: Int, pendingIntents: Int, completionWaiters: Int) {
+        lock.withLock {
+            (controlTask == nil ? 0 : 1,
+             (pendingFlushImageRemoval == nil ? 0 : 1)
+                + (pendingObservationRevision == nil ? 0 : 1) + (pendingRemoval ? 1 : 0),
+             (activeFlushHasCompletion ? 1 : 0) + (pendingFlushCompletion == nil ? 0 : 1)
+                + removalWaiters.count)
         }
-        if let settled { completion(settled) }
     }
 
     func loadPerformanceMetrics(

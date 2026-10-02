@@ -44,10 +44,13 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         XCTAssertTrue(reader.canAdd(output))
-        reader.add(output)
-        XCTAssertTrue(reader.startReading())
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
 
-        let sample = try XCTUnwrap(output.copyNextSampleBuffer())
+        let next = try await provider.next()
+        let ready = try XCTUnwrap(next)
+        let sample = try makeOwnedReaderFixtureSample(copying: ready)
         let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
         let stream = try XCTUnwrap(
             CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee

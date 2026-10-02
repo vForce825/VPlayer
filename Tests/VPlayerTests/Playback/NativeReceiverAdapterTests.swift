@@ -41,6 +41,7 @@ final class NativeReceiverAdapterTests: XCTestCase {
         let idle = expectation(description: "SDK event iterator idle interval")
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) { idle.fulfill() }
         await fulfillment(of: [idle], timeout: 1)
+        try await eventually { backend.isReadyForMoreMediaData }
         let resumed = expectation(description: "SDK idle iterator cancels and native enqueue resumes")
         let resumedResult = NativeSmokeResult()
         backend.enqueue(try sample(2)) { result in resumedResult.record(result); resumed.fulfill() }
@@ -54,7 +55,9 @@ final class NativeReceiverAdapterTests: XCTestCase {
         backend.finishedEnqueuing()
         let flushed = expectation(description: "SDK Receiver physical flush settles")
         let flushCount = NativeAdapterCounter()
-        backend.flush(removeDisplayedImage: true) { flushCount.increment(); flushed.fulfill() }
+        backend.flush(removeDisplayedImage: true) { settled in
+            XCTAssertTrue(settled); flushCount.increment(); flushed.fulfill()
+        }
         await fulfillment(of: [flushed], timeout: 3)
         guard flushCount.value == 1 else {
             XCTFail("Native event cancellation/flush did not settle")
@@ -69,6 +72,267 @@ final class NativeReceiverAdapterTests: XCTestCase {
         }
         await fulfillment(of: [removed], timeout: 3)
         XCTAssertEqual(removedCount.value, 1, "SDK did not report physical Receiver removal")
+    }
+
+    func testVideoResetRetainsRetiredSurfaceUntilNativeEnqueueSettles() async throws {
+        let endpoint = ControlledVideoReceiverEndpoint()
+        let backend = VideoRendererBackend(renderer: AVSampleBufferDisplayLayer().sampleBufferRenderer,
+            synchronizer: AVSampleBufferRenderSynchronizer(), receiverEndpoint: endpoint)
+        let oldFrame = try videoFrame(sequence: 1, generation: 0)
+        let newFrame = try videoFrame(sequence: 2, generation: 1)
+        let ledger = VideoSurfaceBudgetLedger(limit: oldFrame.estimatedStorageBytes)
+        let output = SystemVideoOutput(backend: backend, ledger: ledger,
+            removeRenderer: backend.remove, failureSink: { _, _ in })
+        let oldReceipt = NativeAdapterCounter()
+        let resetReceipt = NativeAdapterCounter()
+        let capacityRejection = NativeAdapterCounter()
+        XCTAssertTrue(ledger.retain(oldFrame), "Model the timeline's shared surface reference")
+        output.enqueue([oldFrame]) { result in
+            if case .success = result { XCTFail("A retired enqueue must never complete its old receipt") }
+            oldReceipt.increment()
+        }
+        try await eventually { await endpoint.operations == ["enqueue"] }
+        XCTAssertEqual(ledger.snapshot.referenceCount, 2)
+        output.flush(to: .init(rawValue: 1))
+        output.waitUntilIdleForTesting()
+        XCTAssertEqual(oldReceipt.value, 1, "Logical cancellation is immediate")
+        ledger.release(oldFrame) // Timeline discontinuity drops its independent reference.
+        XCTAssertEqual(ledger.snapshot.referenceCount, 1,
+            "The native submission still owns the full one-surface budget")
+        output.enqueue([newFrame]) { result in
+            if case .success = result { XCTFail("The retired native surface still occupies the budget") }
+            capacityRejection.increment()
+        }
+        output.waitUntilIdleForTesting()
+        XCTAssertEqual(capacityRejection.value, 1)
+        XCTAssertTrue(output.pendingSequenceNumbersForTesting.isEmpty)
+        XCTAssertEqual(ledger.snapshot.retainedBytes, oldFrame.estimatedStorageBytes)
+
+        // An independent same-surface owner detects any double release when the
+        // stale native completion and the queued physical flushes finally run.
+        XCTAssertTrue(ledger.retain(oldFrame))
+        output.reset(.init(generation: .init(rawValue: 1), reason: .timelineDiscontinuity,
+            removeDisplayedImage: true, seedFrames: [])) { result in
+            if case .failure = result { XCTFail("The replacement reset should complete after settlement") }
+            resetReceipt.increment()
+        }
+        output.waitUntilIdleForTesting()
+        await endpoint.complete(.init(result: .accepted, events: []))
+        try await eventually { resetReceipt.value == 1 }
+        output.waitUntilIdleForTesting()
+        XCTAssertEqual(oldReceipt.value, 1)
+        XCTAssertEqual(capacityRejection.value, 1)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 1, "Release only the retired submission's reference")
+        ledger.release(oldFrame)
+        XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
+
+        let accepted = expectation(description: "Budget can be reused after physical settlement")
+        output.enqueue([newFrame]) { result in
+            XCTAssertEqual(try? result.get().sequenceNumbers, [2])
+            accepted.fulfill()
+        }
+        try await eventually { await endpoint.operations.filter { $0 == "enqueue" }.count == 2 }
+        await endpoint.complete(.init(result: .accepted, events: []))
+        await fulfillment(of: [accepted], timeout: 1)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+        let removed = expectation(description: "Reset surface test receiver removed")
+        backend.remove { _ in removed.fulfill() }
+        await fulfillment(of: [removed], timeout: 1)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+    }
+
+    func testVideoStopDeadlineRetainsSurfaceUntilNativeEnqueueSettles() async throws {
+        let endpoint = ControlledVideoReceiverEndpoint()
+        let backend = VideoRendererBackend(renderer: AVSampleBufferDisplayLayer().sampleBufferRenderer,
+            synchronizer: AVSampleBufferRenderSynchronizer(), receiverEndpoint: endpoint)
+        let frame = try videoFrame(sequence: 1, generation: 0)
+        let ledger = VideoSurfaceBudgetLedger(limit: frame.estimatedStorageBytes)
+        let output = SystemVideoOutput(backend: backend, ledger: ledger,
+            removeRenderer: backend.remove, failureSink: { _, _ in })
+        let receipt = NativeAdapterCounter()
+        output.enqueue([frame]) { result in
+            if case .success = result { XCTFail("Stopped receipt must be rejected") }
+            receipt.increment()
+        }
+        try await eventually { await endpoint.operations == ["enqueue"] }
+        let stopped = expectation(description: "Outer stop deadline completes independently of native enqueue")
+        Task { await output.stopAwaitingRendererRemoval(); stopped.fulfill() }
+        await fulfillment(of: [stopped], timeout: 3)
+        XCTAssertEqual(receipt.value, 1)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 1,
+            "A stop timeout cannot release an application-owned native submission")
+        await endpoint.complete(.init(result: .accepted, events: []))
+        try await eventually { ledger.snapshot.referenceCount == 0 }
+        XCTAssertEqual(receipt.value, 1)
+        try await eventually { await endpoint.operations.contains("remove") }
+        XCTAssertEqual(ledger.snapshot.retainedBytes, 0)
+    }
+
+    private func videoFrame(sequence: UInt64, generation: UInt64) throws -> VideoPresentationFrame {
+        VideoPresentationFrame(pixelBuffer: try VideoTestFactories.nv12(width: 64, height: 36),
+            presentationTimeStamp: CMTime(value: Int64(sequence), timescale: 30),
+            duration: CMTime(value: 1, timescale: 30), generation: .init(rawValue: generation),
+            sequenceNumber: sequence, sourceAccessUnitID: sequence,
+            formatMetadata: VideoTestFactories.metadata())
+    }
+
+    func testAudioControlBurstCoalescesBehindHeldPhysicalFlush() async throws {
+        let endpoint = ControlledAudioReceiverEndpoint(holdFlush: true)
+        let renderer = SystemAudioRenderer(identity: .init(rawValue: 10), mediaKind: .linearPCM,
+            receiverEndpoint: endpoint)
+        renderer.flush()
+        try await eventually { await endpoint.operations == ["flush"] }
+        for _ in 0..<64 { renderer.flush(); renderer.finishedEnqueuing() }
+        XCTAssertEqual(renderer.controlWorkSnapshot.workers, 1)
+        XCTAssertEqual(renderer.controlWorkSnapshot.pendingIntents, 2)
+        XCTAssertEqual(renderer.controlWorkSnapshot.completionWaiters, 0)
+        XCTAssertFalse(renderer.isReadyForMoreMediaData)
+        await endpoint.completeFlush()
+        try await eventually { await endpoint.operations == ["flush", "flush"] }
+        XCTAssertFalse(renderer.isReadyForMoreMediaData)
+        await endpoint.completeFlush()
+        try await eventually { renderer.isReadyForMoreMediaData }
+        let operations = await endpoint.operations
+        XCTAssertEqual(operations, ["flush", "flush", "observe"],
+            "A burst must retain only one pending physical flush and latest idle intent")
+    }
+
+    func testVideoControlBurstSupersedesPendingWaitersAndPreservesImageClear() async throws {
+        let endpoint = ControlledVideoReceiverEndpoint(holdFlush: true)
+        let backend = VideoRendererBackend(renderer: AVSampleBufferDisplayLayer().sampleBufferRenderer,
+            synchronizer: AVSampleBufferRenderSynchronizer(), receiverEndpoint: endpoint)
+        let results = NativeControlResults()
+        requestFlush(backend, removeDisplayedImage: false) { results.record($0) }
+        try await eventually { await endpoint.operations == ["flush"] }
+        for index in 0..<64 {
+            requestFlush(backend, removeDisplayedImage: index == 0) { results.record($0) }
+            backend.finishedEnqueuing()
+        }
+        XCTAssertEqual(backend.controlWorkSnapshot.workers, 1)
+        XCTAssertEqual(backend.controlWorkSnapshot.pendingIntents, 2)
+        XCTAssertEqual(backend.controlWorkSnapshot.completionWaiters, 2)
+        XCTAssertEqual(results.values, Array(repeating: false, count: 63),
+            "Superseded pending callbacks must settle explicitly without retained waiters")
+        XCTAssertFalse(backend.isReadyForMoreMediaData)
+        await endpoint.completeFlush()
+        try await eventually { await endpoint.operations == ["flush", "flush"] }
+        XCTAssertEqual(results.values.filter { $0 }.count, 1)
+        let imageClears = await endpoint.flushImageClears
+        XCTAssertEqual(imageClears, [false, true], "Keep the strongest coalesced clear intent")
+        await endpoint.completeFlush()
+        try await eventually { results.values.count == 65 && backend.isReadyForMoreMediaData }
+        XCTAssertEqual(results.values.filter { $0 }.count, 2)
+        let operations = await endpoint.operations
+        XCTAssertEqual(operations, ["flush", "flush", "observe"])
+        let accepted = expectation(description: "Feed resumes after the final physical barrier")
+        backend.enqueue(try pcm()) { result in
+            if case .success(.accepted) = result {} else { XCTFail("Expected genuine native acceptance") }
+            accepted.fulfill()
+        }
+        try await eventually { await endpoint.operations.last == "enqueue" }
+        await endpoint.complete(.init(result: .accepted, events: []))
+        await fulfillment(of: [accepted], timeout: 1)
+    }
+
+    func testVideoControlAndRemovalOverflowRemainBoundedUntilNativeSettlement() async throws {
+        let endpoint = ControlledVideoReceiverEndpoint(holdFlush: true)
+        let backend = VideoRendererBackend(renderer: AVSampleBufferDisplayLayer().sampleBufferRenderer,
+            synchronizer: AVSampleBufferRenderSynchronizer(), receiverEndpoint: endpoint)
+        let flushes = NativeControlResults()
+        let removals = NativeControlResults()
+        backend.enqueue(try pcm()) { _ in }
+        try await eventually { await endpoint.operations == ["enqueue"] }
+        backend.flush(removeDisplayedImage: false) { flushes.record($0) }
+        try await eventually { await endpoint.operations == ["enqueue", "flush"] }
+        for index in 0..<64 {
+            backend.flush(removeDisplayedImage: index == 0) { flushes.record($0) }
+        }
+        backend.cancelPendingEnqueue() // Must preserve the newest logical flush waiter.
+        for _ in 0..<65 { backend.remove { removals.record($0) }; backend.finishedEnqueuing() }
+        XCTAssertEqual(flushes.values, Array(repeating: false, count: 63))
+        XCTAssertEqual(removals.values, Array(repeating: false, count: 63))
+        XCTAssertEqual(backend.controlWorkSnapshot.workers, 1)
+        XCTAssertEqual(backend.controlWorkSnapshot.pendingIntents, 2)
+        XCTAssertEqual(backend.controlWorkSnapshot.completionWaiters, 4)
+        backend.enqueue(try pcm()) { result in
+            if case .success(.cancelled) = result {} else { XCTFail("Removal must close admission") }
+        }
+        await endpoint.completeFlush()
+        // Flush returning is insufficient while native enqueue ignores cancellation.
+        XCTAssertEqual(flushes.values.filter { $0 }.count, 0)
+        await endpoint.complete(.init(result: .accepted, events: []))
+        try await eventually { await endpoint.operations == ["enqueue", "flush", "flush"] }
+        XCTAssertEqual(flushes.values.filter { $0 }.count, 1)
+        XCTAssertEqual(removals.values.filter { $0 }.count, 0)
+        let imageClears = await endpoint.flushImageClears
+        XCTAssertEqual(imageClears, [false, true])
+        await endpoint.completeFlush()
+        try await eventually { removals.values.count == 65 && backend.controlWorkSnapshot.workers == 0 }
+        XCTAssertEqual(flushes.values.filter { $0 }.count, 2)
+        XCTAssertEqual(removals.values.filter { $0 }.count, 2)
+        XCTAssertEqual(backend.controlWorkSnapshot.completionWaiters, 0)
+        XCTAssertFalse(backend.isReadyForMoreMediaData)
+        let operations = await endpoint.operations
+        XCTAssertEqual(operations, ["enqueue", "flush", "flush", "remove"],
+            "Removal dominates idle monitoring and occurs once after the true physical barriers")
+    }
+
+    func testSupersededVideoFlushKeepsNativeFailureUntilCurrentPhysicalBarrier() async throws {
+        let endpoint = ControlledVideoReceiverEndpoint(holdFlush: true)
+        let backend = VideoRendererBackend(renderer: AVSampleBufferDisplayLayer().sampleBufferRenderer,
+            synchronizer: AVSampleBufferRenderSynchronizer(), receiverEndpoint: endpoint)
+        backend.enqueue(try pcm()) { _ in }
+        try await eventually { await endpoint.operations == ["enqueue"] }
+        await endpoint.complete(.init(result: .requiresRecovery(.failed(
+            NSError(domain: "Receiver.CurrentFailure", code: -1))), events: []))
+        try await eventually { backend.health == .failed }
+        let results = NativeControlResults()
+        backend.flush(removeDisplayedImage: false) { results.record($0) }
+        try await eventually { await endpoint.operations == ["enqueue", "flush"] }
+        backend.flush(removeDisplayedImage: false) { results.record($0) }
+        backend.flush(removeDisplayedImage: false) { results.record($0) }
+        XCTAssertEqual(results.values, [false])
+        XCTAssertEqual(backend.health, .failed)
+        await endpoint.completeFlush()
+        try await eventually { await endpoint.operations == ["enqueue", "flush", "flush"] }
+        XCTAssertEqual(backend.health, .failed, "An older barrier cannot clear the current failure fence")
+        XCTAssertFalse(backend.isReadyForMoreMediaData)
+        await endpoint.completeFlush()
+        try await eventually { backend.isReadyForMoreMediaData }
+        XCTAssertEqual(backend.health, .noKnownFailure)
+        XCTAssertEqual(results.values, [false, true, true])
+    }
+
+    func testAudioRemovalOverflowKeepsOnlyFirstAndNewestWaiter() async throws {
+        let endpoint = ControlledAudioReceiverEndpoint(holdFlush: true)
+        let renderer = SystemAudioRenderer(identity: .init(rawValue: 11), mediaKind: .linearPCM,
+            receiverEndpoint: endpoint)
+        renderer.flush()
+        try await eventually { await endpoint.operations == ["flush"] }
+        let removals = NativeControlResults()
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        for _ in 0..<65 {
+            renderer.remove(from: synchronizer, at: .invalid) { removals.record($0) }
+            renderer.finishedEnqueuing()
+        }
+        XCTAssertEqual(removals.values, Array(repeating: false, count: 63))
+        XCTAssertEqual(renderer.controlWorkSnapshot.workers, 1)
+        XCTAssertEqual(renderer.controlWorkSnapshot.pendingIntents, 2)
+        XCTAssertEqual(renderer.controlWorkSnapshot.completionWaiters, 2)
+        await endpoint.completeFlush()
+        try await eventually { await endpoint.operations == ["flush", "flush"] }
+        XCTAssertEqual(removals.values.filter { $0 }.count, 0)
+        await endpoint.completeFlush()
+        try await eventually { removals.values.count == 65 && renderer.controlWorkSnapshot.workers == 0 }
+        XCTAssertEqual(removals.values.filter { $0 }.count, 2)
+        let operations = await endpoint.operations
+        XCTAssertEqual(operations, ["flush", "flush", "remove"])
+        XCTAssertFalse(renderer.isReadyForMoreMediaData)
+    }
+
+    private func requestFlush(_ backend: VideoRendererBackend, removeDisplayedImage: Bool,
+        completion: @escaping @Sendable (Bool) -> Void) {
+        backend.flush(removeDisplayedImage: removeDisplayedImage, completion: completion)
     }
 
     func testAudioSuggestedAutomaticFlushSettlesBeforeNextNativeEnqueue() async throws {
@@ -100,9 +364,11 @@ final class NativeReceiverAdapterTests: XCTestCase {
         renderer.finishedEnqueuing()
         try await eventually { await endpoint.operations == ["observe"] }
         await endpoint.emit(.automaticFlush(.zero))
-        renderer.enqueue(try pcm()) { _ in }
+        renderer.enqueue(try pcm()) { result in XCTAssertEqual(try? result.get(), .backpressured) }
         try await eventually { await endpoint.operations == ["observe", "flush"] }
         await endpoint.completeFlush()
+        try await eventually { renderer.isReadyForMoreMediaData }
+        renderer.enqueue(try pcm()) { _ in }
         try await eventually { await endpoint.operations == ["observe", "flush", "enqueue"] }
         await endpoint.complete(.init(result: .accepted, events: []))
     }
@@ -134,11 +400,13 @@ final class NativeReceiverAdapterTests: XCTestCase {
         renderer.flush()
         try await eventually { await endpoint.operations == ["enqueue", "flush"] }
         await endpoint.complete(.init(result: .accepted, events: []))
-        try await eventually { renderer.isReadyForMoreMediaData }
-        renderer.enqueue(try pcm()) { _ in }
+        XCTAssertFalse(renderer.isReadyForMoreMediaData)
+        renderer.enqueue(try pcm()) { result in XCTAssertEqual(try? result.get(), .backpressured) }
         let beforeFlushSettlement = await endpoint.operations
         XCTAssertEqual(beforeFlushSettlement, ["enqueue", "flush"])
         await endpoint.completeFlush()
+        try await eventually { renderer.isReadyForMoreMediaData }
+        renderer.enqueue(try pcm()) { _ in }
         try await eventually { await endpoint.operations == ["enqueue", "flush", "enqueue"] }
         await endpoint.complete(.init(result: .accepted, events: []))
     }
@@ -170,12 +438,12 @@ final class NativeReceiverAdapterTests: XCTestCase {
         backend.startObserving { _ in notices.increment() }
         backend.enqueue(try pcm()) { _ in }
         try await eventually { await endpoint.operations == ["enqueue"] }
-        backend.flush(removeDisplayedImage: false) { flushed.increment() }
+        backend.flush(removeDisplayedImage: false) { settled in XCTAssertTrue(settled); flushed.increment() }
         try await eventually { await endpoint.operations.contains("flush") }
         XCTAssertEqual(flushed.value, 0)
         await endpoint.complete(.init(result: .requiresRecovery(.failed(
             NSError(domain: "OldReceiver", code: -1))), events: []))
-        try await eventually { flushed.value == 1 }
+        try await eventually { flushed.value == 1 && backend.isReadyForMoreMediaData }
         XCTAssertTrue(backend.isReadyForMoreMediaData)
         XCTAssertFalse(backend.requiresFlushToResumeDecoding)
         XCTAssertNil(backend.error)
@@ -241,7 +509,11 @@ private actor ControlledAudioReceiverEndpoint: AudioReceiverEndpoint {
 
 private actor ControlledVideoReceiverEndpoint: VideoReceiverEndpoint {
     private(set) var operations: [String] = []
+    private(set) var flushImageClears: [Bool] = []
     private var continuation: CheckedContinuation<VideoReceiverOutcome, Never>?
+    private var flushContinuation: CheckedContinuation<Void, Never>?
+    private let holdFlush: Bool
+    init(holdFlush: Bool = false) { self.holdFlush = holdFlush }
     func enqueue(_ sample: RendererReceiverSample) async throws -> VideoReceiverOutcome {
         _ = sample
         operations.append("enqueue")
@@ -252,8 +524,19 @@ private actor ControlledVideoReceiverEndpoint: VideoReceiverEndpoint {
         continuation = nil
         pending?.resume(returning: result)
     }
-    func flush(removeDisplayedImage: Bool) { _ = removeDisplayedImage; operations.append("flush") }
-    func finishedEnqueuing(_ handler: @escaping @Sendable (VideoRendererBackendEvent) -> Void) { _ = handler }
+    func flush(removeDisplayedImage: Bool) async {
+        operations.append("flush")
+        flushImageClears.append(removeDisplayedImage)
+        if holdFlush { await withCheckedContinuation { flushContinuation = $0 } }
+    }
+    func completeFlush() {
+        let pending = flushContinuation
+        flushContinuation = nil
+        pending?.resume()
+    }
+    func finishedEnqueuing(_ handler: @escaping @Sendable (VideoRendererBackendEvent) -> Void) {
+        _ = handler; operations.append("observe")
+    }
     func remove(from synchronizer: AVSampleBufferRenderSynchronizer) async -> Bool {
         _ = synchronizer; operations.append("remove"); return true
     }
@@ -282,4 +565,11 @@ private final class NativeSmokeResult: @unchecked Sendable {
             }
         }
     }
+}
+
+private final class NativeControlResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Bool] = []
+    var values: [Bool] { lock.withLock { stored } }
+    func record(_ value: Bool) { lock.withLock { stored.append(value) } }
 }

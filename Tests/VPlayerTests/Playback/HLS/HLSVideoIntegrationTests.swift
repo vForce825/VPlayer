@@ -670,12 +670,14 @@ final class HLSVideoIntegrationTests: XCTestCase {
             ]
         )
         guard reader.canAdd(readerOutput) else { throw CompressionError(status: -7) }
-        reader.add(readerOutput)
-        guard reader.startReading() else { throw CompressionError(status: -8) }
+        let provider = reader.outputProvider(for: readerOutput)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
 
         var pbs: [CVPixelBuffer] = []
         var ptss: [CMTime] = []
-        while let sb = readerOutput.copyNextSampleBuffer() {
+        while let ready = try await provider.next() {
+            let sb = try makeOwnedReaderFixtureSample(copying: ready)
             if let pb = CMSampleBufferGetImageBuffer(sb) {
                 pbs.append(pb)
                 ptss.append(CMSampleBufferGetPresentationTimeStamp(sb))

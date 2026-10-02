@@ -50,41 +50,10 @@ jobs:
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
 
-      - name: Install official Metal toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
-
-      - name: Rebuild tvOS 27 Metal libraries
-        run: ./Scripts/build-metal-libraries.sh
-
-      - name: Generate project for SDK migration diagnostic
-        run: ./Scripts/bootstrap.sh --generate
-
-      - name: Export bounded generated outputs to build log
+      - name: Verify committed generated project and licenses
         run: |
-          python3 - <<'PY'
-          import base64, hashlib, pathlib, subprocess
-          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-          print("GENERATED_SOURCE_COMMIT=" + commit)
-          print("GENERATED_LOCAL_SOURCE_COMMIT=f45a1b6033b2fce3eed7f3eeced74778c9c33363")
-          paths = [
-              "VPlayer.xcodeproj/project.pbxproj",
-              "Sources/VPlayerPlayback/Resources/VPlayerPlayback-tvos.metallib",
-              "Sources/VPlayerPlayback/Resources/VPlayerPlayback-tvsimulator.metallib",
-          ]
-          total = 0
-          for name in paths:
-              data = pathlib.Path(name).read_bytes()
-              total += len(data)
-              if total > 1048576:
-                  raise SystemExit("Generated outputs exceed bounded 1 MiB log export")
-              print("GENERATED_BEGIN " + name)
-              print("GENERATED_BYTES=" + str(len(data)))
-              print("GENERATED_SHA256=" + hashlib.sha256(data).hexdigest())
-              encoded = base64.b64encode(data).decode()
-              for offset in range(0, len(encoded), 120):
-                  print("GENERATED_BASE64=" + encoded[offset:offset + 120])
-              print("GENERATED_END " + name)
-          PY
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
 
       - name: Compile tvOS 27 app and tests
         run: |
@@ -97,7 +66,7 @@ jobs:
       - name: Verify bounded XCTest timeout options
         run: |
           help="$(xcodebuild -help 2>&1)"
-          for option in -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
+          for option in -collect-test-diagnostics -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
             printf '%s\n' "$help" | grep -F -- "$option"
           done
 
@@ -111,7 +80,7 @@ jobs:
           command = [
               "xcodebuild", "test-without-building", "-project", "VPlayer.xcodeproj",
               "-scheme", "VPlayer", "-destination", os.environ["TVOS_TEST_DESTINATION"],
-              "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
+              "-parallel-testing-enabled", "NO", "-collect-test-diagnostics", "never", "-test-timeouts-enabled", "YES",
               "-default-test-execution-time-allowance", "120",
               "-maximum-test-execution-time-allowance", "300",
               "-only-testing:VPlayerTests/AudioSessionLifecycleTests",
@@ -127,6 +96,12 @@ jobs:
               "-only-testing:VPlayerTests/ReducedResourceUsageTests",
               "-only-testing:VPlayerTests/SegmentedFMP4WriterTests",
               "-only-testing:VPlayerTests/AACPrimingCalibratorTests",
+              "-only-testing:VPlayerTests/OutputCleanupCoordinatorTests",
+              "-only-testing:VPlayerTests/PlaybackDeadlineTests",
+              "-only-testing:VPlayerTests/Task9ReconstructedRegressionTests",
+              "-only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests",
+              "-only-testing:VPlayerTests/SampleBufferBackendTests",
+              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests",
               "CODE_SIGNING_ALLOWED=NO",
           ]
           process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)

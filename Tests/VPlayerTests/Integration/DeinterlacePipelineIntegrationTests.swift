@@ -150,6 +150,7 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(result.deliveredSourceAccessUnitIDs.prefix(3), [1, 3, 2])
         XCTAssertEqual(result.repeatFieldRoute, .metalYADIF2x)
+        XCTAssertTrue(result.initialInterlacedGOPWasRejected)
         XCTAssertTrue(result.repeatFieldMetadataReachedProcessor)
         XCTAssertEqual(
             result.repeatFieldNormalizedDurations,
