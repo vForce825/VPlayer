@@ -20,6 +20,40 @@ private final class WeakSystemAVPlayerDriverProbe {
 }
 
 @MainActor
+private final class NativeAudibleSelectionProgressProbe {
+    weak var driver: SystemAVPlayerDriver?
+    private var phase = "fixture"
+    private var task: Task<Void, Never>?
+
+    init() {
+        mark("fixture")
+        task = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) }
+            catch { return }
+            guard !Task.isCancelled, let self else { return }
+            // Keep only a weak driver across the sleep. This single read cannot
+            // extend the physical item or any SDK callback's lifetime.
+            let item = driver?.player.currentItem
+            let error = item?.error as NSError?
+            print("NATIVE_AUDIBLE_WAIT phase=\(phase) "
+                + "waitPhase=\(driver?.prepareWait.activePhase.map { String(describing: $0) } ?? "none") "
+                + "itemStatus=\(item?.status.rawValue ?? -1) "
+                + "errorDomain=\(error?.domain ?? "none") errorCode=\(error?.code ?? 0) "
+                + "disconnected=\(driver?.disconnectedFromSystemAudio ?? false) "
+                + "waiterCount=\(driver?.activeWaiterCount ?? 0) "
+                + "callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount)")
+        }
+    }
+
+    func mark(_ phase: String) {
+        self.phase = phase
+        print("NATIVE_AUDIBLE_PHASE phase=\(phase)")
+    }
+
+    func stop() { task?.cancel(); task = nil }
+}
+
+@MainActor
 final class AVPlayerItemCoordinatorTests: XCTestCase {
     func testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries() async throws {
         let encoded = try await Task21RealAACSeed.makeEncodedInput()
@@ -305,26 +339,37 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup()
         async throws {
+        let progress = NativeAudibleSelectionProgressProbe()
+        defer { progress.stop() }
         let fixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_122),
             audioOnly: true)
         defer { fixture.shutdown() }
+        progress.mark("driver")
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        progress.driver = driver
         let item = fixture.request.item
         try driver.install(url: fixture.request.itemURL, identity: item)
         defer { driver.replaceCurrentItemWithNil(item: item) }
+        progress.mark("disconnect")
         try await driver.setDisconnectedFromSystemAudio(true, item: item)
+        progress.mark("ready")
         let ready = try await driver.waitUntilReady(item: item)
         XCTAssertEqual(ready, item)
         let physical = try XCTUnwrap(driver.player.currentItem)
+        progress.mark("audible-group")
         let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+        print("NATIVE_AUDIBLE_GROUP present=\(group != nil) optionCount=\(group?.options.count ?? 0)")
+        progress.mark("audio-tracks")
         let tracks = try await physical.asset.loadTracks(withMediaType: .audio)
         print("NATIVE_AUDIBLE_SELECTION groupPresent=\(group != nil) optionCount=\(group?.options.count ?? 0) audioTrackCount=\(tracks.count)")
         XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
         XCTAssertEqual(tracks.count, 1,
                        "a missing selection group is only valid here with one real audio track")
 
+        progress.mark("production-selection")
         try await driver.selectAudibleMedia(item: item)
+        progress.mark("complete")
 
         XCTAssertTrue(driver.player.currentItem === physical)
         XCTAssertEqual(driver.rate, 0)
@@ -1569,7 +1614,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     func testEndpointAdmissionConsumesSealedWriterSnapshotAndRejectsServedTrimMutations()
         async throws {
         let fixture = try await Task21RealIntegrationFixture.make()
-        defer { fixture.shutdown() }
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
         try await fixture.validateEndpointThroughCompletedSocketBodies()
         XCTAssertThrowsError(try fixture.validateEndpoint(),
                              "production authority 不允许调用方重放或自填 expected 字段")
@@ -5145,6 +5191,65 @@ private final class Task21FinalEOSCleanupReceiver: PlaybackOwnedCleanupReceiving
 
 @MainActor
 private final class Task21RealIntegrationFixture {
+    /// Holds the exact native fixture until its Registry retirement joins, then
+    /// releases it before waiting for physical SDK log reads and queued wakes.
+    @MainActor
+    final class Owner {
+        private var fixture: Task21RealIntegrationFixture?
+        private weak var driver: SystemAVPlayerDriver?
+        private let resourceBaseline: Int
+        private let applicationBaseline: Int
+        private let callbackBaseline: Int
+
+        init(_ fixture: Task21RealIntegrationFixture) {
+            self.fixture = fixture
+            driver = fixture.driver
+            resourceBaseline = fixture.resourceBaseline
+            applicationBaseline = fixture.applicationBaseline
+            callbackBaseline = fixture.callbackBaseline
+        }
+
+        func tearDown(file: StaticString = #filePath, line: UInt = #line) async throws {
+            var cleanupError: (any Error)?
+            do { try await releaseFixture() }
+            catch { cleanupError = error }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while (driver != nil
+                   || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline
+                   || PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline
+                   || HLSDeliveryApplicationChargeLedger.shared.chargedBytes != applicationBaseline),
+                  ContinuousClock.now < deadline {
+                await Task21RealIntegrationFixture.awaitMainQueueTurn()
+            }
+            if driver != nil || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline
+                || PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline
+                || HLSDeliveryApplicationChargeLedger.shared.chargedBytes != applicationBaseline {
+                print("NATIVE_FIXTURE_TAIL driverAlive=\(driver != nil) "
+                    + "itemInstalled=\(driver?.currentItemIdentity != nil) "
+                    + "callbacks=\(AVPlayerSDKCallbackLease.occupiedCount) expectedCallbacks=\(callbackBaseline) "
+                    + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) expectedContextBytes=\(resourceBaseline) "
+                    + "applicationBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes) expectedApplicationBytes=\(applicationBaseline)")
+            }
+            XCTAssertNil(driver, "The original native log reader must release its driver",
+                         file: file, line: line)
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline,
+                           "Actual SDK callback aliases must complete before the next fixture",
+                           file: file, line: line)
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline,
+                           "The queued native wake must release its original admission escrow",
+                           file: file, line: line)
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes,
+                           applicationBaseline, "The retired fixture must release its metadata",
+                           file: file, line: line)
+            if let cleanupError { throw cleanupError }
+        }
+
+        private func releaseFixture() async throws {
+            defer { fixture = nil }
+            try await fixture?.shutdownThroughRegistry()
+        }
+    }
+
     struct PlaybackResult {
         let presentedEnd: Double
         let endpointEnd: Double
@@ -5748,6 +5853,54 @@ private final class Task21RealIntegrationFixture {
             try server.retire(cleanupTicket: ticket)
         } catch {
             XCTFail("非 EOS 夹具 server cleanup 失败：\(error)")
+        }
+    }
+
+    private func shutdownThroughRegistry() async throws {
+        var cleanupError: (any Error)?
+        do {
+            try await stopAndRetireRegistryOutput()
+            guard coordinator.currentItemIdentity == nil,
+                  coordinator.phase == .quiescent else {
+                throw AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+        } catch {
+            cleanupError = error
+            // A failed claim may still have an original registered runner. Join
+            // that task before retiring this test's exact observation owners.
+            await graph.registry.joinOwnedTerminalCleanup(
+                session: item.outputLifecycleEpoch.backendIdentity.sessionIdentity)
+            driver.pause(item: item)
+            driver.replaceCurrentItemWithNil(item: item)
+            driver.removeObservers(item: item)
+            evidenceSource.retirePreparation()
+            // This fallback signs no quiescence receipt and retains the failure.
+            // Native callbacks keep their leases until their actual completion.
+        }
+        do {
+            try await closeAndRetireServer()
+        } catch {
+            if cleanupError == nil { cleanupError = error }
+            else { XCTFail("Native fixture HTTP cleanup also failed: \(error)") }
+        }
+        if let cleanupError { throw cleanupError }
+    }
+
+    private func closeAndRetireServer() async throws {
+        let ticket = server.closeAdmission()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (server.usage.connections != 0 || server.usage.activeResponses != 0),
+              ContinuousClock.now < deadline {
+            await Self.awaitMainQueueTurn()
+        }
+        guard server.usage.connections == 0, server.usage.activeResponses == 0 else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
+        try server.drain(cleanupTicket: ticket)
+        try server.retire(cleanupTicket: ticket)
+        guard server.usage.distinctBackingBytes == 0,
+              server.usage.parserAndStagingBytes == 0 else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
     }
 

@@ -157,6 +157,162 @@ final class RefreshLifecycleTests: XCTestCase {
         driver.deactivate()
     }
 
+    func testReducedResourcePreferencePreservesManualRefreshWhileAutomaticWorkIsDeferred() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let work = BackgroundWorkProbe()
+        let sleeping = expectation(description: "Reduced foreground loop reached its normal sleep")
+        let automaticLoad = expectation(description: "Preference changes must not load foreground profiles")
+        automaticLoad.isInverted = true
+        let refresh: ForegroundRefreshDriver.Refresh = { profileID, resources, trigger in
+            XCTAssertEqual(profileID, profile.id)
+            await work.recordRefresh(resources: resources, trigger: trigger)
+            return resources.map { RefreshOutcome(resource: $0, succeeded: true, message: nil) }
+        }
+        let driver = ForegroundRefreshDriver(
+            loadProfiles: { automaticLoad.fulfill(); return [profile] },
+            refresh: refresh,
+            now: { now },
+            sleep: { sleeping.fulfill(); try await Task.sleep(for: .seconds(3_600)) },
+            reportStatus: { _ in XCTFail("No automatic refresh error is expected") }
+        )
+        defer { driver.deactivate() }
+        let scheduler = BackgroundSchedulerSpy()
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [profile] }, refresh: refresh,
+            now: { now }, reportStatus: { _ in XCTFail("Background deferral should succeed") }
+        )
+        let model = AppModel(
+            repository: RepositorySpy(profiles: [profile]), refresh: refresh, now: { now }
+        )
+        driver.setPrefersReducedResourceUsage(true)
+        registrar.setPrefersReducedResourceUsage(true)
+        driver.initialLibraryLoadDidComplete()
+        driver.activate()
+        registrar.register()
+        let completed = expectation(description: "Reduced background launch completed")
+        let backgroundTask = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { success in XCTAssertTrue(success); completed.fulfill() }
+        )
+        try scheduler.launch(backgroundTask)
+        await fulfillment(of: [sleeping, completed], timeout: 2)
+        let automaticRefreshCount = await work.refreshCount
+        XCTAssertEqual(automaticRefreshCount, 0)
+
+        await model.reload()
+        await model.refresh(profileID: profile.id, resource: .epg)
+
+        let resources = await work.resources
+        let trigger = await work.trigger
+        let refreshCount = await work.refreshCount
+        XCTAssertEqual(resources, [.epg])
+        XCTAssertEqual(refreshCount, 1)
+        guard case .manual? = trigger else { return XCTFail("Expected only the requested manual refresh") }
+        XCTAssertEqual(scheduler.submissions.map(\.earliestBeginDate), [now.addingTimeInterval(3_600)])
+
+        let unexpectedScheduling = expectation(description: "Preference changes must not resubmit or cancel")
+        unexpectedScheduling.isInverted = true
+        scheduler.onMutation = { unexpectedScheduling.fulfill() }
+        driver.setPrefersReducedResourceUsage(false)
+        registrar.setPrefersReducedResourceUsage(false)
+        driver.setPrefersReducedResourceUsage(true)
+        registrar.setPrefersReducedResourceUsage(true)
+        await fulfillment(of: [automaticLoad, unexpectedScheduling], timeout: 0.05)
+        let finalRefreshCount = await work.refreshCount
+        XCTAssertEqual(finalRefreshCount, 1)
+    }
+
+    func testReducedResourceBackgroundLaunchDefersOneHourThenNormalLaunchRefreshesDueWork() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        defer { scheduler.completeAsyncSubmission() }
+        let submitted = expectation(description: "Reduced successor submission entered")
+        scheduler.onSubmission = { submitted.fulfill() }
+        let work = BackgroundWorkProbe()
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [profile] },
+            refresh: { _, resources, trigger in
+                await work.recordRefresh(resources: resources, trigger: trigger)
+                return resources.map { RefreshOutcome(resource: $0, succeeded: true, message: nil) }
+            },
+            now: { now }, reportStatus: { _ in XCTFail("Scheduling should succeed") }
+        )
+        registrar.setPrefersReducedResourceUsage(true)
+        registrar.register()
+        var completions: [Bool] = []
+        let deferred = expectation(description: "Reduced launch completed after successor submission")
+        let reducedTask = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { success in completions.append(success); deferred.fulfill() }
+        )
+        try scheduler.launch(reducedTask)
+        await fulfillment(of: [submitted], timeout: 2)
+        XCTAssertTrue(completions.isEmpty, "The launch must wait for physical successor submission")
+        XCTAssertEqual(scheduler.events, [.cancel, .begin(now.addingTimeInterval(3_600))])
+        scheduler.completeAsyncSubmission()
+        await fulfillment(of: [deferred], timeout: 2)
+        XCTAssertEqual(completions, [true])
+        let reducedRefreshCount = await work.refreshCount
+        XCTAssertEqual(reducedRefreshCount, 0)
+        XCTAssertEqual(scheduler.pendingSubmission?.earliestBeginDate, now.addingTimeInterval(3_600))
+
+        scheduler.onSubmission = nil
+        let preferenceOnlyMutation = expectation(description: "Preference changes alone must preserve pending work")
+        preferenceOnlyMutation.isInverted = true
+        scheduler.onMutation = { preferenceOnlyMutation.fulfill() }
+        registrar.setPrefersReducedResourceUsage(false)
+        await fulfillment(of: [preferenceOnlyMutation], timeout: 0.05)
+        let recoveredRefreshCount = await work.refreshCount
+        XCTAssertEqual(recoveredRefreshCount, 0, "Only a legitimate launch may resume automatic refresh")
+        XCTAssertEqual(scheduler.pendingSubmission?.earliestBeginDate, now.addingTimeInterval(3_600))
+
+        scheduler.onMutation = nil
+        scheduler.holdsAsyncSubmission = false
+        let refreshed = expectation(description: "Normal background launch completed")
+        let normalTask = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { success in completions.append(success); refreshed.fulfill() }
+        )
+        try scheduler.launch(normalTask)
+        await fulfillment(of: [refreshed], timeout: 2)
+        XCTAssertEqual(completions, [true, true])
+        XCTAssertEqual(scheduler.submissions.map(\.earliestBeginDate), [
+            now.addingTimeInterval(3_600), now.addingTimeInterval(15 * 60),
+        ])
+        XCTAssertEqual(scheduler.cancelledIdentifiers, Array(repeating: BackgroundRefreshRegistrar.identifier, count: 2))
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+        let resources = await work.resources
+        let trigger = await work.trigger
+        let refreshCount = await work.refreshCount
+        XCTAssertEqual(resources, [.playlist])
+        XCTAssertEqual(refreshCount, 1)
+        guard case .background? = trigger else { return XCTFail("Expected restored background refresh") }
+    }
+
+    func testReducedResourceBackgroundSchedulePreservesAnAlreadyLaterPlannerDate() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var profile = makeProfile(now: now)
+        profile.m3uRefreshInterval = .sixHours
+        profile.m3uStatus.lastSuccessAt = now
+        let scheduledProfile = profile
+        let scheduler = BackgroundSchedulerSpy()
+        let submitted = expectation(description: "Later planner date physically submitted")
+        scheduler.onSubmissionCompleted = { submitted.fulfill() }
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [scheduledProfile] },
+            refresh: { _, _, _ in XCTFail("Scheduling must not perform a refresh"); return [] },
+            now: { now }, reportStatus: { _ in XCTFail("Scheduling should succeed") }
+        )
+        registrar.setPrefersReducedResourceUsage(true)
+        registrar.scheduleNext()
+        await fulfillment(of: [submitted], timeout: 2)
+        XCTAssertEqual(scheduler.submissions.map(\.earliestBeginDate), [now.addingTimeInterval(6 * 3_600)])
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+    }
+
     func testNewScheduleWaitsForOldPhysicalSubmissionBeforeReplacingIt() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(now: now)
@@ -886,6 +1042,7 @@ private actor ForegroundLoadFailureGate {
 }
 
 private actor BackgroundWorkProbe {
+    private(set) var refreshCount = 0
     private(set) var resources: Set<RefreshResource> = []
     private(set) var trigger: RefreshTrigger?
     private(set) var cancellationCount = 0
@@ -896,6 +1053,7 @@ private actor BackgroundWorkProbe {
     }
 
     func recordRefresh(resources: Set<RefreshResource>, trigger: RefreshTrigger) {
+        refreshCount += 1
         self.resources = resources
         self.trigger = trigger
     }
@@ -1061,6 +1219,9 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
     private(set) var submissions: [Submission] = []
     var submitError: NSError?
     var holdsAsyncSubmission = false
+    var onSubmission: (@MainActor () -> Void)?
+    var onSubmissionCompleted: (@MainActor () -> Void)?
+    var onMutation: (@MainActor () -> Void)?
     private(set) var asyncSubmissionCount = 0
     private(set) var inFlightSubmissions = 0
     private(set) var maximumInFlightSubmissions = 0
@@ -1081,6 +1242,8 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
         events.append(.begin(earliestBeginDate))
         inFlightSubmissions += 1
         maximumInFlightSubmissions = max(maximumInFlightSubmissions, inFlightSubmissions)
+        onSubmission?()
+        onMutation?()
         defer { inFlightSubmissions -= 1 }
         if holdsAsyncSubmission {
             try await withCheckedThrowingContinuation { submissionContinuation = $0 }
@@ -1090,6 +1253,7 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
         submissions.append(submission)
         pendingSubmission = submission
         events.append(.succeed(earliestBeginDate))
+        onSubmissionCompleted?()
     }
     private var handler: (@MainActor @Sendable (any BackgroundRefreshTask) -> Void)?
 
@@ -1103,6 +1267,7 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
     }
 
     func cancel(identifier: String) {
+        onMutation?()
         cancelledIdentifiers.append(identifier)
         pendingSubmission = nil
         events.append(.cancel)

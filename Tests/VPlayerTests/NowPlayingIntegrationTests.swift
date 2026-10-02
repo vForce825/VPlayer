@@ -91,6 +91,83 @@ final class NowPlayingIntegrationTests: XCTestCase {
         XCTAssertNil(coordinator.current)
     }
 
+    func testReducedResourcePreferencePreservesCachedChannelPlaybackAndCurrentOwnerTransport() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = SourceProfile(
+            id: UUID(), name: "Cached source",
+            m3uURL: URL(string: "https://example.invalid/list.m3u")!,
+            epgURL: URL(string: "https://example.invalid/guide.xml")!,
+            m3uRefreshInterval: .hourly, epgRefreshInterval: .hourly,
+            m3uStatus: ResourceRefreshStatus(), epgStatus: ResourceRefreshStatus(),
+            createdAt: now, updatedAt: now
+        )
+        let channel = Channel(
+            sourceProfileID: profile.id, displayName: "Cached channel",
+            streamURL: URL(string: "https://example.invalid/live")!,
+            tvgID: nil, tvgName: nil, logoURL: nil, groupTitle: nil, attributes: [:], order: 0
+        )
+        let automaticWork = expectation(description: "Playback must not admit deferred automatic refresh")
+        automaticWork.isInverted = true
+        let sleeping = expectation(description: "Reduced automatic loop reached sleep")
+        let refresh: AppModel.Refresh = { _, _, _ in automaticWork.fulfill(); return [] }
+        let engine = TestNowPlayingEngine()
+        let dependencies = AppDependencies(
+            libraryStartup: LibraryStartup {},
+            foregroundRefreshDriver: ForegroundRefreshDriver(
+                loadProfiles: { automaticWork.fulfill(); return [profile] },
+                refresh: refresh,
+                now: { now },
+                sleep: { sleeping.fulfill(); try await Task.sleep(for: .seconds(3_600)) },
+                reportStatus: { _ in XCTFail("Automatic refresh should remain deferred") }
+            ),
+            backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
+                scheduler: NowPlayingBackgroundSchedulerStub(),
+                loadProfiles: { [profile] }, refresh: refresh, now: { now },
+                reportStatus: { _ in XCTFail("No background refresh error is expected") }
+            ),
+            repository: RepositorySpy(profiles: [profile], channels: [profile.id: [channel]]),
+            refresh: refresh,
+            playbackEngine: engine
+        )
+        dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(true)
+        dependencies.backgroundRefreshRegistrar.setPrefersReducedResourceUsage(true)
+        dependencies.foregroundRefreshDriver.activate()
+        defer { dependencies.foregroundRefreshDriver.deactivate() }
+        let appModel = AppModel(repository: dependencies.repository, refresh: dependencies.refresh, now: { now })
+        let opened = await dependencies.openInitialLibrary(using: appModel)
+        XCTAssertTrue(opened)
+        await fulfillment(of: [sleeping], timeout: 2)
+        appModel.select(channel: channel)
+        let request = try XCTUnwrap(appModel.presentedPlaybackRequest)
+        XCTAssertEqual(request.channelID, channel.id)
+        XCTAssertEqual(request.sourceProfileID, profile.id)
+        XCTAssertEqual(request.streamURL, channel.streamURL)
+
+        let coordinator = PlaybackNowPlayingCoordinator { _ in TestNowPlayingSession() }
+        let model = FullScreenPlayerViewModel(
+            request: request, engine: dependencies.playbackEngine,
+            presentationStreamProvider: { AsyncStream { $0.finish() } },
+            presentationMount: DefaultPlaybackPresentationMount(),
+            settings: dependencies.playbackSettings, nowPlaying: coordinator
+        )
+        model.start()
+        try await eventually { model.state == .playing(request) }
+        let currentOwner = try XCTUnwrap(coordinator.current)
+        await currentOwner.setPaused(true)
+        try await eventually { model.state == .paused(request) }
+        await currentOwner.setPaused(false)
+        try await eventually { model.state == .playing(request) }
+        await currentOwner.stop()
+        XCTAssertNil(coordinator.current)
+        let plays = await engine.playRequests
+        let pauseCommands = await engine.pauseCommands
+        let stops = await engine.stopCount
+        XCTAssertEqual(plays, [request])
+        XCTAssertEqual(pauseCommands, [true, false])
+        XCTAssertEqual(stops, 1)
+        await fulfillment(of: [automaticWork], timeout: 0.05)
+    }
+
     func testOldFullScreenStopCannotStopReplacementOnSharedEngine() async throws {
         let coordinator = PlaybackNowPlayingCoordinator { _ in TestNowPlayingSession() }
         let engine = TestNowPlayingEngine()
@@ -196,7 +273,20 @@ private final class SuspendedNowPlayingSession: NowPlayingSessionPublishing {
     func complete() { continuation?.resume(); continuation = nil }
 }
 
+@MainActor
+private final class NowPlayingBackgroundSchedulerStub: BackgroundRefreshScheduling {
+    func register(
+        identifier: String,
+        handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void
+    ) -> Bool { true }
+    func cancel(identifier: String) { XCTFail("Playback must not cancel background scheduling") }
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
+        XCTFail("Playback must not submit background refresh")
+    }
+}
+
 private actor TestNowPlayingEngine: PlaybackEngine {
+    private(set) var playRequests: [PlaybackRequest] = []
     private var continuations: [UUID: AsyncStream<PlaybackState>.Continuation] = [:]
     private var state: PlaybackState = .idle
     private var request: PlaybackRequest?
@@ -218,6 +308,7 @@ private actor TestNowPlayingEngine: PlaybackEngine {
         for continuation in continuations.values { continuation.yield(state) }
     }
     func play(_ request: PlaybackRequest) async {
+        playRequests.append(request)
         self.request = request
         emit(.preparing(request))
         emit(.playing(request))

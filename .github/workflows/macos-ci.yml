@@ -1,4 +1,4 @@
-name: EOF publication GREEN diagnostic
+name: Native admission ownership and selection diagnostic
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-eof-green-${{ github.ref }}
+  group: macos-ci-native-tail-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Run complete Publisher and resource-store regression classes
+      - name: Verify manual actions and background resource preference contracts
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -73,60 +73,26 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/EOFGreen.xcresult" \
-            -only-testing:VPlayerTests/HLSPublisherTests \
-            -only-testing:VPlayerTests/HLSResourceStoreTests \
-            -only-testing:VPlayerTests/VPlayerAppStartupTests
-      - name: Report scoped EOF and resource-store failures
+            -resultBundlePath "$RUNNER_TEMP/ResourceAcceptance.xcresult" \
+            -only-testing:VPlayerTests/NowPlayingIntegrationTests \
+            -only-testing:VPlayerTests/RefreshLifecycleTests \
+            -only-testing:VPlayerTests/VPlayerAppStartupTests \
+            -only-testing:VPlayerTests/ReducedResourceUsageTests
+      - name: Report scoped resource preference failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/EOFGreen.xcresult"
-
-  fixture-validation:
-    name: HTTP playback and full-length 4K timeline fixtures
-    runs-on: xcode-27
-    timeout-minutes: 90
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
-      TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_ANALYTICS: "1"
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Verify toolchain
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ResourceAcceptance.xcresult"
+      - name: Verify native selection phases and exact admission teardown
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
-          xcodebuild -version
-          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
-      - name: Install build and fixture tooling
-        run: brew install mint jq ripgrep ffmpeg
-      - name: Build and audit pinned application FFmpeg
-        run: ./ci_scripts/ci_post_clone.sh
-      - name: Verify committed project and licenses
-        run: |
-          ./Scripts/bootstrap.sh --check
-          ./Scripts/verify-licenses.sh
-          python3 Scripts/Tests/test_tvos27_deployment.py
-      - name: Check fixture runner, server and generator contracts
-        run: |
-          python3 Scripts/Tests/test_playback_fixture_runner.py
-          python3 Scripts/Tests/test_timeline_fixture.py
-          python3 Scripts/Support/fixture_server.py --self-test
-          ./Scripts/run-playback-integration-tests.sh --self-test
-          ./Scripts/generate-playback-fixtures.sh --self-test
-      - name: Run HTTP playback and 900-second 4K timeline coverage
-        timeout-minutes: 30
-        run: |
-          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/vplayer-timeline.XXXXXX")"
-          trap 'rm -rf "$fixture_dir"' EXIT
-          python3 Scripts/generate-timeline-fixture.py "$fixture_dir/timeline.ts"
-          ./Scripts/run-playback-integration-tests.sh \
-            --timeline-fixture "$fixture_dir/timeline.ts" \
-            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
-            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
-            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
-            --only-testing VPlayerTests/HLSTimelineTests \
-            -- -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/ControlNative.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27DirectAudioPlaylistSelectsItsSoleTrackWithoutAlternativeMediaGroup \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testEndpointAdmissionConsumesSealedWriterSnapshotAndRejectsServedTrimMutations \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalAlreadyCancelledReadyWaitCannotRetainObservationOrDeadlineSlot
+      - name: Report scoped control and native failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlNative.xcresult"

@@ -708,6 +708,20 @@ final class VPlayerAppStartupTests: XCTestCase {
     }
 
     func testInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes() async {
+        await assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
+            prefersReducedResourceUsage: false
+        )
+    }
+
+    func testReducedResourcePreferencePreservesInitialCachedLibraryBeforeBlockedMaintenanceCompletes() async {
+        await assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
+            prefersReducedResourceUsage: true
+        )
+    }
+
+    private func assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
+        prefersReducedResourceUsage: Bool
+    ) async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = SourceProfile(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
@@ -735,22 +749,30 @@ final class VPlayerAppStartupTests: XCTestCase {
         let repository = RepositorySpy(profiles: [profile])
         let maintenance = BlockingStartupMaintenanceProbe()
         let completion = StartupOpeningCompletionProbe()
+        let opened = expectation(description: "Initial library returned before optional maintenance")
+        let foregroundSleeping = prefersReducedResourceUsage
+            ? expectation(description: "Reduced foreground work is deferred") : nil
+        let automaticWork = expectation(description: "Reduced mode must not start automatic refresh")
+        automaticWork.isInverted = true
+        let refresh: AppModel.Refresh = { _, _, _ in automaticWork.fulfill(); return [] }
         let dependencies = VPlayerDependencies(
             libraryStartup: LibraryStartup {
                 try await maintenance.purgeUnreferencedSnapshots()
             },
             foregroundRefreshDriver: ForegroundRefreshDriver(
-                loadProfiles: { [] },
-                refresh: { _, _, _ in [] },
-                reportStatus: { _ in }
+                loadProfiles: { automaticWork.fulfill(); return [profile] },
+                refresh: refresh,
+                sleep: { foregroundSleeping?.fulfill(); try await Task.sleep(for: .seconds(3_600)) },
+                reportStatus: { _ in XCTFail("Automatic foreground refresh must remain deferred") }
             ),
             backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
                 scheduler: StartupBackgroundSchedulerSpy(),
-                loadProfiles: { [] },
-                refresh: { _, _, _ in [] },
+                loadProfiles: { [profile] },
+                refresh: refresh,
                 reportStatus: { _ in }
             ),
             repository: repository,
+            refresh: refresh,
             prepare: {
                 await repository.replaceChannels(
                     profileID: profile.id,
@@ -760,24 +782,36 @@ final class VPlayerAppStartupTests: XCTestCase {
         )
         let model = AppModel(
             repository: repository,
-            refresh: { _, _, _ in [] },
+            refresh: dependencies.refresh,
             now: { now }
         )
 
+        dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(prefersReducedResourceUsage)
+        dependencies.backgroundRefreshRegistrar.setPrefersReducedResourceUsage(prefersReducedResourceUsage)
+        if prefersReducedResourceUsage {
+            dependencies.foregroundRefreshDriver.activate()
+        }
+        defer { dependencies.foregroundRefreshDriver.deactivate() }
         let opening = Task {
-            await dependencies.openInitialLibrary(using: model)
+            let result = await dependencies.openInitialLibrary(using: model)
             await completion.recordCompletion()
+            opened.fulfill()
+            return result
         }
         await maintenance.waitUntilAttempted()
-        for _ in 0..<100 {
-            await Task.yield()
+        await fulfillment(of: [opened], timeout: 2)
+        if let foregroundSleeping {
+            await fulfillment(of: [foregroundSleeping], timeout: 2)
         }
         let completedBeforeCleanupRelease = await completion.isComplete
 
         XCTAssertEqual(model.channels, [channel])
         await maintenance.release()
-        await opening.value
+        let didOpen = await opening.value
+        XCTAssertTrue(didOpen)
+        XCTAssertTrue(dependencies.foregroundRefreshDriver.isInitialLibraryLoadComplete)
         XCTAssertTrue(completedBeforeCleanupRelease)
+        await fulfillment(of: [automaticWork], timeout: 0.05)
     }
 
     func testInitialLibraryPreparationFailureKeepsLibraryClosedUntilRetrySucceeds() async {
