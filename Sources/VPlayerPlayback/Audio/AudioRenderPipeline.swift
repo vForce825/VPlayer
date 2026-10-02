@@ -1797,6 +1797,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         }
         reconcileRendererRequest(hasPendingWork: pendingRendererSampleCount > 0)
         if pendingRendererSampleCount == 0, submission == nil { renderer?.finishedEnqueuing() }
+        // Enqueue/reconciliation work is complete. Readiness can synchronously
+        // prepare a shared anchor, flush this queue, and request its replay.
+        // Release drain ownership before that callback so the fresh queue can
+        // run; synchronous enqueue completions above still cannot recurse.
+        drivingRenderer = false
         updateReadiness()
     }
 
@@ -1933,13 +1938,16 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             recordRendererAcceptedCoverage(ticket.sampleBuffer)
             recordRendererAcceptanceDiagnostic(at: CMSampleBufferGetPresentationTimeStamp(ticket.sampleBuffer))
             if let sample = ticket.compressed {
+                // Preroll belongs to this physical queue episode. Reaccepted
+                // replay earns it again; lifetime admission diagnostics below
+                // still count each retained compressed entry only once.
+                recordCompressedPreroll(ticket.sampleBuffer)
                 if ticket.resetsDecoder { needsDecoderResetBeforeNextCompressedEnqueue = false }
                 if let index = replay.firstIndex(where: { $0.retentionID == ticket.retentionID }) {
                     replay[index].sentCompressed = true
                     replay[index].discardIfExpiredDuringRecovery = false
                     if !replay[index].acceptedCompressed {
                         replay[index].acceptedCompressed = true
-                        recordCompressedPreroll(sample)
                         recordAcceptedCompressedMedia(sample)
                     }
                 }
@@ -2238,9 +2246,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         }
     }
 
-    private func recordCompressedPreroll(_ sample: CompressedAudioSample) {
-        let pts = sample.presentationTimeStamp
-        let duration = sample.duration
+    private func recordCompressedPreroll(_ sampleBuffer: CMSampleBuffer) {
+        let pts = CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer)
+        let duration = CMSampleBufferGetOutputDuration(sampleBuffer)
         let end = CMTimeAdd(pts, duration)
         guard pts.isNumeric,
               duration.isNumeric,
@@ -2521,6 +2529,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     }
 
     private func resetRendererAcceptedCoverage() {
+        resetCompressedPreroll()
         snapshotLock.withLock { publicSnapshot.acceptedCoverage = nil }
     }
 

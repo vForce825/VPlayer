@@ -3968,6 +3968,98 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
+    func testSynchronousAnchorReplayKeepsOneEnqueueStackAcrossBufferedBurst() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.anchor-burst")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let preparation = SynchronousAudioAnchorPreparation(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer, executor: executor,
+            failureSink: { _, _ in XCTFail("buffered anchor replay must not fail") },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
+            routeMonitor: FakeAudioRouteMonitor(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged,
+            readinessSink: { change, _ in preparation.receive(change) }
+        )
+        preparation.install(pipeline, island: .init(rawValue: 1))
+        let duration = CMTime(value: 1_024, timescale: 48_000)
+        let samplePTS = (0..<64).map { CMTimeMultiply(duration, multiplier: Int32($0)) }
+        try perform(on: executor) {
+            try pipeline.configure(format: try self.makeFormat(codec: .aac), codec: .aac,
+                generation: .init(rawValue: 1), fingerprint: self.fingerprint(1))
+            pipeline.activateContinuityIsland(.init(rawValue: 1), generation: .init(rawValue: 1))
+            for (index, pts) in samplePTS.enumerated() {
+                try pipeline.enqueue(try self.makeSample(id: UInt64(index + 1),
+                    pts: pts, duration: duration))
+            }
+        }
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        XCTAssertTrue(renderer.snapshot.enqueuedPTS.isEmpty)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        renderer.fireReady()
+        drain(executor)
+
+        XCTAssertEqual(preparation.snapshot.count, 1)
+        XCTAssertNil(preparation.snapshot.error)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, samplePTS + samplePTS)
+        XCTAssertEqual(renderer.snapshot.pendingPTS, samplePTS)
+        XCTAssertEqual(renderer.snapshot.maximumEnqueueCallDepth, 1,
+            "synchronous completions must not recursively pump the buffered tail")
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(pipeline.diagnostics.pendingSampleCount, 0)
+    }
+
+    func testSynchronousReadinessStopFencesSuspendedReceiverAcceptance() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.readiness-stop")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let action = SynchronousAudioReadinessAction()
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer, executor: executor,
+            failureSink: { _, _ in XCTFail("stopping readiness must not fail") },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
+            routeMonitor: FakeAudioRouteMonitor(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged,
+            readinessSink: { change, _ in action.receive(change) }
+        )
+        action.install(pipeline) { $0.stop() }
+        try perform(on: executor) {
+            try pipeline.configure(format: try self.makeFormat(codec: .aac), codec: .aac,
+                generation: .init(rawValue: 1), fingerprint: self.fingerprint(1))
+            pipeline.activateContinuityIsland(.init(rawValue: 1), generation: .init(rawValue: 1))
+        }
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: true)
+        renderer.holdEnqueueCompletions = true
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(id: 1, pts: .zero))
+        }
+        XCTAssertEqual(action.callCount, 1)
+        XCTAssertEqual(renderer.heldEnqueueCount, 1)
+        XCTAssertEqual(synchronizer.removalCount, 1)
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertNil(pipeline.acceptedCoverage)
+
+        renderer.completeEnqueue(.accepted)
+        drain(executor)
+        synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(executor)
+
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertNil(pipeline.acceptedCoverage)
+        XCTAssertEqual(pipeline.diagnostics.pendingSampleCount, 0)
+        XCTAssertEqual(renderers.snapshot.count, 1)
+        XCTAssertEqual(renderer.heldEnqueueCount, 0)
+        XCTAssertEqual(renderer.snapshot.maximumEnqueueCallDepth, 1)
+        XCTAssertEqual(action.callCount, 1)
+    }
+
     func testSynchronousReadinessAnchorPreparationReplaysOnceWithoutAnotherInput() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.reentrant-anchor")
         let synchronizer = FakeAudioSynchronizer()
@@ -7390,6 +7482,35 @@ private final class LockedAudioReadinessChanges: @unchecked Sendable {
         lock.withLock { records.append(.init(change: change, generation: generation)) }
     }
     var snapshot: [AudioReadinessRecord] { lock.withLock { records } }
+}
+
+private final class SynchronousAudioReadinessAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var pipeline: AudioRenderPipeline?
+    private var action: (@Sendable (AudioRenderPipeline) -> Void)?
+    private var count = 0
+
+    func install(_ pipeline: AudioRenderPipeline,
+        action: @escaping @Sendable (AudioRenderPipeline) -> Void) {
+        lock.withLock {
+            self.pipeline = pipeline
+            self.action = action
+        }
+    }
+
+    func receive(_ change: AudioRenderReadinessChange) {
+        guard change == .available else { return }
+        let target = lock.withLock { () -> (AudioRenderPipeline, @Sendable (AudioRenderPipeline) -> Void)? in
+            guard let pipeline, let action else { return nil }
+            self.action = nil
+            count += 1
+            return (pipeline, action)
+        }
+        guard let (pipeline, action) = target else { return }
+        action(pipeline)
+    }
+
+    var callCount: Int { lock.withLock { count } }
 }
 
 private final class SynchronousAudioAnchorPreparation: @unchecked Sendable {

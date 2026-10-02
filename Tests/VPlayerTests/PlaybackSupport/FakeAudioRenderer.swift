@@ -18,6 +18,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         let observationStartCount: Int
         let observationStopCount: Int
         let readinessCheckCount: Int
+        let maximumEnqueueCallDepth: Int
     }
 
     let identity: AudioRendererIdentity
@@ -42,6 +43,8 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var observationStopCount = 0
     private var readinessCheckCount = 0
     private var attached = false
+    private var enqueueCallDepth = 0
+    private var maximumEnqueueCallDepth = 0
 
     init(identity: UInt64, mediaKind: AudioRendererMediaKind, canObserveConsumption: Bool = true) {
         self.canObserveConsumption = canObserveConsumption
@@ -83,6 +86,11 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
 
     func enqueue(_ sampleBuffer: CMSampleBuffer,
         completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void) {
+        withLock {
+            enqueueCallDepth += 1
+            maximumEnqueueCallDepth = max(maximumEnqueueCallDepth, enqueueCallDepth)
+        }
+        defer { withLock { enqueueCallDepth -= 1 } }
         if withLock({ holdEnqueueCompletions }) {
             withLock { heldEnqueues.append(completion) }
         } else {
@@ -205,7 +213,8 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
                 stopRequestCount: stopRequestCount,
                 observationStartCount: observationStartCount,
                 observationStopCount: observationStopCount,
-                readinessCheckCount: readinessCheckCount
+                readinessCheckCount: readinessCheckCount,
+                maximumEnqueueCallDepth: maximumEnqueueCallDepth
             )
         }
     }
