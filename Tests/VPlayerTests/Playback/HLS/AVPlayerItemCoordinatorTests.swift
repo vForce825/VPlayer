@@ -1491,9 +1491,17 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testFiniteAVPublicationRetainsAcceptedTerminalTailsBeforeNativePlayback() async throws {
+        let fixture = try await Task21RealIntegrationFixture.make(endList: true, includeVideo: true)
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
+        try fixture.assertFiniteAVPublication()
+    }
+
     func testRealAVMasterSelectedAudioAndVideoShareThreeSecondCompletedBodyCoverage() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make(includeVideo: true)
+        let fixture = try await Task21RealIntegrationFixture.make(endList: true, includeVideo: true)
         defer { fixture.shutdown() }
+        try fixture.assertFiniteAVPublication()
         _ = try await fixture.prepare()
         XCTAssertTrue(fixture.hasVideoParticipant,
                       "本 selector 必须经过真实 master、video 与 selected audio participant")
@@ -1900,6 +1908,49 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.driver.directStateCallCount, readsBeforeStop + 1,
                        "迟到 KVO 不能重试或改写原停止终态")
         XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+    }
+
+    func testCurrentAuthorityMalformedAccessLogFailsClosedThroughDirectAndInstalledObserver() async throws {
+        for installedObserver in [false, true] {
+            let harness = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+            _ = try await harness.prepare()
+            let invalid = try harness.malformedCurrentAuthorityURL()
+            XCTAssertEqual(harness.classifyAccessLog(invalid), .invalidLocalResource,
+                           "The negative URL must belong to the genuine current loopback authority")
+            let foreign = URL(string: "https://example.invalid/media.m4s")!
+            XCTAssertEqual(harness.classifyAccessLog(foreign), .unrelated)
+            harness.coordinator.observeAccessLogURI(foreign, item: harness.item)
+            harness.coordinator.observeAccessLogURI(invalid,
+                item: Task21Fixtures.staleGenerationItem(from: harness.item))
+            XCTAssertEqual(harness.coordinator.phase, .prepared,
+                           "A foreign URI or stale item must not fault the current attempt")
+            if installedObserver {
+                XCTAssertEqual(harness.driver.emitAccessLogURI(invalid), .invalidLocalResource)
+            } else {
+                harness.coordinator.observeAccessLogURI(invalid, item: harness.item)
+            }
+            XCTAssertEqual(harness.coordinator.phase, .stopping,
+                           "A malformed current-authority resource must revoke readiness")
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+            try await harness.shutdown()
+        }
+    }
+
+    func testMalformedCurrentAuthorityLogDuringPrepareReportsItemFailureBeforePreroll() async throws {
+        let harness = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        let invalid = try harness.malformedCurrentAuthorityURL()
+        XCTAssertEqual(harness.classifyAccessLog(invalid), .invalidLocalResource)
+        harness.driver.accessLogURIAtFence = (.seek, invalid)
+        do {
+            _ = try await harness.prepare()
+            XCTFail("A real local-resource fault cannot produce a prepared capability")
+        } catch {
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed,
+                           "Transport failure must not be reported as a rendition selection change")
+        }
+        XCTAssertEqual(harness.driver.prerollCallCount, 0)
+        XCTAssertEqual(harness.driver.playCallCount, 0)
+        try await harness.shutdown()
     }
 
     func testReview2AccessLogURIClassifierV1ClassifiesAndAppliesMatchingConflictingInvalidLocalResource()
@@ -3604,6 +3655,10 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var prepareMutation: Task21PrepareMutation = .none
     var diagnosticPhases = false
     var conflictingRenditionFence: AVPlayerPreparationFence?
+    var accessLogURIAtFence: (AVPlayerPreparationFence, URL)?
+    private var accessLogItem: AVPlayerItemInstanceIdentity?
+    private var accessLogClassifier: (@Sendable (URL) -> AccessLogURIClassification)?
+    private var accessLogHandler: (@MainActor @Sendable (AccessLogURIClassification, AVPlayerItemInstanceIdentity) -> Void)?
     var conflictHandler: (() -> Void)?
     var operations: [Task21DriverOperation] = []
     var observedPlayheads: [PreparedPlayheadIdentity] = []
@@ -3820,11 +3875,17 @@ private final class Task21FakeDriver: AVPlayerDriving {
 
     func removeObservers(item: AVPlayerItemInstanceIdentity) {
         operations.append(.removeObservers)
+        accessLogItem = nil
+        accessLogClassifier = nil
+        accessLogHandler = nil
     }
 
     func preparationFenceReached(_ fence: AVPlayerPreparationFence,
                                  item: AVPlayerItemInstanceIdentity) {
         if conflictingRenditionFence == fence { conflictHandler?() }
+        if let (expected, uri) = accessLogURIAtFence, expected == fence {
+            _ = emitAccessLogURI(uri)
+        }
     }
 
     func installTimeControlStatusRelay(
@@ -3847,6 +3908,17 @@ private final class Task21FakeDriver: AVPlayerDriving {
         handler: @escaping @MainActor @Sendable (AccessLogURIClassification, AVPlayerItemInstanceIdentity) -> Void
     ) throws {
         if failAccessLogObservation { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
+        accessLogItem = item
+        accessLogClassifier = classify
+        accessLogHandler = handler
+    }
+
+    @discardableResult
+    func emitAccessLogURI(_ uri: URL) -> AccessLogURIClassification? {
+        guard let item = accessLogItem, let classify = accessLogClassifier else { return nil }
+        let classification = classify(uri)
+        accessLogHandler?(classification, item)
+        return classification
     }
 
     func constrainPlaybackEnd(to time: ExactMediaTime,
@@ -4764,6 +4836,19 @@ private final class Task21Harness {
         try coordinator.install(preparation)
     }
 
+    func malformedCurrentAuthorityURL() throws -> URL {
+        var components = try XCTUnwrap(URLComponents(url: authorityFixture.request.itemURL,
+                                                     resolvingAgainstBaseURL: false))
+        components.percentEncodedPath += "/%2e%2e/media.m4s"
+        return try XCTUnwrap(components.url)
+    }
+
+    func classifyAccessLog(_ uri: URL) -> AccessLogURIClassification {
+        evidence.classifyAccessLogURI(uri, itemURL: authorityFixture.request.itemURL,
+            item: item, publicationSequence: authorityFixture.request.publicationSequence,
+            selected: coordinator.selectedRenditions.first)
+    }
+
     func assertLiveAVPrefixPrerequisites(file: StaticString = #filePath, line: UInt = #line) throws {
         try authorityFixture.assertLiveAVPrefixPrerequisites(file: file, line: line)
     }
@@ -5403,13 +5488,15 @@ private final class Task21RealIntegrationFixture {
         let seed = try await Task21RealAACSeed.make(
             outputLifecycleEpoch: graph.lifecycle)
         let lifecycle = graph.lifecycle
-        let avSeed = includeVideo ? try await Task21RealAVSeed.make(audio: seed) : nil
+        let avSeed = includeVideo ? try await Task21RealAVSeed.make(
+            audio: seed, includeTerminalTail: endList) : nil
         let box = Task21LockedHarness()
-        let preparePublication: @Sendable (LoopbackSessionToken) throws
+        let preparePublication: @Sendable (LoopbackSessionToken) async throws
             -> LoopbackPreparedPublication = { token in
                 let harness = try Task21RealHLSHarness(token: token, seed: seed,
                     avSeed: avSeed, endList: endList)
                 box.value = harness
+                if includeVideo && endList { try await harness.publishFiniteAVEnd() }
                 guard let snapshot = harness.publisher.visible else {
                     throw LoopbackHTTPServerError.invalidConfiguration
                 }
@@ -5417,7 +5504,7 @@ private final class Task21RealIntegrationFixture {
                                                     declaration: harness.declaration,
                                                     snapshot: snapshot)
             }
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 19, now: { 0 }, logger: { _ in },
             responseFailure: { _, _ in }, prepare: preparePublication)
         guard let harness = box.value else {
@@ -5480,6 +5567,31 @@ private final class Task21RealIntegrationFixture {
 
     var acceptedGETs: LoopbackAcceptedGETSnapshot { server.acceptedGETSnapshot() }
     var hasVideoParticipant: Bool { publication.declaration.video != nil }
+    func assertFiniteAVPublication(file: StaticString = #filePath, line: UInt = #line) throws {
+        let seed = try XCTUnwrap(publication.avSeed, file: file, line: line)
+        let snapshot = try XCTUnwrap(publication.publisher.visible, file: file, line: line)
+        let audio = try XCTUnwrap(snapshot.media[2], file: file, line: line)
+        let video = try XCTUnwrap(snapshot.media[1], file: file, line: line)
+        let audioTail = try XCTUnwrap(seed.audioPackets.last, file: file, line: line)
+        let videoTail = try XCTUnwrap(seed.videoPackets.last, file: file, line: line)
+        XCTAssertEqual(audioTail.object.key, seed.endpointAuthority.receipt.terminalMedia.key,
+                       "The finite seed must retain its original writer's actual terminal AAC body",
+                       file: file, line: line)
+        XCTAssertTrue(snapshot.aacTerminalBindings[2] === seed.endpointAuthority.terminalBinding,
+                      file: file, line: line)
+        XCTAssertEqual(audio.resources.last, audioTail.object.key, file: file, line: line)
+        XCTAssertEqual(video.resources.last, videoTail.object.key, file: file, line: line)
+        XCTAssertEqual(audio.logicalSequences.last, seed.endpointAuthority.receipt.terminalLogicalSequence,
+                       file: file, line: line)
+        XCTAssertEqual(video.logicalSequences.last, audio.logicalSequences.last, file: file, line: line)
+        for media in [audio, video] {
+            XCTAssertEqual(media.text.components(separatedBy: "#EXT-X-ENDLIST").count - 1, 1,
+                           "A fixed native presentation must publish one real ENDLIST",
+                           file: file, line: line)
+            XCTAssertTrue(media.text.hasSuffix("#EXT-X-ENDLIST\n"), file: file, line: line)
+        }
+        XCTAssertEqual(publication.publisher.pendingLogicalSequenceCount, 0, file: file, line: line)
+    }
     var endpointSourceTime: ExactMediaTime { publication.seed.endpoint.lastEffectiveEnd }
     var endpointItemTime: ExactMediaTime {
         get throws {
@@ -6176,11 +6288,14 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
     let avSeed: Task21RealAVSeed?
     let publisher: HLSPublicationCoordinator
     let declaration: HLSItemDeclaration
+    private let finitePublicationClock: HLSNaturalEndPublicationClock?
 
     init(token: LoopbackSessionToken, seed: Task21RealAACSeed,
          avSeed: Task21RealAVSeed?, endList: Bool) throws {
         self.seed = seed
         self.avSeed = avSeed
+        finitePublicationClock = avSeed != nil && endList
+            ? try HLSNaturalEndPublicationClock.make() : nil
         store = SealedMediaStore(loopbackSession: token, itemGeneration: 19)
         var declared = try Task19.declaration(audioOnly: avSeed == nil)
         declared.token = token.value
@@ -6212,9 +6327,10 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             candidate: candidate,
             aacTerminalBinding: (avSeed?.endpointAuthority ?? seed.endpointAuthority)
                 .terminalBinding,
-            // This A/V snapshot is live and deliberately omits its final tail.
-            // Carry the original writer's real prefix authority into publication.
-            aacRenditionBinding: avSeed?.audioRenditionBinding
+            // Live prefixes retain their original rendition mapping. The finite
+            // batch uses the original sealed writer endpoint; this writer never
+            // claimed an incremental rendition-final receipt.
+            aacRenditionBinding: endList ? nil : avSeed?.audioRenditionBinding
         )]
         if let avSeed {
             participants.insert(.init(initialization: avSeed.videoInitialization,
@@ -6225,12 +6341,14 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             participants: participants,
             declaration: declared,
             anchor: .init(mediaOrigin: avSeed?.sourceOrigin ?? Task21Fixtures.time(0),
-                          utcMilliseconds: 1_788_912_000_000))
+                          utcMilliseconds: 1_788_912_000_000),
+            publicationClock: finitePublicationClock)
         let audioPackets = avSeed?.audioPackets ?? seed.packets
         let videoPackets = avSeed?.videoPackets ?? []
         let packetCount = max(audioPackets.count, videoPackets.count)
         for index in 0..<packetCount {
-            let now: Int64 = index >= 6 ? 1_000_000_000 : 0
+            let now: Int64 = try finitePublicationClock?.now().logical
+                ?? (index >= 6 ? 1_000_000_000 : 0)
             if videoPackets.indices.contains(index) {
                 let packet = videoPackets[index]
                 _ = try publisher.offer(packet.object, receipt: packet.receipt,
@@ -6242,12 +6360,12 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
                     relay: packet.relay, ticket: publisher.ticket, now: now)
             }
         }
-        if avSeed != nil {
+        if avSeed != nil && !endList {
             // 首六段建立初始 master/media snapshot；第七段再由同一 publisher
             // 推进真实滑窗，使 requested 三秒后的下一解码段可被系统加载。
             _ = try publisher.publish(ticket: publisher.ticket,
                                       now: 1_000_000_000)
-        } else {
+        } else if avSeed == nil {
             // writer endpoint 的 terminal tail 必须先经同 publisher 的 natural-end
             // CAS 进入真实 HTTP snapshot；测试是否自动播放到尾不改变这项 authority。
             _ = endList
@@ -6267,6 +6385,51 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             guard reachedEnd else {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
             }
+        }
+    }
+
+    func publishFiniteAVEnd() async throws {
+        let avSeed = try XCTUnwrap(avSeed)
+        _ = try XCTUnwrap(finitePublicationClock)
+        let initial = try XCTUnwrap(publisher.visible)
+        let pending = publisher.pendingLogicalSequenceCount
+        guard pending > 0 else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
+        let packetSets: [UInt64: [Task19Packet]] = [1: avSeed.videoPackets, 2: avSeed.audioPackets]
+        let audioTail = try XCTUnwrap(avSeed.audioPackets.last)
+        let videoTail = try XCTUnwrap(avSeed.videoPackets.last)
+        print("NATIVE_FINITE_AV_TAIL audioSequence=\(audioTail.object.logicalSequence) "
+            + "videoSequence=\(videoTail.object.logicalSequence) "
+            + "audioCount=\(avSeed.audioPackets.count) videoCount=\(avSeed.videoPackets.count) "
+            + "audioEnd=\(audioTail.receipt.presentationRange.end) "
+            + "videoEnd=\(videoTail.receipt.presentationRange.end) pending=\(pending)")
+        guard avSeed.audioPackets.map({ $0.object.logicalSequence })
+                == avSeed.videoPackets.map({ $0.object.logicalSequence }),
+              audioTail.object.key == avSeed.endpointAuthority.receipt.terminalMedia.key,
+              audioTail.receipt.presentationRange.end
+                == avSeed.endpointAuthority.receipt.terminalPhysicalEnd else {
+            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        let result = try await publisher.drainNaturalEnd()
+        XCTAssertEqual(result, .endListPublished)
+        let final = try XCTUnwrap(publisher.visible)
+        XCTAssertEqual(final.publicationSequence, initial.publicationSequence + UInt64(pending),
+                       "Each pending real segment must consume its own publication transaction")
+        XCTAssertEqual(publisher.pendingLogicalSequenceCount, 0)
+        for (participant, packets) in packetSets {
+            let first = try XCTUnwrap(initial.media[participant])
+            let last = try XCTUnwrap(final.media[participant])
+            XCTAssertEqual(Set(first.logicalSequences + last.logicalSequences),
+                           Set(packets.map { $0.object.logicalSequence }),
+                           "Every accepted packet in this short finite fixture must appear in a committed window")
+            XCTAssertEqual(last.resources.last, packets.last?.object.key)
+            XCTAssertEqual(last.logicalSequences.last, audioTail.object.logicalSequence)
+            XCTAssertEqual(last.text.components(separatedBy: "#EXT-X-ENDLIST").count - 1, 1)
+            XCTAssertTrue(last.text.hasSuffix("#EXT-X-ENDLIST\n"))
+        }
+        XCTAssertThrowsError(try publisher.publish(ticket: publisher.ticket,
+            now: try XCTUnwrap(publisher.ticket.previousPublishInstant), naturalEnd: true)) { error in
+            XCTAssertEqual(error as? HLSPublicationFailure, .closed,
+                           "The exact terminal publication must be unique")
         }
     }
 
@@ -7227,9 +7390,12 @@ final class Task21RealAVSeed: @unchecked Sendable {
     static func make(audio: Task21RealAACSeed,
                      additionalAudioSeed: Task21RealAACSeed? = nil,
                      additionalAudioParticipantID: UInt64? = nil,
+                     includeTerminalTail: Bool = false,
                      diagnosticPhases: Bool = false) async throws
         -> Task21RealAVSeed {
-        // 普通 A/V 仍冻结 7 个共同一秒段。dual-audio 专用夹具只送 6 个
+        // Live A/V keeps its seven-segment prefix; explicit finite A/V retains
+        // every actual terminal object from the same unmodified encoded input.
+        // dual-audio 专用夹具只送 6 个
         // 编码块：系统 writer 的最终 flush 段因此仍落在 HLS 最多 7 段的
         // 可见窗口内，两个 terminal media key 都能由同一 snapshot 广告。
         let inputBufferCount = additionalAudioSeed == nil ? 7 : 6
@@ -7556,9 +7722,9 @@ final class Task21RealAVSeed: @unchecked Sendable {
         }
         let audioTimeline = SegmentTimelineValidator(proof: audioProof)
         let videoTimeline = SegmentTimelineValidator(proof: videoProof)
-        let selectedAudioObjects = additionalAudioSeed == nil
+        let selectedAudioObjects = additionalAudioSeed == nil && !includeTerminalTail
             ? Array(audioObjects.prefix(7)) : audioObjects
-        let selectedVideoObjects = additionalAudioSeed == nil
+        let selectedVideoObjects = additionalAudioSeed == nil && !includeTerminalTail
             ? Array(videoObjects.prefix(7)) : videoObjects
         if additionalAudioSeed != nil {
             guard audioObjects.count <= 7, videoObjects.count <= 7,
