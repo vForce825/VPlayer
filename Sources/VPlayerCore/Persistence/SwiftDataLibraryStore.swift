@@ -3,6 +3,8 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import Observation
+import OSLog
 import SwiftData
 
 enum LibraryStoreSavePhase: Equatable, Sendable {
@@ -66,6 +68,126 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     /// opt-in so that in-memory fixture and test stores cannot overwrite the
     /// one copy of the real profiles with seeded data.
     private var profileMirror: SourceProfileMirror?
+
+    // ResultsObserver is Observable, not an AsyncSequence. These observers and
+    // every model they expose remain confined to this ModelActor's context.
+    private var observedProfiles: ResultsObserver<SourceProfileRecord, Never>?
+    private var observedState: ResultsObserver<LibraryStateRecord, Never>?
+    private var observedMappings: ResultsObserver<ManualEPGMappingRecord, Never>?
+    private var observationID: UUID?
+    private var observedSnapshot: CommittedLibrarySnapshot?
+    private var committedObservationRevision: UInt64 = 0
+    private var changeContinuations: [UUID: AsyncStream<CommittedLibrarySnapshot>.Continuation] = [:]
+
+    /// Produces committed metadata values only; no staging rows or model objects
+    /// cross isolation. The first value is the caller's comparison baseline.
+    public func committedChanges() throws -> AsyncStream<CommittedLibrarySnapshot> {
+        if observedProfiles == nil {
+            let profiles = try ResultsObserver<SourceProfileRecord, Never>(
+                modelContext: modelContext, isolation: self
+            )
+            let state = try ResultsObserver<LibraryStateRecord, Never>(
+                modelContext: modelContext, isolation: self
+            )
+            let mappings = try ResultsObserver<ManualEPGMappingRecord, Never>(
+                modelContext: modelContext, isolation: self
+            )
+            observedProfiles = profiles
+            observedState = state
+            observedMappings = mappings
+            let id = UUID()
+            observationID = id
+            do {
+                _ = publishCommittedSnapshot(try trackCommittedSnapshot(observationID: id))
+            } catch {
+                observationID = nil
+                observedProfiles = nil
+                observedState = nil
+                observedMappings = nil
+                throw error
+            }
+        }
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<CommittedLibrarySnapshot>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        changeContinuations[id] = continuation
+        continuation.onTermination = { @Sendable [weak self] _ in
+            Task { await self?.removeCommittedChangeConsumer(id) }
+        }
+        if let observedSnapshot { continuation.yield(observedSnapshot) }
+        return stream
+    }
+
+    /// The explicit local-commit fence reads the writer's already-saved context
+    /// synchronously. It does not depend on when native observer callbacks run.
+    public func committedObservationBoundary() throws -> CommittedLibrarySnapshot {
+        publishCommittedSnapshot(try readCommittedSnapshot())
+    }
+
+    private func readCommittedSnapshot() throws -> CommittedLibrarySnapshot {
+        var profiles: [UUID: CommittedLibrarySnapshot.Profile] = [:]
+        var states: [String: CommittedLibrarySnapshot.State] = [:]
+        var mappings: [CommittedLibrarySnapshot.MappingKey: String] = [:]
+        for record in try modelContext.fetch(FetchDescriptor<SourceProfileRecord>()) {
+            profiles[record.id] = .init(record)
+        }
+        for record in try modelContext.fetch(FetchDescriptor<LibraryStateRecord>()) {
+            states[record.key] = .init(activeProfileID: record.activeProfileID)
+        }
+        for record in try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>()) {
+            mappings[.init(profileID: record.sourceProfileID, channelID: record.channelID)] = record.xmltvChannelID
+        }
+        return CommittedLibrarySnapshot(profiles: profiles, states: states, mappings: mappings)
+    }
+
+    private func trackCommittedSnapshot(observationID: UUID) throws -> CommittedLibrarySnapshot {
+        let result = withObservationTracking {
+            // Track native collection changes plus the fetched records' scalar
+            // metadata. Re-fetch on this same context so a delayed native results
+            // collection can never roll an explicit commit fence backwards.
+            _ = observedProfiles?.results
+            _ = observedState?.results
+            _ = observedMappings?.results
+            return Result { try readCommittedSnapshot() }
+        } onChange: { [weak self] in
+            // Observation fires on willSet. The actor hop waits for synchronous
+            // save/rollback to settle and coalesces one import transaction.
+            Task { await self?.committedResultsDidChange(observationID: observationID) }
+        }
+        return try result.get()
+    }
+
+    private func committedResultsDidChange(observationID: UUID) {
+        guard self.observationID == observationID else { return }
+        do {
+            _ = publishCommittedSnapshot(try trackCommittedSnapshot(observationID: observationID))
+        } catch {
+            // Tracking has already rearmed; a later real change retries the read.
+            Logger(subsystem: "com.vforce.vplayer", category: "LibraryObservation")
+                .error("Cannot read committed library observation: \(String(describing: error), privacy: .private)")
+        }
+    }
+
+    @discardableResult
+    private func publishCommittedSnapshot(_ snapshot: CommittedLibrarySnapshot) -> CommittedLibrarySnapshot {
+        if let observedSnapshot, snapshot.change(since: observedSnapshot) == nil { return observedSnapshot }
+        committedObservationRevision &+= 1
+        let next = snapshot.numbered(committedObservationRevision)
+        observedSnapshot = next
+        for continuation in changeContinuations.values { continuation.yield(next) }
+        return next
+    }
+
+    private func removeCommittedChangeConsumer(_ id: UUID) {
+        changeContinuations[id] = nil
+        guard changeContinuations.isEmpty else { return }
+        observationID = nil
+        observedProfiles = nil
+        observedState = nil
+        observedMappings = nil
+        observedSnapshot = nil
+    }
 
     /// Mirrors profile configuration into `profileMirror` on every change, so
     /// `synchronizeProfileMirror()` can rebuild the profiles after the system

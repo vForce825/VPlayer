@@ -10,4 +10,5 @@ xcodebuild test \
   -project VPlayer.xcodeproj \
   -scheme VPlayer \
   -destination "$destination" \
-  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_ALLOWED=NO \
+  "$@"

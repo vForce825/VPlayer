@@ -171,6 +171,7 @@ struct FullScreenPlayerView: View {
         acceptanceMetricsEnabled: Bool,
         acceptanceStateEnabled: Bool,
         settings: PlaybackSettingsStore,
+        nowPlaying: PlaybackNowPlayingCoordinator,
         onDismiss: @escaping () -> Void
     ) {
         let presentationHostMount = PlaybackPresentationHostMount()
@@ -182,7 +183,9 @@ struct FullScreenPlayerView: View {
             presentationStreamProvider: presentationProvider,
             presentationMount: presentationHostMount,
             mediaInformationProvider: mediaInformationProvider,
-            settings: settings
+            settings: settings,
+            nowPlaying: nowPlaying,
+            channelPresentation: channelPresentation
         ))
         _presentationHostMount = State(initialValue: presentationHostMount)
         self.settings = settings
@@ -276,6 +279,9 @@ struct FullScreenPlayerView: View {
             await runControlsAutoHide(for: controlsAutoHideKey)
         }
         .task { model.start() }
+        .onChange(of: channelPresentation) { _, presentation in
+            model.updateChannelPresentation(presentation)
+        }
         .onChange(of: model.state, initial: true) { _, state in
             controlsVisibility.apply(
                 .stateChanged(PlayerControlsVisibilityPolicy.mode(for: state))

@@ -98,7 +98,7 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(epgNotice.contains("EPGCoverageNotice"))
     }
 
-    func testDeploymentTargetIsTVOS26Everywhere() throws {
+    func testDeploymentTargetIsTVOS27Everywhere() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -114,7 +114,15 @@ final class ProjectConfigurationTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 26.0")
+        XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 27.0")
+        let configuredFloors = projectYAML.split(separator: "\n")
+            .filter { $0.contains("deploymentTarget:") && $0.contains("\"") }
+        XCTAssertEqual(configuredFloors.count, 6)
+        XCTAssertTrue(configuredFloors.allSatisfy { $0.contains("\"27.0\"") })
+        let generatedFloors = generatedProject.split(separator: "\n")
+            .filter { $0.contains("TVOS_DEPLOYMENT_TARGET =") }
+        XCTAssertFalse(generatedFloors.isEmpty)
+        XCTAssertTrue(generatedFloors.allSatisfy { $0.contains("= 27.0;") })
         XCTAssertFalse(projectYAML.contains("deploymentTarget: \"18.0\""))
         XCTAssertFalse(generatedProject.contains("TVOS_DEPLOYMENT_TARGET = 18.0;"))
         XCTAssertEqual(PlaybackFoundation.contractVersion, 1)

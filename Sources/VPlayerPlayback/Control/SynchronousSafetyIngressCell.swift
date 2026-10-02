@@ -58,7 +58,7 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
             }
             break
         }
-        guard state.failure == nil, !state.interruptionVeto, !state.userPaused,
+        guard state.failure == nil, !state.interruptionVeto, !state.userPaused, !state.mediaServicesResumeRequired,
               state.routeObservationGateOpen, state.readinessOpen,
               state.outputPermitPresent, validateAndConsume(state.output) else {
             return false
@@ -77,15 +77,26 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         receive(route: nil, system: event)
     }
 
+    @discardableResult
+    func performSyncIngress(_ event: PlaybackSystemSafetyEvent,
+        matching epoch: AudioSessionLifecycleEpoch) -> PlaybackSystemSafetyReceipt? {
+        receive(route: nil, system: event, expectedLifecycleEpoch: epoch)
+    }
+
     func receiveRegisteredRoute(_ ingress: PlaybackRouteIngress, registration: PlaybackAudioSessionRegistration) {
         receive(route: ingress, system: nil, registration: registration)
     }
 
     @discardableResult
     private func receive(route: PlaybackRouteIngress?, system: PlaybackSystemSafetyEvent?,
-        registration: PlaybackAudioSessionRegistration? = nil) -> PlaybackSystemSafetyReceipt? {
+        registration: PlaybackAudioSessionRegistration? = nil,
+        expectedLifecycleEpoch: AudioSessionLifecycleEpoch? = nil) -> PlaybackSystemSafetyReceipt? {
         lock.lock()
         guard state.failure == nil else { lock.unlock(); return nil }
+        if let expectedLifecycleEpoch, expectedLifecycleEpoch != AudioSessionLifecycleEpoch(state) {
+            lock.unlock()
+            return nil
+        }
         if let registration {
             guard let route, route.monitorLifecycle == registration.identity.monitorLifecycle,
                   route.sessionIdentity == registration.identity.sessionIdentity,
@@ -182,21 +193,29 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         var mediaServicesEpoch = state.mediaServicesEpoch
         var freezeGeneration = state.freezeGeneration
         var veto = state.interruptionVeto
+        var requiresUserResume = state.mediaServicesResumeRequired
         if pending.interruptionClockFold == nil {
             pending.interruptionClockFold = ResetPreRouteClockFold(
                 windowStartInstant: instant, lastIngressInstant: instant,
-                frozen: state.userPaused || interruption == .began, freezeGeneration: freezeGeneration
+                frozen: state.userPaused || requiresUserResume || interruption == .began, freezeGeneration: freezeGeneration
             )
         }
         switch event {
         case .mediaServicesReset:
+            requiresUserResume = true
+            veto = true
+            // A reset invalidates the prior audio-service interruption episode too.
+            // A new physical interruption must supply a new began event in this epoch.
+            interruption = .inactive
+            interruptionEpoch = try allocator.next(in: .interruption)
+            freezeGeneration = try allocator.next(in: .freezeGeneration)
             let root = try allocator.next(in: .resetRoot)
             mediaServicesEpoch = try allocator.next(in: .mediaServices)
             if pending.firstUndrainedResetIngressInstant == nil {
                 pending.firstUndrainedResetIngressInstant = instant
                 pending.resetPreRouteClockFold = ResetPreRouteClockFold(
                     windowStartInstant: instant, lastIngressInstant: instant,
-                    frozen: state.userPaused || interruption == .began, freezeGeneration: freezeGeneration
+                    frozen: state.userPaused || requiresUserResume || interruption == .began, freezeGeneration: freezeGeneration
                 )
             }
             pending.latestResetIngress = PendingResetIngress(
@@ -213,13 +232,13 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
             interruptionEpoch = try allocator.next(in: .interruption)
             if interruption == .began { freezeGeneration = try allocator.next(in: .freezeGeneration) }
             interruption = .ended(shouldResume: shouldResume)
-            veto = !shouldResume
+            veto = requiresUserResume || !shouldResume
         }
         try pending.resetPreRouteClockFold?.advance(
-            to: instant, frozen: state.userPaused || interruption == .began, freezeGeneration: freezeGeneration
+            to: instant, frozen: state.userPaused || requiresUserResume || interruption == .began, freezeGeneration: freezeGeneration
         )
         try pending.interruptionClockFold?.advance(
-            to: instant, frozen: state.userPaused || interruption == .began, freezeGeneration: freezeGeneration
+            to: instant, frozen: state.userPaused || requiresUserResume || interruption == .began, freezeGeneration: freezeGeneration
         )
         pending.latestInterruptionState = interruption
         pending.throughRevision = revision
@@ -231,6 +250,7 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         state.freezeGeneration = freezeGeneration
         state.interruptionState = interruption
         state.interruptionVeto = veto
+        state.mediaServicesResumeRequired = requiresUserResume
     }
 
     /// 仅由共享executor调用。apply与目标CAS均无逃逸、无await且持有同一cell锁。
@@ -340,10 +360,11 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         }
     }
 
-    func performPlaybackAdmission(requestID: UUID) -> PlaybackSafetyBarrierResult<PlaybackRequestAdmissionResult> {
-        switch performOutputControl(.playbackAdmission(requestID)) {
+    func performPlaybackAdmission(requestID: UUID,
+        originalActionEpoch: AudioSessionLifecycleEpoch) -> PlaybackSafetyBarrierResult<PlaybackRequestAdmissionResult> {
+        switch performOutputControl(.playbackAdmission(requestID, originalActionEpoch: originalActionEpoch)) {
         case .retry: .retry
-        case .performed(.playbackAdmitted(let admission, _, _)): .performed(.admitted(admission))
+        case .performed(.playbackAdmitted(let admission, _, _, _)): .performed(.admitted(admission))
         case .performed(.playbackAdmissionNeedsCleanupJoin): .performed(.needsCleanupJoin)
         default: .rejected
         }
@@ -368,7 +389,13 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         if descriptor == .resourceOwnership, state.failure != nil { return .rejected }
         let application = applyOutputControl(request, state)
         switch application {
-        case .playbackAdmitted(_, let output, let freeze):
+        case .playbackAdmitted(_, let output, let freeze, let clearsMediaServicesResume):
+            // Mirror only the original action's authorization accepted by Authority
+            // under this lock; admission itself does not authorize a newer reset.
+            if clearsMediaServicesResume {
+                state.mediaServicesResumeRequired = false
+                if state.interruptionState != .began { state.interruptionVeto = false }
+            }
             state.userPaused = false
             state.output = output
             state.freezeGeneration = freeze
@@ -402,11 +429,12 @@ final class SynchronousSafetyIngressCell: @unchecked Sendable {
         case .applied(let update, let result):
             state.userPaused = update.userPaused
             state.interruptionVeto = update.interruptionVeto
+            state.mediaServicesResumeRequired = update.mediaServicesResumeRequired
             state.freezeGeneration = update.freezeGeneration
             if case .user(let user) = request, user.kind == .pause { state.output.revokeForUserPause() }
             return .performed(.applied(update, result))
         case .retired(_, let clearsVeto), .interruptionSettled(_, _, let clearsVeto):
-            if clearsVeto { state.interruptionVeto = false }
+            if clearsVeto, !state.mediaServicesResumeRequired { state.interruptionVeto = false }
             return .performed(application)
         case .routeSampleSettled, .audioEventRelay: return .performed(application)
         case .routeSampled(let generation, let fence, let gateOpen, _):

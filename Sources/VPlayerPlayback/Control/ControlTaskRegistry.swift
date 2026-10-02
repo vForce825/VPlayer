@@ -549,7 +549,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
             counterBacking: PlaybackIdentityAllocator.counterBackingAllocationBytes,
             dispatchObjects: 4 * 128, // 两queue、executor source、deadline timer的可见对象本体。
             permanentCaptures: 2 * 48 + 2 * (32 + 48), // 两hook环境；两weak handler环境和Block。
-            inFlightDeliveries: 2 * (object(AudioSessionCallDelivery.self) + 32 + 48),
+            // 原/新completion尾可交叠；native async各保守预留一个512B Task slab。
+            inFlightDeliveries: 2 * (object(AudioSessionCallDelivery.self) + 32 + 48 + 512),
             registrations: 2 * object(PlaybackAudioSessionRegistration.self), // 原退出与新registration准备可交叠。
             fixedScratch: malloc_good_size(1024) + malloc_good_size(256),
             routeWrapper: object(SystemAudioSessionRouteSnapshot.self),
@@ -1048,7 +1049,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             allocator: PlaybackIdentityAllocator, instant: UInt64) -> OutputControlApplication {
             precondition(!resourceTransactionActive, "具名控制不能重入资源CAS")
             switch request {
-            case .playbackAdmission(let requestID):
+            case .playbackAdmission(let requestID, let originalActionEpoch):
                 guard resourceState != nil || !commands.contains(where: {
                     if case .controllerCleanup = $0?.payload { return true }; return false
                 }) else { return .playbackAdmissionNeedsCleanupJoin }
@@ -1057,7 +1058,13 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     var budget = PlaybackProgressBudgetTicket.coldStart(sessionIdentity: session,
                         originInstant: instant, nonce: try allocator.next(in: .deadline),
                         freezeGeneration: try allocator.next(in: .freezeGeneration))
-                    if !incoming.interruptionVeto { budget.resume(at: instant, freezeGeneration: budget.freezeGeneration) }
+                    let clearsMediaServicesResume = incoming.mediaServicesResumeRequired &&
+                        originalActionEpoch == AudioSessionLifecycleEpoch(incoming)
+                    if incoming.interruptionState != .began,
+                       !incoming.mediaServicesResumeRequired || clearsMediaServicesResume,
+                       !incoming.interruptionVeto || clearsMediaServicesResume {
+                        budget.resume(at: instant, freezeGeneration: budget.freezeGeneration)
+                    }
                     var output = incoming.output
                     if let predecessor = outputContext {
                         _ = try AudioSessionLockedOperations(authority: self, allocator: allocator,
@@ -1067,11 +1074,17 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     }
                     let admission = CurrentPlaybackOperationDeadlineTicket.coldStart(budget)
                     playbackRequestAdmission = admission
-                    // 新请求只清旧用户pause，不越过任何物理interruption veto；同锁提交Cell与Authority。
+                    // Retain the latest request even if reset changed while it awaited
+                    // cleanup. Only a user action from this exact epoch clears its gate.
+                    if clearsMediaServicesResume {
+                        snapshot.mediaServicesResumeRequired = false
+                        if incoming.interruptionState != .began { snapshot.interruptionVeto = false }
+                    }
                     snapshot.userPaused = false
                     snapshot.output = output
                     snapshot.freezeGeneration = budget.freezeGeneration
-                    return .playbackAdmitted(admission, output, freezeGeneration: budget.freezeGeneration)
+                    return .playbackAdmitted(admission, output, freezeGeneration: budget.freezeGeneration,
+                        clearsMediaServicesResume: clearsMediaServicesResume)
                 } catch let failure as PlaybackSafetyFailure { return .failed(failure) }
                 catch PlaybackIdentityAllocationError.identitySpaceExhausted { return .failed(.identitySpaceExhausted) }
                 catch { return .failed(.invalidEvidence) }
@@ -1456,7 +1469,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 nonce: try allocator.next(in: .deadline), freezeGeneration: incoming.freezeGeneration
             )
             let shouldRun = resetPreRoute
-                ? !incoming.userPaused && incoming.interruptionState != .began
+                ? !incoming.userPaused && !incoming.mediaServicesResumeRequired && incoming.interruptionState != .began
                 : !incoming.userPaused && !incoming.interruptionVeto &&
                     context.sessionReceipts?.active != nil && authoritativeRoute.semantic != nil
             if shouldRun { parent.runningSince = originInstant }
@@ -1620,7 +1633,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }
             switch action {
             case .acquisitionTimer(let expected):
-                guard let context = outputContext, context.acquisitionDeadline == expected else {
+                guard let context = outputContext, context.acquisitionDeadline == expected, !expected.isParked else {
                     return .application(.budget(.rejected))
                 }
                 if instant < expected.deadlineInstant {
@@ -2226,7 +2239,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             context.interruptionProof = proof
             context.interruptionDrainRequired = false
             var recoverySnapshot = incoming
-            let consumesPendingResume = context.userResumeRequested && incoming.interruptionState != .began
+            let consumesPendingResume = context.userResumeRequested && !incoming.mediaServicesResumeRequired && incoming.interruptionState != .began
             if consumesPendingResume { recoverySnapshot.interruptionVeto = false }
             var command: PreparedCommand?
             var cycle: PreparedOutputCycle?
@@ -2276,7 +2289,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                case .pending(var pending) = routeObservationState {
                 var stage = postConfigurationRouteState
                 var recoverySnapshot = incoming
-                let consumesPendingResume = context.userResumeRequested && incoming.interruptionState != .began
+                let consumesPendingResume = context.userResumeRequested && !incoming.mediaServicesResumeRequired && incoming.interruptionState != .began
                 if consumesPendingResume { recoverySnapshot.interruptionVeto = false }
                 switch try prepareReactivation(context: &context, phase: &phase, stage: &stage, pending: &pending,
                     command: &command, cycle: &cycle, snapshot: recoverySnapshot, contextNonce: context.contextNonce,
@@ -2318,16 +2331,41 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   request.contextNonce == context.contextNonce, request.interruptionEpoch == incoming.interruptionEpoch,
                   request.mediaServicesEpoch == incoming.mediaServicesEpoch,
                   request.resetPreRouteBinding == context.resetPreRouteBinding else { return .rejected }
+            guard !incoming.mediaServicesResumeRequired || request.userInitiated else { return .rejected }
+            if let original = request.originalActionEpoch,
+               original != AudioSessionLifecycleEpoch(incoming) { return .rejected }
+            if request.consumePendingResetResume {
+                guard !incoming.userPaused, let original = request.originalActionEpoch,
+                      let lease = request.explicitResumeLease,
+                      context.pendingResetResumeIntent == .init(epoch: original, leaseID: lease.id)
+                else { return .rejected }
+            }
             // 无proof的resume只记录用户意图；只有准确lease或当前排空proof可以清除物理veto。
             var resumeAuthorizesRecovery = !incoming.interruptionVeto
             if let requestedLease = request.explicitResumeLease {
-                guard request.kind == .resume, case .ended = incoming.interruptionState,
+                let mayRequestResume: Bool
+                if case .ended = incoming.interruptionState { mayRequestResume = true }
+                else { mayRequestResume = incoming.mediaServicesResumeRequired && incoming.interruptionState != .began }
+                guard request.kind == .resume, mayRequestResume,
                       let lease = ownedLeaseResources, requestedLease.id == lease.leaseID,
                       requestedLease.generation == lease.leaseID,
                       let registration = lease.object as? PlaybackAudioSessionRegistration,
                       ownsRegistration(registration, allowsClosing: false),
                       context.pendingActivationCall == nil, context.sessionReceipts?.active == nil
                 else { return .rejected }
+                if request.userInitiated, incoming.mediaServicesResumeRequired,
+                   incoming.interruptionState != .began,
+                   context.pendingReset?.mediaServicesEpoch == incoming.mediaServicesEpoch,
+                   context.systemRecoveryBinding?.inactiveConfigurationReceipt == nil {
+                    // User authorization is retained independently of readiness. No physical
+                    // permit or reset gate is released until this exact configuration completes.
+                    context.pendingResetResumeIntent = .init(epoch: AudioSessionLifecycleEpoch(incoming), leaseID: lease.leaseID)
+                    context.userResumeRequested = false
+                    outputContext = context
+                    snapshot.userPaused = false
+                    return .applied(.init(userPaused: false, interruptionVeto: incoming.interruptionVeto,
+                        mediaServicesResumeRequired: true, freezeGeneration: incoming.freezeGeneration), .acceptedWaiting)
+                }
                 if case .acquiringLease(_, .awaitingActivation(let configured)) = resourceState {
                     // 尚未创建输出的acquisition已有自己的真实所有权证明，不借旧输出drain proof。
                     let proof = configured.acquired.proof
@@ -2354,7 +2392,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                           binding.incarnation.identity.root.mediaServicesEpoch == incoming.mediaServicesEpoch,
                           registeredDrainProof == .reset(binding.resetDrainProof),
                           binding.inactiveConfigurationReceipt != nil,
-                          !context.interruptionDrainRequired else { return .rejected }
+                          incoming.interruptionState != .began else { return .rejected }
                 } else {
                     guard let proof = context.interruptionProof,
                           registeredDrainProof == .interruption(proof), !context.interruptionDrainRequired,
@@ -2384,12 +2422,16 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     resumeAuthorizesRecovery = true
                 }
             }
+            // A new pause or an admitted ready resume invalidates any deferred reset action.
+            context.pendingResetResumeIntent = nil
             var next = incoming
             next.userPaused = request.kind == .pause
+            if request.kind == .resume, request.userInitiated { next.mediaServicesResumeRequired = false }
             if request.kind == .resume, incoming.interruptionState != .began, resumeAuthorizesRecovery {
                 next.interruptionVeto = false
             }
-            let changed = next.userPaused != incoming.userPaused || next.interruptionVeto != incoming.interruptionVeto
+            let changed = next.userPaused != incoming.userPaused || next.interruptionVeto != incoming.interruptionVeto ||
+                next.mediaServicesResumeRequired != incoming.mediaServicesResumeRequired
             do {
                 var preRoute = resetPreRouteState
                 var post = postConfigurationRouteState
@@ -2407,7 +2449,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                             guard let elapsed = state.effectiveElapsed(at: instant) else { throw PlaybackSafetyFailure.clockOverflow }
                             guard elapsed < state.boundaryEffectiveElapsed else { return try terminateUserControl(&context, instant: instant) }
                             state.accumulatedEffectiveTime = elapsed
-                            state.runningSince = next.userPaused || next.interruptionState == .began ? nil : instant
+                            state.runningSince = next.userPaused || next.mediaServicesResumeRequired || next.interruptionState == .began ? nil : instant
                             state.freezeGeneration = next.freezeGeneration
                             state.deadlineArm = state.runningSince == nil ? nil : .init(ticketIdentity: state.ticketIdentity,
                                 boundaryEffectiveElapsed: state.boundaryEffectiveElapsed, freezeGeneration: state.freezeGeneration,
@@ -2435,7 +2477,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                                 return try terminateUserControl(&context, instant: instant)
                             }
                             state.budget.accumulatedEffectiveTime = elapsed
-                            state.runningSince = next.userPaused || next.interruptionState == .began ||
+                            state.runningSince = next.userPaused || next.mediaServicesResumeRequired || next.interruptionState == .began ||
                                 context.sessionReceipts?.active == nil ? nil : instant
                             state.freezeGeneration = next.freezeGeneration
                             post = state
@@ -2503,7 +2545,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     }
                 }
                 return .applied(.init(userPaused: next.userPaused, interruptionVeto: next.interruptionVeto,
-                    freezeGeneration: next.freezeGeneration), result)
+                    mediaServicesResumeRequired: next.mediaServicesResumeRequired, freezeGeneration: next.freezeGeneration), result)
             } catch let failure as PlaybackSafetyFailure { return .failed(failure) }
             catch PlaybackIdentityAllocationError.identitySpaceExhausted { return .failed(.identitySpaceExhausted) }
             catch { return .failed(.invalidEvidence) }
@@ -2791,7 +2833,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             state.mandatorySuffix = suffix
             state.boundaryEffectiveElapsed = min(state.boundaryEffectiveElapsed, parent.cap - suffix)
             state.freezeGeneration = incoming.freezeGeneration
-            state.runningSince = incoming.userPaused || incoming.interruptionState == .began ? nil : instant
+            state.runningSince = incoming.userPaused || incoming.mediaServicesResumeRequired || incoming.interruptionState == .began ? nil : instant
             if state.runningSince == nil { state.deadlineArm = nil }
             else if state.deadlineArm?.boundaryEffectiveElapsed != state.boundaryEffectiveElapsed ||
                 state.deadlineArm?.freezeGeneration != state.freezeGeneration {
@@ -2954,6 +2996,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 outputContext?.resetProof = nil
                 outputContext?.interruptionProof = nil
                 outputContext?.userResumeRequested = false
+                outputContext?.pendingResetResumeIntent = nil
                 audioPhase?.reactivationState = nil
                 outputContext?.teardownRequested = true
                 if let reset = snapshot.system.latestResetIngress {
@@ -2976,6 +3019,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 audioPhase?.currentReactivationProof = nil
                 outputContext?.interruptionProof = nil
                 outputContext?.userResumeRequested = false
+                outputContext?.pendingResetResumeIntent = nil
                 outputContext?.interruptionDrainRequired = true
                 audioPhase?.reactivationState?.basePhase = .awaitingActivation
                 audioPhase?.reactivationState?.freezeCauses.insert(.systemInterruption)
@@ -3685,7 +3729,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
             guard let context = authority.outputContext, !context.poisoned,
                   authority.snapshot.failure == nil else { return .init() }
             var value = PlaybackDeadlineScheduleSnapshot()
-            value.acquisition = context.acquisitionDeadline
+            value.acquisition = context.acquisitionDeadline.flatMap { $0.isParked ? nil : $0 }
             value.cleanup = context.budget
             if case .pending(let pending) = authority.routeObservationState {
                 value.ordinaryRoute = pending.ordinaryDeadlineState?.arm
@@ -4758,6 +4802,18 @@ final class ControlTaskRegistry: @unchecked Sendable {
         bindEventRelay(.pipeline(relay), to: ticket)
     }
 
+    /// Read-only advisory check from a synchronous system callback; never wait for the executor.
+    func hasAcceptedAudioSessionActivation(matching epoch: AudioSessionLifecycleEpoch) -> Bool {
+        executor.safetyIngress.withReadOnlyAuthorityProjection {
+            guard AudioSessionLifecycleEpoch(authority.snapshot) == epoch,
+                  !authority.snapshot.interruptionVeto, !authority.snapshot.mediaServicesResumeRequired,
+                  let context = authority.outputContext,
+                  context.mediaServicesEpoch == epoch.mediaServices,
+                  context.sessionReceipts?.active?.interruptionEpoch == epoch.interruption else { return false }
+            return true
+        }
+    }
+
     /// 物理callback不等待executor；同Cell锁只借当前原relay，离锁发送后由原ticket再次CAS消费。
     func forwardAudioSessionEvent(_ envelope: PlaybackAudioSessionEventEnvelope) {
         guard let relay = executor.safetyIngress.currentOwnedAudioEventRelay() else { return }
@@ -5299,19 +5355,41 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// 借用快照只形成CAS期望值；lease、proof和最新物理epoch在同一Authority内重新核验。
-    func prepareExplicitResume(for lease: PlaybackAudioSessionLease) -> ControlTaskTicket? {
+    func prepareExplicitResume(for lease: PlaybackAudioSessionLease, userInitiated: Bool = true,
+        expectedEpoch: AudioSessionLifecycleEpoch? = nil, consumePendingResetResume: Bool = false) -> ControlTaskTicket? {
         guard let context = outputResourceContextSnapshot() else { return nil }
         let safety = executor.safetyIngress.snapshot
         let request = OutputUserControlRequest(kind: .resume, sessionIdentity: context.sessionIdentity,
             expectedOwner: context.owner, contextNonce: context.contextNonce,
             interruptionEpoch: safety.interruptionEpoch, mediaServicesEpoch: safety.mediaServicesEpoch,
-            resetPreRouteBinding: context.resetPreRouteBinding, explicitResumeLease: lease)
+            resetPreRouteBinding: context.resetPreRouteBinding, explicitResumeLease: lease, userInitiated: userInitiated,
+            originalActionEpoch: expectedEpoch ?? (userInitiated ? AudioSessionLifecycleEpoch(safety) : nil),
+            consumePendingResetResume: consumePendingResetResume)
         switch executor.performUserControl(request) {
         case .acceptedAndPrepared(let ticket): return ticket
         case .acceptedWaiting:
+            if context.phase == .pendingLeaseAcquisition {
+                return try? beginOutputAcquisitionActivation(contextNonce: context.contextNonce)
+            }
             return try? beginOutputResetConfigurationActivation(contextNonce: context.contextNonce)
         default: return nil
         }
+    }
+
+    func hasPendingResetResume(for lease: PlaybackAudioSessionLease, matching epoch: AudioSessionLifecycleEpoch) -> Bool {
+        projection {
+            authority.outputContext?.pendingResetResumeIntent == .init(epoch: epoch, leaseID: lease.id) &&
+                AudioSessionLifecycleEpoch(authority.snapshot) == epoch && !authority.snapshot.userPaused
+        }
+    }
+
+    /// Called only after an actual configuration completion; the original user scope and
+    /// retained intent are revalidated atomically by applyUserControl, including a later pause.
+    func preparePendingResetResume() -> ControlTaskTicket? {
+        guard let context = outputResourceContextSnapshot(), let pending = context.pendingResetResumeIntent,
+              context.systemRecoveryBinding?.inactiveConfigurationReceipt != nil,
+              let lease = audioSessionLease(session: context.sessionIdentity), lease.id == pending.leaseID else { return nil }
+        return prepareExplicitResume(for: lease, expectedEpoch: pending.epoch, consumePendingResetResume: true)
     }
 
     func acceptsReactivationCompletion(_ receipt: AudioSessionReactivationCompletionReceipt) -> Bool {
@@ -5644,6 +5722,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                authority.outputContext?.phase == .pendingLeaseAcquisition {
                 authority.outputContext?.acquisitionDeadline = try .init(acquisitionTicket: ticket,
                     anchorInstant: self.instant)
+            } else if record.audioPolicy != nil,
+                      authority.outputContext?.phase == .pendingLeaseAcquisition {
+                // A physical SDK call must never inherit a parked user-wait clock.
+                try authority.outputContext?.acquisitionDeadline?.resume(at: self.instant)
             }
             authority.commands[index]?.phase = .running
             return true
@@ -5775,7 +5857,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
         func beginOutputAcquisitionActivation(contextNonce: UInt64, output: inout PlaybackOutputSafetyState) throws -> ControlTaskTicket? {
             guard try !expireOutputAcquisitionLocked(output: &output) else { return nil }
-            guard case .acquiringLease(let context, .awaitingActivation(let configured)) = authority.resourceState,
+            guard case .acquiringLease(var context, .awaitingActivation(let configured)) = authority.resourceState,
                   context.contextNonce == contextNonce, context.disposition != .releaseAfterTeardown,
                   context.pendingReset == nil, !context.poisoned,
                   context.pendingActivationCall == nil, var phase = authority.audioPhase,
@@ -5783,7 +5865,16 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   phase.processReceipt == configured.processReceipt,
                   phase.configuredReceipt == configured.configuredReceipt,
                   configured.processReceipt.identity.mediaServicesEpoch == authority.snapshot.mediaServicesEpoch else { return nil }
-            if authority.snapshot.interruptionVeto { return nil }
+            if authority.snapshot.interruptionVeto || authority.snapshot.userPaused {
+                if authority.snapshot.mediaServicesResumeRequired || authority.snapshot.userPaused,
+                   authority.audioSessionPermit == nil {
+                    // Actual configuration completed and no physical call remains.
+                    // Keep its spent time while this admitted request awaits user intent.
+                    context.acquisitionDeadline?.park(at: self.instant)
+                    authority.resourceState = .acquiringLease(context, .awaitingActivation(configured))
+                }
+                return nil
+            }
             phase.policy = .activate(purpose: .activateAcquiredConfiguredGeneration(sessionIdentity: context.sessionIdentity,
                 committedGeneration: configured.processReceipt.identity.configurationGeneration,
                 acquisitionOwnershipProof: configured.acquired.proof), interruptionEpoch: authority.snapshot.interruptionEpoch,
@@ -6099,7 +6190,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 if authority.snapshot.failure != nil { context.poisoned = true }
                 context.ownerIngressRevision = authority.snapshot.throughRevision
                 context.teardownRequested = context.teardownRequested || needsTeardown
-                if releases { context.disposition = .releaseAfterTeardown; context.relayClosing = true }
+                if releases {
+                    context.disposition = .releaseAfterTeardown
+                    context.relayClosing = true
+                    context.pendingResetResumeIntent = nil
+                }
                 if context.phase == .pendingSuccessorLease && releases {
                     guard let nonce = reservation.nonce(for: .leaseOnly) else { return nil }
                     context.contextNonce = nonce
@@ -6171,7 +6266,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 guard var context = authority.outputContext, context.phase == .pendingLeaseAcquisition,
                       let deadline = context.acquisitionDeadline, let reservation = authority.cleanupReservation else { return false }
                 let instant = self.instant
-                guard instant >= deadline.deadlineInstant else { return false }
+                guard deadline.isExpired(at: instant) else { return false }
                 if context.poisoned { return true }
                 let budget = try context.budget ?? CleanupBudgetTicket(predecessorIdentity: reservation.ticket.ownerGroup.resourceIdentity,
                     anchorInstant: instant, nonce: reservation.ticket.nonce)
@@ -7117,12 +7212,15 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// 用户请求准入与旧输出撤权同锁提交；在任何前驱等待、SDK调用或factory之前冻结真实起点。
-    func admitPlaybackRequest(requestID: UUID) throws -> CurrentPlaybackOperationDeadlineTicket {
+    func admitPlaybackRequest(requestID: UUID,
+        expectedEpoch: AudioSessionLifecycleEpoch? = nil) throws -> CurrentPlaybackOperationDeadlineTicket {
+        let originalActionEpoch = expectedEpoch ?? AudioSessionLifecycleEpoch(executor.safetyIngress.snapshot)
         var admission: CurrentPlaybackOperationDeadlineTicket?
         var needsJoin = false
         executor.sync {
             while true {
-                switch executor.safetyIngress.performPlaybackAdmission(requestID: requestID) {
+                switch executor.safetyIngress.performPlaybackAdmission(requestID: requestID,
+                    originalActionEpoch: originalActionEpoch) {
                 case .retry: continue
                 case .rejected: return
                 case .performed(.admitted(let value)): admission = value; return
@@ -7157,7 +7255,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   case .coldStart(let budget) = admission,
                   try !budget.isExpired(at: monotonicClock.nowNanoseconds) else { return nil }
             return try beginOutputAcquisitionLocked(session: budget.identity.sessionIdentity,
-                parent: admission, resetRecoveryMandatorySuffix: resetRecoveryMandatorySuffix)
+                parent: admission, resetRecoveryMandatorySuffix: resetRecoveryMandatorySuffix,
+                freshPlaybackAdmission: true)
         }
     }
 
@@ -7172,13 +7271,23 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     private func beginOutputAcquisitionLocked(session: PlaybackSessionIdentity,
-        parent: CurrentPlaybackOperationDeadlineTicket, resetRecoveryMandatorySuffix: UInt64) throws -> ControlTaskTicket? {
+        parent: CurrentPlaybackOperationDeadlineTicket, resetRecoveryMandatorySuffix: UInt64,
+        freshPlaybackAdmission: Bool = false) throws -> ControlTaskTicket? {
             let parentValue: PlaybackProgressBudgetTicket
             switch parent { case .coldStart(let value), .outputRecovery(let value): parentValue = value }
             let parentIdentity = parentValue.identity
             guard resetRecoveryMandatorySuffix > 0, resetRecoveryMandatorySuffix < parentValue.cap else { return nil }
             guard parentIdentity.sessionIdentity == session else { return nil }
-            guard authority.currentResetRoot == nil ||
+            // A new admitted session may rebuild configuration after the predecessor's
+            // final owned task has returned. This is checked in the same resource CAS,
+            // not inferred from outputContext == nil while cleanup still owns a tail.
+            // Configuration has its own current-epoch permit; this never clears the
+            // manual-resume gate or manufactures a reset recovery drain proof.
+            let freshEmptyAdmission = freshPlaybackAdmission && authority.playbackRequestAdmission == parent &&
+                authority.resourceState == nil && authority.cleanupReservation == nil &&
+                authority.audioSessionPermit == nil && authority.commands.allSatisfy({ $0 == nil }) &&
+                authority.groups.allSatisfy({ $0 == nil })
+            guard authority.currentResetRoot == nil || freshEmptyAdmission ||
                   authority.processConfigurationReceipt?.identity.mediaServicesEpoch == authority.snapshot.mediaServicesEpoch else { return nil }
             guard authority.cleanupReservation == nil, authority.outputContext == nil,
                   authority.ownedResource == nil else { return nil }

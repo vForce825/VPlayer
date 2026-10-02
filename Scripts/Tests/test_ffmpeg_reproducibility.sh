@@ -87,9 +87,9 @@ for slice in device sim-arm64 sim-x86_64; do
     }' "$record" >/dev/null
 
   case "$slice" in
-    device) target='arm64-apple-tvos18.0' ;;
-    sim-arm64) target='arm64-apple-tvos18.0-simulator' ;;
-    sim-x86_64) target='x86_64-apple-tvos18.0-simulator' ;;
+    device) target='arm64-apple-tvos27.0' ;;
+    sim-arm64) target='arm64-apple-tvos27.0-simulator' ;;
+    sim-x86_64) target='x86_64-apple-tvos27.0-simulator' ;;
   esac
   assert_normalized_config "$vendor/Work/build-$slice/config.h" "$slice" "$target"
 done

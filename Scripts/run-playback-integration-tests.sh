@@ -270,7 +270,9 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 destination_override=""
-test_selector="VPlayerTests/PlaybackFixtureIntegrationTests"
+test_selectors=()
+test_arguments=()
+timeline_fixture=""
 external_fixture_server=""
 
 while [[ $# -gt 0 ]]; do
@@ -282,8 +284,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --only-testing)
       [[ $# -ge 2 ]] || fail "option $1 requires an argument"
-      test_selector="$2"
+      test_selectors+=("-only-testing:$2")
       shift 2
+      ;;
+    --timeline-fixture)
+      [[ $# -ge 2 ]] || fail "option $1 requires an argument"
+      timeline_fixture="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      test_arguments=("$@")
+      break
       ;;
     --fixture-server)
       [[ $# -ge 2 ]] || fail "option $1 requires an argument"
@@ -295,6 +307,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ ${#test_selectors[@]} -eq 0 ]]; then
+  test_selectors=("-only-testing:VPlayerTests/PlaybackFixtureIntegrationTests")
+fi
+if [[ -n "$timeline_fixture" ]]; then
+  [[ -z "$external_fixture_server" ]] || fail 'timeline fixture requires the managed loopback server'
+  [[ "$timeline_fixture" == /* && -f "$timeline_fixture" && -r "$timeline_fixture" ]] || \
+    fail 'timeline fixture must be an absolute readable file path'
+fi
 
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
 server_script="$root/Scripts/Support/fixture_server.py"
@@ -313,6 +334,9 @@ else
   [[ -z ${VPLAYER_RUNNER_FIXTURE_SERVER+x} ]] || fail 'fixture server override is test-only'
   [[ -z ${VPLAYER_RUNNER_XCODEBUILD+x} ]] || fail 'xcodebuild override is test-only'
   "$root/Scripts/generate-playback-fixtures.sh" --verify
+  if [[ -n "$timeline_fixture" ]]; then
+    python3 "$root/Scripts/generate-timeline-fixture.py" --verify "$timeline_fixture"
+  fi
 fi
 
 [[ -d "$fixture_root" ]] || fail "fixture root is missing: $fixture_root"
@@ -338,7 +362,11 @@ if [[ -n "$external_fixture_server" ]]; then
   port="$(sed -E 's|^https?://[^:/]+:([0-9]+).*|\1|' <<<"$external_fixture_server")"
 else
   port_file="$(mktemp "$temp_parent/vplayer-fixture-port.XXXXXX")"
-  "$server_script" --root "$fixture_root" --port-file "$port_file" &
+  server_arguments=(--root "$fixture_root" --port-file "$port_file")
+  if [[ -n "$timeline_fixture" ]]; then
+    server_arguments+=(--timeline-fixture "$timeline_fixture")
+  fi
+  "$server_script" "${server_arguments[@]}" &
   server_pid=$!
   [[ "$server_pid" =~ ^[1-9][0-9]*$ ]] || fail 'invalid fixture server PID'
 
@@ -375,11 +403,11 @@ done < <(find "$test_artifacts/Build/Products" -name '*.xctestrun' -type f -prin
   fail "expected one xctestrun file, found ${#xctestrun_files[@]}"
 xctestrun_file="${xctestrun_files[0]}"
 
-python3 - "$xctestrun_file" "http://127.0.0.1:$port" <<'PY'
+python3 - "$xctestrun_file" "http://127.0.0.1:$port" "$timeline_fixture" <<'PY'
 import plistlib
 import sys
 
-path, base_url = sys.argv[1:]
+path, base_url, timeline_fixture = sys.argv[1:]
 with open(path, "rb") as stream:
     document = plistlib.load(stream)
 targets = [
@@ -389,10 +417,18 @@ targets = [
     and isinstance(value, dict)
     and value.get("BlueprintName") == "VPlayerTests"
 ]
-if len(targets) != 1:
-    raise SystemExit(f"expected one VPlayerTests xctestrun target, found {len(targets)}")
-environment = targets[0].setdefault("EnvironmentVariables", {})
-environment["VPLAYER_FIXTURE_BASE_URL"] = base_url
+for configuration in document.get("TestConfigurations", []):
+    targets.extend(
+        target for target in configuration.get("TestTargets", [])
+        if target.get("BlueprintName") == "VPlayerTests"
+    )
+if not targets:
+    raise SystemExit("VPlayerTests xctestrun target was not found")
+for target in targets:
+    environment = target.setdefault("EnvironmentVariables", {})
+    environment["VPLAYER_FIXTURE_BASE_URL"] = base_url
+    if timeline_fixture:
+        environment["VPLAYER_TIMELINE_FIXTURE_URL"] = base_url + "/timeline-4k-15m.ts"
 with open(path, "wb") as stream:
     plistlib.dump(document, stream, fmt=plistlib.FMT_BINARY, sort_keys=False)
 PY
@@ -402,7 +438,8 @@ VPLAYER_FIXTURE_BASE_URL="http://127.0.0.1:$port" \
     -xctestrun "$xctestrun_file" \
     -destination "$destination" \
     -resultBundlePath "$test_artifacts/PlaybackIntegration.xcresult" \
-    -only-testing:"$test_selector" &
+    "${test_selectors[@]}" \
+    ${test_arguments[@]+"${test_arguments[@]}"} &
 test_pid=$!
 
 set +e

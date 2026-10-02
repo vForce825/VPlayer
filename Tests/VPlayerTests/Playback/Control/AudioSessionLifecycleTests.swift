@@ -13,6 +13,37 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioSessionLifecycleTests: XCTestCase {
+    func testVerifiedLegacyInterruptionPayloadFoldsBeforeNotificationPostReturns() {
+        let registry = ControlTaskRegistry()
+        let ingress = registry.executor.safetyIngress
+        let center = NotificationCenter()
+        let monitor = SystemAudioEventMonitor(safetyIngress: ingress, notificationCenter: center)
+        monitor.start()
+        defer { monitor.stop() }
+        // Independent wire values verified by the tvOS27 runtime probe, run 36949943097.
+        let name = Notification.Name("AVAudioSessionInterruptionNotification")
+        let typeKey = "AVAudioSessionInterruptionTypeKey"
+        let optionKey = "AVAudioSessionInterruptionOptionKey"
+        let initialRevision = ingress.snapshot.throughRevision
+        center.post(name: name, object: nil)
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(2)])
+        XCTAssertEqual(ingress.snapshot.throughRevision, initialRevision)
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(1)])
+        XCTAssertEqual(ingress.snapshot.interruptionState, .began)
+        XCTAssertTrue(ingress.snapshot.interruptionVeto,
+            "The legacy safety veto must be installed synchronously on the posting thread")
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(0)])
+        XCTAssertEqual(ingress.snapshot.interruptionState, .ended(shouldResume: false))
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(1)])
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(0), optionKey: UInt(3)])
+        XCTAssertEqual(ingress.snapshot.interruptionState, .ended(shouldResume: true),
+            "The verified resume bit must survive unrelated option bits")
+        monitor.stop()
+        let stoppedRevision = ingress.snapshot.throughRevision
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(1)])
+        XCTAssertEqual(ingress.snapshot.throughRevision, stoppedRevision)
+    }
+
     func testControlCommandBackingFitsTVOSXzoneSixteenKiBBin() {
         // tvOS xzone 的下一档是 24 KiB；必须包含原生 Array 的 32 字节头。
         let requested = 32 + ControlTaskRegistry.commandBackingCapacity * MemoryLayout<OwnedPostIngressControlCommand?>.stride
@@ -81,7 +112,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
         XCTAssertEqual(allocation.commandBacking, malloc_good_size(32 + 32 * MemoryLayout<OwnedPostIngressControlCommand?>.stride))
         XCTAssertEqual(allocation.groupBacking, malloc_good_size(32 + ControlTaskRegistry.groupValueBytes))
         XCTAssertEqual(allocation.fixedScratch, malloc_good_size(1024) + malloc_good_size(256))
-        XCTAssertEqual(allocation.inFlightDeliveries, 2 * (malloc_good_size(class_getInstanceSize(AudioSessionCallDelivery.self)) + 32 + 48))
+        XCTAssertEqual(allocation.inFlightDeliveries, 2 * (malloc_good_size(class_getInstanceSize(AudioSessionCallDelivery.self)) + 32 + 48 + 512))
         XCTAssertEqual(allocation.externalSyncReservation, 34 * (32 + 48))
         XCTAssertEqual(allocation.weakSideTables, 5 * 32)
         XCTAssertGreaterThan(allocation.fixedObjects, 0)
@@ -631,7 +662,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
         let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success], blockedEvent: .route)
         let handoff = try await harness.acquire(reset: true)
         let context = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
-        let activation = try XCTUnwrap(harness.registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce))
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(harness.registry, contextNonce: context.contextNonce))
         XCTAssertEqual(harness.owner.invoke(activation, receiver: harness.receiver), .started)
         for _ in 0..<500 {
             if harness.receiver.last?.0.record == activation { break }
@@ -692,7 +723,7 @@ final class AudioSessionLifecycleTests: XCTestCase {
             let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success], blockedEvent: .route)
             _ = try await harness.acquire(reset: true, parentCap: parentCap, mandatorySuffix: suffix)
             let context = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
-            let first = try XCTUnwrap(harness.registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce))
+            let first = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(harness.registry, contextNonce: context.contextNonce))
             XCTAssertEqual(harness.owner.invoke(first, receiver: harness.receiver), .started)
             for _ in 0..<500 {
                 if harness.receiver.last?.0.record == first { break }
@@ -1049,6 +1080,91 @@ final class AudioSessionLifecycleTests: XCTestCase {
         XCTAssertNil(harness.registry.outputAcquisitionCommitSnapshot())
         XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.disposition, .releaseAfterTeardown)
     }
+    func testMediaResetRequiresUserActionEvenAfterSystemRecommendsResume() {
+        let registry = ControlTaskRegistry(allocator: .init(), clock: ManualPlaybackClock(100))
+        let ingress = registry.executor.safetyIngress
+        ingress.performSyncIngress(.interruptionBegan)
+        ingress.performSyncIngress(.mediaServicesReset)
+        XCTAssertEqual(ingress.snapshot.interruptionState, .inactive,
+            "Reset invalidates an interruption from the previous audio-service epoch")
+        XCTAssertTrue(ingress.snapshot.interruptionVeto,
+            "Reset may rebuild audio configuration, but must wait for user action before activation")
+        ingress.performSyncIngress(.interruptionEnded(shouldResume: true))
+        XCTAssertTrue(ingress.snapshot.interruptionVeto,
+            "A system resumption recommendation cannot substitute for user action after reset")
+        XCTAssertFalse(ingress.snapshot.outputPermitPresent)
+        XCTAssertFalse(ingress.snapshot.readinessOpen)
+    }
+
+    @MainActor
+    func testResetReconfigurationWaitsForExplicitResumeThenActivatesOnce() async throws {
+        let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success, .success])
+        let first = try await harness.acquire()
+        try await harness.release(first)
+        harness.registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
+        let resetHandoff = try await harness.acquire(reset: true)
+        let context = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+        XCTAssertNil(try harness.registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce),
+            "Inactive reset configuration alone must not authorize activation")
+        XCTAssertEqual(harness.sdk.events.filter { $0 == .activate }.count, 1)
+        XCTAssertNil(harness.registry.resetPreRouteDeadlineSnapshot()?.runningSince,
+            "Waiting for the user must not consume the effective reset recovery budget")
+        harness.clock.advance(nanoseconds: 60_000_000_000)
+        let lease = try XCTUnwrap(harness.registry.audioSessionLease(session: context.sessionIdentity))
+        XCTAssertTrue(harness.owner.requestResume(for: lease),
+            "Explicit user action must be able to leave the reset gate without deadlocking")
+        for _ in 0..<500 {
+            if harness.registry.outputResourceContextSnapshot()?.sessionReceipts?.active != nil { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertNotNil(harness.registry.outputResourceContextSnapshot()?.sessionReceipts?.active)
+        XCTAssertEqual(harness.sdk.events.filter { $0 == .activate }.count, 2)
+        XCTAssertFalse(harness.registry.executor.safetyIngress.snapshot.interruptionVeto)
+        try await harness.release(resetHandoff)
+    }
+
+    @MainActor
+    func testNativeActivationFalseDoesNotProduceReadyReceiptOrRetry() async throws {
+        let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success])
+        harness.sdk.nativeActivationResult = false
+        let acquisition = try harness.prepareAcquisition()
+        XCTAssertTrue(try harness.owner.startAcquisition(acquisition, receiver: harness.receiver))
+        for _ in 0..<500 {
+            if harness.receiver.history.contains(where: { $0.0.operation == .activate }) { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(harness.sdk.events.filter { $0 == .activate }.count, 1)
+        XCTAssertNil(harness.registry.outputAcquisitionCommitSnapshot(),
+            "Native activation false is a failure even when the SDK does not throw")
+        XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.disposition, .releaseAfterTeardown)
+    }
+
+    @MainActor
+    func testNativeDeactivationFalseSettlesOriginalCallAsFailure() async throws {
+        let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success])
+        let handoff = try await harness.acquire()
+        harness.sdk.nativeDeactivationResult = false
+        let registration = try XCTUnwrap(harness.owner.registration(for: handoff.committed.relayIdentity.acquisitionTicket))
+        let context = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+        let coordinator = OutputCleanupCoordinator(registry: harness.registry)
+        let cleanup = try XCTUnwrap(coordinator.begin(contextNonce: context.contextNonce,
+            reason: .stop, at: harness.clock.nowNanoseconds))
+        let stop = try XCTUnwrap(coordinator.advance(owner: cleanup))
+        XCTAssertTrue(harness.registry.claimStart(stop))
+        XCTAssertTrue(registration.stop(stop))
+        let deactivation = try XCTUnwrap(coordinator.advance(owner: cleanup))
+        XCTAssertEqual(harness.owner.invoke(deactivation, receiver: harness.receiver), .started)
+        for _ in 0..<500 {
+            if case .deactivationSettled = graphOwnedDeactivation(harness.registry) { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        guard case .deactivationSettled(_, .failed) = graphOwnedDeactivation(harness.registry) else {
+            return XCTFail("Native deactivation false must not fabricate a successful physical result")
+        }
+        XCTAssertEqual(harness.sdk.events.filter { $0 == .deactivate }.count, 1)
+        XCTAssertEqual(harness.sdk.maximumConcurrentCalls, 1)
+    }
+
     func testActualLaneABIIncludesOriginalRequestAndRegisteredResourceLifetime() {
         let base = ControlTaskRegistry.fixedValueStorageBytes + PlaybackDeadlineScheduler.fixedValueStorageBytes +
             ControlTaskRegistry.boundedResourceTransitionPreparationValueBytes +
@@ -1475,10 +1591,13 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
     private let multichannelFails: Bool
     private let randomFails: Bool
     private var activationFailures: Int
+    private var activationResult = true
+    private var deactivationResult = true
     private var blockedEvent: Event?
     private let route: any AudioSessionRouteSnapshot
     private let enteredBlocked = DispatchSemaphore(value: 0)
     private let unblock = DispatchSemaphore(value: 0)
+    private var asyncBlockedCall: CheckedContinuation<Void, Never>?
     private var recorded: [Event] = []
     private var mainThread = false
     private var controlExecutor = false
@@ -1504,6 +1623,14 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
         self.blockedEvent = blockedEvent
         self.route = route
     }
+    var nativeActivationResult: Bool {
+        get { lock.withLock { activationResult } }
+        set { lock.withLock { activationResult = newValue } }
+    }
+    var nativeDeactivationResult: Bool {
+        get { lock.withLock { deactivationResult } }
+        set { lock.withLock { deactivationResult = newValue } }
+    }
     var events: [Event] { lock.withLock { recorded } }
     var usedMainThread: Bool { lock.withLock { mainThread } }
     var usedControlExecutor: Bool { lock.withLock { controlExecutor } }
@@ -1518,7 +1645,17 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
         }
     }
     func waitForBlockedCall() -> Bool { enteredBlocked.wait(timeout: .now() + 2) == .success }
-    func releaseBlockedCall() { unblock.signal() }
+    func releaseBlockedCall() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            if let continuation = asyncBlockedCall {
+                asyncBlockedCall = nil
+                return continuation
+            }
+            return nil
+        }
+        continuation?.resume()
+        unblock.signal()
+    }
     func armBlocking(_ event: Event) { lock.withLock { blockedEvent = event } }
 
     func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {
@@ -1535,8 +1672,8 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
         defer { leave() }
         if multichannelFails { throw Failure.sdk }
     }
-    func activate() throws {
-        enter(.activate)
+    func activate() async throws -> Bool {
+        await enterAsync(.activate)
         defer { leave() }
         let failed = lock.withLock {
             guard activationFailures > 0 else { return false }
@@ -1544,8 +1681,13 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
             return true
         }
         if failed { throw Failure.sdk }
+        return nativeActivationResult
     }
-    func deactivate() throws { enter(.deactivate); leave() }
+    func deactivate() async throws -> Bool {
+        await enterAsync(.deactivate)
+        defer { leave() }
+        return nativeDeactivationResult
+    }
     func currentRoute() -> any AudioSessionRouteSnapshot {
         enter(.route)
         defer { leave() }
@@ -1559,6 +1701,26 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
     }
 
     private func enter(_ event: Event) {
+        if recordEntry(event) {
+            enteredBlocked.signal()
+            unblock.wait()
+        }
+    }
+
+    private func enterAsync(_ event: Event) async {
+        guard recordEntry(event) else { return }
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                precondition(asyncBlockedCall == nil, "Only one physical SDK call may be suspended")
+                asyncBlockedCall = continuation
+            }
+            // Publish entry only after the continuation is installed. A sync route release
+            // must not accidentally release the later native activation as well.
+            enteredBlocked.signal()
+        }
+    }
+
+    private func recordEntry(_ event: Event) -> Bool {
         lock.withLock {
             recorded.append(event)
             mainThread = mainThread || Thread.isMainThread
@@ -1587,10 +1749,7 @@ final class AudioSessionSDKSpy: PlaybackAudioSessionSDK, @unchecked Sendable {
             }
             lock.withLock { reentrantCompleted = completed }
         }
-        if lock.withLock({ event == blockedEvent }) {
-            enteredBlocked.signal()
-            unblock.wait()
-        }
+        return lock.withLock { event == blockedEvent }
     }
     private func leave() { lock.withLock { concurrent -= 1 } }
 }

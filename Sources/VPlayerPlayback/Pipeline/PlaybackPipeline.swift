@@ -3701,7 +3701,6 @@ final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked S
         // This exact object belongs to the visible AVSampleBufferDisplayLayer.
         // Attach it before the output adapter exists, so no video sample can be
         // enqueued outside the audio renderer's shared system timebase.
-        synchronizer.addRenderer(videoRenderer)
         let recommendedPixelBufferAttributes = videoRenderer
             .recommendedPixelBufferAttributes
         #if DEBUG

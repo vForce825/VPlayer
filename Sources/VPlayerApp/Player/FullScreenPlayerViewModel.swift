@@ -29,7 +29,7 @@ final class DefaultPlaybackPresentationMount: PlaybackPresentationMounting {
 
 @MainActor
 @Observable
-final class FullScreenPlayerViewModel {
+final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private struct PendingPauseCommand: Equatable {
         let id: UUID
         let target: Bool
@@ -60,6 +60,9 @@ final class FullScreenPlayerViewModel {
     private let presentationMount: any PlaybackPresentationMounting
     private let mediaInformationProvider: MediaInformationProvider
     private let settings: PlaybackSettingsStore
+    @ObservationIgnored private let nowPlaying: PlaybackNowPlayingCoordinator?
+    @ObservationIgnored private var nowPlayingOwnerID: UUID?
+    @ObservationIgnored private var channelPresentation: PlayerChannelPresentation
     private var stateTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
@@ -70,6 +73,8 @@ final class FullScreenPlayerViewModel {
     private var mediaInformationProviderTask: Task<Void, Never>?
     private var mediaInformationTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
+    @ObservationIgnored private var pauseWorkerTask: Task<Void, Never>?
+    @ObservationIgnored private var pauseWorkerID: UUID?
     private var stopTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
@@ -80,6 +85,7 @@ final class FullScreenPlayerViewModel {
     private var pendingPauseCommands: [PendingPauseCommand] = []
     private var awaitingAuthoritativePause: Bool?
     private var acceptsAuthoritativePauseState = false
+    private var receivedRequestState = false
     private var started = false
     private var stopped = false
 
@@ -125,7 +131,9 @@ final class FullScreenPlayerViewModel {
             AsyncStream<PlaybackMediaInformation?> { continuation in continuation.finish() }
         },
         settings: PlaybackSettingsStore,
-        initialPresentationConsumerGeneration: UInt64 = 0
+        initialPresentationConsumerGeneration: UInt64 = 0,
+        nowPlaying: PlaybackNowPlayingCoordinator? = nil,
+        channelPresentation: PlayerChannelPresentation? = nil
     ) {
         self.request = request
         self.engine = engine
@@ -135,7 +143,19 @@ final class FullScreenPlayerViewModel {
         self.presentationMount = presentationMount ?? PlaybackPresentationHostMount()
         self.mediaInformationProvider = mediaInformationProvider
         self.settings = settings
+        self.nowPlaying = nowPlaying
+        self.channelPresentation = channelPresentation ?? .init(request: request, logoURL: nil, programmes: [])
         presentationConsumerGeneration = initialPresentationConsumerGeneration
+    }
+
+    deinit {
+        pauseWorkerTask?.cancel()
+        if let nowPlayingOwnerID {
+            let nowPlaying = nowPlaying
+            Task { @MainActor [weak nowPlaying] in
+                nowPlaying?.end(owner: nowPlayingOwnerID)
+            }
+        }
     }
 
     func detachPresentationIfOwned(_ expected: PresentationMountOwnership) {
@@ -157,7 +177,9 @@ final class FullScreenPlayerViewModel {
         guard !started, !stopped else { return }
         resetMediaInformation()
         resetPauseIntent()
+        receivedRequestState = false
         started = true
+        nowPlayingOwnerID = nowPlaying?.begin(owner: self, presentation: channelPresentation)
         playbackGeneration &+= 1
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
@@ -169,7 +191,7 @@ final class FullScreenPlayerViewModel {
                 for await state in states {
                     guard let self,
                           !Task.isCancelled,
-                          isCurrent(lifecycle: lifecycle) else { return }
+                          isCurrent(lifecycle: lifecycle, playback: playback) else { return }
                     self.apply(state)
                 }
             }
@@ -190,26 +212,98 @@ final class FullScreenPlayerViewModel {
         case .idle, .preparing, .buffering, .recovering, .stopped, .failed:
             return
         }
-        desiredPaused.toggle()
-        let command = PendingPauseCommand(id: UUID(), target: desiredPaused)
-        pendingPauseCommands.append(command)
+        enqueuePause(!desiredPaused)
+    }
+
+    func setPausedFromNowPlaying(_ paused: Bool) async {
+        guard started, !stopped else { return }
+        switch state {
+        case .playing, .paused: break
+        case .idle, .preparing, .buffering, .recovering, .stopped, .failed: return
+        }
+        // A drained worker can still be waiting for the state stream to
+        // acknowledge its last command. Preserve that intent over stale state.
+        if !acceptsAuthoritativePauseState,
+           pendingPauseCommands.isEmpty,
+           awaitingAuthoritativePause == nil {
+            desiredPaused = isPaused
+        }
+        if desiredPaused != paused { enqueuePause(paused) }
+        // A retiring worker can still be physically suspended. Its completion
+        // starts the one successor worker; never overlap physical command lanes.
+        await pauseWorkerTask?.value
+        await pauseTask?.value
+    }
+
+    func stopFromNowPlaying() async { await stop() }
+
+    func updateChannelPresentation(_ presentation: PlayerChannelPresentation) {
+        guard presentation.request.id == request.id, !stopped else { return }
+        channelPresentation = presentation
+        if let nowPlayingOwnerID {
+            nowPlaying?.updatePresentation(presentation, owner: nowPlayingOwnerID)
+        }
+    }
+
+    private func enqueuePause(_ paused: Bool) {
+        desiredPaused = paused
+        let command = PendingPauseCommand(id: UUID(), target: paused)
+        if pauseWorkerTask != nil, pauseTask == nil {
+            // The old generation is canceled but has not physically returned.
+            // Retain just one successor intent in addition to that old command.
+            pendingPauseCommands = [command]
+        } else if pendingPauseCommands.count < 2 {
+            pendingPauseCommands.append(command)
+        } else {
+            // Keep the exact in-flight head; fold a burst into the latest tail.
+            pendingPauseCommands[1] = command
+        }
         awaitingAuthoritativePause = nil
-        let predecessor = pauseTask
+        startPauseWorkerIfNeeded()
+    }
+
+    private func startPauseWorkerIfNeeded() {
+        guard pauseWorkerTask == nil, !pendingPauseCommands.isEmpty, !stopped else { return }
+        if let nowPlayingOwnerID, nowPlaying?.owns(nowPlayingOwnerID) != true {
+            pendingPauseCommands.removeAll()
+            return
+        }
+        // This may run from a canceled predecessor's defer. A new unstructured
+        // worker gets its own cancellation state; do not test the finishing
+        // task's cancellation while deciding whether a successor is needed.
+        let workerID = UUID()
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
         let engine = engine
-        let task = Task { [weak self] in
-            await predecessor?.value
-            guard let self,
-                  isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-            await engine.setPaused(command.target)
-            retirePauseCommand(
-                command,
-                lifecycle: lifecycle,
-                playback: playback
-            )
+        let requestID = request.id
+        pauseWorkerID = workerID
+        let task = Task { @MainActor [weak self] in
+            defer { self?.finishPauseWorker(workerID) }
+            while let command = self?.nextPauseCommand(lifecycle: lifecycle, playback: playback) {
+                if let scoped = engine as? any RequestScopedPlaybackControlling {
+                    await scoped.setPaused(command.target, requestID: requestID)
+                } else {
+                    await engine.setPaused(command.target)
+                }
+                guard !Task.isCancelled else { return }
+                self?.retirePauseCommand(command, lifecycle: lifecycle, playback: playback)
+            }
         }
+        pauseWorkerTask = task
         pauseTask = task
+    }
+
+    private func nextPauseCommand(lifecycle: UInt64, playback: UInt64) -> PendingPauseCommand? {
+        guard isCurrent(lifecycle: lifecycle, playback: playback) else { return nil }
+        return pendingPauseCommands.first
+    }
+
+    private func finishPauseWorker(_ id: UUID) {
+        guard pauseWorkerID == id else { return }
+        pauseWorkerID = nil
+        pauseWorkerTask = nil
+        pauseTask = nil
+        startPauseWorkerIfNeeded()
     }
 
     func retry() {
@@ -220,6 +314,7 @@ final class FullScreenPlayerViewModel {
         presentationSuccessorPending = presentationController != nil
         playbackGeneration &+= 1
         resetPauseIntent()
+        receivedRequestState = false
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
         let predecessor = playbackTask
@@ -235,7 +330,7 @@ final class FullScreenPlayerViewModel {
                 for await state in states {
                     guard let self,
                           !Task.isCancelled,
-                          isCurrent(lifecycle: lifecycle) else { return }
+                          isCurrent(lifecycle: lifecycle, playback: playback) else { return }
                     self.apply(state)
                 }
             }
@@ -255,7 +350,10 @@ final class FullScreenPlayerViewModel {
             return
         }
         guard !stopped else { return }
+        let stoppingOwnerID = nowPlayingOwnerID
         stopped = true
+        if let nowPlayingOwnerID { nowPlaying?.end(owner: nowPlayingOwnerID) }
+        nowPlayingOwnerID = nil
         lifecycleGeneration &+= 1
         playbackGeneration &+= 1
 
@@ -290,12 +388,21 @@ final class FullScreenPlayerViewModel {
         latestPresentationRevision = nil
 
         let engine = engine
+        let requestID = request.id
+        let nowPlaying = nowPlaying
         let task = Task {
             await playback?.value
             await pause?.value
             await states?.value
             await mediaInformation?.value
-            await engine.stop()
+            if let nowPlaying {
+                guard let stoppingOwnerID, nowPlaying.isLatestOwner(stoppingOwnerID) else { return }
+            }
+            if let scoped = engine as? any RequestScopedPlaybackControlling {
+                await scoped.stop(requestID: requestID)
+            } else {
+                await engine.stop()
+            }
         }
         stopTask = task
         await task.value
@@ -609,11 +716,29 @@ final class FullScreenPlayerViewModel {
         guard !Task.isCancelled,
               !stopped,
               lifecycleGeneration == lifecycle else { return false }
+        if let nowPlayingOwnerID, nowPlaying?.owns(nowPlayingOwnerID) != true { return false }
         return playback.map { playbackGeneration == $0 } ?? true
     }
 
     private func apply(_ newState: PlaybackState) {
+        switch newState {
+        case let .preparing(eventRequest), let .buffering(eventRequest), let .recovering(eventRequest),
+             let .playing(eventRequest), let .paused(eventRequest):
+            guard eventRequest.id == request.id else { return }
+            receivedRequestState = true
+        case .idle, .stopped, .failed: break
+        }
         state = newState
+        if let nowPlayingOwnerID {
+            // The shared engine can replay the previous owner's terminal state
+            // before this request starts. A real failure remains visible, but an
+            // initial stopped value must not retire the newly reserved session.
+            if case .stopped = newState {
+                if receivedRequestState { nowPlaying?.update(newState, owner: nowPlayingOwnerID) }
+            } else {
+                nowPlaying?.update(newState, owner: nowPlayingOwnerID)
+            }
+        }
         switch newState {
         case .preparing, .buffering, .recovering:
             acceptsAuthoritativePauseState = true
@@ -657,6 +782,10 @@ final class FullScreenPlayerViewModel {
     }
 
     private func resetPauseIntent() {
+        // There is one physical worker, so cancellation revokes every command
+        // in this generation. Retain it until physical return to prevent a new
+        // generation from growing a chain of suspended unstructured tasks.
+        pauseWorkerTask?.cancel()
         pauseTask?.cancel()
         pauseTask = nil
         desiredPaused = false

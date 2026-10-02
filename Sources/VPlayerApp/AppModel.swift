@@ -847,6 +847,10 @@ final class AppModel {
                 .manual
             )
             if let completionClaim {
+                // The persisted callback is awaited, but native observation has
+                // its own actor/stream delivery lane. Fence that lane before the
+                // claim closes so this same local commit cannot reload twice.
+                await libraryChanges?.flushCommittedChanges()
                 libraryChanges?.stopClaimingPersistedRefreshes(completionClaim)
             }
             guard let self else {

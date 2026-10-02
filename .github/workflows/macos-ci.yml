@@ -50,5 +50,141 @@ jobs:
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
 
-      - name: Compile and run unit and UI tests
-        run: ./Scripts/test.sh
+      - name: Verify committed generated project and licenses
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+
+      - name: Compile tvOS 27 app and tests
+        run: |
+          xcodebuild build-for-testing \
+            -project VPlayer.xcodeproj \
+            -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify bounded XCTest timeout options
+        run: |
+          help="$(xcodebuild -help 2>&1)"
+          for option in -collect-test-diagnostics -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
+            printf '%s\n' "$help" | grep -F -- "$option"
+          done
+
+      - name: Run bounded focused migration and writer regression suites
+        run: |
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 - <<'PY'
+          import os, re, selectors, signal, subprocess, sys, time
+          
+          command = [
+              "xcodebuild", "test-without-building", "-project", "VPlayer.xcodeproj",
+              "-scheme", "VPlayer", "-destination", os.environ["TVOS_TEST_DESTINATION"],
+              "-parallel-testing-enabled", "NO", "-collect-test-diagnostics", "never", "-test-timeouts-enabled", "YES",
+              "-default-test-execution-time-allowance", "120",
+              "-maximum-test-execution-time-allowance", "300",
+              "-only-testing:VPlayerTests/AudioSessionLifecycleTests",
+              "-only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests",
+              "-only-testing:VPlayerTests/NativeReceiverAdapterTests",
+              "-only-testing:VPlayerTests/AudioRendererRecoveryProgressTests",
+              "-only-testing:VPlayerTests/SystemVideoOutputTests",
+              "-only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests",
+              "-only-testing:VPlayerTests/AVPlayerLogSnapshotCacheTests",
+              "-only-testing:VPlayerTests/RefreshLifecycleTests",
+              "-only-testing:VPlayerTests/NowPlayingIntegrationTests",
+              "-only-testing:VPlayerTests/CommittedLibraryObservationTests",
+              "-only-testing:VPlayerTests/ReducedResourceUsageTests",
+              "-only-testing:VPlayerTests/SegmentedFMP4WriterTests",
+              "-only-testing:VPlayerTests/AACPrimingCalibratorTests",
+              "-only-testing:VPlayerTests/OutputCleanupCoordinatorTests",
+              "-only-testing:VPlayerTests/PlaybackDeadlineTests",
+              "-only-testing:VPlayerTests/Task9ReconstructedRegressionTests",
+              "-only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests",
+              "-only-testing:VPlayerTests/SampleBufferBackendTests",
+              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testActivationCallsPlayExactlyOnceOnlyForMatchingPermit",
+              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries",
+              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSystemDriverUsesConfiguredStartupBufferForHomePodHLS",
+              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate",
+              "-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt",
+              "-only-testing:VPlayerTests/ChannelProgrammeLayoutTests",
+              "-only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity",
+              "-only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts",
+              "CODE_SIGNING_ALLOWED=NO",
+          ]
+          process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+          selector = selectors.DefaultSelector()
+          selector.register(process.stdout, selectors.EVENT_READ)
+          started = time.monotonic()
+          completed_at = None
+          known_fixture_timeout = False
+          buffer = b""
+          
+          def emit(line):
+              global completed_at, known_fixture_timeout
+              print(line, flush=True)
+              if "testActivationCallsPlayExactlyOnceOnlyForMatchingPermit" in line and "exceeded execution time allowance" in line:
+                  known_fixture_timeout = True
+                  print("CI_DIAGNOSTIC_STOP: known shared HLS fixture timed out; remaining cases are not verified", flush=True)
+              if re.search(r"Test Suite .* started at|Test Case .* started\.", line):
+                  completed_at = None
+              if re.search(r"Test Suite 'Selected tests' (passed|failed) at", line):
+                  completed_at = time.monotonic()
+                  print("CI_POST_SUITE_WATCHDOG: suite completion observed; allowing 180 seconds for finalization", flush=True)
+          
+          def diagnose():
+              print("CI_POST_SUITE_WATCHDOG: owned process did not exit; preserving failure", flush=True)
+              listing = subprocess.check_output(["ps", "-ax", "-o", "pid=,ppid=,stat=,etime=,comm="], text=True)
+              rows = []
+              for line in listing.splitlines():
+                  parts = line.split(None, 4)
+                  if len(parts) == 5:
+                      rows.append((int(parts[0]), int(parts[1]), parts[4], line))
+              owned = {process.pid}
+              while True:
+                  descendants = owned | {pid for pid, parent, _, _ in rows if parent in owned}
+                  if descendants == owned:
+                      break
+                  owned = descendants
+              relevant = [(pid, command, line) for pid, parent, command, line in rows
+                          if pid in owned or os.path.basename(command).startswith("VPlayer")]
+              for _, _, line in relevant:
+                  print("CI_PROCESS " + line, flush=True)
+              subprocess.run(["xcrun", "simctl", "list", "devices", "booted", "--json"], timeout=20, check=False)
+              sample_pids = [process.pid] + [pid for pid, command, _ in relevant
+                                            if pid != process.pid and os.path.basename(command).startswith("VPlayer")][:3]
+              for pid in sample_pids:
+                  print("CI_PROCESS_SAMPLE " + str(pid), flush=True)
+                  try:
+                      sample = subprocess.run(["sample", str(pid), "3", "1"], capture_output=True, text=True, timeout=15)
+                      print("\n".join((sample.stdout + sample.stderr).splitlines()[:400]), flush=True)
+                  except subprocess.TimeoutExpired:
+                      print("CI_PROCESS_SAMPLE timed out", flush=True)
+          
+          while True:
+              for key, _ in selector.select(timeout=1):
+                  chunk = os.read(key.fileobj.fileno(), 65536)
+                  if not chunk:
+                      selector.unregister(key.fileobj)
+                      continue
+                  buffer += chunk
+                  while b"\n" in buffer:
+                      line, buffer = buffer.split(b"\n", 1)
+                      emit(line.decode("utf-8", errors="replace"))
+              if process.poll() is not None:
+                  if buffer:
+                      emit(buffer.decode("utf-8", errors="replace"))
+                  raise SystemExit(process.returncode)
+              now = time.monotonic()
+              if known_fixture_timeout or (completed_at is not None and now - completed_at > 180) or now - started > 1800:
+                  diagnose()
+                  os.killpg(process.pid, signal.SIGTERM)
+                  try:
+                      process.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(process.pid, signal.SIGKILL)
+                      process.wait(timeout=10)
+                  print("CI_XCODEBUILD_RETURN_CODE=" + str(process.returncode), flush=True)
+                  print("CI_DIAGNOSTIC_EXIT=124", flush=True)
+                  raise SystemExit(124)
+          
+          PY

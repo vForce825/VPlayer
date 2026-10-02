@@ -49,6 +49,10 @@ public actor HLSPlaybackWatchdog {
     private var softCapBacklogStartTime: TimeInterval? = nil
     private var starvationStartTime: TimeInterval? = nil
     private var recoveryScheduled: Bool = false
+    private var scopedSession: PlaybackSessionIdentity?
+    private var scopedControlRevision: UInt64 = 0
+    private var replacementGeneration: UInt64 = 0
+    private var retiredThroughSessionID: UInt64?
 
     public init(
         recoveryCoordinator: PlaybackRecoveryCoordinator,
@@ -67,6 +71,45 @@ public actor HLSPlaybackWatchdog {
         currentActivationEpoch = activationEpoch
         lastObservedProgressTime = now()
         recoveryScheduled = false
+    }
+
+    /// Session IDs come from the controller's monotonic identity allocator.
+    /// Retain the latest identity across disarm so an old queued arm is rejected.
+    func arm(activationEpoch: UInt64, hasObservedProgress: Bool,
+             session: PlaybackSessionIdentity, controlRevision: UInt64) {
+        guard accepts(session: session, controlRevision: controlRevision) else { return }
+        arm(activationEpoch: activationEpoch, hasObservedProgress: hasObservedProgress)
+    }
+
+    func disarm(session: PlaybackSessionIdentity, controlRevision: UInt64) {
+        guard accepts(session: session, controlRevision: controlRevision) else { return }
+        disarm()
+    }
+
+    /// Fence replacement before its next session can arm. A delayed arm from
+    /// any already-admitted predecessor remains retired even if its revision
+    /// matches the last scoped arm; a delayed older replacement cannot disarm B.
+    func beginReplacement(generation: UInt64, retiring session: PlaybackSessionIdentity?) {
+        guard generation > replacementGeneration else { return }
+        replacementGeneration = generation
+        if let sessionID = session?.sessionID ?? scopedSession?.sessionID {
+            retiredThroughSessionID = max(retiredThroughSessionID ?? sessionID, sessionID)
+        }
+        disarm()
+    }
+
+    private func accepts(session: PlaybackSessionIdentity, controlRevision: UInt64) -> Bool {
+        if let retiredThroughSessionID, session.sessionID <= retiredThroughSessionID { return false }
+        if let scopedSession {
+            if session == scopedSession {
+                guard controlRevision >= scopedControlRevision else { return false }
+            } else {
+                guard session.sessionID > scopedSession.sessionID else { return false }
+            }
+        }
+        scopedSession = session
+        scopedControlRevision = controlRevision
+        return true
     }
 
     /// prepare、资源服务就绪、route debounce、handoff、用户暂停、系统中断和 permit revoke 均同步 freeze/cancel watchdog。

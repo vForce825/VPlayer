@@ -6,6 +6,55 @@ import XCTest
 
 final class VPlayerUITests: XCTestCase {
     @MainActor
+    func testAccessibilityLargeTextReducesGridDensity() {
+        let standard = gridLayout(contentSizeCategory: "UICTContentSizeCategoryL")
+        let accessible = gridLayout(contentSizeCategory: "UICTContentSizeCategoryAccessibilityXXXL")
+
+        XCTAssertEqual(standard.firstRowCount, 4,
+            "All four seeded channels should share a row at standard text size")
+        XCTAssertGreaterThan(accessible.firstRowCount, 0)
+        XCTAssertLessThan(accessible.firstRowCount, standard.firstRowCount,
+            "Accessibility text must reduce actual rendered columns")
+        XCTAssertGreaterThan(accessible.tileWidth, standard.tileWidth)
+        XCTAssertGreaterThanOrEqual(accessible.tileWidth, 500,
+            "Accessibility text needs fewer, wider channel columns")
+    }
+
+    @MainActor
+    private func gridLayout(contentSizeCategory: String) -> (firstRowCount: Int, tileWidth: CGFloat) {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-ui-fixture", "seeded", "-uiTestResetPlaybackSettings",
+            // UserDefaults launch arguments have precedence over the fixture's
+            // persisted-default reset; no production-only test switch is needed.
+            "-channels.grouping", "playlistOrder",
+            "-UIPreferredContentSizeCategoryName", contentSizeCategory
+        ]
+        app.launch()
+        defer { app.terminate() }
+        let channel = app.buttons["channel.http"]
+        XCTAssertTrue(channel.waitForExistence(timeout: 5))
+        XCTAssertTrue(channel.isHittable)
+        XCTAssertFalse(app.buttons["channel.group.测试分组"].exists,
+            "This comparison requires the same flat playlist on both launches")
+        let channelIDs = ["channel.http", "channel.udp", "channel.grouped", "channel.ungrouped"]
+        for identifier in channelIDs {
+            XCTAssertTrue(app.buttons[identifier].waitForExistence(timeout: 3),
+                "Fewer fixture channels must not masquerade as fewer grid columns: \(identifier)")
+        }
+        let firstFrame = channel.frame
+        // A focused card can be scaled and EPG text makes cards differ in
+        // height. Intersecting the first card's vertical centre identifies its
+        // row without relying on equal frames or a snapshot pixel threshold.
+        let firstRowCount = channelIDs.filter { identifier in
+            let candidate = app.buttons[identifier]
+            return candidate.exists && candidate.frame.minY <= firstFrame.midY
+                && candidate.frame.maxY >= firstFrame.midY
+        }.count
+        return (firstRowCount, firstFrame.width)
+    }
+
+    @MainActor
     func testSeededLaunchExposesSourceChannelAndSettingsFlow() {
         let app = launchSeededApp()
 

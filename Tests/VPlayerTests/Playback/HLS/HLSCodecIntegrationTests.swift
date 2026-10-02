@@ -249,10 +249,9 @@ enum HLSCodecFixtureRunner {
             outputSettings: nil,
             sourceFormatHint: formatDesc
         )
-        writerInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(writerInput) else { throw RunnerError.decodeFailed }
-        writer.add(writerInput)
-        guard writer.startWriting() else { throw RunnerError.decodeFailed }
+        let receiver = writer.inputReceiver(for: writerInput)
+        try writer.start()
         writer.startSession(atSourceTime: .zero)
 
         let auDuration = CMTime(value: 1_536, timescale: 48_000)
@@ -260,9 +259,9 @@ enum HLSCodecFixtureRunner {
               let b1 = makeSampleBuffer(au1, pts: auDuration, dur: auDuration, format: formatDesc) else {
             throw RunnerError.decodeFailed
         }
-        writerInput.append(b0)
-        writerInput.append(b1)
-        writerInput.markAsFinished()
+        try await receiver.append(makeReadyWriterFixtureSample(copying: b0))
+        try await receiver.append(makeReadyWriterFixtureSample(copying: b1))
+        receiver.finish()
         await writer.finishWriting()
         guard writer.status == .completed else { throw RunnerError.decodeFailed }
 
@@ -282,12 +281,14 @@ enum HLSCodecFixtureRunner {
             readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         }
         guard reader.canAdd(readerOutput) else { throw RunnerError.decodeFailed }
-        reader.add(readerOutput)
-        guard reader.startReading() else { throw RunnerError.decodeFailed }
+        let provider = reader.outputProvider(for: readerOutput)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
 
         var decodedPCMCount = 0
         var readSampleBuffers: [CMSampleBuffer] = []
-        while let sample = readerOutput.copyNextSampleBuffer() {
+        while let ready = try await provider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
             let numSamples = CMSampleBufferGetNumSamples(sample)
             guard numSamples > 0 else { continue }
             if readerOutput === lpcmOutput {
@@ -296,7 +297,7 @@ enum HLSCodecFixtureRunner {
                 readSampleBuffers.append(sample)
             }
         }
-        guard reader.status == .completed else { throw RunnerError.decodeFailed }
+        guard reader.status == .completed else { throw reader.error ?? RunnerError.decodeFailed }
 
         if readerOutput === lpcmOutput {
             guard decodedPCMCount > 0 else { throw RunnerError.decodeFailed }
@@ -344,12 +345,14 @@ enum HLSCodecFixtureRunner {
             readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         }
         guard reader.canAdd(readerOutput) else { throw RunnerError.decodeFailed }
-        reader.add(readerOutput)
-        guard reader.startReading() else { throw RunnerError.decodeFailed }
+        let provider = reader.outputProvider(for: readerOutput)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
 
         var decodedPCMCount = 0
         var readSampleBuffers: [CMSampleBuffer] = []
-        while let sample = readerOutput.copyNextSampleBuffer() {
+        while let ready = try await provider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
             let numSamples = CMSampleBufferGetNumSamples(sample)
             guard numSamples > 0 else { continue }
             if readerOutput === lpcmOutput {
@@ -358,7 +361,7 @@ enum HLSCodecFixtureRunner {
                 readSampleBuffers.append(sample)
             }
         }
-        guard reader.status == .completed else { throw RunnerError.decodeFailed }
+        guard reader.status == .completed else { throw reader.error ?? RunnerError.decodeFailed }
 
         if readerOutput === lpcmOutput {
             guard decodedPCMCount > 0 else { throw RunnerError.decodeFailed }

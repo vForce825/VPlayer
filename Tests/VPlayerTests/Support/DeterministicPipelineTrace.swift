@@ -64,6 +64,7 @@ struct DeterministicPipelineResult: @unchecked Sendable {
     var generationAdvanceDeltas: [UInt64] = []
     var unchangedPMTGenerationAdvanceCount = 0
     var rawSourcePTS90k: [UInt64] = []
+    var admittedSourcePTS90k: [Int64] = []
     var pipelineDemuxEventCount = 0
     var discontinuityRendererFlushCount = 0
     var lateDecoderCallbackDeliveryCount = 0
@@ -83,6 +84,7 @@ struct ClassifierAndTimingEdgeResult: Sendable {
     var repeatFieldNormalizedDurations: [CMTime] = []
     var repeatFieldRoute = DeinterlaceRoute.rawWhileClassifying
     var repeatFieldMetadataReachedProcessor = false
+    var initialInterlacedGOPWasRejected = false
 }
 
 struct GPUCommandErrorRegressionResult: Sendable {
@@ -353,6 +355,19 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         )
         repeatCoordinator.replaceFormat(repeatFormat)
         let repeatGeneration = repeatHost.generation
+        // Production intentionally discards the first interlaced H.264 GOP.
+        // That rejected input must not manufacture a decoder callback. The
+        // following random-access unit starts the measured repeat-field trace.
+        let startupAccepted = repeatCoordinator.handle(accessUnit: try makeAccessUnit(
+            id: 199,
+            generation: repeatGeneration,
+            format: repeatFormat,
+            duration: CMTime(value: 1, timescale: 25),
+            parser: traceInterlacedParser(parity: .top, sourcePTS90k: 0)
+        ))
+        guard !startupAccepted, !repeatDecoder.hasConfiguration(for: repeatGeneration) else {
+            throw DeterministicTraceError.pipelineFailure
+        }
         for index in 0..<3 {
             let parser = VideoParserMetadata(
                 fieldOrder: .tt,
@@ -392,7 +407,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             repeatFieldNormalizedDurations: repeatYADIF.snapshot().map(\.frameDuration),
             repeatFieldRoute: repeatCoordinator.route,
             repeatFieldMetadataReachedProcessor: repeatYADIF.snapshot().first?
-                .frame.parserMetadata.repeatFirstField == true
+                .frame.parserMetadata.repeatFirstField == true,
+            initialInterlacedGOPWasRejected: !startupAccepted
         )
     }
 
@@ -654,6 +670,8 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             ],
             unchangedPMTGenerationAdvanceCount: unchangedPMTAdvanceCount,
             rawSourcePTS90k: trace.frames.compactMap(\.parserMetadata.sourcePTS90k),
+            admittedSourcePTS90k: decoder.submittedPresentationTimes(
+                for: trace.frames.map(\.accessUnitID), generation: initialGeneration),
             pipelineDemuxEventCount: demuxer.emissionCount,
             discontinuityRendererFlushCount: rendererSnapshot.flushes.filter {
                 $0 == discontinuityGeneration
@@ -699,30 +717,64 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             duration: CMTime(value: 1, timescale: 1)
         )))
 
+        // Each generation starts with the deliberately discarded interlaced
+        // startup GOP. Keep its identity outside the measured frame IDs.
+        pipeline.receive(video: .accessUnit(try makeAccessUnit(
+            id: accessUnitIDOffset,
+            generation: generation,
+            format: trace.formatDescription,
+            duration: trace.nominalFrameDuration,
+            parser: trace.frames[0].parserMetadata
+        )))
+        _ = await pipeline.debugSnapshot()
+        guard !decoder.hasConfiguration(for: generation) else {
+            throw DeterministicTraceError.pipelineFailure
+        }
+
         let sources = trace.frames + makeFlushFrames(for: trace, generation: generation)
+        let duration = trace.nominalFrameDuration
+        let lookaheadCount = max(sources.count, Int(ceil(
+            CMTimeGetSeconds(PlaybackTuning.default.videoBufferHorizon)
+                / CMTimeGetSeconds(duration))))
+        guard lookaheadCount + 1 <= PlaybackPipeline.pendingVideoDecodeCapacity else {
+            throw DeterministicTraceError.pipelineFailure
+        }
+        // The full pipeline waits for the configured interlaced media horizon
+        // before decoding. Supply that bounded compressed lookahead first;
+        // waiting after one 40ms AU would prevent the prerequisite from arriving.
+        // Match CompressedVideoAssembler's monotonic DTS fallback and PTS>=DTS
+        // clamp for this non-B 25fps input. Decoder parser metadata retains the
+        // raw33-bit values consumed independently by PresentationTimestampNormalizer.
+        for index in 0..<lookaheadCount {
+            let pts = CMTimeAdd(audioPTS, CMTimeMultiply(duration, multiplier: Int32(index)))
+            let rawPTS = UInt64(CMTimeConvertScale(pts, timescale: 90_000,
+                method: .default).value) % (1 << 33)
+            let parser = index < sources.count ? sources[index].parserMetadata
+                : traceInterlacedParser(parity: .top, sourcePTS90k: rawPTS)
+            pipeline.receive(video: .accessUnit(try makeAccessUnit(
+                id: accessUnitIDOffset + UInt64(index + 1),
+                generation: generation,
+                format: trace.formatDescription,
+                duration: duration,
+                parser: parser,
+                admissionPTS: pts
+            )))
+        }
         for source in sources {
             let frame = source.rebased(
                 to: generation,
                 accessUnitID: source.accessUnitID + accessUnitIDOffset
             )
-            pipeline.receive(video: .accessUnit(try makeAccessUnit(
-                id: frame.accessUnitID,
-                generation: generation,
-                format: trace.formatDescription,
-                duration: frame.duration,
-                parser: frame.parserMetadata
-            )))
-            // The first random-access unit of a generation owns the async
-            // configure transition. Cross the executor before constructing
-            // its callback so the fake can attach the exact session identity.
-            _ = await pipeline.debugSnapshot()
+            try await waitUntil(context: "decode submission g\(generation.rawValue) AU\(frame.accessUnitID)") {
+                decoder.hasSubmitted(frame.accessUnitID, generation: generation)
+            }
             pipeline.receive(decoder: decoder.frameEvent(frame))
         }
         _ = await pipeline.debugSnapshot()
         try await drain(yadif)
 
         let targetIDs = Set(trace.frames.map { $0.accessUnitID + accessUnitIDOffset })
-        try await waitUntil {
+        try await waitUntil(context: "measured presentations g\(generation.rawValue)") {
             renderer.snapshot().allFrames.filter {
                 $0.generation == generation && targetIDs.contains($0.sourceAccessUnitID)
             }.count == trace.frames.count * 2
@@ -735,9 +787,10 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
         generation: MediaGeneration,
         format: CMVideoFormatDescription,
         duration: CMTime,
-        parser: VideoParserMetadata
+        parser: VideoParserMetadata,
+        admissionPTS: CMTime? = nil
     ) throws -> CompressedVideoAccessUnit {
-        let pts = parser.sourcePTS90k.map {
+        let pts = admissionPTS ?? parser.sourcePTS90k.map {
             CMTime(value: Int64($0), timescale: 90_000)
         } ?? CMTime(value: Int64(id), timescale: 25)
         let sampleBuffer = try SampleBufferBuilder.makeVideo(
@@ -759,6 +812,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
 
     private func waitUntil(
         timeout: Duration = .seconds(2),
+        context: String = "pipeline prerequisite",
         _ condition: @escaping () async -> Bool
     ) async throws {
         let clock = ContinuousClock()
@@ -767,7 +821,7 @@ final class DeterministicPipelineHarness: @unchecked Sendable {
             if await condition() { return }
             try await Task.sleep(for: .milliseconds(5))
         }
-        throw DeterministicTraceError.timeout
+        throw DeterministicTraceError.timeout(context)
     }
 
     private func makeFlushFrames(
@@ -1432,6 +1486,8 @@ private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable 
     private(set) var decodedAccessUnitCount = 0
     private var eventSink: (@Sendable (VideoDecoderEvent) -> Void)?
     private var identities: [MediaGeneration: VideoDecoderEventIdentity] = [:]
+    private var submittedIDs: [MediaGeneration: Set<UInt64>] = [:]
+    private var submittedPTS: [MediaGeneration: [UInt64: Int64]] = [:]
 
     func installEventSink(_ sink: @escaping @Sendable (VideoDecoderEvent) -> Void) {
         lock.withLock { eventSink = sink }
@@ -1465,12 +1521,29 @@ private final class TraceCoordinatorDecoder: VideoDecoding, @unchecked Sendable 
         return .frame(frame, identity: identity!)
     }
 
+    func hasConfiguration(for generation: MediaGeneration) -> Bool {
+        lock.withLock { identities[generation] != nil }
+    }
+
+    func hasSubmitted(_ accessUnitID: UInt64, generation: MediaGeneration) -> Bool {
+        lock.withLock { submittedIDs[generation]?.contains(accessUnitID) == true }
+    }
+
+    func submittedPresentationTimes(for ids: [UInt64], generation: MediaGeneration) -> [Int64] {
+        lock.withLock { ids.compactMap { submittedPTS[generation]?[$0] } }
+    }
+
     func decode(
         _ accessUnit: CompressedVideoAccessUnit,
         flags _: VTDecodeFrameFlags
     ) throws {
-        lock.withLock { decodedAccessUnitCount += 1 }
-        _ = accessUnit
+        lock.withLock {
+            decodedAccessUnitCount += 1
+            submittedIDs[accessUnit.generation, default: []].insert(accessUnit.id)
+            submittedPTS[accessUnit.generation, default: [:]][accessUnit.id] =
+                CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer),
+                    timescale: 90_000, method: .default).value
+        }
     }
 
     func snapshot() -> TraceCoordinatorDecoderSnapshot {
@@ -1526,5 +1599,5 @@ enum DeterministicTraceError: Error {
     case textureCache(CVReturn)
     case oddFieldCount(Int)
     case pipelineFailure
-    case timeout
+    case timeout(String)
 }

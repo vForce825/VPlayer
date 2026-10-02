@@ -38,11 +38,11 @@ final class LoopbackHTTPServerTests: XCTestCase {
 
     func testProductionFactoryRejectsRawTokenStoreEvenWhenEveryVisibleTokenMatches() async throws {
         do {
-            _ = try await LoopbackHTTPSessionFactory().start(
+            _ = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
                 itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in }
             ) { capability in
-                let harness = try Task19Harness(token: capability.value)
-                try harness.initial()
+                let harness = try await Task19Harness(token: capability.value)
+                try await harness.initial()
                 var declaration = try Task19.declaration()
                 declaration.token = capability.value
                 return LoopbackPreparedPublication(store: harness.store, declaration: declaration,
@@ -62,13 +62,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 let configuration = LoopbackHTTPTestingConfiguration(
                     capability: capability, entropyFault: fault)
                 do {
-                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).start(
+                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).startPreparingAsynchronously(
                         itemGeneration: 19, now: { 0 }, logger: { _ in },
                         responseFailure: { _, _ in }
                     ) { token in
                         prepared.append(1)
-                        let harness = try Task19Harness(loopbackSession: token)
-                        try harness.initial()
+                        let harness = try await Task19Harness(loopbackSession: token)
+                        try await harness.initial()
                         var declaration = try Task19.declaration()
                         declaration.token = token.value
                         return LoopbackPreparedPublication(store: harness.store,
@@ -86,12 +86,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
             let configuration = LoopbackHTTPTestingConfiguration(
                 capability: capability, cancelAfterStartupProbeAccepted: true)
             do {
-                _ = try await LoopbackHTTPSessionFactory(testing: configuration).start(
+                _ = try await LoopbackHTTPSessionFactory(testing: configuration).startPreparingAsynchronously(
                     itemGeneration: 19, now: { 0 }, logger: { _ in },
                     responseFailure: { _, _ in }
                 ) { token in
-                    let harness = try Task19Harness(loopbackSession: token)
-                    try harness.initial()
+                    let harness = try await Task19Harness(loopbackSession: token)
+                    try await harness.initial()
                     storeBox.value = harness
                     var declaration = try Task19.declaration()
                     declaration.token = token.value
@@ -117,7 +117,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             .declaration.playlistURI(participantID: 1)
         let initialHEAD = try rawRequest(port: fixture.server.port, method: "HEAD", target: playlistPath)
 
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let refreshed = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -135,8 +135,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let oldKey = try XCTUnwrap(initial.media[1]?.resources.first)
         let oldPath = try fixture.task19.store.resourceURI(oldKey,
             declaration: try XCTUnwrap(initial.participantVector.first { $0.participantID == 1 }).declaration)
-        try fixture.task19.beginEpoch(2)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.beginEpoch(2)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second * 2), .published)
         let epochTwo = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -640,8 +640,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(Mirror(reflecting: oldReceipt).displayStyle, .class,
                        "coverage receipt 必须是无 memberwise initializer 的 opaque capability")
 
-        try fixture.task19.beginEpoch(2)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.beginEpoch(2)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let successor = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
@@ -943,26 +943,30 @@ final class LoopbackHTTPServerTests: XCTestCase {
     }
 
     func testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts() async throws {
-        let entered = DispatchSemaphore(value: 0)
-        let released = DispatchSemaphore(value: 0)
+        let entered = XCTestExpectation(description: "startup preparation entered")
+        let released = Task20StartupPreparationGate()
         let harnessBox = LockedHarness()
         let task = Task {
-            try await LoopbackHTTPSessionFactory().start(itemGeneration: 19, now: { 0 },
+            try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(itemGeneration: 19, now: { 0 },
                 logger: { _ in }, responseFailure: { _, _ in }) { capability in
-                let harness = try Task19Harness(loopbackSession: capability)
-                try harness.initial()
+                let harness = try await Task19Harness(loopbackSession: capability)
+                try await harness.initial()
                 harnessBox.value = harness
-                entered.signal()
-                _ = released.wait(timeout: .now() + 2)
+                entered.fulfill()
+                await released.waitUntilReleased()
+                XCTAssertTrue(Task.isCancelled, "prepare 必须保持挂起直到取消之后的显式 release")
                 var declaration = try Task19.declaration()
                 declaration.token = capability.value
                 return LoopbackPreparedPublication(store: harness.store, declaration: declaration,
                     snapshot: try XCTUnwrap(harness.publisher.visible))
             }
         }
-        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let enteredResult = await XCTWaiter.fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(enteredResult, .completed)
         task.cancel()
-        released.signal()
+        XCTAssertEqual(harnessBox.value?.store.isClosed, false,
+                       "取消请求不能在 prepare gate 释放前提前结算 store")
+        await released.release()
         do {
             _ = try await task.value
             XCTFail("prepare 后取消必须由统一 startup owner 封闭失败")
@@ -1040,9 +1044,9 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
     }
 
-    func testMediaBeforeInitIsRetrofittedAtomicallyAndInitCapIncludesEvidenceAllocation() throws {
-        let track = try Task19Track(id: 1, mediaType: .video)
-        let packet = try track.next()
+    func testMediaBeforeInitIsRetrofittedAtomicallyAndInitCapIncludesEvidenceAllocation() async throws {
+        let track = try await Task19Track(id: 1, mediaType: .video)
+        let packet = try await track.next()
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
         let mediaReservation = try store.reserveMedia(binding: packet.object.binding,
             kind: .media, bodyBytes: packet.object.bytes.count)
@@ -1073,15 +1077,15 @@ final class LoopbackHTTPServerTests: XCTestCase {
         store.cancel(legal)
     }
 
-    func testFormalInitializationBatchRetrofitsEveryPendingMediaInOneTransaction() throws {
+    func testFormalInitializationBatchRetrofitsEveryPendingMediaInOneTransaction() async throws {
         let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
             epochStart: .zero, videoMode: .passthrough))
-        let video = try Task19Track(id: 1, mediaType: .video, boundary: boundary)
-        let audio = try Task19Track(id: 2, mediaType: .audio, boundary: boundary)
+        let video = try await Task19Track(id: 1, mediaType: .video, boundary: boundary)
+        let audio = try await Task19Track(id: 2, mediaType: .audio, boundary: boundary)
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
         var mediaKeys: [HLSResourceKey] = []
         for track in [video, audio] {
-            let packet = try track.next()
+            let packet = try await track.next()
             let reservation = try store.reserveMedia(binding: packet.object.binding,
                 kind: .media, bodyBytes: packet.object.bytes.count)
             mediaKeys.append(try store.admit(packet.object, proof: track.proof,
@@ -1380,7 +1384,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try fixture.server.retire(cleanupTicket: ticket)
     }
 
-    func testReview4BatchRetrofitRechecksEveryObjectAndStoreHardDeltaAtomically() throws {
+    func testReview4BatchRetrofitRechecksEveryObjectAndStoreHardDeltaAtomically() async throws {
         let layout = LoopbackStorageLayout.current
         let evidenceBytes = SealedMediaStoreCapacityProjection.mediaEvidenceBytes
         let maximumMapBytes = 32 * 1_024 - evidenceBytes
@@ -1404,14 +1408,15 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertEqual($0 as? HLSPublicationFailure, .capacityExceeded)
         }
 
-        func measuredRealMapDelta() throws -> Int {
+        func measuredRealMapDelta() async throws -> Int {
             let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
                 epochStart: .zero, videoMode: .passthrough))
             let tracks = [
-                try Task19Track(id: 1, mediaType: .video, boundary: boundary),
-                try Task19Track(id: 2, mediaType: .audio, boundary: boundary),
+                try await Task19Track(id: 1, mediaType: .video, boundary: boundary),
+                try await Task19Track(id: 2, mediaType: .audio, boundary: boundary),
             ]
-            let packets = try tracks.map { try $0.next() }
+            var packets: [Task19Packet] = []
+            for track in tracks { packets.append(try await track.next()) }
             let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
             var mediaKeys: [HLSResourceKey] = []
             for (track, packet) in zip(tracks, packets) {
@@ -1439,15 +1444,16 @@ final class LoopbackHTTPServerTests: XCTestCase {
             store.close()
             return result
         }
-        let realMapDelta = try measuredRealMapDelta()
+        let realMapDelta = try await measuredRealMapDelta()
 
-        func runBatch(remainingAfterRetrofit: Int, shouldSucceed: Bool) throws {
+        func runBatch(remainingAfterRetrofit: Int, shouldSucceed: Bool) async throws {
             let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
                 epochStart: .zero, videoMode: .passthrough))
-            let video = try Task19Track(id: 1, mediaType: .video, boundary: boundary)
-            let audio = try Task19Track(id: 2, mediaType: .audio, boundary: boundary)
+            let video = try await Task19Track(id: 1, mediaType: .video, boundary: boundary)
+            let audio = try await Task19Track(id: 2, mediaType: .audio, boundary: boundary)
             let tracks = [video, audio]
-            let packets = try tracks.map { try $0.next() }
+            var packets: [Task19Packet] = []
+            for track in tracks { packets.append(try await track.next()) }
             let preRetrofitCharge = zip(tracks, packets).reduce(0) {
                 $0 + $1.1.object.bytes.count + evidenceBytes
                     + $1.0.initialization.bytes.count
@@ -1497,8 +1503,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
             store.close()
         }
 
-        try runBatch(remainingAfterRetrofit: -1, shouldSucceed: false)
-        try runBatch(remainingAfterRetrofit: 0, shouldSucceed: true)
+        try await runBatch(remainingAfterRetrofit: -1, shouldSucceed: false)
+        try await runBatch(remainingAfterRetrofit: 0, shouldSucceed: true)
     }
 
     func testReview5ParserUsesOne16KiBResidentAllocationAndAbsoluteTemporaryCaps() throws {
@@ -1575,10 +1581,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
         directLedger.release(reopened)
 
         let shared = HLSDeliveryApplicationChargeLedger.shared
-        let firstTrack = try Task19Track(id: 1, mediaType: .audio)
-        let secondTrack = try Task19Track(id: 1, mediaType: .audio)
-        let firstPacket = try firstTrack.next()
-        let secondPacket = try secondTrack.next()
+        let firstTrack = try await Task19Track(id: 1, mediaType: .audio)
+        let secondTrack = try await Task19Track(id: 1, mediaType: .audio)
+        let firstPacket = try await firstTrack.next()
+        let secondPacket = try await secondTrack.next()
         let firstCharge = firstPacket.object.bytes.count
             + SealedMediaStoreCapacityProjection.mediaEvidenceBytes
         let storeBaseline = shared.chargedBytes
@@ -2088,7 +2094,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             itemGeneration: 19, publicationSequence: initial.publicationSequence,
             preparationOwner: source.preparationOwner))
         XCTAssertFalse(basis.participants.flatMap { $0.completedMedia.map(\.key) }.contains(deferred))
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let rolled = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -2115,7 +2121,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
         let identities = arenaIdentities()
         for iteration in 2...20 {
-            try fixture.task19.offerBoth(count: 1)
+            try await fixture.task19.offerBoth(count: 1)
             XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
                 now: Int64(iteration) * Task19.second), .published)
             let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -2142,7 +2148,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         var selections: [LoopbackAudioMediaSelectionCapability] = []
         for iteration in 0..<15 {
             if iteration > 0 {
-                try fixture.task19.offerBoth(count: 1)
+                try await fixture.task19.offerBoth(count: 1)
                 XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
                     now: Int64(iteration) * Task19.second), .published)
             }
@@ -2209,7 +2215,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         var selections = [try XCTUnwrap(frozen.audioSelectionCapability)]
         let participantID = selections[0].participantID
         for iteration in 1...13 {
-            try first.task19.offerBoth(count: 1)
+            try await first.task19.offerBoth(count: 1)
             XCTAssertEqual(try first.task19.publisher.publish(ticket: first.task19.publisher.ticket,
                 now: Int64(iteration) * Task19.second), .published)
             let snapshot = try XCTUnwrap(first.task19.publisher.visible)
@@ -2457,7 +2463,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(harness.coordinator.phase, .playing)
         XCTAssertEqual(harness.driver.playCallCount, 1)
 
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second), .published)
         let second = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -2489,7 +2495,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         async throws {
         let beforeFirstGET = try await Task20HTTPFixture.start()
         defer { beforeFirstGET.shutdown() }
-        try beforeFirstGET.task19.offerBoth(count: 1)
+        try await beforeFirstGET.task19.offerBoth(count: 1)
         XCTAssertEqual(try beforeFirstGET.task19.publisher.publish(
             ticket: beforeFirstGET.task19.publisher.ticket,
             now: Task19.second), .published)
@@ -2516,7 +2522,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             fixture: duringPlayback, itemURL: itemURL, snapshot: first)
         let oldAudioKey = try XCTUnwrap(first.media[2]?.resources.first)
 
-        try duringPlayback.task19.offerBoth(count: 1)
+        try await duringPlayback.task19.offerBoth(count: 1)
         XCTAssertEqual(try duringPlayback.task19.publisher.publish(
             ticket: duringPlayback.task19.publisher.ticket,
             now: Task19.second), .published)
@@ -2731,13 +2737,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 let configuration = LoopbackHTTPTestingConfiguration(capability: capability,
                     entropyFault: fault, entropyReadTrace: trace)
                 do {
-                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).start(
+                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).startPreparingAsynchronously(
                         itemGeneration: 19, now: { 0 }, logger: { _ in },
                         responseFailure: { _, _ in }
                     ) { token in
                         prepared.append(1)
-                        let harness = try Task19Harness(loopbackSession: token)
-                        try harness.initial()
+                        let harness = try await Task19Harness(loopbackSession: token)
+                        try await harness.initial()
                         var declaration = try Task19.declaration()
                         declaration.token = token.value
                         return LoopbackPreparedPublication(store: harness.store,
@@ -3082,12 +3088,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try serveFullPublication(first, fixture: fixture, includeMaster: true)
         let firstAudio = try XCTUnwrap(first.media[2]?.resources.first)
 
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second), .published)
         let second = try XCTUnwrap(fixture.task19.publisher.visible)
         try serveFullPublication(second, fixture: fixture, includeMaster: true)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second * 2), .published)
         let third = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -3521,7 +3527,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             events.values == [Int(first.publicationSequence)]
         }, "首个 publication 必须等真实 send terminal/max-CAS 下游完成")
         let oldMedia = try XCTUnwrap(first.media[2]?.resources.first)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second), .published)
         let current = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -3890,13 +3896,13 @@ private final class Task21CompressedLifecycleHTTPFixture: @unchecked Sendable {
                       outputLifecycleEpoch: OutputLifecycleEpoch) async throws
         -> Task21CompressedLifecycleHTTPFixture {
         let box = Task21CompressedLifecyclePublicationBox()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 20,
             now: { 0 },
             logger: { _ in },
             responseFailure: { _, _ in }
         ) { token in
-            let publication = try Task21CompressedLifecyclePublication(
+            let publication = try await Task21CompressedLifecyclePublication(
                 loopbackSession: token,
                 codec: codec,
                 outputLifecycleEpoch: outputLifecycleEpoch)
@@ -3946,8 +3952,8 @@ private final class Task21CompressedLifecyclePublication: @unchecked Sendable {
 
     init(loopbackSession: LoopbackSessionToken,
          codec: HLSAudioCodec,
-         outputLifecycleEpoch: OutputLifecycleEpoch) throws {
-        track = try Task21CompressedLifecycleTrack(
+         outputLifecycleEpoch: OutputLifecycleEpoch) async throws {
+        track = try await Task21CompressedLifecycleTrack(
             codec: codec,
             outputLifecycleEpoch: outputLifecycleEpoch)
         store = SealedMediaStore(loopbackSession: loopbackSession,
@@ -4008,7 +4014,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
     private var nextSequence: UInt64 = 0
 
     init(codec: HLSAudioCodec,
-         outputLifecycleEpoch: OutputLifecycleEpoch) throws {
+         outputLifecycleEpoch: OutputLifecycleEpoch) async throws {
         self.codec = codec
         let binding = FMP4WriterBinding(
             outputLifecycleEpoch: outputLifecycleEpoch,
@@ -4069,7 +4075,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
             relay: relay,
             systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
         try createdWriter.start(at: .zero)
-        try Self.append(first, writer: createdWriter,
+        try await Self.append(first, writer: createdWriter,
                         boundary: boundary,
                         coordinator: firstSource.coordinator)
         var presentationTimeStamp = CMTime(
@@ -4081,7 +4087,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
                 admission: admission,
                 at: presentationTimeStamp)
             let accessUnit = nextSource.accessUnit
-            try Self.append(accessUnit, writer: createdWriter,
+            try await Self.append(accessUnit, writer: createdWriter,
                             boundary: boundary,
                             coordinator: nextSource.coordinator)
             presentationTimeStamp = CMTimeAdd(
@@ -4151,8 +4157,8 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
         writer: SegmentedFMP4Writer,
         boundary: SegmentBoundaryCoordinator,
         coordinator: AudioServiceSemanticCoordinator
-    ) throws {
-        try writer.appendCompressed(
+    ) async throws {
+        try await writer.appendCompressedAwaitingReadiness(
             accessUnit.writerSubmission,
             coordinator: coordinator,
             ticket: boundary.issueCompressedAudioAppend(
@@ -4401,6 +4407,12 @@ private final class Review2LoopbackCoordinatorHarness {
 
 @MainActor
 private final class Review2LoopbackDriver: AVPlayerDriving {
+    var disconnectedFromSystemAudio = false
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == item else { throw .staleIdentity }
+        disconnectedFromSystemAudio = disconnected
+    }
     var seekAction: (() throws -> Void)?
     var rate: Float = 0
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
@@ -4811,7 +4823,7 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
             itemGeneration: itemGeneration,
             outputLifecycleEpoch: outputLifecycleEpoch)
         let box = FinalReplacementLockedHarness()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: itemGeneration, now: { 0 }, logger: { _ in },
             responseFailure: responseFailure
         ) { token in
@@ -5045,7 +5057,7 @@ private final class FinalReview2InitialHTTPFixture: @unchecked Sendable {
             audio: encoded, additionalAudioSeed: surround,
             additionalAudioParticipantID: 4)
         let box = FinalReview2InitialLockedHarness()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 19, now: { 0 }, logger: { _ in },
             responseFailure: { _, _ in }
         ) { token in
@@ -5089,6 +5101,24 @@ private final class FinalReview2InitialLockedHarness: @unchecked Sendable {
     }
 }
 
+/// The preparation owner settles only after the test explicitly releases it.
+/// Task cancellation deliberately does not resume this single-waiter gate.
+private actor Task20StartupPreparationGate {
+    private var isReleased = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func waitUntilReleased() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func release() {
+        isReleased = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
 private final class Task20HTTPFixture: @unchecked Sendable {
     let task19: Task19Harness
     let server: LoopbackHTTPServer
@@ -5108,11 +5138,11 @@ private final class Task20HTTPFixture: @unchecked Sendable {
         let box = LockedHarness()
         let factory = testing.map { LoopbackHTTPSessionFactory(testing: $0) }
             ?? LoopbackHTTPSessionFactory()
-        let server = try await factory.start(itemGeneration: 19, now: now,
+        let server = try await factory.startPreparingAsynchronously(itemGeneration: 19, now: now,
             logger: logger, responseFailure: responseFailure) { token in
-            let harness = try Task19Harness(
+            let harness = try await Task19Harness(
                 loopbackSession: token, audioCount: audioCount)
-            try harness.initial()
+            try await harness.initial()
             box.value = harness
             var declaration = try Task19.declaration(audioCount: audioCount)
             declaration.token = token.value

@@ -2,7 +2,7 @@ name: VPlayer
 options:
   bundleIdPrefix: com.vplayer
   deploymentTarget:
-    tvOS: "26.0"
+    tvOS: "27.0"
   createIntermediateGroups: true
   groupSortPosition: top
   developmentLanguage: zh-Hans
@@ -17,7 +17,7 @@ targets:
   VPlayerCore:
     type: framework
     platform: tvOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Sources/VPlayerCore
     settings:
@@ -30,7 +30,7 @@ targets:
   VPlayerPlayback:
     type: framework
     platform: tvOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Sources/VPlayerPlayback
         excludes:
@@ -72,7 +72,7 @@ targets:
   VPlayer:
     type: application
     platform: tvOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Sources/VPlayerApp
         excludes:
@@ -81,6 +81,7 @@ targets:
       - target: VPlayerCore
       - target: VPlayerPlayback
       - sdk: CryptoKit.framework
+      - sdk: NowPlaying.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer
@@ -93,7 +94,7 @@ targets:
   VPlayerTests:
     type: bundle.unit-test
     platform: tvOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Tests/VPlayerTests
       - path: Tests/Fixtures/playlists
@@ -123,7 +124,7 @@ targets:
   VPlayerReleaseBoundaryTests:
     type: bundle.unit-test
     platform: tvOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Tests/VPlayerReleaseBoundaryTests
     dependencies:
@@ -138,7 +139,7 @@ targets:
   VPlayerUITests:
     type: bundle.ui-testing
     platform: tvOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Tests/VPlayerUITests
         excludes:

@@ -325,15 +325,26 @@ enum AudioRendererEvent: Sendable, Equatable {
 
 enum AudioRendererEnqueueResult: Sendable, Equatable {
     case accepted
+    case acceptedWithSuggestedFlush
     case backpressured
+    case cancelled
+
+    var isAccepted: Bool {
+        self == .accepted || self == .acceptedWithSuggestedFlush
+    }
 }
 
 protocol AudioRenderer: AnyObject, Sendable {
     var identity: AudioRendererIdentity { get }
     var mediaKind: AudioRendererMediaKind { get }
+    /// False when the SDK exposes acceptance but no independent consumption signal.
+    var canObserveConsumption: Bool { get }
     var isReadyForMoreMediaData: Bool { get }
     var hasSufficientMediaDataForReliablePlaybackStart: Bool { get }
-    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void)
+    func cancelPendingEnqueue()
+    func finishedEnqueuing()
     func flush()
     // A demand opportunity only. The pipeline must correlate a post-reset
     // acceptance and backpressure edge before treating this as queue consumption.
@@ -341,6 +352,10 @@ protocol AudioRenderer: AnyObject, Sendable {
     func stopRequestingMediaData()
     func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void)
     func stopObserving()
+}
+
+extension AudioRenderer {
+    var canObserveConsumption: Bool { true }
 }
 
 protocol AudioRendererFactory: Sendable {

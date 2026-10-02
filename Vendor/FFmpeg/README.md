@@ -2,7 +2,7 @@
 
 VPlayer pins the official FFmpeg `n8.1.2` annotated tag at commit
 `38b88335f99e76ed89ff3c93f877fdefce736c13` and builds it in
-`LGPL-2.1-or-later` mode for tvOS 18.0. The generated XCFramework is not
+`LGPL-2.1-or-later` mode for tvOS 27.0. The generated XCFramework is not
 committed.
 
 Source acquisition tries the canonical `git.ffmpeg.org` repository first and
