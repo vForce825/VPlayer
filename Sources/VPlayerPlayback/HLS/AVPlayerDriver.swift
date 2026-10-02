@@ -1175,14 +1175,24 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 firstCurrentTime: first,
                 stableCurrentTime: nil)
             guard self.naturalEndAuthority?.revalidateCurrentAuthority() == true else {
+                #if DEBUG
+                PlaybackDiagnosticTracker.shared.append(
+                    "eos_first_read_authority_rejected_present_\(self.naturalEndAuthority != nil)")
+                #endif
                 self.publishNaturalEnd(.failure(.deadlineCapacityExceeded), item: observedIdentity)
                 return
             }
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("eos_first_read_authority_accepted")
+            #endif
             guard self.endpointStabilityDeadline == nil else { return }
             if let scheduler = self.deadlineScheduler {
                 guard let deadline = scheduler.schedule(after: 0.1, handler: { [weak self] in
                     self?.naturalEndDeadlineFired(identity: observationIdentity)
                 }) else {
+                    #if DEBUG
+                    PlaybackDiagnosticTracker.shared.append("eos_manual_deadline_slot_rejected")
+                    #endif
                     self.publishNaturalEnd(.failure(.deadlineCapacityExceeded), item: observedIdentity)
                     return
                 }
@@ -1190,6 +1200,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             } else {
                 guard self.naturalEndAuthority?.scheduleNaturalEnd(item: observedIdentity,
                     identity: observationIdentity, receiver: self) == true else {
+                    #if DEBUG
+                    PlaybackDiagnosticTracker.shared.append("eos_registry_deadline_rejected")
+                    #endif
                     self.publishNaturalEnd(.failure(.deadlineCapacityExceeded), item: observedIdentity)
                     return
                 }
@@ -1509,6 +1522,17 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
                     pendingEnd ? endpoint : nil, pendingEnd ? endHandler : nil)
             }
             guard let delivery else { return }
+            #if DEBUG
+            if delivery.6 != nil || delivery.1 == .paused {
+                PlaybackDiagnosticTracker.shared.append(
+                    "avrelay_batch_output_\(delivery.0.outputLifecycleEpoch.outputNonce)"
+                    + "_item_\(delivery.0.itemGeneration)"
+                    + "_activation_\(delivery.2?.activationNonce ?? 0)"
+                    + "_status_\(delivery.1?.rawValue ?? -1)"
+                    + "_access_\(delivery.4.map { String(describing: $0) } ?? "nil")"
+                    + "_endpoint_\(delivery.6 != nil)")
+            }
+            #endif
             // 先交付 conflict，使其撤销对后续 playing/EOS 发布可见。
             if let classification = delivery.4 { delivery.5?(classification, delivery.0) }
             if let status = delivery.1, let activation = delivery.2 { delivery.3?(status, delivery.0, activation) }

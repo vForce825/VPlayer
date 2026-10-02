@@ -4099,10 +4099,44 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testNativeEndpointFirstReadSurvivesCoalescedPausedRelayAndRejectsChangedSecondRead()
+        async throws {
+        try await withFinalEOSFixture { fixture in
+            try await fixture.verifyEndpointReadAcrossLaterPausedRelay(coalescedPause: true)
+        }
+    }
+
+    func testNativeCoalescedCurrentAccessFaultWinsOverEndpointAndPausedRelay() async throws {
+        try await withFinalEOSFixture { fixture in
+            try await fixture.verifyCoalescedAccessFaultBeforeEndpoint()
+        }
+    }
+
     func testNativeUnexpectedPauseWithoutEndpointNotificationStillRetires() async throws {
         try await withFinalEOSFixture { fixture in
             try await fixture.verifyUnexpectedPauseWithoutEndpointNotification()
         }
+    }
+
+    func testNativeCurrentItemAccessFaultCancelsPendingEndpointVerification() async throws {
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        try await withFinalEOSFixture { fixture in
+            try await fixture.verifyAccessFaultWhileEndpointReadIsPending()
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline
+               || PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline
+               || HLSDeliveryApplicationChargeLedger.shared.chargedBytes != applicationBaseline),
+              ContinuousClock.now < deadline {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline)
+        XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
     }
 
     func testFinalAlreadyCancelledReadyWaitCannotRetainObservationOrDeadlineSlot() async throws {
@@ -6115,6 +6149,12 @@ private final class FinalManualAVPlayerDeadlineScheduler:
 
     var activeSlotCount: Int { lock.withLock { entries.count } }
 
+    // Retain the real scheduled callback to model a delivery already copied by
+    // the timer before cancellation; do not manufacture a new deadline identity.
+    func retainNextCallback() -> (@Sendable () -> Void)? {
+        lock.withLock { entries.first?.handler }
+    }
+
     func schedule(after seconds: TimeInterval,
                   handler: @escaping @Sendable () -> Void) -> UUID? {
         _ = seconds
@@ -7777,21 +7817,36 @@ private final class Task21RealIntegrationFixture {
         inspectPreparationStorage(stage: "closed-interval")
     }
 
-    func verifyEndpointReadAcrossLaterPausedRelay() async throws {
+    func verifyEndpointReadAcrossLaterPausedRelay(coalescedPause: Bool = false) async throws {
         try await activateForFinalEOSProbe()
         guard case .armed(let activation) = backend.activationResult else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         let physical = try XCTUnwrap(player.currentItem)
+        if coalescedPause {
+            player.pause()
+            XCTAssertEqual(player.timeControlStatus, .paused)
+            // Queue the matching status in the real installed hub without
+            // yielding. The private NotificationCenter observer then adds the
+            // actual endpoint token to this same delivery. This controls relay
+            // batching, not AVFoundation's native callback arrival order.
+            driver.eventHub.receive(.paused, item: item, activation: activation)
+        }
         NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
                                         object: physical)
+        if coalescedPause {
+            XCTAssertNil(driver.naturalEndObservation,
+                         "Neither event may deliver before the shared main-queue batch")
+            XCTAssertEqual(coordinator.invalidationCount, 0)
+            XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
+        }
         try await waitForNaturalEndDeadline()
         let firstRead = try XCTUnwrap(driver.naturalEndObservation).firstCurrentTime
         XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
         XCTAssertNil(driver.naturalEndTerminalResult)
-        // The matching endpoint notification has already admitted its first
-        // direct read. Deliver paused in a separate native KVO/main-queue batch.
-        player.pause()
+        // The default case delivers paused in a later native KVO/main-queue
+        // batch; the coalesced case must have admitted the same bounded read.
+        if !coalescedPause { player.pause() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while coordinator.lastPublishedTimeControlStatus != .paused,
               !hasRegisteredSuspend, ContinuousClock.now < deadline {
@@ -7838,6 +7893,120 @@ private final class Task21RealIntegrationFixture {
         XCTAssertEqual(backendRetireCount, 1)
         XCTAssertNil(driver.naturalEndObservation)
         XCTAssertNil(driver.naturalEndTerminalResult)
+    }
+
+    func verifyAccessFaultWhileEndpointReadIsPending() async throws {
+        try await activateForFinalEOSProbe()
+        guard case .armed(let activation) = backend.activationResult else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        let physical = try XCTUnwrap(player.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
+                                        object: physical)
+        try await waitForNaturalEndDeadline()
+        player.pause()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while coordinator.lastPublishedTimeControlStatus != .paused,
+              !hasRegisteredSuspend, ContinuousClock.now < deadline {
+            await Self.awaitMainQueueTurn()
+        }
+        XCTAssertEqual(coordinator.lastPublishedTimeControlStatus, .paused)
+        XCTAssertFalse(hasRegisteredSuspend)
+        XCTAssertTrue(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
+        let lateRead = try XCTUnwrap(deadlineScheduler.retainNextCallback())
+        var malformed = try XCTUnwrap(URLComponents(url: itemURL,
+                                                    resolvingAgainstBaseURL: false))
+        malformed.percentEncodedPath += "/%2e%2e/media.m4s"
+        let uri = try XCTUnwrap(malformed.url)
+        XCTAssertEqual(evidenceSource.classifyAccessLogURI(uri, itemURL: itemURL,
+            item: item, publicationSequence: try XCTUnwrap(prepared).identity.publicationSequence,
+            selected: coordinator.selectedRenditions.first), .invalidLocalResource)
+        coordinator.observeAccessLogURI(uri, item: Task21Fixtures.staleGenerationItem(from: item))
+        XCTAssertTrue(driver.hasPendingNaturalEndVerification(item: item, activation: activation),
+                      "A stale item's access fault cannot cancel the current endpoint read")
+        coordinator.observeAccessLogURI(uri, item: item)
+        XCTAssertEqual(coordinator.state.phase, .stopping)
+        XCTAssertEqual(coordinator.invalidationCount, 1)
+        XCTAssertFalse(coordinator.requiresReplacementRetirement(item.outputLifecycleEpoch))
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(driver.fixedTimerCount, 0)
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        XCTAssertFalse(deadlineScheduler.fireNext())
+        lateRead()
+        await Self.awaitMainQueueTurn()
+        XCTAssertNil(driver.naturalEndTerminalResult,
+                     "The original second-read callback cannot publish EOS after an access fault")
+        coordinator.observeAccessLogURI(uri, item: item)
+        XCTAssertEqual(coordinator.invalidationCount, 1)
+        do {
+            _ = try await coordinator.prepareCurrentItem()
+            XCTFail("The access fault must remain the current item's first failure")
+        } catch {
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed)
+        }
+        // This fixture's test backend has no runtime failure relay. The separate
+        // production-backend URI tests cover its first-error routing; here join
+        // this same fixture's existing terminal owner after native cancellation.
+        try await stopAndRetireRegistryOutput()
+        XCTAssertEqual(backendSuspendCount, 1)
+        XCTAssertEqual(backendRetireCount, 1)
+        XCTAssertNil(graph.registry.outputResourceContextSnapshot())
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        lateRead()
+        NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
+                                        object: physical)
+        await Self.awaitMainQueueTurn()
+        XCTAssertNil(driver.naturalEndTerminalResult)
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
+    }
+
+    func verifyCoalescedAccessFaultBeforeEndpoint() async throws {
+        try await activateForFinalEOSProbe()
+        guard case .armed(let activation) = backend.activationResult else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        let physical = try XCTUnwrap(player.currentItem)
+        var malformed = try XCTUnwrap(URLComponents(url: itemURL,
+                                                    resolvingAgainstBaseURL: false))
+        malformed.percentEncodedPath += "/%2e%2e/media.m4s"
+        let uri = try XCTUnwrap(malformed.url)
+        XCTAssertEqual(driver.eventHub.classify(uri, item: item), .invalidLocalResource)
+        // All three events enter the original installed hub in one actor turn.
+        driver.eventHub.receive(uri, item: item)
+        player.pause()
+        driver.eventHub.receive(.paused, item: item, activation: activation)
+        NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
+                                        object: physical)
+        XCTAssertEqual(driver.eventHub.pendingAccessFailure(item: item), .itemFailed)
+        XCTAssertEqual(coordinator.invalidationCount, 0)
+        XCTAssertNil(driver.naturalEndObservation)
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
+        await Self.awaitMainQueueTurn()
+        XCTAssertEqual(coordinator.state.phase, .stopping)
+        XCTAssertEqual(coordinator.invalidationCount, 1)
+        XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
+        XCTAssertNil(driver.naturalEndObservation?.stableCurrentTime)
+        if case .success = driver.naturalEndTerminalResult {
+            XCTFail("A coalesced endpoint cannot bless playback after the current access fault")
+        }
+        do {
+            _ = try await coordinator.prepareCurrentItem()
+            XCTFail("The current access fault must remain authoritative after both later relays")
+        } catch {
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed)
+        }
+        XCTAssertFalse(coordinator.requiresReplacementRetirement(item.outputLifecycleEpoch))
+        try await stopAndRetireRegistryOutput()
+        XCTAssertEqual(backendSuspendCount, 1)
+        XCTAssertEqual(backendRetireCount, 1)
+        XCTAssertNil(graph.registry.outputResourceContextSnapshot())
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
     }
 
     private func inspectPreparationStorage(stage: String) {
