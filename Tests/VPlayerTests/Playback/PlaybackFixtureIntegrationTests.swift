@@ -240,12 +240,12 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testRawHTTPHLSBecomesReadyWhilePausedAndDisconnected() async throws {
+    func testRawHTTPHLSDisconnectedPreparationBecomesReadyAfterReconnect() async throws {
         try await assertRawHTTPHLSReadiness(disconnected: true)
     }
 
     @MainActor
-    func testRawHTTPHLSPrerollAndAudioConnectionTransitionsRemainPaused() async throws {
+    func testRawHTTPHLSReseekAfterReconnectRestoresExactPausedTarget() async throws {
         let baseURL = try fixtureBaseURL()
         guard baseURL.scheme == "http", baseURL.host == "127.0.0.1",
               baseURL.port != nil, baseURL.user == nil, baseURL.password == nil else {
@@ -316,22 +316,54 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
             let preparedTime = player.currentTime()
             XCTAssertEqual(CMTimeCompare(preparedTime, target), 0)
+            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
 
             await changeRawNativeAudioConnection(true, player: player,
                 stage: "lifecycle.disconnect_prepared", probe: probe)
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
             XCTAssertTrue(player.disconnectedFromSystemAudio)
-            // Record the immediate result, but continue to reconnect even if a
-            // disconnect invalidated readiness or moved the prepared playhead.
+            // Run37021632901 retained readiness but changed physical time by
+            // microseconds. Preserve the owned target and inspect native time;
+            // do not manufacture equality or introduce an epsilon.
             XCTAssertEqual(item.status, .readyToPlay)
-            XCTAssertEqual(CMTimeCompare(player.currentTime(), preparedTime), 0)
+            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
 
             await changeRawNativeAudioConnection(false, player: player,
                 stage: "lifecycle.reconnect_prepared", probe: probe)
             XCTAssertFalse(player.disconnectedFromSystemAudio)
             try await requireRawNativeReady(player, item: item, stage: "lifecycle.reconnected_ready", probe: probe)
             try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
-            XCTAssertEqual(CMTimeCompare(player.currentTime(), preparedTime), 0)
+            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+
+            // Only a new physical seek may re-establish the original exact
+            // target after a connection change. This is a raw diagnostic, not
+            // an invented production pause-cursor or coverage authority.
+            probe.stage = "lifecycle.reseek"
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).begin "
+                + "target=\(NativeHTTPReadinessProgressProbe.timeFact(target))")
+            let reseekCompleted = await withCheckedContinuation { continuation in
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) {
+                    continuation.resume(returning: $0)
+                }
+            }
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).callback succeeded=\(reseekCompleted)")
+            XCTAssertTrue(reseekCompleted)
+            guard reseekCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
+            guard player.status == .readyToPlay, item.status == .readyToPlay, player.rate == 0 else {
+                throw FixtureIntegrationFailure.nativeReadinessFailed
+            }
+            probe.stage = "lifecycle.repreroll"
+            let reprerollCompleted = await withCheckedContinuation { continuation in
+                player.preroll(atRate: 1) { continuation.resume(returning: $0) }
+            }
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).callback succeeded=\(reprerollCompleted)")
+            XCTAssertTrue(reprerollCompleted)
+            guard reprerollCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
+            try assertRawDiagnosticCoverage(player, item: item, stage: probe.stage)
         } catch {
             operationFailure = error
         }
@@ -408,11 +440,35 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
                                                 stage: String, probe: NativeHTTPReadinessProgressProbe) async {
         probe.stage = stage
         print("RAW_HTTP_LIFECYCLE stage=\(stage).begin requestedDisconnected=\(disconnected)")
-        await withCheckedContinuation { continuation in
-            player.setDisconnectedFromSystemAudio(disconnected) { continuation.resume() }
+        let callbackTime = await withCheckedContinuation { continuation in
+            player.setDisconnectedFromSystemAudio(disconnected) {
+                continuation.resume(returning: player.currentTime())
+            }
         }
         print("RAW_HTTP_LIFECYCLE stage=\(stage).callback "
+            + "callbackTime=\(NativeHTTPReadinessProgressProbe.timeFact(callbackTime)) "
             + "\(NativeHTTPReadinessProgressProbe.snapshot(player))")
+    }
+
+    @MainActor
+    private func assertRawDiagnosticCoverage(_ player: AVPlayer, item: AVPlayerItem,
+                                             stage: String) throws {
+        let observed = player.currentTime()
+        XCTAssertTrue(observed.isNumeric)
+        XCTAssertEqual(observed.epoch, 0)
+        guard observed.isNumeric, observed.timescale > 0, observed.epoch == 0 else {
+            throw FixtureIntegrationFailure.nativeReadinessFailed
+        }
+        // The independent fixture is only two seconds long. This exact one-
+        // second observation window cannot prove production's three-second
+        // startup lead or authenticated served/decode coverage.
+        let requested = CMTimeRange(start: observed, duration: CMTime(value: 1, timescale: 1))
+        let coverage = VPReadLoadedRangeCoverage(item, requested)
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).coverage "
+            + "observed=\(NativeHTTPReadinessProgressProbe.timeFact(observed)) "
+            + "diagnosticDuration=1/1 code=\(coverage.code)")
+        XCTAssertEqual(coverage.code, 0, "The complete observed forward window must remain loaded")
+        guard coverage.code == 0 else { throw FixtureIntegrationFailure.nativeLoadedCoverageFailed }
     }
 
     @MainActor
@@ -438,6 +494,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             XCTAssertNil(player.currentItem)
         }
         var disconnectCompletionCount = 0
+        var reconnectCompletionCount = 0
         if disconnected {
             probe.stage = "\(label).disconnect"
             print("RAW_HTTP_READINESS stage=\(probe.stage).begin")
@@ -464,9 +521,26 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         }
         defer { observation.invalidate() }
         player.replaceCurrentItem(with: item)
+        if disconnected {
+            // The original paired run37017106205 showed unknown status after
+            // fifteen seconds. Keep a bounded observation of that simulator
+            // behavior, then prove liveness through an actual reconnect.
+            probe.stage = "disconnected.pending_before_reconnect"
+            try await Task.sleep(for: .seconds(1))
+            print("RAW_HTTP_READINESS stage=\(probe.stage) "
+                + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(facts.summary)")
+            XCTAssertTrue(player.disconnectedFromSystemAudio)
+            XCTAssertEqual(item.status, .unknown)
+            XCTAssertEqual(facts.firstTerminalStatus, -1)
+            XCTAssertEqual(player.rate, 0)
+            await changeRawNativeAudioConnection(false, player: player,
+                stage: "disconnected.reconnect", probe: probe)
+            reconnectCompletionCount = 1
+        }
         probe.stage = "\(label).ready"
         print("RAW_HTTP_READINESS stage=\(probe.stage).begin "
             + "disconnectRequests=\(disconnected ? 1 : 0) disconnectCompletions=\(disconnectCompletionCount) "
+            + "reconnectCompletions=\(reconnectCompletionCount) "
             + "preferredBuffer=\(item.preferredForwardBufferDuration) "
             + "pausedNetwork=\(item.canUseNetworkResourcesForLiveStreamingWhilePaused) "
             + "automaticallyWaits=\(player.automaticallyWaitsToMinimizeStalling)")
@@ -475,7 +549,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         print("RAW_HTTP_READINESS stage=\(probe.stage).observed "
             + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(facts.summary)")
         XCTAssertEqual(disconnectCompletionCount, disconnected ? 1 : 0)
-        XCTAssertEqual(player.disconnectedFromSystemAudio, disconnected)
+        XCTAssertEqual(reconnectCompletionCount, disconnected ? 1 : 0)
+        XCTAssertFalse(player.disconnectedFromSystemAudio)
         XCTAssertTrue(player.currentItem === item)
         XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.readyToPlay.rawValue)
         XCTAssertEqual(item.status, .readyToPlay)
@@ -954,6 +1029,7 @@ private enum FixtureIntegrationFailure: Error {
     case invalidAudioContinuity
     case nativeReadinessFailed
     case nativeCallbackFailed
+    case nativeLoadedCoverageFailed
     case unexpectedNativeAudioLifecycle
 }
 
@@ -1031,13 +1107,30 @@ private final class NativeHTTPReadinessProgressProbe {
     static func snapshot(_ player: AVPlayer) -> String {
         let item = player.currentItem
         let time = player.currentTime()
+        let ranges = item?.loadedTimeRanges ?? []
+        let first = ranges.count <= 128 ? ranges.first?.timeRangeValue : nil
+        let last = ranges.count <= 128 ? ranges.last?.timeRangeValue : nil
+        let timebase = item?.timebase
+        // These are ordered native reads, not an atomic clock snapshot. The
+        // connection helper separately captures time inside the SDK callback.
+        let timebaseTime = timebase.map { timeFact(CMTimebaseGetTime($0)) } ?? "none"
+        let timebaseRate = timebase.map { String(CMTimebaseGetRate($0)) } ?? "none"
+        let effectiveRate = timebase.map { String(CMTimebaseGetEffectiveRate($0)) } ?? "none"
         return "playerStatus=\(player.status.rawValue) playerError=\(errorFact(player.error as NSError?)) "
             + "itemStatus=\(item?.status.rawValue ?? -1) itemError=\(errorFact(item?.error as NSError?)) "
             + "assetPlayableState=\(item.map { playableFact($0.asset) } ?? "no_item") "
-            + "rangeCount=\(item?.loadedTimeRanges.count ?? -1) "
-            + "currentTime=\(time.value)/\(time.timescale):flags\(time.flags.rawValue) "
+            + "rangeCount=\(ranges.count) "
+            + "firstStart=\(timeFact(first?.start)) firstDuration=\(timeFact(first?.duration)) "
+            + "lastStart=\(timeFact(last?.start)) lastDuration=\(timeFact(last?.duration)) "
+            + "currentTime=\(timeFact(time)) timebaseTime=\(timebaseTime) "
+            + "timebaseRate=\(timebaseRate) effectiveRate=\(effectiveRate) "
             + "rate=\(player.rate) timeControlStatus=\(player.timeControlStatus.rawValue) "
             + "disconnected=\(player.disconnectedFromSystemAudio)"
+    }
+
+    static func timeFact(_ time: CMTime?) -> String {
+        guard let time else { return "none" }
+        return "\(time.value)/\(time.timescale):epoch\(time.epoch):flags\(time.flags.rawValue)"
     }
 
     private static func playableFact(_ asset: AVAsset) -> String {
