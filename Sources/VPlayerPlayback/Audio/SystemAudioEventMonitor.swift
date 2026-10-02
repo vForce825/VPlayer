@@ -4,6 +4,7 @@
 
 import AVFAudio
 import Foundation
+import Synchronization
 
 /// Fixed Swift projection; framework context objects never escape their main-actor callback.
 enum PlaybackAudioSessionLifecycleEvent: Sendable, Equatable {
@@ -37,7 +38,6 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
     }
     private let safetyIngress: SynchronousSafetyIngressCell
     private let notificationCenter: NotificationCenter
-    private let lock = NSLock()
     private var interruptionObserver: NSObjectProtocol?
     private var resetObserver: NSObjectProtocol?
     private var activeObserver: NotificationCenter.ObservationToken?
@@ -49,12 +49,14 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
         var recommendation: Bool?
         var activationAccepted = false
     }
-    private var typedInterruption: TypedInterruption?
     private typealias Delivery = (PlaybackAudioSessionEventEnvelope,
         (@Sendable (PlaybackAudioSessionEventEnvelope) -> Void)?)
     // 生产转发与可替换测试observer分离；Registry已在owned账按同一weak target计费。
     private weak var productionRegistry: ControlTaskRegistry?
     private var eventHandler: (@Sendable (PlaybackAudioSessionEventEnvelope) -> Void)?
+    private var typedInterruption: TypedInterruption?
+    // Inline after the episode's byte-sized flags; no independently allocated lock.
+    private let lock = Mutex(())
     
     init(
         safetyIngress: SynchronousSafetyIngressCell,
@@ -70,11 +72,11 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
     deinit { stop() }
     
     func setEventHandler(_ handler: @escaping @Sendable (PlaybackAudioSessionEventEnvelope) -> Void) {
-        lock.withLock { self.eventHandler = handler }
+        lock.withLock { _ in self.eventHandler = handler }
     }
 
     func bindProductionRegistry(_ registry: ControlTaskRegistry) {
-        lock.withLock {
+        lock.withLock { _ in
             precondition(productionRegistry == nil || productionRegistry === registry,
                 "SystemAudioEventMonitor不能改绑另一Registry")
             productionRegistry = registry
@@ -90,25 +92,21 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
             deliver(envelope)
             return envelope
         }
-        lock.lock()
-        var effectiveEvent = event
-        let current = safetyIngress.snapshot
-        if case .interruptionEnded(let shouldResume) = event {
-            let episode = typedInterruption.flatMap { $0.epoch == AudioSessionLifecycleEpoch(current) ? $0 : nil }
-            if episode?.activationAccepted == true {
-                lock.unlock()
-                return nil
+        let delivery = lock.withLock { _ -> Delivery? in
+            var effectiveEvent = event
+            let current = safetyIngress.snapshot
+            if case .interruptionEnded(let shouldResume) = event {
+                let episode = typedInterruption.flatMap { $0.epoch == AudioSessionLifecycleEpoch(current) ? $0 : nil }
+                if episode?.activationAccepted == true { return nil }
+                let permitted = shouldResume && episode?.recommendation != false && !current.mediaServicesResumeRequired
+                effectiveEvent = .interruptionEnded(shouldResume: permitted)
+                // Only an exactly scoped typed recommendation deduplicates its legacy counterpart.
+                if episode?.recommendation != nil, current.interruptionState == .ended(shouldResume: permitted) {
+                    return nil
+                }
             }
-            let permitted = shouldResume && episode?.recommendation != false && !current.mediaServicesResumeRequired
-            effectiveEvent = .interruptionEnded(shouldResume: permitted)
-            // Only an exactly scoped typed recommendation deduplicates its legacy counterpart.
-            if episode?.recommendation != nil, current.interruptionState == .ended(shouldResume: permitted) {
-                lock.unlock()
-                return nil
-            }
+            return emitSystemLocked(effectiveEvent, beforeProductionDelivery: beforeProductionDelivery)
         }
-        let delivery = emitSystemLocked(effectiveEvent, beforeProductionDelivery: beforeProductionDelivery)
-        lock.unlock()
         if let delivery { delivery.1?(delivery.0) }
         return delivery?.0
     }
@@ -118,53 +116,53 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
     @discardableResult
     func emitLifecycle(_ event: PlaybackAudioSessionLifecycleEvent,
         observationGeneration: UInt64? = nil) -> PlaybackAudioSessionEventEnvelope? {
-        lock.lock()
-        if let observationGeneration,
-           observationGeneration != observerGeneration || activeObserver == nil {
-            lock.unlock()
-            return nil
+        let delivery = lock.withLock { _ -> Delivery? in
+            if let observationGeneration,
+               observationGeneration != observerGeneration || activeObserver == nil {
+                return nil
+            }
+            let current = safetyIngress.snapshot
+            let epoch = AudioSessionLifecycleEpoch(current)
+            var delivery: Delivery?
+            switch event {
+            case .becameActive:
+                // A notification is not the SDK call's Bool/completion. Only close an old
+                // advisory episode if Registry already holds the matching accepted receipt.
+                if !current.interruptionVeto, !current.userPaused, !current.mediaServicesResumeRequired,
+                   productionRegistry?.hasAcceptedAudioSessionActivation(matching: epoch) == true {
+                    typedInterruption?.activationAccepted = true
+                }
+            case .becameInactive(systemInitiated: false):
+                // App deactivation is settled exclusively by its original async call permit.
+                break
+            case .becameInactive(systemInitiated: true):
+                if current.interruptionState == .began {
+                    if typedInterruption?.epoch != epoch {
+                        typedInterruption = .init(epoch: epoch, recommendation: nil)
+                    }
+                } else {
+                    delivery = emitSystemLocked(.interruptionBegan, matching: epoch)
+                    if let receipt = delivery?.0.systemReceipt {
+                        typedInterruption = .init(epoch: .init(interruption: receipt.interruptionEpoch,
+                            mediaServices: receipt.mediaServicesEpoch), recommendation: nil)
+                    }
+                }
+            case .resumptionRecommended(let shouldResume):
+                if var episode = typedInterruption, episode.epoch == epoch, !episode.activationAccepted {
+                    // A positive hint cannot override a prior negative decision or reset/user pause.
+                    let permitted = shouldResume && episode.recommendation != false &&
+                        current.interruptionState != .ended(shouldResume: false) &&
+                        !current.mediaServicesResumeRequired && !current.userPaused
+                    episode.recommendation = permitted
+                    typedInterruption = episode
+                    if current.interruptionState == .began ||
+                        (current.interruptionState == .ended(shouldResume: true) && !permitted) {
+                        delivery = emitSystemLocked(.interruptionEnded(shouldResume: permitted), matching: epoch)
+                    }
+                }
+            }
+            return delivery
         }
-        let current = safetyIngress.snapshot
-        let epoch = AudioSessionLifecycleEpoch(current)
-        var delivery: Delivery?
-        switch event {
-        case .becameActive:
-            // A notification is not the SDK call's Bool/completion. Only close an old
-            // advisory episode if Registry already holds the matching accepted receipt.
-            if !current.interruptionVeto, !current.userPaused, !current.mediaServicesResumeRequired,
-               productionRegistry?.hasAcceptedAudioSessionActivation(matching: epoch) == true {
-                typedInterruption?.activationAccepted = true
-            }
-        case .becameInactive(systemInitiated: false):
-            // App deactivation is settled exclusively by its original async call permit.
-            break
-        case .becameInactive(systemInitiated: true):
-            if current.interruptionState == .began {
-                if typedInterruption?.epoch != epoch {
-                    typedInterruption = .init(epoch: epoch, recommendation: nil)
-                }
-            } else {
-                delivery = emitSystemLocked(.interruptionBegan, matching: epoch)
-                if let receipt = delivery?.0.systemReceipt {
-                    typedInterruption = .init(epoch: .init(interruption: receipt.interruptionEpoch,
-                        mediaServices: receipt.mediaServicesEpoch), recommendation: nil)
-                }
-            }
-        case .resumptionRecommended(let shouldResume):
-            if var episode = typedInterruption, episode.epoch == epoch, !episode.activationAccepted {
-                // A positive hint cannot override a prior negative decision or reset/user pause.
-                let permitted = shouldResume && episode.recommendation != false &&
-                    current.interruptionState != .ended(shouldResume: false) &&
-                    !current.mediaServicesResumeRequired && !current.userPaused
-                episode.recommendation = permitted
-                typedInterruption = episode
-                if current.interruptionState == .began ||
-                    (current.interruptionState == .ended(shouldResume: true) && !permitted) {
-                    delivery = emitSystemLocked(.interruptionEnded(shouldResume: permitted), matching: epoch)
-                }
-            }
-        }
-        lock.unlock()
         if let delivery { delivery.1?(delivery.0) }
         return delivery?.0
     }
@@ -205,7 +203,7 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
     }
 
     public func start() {
-        lock.withLock {
+        lock.withLock { _ in
             guard interruptionObserver == nil, observerGeneration < .max else { return }
             observerGeneration += 1
             let generation = observerGeneration
@@ -250,7 +248,7 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
     }
     
     public func stop() {
-        lock.withLock {
+        lock.withLock { _ in
             if observerGeneration < .max { observerGeneration += 1 }
             if let activeObserver { notificationCenter.removeObserver(activeObserver) }
             if let inactiveObserver { notificationCenter.removeObserver(inactiveObserver) }
@@ -272,7 +270,7 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
 
     func emitReactivationCompletion(_ receipt: AudioSessionReactivationCompletionReceipt,
         event: PlaybackAudioSessionEvent = .explicitResumeSucceeded) {
-        lock.withLock {
+        lock.withLock { _ in
             let epoch = AudioSessionLifecycleEpoch(interruption: receipt.interruptionEpoch,
                 mediaServices: receipt.mediaServicesEpoch)
             if typedInterruption?.epoch == epoch,
@@ -286,7 +284,7 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
     }
 
     private func deliver(_ envelope: PlaybackAudioSessionEventEnvelope) {
-        let targets = lock.withLock { (productionRegistry, eventHandler) }
+        let targets = lock.withLock { _ in (productionRegistry, eventHandler) }
         targets.0?.forwardAudioSessionEvent(envelope)
         targets.1?(envelope)
     }

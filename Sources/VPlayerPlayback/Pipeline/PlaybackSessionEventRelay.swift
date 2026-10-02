@@ -5,6 +5,7 @@
 import Darwin
 import Foundation
 import ObjectiveC
+import Synchronization
 
 struct PlaybackRunIdentity: Equatable, Sendable {
     let sessionID: UInt64
@@ -15,7 +16,7 @@ struct PlaybackRunIdentity: Equatable, Sendable {
 final class PlaybackSessionEventRelay: @unchecked Sendable {
     typealias Receiver = @Sendable (PlaybackRunIdentity, PlaybackPipelineEvent) async -> Void
     static let maximumCapacity = 32
-    /// reservation只冻结逻辑请求数；allocator公开capacity可随Swift runtime变化。
+    /// Exactly 32 initialized elements; allocator rounding remains part of the reservation.
     static let fixedBackingCapacity = maximumCapacity
 
     struct SystemAndPipelineRelayAllocationReservation {
@@ -49,13 +50,14 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
         func object(_ type: AnyClass) -> Int { malloc_good_size(class_getInstanceSize(type)) }
         return .init(
             monitorObject: object(SystemAudioEventMonitor.self),
-            monitorLock: object(NSLock.self),
+            // Both synchronization primitives are inline in their charged owner objects.
+            monitorLock: 0,
             // 私有token当前目标实测32B/个；跨tvOS runtime按64B/个保守，framework其余opaque内部仍是盲区。
             observerTokens: 5 * 64,
             observerCaptures: 5 * (32 + 48),
             pipelineRelayObject: object(PlaybackSessionEventRelay.self),
-            pipelineRelayLock: object(NSLock.self),
-            pipelineBacking: malloc_good_size(32 + fixedBackingCapacity * MemoryLayout<PlaybackPipelineEvent>.stride),
+            pipelineRelayLock: 0,
+            pipelineBacking: malloc_good_size(fixedBackingCapacity * MemoryLayout<PlaybackPipelineEvent>.stride),
             receiverCapture: 32 + 48,
             drainRunnerObject: object(OwnedPlaybackEventDrain.self),
             // Swift Task无稳定公开allocation identity；原/新drain各保守512B。
@@ -66,27 +68,39 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
 
     private let identity: PlaybackRunIdentity
     private let receiver: Receiver
-    private let lock = NSLock()
-    // 固定32槽背板，出队后用无载荷值释放旧引用；从不append或扩容。
-    private var pending: [PlaybackPipelineEvent] = Array(repeating: .stopped, count: maximumCapacity)
+    // One original typed allocation owns exactly 32 initialized slots. It has no
+    // Array header, extra payload box, resizing operation, or copied backing.
+    private let pending: UnsafeMutablePointer<PlaybackPipelineEvent>
+    // Executor由Registry持有；relay只能弱借用，避免Authority→relay→Cell→Authority环。
+    private weak var ownedExecutor: PlaybackControlExecutor?
     private var pendingIndex = 0
     private var pendingCount = 0
     private var isDraining = false
     private var isActive = true
     private var overflowed = false
-    // Executor由Registry持有；relay只能弱借用，避免Authority→relay→Cell→Authority环。
-    private weak var ownedExecutor: PlaybackControlExecutor?
     private var ownedDrainRequested = false
+    // Keep the inline lock after byte-sized flags, avoiding pointer-alignment padding.
+    private let lock = Mutex(())
 
     init(identity: PlaybackRunIdentity, receiver: @escaping Receiver) {
         self.identity = identity
         self.receiver = receiver
-        precondition(pending.count == Self.maximumCapacity, "pipeline relay固定背板逻辑槽数不一致")
+        let buffer = UnsafeMutablePointer<PlaybackPipelineEvent>.allocate(capacity: Self.maximumCapacity)
+        buffer.initialize(repeating: .stopped, count: Self.maximumCapacity)
+        pending = buffer
+        precondition(malloc_size(UnsafeRawPointer(pending)) >=
+            Self.maximumCapacity * MemoryLayout<PlaybackPipelineEvent>.stride,
+            "pipeline relay固定背板逻辑槽数不一致")
         PlaybackRuntimeAllocationReservations.validateSystemAndPipelineAndGlobalCaps()
     }
 
+    deinit {
+        pending.deinitialize(count: Self.maximumCapacity)
+        pending.deallocate()
+    }
+
     func bindOwnedExecutor(_ executor: PlaybackControlExecutor) -> Bool {
-        lock.withLock {
+        lock.withLock { _ in
             guard ownedExecutor == nil, !isDraining, pendingCount == 0 else { return false }
             ownedExecutor = executor
             return true
@@ -94,7 +108,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     }
 
     func claimOwnedDrainRequest() -> Bool {
-        lock.withLock {
+        lock.withLock { _ in
             guard ownedDrainRequested else { return false }
             ownedDrainRequested = false
             return true
@@ -102,12 +116,12 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     }
 
     func send(_ event: PlaybackPipelineEvent) {
-        let executor = lock.withLock { () -> PlaybackControlExecutor? in
+        let executor = lock.withLock { _ -> PlaybackControlExecutor? in
             guard let ownedExecutor, isActive, !overflowed else { return nil }
             if pendingCount >= Self.maximumCapacity - (isDraining ? 1 : 0) {
                 // 不可折叠溢出成为一次终态；用原槽保存，不另排队或继续接纳。
                 overflowed = true
-                for index in pending.indices { pending[index] = .stopped }
+                for index in 0..<Self.maximumCapacity { pending[index] = .stopped }
                 pendingIndex = 0
                 pending[0] = .failed(.controlEventCapacityExceeded)
                 pendingCount = 1
@@ -124,10 +138,10 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     }
 
     func deactivate() {
-        lock.withLock {
+        lock.withLock { _ in
             guard isActive else { return }
             isActive = false
-            for index in pending.indices { pending[index] = .stopped }
+            for index in 0..<Self.maximumCapacity { pending[index] = .stopped }
             pendingIndex = 0
             pendingCount = 0
         }
@@ -141,9 +155,9 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     }
 
     private func nextEvent() -> PlaybackPipelineEvent? {
-        lock.withLock {
+        lock.withLock { _ in
             guard isActive else {
-                for index in pending.indices { pending[index] = .stopped }
+                for index in 0..<Self.maximumCapacity { pending[index] = .stopped }
                 pendingIndex = 0
                 pendingCount = 0
                 isDraining = false
@@ -441,7 +455,9 @@ enum PlaybackRuntimeAllocationReservations {
             coreErrorStride=\(MemoryLayout<PlaybackCoreError>.stride), \
             mediaStride=\(MemoryLayout<PlaybackMediaInformation?>.stride), \
             generationStride=\(MemoryLayout<MediaGeneration?>.stride), \
-            tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride)
+            tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride), \
+            typedRequestClass=\(malloc_good_size(32 * MemoryLayout<PlaybackPipelineEvent>.stride)), \
+            arrayRequestClass=\(malloc_good_size(32 + 32 * MemoryLayout<PlaybackPipelineEvent>.stride))
             """)
         validateGlobalCap()
     }
