@@ -18,6 +18,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     static let maximumCapacity = 32
     /// Exactly 32 initialized elements; allocator rounding remains part of the reservation.
     static let fixedBackingCapacity = maximumCapacity
+    static let backingSegmentCapacity = maximumCapacity / 2
 
     struct SystemAndPipelineRelayAllocationReservation {
         let monitorObject: Int
@@ -57,7 +58,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
             observerCaptures: 5 * (32 + 48),
             pipelineRelayObject: object(PlaybackSessionEventRelay.self),
             pipelineRelayLock: 0,
-            pipelineBacking: malloc_good_size(fixedBackingCapacity * MemoryLayout<PlaybackPipelineEvent>.stride),
+            pipelineBacking: 2 * malloc_good_size(backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride),
             receiverCapture: 32 + 48,
             drainRunnerObject: object(OwnedPlaybackEventDrain.self),
             // Swift Task无稳定公开allocation identity；原/新drain各保守512B。
@@ -68,9 +69,11 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
 
     private let identity: PlaybackRunIdentity
     private let receiver: Receiver
-    // One original typed allocation owns exactly 32 initialized slots. It has no
-    // Array header, extra payload box, resizing operation, or copied backing.
+    // Two original 16-slot typed allocations avoid the allocator's 2048-byte
+    // class for one 1792-byte request. Together they own the same 32 event slots.
+    // There is no Array header, payload box, resizing, or copied backing.
     private let pending: UnsafeMutablePointer<PlaybackPipelineEvent>
+    private let pendingTail: UnsafeMutablePointer<PlaybackPipelineEvent>
     // Executor由Registry持有；relay只能弱借用，避免Authority→relay→Cell→Authority环。
     private weak var ownedExecutor: PlaybackControlExecutor?
     private var pendingIndex = 0
@@ -85,18 +88,33 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     init(identity: PlaybackRunIdentity, receiver: @escaping Receiver) {
         self.identity = identity
         self.receiver = receiver
-        let buffer = UnsafeMutablePointer<PlaybackPipelineEvent>.allocate(capacity: Self.maximumCapacity)
-        buffer.initialize(repeating: .stopped, count: Self.maximumCapacity)
-        pending = buffer
-        precondition(malloc_size(UnsafeRawPointer(pending)) >=
-            Self.maximumCapacity * MemoryLayout<PlaybackPipelineEvent>.stride,
+        let head = UnsafeMutablePointer<PlaybackPipelineEvent>.allocate(capacity: Self.backingSegmentCapacity)
+        let tail = UnsafeMutablePointer<PlaybackPipelineEvent>.allocate(capacity: Self.backingSegmentCapacity)
+        head.initialize(repeating: .stopped, count: Self.backingSegmentCapacity)
+        tail.initialize(repeating: .stopped, count: Self.backingSegmentCapacity)
+        pending = head
+        pendingTail = tail
+        let segmentBytes = Self.backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride
+        precondition(2 * Self.backingSegmentCapacity == Self.maximumCapacity &&
+            malloc_size(UnsafeRawPointer(pending)) >= segmentBytes &&
+            malloc_size(UnsafeRawPointer(pendingTail)) >= segmentBytes,
             "pipeline relay固定背板逻辑槽数不一致")
         PlaybackRuntimeAllocationReservations.validateSystemAndPipelineAndGlobalCaps()
     }
 
     deinit {
-        pending.deinitialize(count: Self.maximumCapacity)
+        pending.deinitialize(count: Self.backingSegmentCapacity)
+        pendingTail.deinitialize(count: Self.backingSegmentCapacity)
         pending.deallocate()
+        pendingTail.deallocate()
+    }
+
+    /// Only called while the inline relay lock is held. The original logical
+    /// ring index and overflow rule remain independent of physical segmentation.
+    private func pendingSlot(at index: Int) -> UnsafeMutablePointer<PlaybackPipelineEvent> {
+        precondition((0..<Self.maximumCapacity).contains(index))
+        if index < Self.backingSegmentCapacity { return pending.advanced(by: index) }
+        return pendingTail.advanced(by: index - Self.backingSegmentCapacity)
     }
 
     func bindOwnedExecutor(_ executor: PlaybackControlExecutor) -> Bool {
@@ -121,13 +139,13 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
             if pendingCount >= Self.maximumCapacity - (isDraining ? 1 : 0) {
                 // 不可折叠溢出成为一次终态；用原槽保存，不另排队或继续接纳。
                 overflowed = true
-                for index in 0..<Self.maximumCapacity { pending[index] = .stopped }
+                for index in 0..<Self.maximumCapacity { pendingSlot(at: index).pointee = .stopped }
                 pendingIndex = 0
-                pending[0] = .failed(.controlEventCapacityExceeded)
+                pendingSlot(at: 0).pointee = .failed(.controlEventCapacityExceeded)
                 pendingCount = 1
                 return nil
             }
-            pending[(pendingIndex + pendingCount) % Self.maximumCapacity] = event
+            pendingSlot(at: (pendingIndex + pendingCount) % Self.maximumCapacity).pointee = event
             pendingCount += 1
             guard !isDraining else { return nil }
             isDraining = true
@@ -141,7 +159,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
         lock.withLock { _ in
             guard isActive else { return }
             isActive = false
-            for index in 0..<Self.maximumCapacity { pending[index] = .stopped }
+            for index in 0..<Self.maximumCapacity { pendingSlot(at: index).pointee = .stopped }
             pendingIndex = 0
             pendingCount = 0
         }
@@ -157,7 +175,7 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     private func nextEvent() -> PlaybackPipelineEvent? {
         lock.withLock { _ in
             guard isActive else {
-                for index in 0..<Self.maximumCapacity { pending[index] = .stopped }
+                for index in 0..<Self.maximumCapacity { pendingSlot(at: index).pointee = .stopped }
                 pendingIndex = 0
                 pendingCount = 0
                 isDraining = false
@@ -168,8 +186,9 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
                 isDraining = false
                 return nil
             }
-            let event = pending[pendingIndex]
-            pending[pendingIndex] = .stopped
+            let slot = pendingSlot(at: pendingIndex)
+            let event = slot.pointee
+            slot.pointee = .stopped
             pendingIndex = (pendingIndex + 1) % Self.maximumCapacity
             pendingCount -= 1
             return event
@@ -456,6 +475,7 @@ enum PlaybackRuntimeAllocationReservations {
             mediaStride=\(MemoryLayout<PlaybackMediaInformation?>.stride), \
             generationStride=\(MemoryLayout<MediaGeneration?>.stride), \
             tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride), \
+            segmentRequestClass=\(malloc_good_size(PlaybackSessionEventRelay.backingSegmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride)), \
             typedRequestClass=\(malloc_good_size(32 * MemoryLayout<PlaybackPipelineEvent>.stride)), \
             arrayRequestClass=\(malloc_good_size(32 + 32 * MemoryLayout<PlaybackPipelineEvent>.stride))
             """)

@@ -6,6 +6,7 @@ import Foundation
 import Darwin
 import ObjectiveC
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 extension XCTestCase {
@@ -43,6 +44,9 @@ private protocol Task9NativeBufferObservation {
     var storageIdentityForAllocation: UInt { get }
     var frozenTailAllocationBytes: Int { get }
     var allocationHeaderBytes: Int { get }
+    var allocationSegmentCapacity: Int { get }
+    var allocationSegmentCount: Int { get }
+    var secondStorageIdentityForAllocation: UInt? { get }
 }
 
 extension Array: Task9NativeBufferObservation {
@@ -56,18 +60,32 @@ extension Array: Task9NativeBufferObservation {
         malloc_good_size(32 + capacity * MemoryLayout<Element>.stride)
     }
     fileprivate var allocationHeaderBytes: Int { 32 }
+    fileprivate var allocationSegmentCapacity: Int { capacity }
+    fileprivate var allocationSegmentCount: Int { 1 }
+    fileprivate var secondStorageIdentityForAllocation: UInt? { nil }
 }
 
 /// This is a borrowed original allocation base, not a copied Array or an element
 /// address with a guessed header. Only the production relay owns/deallocates it.
 private struct Task9PipelineBackingObservation: Task9NativeBufferObservation {
     let base: UnsafeMutablePointer<PlaybackPipelineEvent>
+    let tail: UnsafeMutablePointer<PlaybackPipelineEvent>
     var countForAllocation: Int { PlaybackSessionEventRelay.maximumCapacity }
     var capacityForAllocation: Int { PlaybackSessionEventRelay.maximumCapacity }
     var elementStrideForAllocation: Int { MemoryLayout<PlaybackPipelineEvent>.stride }
     var storageIdentityForAllocation: UInt { UInt(bitPattern: base) }
-    var frozenTailAllocationBytes: Int { malloc_size(UnsafeRawPointer(base)) }
+    var frozenTailAllocationBytes: Int {
+        malloc_size(UnsafeRawPointer(base)) + malloc_size(UnsafeRawPointer(tail))
+    }
     var allocationHeaderBytes: Int { 0 }
+    var allocationSegmentCapacity: Int { PlaybackSessionEventRelay.backingSegmentCapacity }
+    var allocationSegmentCount: Int { 2 }
+    var secondStorageIdentityForAllocation: UInt? { UInt(bitPattern: tail) }
+}
+
+private final class Task9WeakObjectProbe: @unchecked Sendable {
+    weak var value: AnyObject?
+    init(_ value: AnyObject) { self.value = value }
 }
 
 /// 只按同一tvOS运行时的真实对象base或公开Array容量计量；绝不对element base调用malloc_size。
@@ -119,8 +137,10 @@ private func task9AnyObjectField(_ name: String, of value: Any) -> AnyObject? {
 }
 
 private func task9ArrayField(_ name: String, of value: Any) -> (any Task9NativeBufferObservation)? {
-    if let pointer = task9Field(name, of: value) as? UnsafeMutablePointer<PlaybackPipelineEvent> {
-        return Task9PipelineBackingObservation(base: pointer)
+    if name == "pending",
+       let pointer = task9Field(name, of: value) as? UnsafeMutablePointer<PlaybackPipelineEvent>,
+       let tail = task9Field("pendingTail", of: value) as? UnsafeMutablePointer<PlaybackPipelineEvent> {
+        return Task9PipelineBackingObservation(base: pointer, tail: tail)
     }
     return task9Field(name, of: value) as? any Task9NativeBufferObservation
 }
@@ -132,6 +152,9 @@ private struct Task9ArrayAllocationSnapshot {
     let identity: UInt
     let bytes: Int
     let allocationHeaderBytes: Int
+    let allocationSegmentCapacity: Int
+    let allocationSegmentCount: Int
+    let secondIdentity: UInt?
 }
 
 /// Mirror得到的Array副本只在本函数短借；生产mutation前销毁，避免测试自身制造COW。
@@ -139,7 +162,22 @@ private func task9ArraySnapshot(_ name: String, of value: Any) -> Task9ArrayAllo
     guard let array = task9ArrayField(name, of: value) else { return nil }
     return .init(count: array.countForAllocation, capacity: array.capacityForAllocation,
         stride: array.elementStrideForAllocation, identity: array.storageIdentityForAllocation,
-        bytes: array.frozenTailAllocationBytes, allocationHeaderBytes: array.allocationHeaderBytes)
+        bytes: array.frozenTailAllocationBytes, allocationHeaderBytes: array.allocationHeaderBytes,
+        allocationSegmentCapacity: array.allocationSegmentCapacity,
+        allocationSegmentCount: array.allocationSegmentCount,
+        secondIdentity: array.secondStorageIdentityForAllocation)
+}
+
+private func task9PipelineBackingCharges(_ relay: PlaybackSessionEventRelay) throws -> [Task9AllocationCharge] {
+    let head = try XCTUnwrap(task9Field("pending", of: relay) as? UnsafeMutablePointer<PlaybackPipelineEvent>)
+    let tail = try XCTUnwrap(task9Field("pendingTail", of: relay) as? UnsafeMutablePointer<PlaybackPipelineEvent>)
+    XCTAssertNotEqual(UInt(bitPattern: head), UInt(bitPattern: tail), "Both original allocations must be distinct")
+    return [
+        .init(ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending.head",
+            allocationIdentity: UInt(bitPattern: head), bytes: malloc_size(UnsafeRawPointer(head))),
+        .init(ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending.tail",
+            allocationIdentity: UInt(bitPattern: tail), bytes: malloc_size(UnsafeRawPointer(tail)))
+    ]
 }
 
 private final class Task9RuntimeWeakTargets {
@@ -3703,22 +3741,32 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         let relay = PlaybackSessionEventRelay(identity: .init(sessionID: 98, requestID: UUID())) { _, _ in }
         let base = try XCTUnwrap(task9Field("pending", of: relay)
             as? UnsafeMutablePointer<PlaybackPipelineEvent>)
-        let buffer = UnsafeBufferPointer(start: base, count: PlaybackSessionEventRelay.maximumCapacity)
-        let actual = malloc_size(UnsafeRawPointer(base))
-        XCTAssertEqual(buffer.count, 32)
-        XCTAssertTrue(buffer.allSatisfy { $0 == .stopped }, "Every owned slot must be initialized")
+        let tail = try XCTUnwrap(task9Field("pendingTail", of: relay)
+            as? UnsafeMutablePointer<PlaybackPipelineEvent>)
+        let segmentCapacity = PlaybackSessionEventRelay.backingSegmentCapacity
+        let headBuffer = UnsafeBufferPointer(start: base, count: segmentCapacity)
+        let tailBuffer = UnsafeBufferPointer(start: tail, count: segmentCapacity)
+        let headBytes = malloc_size(UnsafeRawPointer(base))
+        let tailBytes = malloc_size(UnsafeRawPointer(tail))
+        let actual = headBytes + tailBytes
+        XCTAssertNotEqual(UInt(bitPattern: base), UInt(bitPattern: tail))
+        XCTAssertEqual(headBuffer.count, 16)
+        XCTAssertEqual(tailBuffer.count, 16)
+        XCTAssertEqual(headBuffer.count + tailBuffer.count, 32)
+        XCTAssertTrue(headBuffer.allSatisfy { $0 == .stopped }, "Every head slot must be initialized")
+        XCTAssertTrue(tailBuffer.allSatisfy { $0 == .stopped }, "Every tail slot must be initialized")
         XCTAssertEqual(actual, reservation.pipelineBacking,
-            "The typed buffer base is the original malloc allocation, not an Array element address")
-        XCTAssertEqual(actual, malloc_good_size(32 * MemoryLayout<PlaybackPipelineEvent>.stride))
-        XCTAssertLessThan(actual, malloc_good_size(32 + 32 * MemoryLayout<PlaybackPipelineEvent>.stride),
-            "The repair must remove a real native allocation bin, not move uncharged memory")
+            "Both typed bases are original allocations; neither is a guessed Array element address")
+        XCTAssertEqual(headBytes, malloc_good_size(segmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride))
+        XCTAssertEqual(tailBytes, malloc_good_size(segmentCapacity * MemoryLayout<PlaybackPipelineEvent>.stride))
         XCTAssertNil(task9AnyObjectField("lock", of: relay))
         XCTAssertNil(task9AnyObjectField("lock", of: monitor))
         XCTAssertEqual(reservation.pipelineRelayLock, 0)
         XCTAssertEqual(reservation.monitorLock, 0)
         XCTAssertEqual(malloc_size(Unmanaged.passUnretained(relay).toOpaque()), reservation.pipelineRelayObject)
         XCTAssertEqual(malloc_size(Unmanaged.passUnretained(monitor).toOpaque()), reservation.monitorObject)
-        print("pipelineTypedBacking=\(actual), slots=\(buffer.count), stride=\(MemoryLayout<PlaybackPipelineEvent>.stride), " +
+        print("pipelineTypedBacking=\(actual), head=\(headBytes), tail=\(tailBytes), slots=32, " +
+            "stride=\(MemoryLayout<PlaybackPipelineEvent>.stride), " +
             "pipelineObject=\(reservation.pipelineRelayObject), monitorObject=\(reservation.monitorObject), " +
             "systemAndPipelineTotal=\(reservation.total)/4096")
     }
@@ -3730,9 +3778,11 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         let delivered = expectation(description: "All 32 original event payloads delivered")
         delivered.expectedFulfillmentCount = 32
         let events = (0..<32).map { index in
-            PlaybackPipelineEvent.failed(.presented(.init(code: "code-\(index)",
-                userMessage: "failure-\(index)", diagnosticCode: "diagnostic-\(index)",
-                retryDisposition: index.isMultiple(of: 2) ? .retrySameRequest : .chooseAnotherChannel)))
+            PlaybackPipelineEvent.failed(.presented(.init(code: index == 0 ? "" : "代码-\(index)",
+                userMessage: index.isMultiple(of: 2) ? String(repeating: "📺", count: 64) + "-\(index)" : "failure-\(index)",
+                diagnosticCode: index % 3 == 0 ? nil : (index % 3 == 1 ? "" : "诊断-\(index)"),
+                retryDisposition: index % 3 == 0 ? .retrySameRequest :
+                    (index % 3 == 1 ? .chooseAnotherChannel : .doNotRetry))))
         }
         let relay = PlaybackSessionEventRelay(identity: identity) { run, event in
             XCTAssertEqual(run, identity)
@@ -3746,13 +3796,98 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         for event in events.dropFirst() { relay.send(event) }
         let before = try XCTUnwrap(task9ArraySnapshot("pending", of: relay))
         XCTAssertEqual(before.count, 32)
+        XCTAssertNotNil(before.secondIdentity)
         await gate.release()
         await fulfillment(of: [delivered], timeout: 3)
         XCTAssertEqual(observed.snapshot, events)
         let after = try XCTUnwrap(task9ArraySnapshot("pending", of: relay))
-        XCTAssertEqual(after.identity, before.identity, "Draining must retain the original fixed allocation")
+        XCTAssertEqual(after.identity, before.identity, "Draining must retain the original head allocation")
+        XCTAssertEqual(after.secondIdentity, before.secondIdentity, "Draining must retain the original tail allocation")
         XCTAssertEqual(after.bytes, before.bytes)
         relay.deactivate()
+    }
+
+    func testPipelineSplitRingPreservesOptionalMediaAndFullWidthGenerationsAcrossBothHalves() async throws {
+        let identity = PlaybackRunIdentity(sessionID: 101, requestID: UUID())
+        let gate = Task9OperationGate()
+        let observed = PlaybackStreamRecorder<PlaybackPipelineEvent>()
+        let delivered = expectation(description: "All media bit patterns delivered")
+        delivered.expectedFulfillmentCount = 32
+        var expected = (0..<32).map { PlaybackPipelineEvent.ready(readinessCycle: UInt64($0)) }
+        expected[0] = .ready(readinessCycle: .max)
+        expected[14] = .mediaInformation(nil, generation: nil)
+        expected[15] = .mediaInformation(nil, generation: .init(rawValue: 0))
+        expected[16] = .mediaInformation(nil, generation: .init(rawValue: .max))
+        func information(_ output: Double?) -> PlaybackMediaInformation {
+            .init(width: .min, height: .max, scanMode: .interlaced,
+                sourceFrameRate: .init(num: .max, den: 1), outputFrameRate: output,
+                isSmoothMotionEnhanced: true)
+        }
+        expected[17] = .mediaInformation(information(nil), generation: .init(rawValue: 0))
+        expected[18] = .mediaInformation(information(0), generation: nil)
+        expected[30] = .mediaInformation(information(-Double.zero), generation: .init(rawValue: .max))
+        expected[31] = .mediaInformation(information(Double(bitPattern: 0x7ff8_0000_0000_0042)), generation: nil)
+        let relay = PlaybackSessionEventRelay(identity: identity) { _, event in
+            observed.append(event)
+            if event == .ready(readinessCycle: .max) { await gate.enter() }
+            delivered.fulfill()
+        }
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
+        relay.send(expected[0])
+        await gate.waitUntilEntered()
+        for event in expected.dropFirst() { relay.send(event) }
+        await gate.release()
+        await fulfillment(of: [delivered], timeout: 3)
+        let actual = observed.snapshot
+        XCTAssertEqual(actual.count, expected.count)
+        for (actualEvent, expectedEvent) in zip(actual, expected) {
+            if case .mediaInformation(let actualInfo, let actualGeneration) = actualEvent,
+               case .mediaInformation(let expectedInfo, let expectedGeneration) = expectedEvent {
+                XCTAssertEqual(actualGeneration, expectedGeneration)
+                XCTAssertEqual(actualInfo?.width, expectedInfo?.width)
+                XCTAssertEqual(actualInfo?.height, expectedInfo?.height)
+                XCTAssertEqual(actualInfo?.scanMode, expectedInfo?.scanMode)
+                XCTAssertEqual(actualInfo?.sourceFrameRate, expectedInfo?.sourceFrameRate)
+                XCTAssertEqual(actualInfo?.outputFrameRate?.bitPattern, expectedInfo?.outputFrameRate?.bitPattern)
+                XCTAssertEqual(actualInfo?.isSmoothMotionEnhanced, expectedInfo?.isSmoothMotionEnhanced)
+            } else {
+                XCTAssertEqual(actualEvent, expectedEvent)
+            }
+        }
+        relay.deactivate()
+    }
+
+    func testPipelineSplitRingReleasesQueuedReferencesAcrossTheSegmentBoundaryAndDeinitializesAfterJoin() async throws {
+        let identity = PlaybackRunIdentity(sessionID: 100, requestID: UUID())
+        let gate = Task9OperationGate()
+        let relay = PlaybackSessionEventRelay(identity: identity) { _, _ in await gate.enter() }
+        let weakRelay = Task9WeakObjectProbe(relay)
+        // XCTest runs teardown blocks in reverse order: the owned-record teardown
+        // registered below must physically join and release before this check.
+        addTeardownBlock { XCTAssertNil(weakRelay.value, "Relay deinit must run after the original drain joins") }
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
+        relay.send(.ready(readinessCycle: 0))
+        await gate.waitUntilEntered()
+        let retained = try autoreleasepool { () throws -> [Task9WeakObjectProbe] in
+            var retained: [Task9WeakObjectProbe] = []
+            for index in 1...31 {
+                if index == 15 || index == 16 || index == 31 {
+                    let diagnostic = ErrorDiagnosticSnapshot(typeName: "split-ring", message: "slot-\(index)")
+                    let storage = try XCTUnwrap(task9AnyObjectField("storage", of: diagnostic))
+                    retained.append(Task9WeakObjectProbe(storage))
+                    relay.send(.failed(.unexpected(stage: "split-ring", diagnostic: diagnostic)))
+                } else {
+                    relay.send(.ready(readinessCycle: UInt64(index)))
+                }
+            }
+            return retained
+        }
+        XCTAssertEqual(retained.count, 3)
+        XCTAssertTrue(retained.allSatisfy { $0.value != nil }, "Queued slots must own their unchanged payloads")
+        relay.deactivate()
+        XCTAssertTrue(retained.allSatisfy { $0.value == nil },
+            "Clearing slots15,16,31 must release references on both sides of the physical boundary")
+        await gate.release()
     }
 
     func testProductionRuntimeUsesFiveDisjointAllocationLedgersAndFitsGlobalCap() throws {
@@ -3787,11 +3922,9 @@ final class Task9RuntimeCapacityTests: XCTestCase {
                 ledger: .audioRelay, name: "AudioRelay.pending"),
             task9ObjectCharge(fixture.owner.monitor, ledger: .systemAndPipelineRelay, name: "SystemMonitor"),
             task9ObjectCharge(pipeline, ledger: .systemAndPipelineRelay, name: "PipelineRelay"),
-            task9ArrayCharge(XCTUnwrap(task9ArrayField("pending", of: pipeline)),
-                ledger: .systemAndPipelineRelay, name: "PipelineRelay.pending"),
             task9ObjectCharge(service, ledger: .route, name: "RouteService"),
             presentationCharge
-        ]
+        ] + task9PipelineBackingCharges(pipeline)
         let grouped = Dictionary(grouping: charges, by: \.ledger).mapValues { rows in
             Dictionary(grouping: rows, by: \.allocationIdentity).values.reduce(0) { total, aliases in
                 total + (aliases.map(\.bytes).max() ?? 0)
@@ -3867,7 +4000,8 @@ final class Task9RuntimeCapacityTests: XCTestCase {
             XCTAssertEqual(array.count, expectedCount)
             XCTAssertGreaterThanOrEqual(array.capacity, expectedCount,
                 "公开capacity是本目标allocator事实，不能用count替代")
-            XCTAssertEqual(array.bytes, malloc_good_size(array.allocationHeaderBytes + array.capacity * array.stride))
+            XCTAssertEqual(array.bytes, array.allocationSegmentCount *
+                malloc_good_size(array.allocationHeaderBytes + array.allocationSegmentCapacity * array.stride))
             if name == "commands" {
                 XCTAssertEqual(ControlTaskRegistry.commandBackingCapacity, array.count)
                 XCTAssertEqual(ControlTaskRegistry.controlAllocationReservation.commandBacking, array.bytes,
@@ -4172,7 +4306,8 @@ final class Task9RuntimeCapacityTests: XCTestCase {
             XCTAssertEqual(actual.count, 32)
             XCTAssertEqual(policyCount, actual.count,
                 "\(name)的类型化reservation策略只能冻结逻辑32请求，不能冻结某台模拟器公开capacity")
-            XCTAssertEqual(reservedBytes, malloc_good_size(actual.allocationHeaderBytes + 32 * actual.stride),
+            XCTAssertEqual(reservedBytes, actual.allocationSegmentCount *
+                malloc_good_size(actual.allocationHeaderBytes + (32 / actual.allocationSegmentCount) * actual.stride),
                 "\(name)须按当前runtime对逻辑32请求得到的allocation class自适应计费")
             XCTAssertEqual(actual.bytes, reservedBytes,
                 "\(name)真实背板必须落在同一runtime allocation class")
