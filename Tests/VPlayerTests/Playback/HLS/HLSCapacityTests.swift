@@ -586,7 +586,7 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
         let driver = try await makeDisconnectedEmptyDriver()
         var installation: PlaybackResourceContextReservation? = try context.reserve(
             allocationIdentity: .stable(UUID()), bytes: 4 * 1_024)
-        weak var originalInstallation = installation
+        let originalInstallation = CallbackCreditWeakInstallation(installation)
         driver.retainInstallationResourceContext(try XCTUnwrap(installation))
         let pool = try driver.reserveSDKCallbackCredits()
         var operation: AVPlayerSDKCallbackLease? = try driver.borrowSDKOperationCredit(.ready, from: pool)
@@ -598,14 +598,14 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
         let replacement = try context.reserve(allocationIdentity: .stable(UUID()), bytes: 1_024)
         driver.retainInstallationResourceContext(replacement)
         installation = nil
-        XCTAssertNotNil(originalInstallation, "Protected rollback still needs the original installation owner")
+        XCTAssertNotNil(originalInstallation.value, "Protected rollback still needs the original installation owner")
         var rollback: AVPlayerSDKCallbackLease? = try driver.borrowSDKRollbackCredit(from: pool)
         rollback?.assertRegistered()
-        XCTAssertNotNil(originalInstallation)
+        XCTAssertNotNil(originalInstallation.value)
         rollback = nil
-        XCTAssertNotNil(originalInstallation, "Dropping the physical borrower does not settle cleanup")
+        XCTAssertNotNil(originalInstallation.value, "Dropping the physical borrower does not settle cleanup")
         XCTAssertTrue(driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool))
-        XCTAssertNil(originalInstallation)
+        XCTAssertNil(originalInstallation.value)
     }
 
     func testChangedInstalledItemRejectsResolutionOfPoolCapturedWhileEmpty() async throws {
@@ -743,4 +743,10 @@ private final class CallbackCreditTailBox: @unchecked Sendable {
     private var lease: AVPlayerSDKCallbackLease?
     init(_ lease: AVPlayerSDKCallbackLease) { self.lease = lease }
     func release() { lock.withLock { lease = nil } }
+}
+
+private final class CallbackCreditWeakInstallation {
+    weak var value: PlaybackResourceContextReservation?
+
+    init(_ value: PlaybackResourceContextReservation?) { self.value = value }
 }
