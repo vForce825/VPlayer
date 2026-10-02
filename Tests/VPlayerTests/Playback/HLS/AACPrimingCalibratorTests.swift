@@ -835,7 +835,7 @@ final class AACPrimingCalibratorTests: XCTestCase {
         let record = AACWriterRetirementRecord()
         var owner: AACWriterRetirementProbe? = AACWriterRetirementProbe(
             lane: lane, lease: try workspace.acquire(.temporaryFile, bytes: 1_048_576), record: record)
-        weak var weakOwner = owner
+        let weakOwner = AACWeakWriterRetirementProbe(try XCTUnwrap(owner))
         try lane.claimWriterOwnership(try XCTUnwrap(owner))
         XCTAssertThrowsError(try lane.claimWriterOwnership(
             AACWriterRetirementProbe(lane: lane, lease: nil, record: record))) {
@@ -846,7 +846,7 @@ final class AACPrimingCalibratorTests: XCTestCase {
         XCTAssertFalse(lane.finishWriterOwnership(try XCTUnwrap(owner)), "retirement is admitted once")
         owner = nil
         lane.requestCancel()
-        XCTAssertNotNil(weakOwner, "the occupied lane owns the deferred physical resources")
+        XCTAssertNotNil(weakOwner.value, "the occupied lane owns the deferred physical resources")
         XCTAssertEqual(workspace.currentBytes, 1_048_576)
         XCTAssertEqual(record.count, 0)
         XCTAssertFalse(lane.finishCancellation { XCTFail("writer terminal has not completed") })
@@ -854,7 +854,7 @@ final class AACPrimingCalibratorTests: XCTestCase {
         XCTAssertEqual(record.count, 1)
         XCTAssertTrue(record.wasExcludedDuringRetirement)
         XCTAssertEqual(workspace.currentBytes, 0)
-        XCTAssertNil(weakOwner)
+        XCTAssertNil(weakOwner.value)
         XCTAssertTrue(lane.finishCancellation {})
     }
 
@@ -1488,6 +1488,11 @@ private final class AACCalibrationStreamProbe: @unchecked Sendable {
             return appends
         }
     }
+}
+
+private final class AACWeakWriterRetirementProbe {
+    weak var value: AACWriterRetirementProbe?
+    init(_ value: AACWriterRetirementProbe) { self.value = value }
 }
 
 private final class AACWriterRetirementRecord: @unchecked Sendable {
