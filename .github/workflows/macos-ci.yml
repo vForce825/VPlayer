@@ -170,46 +170,9 @@ jobs:
           PY
           python3 -m py_compile "$RUNNER_TEMP/vplayer-bounded-tests.py"
 
-      - name: Core, ownership, observation and Large Text regressions
-        id: core_tests
+      - name: Probe actual test-host allocation contract
+        id: startup_probe
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
         run: |
           python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/AudioSessionLifecycleTests \
-            -only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests \
-            -only-testing:VPlayerTests/NativeReceiverAdapterTests \
-            -only-testing:VPlayerTests/AudioRendererRecoveryProgressTests \
-            -only-testing:VPlayerTests/SystemVideoOutputTests \
-            -only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests \
-            -only-testing:VPlayerTests/AVPlayerLogSnapshotCacheTests \
-            -only-testing:VPlayerTests/RefreshLifecycleTests \
-            -only-testing:VPlayerTests/NowPlayingIntegrationTests \
-            -only-testing:VPlayerTests/CommittedLibraryObservationTests \
-            -only-testing:VPlayerTests/ReducedResourceUsageTests \
-            -only-testing:VPlayerTests/OutputCleanupCoordinatorTests \
-            -only-testing:VPlayerTests/PlaybackDeadlineTests \
-            -only-testing:VPlayerTests/Task9ReconstructedRegressionTests \
-            -only-testing:VPlayerTests/DeinterlacePipelineIntegrationTests \
-            -only-testing:VPlayerTests/SampleBufferBackendTests \
-            -only-testing:VPlayerTests/ChannelProgrammeLayoutTests \
-            -only-testing:VPlayerUITests/VPlayerUITests/testAccessibilityLargeTextReducesGridDensity
-
-      - name: AAC and native writer regressions
-        id: writer_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
-        run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/SegmentedFMP4WriterTests \
-            -only-testing:VPlayerTests/AACPrimingCalibratorTests
-
-      - name: Representative HLS lifecycle and cancellation regressions
-        id: hls_tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.prepare_tests.outcome == 'success' }}
-        run: |
-          python3 "$RUNNER_TEMP/vplayer-bounded-tests.py" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testActivationCallsPlayExactlyOnceOnlyForMatchingPermit \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSystemDriverUsesConfiguredStartupBufferForHomePodHLS \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt \
-            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests

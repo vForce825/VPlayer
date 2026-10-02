@@ -424,8 +424,25 @@ enum PlaybackRuntimeAllocationReservations {
         validateGlobalCap()
     }
     static func validateSystemAndPipelineAndGlobalCaps() {
-        precondition(systemAndPipelineRelay.total <= systemAndPipelineRelayHardCap,
-            "system/pipeline relay allocation超出4KiB")
+        let reservation = systemAndPipelineRelay
+        precondition(reservation.total <= systemAndPipelineRelayHardCap, """
+            system/pipeline relay allocation超出4KiB: total=\(reservation.total), \
+            monitor=\(reservation.monitorObject), monitorLock=\(reservation.monitorLock), \
+            tokens=\(reservation.observerTokens), observerCaptures=\(reservation.observerCaptures), \
+            pipeline=\(reservation.pipelineRelayObject), pipelineLock=\(reservation.pipelineRelayLock), \
+            backing=\(reservation.pipelineBacking), receiver=\(reservation.receiverCapture), \
+            drain=\(reservation.drainRunnerObject), tasks=\(reservation.relayTaskSlabs), \
+            taskCaptures=\(reservation.drainTaskCaptures), weak=\(reservation.weakTargetAllocationCharges), \
+            monitorInstance=\(class_getInstanceSize(SystemAudioEventMonitor.self)), \
+            pipelineInstance=\(class_getInstanceSize(PlaybackSessionEventRelay.self)), \
+            drainInstance=\(class_getInstanceSize(OwnedPlaybackEventDrain.self)), \
+            lockInstance=\(class_getInstanceSize(NSLock.self)), \
+            pipelineStride=\(MemoryLayout<PlaybackPipelineEvent>.stride), \
+            coreErrorStride=\(MemoryLayout<PlaybackCoreError>.stride), \
+            mediaStride=\(MemoryLayout<PlaybackMediaInformation?>.stride), \
+            generationStride=\(MemoryLayout<MediaGeneration?>.stride), \
+            tokenStride=\(MemoryLayout<NotificationCenter.ObservationToken?>.stride)
+            """)
         validateGlobalCap()
     }
     static func validateRouteAndGlobalCaps() {
