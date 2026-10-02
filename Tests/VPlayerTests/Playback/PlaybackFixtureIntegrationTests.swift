@@ -233,6 +233,125 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testRawHTTPHLSBecomesReadyWhilePausedAndConnected() async throws {
+        try await assertRawHTTPHLSReadiness(disconnected: false)
+    }
+
+    @MainActor
+    func testRawHTTPHLSBecomesReadyWhilePausedAndDisconnected() async throws {
+        try await assertRawHTTPHLSReadiness(disconnected: true)
+    }
+
+    @MainActor
+    private func assertRawHTTPHLSReadiness(disconnected: Bool) async throws {
+        // Use the existing fixture-runner convention. The dedicated diagnostic
+        // lane must prove env injection and exactly two executions with no skips.
+        let baseURL = try fixtureBaseURL()
+        guard baseURL.scheme == "http", baseURL.host == "127.0.0.1",
+              baseURL.port != nil, baseURL.user == nil, baseURL.password == nil else {
+            throw FixtureIntegrationFailure.invalidHTTPResponse
+        }
+        let itemURL = try await verifyIndependentHTTPHLSFixture(baseURL: baseURL)
+        let label = disconnected ? "disconnected" : "connected"
+        let player = AVPlayer()
+        player.pause()
+        player.automaticallyWaitsToMinimizeStalling = true
+        XCTAssertNil(player.currentItem)
+        XCTAssertFalse(player.disconnectedFromSystemAudio)
+        let probe = NativeHTTPReadinessProgressProbe(player: player, stage: "\(label).setup")
+        defer {
+            probe.cancel()
+            player.replaceCurrentItem(with: nil)
+            XCTAssertNil(player.currentItem)
+        }
+        var disconnectCompletionCount = 0
+        if disconnected {
+            probe.stage = "\(label).disconnect"
+            print("RAW_HTTP_READINESS stage=\(probe.stage).begin")
+            // Complete disconnection before creating/attaching media, so no
+            // connected loading window can make this control falsely pass.
+            // Own this physical transition until AVFoundation completes it.
+            // No timeout race releases the player while its callback is pending;
+            // the unchanged outer XCTest timeout remains authoritative.
+            await withCheckedContinuation { continuation in
+                player.setDisconnectedFromSystemAudio(true) { continuation.resume() }
+            }
+            disconnectCompletionCount = 1
+            print("RAW_HTTP_READINESS stage=\(probe.stage).completed")
+        }
+        XCTAssertNil(player.currentItem)
+        XCTAssertEqual(player.disconnectedFromSystemAudio, disconnected)
+        let item = AVPlayerItem(url: itemURL)
+        item.preferredForwardBufferDuration = 3
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        let terminal = expectation(description: "Raw HTTP HLS \(label) reaches terminal status")
+        let facts = NativeHTTPReadinessKVOFacts()
+        let observation = item.observe(\.status, options: [.initial, .new]) { observed, change in
+            if facts.record(observed.status, changeStatus: change.newValue) { terminal.fulfill() }
+        }
+        defer { observation.invalidate() }
+        player.replaceCurrentItem(with: item)
+        probe.stage = "\(label).ready"
+        print("RAW_HTTP_READINESS stage=\(probe.stage).begin "
+            + "disconnectRequests=\(disconnected ? 1 : 0) disconnectCompletions=\(disconnectCompletionCount) "
+            + "preferredBuffer=\(item.preferredForwardBufferDuration) "
+            + "pausedNetwork=\(item.canUseNetworkResourcesForLiveStreamingWhilePaused) "
+            + "automaticallyWaits=\(player.automaticallyWaitsToMinimizeStalling)")
+        await fulfillment(of: [terminal], timeout: 15)
+        probe.cancel()
+        print("RAW_HTTP_READINESS stage=\(probe.stage).observed "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(facts.summary)")
+        XCTAssertEqual(disconnectCompletionCount, disconnected ? 1 : 0)
+        XCTAssertEqual(player.disconnectedFromSystemAudio, disconnected)
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.readyToPlay.rawValue)
+        XCTAssertEqual(item.status, .readyToPlay)
+        XCTAssertNil(item.error)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+    }
+
+    @MainActor
+    private func verifyIndependentHTTPHLSFixture(baseURL: URL) async throws -> URL {
+        // These are the separately generated and ffprobe-audited H264/AAC bytes,
+        // not the production HLS writer, publication seed, or loopback server.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 10
+        configuration.timeoutIntervalForResource = 20
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        func fetch(_ path: String) async throws -> Data {
+            var request = URLRequest(url: baseURL.appending(path: path))
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            let (bytes, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  !bytes.isEmpty else { throw FixtureIntegrationFailure.invalidHTTPResponse }
+            return bytes
+        }
+        let entries = try parseChecksumManifest(try await fetch("SHA256SUMS"))
+        for path in ["hls/master.m3u8", "hls/segment0.ts"] {
+            let bytes = try await fetch(path)
+            let expected = try XCTUnwrap(entries[path])
+            let matches = SHA256.hash(data: bytes).hexString == expected
+            XCTAssertTrue(matches, "Independent fixture checksum must match")
+            guard matches else { throw FixtureIntegrationFailure.invalidHTTPResponse }
+            if path.hasSuffix(".m3u8") {
+                let playlist = try XCTUnwrap(String(data: bytes, encoding: .utf8))
+                let segments = playlist.split(separator: "\n")
+                    .filter { !$0.hasPrefix("#") }.map(String.init)
+                XCTAssertTrue(playlist.contains("#EXT-X-ENDLIST\n"))
+                XCTAssertEqual(segments, ["segment0.ts"])
+                guard playlist.contains("#EXT-X-ENDLIST\n"), segments == ["segment0.ts"] else {
+                    throw FixtureIntegrationFailure.invalidHTTPResponse
+                }
+            }
+            print("RAW_HTTP_READINESS fixture=\(path.hasSuffix(".m3u8") ? "playlist" : "segment") "
+                + "bytes=\(bytes.count) checksumMatches=\(matches)")
+        }
+        return baseURL.appending(path: "hls/master.m3u8")
+    }
+
     func testCancellingFromInitialHLSTracksDropsEveryRetainedStartupPacket() throws {
         let url = try fixtureBaseURL().appending(path: "hls/master.m3u8")
         let recorder = RawCancellingDemuxRecorder()
@@ -661,6 +780,79 @@ private enum FixtureIntegrationFailure: Error {
     case invalidHTTPResponse
     case requestTimedOut
     case invalidAudioContinuity
+}
+
+private final class NativeHTTPReadinessKVOFacts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var lastStatus = -1
+    private var lastChangeStatus = -1
+    private var terminalStatus = -1
+
+    func record(_ status: AVPlayerItem.Status, changeStatus: AVPlayerItem.Status?) -> Bool {
+        lock.withLock {
+            count += 1
+            lastStatus = status.rawValue
+            lastChangeStatus = changeStatus?.rawValue ?? -1
+            guard terminalStatus == -1,
+                  status == .readyToPlay || status == .failed else { return false }
+            terminalStatus = lastStatus
+            return true
+        }
+    }
+
+    var firstTerminalStatus: Int { lock.withLock { terminalStatus } }
+    var summary: String {
+        lock.withLock {
+            "kvoCount=\(count) kvoStatus=\(lastStatus) "
+                + "kvoTypedChange=\(lastChangeStatus) kvoTerminal=\(terminalStatus)"
+        }
+    }
+}
+
+@MainActor
+private final class NativeHTTPReadinessProgressProbe {
+    var stage: String
+    private weak var player: AVPlayer?
+    private var task: Task<Void, Never>?
+
+    init(player: AVPlayer, stage: String) {
+        self.player = player
+        self.stage = stage
+        task = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) }
+            catch { return }
+            guard !Task.isCancelled, let self, let player = self.player else { return }
+            print("RAW_HTTP_READINESS_WAIT stage=\(self.stage) \(Self.snapshot(player))")
+        }
+    }
+
+    static func snapshot(_ player: AVPlayer) -> String {
+        let item = player.currentItem
+        return "playerStatus=\(player.status.rawValue) playerError=\(errorFact(player.error as NSError?)) "
+            + "itemStatus=\(item?.status.rawValue ?? -1) itemError=\(errorFact(item?.error as NSError?)) "
+            + "assetPlayableState=\(item.map { playableFact($0.asset) } ?? "no_item") "
+            + "rangeCount=\(item?.loadedTimeRanges.count ?? -1) "
+            + "rate=\(player.rate) timeControlStatus=\(player.timeControlStatus.rawValue) "
+            + "disconnected=\(player.disconnectedFromSystemAudio)"
+    }
+
+    private static func playableFact(_ asset: AVAsset) -> String {
+        switch asset.status(of: .isPlayable) {
+        case .notYetLoaded: return "notYetLoaded"
+        case .loading: return "loading"
+        case .loaded(let playable): return "loaded:\(playable)"
+        case .failed(let error): return "failed:\(errorFact(error))"
+        }
+    }
+
+    private static func errorFact(_ error: NSError?) -> String {
+        guard let error else { return "none" }
+        return "\(String(error.domain.prefix(96))):\(error.code)"
+    }
+
+    func cancel() { task?.cancel(); task = nil }
+    deinit { task?.cancel() }
 }
 
 private struct AssembledFixture {

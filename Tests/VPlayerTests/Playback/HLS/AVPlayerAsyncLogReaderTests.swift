@@ -124,6 +124,46 @@ final class AVPlayerAsyncLogReaderTests: XCTestCase {
         await drainMainQueue()
     }
 
+    func testCurrentFaultDeliversOnceWhileSubsequentErrorLogReadIsHeld() async throws {
+        let reader = DelayedAVPlayerLogReader(first: [
+            "http://127.0.0.1/invalid", "http://127.0.0.1/matching"
+        ], subsequent: [], holdFirstErrorRead: true)
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer(), logReader: reader)
+        let item = makeItem(9)
+        var classifications: [AccessLogURIClassification] = []
+        defer {
+            reader.releaseFirstRead()
+            reader.releaseFirstErrorRead()
+            driver.replaceCurrentItemWithNil(item: item)
+        }
+        try install(driver, item: item) { classifications.append($0) }
+        let started = await reader.waitForReadCount(1)
+        XCTAssertTrue(started)
+        reader.releaseFirstRead()
+        let deliveredWhileErrorReadIsHeld = await waitUntil {
+            reader.errorReadCount == 1 && !classifications.isEmpty
+        }
+        XCTAssertTrue(deliveredWhileErrorReadIsHeld,
+                      "A known fault must not wait for the following SDK error-log retrieval")
+        XCTAssertEqual(classifications, [.invalidLocalResource])
+        XCTAssertFalse(reader.firstErrorReadReleased)
+        let physical = try XCTUnwrap(driver.player.currentItem)
+        XCTAssertEqual(driver.logSnapshotCache.snapshot(item: item,
+            objectIdentity: ObjectIdentifier(physical)), .empty)
+        reader.releaseFirstErrorRead()
+        let completed = await waitUntil {
+            driver.logSnapshotCache.snapshot(item: item,
+                objectIdentity: ObjectIdentifier(physical)).accessEventCount == 2
+        }
+        XCTAssertTrue(completed)
+        await drainMainQueue()
+        XCTAssertEqual(classifications, [.invalidLocalResource],
+                       "Returning from the same SDK batch must not deliver its fault twice")
+        XCTAssertEqual(reader.maximumConcurrentReads, 1)
+        driver.replaceCurrentItemWithNil(item: item)
+        await drainMainQueue()
+    }
+
     func testHubCoalescingPreservesInvalidResourceInBothConflictOrders() async throws {
         let reader = DelayedAVPlayerLogReader(first: [], subsequent: [])
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer(), logReader: reader)
@@ -216,13 +256,18 @@ private final class DelayedAVPlayerLogReader: AVPlayerLogReading {
     let subsequent: [String]
     private var gate: CheckedContinuation<Void, Never>?
     private var firstReadReleased = false
+    private let holdFirstErrorRead: Bool
+    private var errorGate: CheckedContinuation<Void, Never>?
+    private(set) var firstErrorReadReleased = false
+    private(set) var errorReadCount = 0
     private var activeReads = 0
     private(set) var accessReadCount = 0
     private(set) var maximumConcurrentReads = 0
 
-    init(first: [String], subsequent: [String]) {
+    init(first: [String], subsequent: [String], holdFirstErrorRead: Bool = false) {
         self.first = first
         self.subsequent = subsequent
+        self.holdFirstErrorRead = holdFirstErrorRead
     }
 
     func readAccessLog(item: AVPlayerItem, visitURI: @MainActor (String) -> Void) async -> Int {
@@ -238,7 +283,20 @@ private final class DelayedAVPlayerLogReader: AVPlayerLogReading {
         return values.count
     }
 
-    func readErrorLogCount(item: AVPlayerItem) async -> Int { 0 }
+    func readErrorLogCount(item: AVPlayerItem) async -> Int {
+        errorReadCount += 1
+        if holdFirstErrorRead, errorReadCount == 1, !firstErrorReadReleased {
+            await withCheckedContinuation { errorGate = $0 }
+        }
+        return 0
+    }
+
+    func releaseFirstErrorRead() {
+        firstErrorReadReleased = true
+        let continuation = errorGate
+        errorGate = nil
+        continuation?.resume()
+    }
 
     func releaseFirstRead() {
         firstReadReleased = true

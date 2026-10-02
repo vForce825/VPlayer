@@ -466,7 +466,9 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         defer { driver.replaceCurrentItemWithNil(item: item) }
         let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
             duration: ExactMediaTime(value: 1, timescale: 100))
+        print("SDK_FIXED_NATIVE_STAGE loaded_begin")
         let loaded = try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead, covering: requested)
+        print("SDK_FIXED_NATIVE_STAGE loaded_returned")
         XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: requested))
         XCTAssertEqual(driver.activeWaiterCount, 0)
         let attachment = XCTAttachment(string:
@@ -495,6 +497,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
         try driver.install(url: invalidURL, identity: item)
         let invalidItem = try XCTUnwrap(driver.player.currentItem)
+        print("SDK_FIXED_NATIVE_STAGE invalid_ready_begin")
         do {
             _ = try await driver.waitUntilReady(item: item)
             XCTFail("Malformed media must report the native item failure")
@@ -507,6 +510,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(invalidItem.status, .failed)
         XCTAssertNotNil(invalidItem.error)
         XCTAssertEqual(driver.activeWaiterCount, 0)
+        print("SDK_FIXED_NATIVE_STAGE native_failure_observed")
         driver.replaceCurrentItemWithNil(item: item)
         driver.removeObservers(item: item)
     }
@@ -1971,9 +1975,13 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             let invalid = try harness.malformedCurrentAuthorityURL()
             XCTAssertEqual(harness.classifyAccessLog(invalid), .invalidLocalResource,
                            "The negative URL must belong to the genuine current loopback authority")
-            let foreign = URL(string: "https://example.invalid/media.m4s")!
-            XCTAssertEqual(harness.classifyAccessLog(foreign), .unrelated)
-            harness.coordinator.observeAccessLogURI(foreign, item: harness.item)
+            for (category, foreign) in try harness.foreignAuthorityURLs() {
+                XCTAssertEqual(harness.classifyAccessLog(foreign), .unrelated, category)
+                harness.coordinator.observeAccessLogURI(foreign, item: harness.item)
+            }
+            for (category, local) in try harness.sameOriginInvalidResourceURLs() {
+                XCTAssertEqual(harness.classifyAccessLog(local), .invalidLocalResource, category)
+            }
             harness.coordinator.observeAccessLogURI(invalid,
                 item: Task21Fixtures.staleGenerationItem(from: harness.item))
             XCTAssertEqual(harness.coordinator.phase, .prepared,
@@ -1986,6 +1994,16 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(harness.coordinator.phase, .stopping,
                            "A malformed current-authority resource must revoke readiness")
             XCTAssertEqual(harness.driver.playCallCount, 0)
+            harness.coordinator.observeAccessLogURI(invalid, item: harness.item)
+            XCTAssertEqual(harness.coordinator.invalidationCount, 1,
+                           "Repeated delivery cannot create a second terminal action")
+            do {
+                _ = try await harness.coordinator.prepareCurrentItem()
+                XCTFail("The current item's fault cannot be cleared by preparing it again")
+            } catch {
+                XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed)
+            }
+            XCTAssertEqual(harness.coordinator.phase, .stopping)
             try await harness.shutdown()
         }
     }
@@ -2007,31 +2025,97 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         try await harness.shutdown()
     }
 
+    func testQueuedCurrentLogFaultBlocksOwnedNativePlayBeforeDeliveryButStaleFaultDoesNot() async throws {
+        try await checkQueuedNativeLogAdmission(staleFault: false)
+        try await checkQueuedNativeLogAdmission(staleFault: true)
+    }
+
+    private func checkQueuedNativeLogAdmission(staleFault: Bool) async throws {
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let backend = Task21QueuedLogGateBackend(driver: driver, staleFault: staleFault)
+        let graph = try OutputGraphFixture(backendObject: backend)
+        let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: graph.lifecycle, itemGeneration: 1)
+        backend.configure(identity: graph.lifecycle.backendIdentity, item: item, registry: graph.registry)
+        var operationError: (any Error)?
+        do {
+            let prepare = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+            XCTAssertTrue(graph.registry.startOutputPrepareOperation(prepare))
+            guard case .succeeded = await graph.registry.joinOutputBackendOperation(prepare) else {
+                throw AVPlayerItemCoordinatorFailure.itemFailed
+            }
+            let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+            let activation = try XCTUnwrap(graph.registry.beginOutputActivation(contextNonce: context.contextNonce))
+            XCTAssertTrue(graph.registry.startOutputActivationOperation(activation))
+            _ = await graph.registry.joinOutputBackendOperation(activation)
+            XCTAssertTrue(backend.hadCurrentInvocation)
+            XCTAssertEqual(backend.deliveriesBeforePlay, 0,
+                           "The assertion must exercise a queued, not already delivered, fault")
+            XCTAssertEqual(backend.deliveriesAtPlayExit, 0,
+                           "The native call must stay in the same actor turn before queued delivery")
+            XCTAssertEqual(backend.classifiedFault, staleFault ? nil : .invalidLocalResource)
+            if staleFault {
+                XCTAssertNil(backend.playFailure)
+                XCTAssertTrue(backend.playReturned,
+                              "A stale item fault must not blanket-block the current signed activation")
+            } else {
+                XCTAssertEqual(backend.playFailure, .itemFailed)
+                XCTAssertFalse(backend.playReturned,
+                               "Native play must reject the known fault before its signed side effect")
+                XCTAssertEqual(driver.rate, 0)
+            }
+        } catch { operationError = error }
+        let ownerContext = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: ownerContext.contextNonce,
+            reason: .stop, at: graph.registry.clock.nowNanoseconds, teardown: true))
+        let receiver = Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+        XCTAssertTrue(graph.registry.startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+                                                               terminalState: .stopped))
+        await graph.registry.joinOwnedTerminalCleanup(session: ownerContext.sessionIdentity)
+        try receiver.result()
+        XCTAssertNil(graph.registry.ownedResourceSnapshot())
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        if let operationError { throw operationError }
+    }
+
     func testReview2AccessLogURIClassifierV1ClassifiesAndAppliesMatchingConflictingInvalidLocalResource()
         async throws {
-        let matching = try await Task21Harness()
-        _ = try await matching.prepare()
-        matching.coordinator.observeAccessLogURI(
-            URL(string: "http://127.0.0.1:49152/v1/token/91/audio/201/index.m3u8")!,
-            item: matching.item
-        )
+        let matching = try await Task21AdvertisedAudioFixture.make()
+        addTeardownBlock { try await matching.shutdown() }
+        _ = try await matching.coordinator.prepareCurrentItem()
+        XCTAssertEqual(matching.coordinator.selectedRenditions, [.init(rawValue: 2)])
+        XCTAssertEqual(matching.classify(matching.selectedURL), .matching)
+        XCTAssertEqual(matching.classify(matching.alternativeURL), .conflicting,
+                       "Both URIs must resolve to real advertised participants in the same publication")
+        matching.coordinator.observeAccessLogURI(matching.selectedURL, item: matching.item)
         XCTAssertEqual(matching.coordinator.invalidationCount, 0)
-
-        matching.coordinator.observeAccessLogURI(
-            URL(string: "http://127.0.0.1:49152/v1/token/91/audio/202/index.m3u8")!,
-            item: matching.item
-        )
+        matching.coordinator.observeAccessLogURI(matching.alternativeURL, item: matching.item)
         XCTAssertEqual(matching.coordinator.phase, .stopping,
                        "同 publication 的冲突 rendition 必须由 classifier 触发失效")
+        let lateMalformed = matching.selectedURL.appendingPathComponent("invalid-resource")
+        XCTAssertEqual(matching.classify(lateMalformed), .invalidLocalResource)
+        matching.coordinator.observeAccessLogURI(lateMalformed, item: matching.item)
+        XCTAssertEqual(matching.coordinator.invalidationCount, 1)
+        do {
+            _ = try await matching.coordinator.prepareCurrentItem()
+            XCTFail("A terminal item cannot restart preparation")
+        } catch {
+            XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .selectionChanged,
+                           "After delivery, the first terminal cause is immutable")
+        }
+        try await matching.shutdown()
 
-        let invalid = try await Task21Harness()
+        let invalid = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
         _ = try await invalid.prepare()
-        invalid.coordinator.observeAccessLogURI(
-            URL(string: "http://127.0.0.1:49152/v1/token/91/%2e%2e/media.m4s")!,
-            item: invalid.item
-        )
+        let malformed = try invalid.malformedCurrentAuthorityURL()
+        XCTAssertEqual(invalid.classifyAccessLog(malformed), .invalidLocalResource)
+        invalid.coordinator.observeAccessLogURI(malformed, item: invalid.item)
         XCTAssertEqual(invalid.coordinator.phase, .stopping,
                        "无效本地资源必须失败闭合")
+        try await invalid.shutdown()
     }
 
     func testReview2AVParticipantCardinalityTimeoutTaxonomyAndCheckedCountersFailClosed()
@@ -4905,6 +4989,52 @@ private final class Task21Harness {
                                                      resolvingAgainstBaseURL: false))
         components.percentEncodedPath += "/%2e%2e/media.m4s"
         return try XCTUnwrap(components.url)
+    }
+
+    func foreignAuthorityURLs() throws -> [(String, URL)] {
+        let original = try XCTUnwrap(URLComponents(url: authorityFixture.request.itemURL,
+                                                  resolvingAgainstBaseURL: false))
+        var values: [(String, URL)] = [
+            ("foreign-host", URL(string: "https://example.invalid/media.m4s")!)
+        ]
+        var changed = original
+        changed.scheme = "https"
+        values.append(("foreign-scheme", try XCTUnwrap(changed.url)))
+        changed = original
+        let port = try XCTUnwrap(original.port)
+        changed.port = port == 65_535 ? 65_534 : port + 1
+        values.append(("foreign-port", try XCTUnwrap(changed.url)))
+        for host in ["localhost", "127.1"] {
+            changed = original
+            changed.host = host
+            values.append(("noncanonical-host", try XCTUnwrap(changed.url)))
+        }
+        return values
+    }
+
+    func sameOriginInvalidResourceURLs() throws -> [(String, URL)] {
+        let original = try XCTUnwrap(URLComponents(url: authorityFixture.request.itemURL,
+                                                  resolvingAgainstBaseURL: false))
+        var values = [("noncanonical-path", try malformedCurrentAuthorityURL())]
+        var changed = original
+        changed.user = "unexpected"
+        values.append(("credentials", try XCTUnwrap(changed.url)))
+        changed = original
+        changed.fragment = "unexpected"
+        values.append(("fragment", try XCTUnwrap(changed.url)))
+        var components = original.percentEncodedPath.split(separator: "/").map(String.init)
+        guard components.count >= 3 else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        changed = original
+        components[1] = components[1] == String(repeating: "0", count: 32)
+            ? String(repeating: "1", count: 32) : String(repeating: "0", count: 32)
+        changed.percentEncodedPath = "/" + components.joined(separator: "/")
+        values.append(("wrong-token", try XCTUnwrap(changed.url)))
+        changed = original
+        components = original.percentEncodedPath.split(separator: "/").map(String.init)
+        components[2] = String(item.itemGeneration + 1)
+        changed.percentEncodedPath = "/" + components.joined(separator: "/")
+        values.append(("wrong-generation", try XCTUnwrap(changed.url)))
+        return values
     }
 
     func classifyAccessLog(_ uri: URL) -> AccessLogURIClassification {
@@ -8498,4 +8628,262 @@ private final class Task27HLSBackendForwarder: PlaybackBackend,
         await backend.retireOutput(epoch: epoch)
     }
     func metricsSnapshot(window: Duration) -> PlaybackMetricsSnapshot? { nil }
+}
+
+/// Real two-audio publication for classifier integration. Only the selected audio
+/// and video bodies are served; the alternative remains genuinely advertised.
+@MainActor
+private final class Task21AdvertisedAudioFixture {
+    let publication: Task19Harness
+    let server: LoopbackHTTPServer
+    let source: LoopbackAVPlayerPreparationEvidenceSource
+    let request: AVPlayerItemPreparationRequest
+    let driver: Task21FakeDriver
+    let coordinator: AVPlayerItemCoordinator
+    let selectedURL: URL
+    let alternativeURL: URL
+    var item: AVPlayerItemInstanceIdentity { request.item }
+    private var retired = false
+
+    private init(publication: Task19Harness, server: LoopbackHTTPServer,
+                 source: LoopbackAVPlayerPreparationEvidenceSource,
+                 request: AVPlayerItemPreparationRequest,
+                 driver: Task21FakeDriver, coordinator: AVPlayerItemCoordinator,
+                 selectedURL: URL, alternativeURL: URL) {
+        self.publication = publication
+        self.server = server
+        self.source = source
+        self.request = request
+        self.driver = driver
+        self.coordinator = coordinator
+        self.selectedURL = selectedURL
+        self.alternativeURL = alternativeURL
+    }
+
+    static func make() async throws -> Task21AdvertisedAudioFixture {
+        let box = FinalLockedValue<Task19Harness>()
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
+            itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in }
+        ) { token in
+            let clock = try HLSNaturalEndPublicationClock.make()
+            let publication = try await Task19Harness(loopbackSession: token, audioCount: 2,
+                terminalLogicalSequence: 5, publicationClock: clock)
+            try await publication.initial()
+            let terminal = try await publication.publisher.drainNaturalEnd()
+            XCTAssertEqual(terminal, .endListPublished)
+            box.value = publication
+            let snapshot = try XCTUnwrap(publication.publisher.visible)
+            let declaration = try XCTUnwrap(snapshot.participantVector.first).declaration
+            return LoopbackPreparedPublication(store: publication.store,
+                declaration: declaration, snapshot: snapshot)
+        }
+        var reservedSource: LoopbackAVPlayerPreparationEvidenceSource?
+        do {
+            let publication = try XCTUnwrap(box.value)
+            let snapshot = try XCTUnwrap(publication.publisher.visible)
+            let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+            reservedSource = source
+            let item = AVPlayerItemInstanceIdentity(
+                outputLifecycleEpoch: try XCTUnwrap(snapshot.participantVector.first).binding.outputLifecycleEpoch,
+                itemGeneration: 19)
+            let bundle = try LoopbackAVPlayerPreparationBundle(evidenceSource: source, item: item)
+            func playlist(_ id: UInt64) throws -> URL {
+                let entry = try XCTUnwrap(snapshot.participantVector.first { $0.participantID == id })
+                return try XCTUnwrap(URL(string: entry.declaration.playlistURI(participantID: id),
+                                         relativeTo: server.baseURL)?.absoluteURL)
+            }
+            let selectedURL = try playlist(2)
+            let alternativeURL = try playlist(3)
+            var urls = [bundle.request.itemURL, try playlist(1), selectedURL, alternativeURL]
+            for id: UInt64 in [1, 2] {
+                let media = try XCTUnwrap(snapshot.media[id])
+                urls += try (media.initializationResources + media.resources).map {
+                    try XCTUnwrap(URL(string: server.path(for: $0), relativeTo: server.baseURL)?.absoluteURL)
+                }
+            }
+            let session = URLSession(configuration: .ephemeral)
+            defer { session.invalidateAndCancel() }
+            for url in urls {
+                let (body, response) = try await session.data(from: url)
+                XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+                XCTAssertFalse(body.isEmpty)
+            }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while server.currentAudioSelectionCapability(itemGeneration: 19,
+                    publicationSequence: snapshot.publicationSequence) == nil,
+                  ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let selection = try XCTUnwrap(server.currentAudioSelectionCapability(itemGeneration: 19,
+                publicationSequence: snapshot.publicationSequence))
+            XCTAssertEqual(selection.renditionIdentity, .init(rawValue: 2))
+            let driver = Task21FakeDriver()
+            let coordinator = try AVPlayerItemCoordinator(driver: driver, evidenceSource: source)
+            try coordinator.install(bundle.request)
+            return .init(publication: publication, server: server, source: source,
+                request: bundle.request, driver: driver, coordinator: coordinator,
+                selectedURL: selectedURL, alternativeURL: alternativeURL)
+        } catch {
+            let original = error
+            do { try await retireTransport(server: server, source: reservedSource) }
+            catch { XCTFail("Advertised-audio fixture creation cleanup also failed: \(error)") }
+            throw original
+        }
+    }
+
+    func classify(_ uri: URL) -> AccessLogURIClassification {
+        source.classifyAccessLogURI(uri, itemURL: request.itemURL, item: item,
+            publicationSequence: request.publicationSequence,
+            selected: coordinator.selectedRenditions.first)
+    }
+
+    func shutdown() async throws {
+        guard !retired else { return }
+        if driver.currentItemIdentity == item {
+            driver.pause(item: item)
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            driver.replaceCurrentItemWithNil(item: item)
+            driver.removeObservers(item: item)
+        }
+        guard driver.currentItemIdentity == nil, driver.rate == 0,
+              driver.disconnectedFromSystemAudio else {
+            throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+        }
+        try await Self.retireTransport(server: server, source: source)
+        retired = true
+    }
+
+    private static func retireTransport(server: LoopbackHTTPServer,
+                                        source: LoopbackAVPlayerPreparationEvidenceSource?) async throws {
+        source?.retirePreparation()
+        let ticket = server.closeAdmission()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (server.usage.connections != 0 || server.usage.activeResponses != 0
+                || FrozenPreparationOwner.activeHistoryServer === server),
+              ContinuousClock.now < deadline {
+            // Cleanup must still join physical tails when the creating task was cancelled.
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+        guard server.usage.connections == 0, server.usage.activeResponses == 0,
+              FrozenPreparationOwner.activeHistoryServer !== server else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
+        try server.drain(cleanupTicket: ticket)
+        try server.retire(cleanupTicket: ticket)
+        XCTAssertEqual(server.usage.distinctBackingBytes, 0)
+        XCTAssertEqual(server.usage.parserAndStagingBytes, 0)
+    }
+}
+
+/// Only preparation is mocked. Activation is installed, claimed and signed by
+/// the real Registry, and the target is the original native driver side effect.
+private final class Task21QueuedLogGateBackend: PlaybackBackend, @unchecked Sendable {
+    private let lock = NSLock()
+    private let driver: SystemAVPlayerDriver
+    private let staleFault: Bool
+    private var storedIdentity = PlaybackBackendIdentity(
+        sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0)
+    private var item: AVPlayerItemInstanceIdentity?
+    private weak var registry: ControlTaskRegistry?
+    private var activationTask: ControlTaskTicket?
+    private var deliveries = 0
+    private var currentInvocation = false
+    private var beforePlay = -1
+    private var atPlayExit = -1
+    private var classification: AccessLogURIClassification?
+    private var returned = false
+    private var failure: AVPlayerItemCoordinatorFailure?
+
+    init(driver: SystemAVPlayerDriver, staleFault: Bool) {
+        self.driver = driver
+        self.staleFault = staleFault
+    }
+    var identity: PlaybackBackendIdentity { lock.withLock { storedIdentity } }
+    var presentation: PlaybackPresentation? { nil }
+    var outputItemGeneration: UInt64? { 1 }
+    var hadCurrentInvocation: Bool { lock.withLock { currentInvocation } }
+    var deliveriesBeforePlay: Int { lock.withLock { beforePlay } }
+    var deliveriesAtPlayExit: Int { lock.withLock { atPlayExit } }
+    var classifiedFault: AccessLogURIClassification? { lock.withLock { classification } }
+    var playReturned: Bool { lock.withLock { returned } }
+    var playFailure: AVPlayerItemCoordinatorFailure? { lock.withLock { failure } }
+
+    func configure(identity: PlaybackBackendIdentity, item: AVPlayerItemInstanceIdentity,
+                   registry: ControlTaskRegistry) {
+        lock.withLock { storedIdentity = identity; self.item = item; self.registry = registry }
+    }
+    func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        let item = try XCTUnwrap(lock.withLock { self.item })
+        guard invocation.outputLifecycleEpoch == item.outputLifecycleEpoch else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        try await install(item)
+    }
+    func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        try await prepare(invocation: invocation)
+    }
+    @MainActor private func install(_ item: AVPlayerItemInstanceIdentity) async throws {
+        try driver.install(url: URL(fileURLWithPath: "/dev/null"), identity: item)
+        try await driver.setDisconnectedFromSystemAudio(false, item: item)
+        driver.eventHub.installAccessLog(classify: { _ in .invalidLocalResource }) { [weak self] _, _ in
+            guard let self else { return }
+            let cancellation = self.lock.withLock { () -> (ControlTaskRegistry, ControlTaskTicket)? in
+                self.deliveries += 1
+                guard let registry = self.registry, let ticket = self.activationTask else { return nil }
+                return (registry, ticket)
+            }
+            if let (registry, ticket) = cancellation { _ = registry.requestCancel(ticket) }
+        }
+    }
+    func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
+        try await playBeforeQueuedDelivery(invocation)
+    }
+    @MainActor private func playBeforeQueuedDelivery(
+        _ invocation: ControlTaskRegistry.BackendPositiveRateInvocation
+    ) async throws {
+        let item = try XCTUnwrap(lock.withLock { self.item })
+        let snapshot = try XCTUnwrap(invocation.currentSnapshot)
+        XCTAssertEqual(snapshot.interval.outputLifecycle, item.outputLifecycleEpoch)
+        XCTAssertEqual(snapshot.interval.itemGeneration, item.itemGeneration)
+        lock.withLock { currentInvocation = true; activationTask = snapshot.sourceTask }
+        let observed = staleFault
+            ? AVPlayerItemInstanceIdentity(outputLifecycleEpoch: item.outputLifecycleEpoch,
+                                           itemGeneration: item.itemGeneration + 1) : item
+        let observedClassification = driver.eventHub.classify(
+            URL(string: "http://127.0.0.1/current-resource-fault")!, item: observed)
+        if let observedClassification { driver.eventHub.receive(observedClassification, item: observed) }
+        lock.withLock { beforePlay = deliveries; classification = observedClassification }
+        defer { lock.withLock { atPlayExit = deliveries } }
+        do {
+            // Both methods run on this actor, and native play has no suspension
+            // before its signed SDK side effect. The queued hub block is pending.
+            try await driver.play(invocation: invocation, item: item)
+            lock.withLock { returned = true }
+        } catch {
+            lock.withLock { failure = error as? AVPlayerItemCoordinatorFailure }
+            throw error
+        }
+    }
+    func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async -> BackendSuspendResult {
+        // This adapter has no AVPlayer coordinator receipt issuer. It must request
+        // real physical retirement instead of fabricating a quiescence proof.
+        .requiresRetirement
+    }
+    func retireOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
+        guard let item = lock.withLock({ self.item }), item.outputLifecycleEpoch == epoch else {
+            return .unconfirmed
+        }
+        do {
+            await MainActor.run { driver.pause(item: item) }
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            let retired = await MainActor.run {
+                driver.replaceCurrentItemWithNil(item: item)
+                return driver.currentItemIdentity == nil && driver.rate == 0
+                    && driver.disconnectedFromSystemAudio
+            }
+            return retired ? .confirmedLocalOutputStopped : .unconfirmed
+        } catch { return .unconfirmed }
+    }
 }
