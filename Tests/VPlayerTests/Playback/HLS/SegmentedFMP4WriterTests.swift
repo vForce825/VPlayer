@@ -30,9 +30,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         native.observeAsyncAppend(entered: { entered.fulfill() },
             cancellation: { cancelled.fulfill() }, deferCancellationReturn: true)
         let ticket = try Task17Fixtures.compressedTicket(accessUnit: accessUnit, writer: writer)
-        let append = Task {
-            try await writer.appendCompressedAwaitingReadiness(accessUnit.writerSubmission,
-                coordinator: harness.coordinator, ticket: ticket)
+        let coordinator = harness.coordinator
+        let submission = accessUnit.writerSubmission
+        let append = Task { [writer, submission, coordinator, ticket] in
+            try await writer.appendCompressedAwaitingReadiness(submission,
+                coordinator: coordinator, ticket: ticket)
         }
         await fulfillment(of: [entered], timeout: 2)
         XCTAssertEqual(native.appendCount, 0)

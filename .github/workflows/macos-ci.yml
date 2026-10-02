@@ -58,7 +58,14 @@ jobs:
       - name: Compile tvOS 27 app and tests
         id: build
         run: |
-          xcodebuild build-for-testing \
+          options=()
+          help="$(xcodebuild -help 2>&1)"
+          if printf '%s\n' "$help" | grep -F -- '-continue-building-after-errors'; then
+            options+=(-continue-building-after-errors)
+          else
+            echo "Optional continue-building flag is not advertised; retaining default build behavior"
+          fi
+          xcodebuild build-for-testing "${options[@]}" \
             -project VPlayer.xcodeproj \
             -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" \
