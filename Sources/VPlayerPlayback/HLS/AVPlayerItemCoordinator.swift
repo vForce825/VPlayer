@@ -1345,11 +1345,20 @@ final class AVPlayerItemCoordinator {
             if preparationTicket == operationTicket { preparationTicket = nil }
         }
         do {
-            try await driver.setDisconnectedFromSystemAudio(true, item: request.item)
+            try Task.checkCancellation()
+            // Keep preparation connected and paused: the tvOS 27 simulator
+            // control remained pending when disconnected before HLS readiness.
+            // A reused player may still be disconnected by its prior suspension.
+            // The transition method joins any actual SDK change and is a no-op
+            // only after proving the requested physical state is already settled.
+            guard driver.rate == 0, driver.timeControlStatus != .playing else {
+                throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+            }
+            try await driver.setDisconnectedFromSystemAudio(false, item: request.item)
             try Task.checkCancellation()
             guard self.request?.item == request.item,
                   preparationTicket == operationTicket, !invalidated,
-                  driver.disconnectedFromSystemAudio else {
+                  !driver.disconnectedFromSystemAudio else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
             PlaybackDiagnosticTracker.shared.append("avprep_wait_ready")
@@ -1651,7 +1660,7 @@ final class AVPlayerItemCoordinator {
     private func validatePreparationDirect(_ direct: AVPlayerDirectState,
                                            item: AVPlayerItemInstanceIdentity) throws {
         guard direct.item == item, direct.rate == 0,
-              direct.timeControlStatus != .playing, driver.disconnectedFromSystemAudio else {
+              direct.timeControlStatus != .playing, !driver.disconnectedFromSystemAudio else {
             throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
         }
     }

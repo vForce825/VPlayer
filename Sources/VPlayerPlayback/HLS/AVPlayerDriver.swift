@@ -336,6 +336,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             throw .staleIdentity
         }
         guard !systemAudioTransitionInFlight else { throw .operationInFlight }
+        // A settled matching state needs no new SDK transition or callback
+        // lease. Do not use the public disconnected projection for this check:
+        // it is also false while a physical transition is still in flight.
+        // Callers retain cancellation/authority checks around this operation;
+        // cleanup must still be able to settle audio after cancellation.
+        guard player.disconnectedFromSystemAudio != disconnected else { return }
         let lease: AVPlayerSDKCallbackLease
         do { lease = try reserveSDKCallbackLease(.systemAudio) }
         catch {
@@ -750,6 +756,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     func directState(item identity: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState {
         guard currentItemIdentity == identity, let item, player.currentItem === item else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        guard !systemAudioTransitionInFlight else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
         return AVPlayerDirectState(item: identity, rate: player.rate,
                             timeControlStatus: player.timeControlStatus)

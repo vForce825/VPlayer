@@ -629,6 +629,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
         let timeline = try makeRealTimelineEvidence(
             fixture: fixture, snapshot: snapshot, authorityParticipantID: 2)
+        let preparationOwner = try fixture.beginPreparationHistory().preparationOwner
         let context = Self.makeCoverageContext(rendition: 1, nonce: 301,
             timeline: timeline.authority, selectionCapability: timeline.selection)
         for key in [oldInit, oldMedia] {
@@ -674,13 +675,36 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let newMedia = try XCTUnwrap(successor.resources.last)
         clock.value = Task19.second * 60
         fixture.task19.store.sweep(now: clock.value)
+        XCTAssertTrue(preparationOwner.isHistoryActive)
+        XCTAssertEqual(fixture.server.completedEvidence(for: oldMedia), mediaEvidence,
+                       "活动 history 仍钉住原 publication，跨过 horizon 本身不能退休旧 media")
+        XCTAssertEqual(try fixture.server.coverageReceipt(for: context, adding: oldRange), oldReceipt)
+        // Release the live publication history while the original frozen audio
+        // timeline and immutable receipt aliases remain held by this test.
+        fixture.retirePreparationHistory()
+        XCTAssertTrue(preparationOwner.isRetired)
+        fixture.task19.store.sweep(now: clock.value)
         XCTAssertNil(fixture.server.completedEvidence(for: oldMedia),
                      "旧 media 跨过 horizon 后必须从 store 信任域退休")
+        XCTAssertNil(try fixture.server.coverageReceipt(for: context, adding: oldRange),
+                     "保留旧 receipt 别名不能重新签发已经退休的 dependency")
         for key in [newInit, newMedia] {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: fixture.server.path(for: key)).status, 200)
         }
         let newMap = try XCTUnwrap(fixture.task19.store.decodeCoverageMap(for: newMedia))
+        let newRange = try XCTUnwrap(newMap.samples.first).presentationRange
+        let successorReceipt = try XCTUnwrap(fixture.server.coverageReceipt(
+            for: context, adding: newRange))
+        XCTAssertEqual(successorReceipt.preparedPlayheadIdentity, context.preparedPlayheadIdentity)
+        XCTAssertEqual(successorReceipt.presentationRange, newRange)
+        XCTAssertEqual(successorReceipt.dependencies.count, 1)
+        let successorDependency = try XCTUnwrap(successorReceipt.dependencies.first)
+        XCTAssertEqual(successorDependency.mediaEpoch, newMedia.mediaEpoch)
+        XCTAssertEqual(successorDependency.epochProofIdentity, newMap.epochProofIdentity)
+        XCTAssertEqual(successorDependency.segmentReceiptIdentity, newMap.segmentReceiptIdentity)
+        XCTAssertEqual(successorDependency.mediaBackingIdentity, newMap.resourceIdentity)
+        XCTAssertNotEqual(successorDependency.mediaEpoch, dependency.mediaEpoch)
         let newEnd = try XCTUnwrap(newMap.samples.last).presentationRange.end
         let spanning = try FMP4PresentationRange(start: oldRange.start,
             duration: newEnd.subtracting(oldRange.start))

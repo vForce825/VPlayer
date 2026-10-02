@@ -140,17 +140,58 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
-    func testTVOS27PrepareDisconnectsAndActivationReconnectsBeforePositiveRate() async throws {
+    func testTVOS27InitialPreparationStaysConnectedUntilActualSuspension() async throws {
+        try await withConnectedPlayerLifecycleHarness { harness in
+            _ = try await harness.prepare()
+            XCTAssertEqual(harness.driver.audioConnectionChanges, [],
+                           "Connected rate-zero preparation must not insert an early disconnect")
+            XCTAssertEqual(harness.driver.readyConnectionStates, [false])
+            XCTAssertFalse(harness.driver.systemAudioDisconnected)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+            _ = try await harness.activate()
+            XCTAssertEqual(harness.driver.audioConnectionChanges, [],
+                           "The first signed activation must not reconnect an already connected player")
+            XCTAssertFalse(harness.driver.playedWhileDisconnected)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            _ = try await harness.stop()
+            XCTAssertEqual(harness.driver.audioConnectionChanges, [true])
+            XCTAssertTrue(harness.driver.systemAudioDisconnected)
+        }
+    }
+
+    func testTVOS27ReusedDisconnectedPlayerReconnectsBeforeInitialReadiness() async throws {
+        try await withConnectedPlayerLifecycleHarness { harness in
+            // A previous item's real suspension can leave the reused player
+            // disconnected. The new preparation must settle connection first.
+            harness.driver.systemAudioDisconnected = true
+            _ = try await harness.prepare()
+            XCTAssertEqual(harness.driver.audioConnectionChanges, [false])
+            XCTAssertEqual(harness.driver.readyConnectionStates, [false])
+            XCTAssertFalse(harness.driver.systemAudioDisconnected)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+        }
+    }
+
+    private func withConnectedPlayerLifecycleHarness(
+        _ body: @MainActor (Task21Harness) async throws -> Void
+    ) async throws {
         let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        XCTAssertEqual(harness.driver.audioConnectionChanges, [true])
-        XCTAssertTrue(harness.driver.systemAudioDisconnected)
-        _ = try await harness.activate()
-        XCTAssertEqual(harness.driver.audioConnectionChanges, [true, false])
-        XCTAssertFalse(harness.driver.playedWhileDisconnected)
-        _ = try await harness.stop()
-        XCTAssertEqual(harness.driver.audioConnectionChanges, [true, false, true])
-        XCTAssertTrue(harness.driver.systemAudioDisconnected)
+        var operationError: (any Error)?
+        do { try await body(harness) }
+        catch { operationError = error }
+        harness.driver.holdAudioConnectionCompletion = false
+        harness.driver.releaseAudioConnection()
+        do { try await harness.shutdown() }
+        catch {
+            if let operationError {
+                XCTFail("Lifecycle cleanup also failed after the primary failure: \(error)")
+                throw operationError
+            }
+            throw error
+        }
+        if let operationError { throw operationError }
     }
 
     func testTVOS27StopWaitsForPhysicalDisconnectBeforeReceipt() async throws {
@@ -199,28 +240,33 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
     }
 
-    func testTVOS27CancelledReconnectSettlesBeforeStopAndCannotPlay() async throws {
-        let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        harness.driver.holdAudioConnectionCompletion = true
-        let activation = Task { try await harness.activate() }
-        guard await harness.driver.waitForHeldAudioConnection() else {
-            XCTFail("The coordinator never requested the physical connection transition")
-            return
+    func testTVOS27CancelledResumeReconnectSettlesBeforeStopAndCannotPlayAgain() async throws {
+        try await withConnectedPlayerLifecycleHarness { harness in
+            _ = try await harness.prepare()
+            _ = try await harness.activate()
+            _ = try await harness.stop()
+            let firstOwner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: firstOwner))
+            harness.driver.holdAudioConnectionCompletion = true
+            let activation = Task { try await harness.resumeThroughRegistry() }
+            guard await harness.driver.waitForHeldAudioConnection() else {
+                XCTFail("The coordinator never requested the physical connection transition")
+                return
+            }
+            let stopping = Task { try await harness.stop(strongerReason: true) }
+            let stopDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while harness.graph.registry.outputResourceContextSnapshot()?.owner == nil,
+                  ContinuousClock.now < stopDeadline { await Task.yield() }
+            XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.owner,
+                "Revoke the activation before releasing the delayed connection callback")
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            _ = try? await activation.value
+            _ = try await stopping.value
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertTrue(harness.driver.systemAudioDisconnected)
         }
-        let stopping = Task { try await harness.stop() }
-        let stopDeadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while harness.graph.registry.outputResourceContextSnapshot()?.owner == nil,
-              ContinuousClock.now < stopDeadline { await Task.yield() }
-        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.owner,
-            "Revoke the activation before releasing the delayed connection callback")
-        XCTAssertEqual(harness.driver.playCallCount, 0)
-        harness.driver.holdAudioConnectionCompletion = false
-        harness.driver.releaseAudioConnection()
-        _ = try? await activation.value
-        _ = try await stopping.value
-        XCTAssertEqual(harness.driver.playCallCount, 0)
-        XCTAssertTrue(harness.driver.systemAudioDisconnected)
     }
 
     func testTVOS27FailedPreparationRetainsInstalledOwnerUntilPhysicalRetirement() async throws {
@@ -352,29 +398,45 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let item = fixture.request.item
         try driver.install(url: fixture.request.itemURL, identity: item)
         defer { driver.replaceCurrentItemWithNil(item: item) }
-        progress.mark("disconnect")
-        try await driver.setDisconnectedFromSystemAudio(true, item: item)
-        progress.mark("ready")
-        let ready = try await driver.waitUntilReady(item: item)
-        XCTAssertEqual(ready, item)
-        let physical = try XCTUnwrap(driver.player.currentItem)
-        progress.mark("audible-group")
-        let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
-        print("NATIVE_AUDIBLE_GROUP present=\(group != nil) optionCount=\(group?.options.count ?? 0)")
-        progress.mark("audio-tracks")
-        let tracks = try await physical.asset.loadTracks(withMediaType: .audio)
-        print("NATIVE_AUDIBLE_SELECTION groupPresent=\(group != nil) optionCount=\(group?.options.count ?? 0) audioTrackCount=\(tracks.count)")
-        XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
-        XCTAssertEqual(tracks.count, 1,
-                       "a missing selection group is only valid here with one real audio track")
+        var operationError: (any Error)?
+        do {
+            progress.mark("connect")
+            try await driver.setDisconnectedFromSystemAudio(false, item: item)
+            progress.mark("ready")
+            let ready = try await driver.waitUntilReady(item: item)
+            XCTAssertEqual(ready, item)
+            let physical = try XCTUnwrap(driver.player.currentItem)
+            progress.mark("audible-group")
+            let group = try await physical.asset.loadMediaSelectionGroup(for: .audible)
+            print("NATIVE_AUDIBLE_GROUP present=\(group != nil) optionCount=\(group?.options.count ?? 0)")
+            progress.mark("audio-tracks")
+            let tracks = try await physical.asset.loadTracks(withMediaType: .audio)
+            print("NATIVE_AUDIBLE_SELECTION groupPresent=\(group != nil) optionCount=\(group?.options.count ?? 0) audioTrackCount=\(tracks.count)")
+            XCTAssertNil(group, "the direct media-playlist fixture must exercise no alternative group")
+            XCTAssertEqual(tracks.count, 1,
+                           "a missing selection group is only valid here with one real audio track")
 
-        progress.mark("production-selection")
-        try await driver.selectAudibleMedia(item: item)
-        progress.mark("complete")
+            progress.mark("production-selection")
+            try await driver.selectAudibleMedia(item: item)
+            progress.mark("complete")
 
-        XCTAssertTrue(driver.player.currentItem === physical)
-        XCTAssertEqual(driver.rate, 0)
+            XCTAssertTrue(driver.player.currentItem === physical)
+            XCTAssertEqual(driver.rate, 0)
+            XCTAssertFalse(driver.disconnectedFromSystemAudio)
+        } catch { operationError = error }
+        driver.cancelPendingPrerolls(item: item)
+        driver.pause(item: item)
+        do {
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+        } catch {
+            if let operationError {
+                XCTFail("Native selection cleanup also failed: \(error)")
+                throw operationError
+            }
+            throw error
+        }
         XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        if let operationError { throw operationError }
     }
 
     func testTVOS27SystemDriverWaitsForNativeConnectionState() async throws {
@@ -393,6 +455,97 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertFalse(driver.disconnectedFromSystemAudio)
         try await driver.setDisconnectedFromSystemAudio(true, item: item)
         XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        let settled = try await driver.directState(item: item)
+        XCTAssertEqual(settled.item, item)
+        XCTAssertEqual(settled.rate, 0)
+        XCTAssertEqual(settled.timeControlStatus, .paused)
+    }
+
+    func testTVOS27SettledConnectionDoesNotReserveAnotherSDKCallback() async throws {
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let item = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_100),
+            itemGeneration: 1)
+        try driver.install(url: URL(fileURLWithPath: "/tmp/VPlayer-settled-connection.m3u8"),
+                           identity: item)
+        var leases: [AVPlayerSDKCallbackLease] = []
+        defer {
+            leases.removeAll()
+            driver.replaceCurrentItemWithNil(item: item)
+        }
+        for _ in 0..<8 { leases.append(try driver.reserveSDKCallbackLease(.ready)) }
+        let bytes = PlaybackResourceContextLedger.shared.chargedBytes
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 8)
+        XCTAssertFalse(driver.player.disconnectedFromSystemAudio)
+
+        try await driver.setDisconnectedFromSystemAudio(false, item: item)
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 8)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, bytes,
+                       "An already settled connection must not allocate or hand off a native callback")
+        let stale = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: item.outputLifecycleEpoch,
+                                                itemGeneration: item.itemGeneration + 1)
+        do {
+            try await driver.setDisconnectedFromSystemAudio(false, item: stale)
+            XCTFail("Idempotence must not bypass exact-item validation")
+        } catch { XCTAssertEqual(error, .staleIdentity) }
+        do {
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            XCTFail("A real connection change must still reserve its physical callback")
+        } catch { XCTAssertEqual(error, .capacityExceeded) }
+        XCTAssertFalse(driver.player.disconnectedFromSystemAudio)
+    }
+
+    func testTVOS27DirectStateContractRejectsHeldConnectionCompletion() async throws {
+        // The Swift overlay setter cannot be overridden to hold a native
+        // callback. Exercise the exact protocol contract with the existing
+        // deterministic fake; native connection smoke covers settled reads.
+        let driver = Task21FakeDriver()
+        let item = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_101),
+            itemGeneration: 1)
+        try driver.install(url: URL(fileURLWithPath: "/tmp/VPlayer-held-connection.m3u8"),
+                           identity: item)
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+        driver.holdAudioConnectionCompletion = true
+        let transition = Task { try await driver.setDisconnectedFromSystemAudio(true, item: item) }
+        let hasHeldCompletion = await driver.waitForHeldAudioConnection()
+        var operationError: (any Error)?
+        do {
+            XCTAssertTrue(hasHeldCompletion)
+            guard hasHeldCompletion else {
+                throw AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            // Model physical state reaching its target before the completion
+            // resumes the original connection runner.
+            driver.systemAudioDisconnected = true
+            XCTAssertFalse(driver.disconnectedFromSystemAudio,
+                           "The public projection must not certify an in-flight transition")
+            do {
+                _ = try await driver.directState(item: item)
+                XCTFail("A paused scalar snapshot cannot certify an in-flight connection")
+            } catch { XCTAssertEqual(error, .operationInFlight) }
+            do {
+                try await driver.setDisconnectedFromSystemAudio(true, item: item)
+                XCTFail("Matching raw state must not bypass the in-flight guard")
+            } catch { XCTAssertEqual(error, .operationInFlight) }
+        } catch { operationError = error }
+        // Release and join the original transition before detaching the item.
+        driver.holdAudioConnectionCompletion = false
+        driver.releaseAudioConnection()
+        do { try await transition.value }
+        catch {
+            if let operationError {
+                XCTFail("Joining the held connection also failed: \(error)")
+                throw operationError
+            }
+            throw error
+        }
+        let settled = try await driver.directState(item: item)
+        XCTAssertEqual(settled.item, item)
+        XCTAssertEqual(settled.rate, 0)
+        XCTAssertEqual(settled.timeControlStatus, .paused)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        if let operationError { throw operationError }
     }
 
     func testSDKFixedStopStorageAndGapRejection() async throws {
@@ -3367,6 +3520,11 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let prepare = Task { try await harness.prepare() }
         while !gate.started { await Task.yield() }
 
+        XCTAssertEqual(harness.driver.readyConnectionStates, [false])
+        XCTAssertFalse(harness.driver.systemAudioDisconnected)
+        XCTAssertEqual(harness.driver.rate, 0)
+        XCTAssertEqual(harness.driver.playCallCount, 0)
+
         XCTAssertTrue(harness.graph.registry.requestCancel(source))
         for _ in 0..<64 where !gate.cancellationObserved { await Task.yield() }
         let cancellationObserved = gate.cancellationObserved
@@ -3380,6 +3538,11 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTFail("被 Registry 取消的 runner join 必须返回 canceled 终态")
         }
         XCTAssertFalse(gate.hasWaiter)
+        XCTAssertEqual(harness.driver.currentItemIdentity, harness.item,
+                       "Cancellation must retain the installed owner until registered retirement")
+        try await harness.shutdown()
+        XCTAssertNil(harness.driver.currentItemIdentity)
+        XCTAssertTrue(harness.driver.systemAudioDisconnected)
     }
 
     func testReview3CapacityChargesRetainedGraphAndFifthDeadlineFailsClosed() async throws {
@@ -4164,6 +4327,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
         pendingAudioConnection == nil && systemAudioDisconnected
     }
     var audioConnectionChanges: [Bool] = []
+    var readyConnectionStates: [Bool] = []
     var playedWhileDisconnected = false
     var holdAudioConnectionCompletion = false
     private var pendingAudioConnection: (Bool, CheckedContinuation<Void, Never>)?
@@ -4171,6 +4335,8 @@ private final class Task21FakeDriver: AVPlayerDriving {
     func setDisconnectedFromSystemAudio(_ disconnected: Bool,
         item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
         guard currentItemIdentity == item else { throw .staleIdentity }
+        guard pendingAudioConnection == nil else { throw .operationInFlight }
+        guard systemAudioDisconnected != disconnected else { return }
         audioConnectionChanges.append(disconnected)
         if holdAudioConnectionCompletion {
             await withCheckedContinuation { continuation in
@@ -4258,6 +4424,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     }
 
     func waitUntilReady(item: AVPlayerItemInstanceIdentity) async throws -> AVPlayerItemInstanceIdentity {
+        readyConnectionStates.append(systemAudioDisconnected)
         if let readyCancellationGate {
             try await readyCancellationGate.wait()
         }
@@ -4406,6 +4573,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
 
     func directState(item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState {
         operations.append(.readPausedState)
+        guard pendingAudioConnection == nil else { throw .operationInFlight }
         if let directFailure { throw directFailure }
         if holdDirectPausedRead {
             return await withCheckedContinuation { pausedReadContinuation = $0 }
@@ -6399,7 +6567,7 @@ private final class Task21RealIntegrationFixture {
     func verifyNativePauseResumeConnections() async throws {
         _ = try await prepare()
         let physicalItem = try XCTUnwrap(player.currentItem)
-        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        XCTAssertFalse(driver.disconnectedFromSystemAudio)
         var priorReceipt: AVPlayerQuiescenceReceipt?
         for cycle in 0..<2 {
             backend.clearActivationResult()
