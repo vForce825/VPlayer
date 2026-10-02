@@ -543,12 +543,25 @@ final class AudioSessionLifecycleTests: XCTestCase {
         let sdk = AudioSessionSDKSpy(categoryResults: [], multichannelFails: false,
             executor: ControlTaskRegistry().executor)
         let salt = try XCTUnwrap(AudioSessionEndpointSalt.make(using: sdk))
-        for (index, entry) in [(NSNumber(value: Int64.max), true), (NSNumber(value: Int64.min), true),
-            (NSNumber(value: UInt64.max), false), (NSNumber(value: 1.5), false), (NSNumber(value: Double.nan), false),
-            (NSNumber(value: Double.infinity), false), (NSNumber(value: -Double.infinity), false),
-            (NSNumber(value: true), true), (NSNumber(value: false), true),
-            (NSNumber(value: UInt64(Int64.max)), true), (NSNumber(value: UInt64(Int64.max) + 1), false)].enumerated() {
-            let (number, valid) = entry
+        let cases: [(NSNumber, Int64?)] = [
+            (NSNumber(value: Int64.max), Int64.max), (NSNumber(value: Int64.min), Int64.min),
+            (NSNumber(value: UInt64.max), nil), (NSNumber(value: 1.5), nil), (NSNumber(value: Double.nan), nil),
+            (NSNumber(value: Double.infinity), nil), (NSNumber(value: -Double.infinity), nil),
+            (NSNumber(value: true), 1), (NSNumber(value: false), 0),
+            (NSNumber(value: UInt64(Int64.max)), Int64.max), (NSNumber(value: UInt64(Int64.max) + 1), nil),
+            (NSNumber(value: Double(Int64.max)), nil), (NSNumber(value: Double(Int64.min)), Int64.min),
+            (NSNumber(value: Double(Int64.max).nextDown), Int64.max - 1_023),
+            (NSNumber(value: Double(Int64.min).nextDown), nil),
+            (NSNumber(value: Double.greatestFiniteMagnitude), nil),
+            (NSNumber(value: -Double.greatestFiniteMagnitude), nil),
+            (NSNumber(value: Double.leastNonzeroMagnitude), nil),
+            (NSNumber(value: -Double.leastNonzeroMagnitude), nil),
+            (NSNumber(value: 42.0), 42), (NSNumber(value: -42.0), -42),
+            (NSNumber(value: 0.0), 0), (NSNumber(value: -0.0), 0),
+            (NSNumber(value: Float.infinity), nil), (NSNumber(value: -Float.infinity), nil)
+        ]
+        for (index, entry) in cases.enumerated() {
+            let (number, expected) = entry
             weak var routeReference: ObjectiveCRouteDouble?
             weak var portReference: ObjectiveCPortDouble?
             try autoreleasepool {
@@ -563,9 +576,15 @@ final class AudioSessionLifecycleTests: XCTestCase {
                 }
                 XCTAssertNotNil(routeReference)
                 XCTAssertNotNil(portReference)
-                let evidence = AudioSessionBlockingCallLane.project(try XCTUnwrap(snapshot), salt: salt)
-                if valid { guard case .available = evidence else { return XCTFail("精确Int64边界必须有效") } }
-                else { XCTAssertEqual(evidence, .invalid, "dataSource边界用例\(index)") }
+                let retained = try XCTUnwrap(snapshot)
+                let evidence = AudioSessionBlockingCallLane.project(retained, salt: salt)
+                if let expected {
+                    guard case .available = evidence else { return XCTFail("精确Int64边界必须有效：用例\(index)") }
+                    guard case .integer(let actual) = retained.endpoint(at: 0).dataSource else {
+                        return XCTFail("有效数值必须保留精确整数：用例\(index)")
+                    }
+                    XCTAssertEqual(actual, expected, "精确整数不能经过Double舍入：用例\(index)")
+                } else { XCTAssertEqual(evidence, .invalid, "dataSource边界用例\(index)") }
                 snapshot = nil
             }
             XCTAssertNil(routeReference, "+0 ObjC借用可进入autorelease池，但池退出后投影不能强持或泄漏原route")

@@ -90,8 +90,15 @@ final class SystemAudioSessionRouteSnapshot: AudioSessionRouteSnapshot, @uncheck
                 if unsigned && number.uint64Value > UInt64(Int64.max) { dataSource = .invalid }
                 else {
                     let value = unsafeBitCast(number, to: CFNumber.self)
-                    var integer: Int64 = 0
-                    dataSource = CFNumberGetValue(value, .sInt64Type, &integer) ? .integer(integer) : .invalid
+                    if CFNumberIsFloatType(value) {
+                        // CFNumberGetValue can report success for infinity on tvOS27.
+                        // Swift's exact conversion rejects non-finite, fractional, and
+                        // out-of-range values. Integer storage never passes through Double.
+                        dataSource = Int64(exactly: number.doubleValue).map(AudioSessionDataSourceEvidence.integer) ?? .invalid
+                    } else {
+                        var integer: Int64 = 0
+                        dataSource = CFNumberGetValue(value, .sInt64Type, &integer) ? .integer(integer) : .invalid
+                    }
                 }
             } else { dataSource = .invalid }
         } else { dataSource = .missing }

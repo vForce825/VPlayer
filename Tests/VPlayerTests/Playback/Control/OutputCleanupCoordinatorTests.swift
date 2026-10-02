@@ -1696,7 +1696,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             result: .configuration(.multichannelCapability(true))), lane: fixture.lane)), .rejected, "原terminal只签一次receipt")
         XCTAssertEqual(registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt, receipt)
         XCTAssertNil(registry.phase(of: multichannel))
-        let activation = try XCTUnwrap(multichannelCompletion.followUp)
+        XCTAssertNil(multichannelCompletion.followUp,
+            "inactive reset configuration must not authorize automatic activation")
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        let configuredContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
+            contextNonce: configuredContext.contextNonce))
         let activationCompletion = try graphAudioCall(registry, lane: fixture.lane, activation, .activation(nil))
         XCTAssertEqual(activationCompletion.disposition, .accepted)
         XCTAssertNotNil(activationCompletion.followUp, "原activate完成必须交付准确首sampler")
@@ -2185,7 +2190,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testResetInactiveConfigurationHandsOffWithoutActivationOrRetiringPreRouteClock() throws {
-        let fixture = try ResetAcquiringOutputFixture()
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let registry = fixture.registry
         try fixture.acceptLease()
         let original = try XCTUnwrap(registry.outputResourceContextSnapshot())
@@ -2242,9 +2247,10 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     func testFirstSessionResetMaterializesDeadlineBeforeDrainAndTransfersSameTicketToNewRoot() throws {
         let fixture = try AcquiringOutputFixture()
         let registry = fixture.registry
-        registry.executor.sync {
+        try registry.executor.sync {
             fixture.clock.set(200)
             registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
+            try authorizeGraphResetRecoveryClock(registry)
             fixture.clock.set(220)
             registry.executor.safetyIngress.performSyncIngress(.interruptionBegan)
             fixture.clock.set(270)
@@ -2270,7 +2276,14 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(next.ticketIdentity, first.ticketIdentity)
         XCTAssertEqual(next.accumulatedEffectiveTime, 150)
         XCTAssertEqual(next.boundaryEffectiveElapsed, first.boundaryEffectiveElapsed)
-        XCTAssertEqual(next.deadlineArm, first.deadlineArm, "仅换root不能换稳定边界的arm")
+        XCTAssertNil(next.runningSince, "新的reset必须再次等待新epoch的用户操作")
+        XCTAssertNil(next.deadlineArm)
+        try authorizeGraphResetRecoveryClock(registry)
+        let reauthorized = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
+        XCTAssertEqual(reauthorized.ticketIdentity, first.ticketIdentity)
+        XCTAssertEqual(reauthorized.boundaryEffectiveElapsed, first.boundaryEffectiveElapsed)
+        XCTAssertNotEqual(reauthorized.deadlineArm, first.deadlineArm,
+            "新用户操作只能重新arm原边界，不能复用旧freeze generation")
         XCTAssertNotEqual(registry.outputResourceContextSnapshot()?.resetPreRouteBinding, binding)
         XCTAssertNil(try registry.freezeOutputResetPreRouteClock(binding), "旧binding永久无权")
     }
@@ -2296,6 +2309,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
             _ = registry.executor.withSafetyIngressBarrier(operationDescriptor: .resourceOwnership) { _ in }
         }
+        try authorizeGraphResetRecoveryClock(registry)
         let first = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         registry.executor.sync {
             fixture.clock.set(220)
@@ -2355,7 +2369,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testResetClockSettlesOriginalParentAndTighteningPastElapsedPoisonsOwner() throws {
-        let fixture = try ResetAcquiringOutputFixture()
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let registry = fixture.registry
         let binding = try XCTUnwrap(registry.outputResourceContextSnapshot()?.resetAcquisitionBinding?.binding)
         XCTAssertTrue(registry.claimStart(fixture.acquire))
@@ -2367,10 +2381,11 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(parent.identity, fixture.parentIdentity)
         XCTAssertEqual(parent.accumulatedEffectiveTime, 2_000_000_000, "reset结算必须同步原parent，不能只更新边界副本")
         XCTAssertNil(parent.runningSince)
-        XCTAssertNil(try registry.tightenOutputResetPreRouteBoundary(binding, mandatorySuffix: 39_000_000_000))
+        let tightenedSuffix = parent.cap - 1_000_000_000
+        XCTAssertNil(try registry.tightenOutputResetPreRouteBoundary(binding, mandatorySuffix: tightenedSuffix))
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         XCTAssertEqual(state.boundaryEffectiveElapsed, 1_000_000_000)
-        XCTAssertEqual(state.mandatorySuffix, 39_000_000_000)
+        XCTAssertEqual(state.mandatorySuffix, tightenedSuffix)
         XCTAssertEqual(state.accumulatedEffectiveTime, 2_000_000_000)
         XCTAssertNil(state.deadlineArm)
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
@@ -2381,8 +2396,10 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testResetBoundaryRejectsQueuedAcquireBeforeTimerAndKeepsExactNoInvocationProof() throws {
-        let fixture = try ResetAcquiringOutputFixture()
-        fixture.clock.set(10_000_000_100)
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
+        let state = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
+        fixture.clock.set(try XCTUnwrap(state.runningSince)
+            + state.boundaryEffectiveElapsed - state.accumulatedEffectiveTime)
         XCTAssertFalse(fixture.registry.claimStart(fixture.acquire), "claim自身必须读唯一有效边界，不能等timer回调")
         let context = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
         XCTAssertTrue(context.poisoned)
@@ -2390,6 +2407,22 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(context.acquisitionNoLeaseReceipt?.acquisitionTicket, fixture.acquire)
         XCTAssertEqual(context.acquisitionNoLeaseReceipt?.outcome, .canceledBeforeClaim)
         XCTAssertEqual(fixture.registry.phase(of: fixture.acquire), .terminal(.canceled))
+    }
+
+    func testResetWithoutFreshUserActionKeepsQueuedRecoveryBudgetParked() throws {
+        let fixture = try ResetAcquiringOutputFixture()
+        let before = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
+        fixture.clock.set(fixture.clock.read() + before.boundaryEffectiveElapsed + 1)
+        let after = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
+        XCTAssertEqual(after.ticketIdentity, before.ticketIdentity)
+        XCTAssertEqual(after.effectiveElapsed(at: fixture.clock.read()), 0)
+        XCTAssertNil(after.runningSince)
+        XCTAssertNil(after.deadlineArm)
+        XCTAssertEqual(fixture.registry.phase(of: fixture.acquire), .queued)
+        XCTAssertFalse(fixture.registry.outputResourceContextSnapshot()?.poisoned == true,
+            "manual-wait time cannot expire the effective recovery budget")
+        XCTAssertTrue(fixture.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        XCTAssertFalse(fixture.registry.executor.safetyIngress.snapshot.outputPermitPresent)
     }
 
     func testHandoffGenerationMismatchPoisonsOriginalOwnerWithoutPublishingCandidate() throws {
@@ -2582,7 +2615,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             .configuration(.multichannelCapability(true)))
         XCTAssertEqual(secondConfigurationCompletion.disposition, .accepted)
         XCTAssertNil(registry.phase(of: secondMultichannel))
-        let secondActivation = try XCTUnwrap(secondConfigurationCompletion.followUp)
+        XCTAssertNil(secondConfigurationCompletion.followUp,
+            "the second reset also needs a fresh current-epoch user action")
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        let secondConfiguredContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let secondActivation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
+            contextNonce: secondConfiguredContext.contextNonce))
         let secondActivationRequest = try claimGraphAudioCall(registry, lane: ordinary.lane, secondActivation)
         let secondActivationCompletion = try completeGraphAudioCall(registry, lane: ordinary.lane,
             secondActivationRequest, .activation(nil))
@@ -2600,9 +2638,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let registry = ControlTaskRegistry(clock: clock)
         let root = try capturedResetRoot(registry)
         let proof = try XCTUnwrap(registry.issueEmptyOutputResetDrainProof(root: root))
-        let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
-        let parent = CurrentPlaybackOperationDeadlineTicket.coldStart(.init(identity: .init(sessionIdentity: session, nonce: 1),
-            kind: .coldStart, originInstant: 50, cap: 40_000_000_000, accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        let parent = try registry.admitPlaybackRequest(requestID: UUID())
+        let session = parent.value.identity.sessionIdentity
+        XCTAssertFalse(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        XCTAssertGreaterThan(parent.value.cap, 32_000_000_000)
+        guard parent.value.cap > 32_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
         let acquire = try XCTUnwrap(registry.beginResetOutputAcquisition(session: session, parent: parent,
             admission: .init(proof: proof, mandatorySuffix: 30_000_000_000, inheritedRouteAvailabilityConstraint: nil)),
             "reset-mode admission必须一次安装原parent、唯一边界及binding")
@@ -2617,7 +2658,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(reset.proof, proof)
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         XCTAssertEqual(state.ticketIdentity, reset.preRouteTicket.identity)
-        XCTAssertEqual(state.boundaryEffectiveElapsed, 10_000_000_000)
+        XCTAssertEqual(state.boundaryEffectiveElapsed, originalParent.cap - 30_000_000_000)
         XCTAssertEqual(state.runningSince, 100)
         XCTAssertNotNil(state.deadlineArm)
         XCTAssertNil(context.acquisitionDeadline, "acquire自己5秒必须从实际claim才启动")
@@ -2630,7 +2671,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         clock.set(2_000_000_100)
         let tightened = try XCTUnwrap(registry.tightenOutputResetPreRouteBoundary(reset.binding, mandatorySuffix: 32_000_000_000))
         XCTAssertEqual(tightened.ticketIdentity, state.ticketIdentity)
-        XCTAssertEqual(tightened.boundaryEffectiveElapsed, 8_000_000_000)
+        XCTAssertEqual(tightened.boundaryEffectiveElapsed, originalParent.cap - 32_000_000_000)
         XCTAssertEqual(tightened.accumulatedEffectiveTime, frozen.accumulatedEffectiveTime)
         XCTAssertNil(tightened.deadlineArm)
         let resumed = try XCTUnwrap(registry.resumeOutputResetPreRouteClock(reset.binding))
@@ -4729,6 +4770,25 @@ func prepareGraphResetActivationAfterUserResume(_ registry: ControlTaskRegistry,
     return registry.prepareExplicitResume(for: lease)
 }
 
+/// A fresh current-epoch user action starts logical recovery; it grants no
+/// physical activation or drain proof. Keep the reset-only parked state visible.
+func authorizeGraphResetRecoveryClock(_ registry: ControlTaskRegistry,
+    file: StaticString = #filePath, line: UInt = #line) throws {
+    let before = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot(), file: file, line: line)
+    XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
+        file: file, line: line)
+    XCTAssertNil(before.runningSince, file: file, line: line)
+    XCTAssertNil(before.deadlineArm, file: file, line: line)
+    XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .resume)),
+        .acceptedWaiting, file: file, line: line)
+    let after = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot(), file: file, line: line)
+    XCTAssertEqual(after.ticketIdentity, before.ticketIdentity, file: file, line: line)
+    XCTAssertEqual(after.accumulatedEffectiveTime, before.accumulatedEffectiveTime, file: file, line: line)
+    XCTAssertEqual(after.runningSince, registry.clock.nowNanoseconds, file: file, line: line)
+    XCTAssertNotNil(after.deadlineArm, file: file, line: line)
+    XCTAssertFalse(registry.executor.safetyIngress.snapshot.outputPermitPresent, file: file, line: line)
+}
+
 struct ResetAcquiringOutputFixture {
     let clock: OutputTestClock
     let registry: ControlTaskRegistry
@@ -4736,19 +4796,43 @@ struct ResetAcquiringOutputFixture {
     let acquire: ControlTaskTicket
     let parentIdentity: PlaybackProgressBudgetTicket.Identity
     init(allocator: PlaybackIdentityAllocator = .init(),
-        clock: OutputTestClock = .init(100)) throws {
+        clock: OutputTestClock = .init(100), freshUserPlayback: Bool = false) throws {
         self.clock = clock
         registry = ControlTaskRegistry(allocator: allocator, clock: clock)
         lane = try bindGraphAudioSessionLane(registry)
         let root = try capturedResetRoot(registry)
         let proof = try XCTUnwrap(registry.issueEmptyOutputResetDrainProof(root: root))
-        let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
-        parentIdentity = .init(sessionIdentity: session, nonce: 1)
-        let parent = CurrentPlaybackOperationDeadlineTicket.coldStart(.init(identity: parentIdentity,
-            kind: .coldStart, originInstant: 50, cap: 40_000_000_000,
-            accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
+            "reset alone must keep recovery parked until a fresh user action")
+        let parent: CurrentPlaybackOperationDeadlineTicket
+        if freshUserPlayback {
+            parent = try registry.admitPlaybackRequest(requestID: UUID())
+            parentIdentity = parent.value.identity
+            XCTAssertEqual(registry.playbackRequestAdmissionSnapshot(), parent)
+            XCTAssertFalse(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        } else {
+            parentIdentity = .init(sessionIdentity: .init(sessionID: 1, requestID: UUID()), nonce: 1)
+            parent = .coldStart(.init(identity: parentIdentity,
+                kind: .coldStart, originInstant: 50, cap: 40_000_000_000,
+                accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
+        }
+        let session = parentIdentity.sessionIdentity
+        XCTAssertGreaterThan(parent.value.cap, 30_000_000_000)
+        guard parent.value.cap > 30_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
         acquire = try XCTUnwrap(registry.beginResetOutputAcquisition(session: session, parent: parent,
             admission: .init(proof: proof, mandatorySuffix: 30_000_000_000, inheritedRouteAvailabilityConstraint: nil)))
+        let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
+        XCTAssertEqual(state.boundaryEffectiveElapsed, parent.value.cap - 30_000_000_000)
+        XCTAssertEqual(registry.phase(of: acquire), .queued)
+        XCTAssertNil(registry.outputResourceContextSnapshot()?.acquisitionDeadline,
+            "logical recovery authorization must not start an unclaimed physical acquire deadline")
+        if freshUserPlayback {
+            XCTAssertEqual(state.runningSince, clock.read())
+            XCTAssertNotNil(state.deadlineArm)
+        } else {
+            XCTAssertNil(state.runningSince)
+            XCTAssertNil(state.deadlineArm)
+        }
     }
     func acceptLease() throws {
         XCTAssertTrue(registry.claimStart(acquire))

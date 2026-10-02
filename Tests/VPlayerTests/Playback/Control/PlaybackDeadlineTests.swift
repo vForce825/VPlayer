@@ -216,12 +216,14 @@ final class PlaybackDeadlineTests: XCTestCase {
         XCTAssertFalse(registry.completePlaybackMediaProgress(active.receipt), "重复progress不得创建新45秒parent")
     }
 
-    func testFirstProgressThenResetCreatesRunningRecoveryParentInIngressCAS() throws {
+    func testFirstProgressThenResetCreatesParkedRecoveryParentUntilFreshUserAction() throws {
         let active = try ActiveDeadlineFixture()
         XCTAssertTrue(active.fixture.registry.completePlaybackMediaProgress(active.receipt))
         let resetInstant = active.clock.read() + 10
         active.clock.set(resetInstant)
         _ = try capturedResetRoot(active.fixture.registry)
+        XCTAssertNil(active.fixture.registry.outputResourceContextSnapshot()?.parentDeadline?.value.runningSince)
+        try authorizeGraphResetRecoveryClock(active.fixture.registry)
         guard case .outputRecovery(let parent) = active.fixture.registry.outputResourceContextSnapshot()?.parentDeadline else {
             return XCTFail("首progress后的真实reset必须在消费ingress时创建recovery parent")
         }
@@ -333,7 +335,7 @@ final class PlaybackDeadlineTests: XCTestCase {
     }
 
     func testResetAndPostTimersUseStrictBoundaryAndInvalidateFrozenArm() throws {
-        let reset = try ResetAcquiringOutputFixture()
+        let reset = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let registry = reset.registry
         let initial = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         let resetArm = try XCTUnwrap(initial.deadlineArm)
@@ -401,7 +403,7 @@ final class PlaybackDeadlineTests: XCTestCase {
     }
 
     func testResetTimerBackwardClockFailsClosedInSameCellCall() throws {
-        let fixture = try ResetAcquiringOutputFixture()
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let state = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
         let arm = try XCTUnwrap(state.deadlineArm)
         fixture.clock.set(try XCTUnwrap(state.runningSince) - 1)
@@ -449,7 +451,7 @@ final class PlaybackDeadlineTests: XCTestCase {
         XCTAssertEqual(checkedOrdinary.ticketIdentity, ordinary.ticketIdentity)
         XCTAssertNotEqual(checkedOrdinary, ordinary, "ordinary投递必须安装新checked arm")
 
-        let reset = try ResetAcquiringOutputFixture()
+        let reset = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let resetArm = try XCTUnwrap(reset.registry.resetPreRouteDeadlineSnapshot()?.deadlineArm)
         let resetScheduler = PlaybackDeadlineScheduler(registry: reset.registry)
         resetScheduler.armResetPreRoute(resetArm)
@@ -529,7 +531,7 @@ final class PlaybackDeadlineTests: XCTestCase {
     func testManualClockOriginsStayIdleUntilAdvanceAndDeliverOneExactBoundary() throws {
         for origin: UInt64 in [0, 100] {
             let clock = ManualPlaybackClock(nowNanoseconds: origin)
-            let fixture = try ResetAcquiringOutputFixture(clock: clock)
+            let fixture = try ResetAcquiringOutputFixture(clock: clock, freshUserPlayback: true)
             let registry = fixture.registry
             let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
             let arm = try XCTUnwrap(state.deadlineArm)
@@ -559,7 +561,7 @@ final class PlaybackDeadlineTests: XCTestCase {
 
     func testManualEarlyWakeRearmsSameResetTicketWithoutRenewingAbsoluteBoundary() throws {
         let clock = ManualPlaybackClock(nowNanoseconds: 100)
-        let fixture = try ResetAcquiringOutputFixture(clock: clock)
+        let fixture = try ResetAcquiringOutputFixture(clock: clock, freshUserPlayback: true)
         let registry = fixture.registry
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         let arm = try XCTUnwrap(state.deadlineArm)
@@ -656,13 +658,19 @@ final class PlaybackDeadlineTests: XCTestCase {
     }
 
     func testResetTerminalPreparationFailureDoesNotPartiallyInstallSettledClock() throws {
-        let origin = UInt64.max - 30_000_000_000
-        let clock = ManualPlaybackClock(nowNanoseconds: origin)
-        let fixture = try ResetAcquiringOutputFixture(clock: clock)
+        // First prove ordinary admission and arming succeeded at a safe origin.
+        // Only terminal cleanup preparation is asked to operate at UInt64.max.
+        let clock = ManualPlaybackClock(nowNanoseconds: 100)
+        let fixture = try ResetAcquiringOutputFixture(clock: clock, freshUserPlayback: true)
         let registry = fixture.registry
         let beforeState = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         let beforeContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
         let arm = try XCTUnwrap(beforeState.deadlineArm)
+        XCTAssertNil(registry.executor.safetyIngress.snapshot.failure)
+        XCTAssertFalse(beforeContext.poisoned)
+        XCTAssertEqual(registry.rearmOutputResetPreRouteDeadline(arm)?.remainingNanoseconds,
+            beforeState.boundaryEffectiveElapsed - beforeState.accumulatedEffectiveTime)
+        XCTAssertEqual(registry.resetPreRouteDeadlineSnapshot(), beforeState)
 
         clock.set(nowNanoseconds: .max)
         XCTAssertNil(registry.executor.performPlaybackBudget(.resetPreRouteTimer(arm)),

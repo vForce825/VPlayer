@@ -38,7 +38,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     private var interruptionActive = false
     private var systemPauseRequired = false
     private var resumeVetoRequired = false
-    private var resumeRequestInFlight = false
+    private var resumeRequestInFlight: AudioSessionLifecycleEpoch?
     // 同一session的终态只关闭一次presentation；恢复/切路由只clear，不占用此终态身份。
     private var finishedPresentationSession: PlaybackSessionIdentity?
     private var diagnosticStage = "init" {
@@ -754,24 +754,28 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             break
         }
         
+        guard let context = registry.outputResourceContextSnapshot() else { return }
+        let safety = registry.executor.safetyIngress.snapshot
+        let resumeEpoch = AudioSessionLifecycleEpoch(safety)
+        // Safety callbacks fold synchronously before their actor messages arrive.
+        // Admit this action against that current physical state, even if the
+        // controller's reset/ended presentation flags have not caught up yet.
+        let requiresExplicitResume = resumeVetoRequired || safety.interruptionVeto || safety.mediaServicesResumeRequired
         // An idempotent duplicate does not cancel the earlier physical command.
         // In particular a duplicate Play rejected by resumeRequestInFlight must
         // not strand the original resume waiter with an obsolete revision.
         let duplicatePause = paused && controllerState.userPaused
-        let duplicateResume = !paused && (resumeVetoRequired ? resumeRequestInFlight : !controllerState.userPaused)
+        let duplicateResume = !paused && (requiresExplicitResume ? resumeRequestInFlight == resumeEpoch : !controllerState.userPaused)
         if !duplicatePause && !duplicateResume { userControlRevision &+= 1 }
         let controlRevision = userControlRevision
-        guard let context = registry.outputResourceContextSnapshot() else { return }
-        let safety = registry.executor.safetyIngress.snapshot
-        let resumeEpoch = AudioSessionLifecycleEpoch(safety)
         let sessionIdentity = context.sessionIdentity
         guard sessionIdentity.requestID == request.id else { return }
-        if !paused, resumeVetoRequired {
+        if !paused, requiresExplicitResume {
             controllerState.userPaused = false
             publish(.paused(request))
-            guard !interruptionActive, !resumeRequestInFlight,
+            guard safety.interruptionState != .began, resumeRequestInFlight != resumeEpoch,
                   let run = admittedRun, let lease = registry.audioSessionLease(session: sessionIdentity) else { return }
-            resumeRequestInFlight = true
+            resumeRequestInFlight = resumeEpoch
             await registry.joinOwnedTerminalCleanup()
             guard isCurrent(run), ownsUserControl(controlRun, revision: controlRevision),
                   AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return }
@@ -779,8 +783,10 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                owner.reason == .recovery, retained.pendingReset == nil {
                 _ = try? registry.finishRetainedOutputCleanup(owner: owner)
             }
-            if !audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch) { resumeRequestInFlight = false }
-            if context.phase == .pendingLeaseAcquisition, resumeRequestInFlight {
+            if !audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch) {
+                clearResumeRequest(matching: resumeEpoch)
+            }
+            if context.phase == .pendingLeaseAcquisition, resumeRequestInFlight == resumeEpoch {
                 // 此session仍由原acquisition等待者消费真实active completion，不启动第二prepare。
                 resumeVetoRequired = false
                 systemPauseRequired = false
@@ -798,7 +804,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         )
         let controlResult = registry.performOutputUserControl(userControl)
         if case .rejected = controlResult { return }
-        if paused { resumeRequestInFlight = false }
+        if paused { resumeRequestInFlight = nil }
         
         guard controllerState.userPaused != paused else { return }
         controllerState.userPaused = paused
@@ -808,15 +814,17 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             guard !paused, let run = admittedRun else { return }
             if context.pendingReset != nil {
                 await continueResetRecovery(identity: run)
-            } else if !interruptionActive, let lease = registry.audioSessionLease(session: sessionIdentity) {
-                resumeRequestInFlight = true
+            } else if safety.interruptionState != .began, let lease = registry.audioSessionLease(session: sessionIdentity) {
+                resumeRequestInFlight = resumeEpoch
                 await registry.joinOwnedTerminalCleanup()
                 guard isCurrent(run), ownsUserControl(controlRun, revision: controlRevision),
                       AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return }
                 if let owner = registry.outputResourceContextSnapshot()?.owner {
                     _ = try? registry.finishRetainedOutputCleanup(owner: owner)
                 }
-                resumeRequestInFlight = audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch)
+                if !audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch) {
+                    clearResumeRequest(matching: resumeEpoch)
+                }
             }
             return
         }
@@ -863,6 +871,17 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 paused: false, readinessCycle: controllerState.readinessCycle)
             publish(.preparing(request))
         }
+    }
+
+    /// This marker only coalesces controller actions; Registry still owns physical permission.
+    private func clearResumeRequest(matching epoch: AudioSessionLifecycleEpoch) {
+        if resumeRequestInFlight == epoch { resumeRequestInFlight = nil }
+    }
+
+    private func discardObsoleteResumeRequest() {
+        guard let pending = resumeRequestInFlight,
+              pending != AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) else { return }
+        clearResumeRequest(matching: pending)
     }
 
     public func stop() async { await stop(expectedRequestID: nil) }
@@ -1337,7 +1356,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         let event = envelope.event
         switch event {
         case .interruptionBegan:
-            resumeRequestInFlight = false
+            discardObsoleteResumeRequest()
             guard !interruptionActive else { return }
             interruptionActive = true
             systemPauseRequired = true
@@ -1365,7 +1384,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 _ = registry.startOwnedInterruptionCleanup(owner: owner, receiver: self)
             }
         case .mediaServicesWereReset:
-            resumeRequestInFlight = false
+            discardObsoleteResumeRequest()
             interruptionActive = registry.executor.safetyIngress.snapshot.interruptionState == .began
             systemPauseRequired = true
             resumeVetoRequired = true
@@ -1377,7 +1396,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             await continueResetRecovery(identity: identity)
         case let .interruptionEnded(shouldResume):
             interruptionActive = false
-            resumeRequestInFlight = false
+            discardObsoleteResumeRequest()
             let requiresUserResume = registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired
             resumeVetoRequired = !shouldResume || requiresUserResume
             systemPauseRequired = true
@@ -1394,9 +1413,15 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             guard shouldResume, !controllerState.userPaused,
                   let lease = registry.audioSessionLease(session: context.sessionIdentity) else { return }
             _ = try? registry.finishRetainedOutputCleanup(owner: owner)
-            resumeRequestInFlight = audioSessionOwner.requestAutomaticResume(for: lease)
+            let automaticEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
+            if audioSessionOwner.requestAutomaticResume(for: lease) {
+                resumeRequestInFlight = automaticEpoch
+            }
         case .explicitResumeSucceeded, .resetConfigurationSucceeded:
-            resumeRequestInFlight = false
+            if let receipt = envelope.reactivationReceipt {
+                clearResumeRequest(matching: .init(interruption: receipt.interruptionEpoch,
+                    mediaServices: receipt.mediaServicesEpoch))
+            }
             guard systemPauseRequired, !interruptionActive,
                   !registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
                   let run = admittedRun, let context = registry.outputResourceContextSnapshot() else { return }
@@ -1563,7 +1588,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         interruptionActive = false
         systemPauseRequired = false
         resumeVetoRequired = false
-        resumeRequestInFlight = false
+        resumeRequestInFlight = nil
         if let context = registry.outputResourceContextSnapshot() {
             registry.deactivateOutputEventRelays(session: context.sessionIdentity)
         }

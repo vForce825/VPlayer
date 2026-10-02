@@ -873,6 +873,78 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         await controller.stop()
     }
 
+    func testNewResetScopeReplacesOldResumeWaiterBeforeResetActorDelivery() async throws {
+        let retirement = Task9OperationGate()
+        let registry = ControlTaskRegistry(allocator: .init())
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let factory = Task9PreparedFactory(retirementGate: retirement)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: factory)
+        let current = request()
+        await controller.play(current)
+        owner.monitor.emit(.interruptionBegan)
+        owner.monitor.emit(.interruptionEnded(shouldResume: false))
+        await retirement.waitUntilEntered()
+        for _ in 0..<500 {
+            if await controller.currentStateForTesting == .paused(current),
+               !(await controller.audioSessionInterruptedForTesting) { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let oldResume = Task { await controller.setPaused(false) }
+        for _ in 0..<500 {
+            if await controller.task9ResumeRequestIsInFlight { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let oldWaiting = await controller.task9ResumeRequestIsInFlight
+        XCTAssertTrue(oldWaiting)
+        let folded = expectation(description: "New reset folded while old resume joins retirement")
+        let delivered = expectation(description: "Delayed reset delivered")
+        let activated = expectation(description: "Only the new user action reaches activation")
+        let deliveryGate = DispatchSemaphore(value: 0)
+        let activationGate = DispatchSemaphore(value: 0)
+        defer { deliveryGate.signal(); activationGate.signal() }
+        sdk.lock.withLock { sdk.onActivate = { activated.fulfill(); activationGate.wait() } }
+        DispatchQueue.global().async {
+            owner.monitor.emit(.mediaServicesWereReset,
+                beforeProductionDelivery: { folded.fulfill(); deliveryGate.wait() })
+            delivered.fulfill()
+        }
+        await fulfillment(of: [folded], timeout: 2)
+        let newEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
+        let newResume = Task { await controller.setPaused(false) }
+        for _ in 0..<500 {
+            if await controller.task9ResumeRequestEpoch == newEpoch { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let admittedNewEpoch = await controller.task9ResumeRequestEpoch
+        XCTAssertEqual(admittedNewEpoch, newEpoch,
+            "The obsolete waiter cannot make a post-reset user action look like a duplicate")
+        await retirement.release()
+        await oldResume.value
+        await newResume.value
+        let afterOldWaiter = await controller.task9ResumeRequestEpoch
+        XCTAssertEqual(afterOldWaiter, newEpoch, "Old waiter exit must not clear the new action's marker")
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.pendingResetResumeIntent?.epoch, newEpoch)
+        XCTAssertEqual(sdk.lock.withLock { sdk.activateCallCount }, 1)
+        deliveryGate.signal()
+        await fulfillment(of: [delivered, activated], timeout: 2)
+        let duringNewActivation = await controller.task9ResumeRequestEpoch
+        XCTAssertEqual(duringNewActivation, newEpoch, "Late reset delivery must preserve the accepted current action")
+        sdk.lock.withLock { sdk.onActivate = nil }
+        activationGate.signal()
+        for _ in 0..<1_000 {
+            if factory.backends.count == 2, factory.backends.last?.activationCount == 1 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(sdk.lock.withLock { sdk.activateCallCount }, 2)
+        XCTAssertEqual(factory.backends.count, 2)
+        let completedMarker = await controller.task9ResumeRequestEpoch
+        XCTAssertNil(completedMarker)
+        await controller.stop()
+    }
+
     func testBeganDuringResetConfigurationKeepsSafeConfigurationAndResumesOnce() async throws {
         try await assertBeganDuringResetSDK(activationInFlight: false)
     }
@@ -1117,6 +1189,72 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         _ = try XCTUnwrap(registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt)
         XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
         await controller.setPaused(false)
+    }
+
+    func testPlayAfterResetFoldIsRetainedBeforeControllerReceivesReset() async throws {
+        try await assertPlayAfterSafetyFoldBeforeControllerDelivery(resetDelivery: true)
+    }
+
+    func testPlayAfterEndedFoldUsesCurrentPhysicalStateBeforeControllerDelivery() async throws {
+        try await assertPlayAfterSafetyFoldBeforeControllerDelivery(resetDelivery: false)
+    }
+
+    private func assertPlayAfterSafetyFoldBeforeControllerDelivery(resetDelivery: Bool) async throws {
+        let registry = ControlTaskRegistry(allocator: .init())
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let factory = Task9PreparedFactory()
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: factory)
+        await controller.play(request())
+        if !resetDelivery {
+            owner.monitor.emit(.mediaServicesWereReset)
+            owner.monitor.emit(.interruptionBegan)
+            for _ in 0..<1_000 {
+                if registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt != nil,
+                   await controller.audioSessionInterruptedForTesting { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            _ = try XCTUnwrap(registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt)
+            let interrupted = await controller.audioSessionInterruptedForTesting
+            XCTAssertTrue(interrupted)
+        }
+        let folded = expectation(description: "Safety state folded before actor delivery")
+        let delivered = expectation(description: "Held system event delivered")
+        let activated = expectation(description: "Current user action reaches physical activation")
+        let deliveryGate = DispatchSemaphore(value: 0)
+        let activationGate = DispatchSemaphore(value: 0)
+        defer { deliveryGate.signal(); activationGate.signal() }
+        sdk.lock.withLock { sdk.onActivate = { activated.fulfill(); activationGate.wait() } }
+        DispatchQueue.global().async {
+            owner.monitor.emit(resetDelivery ? .mediaServicesWereReset : .interruptionEnded(shouldResume: true),
+                beforeProductionDelivery: { folded.fulfill(); deliveryGate.wait() })
+            delivered.fulfill()
+        }
+        await fulfillment(of: [folded], timeout: 2)
+        let userEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
+        XCTAssertNotEqual(registry.executor.safetyIngress.snapshot.interruptionState, .began)
+        await controller.setPaused(false)
+        if resetDelivery {
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.pendingResetResumeIntent?.epoch, userEpoch)
+            XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
+                "Early user intent must wait for real reset configuration instead of clearing its gate")
+            XCTAssertEqual(sdk.lock.withLock { sdk.activateCallCount }, 1)
+        }
+        deliveryGate.signal()
+        await fulfillment(of: [delivered, activated], timeout: 2)
+        sdk.lock.withLock { sdk.onActivate = nil }
+        activationGate.signal()
+        for _ in 0..<1_000 {
+            if factory.backends.count == 2, factory.backends.last?.activationCount == 1 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(sdk.lock.withLock { sdk.activateCallCount }, 2)
+        XCTAssertEqual(factory.backends.count, 2)
+        XCTAssertEqual(factory.backends.last?.activationCount, 1)
+        XCTAssertNil(registry.outputResourceContextSnapshot()?.pendingReset)
+        await controller.stop()
     }
 
     func testProductionBeganEndedResetDrainsOnceAndCreatesOneResetSuccessor() async throws {
@@ -1391,13 +1529,24 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
             .interruptionBegan, .interruptionEnded(shouldResume: false)
         ]
         let events = (0..<count).map { pattern[$0 % pattern.count] }
-        let expected: [PlaybackAudioSessionEvent] = count == 32 ? events : [.recoveryFailed(stage: .eventRelayCapacity)]
-        registry.executor.sync {
+        let authoritativeEvents = registry.executor.sync { () -> [PlaybackAudioSessionEvent] in
+            var values: [PlaybackAudioSessionEvent] = []
             for event in events {
                 guard let envelope = monitor.emit(event) else { XCTFail("原Cell应签发事件key"); continue }
+                // A legacy recommendation after reset cannot authorize automatic
+                // resumption. FIFO preserves the monitor's canonical system key.
+                let expectedEvent: PlaybackAudioSessionEvent = event == .interruptionEnded(shouldResume: true)
+                    ? .interruptionEnded(shouldResume: false) : event
+                XCTAssertEqual(envelope.event, expectedEvent,
+                    "reset后的自动恢复建议必须被manual-resume gate拒绝，其余事件保持原值")
+                values.append(envelope.event)
                 relay.send(lease: lease, event: envelope)
             }
+            return values
         }
+        XCTAssertEqual(authoritativeEvents.count, count)
+        let expected: [PlaybackAudioSessionEvent] = count == 32 ? authoritativeEvents
+            : [.recoveryFailed(stage: .eventRelayCapacity)]
         await fulfillment(of: [received], timeout: 1)
         XCTAssertEqual(resultLock.withLock { delivered }, expected,
             "只排队尚未进入receiver不能虚占一个in-flight槽；两种reset/interruption次序都须保留")
@@ -1676,14 +1825,27 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         fixture.owner.monitor.setEventHandler { event in
             if event.event == .explicitResumeSucceeded { staleSuccess.fulfill() }
         }
-        XCTAssertTrue(fixture.owner.requestResume(for: fixture.lease))
+        let originalActionEpoch = AudioSessionLifecycleEpoch(fixture.registry.executor.safetyIngress.snapshot)
+        XCTAssertTrue(fixture.owner.requestResume(for: fixture.lease, expectedEpoch: originalActionEpoch))
         wait(for: [entered], timeout: 1)
         fixture.owner.monitor.emit(physicalEvent)
         completionGate.signal()
         wait(for: [returned, staleSuccess], timeout: 0.1)
         XCTAssertEqual(fixture.sdk.lock.withLock { fixture.sdk.activateCallCount }, 1)
         XCTAssertNil(fixture.registry.outputResourceContextSnapshot()?.sessionReceipts?.active)
-        XCTAssertFalse(fixture.owner.requestResume(for: fixture.lease), "新物理事件撤销旧proof的恢复调用权")
+        XCTAssertFalse(fixture.owner.requestResume(for: fixture.lease, expectedEpoch: originalActionEpoch),
+            "The pre-event user action cannot adopt the new physical epoch")
+        if physicalEvent == .mediaServicesWereReset {
+            XCTAssertTrue(fixture.owner.requestResume(for: fixture.lease),
+                "A fresh post-reset action may be retained while current configuration is pending")
+            XCTAssertTrue(fixture.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+            XCTAssertEqual(fixture.sdk.lock.withLock { fixture.sdk.activateCallCount }, 1,
+                "Fresh intent cannot activate before the new physical drain/configuration proof exists")
+            XCTAssertNil(fixture.registry.outputResourceContextSnapshot()?.sessionReceipts?.active)
+        } else {
+            XCTAssertFalse(fixture.owner.requestResume(for: fixture.lease),
+                "A real current interruption still vetoes even a fresh user action")
+        }
     }
 
     func testSupersededRequestAdmissionCannotAcquireOrCancelItsReplacement() throws {
@@ -4452,6 +4614,10 @@ final class Task9RuntimeCapacityTests: XCTestCase {
 // existing coordination flag a deterministic boundary observation without a production hook.
 private extension PlaybackController {
     var task9ResumeRequestIsInFlight: Bool {
-        Mirror(reflecting: self).children.first { $0.label == "resumeRequestInFlight" }?.value as? Bool ?? false
+        guard let value = task9Field("resumeRequestInFlight", of: self) else { return false }
+        return (value as? Bool) ?? (value is AudioSessionLifecycleEpoch)
+    }
+    var task9ResumeRequestEpoch: AudioSessionLifecycleEpoch? {
+        task9Field("resumeRequestInFlight", of: self) as? AudioSessionLifecycleEpoch
     }
 }
