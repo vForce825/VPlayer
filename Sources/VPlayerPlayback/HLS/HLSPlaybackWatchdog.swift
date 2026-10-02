@@ -49,6 +49,8 @@ public actor HLSPlaybackWatchdog {
     private var softCapBacklogStartTime: TimeInterval? = nil
     private var starvationStartTime: TimeInterval? = nil
     private var recoveryScheduled: Bool = false
+    private var scopedSession: PlaybackSessionIdentity?
+    private var scopedControlRevision: UInt64 = 0
 
     public init(
         recoveryCoordinator: PlaybackRecoveryCoordinator,
@@ -67,6 +69,32 @@ public actor HLSPlaybackWatchdog {
         currentActivationEpoch = activationEpoch
         lastObservedProgressTime = now()
         recoveryScheduled = false
+    }
+
+    /// Session IDs come from the controller's monotonic identity allocator.
+    /// Retain the latest identity across disarm so an old queued arm is rejected.
+    func arm(activationEpoch: UInt64, hasObservedProgress: Bool,
+             session: PlaybackSessionIdentity, controlRevision: UInt64) {
+        guard accepts(session: session, controlRevision: controlRevision) else { return }
+        arm(activationEpoch: activationEpoch, hasObservedProgress: hasObservedProgress)
+    }
+
+    func disarm(session: PlaybackSessionIdentity, controlRevision: UInt64) {
+        guard accepts(session: session, controlRevision: controlRevision) else { return }
+        disarm()
+    }
+
+    private func accepts(session: PlaybackSessionIdentity, controlRevision: UInt64) -> Bool {
+        if let scopedSession {
+            if session == scopedSession {
+                guard controlRevision >= scopedControlRevision else { return false }
+            } else {
+                guard session.sessionID > scopedSession.sessionID else { return false }
+            }
+        }
+        scopedSession = session
+        scopedControlRevision = controlRevision
+        return true
     }
 
     /// prepare、资源服务就绪、route debounce、handoff、用户暂停、系统中断和 permit revoke 均同步 freeze/cancel watchdog。

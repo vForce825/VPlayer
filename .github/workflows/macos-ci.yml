@@ -59,13 +59,13 @@ jobs:
       - name: Generate project for SDK migration diagnostic
         run: ./Scripts/bootstrap.sh --generate
 
-      - name: Record generated output fingerprints
+      - name: Export bounded generated outputs to build log
         run: |
           python3 - <<'PY'
-          import hashlib, pathlib, subprocess
+          import base64, hashlib, pathlib, subprocess
           commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           print("GENERATED_SOURCE_COMMIT=" + commit)
-          print("GENERATED_LOCAL_SOURCE_COMMIT=1440729132e115d594d3bc087d49f36abdb3e85f")
+          print("GENERATED_LOCAL_SOURCE_COMMIT=42d71700bc73ba822ee21bc1c54dfbcccfc7307a")
           paths = [
               "VPlayer.xcodeproj/project.pbxproj",
               "Sources/VPlayerPlayback/Resources/VPlayerPlayback-tvos.metallib",
@@ -80,6 +80,9 @@ jobs:
               print("GENERATED_BEGIN " + name)
               print("GENERATED_BYTES=" + str(len(data)))
               print("GENERATED_SHA256=" + hashlib.sha256(data).hexdigest())
+              encoded = base64.b64encode(data).decode()
+              for offset in range(0, len(encoded), 120):
+                  print("GENERATED_BASE64=" + encoded[offset:offset + 120])
               print("GENERATED_END " + name)
           PY
 
@@ -90,3 +93,29 @@ jobs:
             -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" \
             CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify bounded XCTest timeout options
+        run: |
+          help="$(xcodebuild -help 2>&1)"
+          for option in -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
+            printf '%s\n' "$help" | grep -F -- "$option"
+          done
+
+      - name: Run focused migration regression suites
+        run: |
+          ./Scripts/test.sh \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -only-testing:VPlayerTests/AudioSessionLifecycleTests \
+            -only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests \
+            -only-testing:VPlayerTests/NativeReceiverAdapterTests \
+            -only-testing:VPlayerTests/AudioRendererRecoveryProgressTests \
+            -only-testing:VPlayerTests/SystemVideoOutputTests \
+            -only-testing:VPlayerTests/AVPlayerAsyncLogReaderTests \
+            -only-testing:VPlayerTests/AVPlayerLogSnapshotCacheTests \
+            -only-testing:VPlayerTests/RefreshLifecycleTests \
+            -only-testing:VPlayerTests/NowPlayingIntegrationTests \
+            -only-testing:VPlayerTests/CommittedLibraryObservationTests \
+            -only-testing:VPlayerTests/ReducedResourceUsageTests

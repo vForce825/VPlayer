@@ -17,6 +17,65 @@ private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
 }
 
 final class PlaybackControllerTests: XCTestCase {
+    func testScopedStopSuspendedAtWatchdogBoundaryCannotCancelReplacement() async throws {
+        let first = FakeControllerPipeline()
+        let replacement = FakeControllerPipeline()
+        let owner = await MainActor.run { RecordingPlaybackAudioSessionOwner() }
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([first, replacement]), audioSessionOwner: owner)
+        let firstRequest = makeRequest(channelID: "scoped-stop-first")
+        let replacementRequest = makeRequest(channelID: "scoped-stop-replacement")
+        await controller.play(firstRequest)
+        let gate = ManualControllerAsyncGate()
+        defer { gate.open() }
+        await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
+            if checkpoint == .stopAfterWatchdog { await gate.wait() }
+        }
+        let obsoleteStop = Task { await controller.stop(requestID: firstRequest.id) }
+        try await eventually { gate.waiterCount == 1 }
+        await controller.play(replacementRequest)
+        let cycle = await controller.readinessCycleForTesting
+        replacement.emit(.ready(readinessCycle: cycle))
+        try await eventually { await controller.currentStateForTesting == .playing(replacementRequest) }
+        gate.open()
+        await obsoleteStop.value
+        XCTAssertEqual(owner.registry.outputResourceContextSnapshot()?.sessionIdentity.requestID, replacementRequest.id)
+        let state = await controller.currentStateForTesting
+        XCTAssertEqual(state, .playing(replacementRequest))
+        XCTAssertEqual(replacement.snapshot().stopCount, 0)
+        await controller.stop()
+    }
+
+    func testScopedPauseAndResumeQueuedBeforeActorValidationCannotControlReplacement() async throws {
+        for paused in [true, false] {
+            let first = FakeControllerPipeline()
+            let replacement = FakeControllerPipeline()
+            let controller = makeRoutedPlaybackController(
+                factory: FakeControllerPipelineFactory([first, replacement]))
+            let firstRequest = makeRequest(channelID: "scoped-pause-first")
+            let replacementRequest = makeRequest(channelID: "scoped-pause-replacement")
+            await controller.play(firstRequest)
+            let gate = ManualControllerAsyncGate()
+            defer { gate.open() }
+            await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
+                if checkpoint == .pauseIngress { await gate.wait() }
+            }
+            let obsoletePause = Task { await controller.setPaused(paused, requestID: firstRequest.id) }
+            try await eventually { gate.waiterCount == 1 }
+            await controller.play(replacementRequest)
+            let cycle = await controller.readinessCycleForTesting
+            replacement.emit(.ready(readinessCycle: cycle))
+            try await eventually { await controller.currentStateForTesting == .playing(replacementRequest) }
+            let pauseCountBeforeRelease = replacement.snapshot().pauses.count
+            gate.open()
+            await obsoletePause.value
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, .playing(replacementRequest))
+            XCTAssertEqual(replacement.snapshot().pauses.count, pauseCountBeforeRelease)
+            await controller.stop()
+        }
+    }
+
     func testCurrentRelayRejectsFrozenOldPrepareScopeAndAcceptsCurrentFailure() async throws {
         let first = FakeControllerPipeline()
         let current = FakeControllerPipeline()
@@ -1388,7 +1447,8 @@ private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwne
     }
 
     @discardableResult
-    override func requestResume(for lease: PlaybackAudioSessionLease) -> Bool {
+    override func requestResume(for lease: PlaybackAudioSessionLease,
+        expectedEpoch: AudioSessionLifecycleEpoch? = nil) -> Bool {
         let count = lock.withLock { () -> Int in
             resumeRequests += 1
             _events.append(.requestResume(lease))
@@ -1401,7 +1461,7 @@ private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwne
             else { sdk.onActivate = nil }
         }
         // 准入、原proof与真实SDK completion全部由基类/Registry完成。
-        return super.requestResume(for: lease)
+        return super.requestResume(for: lease, expectedEpoch: expectedEpoch)
     }
 
     func completeDeferredExplicitResume() { resumeGate.signal() }

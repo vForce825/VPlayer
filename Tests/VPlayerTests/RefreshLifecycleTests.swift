@@ -197,6 +197,318 @@ final class RefreshLifecycleTests: XCTestCase {
         XCTAssertEqual(scheduler.submissions.count, 1)
     }
 
+    func testPreExpiredLaunchPreservesHeldNativeSubmissionAndDoesNoWork() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let loads = BackgroundLoadProbe()
+        let work = BackgroundWorkProbe()
+        var completions: [Bool] = []
+        let bridge = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { completions.append($0) }
+        )
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { await loads.recordLoad(); return [profile] },
+            refresh: { _, resources, trigger in
+                await work.recordRefresh(resources: resources, trigger: trigger)
+                return []
+            },
+            now: { now }, reportStatus: { _ in }
+        )
+        registrar.register()
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+
+        bridge.systemDidExpire()
+        try scheduler.launch(bridge)
+        XCTAssertEqual(completions, [false])
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(scheduler.pendingSubmission, scheduler.submissions.first)
+        XCTAssertNotNil(scheduler.pendingSubmission)
+        XCTAssertEqual(scheduler.cancelledIdentifiers.count, 1)
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+        let loadCount = await loads.loadCount
+        let refreshedResources = await work.resources
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertTrue(refreshedResources.isEmpty)
+        XCTAssertEqual(completions, [false])
+    }
+
+    func testPreExpiredLaunchDoesNotInvalidateAnAwaitedProfileLoad() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let gate = BackgroundProfileLoadGate(
+            profiles: [[makeProfile(now: now)]], heldLoads: [1]
+        )
+        let scheduler = BackgroundSchedulerSpy()
+        var completions: [Bool] = []
+        let bridge = SystemBackgroundRefreshTaskBridge(
+            clearSystemExpirationHandler: {},
+            completeSystemTask: { completions.append($0) }
+        )
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { try await gate.load() },
+            refresh: { _, _, _ in [] }, now: { now }, reportStatus: { _ in }
+        )
+        registrar.register()
+        registrar.scheduleNext()
+        await waitForLoadCount(1, gate: gate)
+        bridge.systemDidExpire()
+        try scheduler.launch(bridge)
+        await gate.completeLoad(1)
+        await eventually { scheduler.pendingSubmission != nil }
+
+        let loadCount = await gate.loadCount
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(completions, [false])
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+        XCTAssertEqual(scheduler.pendingSubmission?.earliestBeginDate, now.addingTimeInterval(15 * 60))
+    }
+
+    func testExpiryDuringProfileLoadPreservesPreviousNativeSuccess() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let gate = BackgroundProfileLoadGate(profiles: [[profile], [profile]], heldLoads: [2])
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        var statuses: [String] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { try await gate.load() },
+            refresh: { _, _, _ in XCTFail("Expired execution must not refresh"); return [] },
+            now: { now }, reportStatus: { statuses.append($0) }
+        )
+        registrar.register()
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await waitForLoadCount(2, gate: gate)
+        task.expire()
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        await gate.completeLoad(2)
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+        XCTAssertEqual(scheduler.cancelledIdentifiers.count, 1)
+        XCTAssertEqual(scheduler.pendingSubmission, scheduler.submissions.first)
+        XCTAssertNotNil(scheduler.pendingSubmission)
+        XCTAssertTrue(statuses.isEmpty)
+    }
+
+    func testExpiryWhileWaitingForPhysicalSlotPreservesPreviousNativeSuccess() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let loads = BackgroundLoadProbe()
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { await loads.recordLoad(); return [profile] },
+            refresh: { _, _, _ in XCTFail("Expired execution must not refresh"); return [] },
+            now: { now }, reportStatus: { _ in }
+        )
+        registrar.register()
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        for _ in 0..<1_000 {
+            if await loads.loadCount == 2 { break }
+            await Task.yield()
+        }
+        for _ in 0..<100 { await Task.yield() }
+        task.expire()
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+        XCTAssertEqual(scheduler.cancelledIdentifiers.count, 1)
+        XCTAssertEqual(scheduler.pendingSubmission, scheduler.submissions.first)
+        XCTAssertNotNil(scheduler.pendingSubmission)
+    }
+
+    func testHeldSubmissionCoalescesToLatestProfileSnapshotWithoutCancellingNewPendingRequest() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var laterProfile = makeProfile(now: now)
+        laterProfile.m3uStatus.lastSuccessAt = now
+        let gate = BackgroundProfileLoadGate(
+            profiles: [[makeProfile(now: now)], [], [laterProfile]], heldLoads: [2]
+        )
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { try await gate.load() },
+            refresh: { _, _, _ in [] }, now: { now }, reportStatus: { _ in }
+        )
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        registrar.scheduleNext()
+        await waitForLoadCount(2, gate: gate)
+        registrar.scheduleNext()
+        await waitForLoadCount(3, gate: gate)
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.asyncSubmissionCount == 2 }
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        let newestPending = scheduler.pendingSubmission
+        await gate.completeLoad(2)
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 2)
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+        XCTAssertEqual(scheduler.pendingSubmission, newestPending)
+        XCTAssertEqual(newestPending?.earliestBeginDate, now.addingTimeInterval(60 * 60))
+        XCTAssertEqual(scheduler.events, [
+            .cancel, .begin(now.addingTimeInterval(15 * 60)), .succeed(now.addingTimeInterval(15 * 60)),
+            .cancel, .begin(now.addingTimeInterval(60 * 60)), .succeed(now.addingTimeInterval(60 * 60))
+        ])
+    }
+
+    func testNativeFailureSettlesBeforeLatestSuccessorSubmits() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        var statuses: [String] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [profile] },
+            refresh: { _, _, _ in [] }, now: { now }, reportStatus: { statuses.append($0) }
+        )
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        registrar.scheduleNext()
+        scheduler.completeAsyncSubmission(error: LifecycleTestError.loadFailed)
+        await eventually { scheduler.asyncSubmissionCount == 2 }
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+        XCTAssertEqual(scheduler.submissions.count, 1)
+        XCTAssertEqual(scheduler.pendingSubmission, scheduler.submissions.last)
+        XCTAssertNotNil(scheduler.pendingSubmission)
+        XCTAssertTrue(statuses.isEmpty, "Superseded native failures must not report current errors")
+    }
+
+    func testLatestEmptyProfilesCancelOldPendingRequestOnlyAfterNativeSettlement() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let gate = BackgroundProfileLoadGate(profiles: [[makeProfile(now: now)], []])
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { try await gate.load() },
+            refresh: { _, _, _ in [] }, now: { now }, reportStatus: { _ in }
+        )
+        registrar.scheduleNext()
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        registrar.scheduleNext()
+        await waitForLoadCount(2, gate: gate)
+        XCTAssertEqual(scheduler.cancelledIdentifiers.count, 1)
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.cancelledIdentifiers.count == 2 }
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertNil(scheduler.pendingSubmission)
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+        XCTAssertEqual(scheduler.events, [
+            .cancel, .begin(now.addingTimeInterval(15 * 60)), .succeed(now.addingTimeInterval(15 * 60)), .cancel
+        ])
+    }
+
+    func testExpiryDoesNotReleaseNativeSlotBeforeLatestSuccessorCanReplaceIt() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var laterProfile = makeProfile(now: now)
+        laterProfile.m3uStatus.lastSuccessAt = now
+        let gate = BackgroundProfileLoadGate(profiles: [[makeProfile(now: now)], [laterProfile]])
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { try await gate.load() },
+            refresh: { _, _, _ in XCTFail("Expired execution must not refresh"); return [] },
+            now: { now }, reportStatus: { _ in }
+        )
+        registrar.register()
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        task.expire()
+        registrar.scheduleNext()
+        await waitForLoadCount(2, gate: gate)
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(scheduler.inFlightSubmissions, 1)
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 1)
+
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.asyncSubmissionCount == 2 }
+        scheduler.completeAsyncSubmission()
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
+        XCTAssertEqual(scheduler.pendingSubmission?.earliestBeginDate, now.addingTimeInterval(60 * 60))
+        XCTAssertEqual(scheduler.events, [
+            .cancel, .begin(now.addingTimeInterval(15 * 60)), .succeed(now.addingTimeInterval(15 * 60)),
+            .cancel, .begin(now.addingTimeInterval(60 * 60)), .succeed(now.addingTimeInterval(60 * 60))
+        ])
+    }
+
+    func testExpiredNativeFailureDoesNotReportStatusOrRefresh() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(now: now)
+        let scheduler = BackgroundSchedulerSpy()
+        scheduler.holdsAsyncSubmission = true
+        var statuses: [String] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { [profile] },
+            refresh: { _, _, _ in XCTFail("Expired execution must not refresh"); return [] },
+            now: { now }, reportStatus: { statuses.append($0) }
+        )
+        registrar.register()
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await eventually { scheduler.asyncSubmissionCount == 1 }
+        task.expire()
+        scheduler.completeAsyncSubmission(error: LifecycleTestError.loadFailed)
+        await eventually { scheduler.inFlightSubmissions == 0 }
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertNil(scheduler.pendingSubmission)
+        XCTAssertTrue(statuses.isEmpty)
+    }
+
+    func testExpiredProfileLoadFailureDoesNotReportStatus() async throws {
+        let gate = BackgroundProfileLoadGate(profiles: [[]], heldLoads: [1])
+        let scheduler = BackgroundSchedulerSpy()
+        var statuses: [String] = []
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler, loadProfiles: { try await gate.load() },
+            refresh: { _, _, _ in [] }, reportStatus: { statuses.append($0) }
+        )
+        registrar.register()
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await waitForLoadCount(1, gate: gate)
+        task.expire()
+        await gate.completeLoad(1, error: LifecycleTestError.loadFailed)
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertTrue(statuses.isEmpty)
+        XCTAssertEqual(scheduler.asyncSubmissionCount, 0)
+    }
+
     func testBackgroundRegistrationIsIdempotentAndSchedulesBeforeRefreshing() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = makeProfile(now: now)
@@ -467,6 +779,14 @@ final class RefreshLifecycleTests: XCTestCase {
         XCTAssertNil(weakBridge)
     }
 
+    private func waitForLoadCount(_ count: Int, gate: BackgroundProfileLoadGate) async {
+        for _ in 0..<1_000 {
+            if await gate.loadCount == count { return }
+            await Task.yield()
+        }
+        XCTFail("Expected profile load \(count)")
+    }
+
     private func makeProfile(now: Date) -> SourceProfile {
         SourceProfile(
             id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
@@ -609,6 +929,37 @@ private actor BackgroundLoadProbe {
     }
 }
 
+private actor BackgroundProfileLoadGate {
+    private let profiles: [[SourceProfile]]
+    private let heldLoads: Set<Int>
+    private var continuations: [Int: CheckedContinuation<Void, any Error>] = [:]
+    private(set) var loadCount = 0
+
+    init(profiles: [[SourceProfile]], heldLoads: Set<Int> = []) {
+        self.profiles = profiles
+        self.heldLoads = heldLoads
+    }
+
+    func load() async throws -> [SourceProfile] {
+        loadCount += 1
+        let index = loadCount
+        if heldLoads.contains(index) {
+            try await withCheckedThrowingContinuation { continuations[index] = $0 }
+        }
+        guard profiles.indices.contains(index - 1) else { throw LifecycleTestError.loadFailed }
+        return profiles[index - 1]
+    }
+
+    func completeLoad(_ index: Int, error: (any Error)? = nil) {
+        let continuation = continuations.removeValue(forKey: index)
+        if let error {
+            continuation?.resume(throwing: error)
+        } else {
+            continuation?.resume()
+        }
+    }
+}
+
 private final class SystemTaskSurfaceSpy: SystemBackgroundRefreshSystemTask, @unchecked Sendable {
     private let lock = NSLock()
 
@@ -697,31 +1048,48 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
         let earliestBeginDate: Date
     }
 
+    enum Event: Equatable {
+        case cancel
+        case begin(Date)
+        case succeed(Date)
+    }
+
+    private(set) var pendingSubmission: Submission?
+    private(set) var events: [Event] = []
     private(set) var registrationCount = 0
     private(set) var cancelledIdentifiers: [String] = []
     private(set) var submissions: [Submission] = []
     var submitError: NSError?
     var holdsAsyncSubmission = false
     private(set) var asyncSubmissionCount = 0
-    private var inFlightSubmissions = 0
+    private(set) var inFlightSubmissions = 0
     private(set) var maximumInFlightSubmissions = 0
-    private var submissionContinuation: CheckedContinuation<Void, Never>?
+    private var submissionContinuation: CheckedContinuation<Void, any Error>?
 
-    func completeAsyncSubmission() {
-        submissionContinuation?.resume()
+    func completeAsyncSubmission(error: (any Error)? = nil) {
+        let continuation = submissionContinuation
         submissionContinuation = nil
+        if let error {
+            continuation?.resume(throwing: error)
+        } else {
+            continuation?.resume()
+        }
     }
 
     func submit(identifier: String, earliestBeginDate: Date) async throws {
         asyncSubmissionCount += 1
+        events.append(.begin(earliestBeginDate))
         inFlightSubmissions += 1
         maximumInFlightSubmissions = max(maximumInFlightSubmissions, inFlightSubmissions)
         defer { inFlightSubmissions -= 1 }
         if holdsAsyncSubmission {
-            await withCheckedContinuation { submissionContinuation = $0 }
+            try await withCheckedThrowingContinuation { submissionContinuation = $0 }
         }
         if let submitError { throw submitError }
-        submissions.append(Submission(identifier: identifier, earliestBeginDate: earliestBeginDate))
+        let submission = Submission(identifier: identifier, earliestBeginDate: earliestBeginDate)
+        submissions.append(submission)
+        pendingSubmission = submission
+        events.append(.succeed(earliestBeginDate))
     }
     private var handler: (@MainActor @Sendable (any BackgroundRefreshTask) -> Void)?
 
@@ -736,6 +1104,8 @@ private final class BackgroundSchedulerSpy: BackgroundRefreshScheduling {
 
     func cancel(identifier: String) {
         cancelledIdentifiers.append(identifier)
+        pendingSubmission = nil
+        events.append(.cancel)
     }
 
     func launch(_ task: any BackgroundRefreshTask) throws {

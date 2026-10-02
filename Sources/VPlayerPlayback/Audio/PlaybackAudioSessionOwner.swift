@@ -147,9 +147,13 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
     func releaseLease(_ lease: PlaybackAudioSessionLease) {}
 
     @discardableResult
-    func requestResume(for lease: PlaybackAudioSessionLease) -> Bool {
-        guard let ticket = registry.prepareExplicitResume(for: lease) else { return false }
-        return invoke(ticket, receiver: self) == .started
+    func requestResume(for lease: PlaybackAudioSessionLease,
+        expectedEpoch: AudioSessionLifecycleEpoch? = nil) -> Bool {
+        let original = expectedEpoch ?? AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
+        if let ticket = registry.prepareExplicitResume(for: lease, expectedEpoch: original) {
+            return invoke(ticket, receiver: self) == .started
+        }
+        return registry.hasPendingResetResume(for: lease, matching: original)
     }
 
     @discardableResult
@@ -241,6 +245,10 @@ class PlaybackAudioSessionOwner: PlaybackAudioSessionCompletionReceiving, @unche
                 } else {
                     _ = invoke(next, receiver: delivery.receiver)
                 }
+            }
+            if delivery.request.permit.operation == .multichannel, completion.disposition == .accepted,
+               let pendingResume = registry.preparePendingResetResume() {
+                _ = invoke(pendingResume, receiver: self)
             }
             if let owner = completion.terminalOwner {
                 registry.startAudioSessionFailureCleanup(

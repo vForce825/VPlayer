@@ -195,6 +195,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         }
         object("HLS/原 SystemAVPlayerDriver 壳", self)
         logSnapshotCache.inspectPreparationAllocations(body)
+        object("owned/async AVPlayer log reader", logReader)
         inspectNativePreparationWeakSideTable("driver", self, body)
         Self.creationLock.inspect("owned/单 driver 准入锁", body)
         eventHub.inspectPreparationAllocations(body)
@@ -227,6 +228,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     static func make(
         player: AVPlayer? = nil,
         deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)? = nil,
+        logReader: (any AVPlayerLogReading)? = nil,
         preferredForwardBufferDuration: TimeInterval = 3
     ) throws -> SystemAVPlayerDriver {
         // Existing core 8 KiB plus a fixed 4 KiB envelope for scalar cache/lock,
@@ -257,7 +259,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         let driver = try SystemAVPlayerDriver(player: player ?? AVPlayer(),
             deadlineScheduler: deadlineScheduler, admission: admission,
             preferredForwardBufferDuration: preferredForwardBufferDuration,
-            resourceContextReservation: resourceReservation)
+            resourceContextReservation: resourceReservation,
+            logReader: logReader ?? SystemAVPlayerLogReader())
         transferred = true
         try PlaybackResourceContextLedger.shared.rebind(
             resourceReservation, to: .object(ObjectIdentifier(driver)))
@@ -275,10 +278,11 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private let resourceContextReservation: PlaybackResourceContextReservation
     private var installationResourceContextReservation: PlaybackResourceContextReservation?
     private var timeControlObservation: NSKeyValueObservation?
-    nonisolated let logSnapshotCache = AVPlayerLogSnapshotCache()
+    nonisolated let logSnapshotCache: AVPlayerLogSnapshotCache
     private var accessLogObserver: NSObjectProtocol?
     private var errorLogObserver: NSObjectProtocol?
     private var logRefreshTask: Task<Void, Never>?
+    private let logReader: any AVPlayerLogReading
     private var systemAudioTransitionInFlight = false
     private var endpointObserver: NSObjectProtocol?
     private var endpointStabilityDeadline: UUID?
@@ -295,13 +299,17 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private init(player: AVPlayer, deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)?,
                  admission: AVPlayerDriverAdmission,
                  preferredForwardBufferDuration: TimeInterval,
-                 resourceContextReservation: PlaybackResourceContextReservation) throws {
+                 resourceContextReservation: PlaybackResourceContextReservation,
+                 logReader: any AVPlayerLogReading) throws {
         self.player = player
         self.deadlineScheduler = deadlineScheduler
         self.preferredForwardBufferDuration = preferredForwardBufferDuration
         self.resourceContextReservation = resourceContextReservation
-        eventHub = try AVPlayerDriverEventHub.make(
+        self.logReader = logReader
+        let hub = try AVPlayerDriverEventHub.make(
             admission: admission, resourceContextReservation: resourceContextReservation)
+        eventHub = hub
+        logSnapshotCache = AVPlayerLogSnapshotCache(lifetimeOwner: hub)
     }
 
     deinit { Self.creationLock.withLock { Self.releaseAdmissionLocked(eventHub.admission) } }
@@ -662,7 +670,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                     logSnapshotCache.complete(ticket, snapshot: .empty)
                     continue
                 }
-                let errorCount = await Self.readErrorLogCount(item)
+                let errorCount = await logReader.readErrorLogCount(item: item)
                 guard self.item === item, player.currentItem === item else {
                     logSnapshotCache.complete(ticket, snapshot: .empty)
                     continue
@@ -673,22 +681,22 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         }
     }
 
-    /// Raw SDK logs and URLs die in this scope before the next asynchronous read.
-    /// Both classification and the later metrics commit use the original ticket.
+    /// Reduce the complete fetched batch into one scalar. The visitor runs after
+    /// the SDK await and validates the original ticket before any classification.
+    /// A matching tail cannot erase an earlier conflict in this coalesced read.
     private func readAccessLog(_ item: AVPlayerItem,
                                ticket: AVPlayerLogSnapshotCache.Ticket) async -> Int {
-        let log = await item.accessLog
+        var reduced: AccessLogURIClassification?
+        let count = await logReader.readAccessLog(item: item) { [self] rawURI in
+            guard logSnapshotCache.isCurrent(ticket), self.item === item,
+                  player.currentItem === item, let url = URL(string: rawURI),
+                  let classification = eventHub.classify(url, item: ticket.scope.item) else { return }
+            if reduced != .conflicting { reduced = classification }
+        }
         guard logSnapshotCache.isCurrent(ticket), self.item === item,
               player.currentItem === item else { return 0 }
-        if let rawURI = log?.events.last?.uri, let url = URL(string: rawURI) {
-            eventHub.receive(url, item: ticket.scope.item)
-        }
-        return log?.events.count ?? 0
-    }
-
-    private static func readErrorLogCount(_ item: AVPlayerItem) async -> Int {
-        let log = await item.errorLog
-        return log?.events.count ?? 0
+        if let reduced { eventHub.receive(reduced, item: ticket.scope.item) }
+        return count
     }
 
     func cancelPendingPrerolls(item identity: AVPlayerItemInstanceIdentity) {
@@ -699,6 +707,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func pause(item identity: AVPlayerItemInstanceIdentity) {
         guard currentItemIdentity == identity else { return }
+        // A retained prepared item can resume under a new activation. Retire the
+        // old activation-specific KVO while its late callbacks keep their own
+        // leases and are rejected by the hub's cleared activation identity.
+        eventHub.cancelTimeControl()
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
         cancelNaturalEndDeadline()
         naturalEndAuthority = nil
         player.pause()
@@ -983,7 +997,14 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
     }
 
     func installTimeControl(activation: ActivationEpoch, handler: @escaping StatusHandler) {
-        lock.withLock { self.activation = activation; statusHandler = handler }
+        lock.withLock {
+            self.activation = activation
+            statusHandler = handler
+            pendingStatus = nil
+        }
+    }
+    func cancelTimeControl() {
+        lock.withLock { activation = nil; statusHandler = nil; pendingStatus = nil }
     }
     func installAccessLog(classify: @escaping @Sendable (URL) -> AccessLogURIClassification,
                           handler: @escaping AccessHandler) {
@@ -1005,11 +1026,18 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
         if schedule { deliver() }
     }
 
-    func receive(_ url: URL, item: AVPlayerItemInstanceIdentity) {
+    func classify(_ url: URL, item: AVPlayerItemInstanceIdentity) -> AccessLogURIClassification? {
         let classifier = lock.withLock { self.item == item ? self.classifier : nil }
-        guard let classifier else { return }
         // 不持 hub 锁进入 server/source，避免 queueSync 或 evidence 回调形成锁环。
-        let classification = classifier(url)
+        return classifier?(url)
+    }
+
+    func receive(_ url: URL, item: AVPlayerItemInstanceIdentity) {
+        guard let classification = classify(url, item: item) else { return }
+        receive(classification, item: item)
+    }
+
+    func receive(_ classification: AccessLogURIClassification, item: AVPlayerItemInstanceIdentity) {
         let schedule = lock.withLock {
             guard self.item == item, accessHandler != nil else { return false }
             // conflict 不能被随后 matching/unrelated 覆盖而丢失撤销语义。

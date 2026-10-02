@@ -267,6 +267,11 @@ struct OutputHandoffAdmission: Sendable {
     let startsCleanup: Bool
 }
 
+struct PendingResetResumeIntent: Sendable, Equatable {
+    let epoch: AudioSessionLifecycleEpoch
+    let leaseID: UInt64
+}
+
 enum OutputUserControlKind: Sendable, Equatable { case pause, resume }
 struct OutputUserControlRequest: Sendable, Equatable {
     let kind: OutputUserControlKind
@@ -278,6 +283,8 @@ struct OutputUserControlRequest: Sendable, Equatable {
     let resetPreRouteBinding: ResetPreRouteTicketBinding?
     var explicitResumeLease: PlaybackAudioSessionLease? = nil
     var userInitiated = true
+    var originalActionEpoch: AudioSessionLifecycleEpoch? = nil
+    var consumePendingResetResume = false
 }
 enum OutputUserControlResult: Sendable, Equatable {
     case rejected, acceptedWaiting
@@ -478,6 +485,7 @@ struct OutputResourceContext: Sendable {
     var resetProof: ResetDrainProof?
     // 物理veto期间的resume只保存意图；准确当前proof到达后才能消费。
     var userResumeRequested = false
+    var pendingResetResumeIntent: PendingResetResumeIntent?
     var pendingReset: MediaServicesResetRootIdentity?
     var interruptionDrainRequired = false
     var teardownRequested = false

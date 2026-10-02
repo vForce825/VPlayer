@@ -245,7 +245,11 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             await predecessor?.value
             guard let self,
                   isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-            await engine.setPaused(command.target)
+            if let scoped = engine as? any RequestScopedPlaybackControlling {
+                await scoped.setPaused(command.target, requestID: request.id)
+            } else {
+                await engine.setPaused(command.target)
+            }
             retirePauseCommand(
                 command,
                 lifecycle: lifecycle,
@@ -337,6 +341,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         latestPresentationRevision = nil
 
         let engine = engine
+        let requestID = request.id
         let nowPlaying = nowPlaying
         let task = Task {
             await playback?.value
@@ -346,7 +351,11 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             if let nowPlaying {
                 guard let stoppingOwnerID, nowPlaying.isLatestOwner(stoppingOwnerID) else { return }
             }
-            await engine.stop()
+            if let scoped = engine as? any RequestScopedPlaybackControlling {
+                await scoped.stop(requestID: requestID)
+            } else {
+                await engine.stop()
+            }
         }
         stopTask = task
         await task.value

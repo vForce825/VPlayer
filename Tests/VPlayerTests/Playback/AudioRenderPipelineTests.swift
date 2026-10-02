@@ -10,6 +10,78 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
+    func testNativeConfigurationSuggestionDuringSettleDoesNotDiscardQueuedAudio() async throws {
+        let endpoint = ConfigurationSuggestionAudioEndpoint()
+        let renderer = SystemAudioRenderer(identity: .init(rawValue: 501), mediaKind: .compressed,
+            receiverEndpoint: endpoint)
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.native-config-settle")
+        let synchronizer = FakeAudioSynchronizer()
+        let scheduler = ManualAudioRecoveryScheduler()
+        let failures = LockedAudioFailures(executor: executor)
+        let pipeline = AudioRenderPipeline(synchronizer: synchronizer, executor: executor,
+            failureSink: { error, generation in failures.append(error, generation: generation) },
+            rendererFactory: ConfigurationSuggestionRendererFactory(renderer: renderer),
+            decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
+            routeMonitor: FakeAudioRouteMonitor(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            recoveryScheduler: scheduler.schedule)
+        let frameDuration = CMTime(value: 1_024, timescale: 48_000)
+        let thirdPTS = CMTimeMultiply(frameDuration, multiplier: 2)
+        await endpoint.warnOnNextEnqueue()
+        try perform(on: executor) {
+            try pipeline.configure(format: try self.makeFormat(codec: .aac), codec: .aac,
+                generation: .init(rawValue: 1), fingerprint: self.fingerprint(1))
+            pipeline.activateContinuityIsland(.init(rawValue: 1), generation: .init(rawValue: 1))
+            try pipeline.enqueue(try self.makeSample(id: 1, pts: .zero, duration: frameDuration))
+            try pipeline.enqueue(try self.makeSample(id: 2, pts: frameDuration, duration: frameDuration))
+        }
+        try await eventuallyAsync {
+            pipeline.diagnostics.pendingSampleCount == 0 &&
+                pipeline.diagnostics.outputConfigurationTriggerCount == 1
+        }
+        // Counter publication precedes deadline registration on the executor.
+        drain(executor)
+        scheduler.advance(by: .milliseconds(120))
+        drain(executor)
+        try await eventuallyAsync {
+            pipeline.recoveryCount == 1 && pipeline.diagnostics.pendingSampleCount == 0
+        }
+        let flushCountBefore = await endpoint.flushCount
+        let queuedBefore = await endpoint.queuedPTS
+        XCTAssertEqual(queuedBefore, [.zero, frameDuration])
+
+        // The coordinator is now within its 300 ms settle window. A second
+        // configuration-only suggestion is intentionally coalesced, so the
+        // native adapter must not independently destroy its accepted queue.
+        await endpoint.warnOnNextEnqueue()
+        try perform(on: executor) {
+            try pipeline.enqueue(try self.makeSample(id: 3, pts: thirdPTS, duration: frameDuration))
+        }
+        try await eventuallyAsync {
+            pipeline.diagnostics.pendingSampleCount == 0 &&
+                pipeline.diagnostics.suppressedCorrelatedTriggerCount > 0
+        }
+        let flushCountAfter = await endpoint.flushCount
+        let queuedAfter = await endpoint.queuedPTS
+        XCTAssertEqual(flushCountAfter, flushCountBefore)
+        XCTAssertEqual(queuedAfter, [.zero, frameDuration, thirdPTS])
+        let coverage = try XCTUnwrap(pipeline.acceptedCoverage)
+        XCTAssertEqual(CMTimeCompare(coverage.firstPTS, .zero), 0)
+        XCTAssertEqual(CMTimeCompare(coverage.endPTS, CMTimeMultiply(frameDuration, multiplier: 3)), 0)
+        XCTAssertTrue(failures.snapshot.isEmpty)
+    }
+
+    private func eventuallyAsync(_ condition: @escaping @Sendable () async -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTFail("native adapter/pipeline state did not settle")
+    }
+
     func testDelayedReceiverFailureAfterFinalAudioEnqueueStillRebuildsRenderer() throws {
         let harness = try makeHarness()
         let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
@@ -2887,6 +2959,56 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.pipeline.diagnostics.automaticFlushNoProgressCount, 1)
         XCTAssertEqual(harness.synchronizer.removalCount, 1)
         XCTAssertEqual(harness.pipeline.diagnostics.compressedRendererRetryCount, 1)
+    }
+
+    func testReceiverStyleHealthyAutoFlushDoesNotInventNoOutputFailure() throws {
+        let harness = try makeHarness(canObserveConsumption: false)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.holdEnqueueCompletions = true
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1, pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)))
+        }
+        renderer.completeEnqueue(.accepted)
+        drain(harness.executor)
+        renderer.emit(.automaticFlush(.zero))
+        drain(harness.executor)
+        XCTAssertEqual(renderer.heldEnqueueCount, 1)
+        renderer.completeEnqueue(.accepted)
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 0)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testReceiverStyleHealthyReplacementDoesNotInventPCMFailure() throws {
+        let harness = try makeHarness(canObserveConsumption: false)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1, pts: .zero,
+                duration: CMTime(value: 10, timescale: 1)))
+        }
+        renderer.emit(.failed("Receiver.Explicit:-1"))
+        drain(harness.executor)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true)
+        replacement.holdEnqueueCompletions = true
+        replacement.fireReady()
+        drain(harness.executor)
+        XCTAssertEqual(replacement.heldEnqueueCount, 1)
+        replacement.completeEnqueue(.accepted)
+        drain(harness.executor)
+        harness.recoveryScheduler.advance(by: .seconds(1))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.pipeline.route, .systemCompressed)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
     func testSilentAlwaysAcceptingRendererCannotClearAutomaticFlushBaseline() throws {
@@ -6020,6 +6142,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
     private func makeHarness(
         codec: VPlayerPlayback.AudioCodec = .aac,
         configure: Bool = true,
+        canObserveConsumption: Bool = true,
         initialRouteCategory: AudioOutputRouteCategory = .other,
         fingerprint: MediaFormatFingerprint = MediaFormatFingerprint(bytes: Data([1])),
         replayRetentionLimits: CompressedAudioRetentionLimits =
@@ -6031,6 +6154,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio")
         let synchronizer = FakeAudioSynchronizer()
         let renderers = FakeAudioRendererFactory()
+        renderers.canObserveConsumption = canObserveConsumption
         let decoderFactory = FakePCMAudioDecoderFactory { sample in
             [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
         }
@@ -7379,4 +7503,38 @@ private final class Task22FCAllocationProbe: @unchecked Sendable {
     var pcmCallbackCount: Int { lock.withLock { storedPCMCallbackCount } }
     var rejectedRoles: [VPFFAudioAllocationRole] { lock.withLock { storedRejectedRoles } }
     var pcmTokens: [Int64] { lock.withLock { storedPCMTokens } }
+}
+
+private struct ConfigurationSuggestionRendererFactory: AudioRendererFactory {
+    let renderer: SystemAudioRenderer
+    func makeRenderer(mediaKind: AudioRendererMediaKind) throws -> any AudioRenderer {
+        guard mediaKind == renderer.mediaKind else {
+            throw PlaybackCoreError.audioRendererFailed("configuration-test.unexpected-fallback")
+        }
+        return renderer
+    }
+}
+
+private actor ConfigurationSuggestionAudioEndpoint: AudioReceiverEndpoint {
+    private(set) var flushCount = 0
+    private(set) var queuedPTS: [CMTime] = []
+    private var nextWarns = false
+    func warnOnNextEnqueue() { nextWarns = true }
+    func enqueue(_ sample: RendererReceiverSample) async throws -> AudioReceiverOutcome {
+        queuedPTS.append(CMSampleBufferGetPresentationTimeStamp(sample.buffer))
+        if nextWarns {
+            nextWarns = false
+            return .init(result: .acceptedWithSuggestedFlush, events: [.outputConfigurationChanged])
+        }
+        return .init(result: .accepted, events: [])
+    }
+    func flush() {
+        flushCount += 1
+        queuedPTS.removeAll()
+    }
+    func finishedEnqueuing(_ eventSink: @escaping @Sendable (AudioRendererEvent) -> Void) { _ = eventSink }
+    func remove(from synchronizer: AVSampleBufferRenderSynchronizer, at time: CMTime) async -> Bool {
+        _ = synchronizer; _ = time
+        return true
+    }
 }

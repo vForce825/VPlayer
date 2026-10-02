@@ -4,6 +4,7 @@
 
 import Foundation
 import Observation
+import OSLog
 import SwiftData
 
 enum LibraryStoreSavePhase: Equatable, Sendable {
@@ -75,6 +76,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     private var observedMappings: ResultsObserver<ManualEPGMappingRecord, Never>?
     private var observationID: UUID?
     private var observedSnapshot: CommittedLibrarySnapshot?
+    private var committedObservationRevision: UInt64 = 0
     private var changeContinuations: [UUID: AsyncStream<CommittedLibrarySnapshot>.Continuation] = [:]
 
     /// Produces committed metadata values only; no staging rows or model objects
@@ -95,7 +97,15 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             observedMappings = mappings
             let id = UUID()
             observationID = id
-            observedSnapshot = trackCommittedSnapshot(observationID: id)
+            do {
+                _ = publishCommittedSnapshot(try trackCommittedSnapshot(observationID: id))
+            } catch {
+                observationID = nil
+                observedProfiles = nil
+                observedState = nil
+                observedMappings = nil
+                throw error
+            }
         }
         let id = UUID()
         let (stream, continuation) = AsyncStream<CommittedLibrarySnapshot>.makeStream(
@@ -109,42 +119,64 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         return stream
     }
 
-    private func trackCommittedSnapshot(observationID: UUID) -> CommittedLibrarySnapshot {
-        withObservationTracking {
-            var profiles: [UUID: CommittedLibrarySnapshot.Profile] = [:]
-            var states: [String: CommittedLibrarySnapshot.State] = [:]
-            var mappings: [CommittedLibrarySnapshot.MappingKey: String] = [:]
-            if let observedProfiles {
-                for record in observedProfiles.results {
-                    profiles[record.id] = .init(record)
-                }
-            }
-            if let observedState {
-                for record in observedState.results {
-                    states[record.key] = .init(activeProfileID: record.activeProfileID)
-                }
-            }
-            if let observedMappings {
-                for record in observedMappings.results {
-                    mappings[.init(profileID: record.sourceProfileID, channelID: record.channelID)] =
-                        record.xmltvChannelID
-                }
-            }
-            return CommittedLibrarySnapshot(profiles: profiles, states: states, mappings: mappings)
+    /// The explicit local-commit fence reads the writer's already-saved context
+    /// synchronously. It does not depend on when native observer callbacks run.
+    public func committedObservationBoundary() throws -> CommittedLibrarySnapshot {
+        publishCommittedSnapshot(try readCommittedSnapshot())
+    }
+
+    private func readCommittedSnapshot() throws -> CommittedLibrarySnapshot {
+        var profiles: [UUID: CommittedLibrarySnapshot.Profile] = [:]
+        var states: [String: CommittedLibrarySnapshot.State] = [:]
+        var mappings: [CommittedLibrarySnapshot.MappingKey: String] = [:]
+        for record in try modelContext.fetch(FetchDescriptor<SourceProfileRecord>()) {
+            profiles[record.id] = .init(record)
+        }
+        for record in try modelContext.fetch(FetchDescriptor<LibraryStateRecord>()) {
+            states[record.key] = .init(activeProfileID: record.activeProfileID)
+        }
+        for record in try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>()) {
+            mappings[.init(profileID: record.sourceProfileID, channelID: record.channelID)] = record.xmltvChannelID
+        }
+        return CommittedLibrarySnapshot(profiles: profiles, states: states, mappings: mappings)
+    }
+
+    private func trackCommittedSnapshot(observationID: UUID) throws -> CommittedLibrarySnapshot {
+        let result = withObservationTracking {
+            // Track native collection changes plus the fetched records' scalar
+            // metadata. Re-fetch on this same context so a delayed native results
+            // collection can never roll an explicit commit fence backwards.
+            _ = observedProfiles?.results
+            _ = observedState?.results
+            _ = observedMappings?.results
+            return Result { try readCommittedSnapshot() }
         } onChange: { [weak self] in
-            // Observation fires on willSet. Defer reading/rearming onto the model
-            // actor: synchronous save/rollback must finish before publication.
-            // This also coalesces all mutations inside one import transaction.
+            // Observation fires on willSet. The actor hop waits for synchronous
+            // save/rollback to settle and coalesces one import transaction.
             Task { await self?.committedResultsDidChange(observationID: observationID) }
         }
+        return try result.get()
     }
 
     private func committedResultsDidChange(observationID: UUID) {
         guard self.observationID == observationID else { return }
-        let next = trackCommittedSnapshot(observationID: observationID)
-        guard next != observedSnapshot else { return }
+        do {
+            _ = publishCommittedSnapshot(try trackCommittedSnapshot(observationID: observationID))
+        } catch {
+            // Tracking has already rearmed; a later real change retries the read.
+            Logger(subsystem: "com.vforce.vplayer", category: "LibraryObservation")
+                .error("Cannot read committed library observation: \(String(describing: error), privacy: .private)")
+        }
+    }
+
+    @discardableResult
+    private func publishCommittedSnapshot(_ snapshot: CommittedLibrarySnapshot) -> CommittedLibrarySnapshot {
+        if let observedSnapshot, snapshot.change(since: observedSnapshot) == nil { return observedSnapshot }
+        committedObservationRevision &+= 1
+        let next = snapshot.numbered(committedObservationRevision)
         observedSnapshot = next
         for continuation in changeContinuations.values { continuation.yield(next) }
+        return next
     }
 
     private func removeCommittedChangeConsumer(_ id: UUID) {

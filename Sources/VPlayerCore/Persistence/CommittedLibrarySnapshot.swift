@@ -77,9 +77,24 @@ public struct CommittedLibrarySnapshot: Equatable, Sendable {
         let channelID: String
     }
 
+    /// Monotonic within one store lifetime; fences delayed stream delivery after
+    /// a local refresh has already reconciled the same durable metadata.
+    public let revision: UInt64
+
     let profiles: [UUID: Profile]
     let states: [String: State]
     let mappings: [MappingKey: String]
+
+    init(profiles: [UUID: Profile], states: [String: State], mappings: [MappingKey: String], revision: UInt64 = 0) {
+        self.profiles = profiles
+        self.states = states
+        self.mappings = mappings
+        self.revision = revision
+    }
+
+    func numbered(_ revision: UInt64) -> Self {
+        Self(profiles: profiles, states: states, mappings: mappings, revision: revision)
+    }
 
     public func change(since previous: Self) -> CommittedLibraryChange? {
         guard states == previous.states,

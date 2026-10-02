@@ -77,6 +77,14 @@ public protocol PlaybackEngine: Actor {
     func setTuning(_ tuning: PlaybackTuning) async
 }
 
+/// Commands issued by a UI/session owner retain the request they were intended
+/// for across the actor hop. Engines offering this capability must validate the
+/// request at their mutation authority and retain its run identity across awaits.
+public protocol RequestScopedPlaybackControlling: PlaybackEngine {
+    func setPaused(_ paused: Bool, requestID: UUID) async
+    func stop(requestID: UUID) async
+}
+
 public extension PlaybackEngine {
     func setTuning(_ tuning: PlaybackTuning) async {}
 }

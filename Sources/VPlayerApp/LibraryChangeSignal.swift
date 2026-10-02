@@ -60,6 +60,9 @@ final class LibraryChangeSignal {
     @ObservationIgnored
     private var committedObservationID: UUID?
 
+    @ObservationIgnored
+    private var lastCommittedSnapshot: CommittedLibrarySnapshot?
+
     deinit { committedObservationTask?.cancel() }
 
     /// Subscribe before library preparation so profile restoration and external
@@ -76,14 +79,44 @@ final class LibraryChangeSignal {
         guard let baseline = await iterator.next(), committedObservationID == id else { return }
         committedObservationTask?.cancel()
         committedObservationStore = store
+        lastCommittedSnapshot = baseline
         committedObservationTask = Task { @MainActor [weak self] in
             var iterator = iterator
-            var previous = baseline
             while let snapshot = await iterator.next() {
                 guard !Task.isCancelled, self?.committedObservationID == id else { return }
-                if let change = snapshot.change(since: previous) { self?.notify(change) }
-                previous = snapshot
+                self?.consumeCommittedSnapshot(snapshot)
             }
+        }
+    }
+
+    func consumeCommittedSnapshot(_ snapshot: CommittedLibrarySnapshot) {
+        if let previous = lastCommittedSnapshot {
+            guard snapshot.revision > previous.revision else { return }
+            if let change = snapshot.change(since: previous) { notify(change) }
+        }
+        lastCommittedSnapshot = snapshot
+    }
+
+    /// Must complete while a local refresh claim is still intercepting updates.
+    /// Delayed native deliveries at/before this revision are then harmless;
+    /// genuinely newer external changes continue through normal scoped reloads.
+    @discardableResult
+    func flushCommittedChanges() async -> Bool {
+        guard let committedObservationStore else { return false }
+        return await flushCommittedChanges(in: committedObservationStore)
+    }
+
+    @discardableResult
+    func flushCommittedChanges(in store: SwiftDataLibraryStore) async -> Bool {
+        if let committedObservationStore, committedObservationStore !== store { return false }
+        let observationID = committedObservationID
+        do {
+            let snapshot = try await store.committedObservationBoundary()
+            guard committedObservationID == observationID else { return false }
+            consumeCommittedSnapshot(snapshot)
+            return true
+        } catch {
+            return false
         }
     }
 

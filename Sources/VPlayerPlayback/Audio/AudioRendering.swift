@@ -337,6 +337,8 @@ enum AudioRendererEnqueueResult: Sendable, Equatable {
 protocol AudioRenderer: AnyObject, Sendable {
     var identity: AudioRendererIdentity { get }
     var mediaKind: AudioRendererMediaKind { get }
+    /// False when the SDK exposes acceptance but no independent consumption signal.
+    var canObserveConsumption: Bool { get }
     var isReadyForMoreMediaData: Bool { get }
     var hasSufficientMediaDataForReliablePlaybackStart: Bool { get }
     func enqueue(_ sampleBuffer: CMSampleBuffer,
@@ -350,6 +352,10 @@ protocol AudioRenderer: AnyObject, Sendable {
     func stopRequestingMediaData()
     func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void)
     func stopObserving()
+}
+
+extension AudioRenderer {
+    var canObserveConsumption: Bool { true }
 }
 
 protocol AudioRendererFactory: Sendable {

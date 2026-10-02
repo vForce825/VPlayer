@@ -8,6 +8,205 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SystemVideoOutputTests: XCTestCase {
+    func testCapacityEvictedReceiptStillRecoversCurrentFlushRequiredRenderer() throws {
+        try verifyRecoveryAfterReceiptCapacityEviction(.requiresFlushToResumeDecoding)
+    }
+
+    func testCapacityEvictedReceiptStillRecoversCurrentFailedRenderer() throws {
+        try verifyRecoveryAfterReceiptCapacityEviction(.failed(NSError(domain: "Receiver.Evicted", code: -1)))
+    }
+
+    private func verifyRecoveryAfterReceiptCapacityEviction(_ reason: VideoRendererBackendEvent) throws {
+        let a = try frame(sequence: 1, pts: 1)
+        let c = try frame(sequence: 3, pts: 3)
+        let b = try frame(sequence: 2, pts: 2)
+        let ledger = VideoSurfaceBudgetLedger(limit: a.estimatedStorageBytes * 2)
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        backend.latchesRecoveryUntilFlush = true
+        let harness = makeHarness(backend: backend, ledger: ledger)
+        let rejected = VideoResetResultBox()
+        let survivor = VideoReceiptBox()
+        harness.output.enqueue([a, c]) { rejected.record($0) }
+        harness.output.waitUntilIdleForTesting()
+        harness.output.enqueue([b]) { survivor.value = try? $0.get() }
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(rejected.count, 1)
+        XCTAssertNotNil(rejected.error)
+        XCTAssertEqual(backend.submittedPTS, [1])
+        backend.completeEnqueue(.requiresRecovery(reason))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertFalse(backend.isReadyForMoreMediaData,
+            "The fake models the native latch until physical flush completion")
+        XCTAssertEqual(backend.flushCount, 1)
+        guard backend.flushCount == 1 else { return }
+        XCTAssertEqual(ledger.snapshot.referenceCount, 1, "Rejected A must not be retained/replayed")
+        XCTAssertNil(survivor.value)
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.submittedPTS, [1, 2])
+        backend.completeEnqueue(.accepted)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(survivor.value?.sequenceNumbers, [2])
+        XCTAssertEqual(rejected.count, 1)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+    }
+
+    func testFlushRequiredAfterAcceptedPrefixReplaysEntireSeedReceipt() throws {
+        try verifyMultiSeedRecovery(.requiresFlushToResumeDecoding, failRetry: false)
+    }
+
+    func testNativeErrorAfterAcceptedPrefixReplaysEntireSeedReceipt() throws {
+        try verifyMultiSeedRecovery(.failed(NSError(domain: "Receiver.Recoverable", code: -1)),
+            failRetry: false)
+    }
+
+    func testReacceptedSeedPrefixCannotResetTransactionRetryBudget() throws {
+        try verifyMultiSeedRecovery(.requiresFlushToResumeDecoding, failRetry: true)
+    }
+
+    private func verifyMultiSeedRecovery(_ reason: VideoRendererBackendEvent,
+        failRetry: Bool) throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let ledger = VideoSurfaceBudgetLedger()
+        let harness = makeHarness(backend: backend, ledger: ledger)
+        let receipt = VideoReceiptBox()
+        let finished = VideoResetResultBox()
+        harness.output.reset(.init(generation: .init(rawValue: 0), reason: .decoderRecovery,
+            removeDisplayedImage: false,
+            seedFrames: [try frame(sequence: 1, pts: 1), try frame(sequence: 2, pts: 2)])) {
+            receipt.value = try? $0.get()
+            finished.record($0)
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.accepted)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.requiresRecovery(reason))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(finished.count, 0)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 2,
+            "The accepted prefix remains budgeted until its full receipt is settled")
+        backend.completeFlush(at: 1)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.submittedPTS, [1, 2, 1])
+        backend.completeEnqueue(.accepted)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.submittedPTS, [1, 2, 1, 2])
+        XCTAssertNil(receipt.value)
+        XCTAssertEqual(finished.count, 0, "Reaccepted A alone cannot certify flushed B")
+        backend.completeEnqueue(failRetry ? .requiresRecovery(reason) : .accepted)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.flushCount, 2, "A replayed prefix cannot buy another retry")
+        XCTAssertEqual(finished.count, 1)
+        if failRetry {
+            XCTAssertNil(receipt.value)
+            XCTAssertNotNil(finished.error)
+        } else {
+            XCTAssertEqual(receipt.value?.sequenceNumbers, [1, 2])
+            XCTAssertNil(finished.error)
+        }
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+    }
+
+    func testSupersedingSeedRetryReleasesEveryRetainedSurface() throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let ledger = VideoSurfaceBudgetLedger()
+        let harness = makeHarness(backend: backend, ledger: ledger)
+        let finished = VideoResetResultBox()
+        harness.output.reset(.init(generation: .init(rawValue: 0), reason: .decoderRecovery,
+            removeDisplayedImage: false,
+            seedFrames: [try frame(sequence: 1, pts: 1), try frame(sequence: 2, pts: 2)])) {
+            finished.record($0)
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.accepted)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.requiresRecovery(.requiresFlushToResumeDecoding))
+        harness.output.waitUntilIdleForTesting()
+        harness.output.flush(to: .init(rawValue: 1))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertNotNil(finished.error)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+        backend.completeFlush(at: 1)
+        backend.completeFlush(at: 2)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.submittedPTS, [1, 2])
+        XCTAssertEqual(finished.count, 1)
+    }
+
+    func testSeedRetryFlushTimeoutRejectsEntireReceiptAndReleasesPrefix() async throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let ledger = VideoSurfaceBudgetLedger()
+        let harness = makeHarness(backend: backend, ledger: ledger)
+        let finished = VideoResetResultBox()
+        let timedOut = expectation(description: "multi-seed retry flush timeout")
+        harness.output.reset(.init(generation: .init(rawValue: 0), reason: .decoderRecovery,
+            removeDisplayedImage: false,
+            seedFrames: [try frame(sequence: 1, pts: 1), try frame(sequence: 2, pts: 2)])) {
+            finished.record($0)
+            timedOut.fulfill()
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.accepted)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.requiresRecovery(.requiresFlushToResumeDecoding))
+        harness.output.waitUntilIdleForTesting()
+        await fulfillment(of: [timedOut], timeout: 3)
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertNotNil(finished.error)
+        XCTAssertEqual(ledger.snapshot.referenceCount, 0)
+        backend.completeFlush(at: 1)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(backend.submittedPTS, [1, 2])
+        XCTAssertEqual(finished.count, 1)
+    }
+
+    func testFlushRequiredSeedRetriesWithoutPrematureAnchorFailure() throws {
+        try verifyRecoverableSeed(.requiresFlushToResumeDecoding)
+    }
+
+    func testNativeErrorSeedRetriesWithoutPrematureAnchorFailure() throws {
+        try verifyRecoverableSeed(.failed(NSError(domain: "Receiver.Recoverable", code: -1)))
+    }
+
+    private func verifyRecoverableSeed(_ reason: VideoRendererBackendEvent) throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let failures = VideoResetResultBox()
+        let receipt = VideoReceiptBox()
+        let harness = makeHarness(backend: backend,
+            failureSink: { error, _ in failures.record(.failure(error)) })
+        harness.output.reset(.init(generation: .init(rawValue: 0), reason: .decoderRecovery,
+            removeDisplayedImage: false, seedFrames: [try frame(sequence: 1, pts: 1)])) {
+            failures.record($0)
+            receipt.value = try? $0.get()
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeFlush(at: 0)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.requiresRecovery(reason))
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(failures.count, 0)
+        XCTAssertNil(receipt.value)
+        XCTAssertEqual(backend.flushCount, 2)
+        backend.completeFlush(at: 1)
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue(.accepted)
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(receipt.value?.sequenceNumbers, [1])
+        XCTAssertNil(failures.error)
+    }
+
     func testReceiverSuspensionDoesNotCompleteVideoAcceptanceEarly() throws {
         let backend = FakeVideoRendererBackend()
         backend.holdEnqueueCompletions = true
@@ -385,6 +584,30 @@ final class SystemVideoOutputTests: XCTestCase {
         XCTAssertEqual(ledger.snapshot.referenceCount, 0)
     }
 
+    func testDecoderGenerationAdvancePreservesAdmittedInFlightReceipt() throws {
+        let backend = FakeVideoRendererBackend()
+        backend.holdEnqueueCompletions = true
+        let harness = makeHarness(backend: backend)
+        let oldReceipt = VideoReceiptBox()
+        let newReceipt = VideoReceiptBox()
+        harness.output.enqueue([try frame(sequence: 1, pts: 1)]) { oldReceipt.value = try? $0.get() }
+        harness.output.waitUntilIdleForTesting()
+        harness.output.advanceDecoderGeneration(to: .init(rawValue: 1))
+        harness.output.enqueue([try frame(sequence: 2, pts: 2, generation: .init(rawValue: 1))]) {
+            newReceipt.value = try? $0.get()
+        }
+        harness.output.waitUntilIdleForTesting()
+        backend.completeEnqueue()
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(oldReceipt.value?.generation, .init(rawValue: 0))
+        XCTAssertNil(newReceipt.value)
+        backend.completeEnqueue()
+        harness.output.waitUntilIdleForTesting()
+        XCTAssertEqual(newReceipt.value?.generation, .init(rawValue: 1))
+        XCTAssertEqual(backend.flushCount, 0)
+        XCTAssertEqual(backend.requestCount, 1)
+    }
+
     func testDecoderGenerationAdvanceDoesNotFlushOrRestartRequest() throws {
         let backend = FakeVideoRendererBackend()
         backend.ready = false
@@ -472,7 +695,7 @@ final class SystemVideoOutputTests: XCTestCase {
         XCTAssertEqual(backend.enqueuedPTS, [1, 2])
 
         backend.requiresFlushToResumeDecoding = true
-        backend.status = .failed
+        backend.health = .failed
         backend.emit(.requiresFlushToResumeDecoding)
         backend.emit(.failed(NSError(domain: "renderer", code: 1)))
         backend.emit(.requiresFlushToResumeDecoding)
@@ -523,7 +746,7 @@ final class SystemVideoOutputTests: XCTestCase {
             failureSink: { _, _ in failures.record() }
         )
         backend.requiresFlushToResumeDecoding = true
-        backend.status = .failed
+        backend.health = .failed
         backend.emit(.requiresFlushToResumeDecoding)
         harness.output.waitUntilIdleForTesting()
 
@@ -642,13 +865,14 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     @unchecked Sendable {
     private let lock = NSLock()
     var ready = true
-    var status: AVQueuedSampleBufferRenderingStatus = .unknown
+    var health: VideoRendererHealth = .noKnownFailure
     var error: (any Error)?
     var requiresFlushToResumeDecoding = false
     private(set) var requestCount = 0
     private(set) var stopRequestCount = 0
     private(set) var flushCount = 0
     private(set) var enqueuedPTS: [Int64] = []
+    private(set) var submittedPTS: [Int64] = []
     private var readiness: (@Sendable () -> Void)?
     private var flushCompletions: [@Sendable () -> Void] = []
     private var eventHandler: (@Sendable (VideoRendererBackendEvent) -> Void)?
@@ -657,25 +881,39 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     ] = []
     private(set) var performanceMetricsRequestCount = 0
 
-    var isReadyForMoreMediaData: Bool { lock.withLock { ready } }
+    var isReadyForMoreMediaData: Bool {
+        lock.withLock { ready && (!latchesRecoveryUntilFlush ||
+            (health != .failed && !requiresFlushToResumeDecoding)) }
+    }
 
     var holdEnqueueCompletions = false
-    private var heldEnqueues: [@Sendable (Result<Void, any Error>) -> Void] = []
+    var latchesRecoveryUntilFlush = false
+    private var heldEnqueues: [@Sendable (Result<VideoRendererEnqueueResult, any Error>) -> Void] = []
     var heldEnqueueCount: Int { lock.withLock { heldEnqueues.count } }
 
     func enqueue(_ sampleBuffer: CMSampleBuffer,
-        completion: @escaping @Sendable (Result<Void, any Error>) -> Void) {
+        completion: @escaping @Sendable (Result<VideoRendererEnqueueResult, any Error>) -> Void) {
+        lock.withLock { submittedPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value) }
         if holdEnqueueCompletions {
             lock.withLock { heldEnqueues.append(completion) }
         } else {
             enqueue(sampleBuffer)
-            completion(.success(()))
+            completion(.success(.accepted))
         }
     }
 
-    func completeEnqueue() {
-        let completion = lock.withLock { heldEnqueues.isEmpty ? nil : heldEnqueues.removeFirst() }
-        completion?(.success(()))
+    func completeEnqueue(_ result: VideoRendererEnqueueResult = .accepted) {
+        let completion = lock.withLock {
+            if latchesRecoveryUntilFlush, case let .requiresRecovery(reason) = result {
+                switch reason {
+                case .requiresFlushToResumeDecoding: requiresFlushToResumeDecoding = true
+                case let .failed(failure): health = .failed; error = failure
+                case .decodeFailure: break
+                }
+            }
+            return heldEnqueues.isEmpty ? nil : heldEnqueues.removeFirst()
+        }
+        completion?(.success(result))
     }
 
     func cancelPendingEnqueue() {}
@@ -738,7 +976,15 @@ private final class FakeVideoRendererBackend: SampleBufferVideoRenderingBackend,
     }
 
     func completeFlush(at index: Int) {
-        lock.withLock { flushCompletions[index] }()
+        let completion = lock.withLock {
+            if latchesRecoveryUntilFlush {
+                health = .noKnownFailure
+                error = nil
+                requiresFlushToResumeDecoding = false
+            }
+            return flushCompletions[index]
+        }
+        completion()
     }
 
     func completePerformanceMetrics(_ snapshot: VideoRendererPerformanceSnapshot?) {

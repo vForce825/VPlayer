@@ -136,6 +136,79 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testTVOS27SystemDriverRebindsObserverAfterPauseAndRejectsOldActivation() async throws {
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let item = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_120),
+            itemGeneration: 1)
+        try driver.install(url: URL(fileURLWithPath: "/tmp/VPlayer-observer-resume.m3u8"), identity: item)
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+        let first = ActivationEpoch(outputLifecycleEpoch: item.outputLifecycleEpoch,
+            audioAdmissionFenceRevision: 0, activationNonce: 1)
+        let second = ActivationEpoch(outputLifecycleEpoch: item.outputLifecycleEpoch,
+            audioAdmissionFenceRevision: 0, activationNonce: 2)
+        var delivered: [ActivationEpoch] = []
+        try driver.installTimeControlStatusRelay(item: item, activation: first) {
+            _, _, activation in delivered.append(activation)
+        }
+        driver.eventHub.receive(.playing, item: item, activation: first)
+        driver.pause(item: item)
+        try await driver.setDisconnectedFromSystemAudio(true, item: item)
+        try driver.installTimeControlStatusRelay(item: item, activation: second) {
+            _, _, activation in delivered.append(activation)
+        }
+        driver.eventHub.receive(.playing, item: item, activation: first)
+        driver.eventHub.receive(.waitingToPlayAtSpecifiedRate, item: item, activation: second)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        XCTAssertFalse(delivered.contains(first), "An old queued status must not be relabelled on resume")
+        XCTAssertTrue(delivered.contains(second))
+    }
+
+    func testTVOS27NativePrepareActivateSuspendResumeSuspendPreservesItem() async throws {
+        try await withFinalEOSFixture { fixture in
+            try await fixture.verifyNativePauseResumeConnections()
+        }
+    }
+
+    func testTVOS27QueuedLogWakeAndMetricsAliasRetainOriginalAdmission() async throws {
+        for keepsMetricsAlias in [false, true] {
+            let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+            var driver: SystemAVPlayerDriver? = try SystemAVPlayerDriver.make(player: AVPlayer())
+            weak var originalDriver = driver
+            var metricsAlias: AVPlayerLogSnapshotCache? = driver!.logSnapshotCache
+            let item = AVPlayerItemInstanceIdentity(
+                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_121),
+                itemGeneration: 1)
+            try driver!.install(url: URL(fileURLWithPath: "/tmp/VPlayer-log-wake-tail.m3u8"), identity: item)
+            try driver!.installAccessLogURIObservation(item: item,
+                classify: { _ in .unrelated }, handler: { _, _ in })
+            driver!.replaceCurrentItemWithNil(item: item)
+            driver = nil
+            XCTAssertNil(originalDriver, "The wake must own escrow without retaining the retired driver")
+            if !keepsMetricsAlias { metricsAlias = nil }
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline + 12 * 1_024)
+            XCTAssertThrowsError(try SystemAVPlayerDriver.make(),
+                "A queued initial log wake must retain the original physical admission")
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            if keepsMetricsAlias {
+                XCTAssertNotNil(metricsAlias)
+                XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline + 12 * 1_024)
+                XCTAssertThrowsError(try SystemAVPlayerDriver.make(),
+                    "A retained synchronous-metrics cache still owns its original allocation")
+                metricsAlias = nil
+            }
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+            var successor: SystemAVPlayerDriver? = try SystemAVPlayerDriver.make()
+            withExtendedLifetime(successor) {}
+            successor = nil
+        }
+    }
+
     func testTVOS27SystemDriverWaitsForNativeConnectionState() async throws {
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         let item = AVPlayerItemInstanceIdentity(
@@ -4862,6 +4935,37 @@ private final class Task21RealIntegrationFixture {
               case .succeeded = await graph.registry.joinOutputBackendOperation(activationTicket),
               case .armed = backend.activationResult else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+    }
+
+    func verifyNativePauseResumeConnections() async throws {
+        _ = try await prepare()
+        let physicalItem = try XCTUnwrap(player.currentItem)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        var priorReceipt: AVPlayerQuiescenceReceipt?
+        for cycle in 0..<2 {
+            backend.clearActivationResult()
+            try await activateForFinalEOSProbe()
+            XCTAssertFalse(driver.disconnectedFromSystemAudio)
+            XCTAssertTrue(player.currentItem === physicalItem)
+            if let priorReceipt { XCTAssertFalse(coordinator.accept(priorReceipt)) }
+            let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+            let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+                reason: .pause, at: graph.registry.clock.nowNanoseconds))
+            let joined = await graph.registry.joinOutputBackendOperations(owner: owner)
+            XCTAssertTrue(joined)
+            let suspend = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
+            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner))
+            guard case .succeeded = await graph.registry.joinOutputBackendOperation(suspend.task) else {
+                throw backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            let receipt = try XCTUnwrap(backend.quiescenceReceipt)
+            XCTAssertTrue(coordinator.accept(receipt))
+            XCTAssertTrue(driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(player.rate, 0)
+            XCTAssertTrue(player.currentItem === physicalItem)
+            priorReceipt = receipt
+            if cycle == 0 { XCTAssertTrue(graph.registry.finishOutputPause(owner: owner)) }
         }
     }
 

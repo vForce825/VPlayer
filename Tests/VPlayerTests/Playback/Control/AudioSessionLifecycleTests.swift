@@ -13,16 +13,35 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioSessionLifecycleTests: XCTestCase {
-    // SDK probe for the intentionally retained synchronous legacy safety ingress.
-    // Scoped deprecation context only; the production target keeps warnings-as-errors.
-    @available(tvOS, deprecated: 27.0)
-    func testPrintLegacyAudioSessionCompatibilityValues() {
-        print("AUDIO_LEGACY_NAME=\(AVAudioSession.interruptionNotification.rawValue)")
-        print("AUDIO_LEGACY_TYPE_KEY=\(AVAudioSessionInterruptionTypeKey)")
-        print("AUDIO_LEGACY_OPTION_KEY=\(AVAudioSessionInterruptionOptionKey)")
-        print("AUDIO_LEGACY_BEGAN=\(AVAudioSession.InterruptionType.began.rawValue)")
-        print("AUDIO_LEGACY_ENDED=\(AVAudioSession.InterruptionType.ended.rawValue)")
-        print("AUDIO_LEGACY_RESUME=\(AVAudioSession.InterruptionOptions.shouldResume.rawValue)")
+    func testVerifiedLegacyInterruptionPayloadFoldsBeforeNotificationPostReturns() {
+        let registry = ControlTaskRegistry()
+        let ingress = registry.executor.safetyIngress
+        let center = NotificationCenter()
+        let monitor = SystemAudioEventMonitor(safetyIngress: ingress, notificationCenter: center)
+        monitor.start()
+        defer { monitor.stop() }
+        // Independent wire values verified by the tvOS27 runtime probe, run 36949943097.
+        let name = Notification.Name("AVAudioSessionInterruptionNotification")
+        let typeKey = "AVAudioSessionInterruptionTypeKey"
+        let optionKey = "AVAudioSessionInterruptionOptionKey"
+        let initialRevision = ingress.snapshot.throughRevision
+        center.post(name: name, object: nil)
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(2)])
+        XCTAssertEqual(ingress.snapshot.throughRevision, initialRevision)
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(1)])
+        XCTAssertEqual(ingress.snapshot.interruptionState, .began)
+        XCTAssertTrue(ingress.snapshot.interruptionVeto,
+            "The legacy safety veto must be installed synchronously on the posting thread")
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(0)])
+        XCTAssertEqual(ingress.snapshot.interruptionState, .ended(shouldResume: false))
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(1)])
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(0), optionKey: UInt(3)])
+        XCTAssertEqual(ingress.snapshot.interruptionState, .ended(shouldResume: true),
+            "The verified resume bit must survive unrelated option bits")
+        monitor.stop()
+        let stoppedRevision = ingress.snapshot.throughRevision
+        center.post(name: name, object: nil, userInfo: [typeKey: UInt(1)])
+        XCTAssertEqual(ingress.snapshot.throughRevision, stoppedRevision)
     }
 
     func testControlCommandBackingFitsTVOSXzoneSixteenKiBBin() {

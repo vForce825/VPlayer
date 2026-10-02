@@ -137,6 +137,25 @@ final class BackendDiagnosticsTests: XCTestCase {
         XCTAssertEqual(BackendDiagnosticErrorCode.hlsWatchdogBacklog.rawValue, "hls.watchdog.backlog")
     }
 
+    func testScopedWatchdogRejectsOldSessionAndOldSameSessionControlRevision() async {
+        let watchdog = HLSPlaybackWatchdog(recoveryCoordinator: PlaybackRecoveryCoordinator())
+        let old = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
+        let current = PlaybackSessionIdentity(sessionID: 2, requestID: UUID())
+        await watchdog.arm(activationEpoch: 20, hasObservedProgress: true, session: current, controlRevision: 4)
+        await watchdog.disarm(session: old, controlRevision: 99)
+        await watchdog.disarm(session: current, controlRevision: 3)
+        let preserved = await watchdog.isArmed
+        XCTAssertTrue(preserved)
+        await watchdog.disarm(session: current, controlRevision: 5)
+        await watchdog.arm(activationEpoch: 10, hasObservedProgress: true, session: old, controlRevision: 100)
+        await watchdog.arm(activationEpoch: 21, hasObservedProgress: true, session: current, controlRevision: 4)
+        let stillPaused = await watchdog.isArmed
+        XCTAssertFalse(stillPaused)
+        await watchdog.arm(activationEpoch: 22, hasObservedProgress: true, session: current, controlRevision: 6)
+        let resumed = await watchdog.isArmed
+        XCTAssertTrue(resumed)
+    }
+
     func testHLSPlaybackWatchdogStallTriggersUnifiedRecovery() async {
         let recoveryCoordinator = PlaybackRecoveryCoordinator()
         let clock = TestClock(100.0)

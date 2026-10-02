@@ -6,6 +6,7 @@ import SwiftUI
 import UIKit
 
 struct ChannelLogoView: View {
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     let url: URL?
     var imagePadding: CGFloat = 20
     var placeholderVerticalPadding: CGFloat = 34
@@ -14,6 +15,7 @@ struct ChannelLogoView: View {
         if let url {
             CachedChannelLogo(
                 url: url,
+                prefersReducedResourceUsage: prefersReducedResourceUsage,
                 imagePadding: imagePadding,
                 placeholderVerticalPadding: placeholderVerticalPadding
             )
@@ -23,21 +25,22 @@ struct ChannelLogoView: View {
     }
 }
 
-private struct LogoLoadIdentity: Hashable {
+struct CachedChannelLogo: View {
     let url: URL
-    let reducedResourceUsage: Bool
-}
-
-private struct CachedChannelLogo: View {
-    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
-    let url: URL
+    let prefersReducedResourceUsage: Bool
     let imagePadding: CGFloat
     let placeholderVerticalPadding: CGFloat
+    var memoryCachedImage: @MainActor @Sendable (URL) -> UIImage? = {
+        ChannelLogoCache.shared.memoryCachedImage(for: $0)
+    }
+    var loadImage: @MainActor @Sendable (URL) async -> UIImage? = {
+        await ChannelLogoCache.shared.image(for: $0)
+    }
     @State private var image: UIImage?
 
     var body: some View {
         Group {
-            if let image = image ?? ChannelLogoCache.shared.memoryCachedImage(for: url) {
+            if let image = image ?? memoryCachedImage(url) {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
@@ -46,11 +49,13 @@ private struct CachedChannelLogo: View {
                 ChannelLogoPlaceholder(verticalPadding: placeholderVerticalPadding)
             }
         }
-        .task(id: LogoLoadIdentity(url: url, reducedResourceUsage: prefersReducedResourceUsage)) {
-            image = ChannelLogoCache.shared.memoryCachedImage(for: url)
-            // Keep already decoded artwork. Defer optional network/disk decode work.
-            guard !prefersReducedResourceUsage else { return }
-            let loadedImage = await ChannelLogoCache.shared.image(for: url)
+        // URL changes and normal visibility lifecycle admit optional work. A
+        // resource-preference update redraws cached artwork but never restarts
+        // this task, including when the preference returns to unrestricted.
+        .task(id: url) {
+            image = memoryCachedImage(url)
+            guard image == nil, !prefersReducedResourceUsage else { return }
+            let loadedImage = await loadImage(url)
             guard !Task.isCancelled else { return }
             image = loadedImage
         }

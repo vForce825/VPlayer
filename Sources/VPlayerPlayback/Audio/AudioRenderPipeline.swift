@@ -1373,7 +1373,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
                 progressMonitor.automaticFlush(
                     key: attemptKey,
                     token: token,
-                    hasReplay: !replay.isEmpty
+                    hasReplay: !replay.isEmpty,
+                    canObserveConsumption: renderer?.canObserveConsumption == true
                 )
             } else {
                 progressMonitor.correlatedRecovery(
@@ -1634,7 +1635,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
                 progressMonitor.replacementReady(
                     key: attemptKey,
                     token: token,
-                    hasReplay: !replay.isEmpty
+                    hasReplay: !replay.isEmpty,
+                    canObserveConsumption: renderer?.canObserveConsumption == true
                 ),
                 fallbackReason: .compressedRendererNoProgressAfterRebuild
             )

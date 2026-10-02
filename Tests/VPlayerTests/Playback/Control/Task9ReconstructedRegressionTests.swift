@@ -707,6 +707,117 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         XCTAssertNil(registry.cleanupReservationSnapshot())
     }
 
+    func testPlayDuringResetConfigurationIsRetainedUntilExactlyThatConfigurationCompletes() async throws {
+        try await assertPlayDuringResetConfiguration(invalidation: nil)
+    }
+
+    func testSecondResetInvalidatesPlayWaitingForResetConfiguration() async throws {
+        try await assertPlayDuringResetConfiguration(invalidation: .mediaServicesWereReset)
+    }
+
+    func testNewInterruptionInvalidatesPlayWaitingForResetConfiguration() async throws {
+        try await assertPlayDuringResetConfiguration(invalidation: .interruptionBegan)
+    }
+
+    func testUserPauseInvalidatesPlayWaitingForResetConfiguration() async throws {
+        try await assertPlayDuringResetConfiguration(invalidation: nil, userPauses: true)
+    }
+
+    private func assertPlayDuringResetConfiguration(invalidation: PlaybackAudioSessionEvent?,
+        userPauses: Bool = false) async throws {
+        let entered = expectation(description: "Reset category call is physically in flight")
+        let sdk = Task9SDKGate(categoryOrdinal: 2, entered: { entered.fulfill() })
+        let registry = ControlTaskRegistry(allocator: .init())
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let factory = Task9PreparedFactory()
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: factory)
+        await controller.play(request())
+        owner.monitor.emit(.mediaServicesWereReset)
+        await fulfillment(of: [entered], timeout: 2)
+        defer { sdk.gate.signal() }
+        XCTAssertNil(registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt)
+        await controller.setPaused(false) // Deliberately before inactive configuration is ready.
+        XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 1)
+        if userPauses { await controller.setPaused(true) }
+        if let invalidation {
+            owner.monitor.emit(invalidation)
+            if invalidation == .interruptionBegan { owner.monitor.emit(.interruptionEnded(shouldResume: true)) }
+        }
+        sdk.gate.signal()
+        let canceled = userPauses || invalidation != nil
+        for _ in 0..<1_000 {
+            if canceled {
+                if registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt != nil { break }
+            } else if factory.backends.count == 2, factory.backends.last?.activationCount == 1 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        if canceled {
+            XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+            XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 1)
+            XCTAssertEqual(factory.backends.count, 1)
+            await controller.setPaused(false)
+            for _ in 0..<1_000 {
+                if factory.backends.count == 2, factory.backends.last?.activationCount == 1 { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        XCTAssertEqual(sdk.base.lock.withLock { sdk.base.activateCallCount }, 2)
+        XCTAssertEqual(factory.backends.count, 2)
+        XCTAssertEqual(factory.backends.last?.activationCount, 1)
+        await controller.stop()
+    }
+
+    func testResumeSuspendedAcrossCleanupCannotAdoptANewerResetEpoch() async throws {
+        let retirement = Task9OperationGate()
+        let registry = ControlTaskRegistry(allocator: .init())
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let factory = Task9PreparedFactory(retirementGate: retirement)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: service, backendFactory: factory)
+        let currentRequest = request()
+        await controller.play(currentRequest)
+        owner.monitor.emit(.interruptionBegan)
+        owner.monitor.emit(.interruptionEnded(shouldResume: false))
+        await retirement.waitUntilEntered()
+        for _ in 0..<500 {
+            let state = await controller.currentStateForTesting
+            let interrupted = await controller.audioSessionInterruptedForTesting
+            if state == .paused(currentRequest), !interrupted { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let oldResume = Task { await controller.setPaused(false) }
+        for _ in 0..<500 {
+            if await controller.task9ResumeRequestIsInFlight { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let wasSuspended = await controller.task9ResumeRequestIsInFlight
+        XCTAssertTrue(wasSuspended, "The old user action must enter the real cleanup wait before reset")
+        owner.monitor.emit(.mediaServicesWereReset)
+        let resetEpoch = registry.executor.safetyIngress.snapshot.mediaServicesEpoch
+        await retirement.release()
+        await oldResume.value
+        for _ in 0..<1_000 {
+            if registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt != nil { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(registry.executor.safetyIngress.snapshot.mediaServicesEpoch, resetEpoch)
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        XCTAssertEqual(sdk.lock.withLock { sdk.activateCallCount }, 1)
+        XCTAssertEqual(factory.backends.count, 1)
+        await controller.setPaused(false)
+        for _ in 0..<1_000 {
+            if factory.backends.count == 2, factory.backends.last?.activationCount == 1 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(sdk.lock.withLock { sdk.activateCallCount }, 2)
+        XCTAssertEqual(factory.backends.last?.activationCount, 1)
+        await controller.stop()
+    }
+
     func testBeganDuringResetConfigurationKeepsSafeConfigurationAndResumesOnce() async throws {
         try await assertBeganDuringResetSDK(activationInFlight: false)
     }
@@ -3859,5 +3970,13 @@ final class Task9RuntimeCapacityTests: XCTestCase {
             if await condition() { return }
             await Task.yield()
         }
+    }
+}
+
+// Keep the observation helper in the test module. Actor isolation makes the reflected
+// existing coordination flag a deterministic boundary observation without a production hook.
+private extension PlaybackController {
+    var task9ResumeRequestIsInFlight: Bool {
+        Mirror(reflecting: self).children.first { $0.label == "resumeRequestInFlight" }?.value as? Bool ?? false
     }
 }

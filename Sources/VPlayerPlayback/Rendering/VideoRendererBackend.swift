@@ -13,6 +13,19 @@ enum VideoRendererBackendEvent: @unchecked Sendable {
     case requiresFlushToResumeDecoding
 }
 
+/// Application-owned projection of Receiver results/events. This says whether
+/// a failure is known; it does not claim that a frame was rendered or displayed.
+enum VideoRendererHealth: Sendable, Equatable {
+    case noKnownFailure
+    case failed
+}
+
+enum VideoRendererEnqueueResult: Sendable {
+    case accepted
+    case cancelled
+    case requiresRecovery(VideoRendererBackendEvent)
+}
+
 struct VideoRendererPerformanceSnapshot: Sendable, Equatable {
     let totalFrameCount: UInt64
     let droppedFrameCount: UInt64
@@ -23,12 +36,12 @@ struct VideoRendererPerformanceSnapshot: Sendable, Equatable {
 
 protocol SampleBufferVideoRenderingBackend: AnyObject, Sendable {
     var isReadyForMoreMediaData: Bool { get }
-    var status: AVQueuedSampleBufferRenderingStatus { get }
+    var health: VideoRendererHealth { get }
     var error: (any Error)? { get }
     var requiresFlushToResumeDecoding: Bool { get }
 
     func enqueue(_ sampleBuffer: CMSampleBuffer,
-        completion: @escaping @Sendable (Result<Void, any Error>) -> Void)
+        completion: @escaping @Sendable (Result<VideoRendererEnqueueResult, any Error>) -> Void)
     func cancelPendingEnqueue()
     func finishedEnqueuing()
     func requestMediaDataWhenReady(
@@ -51,7 +64,7 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     let renderer: AVSampleBufferVideoRenderer
 
     private let synchronizer: AVSampleBufferRenderSynchronizer
-    private let owner: VideoReceiverOwner
+    private let owner: any VideoReceiverEndpoint
     private let lock = NSLock()
     private var feedTask: Task<Void, Never>?
     private var controlTask: Task<Void, Never>?
@@ -61,25 +74,29 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     private var flushRequired = false
     private var removed = false
     private var removalResult: Bool?
+    private var removalInFlight = false
+    private var removalWaiters: [@Sendable (Bool) -> Void] = []
     private var revision: UInt64 = 0
 
-    init(renderer: AVSampleBufferVideoRenderer, synchronizer: AVSampleBufferRenderSynchronizer) {
+    init(renderer: AVSampleBufferVideoRenderer, synchronizer: AVSampleBufferRenderSynchronizer,
+        receiverEndpoint: (any VideoReceiverEndpoint)? = nil) {
         self.renderer = renderer
         self.synchronizer = synchronizer
-        owner = VideoReceiverOwner(receiver: synchronizer.sampleBufferReceiver(adding: renderer))
+        if let receiverEndpoint { owner = receiverEndpoint }
+        else { owner = VideoReceiverOwner(receiver: synchronizer.sampleBufferReceiver(adding: renderer)) }
     }
 
     deinit { feedTask?.cancel(); controlTask?.cancel() }
 
     var isReadyForMoreMediaData: Bool { lock.withLock { !removed && feedTask == nil && !flushRequired && observedError == nil } }
-    var status: AVQueuedSampleBufferRenderingStatus {
-        lock.withLock { observedError == nil ? .unknown : .failed }
+    var health: VideoRendererHealth {
+        lock.withLock { observedError == nil ? .noKnownFailure : .failed }
     }
     var error: (any Error)? { lock.withLock { observedError } }
     var requiresFlushToResumeDecoding: Bool { lock.withLock { flushRequired } }
 
     func enqueue(_ sampleBuffer: CMSampleBuffer,
-        completion: @escaping @Sendable (Result<Void, any Error>) -> Void) {
+        completion: @escaping @Sendable (Result<VideoRendererEnqueueResult, any Error>) -> Void) {
         let sample = RendererReceiverSample(buffer: sampleBuffer)
         let started = lock.withLock { () -> Bool in
             guard !removed, feedTask == nil else { return false }
@@ -95,25 +112,27 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
                 guard let self else { return }
                 let state = lock.withLock { () -> (Bool, (@Sendable () -> Void)?) in
                     feedTask = nil
-                    return (revision == submissionRevision, readiness)
+                    guard revision == submissionRevision else { return (false, readiness) }
+                    // Validate the revision and commit every outcome cache field
+                    // atomically. A reset cannot slip between these operations.
+                    if case let .success(value) = outcome,
+                       case let .requiresRecovery(reason) = value.result {
+                        switch reason {
+                        case let .failed(error): observedError = error
+                        case .requiresFlushToResumeDecoding: flushRequired = true
+                        case .decodeFailure: break
+                        }
+                    }
+                    return (true, readiness)
                 }
                 guard state.0 else {
-                    completion(.failure(CancellationError()))
+                    completion(.success(.cancelled))
                     state.1?()
                     return
                 }
                 switch outcome {
                 case let .success(value):
-                    lock.withLock {
-                        for event in value.events {
-                            switch event {
-                            case let .failed(error): observedError = error
-                            case .requiresFlushToResumeDecoding: flushRequired = true
-                            case .decodeFailure: break
-                            }
-                        }
-                    }
-                    completion(value.accepted ? .success(()) : .failure(CancellationError()))
+                    completion(.success(value.result))
                     for event in value.events { emit(event, revision: submissionRevision) }
                 case let .failure(error): completion(.failure(error))
                 }
@@ -121,7 +140,7 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
             }
             return true
         }
-        if !started { completion(.failure(CancellationError())) }
+        if !started { completion(.success(.cancelled)) }
     }
 
     func cancelPendingEnqueue() {
@@ -142,6 +161,7 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     func flush(removeDisplayedImage: Bool, completion: @escaping @Sendable () -> Void) {
         lock.withLock {
             revision += 1
+            let flushRevision = revision
             feedTask?.cancel()
             let previous = controlTask
             let feed = feedTask
@@ -149,7 +169,13 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
                 await previous?.value
                 await owner.flush(removeDisplayedImage: removeDisplayedImage)
                 await feed?.value
-                self?.lock.withLock { self?.flushRequired = false; self?.observedError = nil }
+                if let self {
+                    lock.withLock {
+                        guard revision == flushRevision else { return }
+                        flushRequired = false
+                        observedError = nil
+                    }
+                }
                 completion()
             }
         }
@@ -169,8 +195,11 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     }
 
     func remove(completion: @escaping @Sendable (Bool) -> Void) {
-        lock.withLock {
-            if let removalResult { completion(removalResult); return }
+        let settled = lock.withLock { () -> Bool? in
+            if let removalResult { return removalResult }
+            removalWaiters.append(completion)
+            guard !removalInFlight else { return nil }
+            removalInFlight = true
             removed = true
             revision += 1
             feedTask?.cancel()
@@ -181,10 +210,18 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
                 await owner.flush(removeDisplayedImage: true)
                 await feed?.value
                 let result = await owner.remove(from: synchronizer)
-                lock.withLock { removalResult = result }
-                completion(result)
+                let waiters = lock.withLock {
+                    removalResult = result
+                    removalInFlight = false
+                    let waiters = removalWaiters
+                    removalWaiters.removeAll()
+                    return waiters
+                }
+                for waiter in waiters { waiter(result) }
             }
+            return nil
         }
+        if let settled { completion(settled) }
     }
 
     func loadPerformanceMetrics(
@@ -232,12 +269,19 @@ final class VideoRendererBackend: SampleBufferVideoRenderingBackend, @unchecked 
     }
 }
 
-private struct VideoReceiverOutcome: Sendable {
-    let accepted: Bool
+struct VideoReceiverOutcome: Sendable {
+    let result: VideoRendererEnqueueResult
     let events: [VideoRendererBackendEvent]
 }
 
-private actor VideoReceiverOwner {
+protocol VideoReceiverEndpoint: Actor {
+    func enqueue(_ sample: RendererReceiverSample) async throws -> VideoReceiverOutcome
+    func flush(removeDisplayedImage: Bool) async
+    func finishedEnqueuing(_ eventSink: @escaping @Sendable (VideoRendererBackendEvent) -> Void) async
+    func remove(from synchronizer: AVSampleBufferRenderSynchronizer) async -> Bool
+}
+
+private actor VideoReceiverOwner: VideoReceiverEndpoint {
     private var receiver: AVSampleBufferVideoRenderer.Receiver?
     private var isEnqueuing = false
     private var events: Task<Void, Never>?
@@ -261,21 +305,21 @@ private actor VideoReceiverOwner {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            return .init(accepted: false, events: [.failed(error)])
+            return .init(result: .requiresRecovery(.failed(error)), events: [])
         }
     }
 
     private func enqueueReady(_ sample: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>,
         into receiver: AVSampleBufferVideoRenderer.Receiver) async throws -> VideoReceiverOutcome {
         switch try await receiver.enqueue(sample) {
-        case .enqueued: return .init(accepted: true, events: [])
+        case .enqueued: return .init(result: .accepted, events: [])
         case let .enqueuedWithDecodeFailures(errors):
-            return .init(accepted: true, events: errors.map { .decodeFailure($0) })
-        case .cancelledDueToFlush: return .init(accepted: false, events: [])
+            return .init(result: .accepted, events: errors.map { .decodeFailure($0) })
+        case .cancelledDueToFlush: return .init(result: .cancelled, events: [])
         case .cancelledDueToFlushRequiredToResume:
-            return .init(accepted: false, events: [.requiresFlushToResumeDecoding])
+            return .init(result: .requiresRecovery(.requiresFlushToResumeDecoding), events: [])
         case let .cancelledDueToError(error):
-            return .init(accepted: false, events: [.failed(error)])
+            return .init(result: .requiresRecovery(.failed(error)), events: [])
         @unknown default: throw CancellationError()
         }
     }

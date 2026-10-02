@@ -136,6 +136,58 @@ final class CommittedLibraryObservationTests: XCTestCase {
         await task.value
     }
 
+    func testDelayedNativeSnapshotsAfterClaimReconciliationAreDeduplicatedWithoutLosingExternalChanges() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let context = ModelContext(container)
+        let profile = profile()
+        context.insert(profile)
+        try context.save()
+        let store = SwiftDataLibraryStore(modelContainer: container)
+        let stream = try await store.committedChanges()
+        var iterator = stream.makeAsyncIterator()
+        let first = await iterator.next()
+        let baseline = try XCTUnwrap(first)
+        let signal = LibraryChangeSignal()
+        signal.consumeCommittedSnapshot(baseline)
+        let claim = signal.claimPersistedRefreshes(profileID: profile.id, resources: [.playlist, .epg])
+        let attempt = UUID()
+        try await store.recordSuccess(profileID: profile.id, resource: .playlist, at: .now, attemptID: attempt)
+        try await store.recordSuccess(profileID: profile.id, resource: .epg, at: .now, attemptID: UUID())
+        // The native stream remains unread while awaited persisted callbacks and
+        // the explicit observation fence complete the claimed reconciliation.
+        signal.notify(profileID: profile.id, resource: .playlist)
+        signal.notify(profileID: profile.id, resource: .epg)
+        let fenced = await signal.flushCommittedChanges(in: store)
+        XCTAssertTrue(fenced)
+        signal.stopClaimingPersistedRefreshes(claim)
+        signal.releasePersistedRefreshes(claim, publishesPendingChanges: false)
+        let held = await iterator.next()
+        signal.consumeCommittedSnapshot(try XCTUnwrap(held))
+        XCTAssertEqual(signal.generation, 0, "Delayed delivery of the same committed revision must not schedule a second reload")
+
+        let external = ModelContext(container)
+        let externalProfile = try XCTUnwrap(try external.fetch(FetchDescriptor<SourceProfileRecord>()).first)
+        let changed = expectation(description: "A newer external commit remains observable")
+        let task = Task { @MainActor in
+            var iterator = iterator
+            while let snapshot = await iterator.next() {
+                signal.consumeCommittedSnapshot(snapshot)
+                if signal.generation > 0 { changed.fulfill(); return }
+            }
+        }
+        externalProfile.m3uAttemptID = UUID()
+        externalProfile.epgAttemptID = UUID()
+        externalProfile.m3uLastSuccessAt = .now
+        externalProfile.epgLastSuccessAt = .now
+        try external.save()
+        await fulfillment(of: [changed], timeout: 3)
+        task.cancel()
+        await task.value
+        // Fence also folds any second resource still coalescing on its actor.
+        _ = await signal.flushCommittedChanges(in: store)
+        XCTAssertEqual(signal.reloadScope(after: 0), .refreshes([profile.id: [.playlist, .epg]]))
+    }
+
     private func profile() -> SourceProfileRecord {
         .init(id: UUID(), name: "Home", m3uURLString: "https://example.invalid/live.m3u",
               epgURLString: "https://example.invalid/guide.xml", m3uRefreshIntervalRaw: 0,

@@ -113,11 +113,15 @@ final class BackgroundRefreshRegistrar {
         let planner = planner
         let now = now
         let reportStatus = reportStatus
-        let revision = beginScheduling()
         let execution = BackgroundRefreshExecution(task: task)
         task.setExpirationHandler {
             execution.expire()
         }
+        // A latched system expiration is delivered synchronously above. Such
+        // an execution has no replacement intent and must not supersede a
+        // live caller that is loading profiles or awaiting native submission.
+        guard !execution.isCompleted else { return }
+        let revision = beginScheduling()
         execution.start { [weak self] in
             guard let self else { return false }
             do {
@@ -130,8 +134,9 @@ final class BackgroundRefreshRegistrar {
                 } catch is CancellationError {
                     try Task.checkCancellation()
                 } catch {
+                    try Task.checkCancellation()
                     succeeded = false
-                    await MainActor.run {
+                    if revision == self.schedulingRevision {
                         reportStatus(Self.sanitizedSchedulingError(error))
                     }
                 }
@@ -139,7 +144,7 @@ final class BackgroundRefreshRegistrar {
                 let refreshDate = now()
                 for profile in profiles {
                     try Task.checkCancellation()
-                    if await self.prefersReducedResourceUsage { break }
+                    if self.prefersReducedResourceUsage { break }
                     let resources = planner.dueResources(for: profile, now: refreshDate)
                     guard !resources.isEmpty else { continue }
                     let outcomes = await refresh(profile.id, resources, .background)
@@ -149,15 +154,15 @@ final class BackgroundRefreshRegistrar {
             } catch is CancellationError {
                 return false
             } catch {
-                await MainActor.run {
-                    reportStatus(Self.sanitizedProfileLoadError(error))
-                }
+                guard !Task.isCancelled, revision == self.schedulingRevision else { return false }
+                reportStatus(Self.sanitizedProfileLoadError(error))
                 return false
             }
         }
     }
 
     private func submitNext(profiles: [SourceProfile], revision: UUID) async throws {
+        try Task.checkCancellation()
         guard revision == schedulingRevision else { throw CancellationError() }
         // Coalesce callers onto the one physical operation; obsolete revisions
         // never create a chain of queued native submission tasks.
@@ -170,6 +175,9 @@ final class BackgroundRefreshRegistrar {
             guard let self else { throw CancellationError() }
             defer { self.submissionTask = nil }
             guard revision == self.schedulingRevision else { throw CancellationError() }
+            // Transfer the pending request only when the latest viable caller
+            // reaches the settled physical slot. A successor may expire while
+            // loading or waiting, so intent alone must not remove the fallback.
             self.scheduler.cancel(identifier: Self.identifier)
             let now = self.now()
             guard var date = self.planner.nextBackgroundDate(for: profiles, now: now) else {
@@ -180,9 +188,9 @@ final class BackgroundRefreshRegistrar {
             }
             try await self.scheduler.submit(identifier: Self.identifier, earliestBeginDate: date)
             guard revision == self.schedulingRevision else {
-                // No successor can submit until this task settles, so this
-                // cancellation cannot remove a newer successfully submitted request.
-                self.scheduler.cancel(identifier: Self.identifier)
+                // The old caller is obsolete, but its successful pending request
+                // remains a fallback until a live successor cancels/replaces it
+                // above. Cancelling here could strand an expired successor.
                 throw CancellationError()
             }
         }
@@ -204,13 +212,13 @@ final class BackgroundRefreshRegistrar {
 private final class BackgroundRefreshExecution {
     private let task: any BackgroundRefreshTask
     private var workTask: Task<Void, Never>?
-    private var isCompleted = false
+    private(set) var isCompleted = false
 
     init(task: any BackgroundRefreshTask) {
         self.task = task
     }
 
-    func start(work: @escaping @Sendable () async -> Bool) {
+    func start(work: @escaping @MainActor @Sendable () async -> Bool) {
         guard !isCompleted else { return }
         workTask = Task { @MainActor [weak self] in
             let succeeded = await work()

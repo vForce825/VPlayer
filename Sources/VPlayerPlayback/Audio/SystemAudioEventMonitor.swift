@@ -12,6 +12,20 @@ enum PlaybackAudioSessionLifecycleEvent: Sendable, Equatable {
     case resumptionRecommended(shouldResume: Bool)
 }
 
+/// Exact legacy wire values verified on tvOS27 by the runtime probe in
+/// https://github.com/vForce825/VPlayer/actions/runs/36949943097 (1 test, 0 failures).
+/// Keep this narrow compatibility ingress synchronous: the safety veto must be
+/// folded on the posting thread before playback can admit another positive rate.
+/// Typed lifecycle messages remain advisory until their timing equivalence is proven.
+private enum LegacyAudioSessionInterruption {
+    static let notificationName = Notification.Name("AVAudioSessionInterruptionNotification")
+    static let typeKey = "AVAudioSessionInterruptionTypeKey"
+    static let optionKey = "AVAudioSessionInterruptionOptionKey"
+    static let began: UInt = 1
+    static let ended: UInt = 0
+    static let shouldResume: UInt = 1
+}
+
 public final class SystemAudioEventMonitor: @unchecked Sendable {
     /// 与pipeline relay共享同一本4KiB账；这里只提供类型化alias，不重复计费。
     static var systemAndPipelineRelayAllocationReservation:
@@ -213,17 +227,15 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
                     observationGeneration: generation)
             }
             if interruptionObserver == nil {
-                interruptionObserver = notificationCenter.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] notification in
+                interruptionObserver = notificationCenter.addObserver(forName: LegacyAudioSessionInterruption.notificationName, object: nil, queue: nil) { [weak self] notification in
                     guard let self = self else { return }
-                    let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-                    guard let typeValue = typeValue, let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+                    guard let type = notification.userInfo?[LegacyAudioSessionInterruption.typeKey] as? UInt else { return }
                     
-                    if type == .began {
+                    if type == LegacyAudioSessionInterruption.began {
                         self.emit(.interruptionBegan)
-                    } else if type == .ended {
-                        let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
-                        let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-                        let shouldResume = options.contains(.shouldResume)
+                    } else if type == LegacyAudioSessionInterruption.ended {
+                        let options = notification.userInfo?[LegacyAudioSessionInterruption.optionKey] as? UInt ?? 0
+                        let shouldResume = options & LegacyAudioSessionInterruption.shouldResume != 0
                         self.emit(.interruptionEnded(shouldResume: shouldResume))
                     }
                 }

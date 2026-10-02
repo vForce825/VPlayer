@@ -28,6 +28,10 @@ final class AVPlayerLogSnapshotCache: @unchecked Sendable {
         fileprivate let identity: UUID
     }
 
+    // The original hub already owns the physical admission and core escrow.
+    // Holding it charges cache aliases even after their retired driver disappears.
+    // The hub does not refer back to this cache, so this is not a retain cycle.
+    private let lifetimeOwner: AVPlayerDriverEventHub?
     private let lock = NSLock()
     private var scope: Scope?
     private var value: AVPlayerLogScalarSnapshot = .empty
@@ -36,6 +40,10 @@ final class AVPlayerLogSnapshotCache: @unchecked Sendable {
     /// Covers the one queued MainActor wake and the entire lifetime of its worker.
     private var workerScheduled = false
     private var wake: (@MainActor @Sendable () -> Void)?
+
+    init(lifetimeOwner: AVPlayerDriverEventHub? = nil) {
+        self.lifetimeOwner = lifetimeOwner
+    }
 
     func installWake(_ wake: @escaping @MainActor @Sendable () -> Void) {
         let action = lock.withLock { () -> (@MainActor @Sendable () -> Void)? in
@@ -141,6 +149,11 @@ final class AVPlayerLogSnapshotCache: @unchecked Sendable {
 
     private func enqueue(_ action: (@MainActor @Sendable () -> Void)?) {
         guard let action else { return }
-        DispatchQueue.main.async { action() }
+        // The queued block itself owns the cache/core/admission until dispatch
+        // exits, including the interval before a physical read task can be created.
+        DispatchQueue.main.async { [self] in
+            action()
+            withExtendedLifetime(self) {}
+        }
     }
 }

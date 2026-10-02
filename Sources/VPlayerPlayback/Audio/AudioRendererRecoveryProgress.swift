@@ -185,11 +185,15 @@ struct AudioRendererRecoveryProgressMonitor: Sendable {
     mutating func automaticFlush(
         key: AudioCompressedAttemptKey,
         token: AudioRendererProgressToken,
-        hasReplay: Bool
+        hasReplay: Bool,
+        canObserveConsumption: Bool = true
     ) -> [AudioRendererProgressAction] {
         startAttemptIfNeeded(key)
         observeProgress(token)
         guard hasReplay else { return [] }
+        // Unavailable observation is unknown, never evidence of stalled output.
+        // Explicit renderer failures still consume the bounded rebuild/fallback budget.
+        guard canObserveConsumption else { baseline = nil; return [.replay] }
         // 每次自动清空都代表物理队列已丢失。已有进度观察只限制重建和降级，
         // 不能阻止补回音频；沿用原有期限，避免连续清空无限延长恢复窗口。
         if baseline != nil { return [.replay] }
@@ -214,12 +218,14 @@ struct AudioRendererRecoveryProgressMonitor: Sendable {
     mutating func replacementReady(
         key: AudioCompressedAttemptKey,
         token: AudioRendererProgressToken,
-        hasReplay: Bool
+        hasReplay: Bool,
+        canObserveConsumption: Bool = true
     ) -> [AudioRendererProgressAction] {
         let continuesConsumedAttempt = attemptKey == key && rebuildConsumed
         startAttemptIfNeeded(key)
         baseline = nil
         guard hasReplay else { return [] }
+        guard canObserveConsumption else { return [.replay] }
         return beginBaseline(
             key: key,
             token: token,

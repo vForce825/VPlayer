@@ -2327,6 +2327,14 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   request.mediaServicesEpoch == incoming.mediaServicesEpoch,
                   request.resetPreRouteBinding == context.resetPreRouteBinding else { return .rejected }
             guard !incoming.mediaServicesResumeRequired || request.userInitiated else { return .rejected }
+            if let original = request.originalActionEpoch,
+               original != AudioSessionLifecycleEpoch(incoming) { return .rejected }
+            if request.consumePendingResetResume {
+                guard !incoming.userPaused, let original = request.originalActionEpoch,
+                      let lease = request.explicitResumeLease,
+                      context.pendingResetResumeIntent == .init(epoch: original, leaseID: lease.id)
+                else { return .rejected }
+            }
             // 无proof的resume只记录用户意图；只有准确lease或当前排空proof可以清除物理veto。
             var resumeAuthorizesRecovery = !incoming.interruptionVeto
             if let requestedLease = request.explicitResumeLease {
@@ -2340,6 +2348,19 @@ final class ControlTaskRegistry: @unchecked Sendable {
                       ownsRegistration(registration, allowsClosing: false),
                       context.pendingActivationCall == nil, context.sessionReceipts?.active == nil
                 else { return .rejected }
+                if request.userInitiated, incoming.mediaServicesResumeRequired,
+                   incoming.interruptionState != .began,
+                   context.pendingReset?.mediaServicesEpoch == incoming.mediaServicesEpoch,
+                   context.systemRecoveryBinding?.inactiveConfigurationReceipt == nil {
+                    // User authorization is retained independently of readiness. No physical
+                    // permit or reset gate is released until this exact configuration completes.
+                    context.pendingResetResumeIntent = .init(epoch: AudioSessionLifecycleEpoch(incoming), leaseID: lease.leaseID)
+                    context.userResumeRequested = false
+                    outputContext = context
+                    snapshot.userPaused = false
+                    return .applied(.init(userPaused: false, interruptionVeto: incoming.interruptionVeto,
+                        mediaServicesResumeRequired: true, freezeGeneration: incoming.freezeGeneration), .acceptedWaiting)
+                }
                 if case .acquiringLease(_, .awaitingActivation(let configured)) = resourceState {
                     // 尚未创建输出的acquisition已有自己的真实所有权证明，不借旧输出drain proof。
                     let proof = configured.acquired.proof
@@ -2396,6 +2417,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     resumeAuthorizesRecovery = true
                 }
             }
+            // A new pause or an admitted ready resume invalidates any deferred reset action.
+            context.pendingResetResumeIntent = nil
             var next = incoming
             next.userPaused = request.kind == .pause
             if request.kind == .resume, request.userInitiated { next.mediaServicesResumeRequired = false }
@@ -2968,6 +2991,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 outputContext?.resetProof = nil
                 outputContext?.interruptionProof = nil
                 outputContext?.userResumeRequested = false
+                outputContext?.pendingResetResumeIntent = nil
                 audioPhase?.reactivationState = nil
                 outputContext?.teardownRequested = true
                 if let reset = snapshot.system.latestResetIngress {
@@ -2990,6 +3014,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 audioPhase?.currentReactivationProof = nil
                 outputContext?.interruptionProof = nil
                 outputContext?.userResumeRequested = false
+                outputContext?.pendingResetResumeIntent = nil
                 outputContext?.interruptionDrainRequired = true
                 audioPhase?.reactivationState?.basePhase = .awaitingActivation
                 audioPhase?.reactivationState?.freezeCauses.insert(.systemInterruption)
@@ -5325,19 +5350,38 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// 借用快照只形成CAS期望值；lease、proof和最新物理epoch在同一Authority内重新核验。
-    func prepareExplicitResume(for lease: PlaybackAudioSessionLease, userInitiated: Bool = true) -> ControlTaskTicket? {
+    func prepareExplicitResume(for lease: PlaybackAudioSessionLease, userInitiated: Bool = true,
+        expectedEpoch: AudioSessionLifecycleEpoch? = nil, consumePendingResetResume: Bool = false) -> ControlTaskTicket? {
         guard let context = outputResourceContextSnapshot() else { return nil }
         let safety = executor.safetyIngress.snapshot
         let request = OutputUserControlRequest(kind: .resume, sessionIdentity: context.sessionIdentity,
             expectedOwner: context.owner, contextNonce: context.contextNonce,
             interruptionEpoch: safety.interruptionEpoch, mediaServicesEpoch: safety.mediaServicesEpoch,
-            resetPreRouteBinding: context.resetPreRouteBinding, explicitResumeLease: lease, userInitiated: userInitiated)
+            resetPreRouteBinding: context.resetPreRouteBinding, explicitResumeLease: lease, userInitiated: userInitiated,
+            originalActionEpoch: expectedEpoch ?? (userInitiated ? AudioSessionLifecycleEpoch(safety) : nil),
+            consumePendingResetResume: consumePendingResetResume)
         switch executor.performUserControl(request) {
         case .acceptedAndPrepared(let ticket): return ticket
         case .acceptedWaiting:
             return try? beginOutputResetConfigurationActivation(contextNonce: context.contextNonce)
         default: return nil
         }
+    }
+
+    func hasPendingResetResume(for lease: PlaybackAudioSessionLease, matching epoch: AudioSessionLifecycleEpoch) -> Bool {
+        projection {
+            authority.outputContext?.pendingResetResumeIntent == .init(epoch: epoch, leaseID: lease.id) &&
+                AudioSessionLifecycleEpoch(authority.snapshot) == epoch && !authority.snapshot.userPaused
+        }
+    }
+
+    /// Called only after an actual configuration completion; the original user scope and
+    /// retained intent are revalidated atomically by applyUserControl, including a later pause.
+    func preparePendingResetResume() -> ControlTaskTicket? {
+        guard let context = outputResourceContextSnapshot(), let pending = context.pendingResetResumeIntent,
+              context.systemRecoveryBinding?.inactiveConfigurationReceipt != nil,
+              let lease = audioSessionLease(session: context.sessionIdentity), lease.id == pending.leaseID else { return nil }
+        return prepareExplicitResume(for: lease, expectedEpoch: pending.epoch, consumePendingResetResume: true)
     }
 
     func acceptsReactivationCompletion(_ receipt: AudioSessionReactivationCompletionReceipt) -> Bool {
@@ -6125,7 +6169,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 if authority.snapshot.failure != nil { context.poisoned = true }
                 context.ownerIngressRevision = authority.snapshot.throughRevision
                 context.teardownRequested = context.teardownRequested || needsTeardown
-                if releases { context.disposition = .releaseAfterTeardown; context.relayClosing = true }
+                if releases {
+                    context.disposition = .releaseAfterTeardown
+                    context.relayClosing = true
+                    context.pendingResetResumeIntent = nil
+                }
                 if context.phase == .pendingSuccessorLease && releases {
                     guard let nonce = reservation.nonce(for: .leaseOnly) else { return nil }
                     context.contextNonce = nonce
