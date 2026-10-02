@@ -21,7 +21,11 @@ private struct ReleaseScopedRuntimeObservation {
 
 @MainActor
 private final class ReleasePreparationProgressProbe {
-    var stage: String
+    var stage: String {
+        didSet {
+            print("RELEASE_PREPARATION_STAGE stage=\(stage) callerCancelled=\(Task.isCancelled)")
+        }
+    }
     weak var driver: SystemAVPlayerDriver?
     weak var server: LoopbackHTTPServer?
     var setupGETs: LoopbackAcceptedGETSnapshot?
@@ -30,42 +34,58 @@ private final class ReleasePreparationProgressProbe {
 
     init(stage: String) {
         self.stage = stage
+        print("RELEASE_PREPARATION_STAGE stage=\(stage) callerCancelled=\(Task.isCancelled)")
         task = Task { @MainActor [weak self] in
             do { try await Task.sleep(for: .seconds(5)) }
             catch { return }
             guard !Task.isCancelled, let self else { return }
-            let player = driver?.player
-            let item = player?.currentItem
-            // These bounded test-only facts are read once. Never retain an item,
-            // URL, or production callback owner in the suspended probe task.
-            let ranges = item?.loadedTimeRanges ?? []
-            let first = ranges.count <= 128 ? ranges.first?.timeRangeValue : nil
-            let last = ranges.count <= 128 ? ranges.last?.timeRangeValue : nil
-            let requests = server?.acceptedGETSnapshot()
-            let usage = server?.usage
-            print("RELEASE_PREPARATION_WAIT stage=\(self.stage) "
-                + "waitPhase=\(driver?.prepareWait.activePhase.map { String(describing: $0) } ?? "none") "
-                + "playerStatus=\(player?.status.rawValue ?? -1) "
-                + "playerError=\(Self.errorFact(player?.error as NSError?)) "
-                + "itemStatus=\(item?.status.rawValue ?? -1) "
-                + "itemError=\(Self.errorFact(item?.error as NSError?)) "
-                + "assetPlayableState=\(Self.playableFact(item)) "
-                + "timeControlStatus=\(player?.timeControlStatus.rawValue ?? -1) "
-                + "rangeCount=\(ranges.count) "
-                + "firstStart=\(Self.timeFact(first?.start)) "
-                + "firstDuration=\(Self.timeFact(first?.duration)) "
-                + "lastStart=\(Self.timeFact(last?.start)) "
-                + "lastDuration=\(Self.timeFact(last?.duration)) "
-                + "requestedStart=\(Self.timeFact(requestedRange?.start.cmTime)) "
-                + "requestedDuration=\(Self.timeFact(requestedRange?.duration.cmTime)) "
-                + "disconnected=\(driver?.disconnectedFromSystemAudio ?? false) "
-                + "waiterCount=\(driver?.activeWaiterCount ?? 0) "
-                + "setupGETs=\(Self.requestFact(setupGETs)) "
-                + "currentGETs=\(Self.requestFact(requests)) "
-                + "connections=\(usage?.connections ?? -1) "
-                + "activeResponses=\(usage?.activeResponses ?? -1) "
-                + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes)")
+            snapshot(reason: "delayed")
         }
+    }
+
+    func reportFailure(_ error: any Error) {
+        // Record the caller before cleanup cancels the independent probe task.
+        // Preserve the original thrown error and all existing assertions.
+        print("RELEASE_PREPARATION_FAILURE stage=\(stage) "
+            + "callerCancelled=\(Task.isCancelled) "
+            + "isCancellation=\(error is CancellationError) "
+            + "errorType=\(String(reflecting: type(of: error))) "
+            + "errorFact=\(Self.errorFact(error as NSError))")
+        snapshot(reason: "failure")
+    }
+
+    private func snapshot(reason: String) {
+        let player = driver?.player
+        let item = player?.currentItem
+        // These bounded test-only facts are read once. Never retain an item,
+        // URL, or production callback owner in the suspended probe task.
+        let ranges = item?.loadedTimeRanges ?? []
+        let first = ranges.count <= 128 ? ranges.first?.timeRangeValue : nil
+        let last = ranges.count <= 128 ? ranges.last?.timeRangeValue : nil
+        let requests = server?.acceptedGETSnapshot()
+        let usage = server?.usage
+        print("RELEASE_PREPARATION_WAIT reason=\(reason) stage=\(self.stage) "
+            + "waitPhase=\(driver?.prepareWait.activePhase.map { String(describing: $0) } ?? "none") "
+            + "playerStatus=\(player?.status.rawValue ?? -1) "
+            + "playerError=\(Self.errorFact(player?.error as NSError?)) "
+            + "itemStatus=\(item?.status.rawValue ?? -1) "
+            + "itemError=\(Self.errorFact(item?.error as NSError?)) "
+            + "assetPlayableState=\(Self.playableFact(item)) "
+            + "timeControlStatus=\(player?.timeControlStatus.rawValue ?? -1) "
+            + "rangeCount=\(ranges.count) "
+            + "firstStart=\(Self.timeFact(first?.start)) "
+            + "firstDuration=\(Self.timeFact(first?.duration)) "
+            + "lastStart=\(Self.timeFact(last?.start)) "
+            + "lastDuration=\(Self.timeFact(last?.duration)) "
+            + "requestedStart=\(Self.timeFact(requestedRange?.start.cmTime)) "
+            + "requestedDuration=\(Self.timeFact(requestedRange?.duration.cmTime)) "
+            + "disconnected=\(driver?.disconnectedFromSystemAudio ?? false) "
+            + "waiterCount=\(driver?.activeWaiterCount ?? 0) "
+            + "setupGETs=\(Self.requestFact(setupGETs)) "
+            + "currentGETs=\(Self.requestFact(requests)) "
+            + "connections=\(usage?.connections ?? -1) "
+            + "activeResponses=\(usage?.activeResponses ?? -1) "
+            + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes)")
     }
 
     func observeRequests(afterSetup server: LoopbackHTTPServer) {
@@ -153,7 +173,9 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         defer { probe.cancel() }
         let allocator = PlaybackIdentityAllocator()
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
-        var fixture: ReleaseAACPublicationFixture? = try await .make(lifecycle: lifecycle)
+        var fixture: ReleaseAACPublicationFixture?
+        do { fixture = try await .make(lifecycle: lifecycle) }
+        catch { probe.reportFailure(error); throw error }
         defer { try? fixture?.teardown() }
         probe.observeRequests(afterSetup: try XCTUnwrap(fixture).server)
         let item = try XCTUnwrap(fixture).request.item
@@ -176,7 +198,9 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         }
         probe.stage = "scoped.coordinator_prepare"
         print("TASK21_RELEASE_RUNTIME stage=prepare-begin")
-        let prepared = try await XCTUnwrap(coordinator).prepareCurrentItem()
+        let prepared: PreparedAVPlayerItem
+        do { prepared = try await XCTUnwrap(coordinator).prepareCurrentItem() }
+        catch { probe.reportFailure(error); throw error }
         print("TASK21_RELEASE_RUNTIME stage=prepare-returned")
         probe.cancel()
 
@@ -199,11 +223,15 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         defer { probe.cancel() }
         let allocator = PlaybackIdentityAllocator()
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
-        let fixture = try await ReleaseAACPublicationFixture.make(lifecycle: lifecycle)
+        let fixture: ReleaseAACPublicationFixture
+        do { fixture = try await ReleaseAACPublicationFixture.make(lifecycle: lifecycle) }
+        catch { probe.reportFailure(error); throw error }
         defer { try? fixture.teardown() }
         probe.observeRequests(afterSetup: fixture.server)
         probe.stage = "loaded.timeline_mapping"
-        let playhead = try await fixture.makePreparedPlayhead()
+        let playhead: PreparedPlayheadIdentity
+        do { playhead = try await fixture.makePreparedPlayhead() }
+        catch { probe.reportFailure(error); throw error }
         let item = fixture.request.item
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         probe.driver = driver
@@ -215,8 +243,12 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
             duration: ExactMediaTime(value: 1, timescale: 100))
         probe.requestedRange = requested
         probe.stage = "loaded.native_ranges"
-        let receipt = try await driver.waitForLoadedTimeRanges(
-            item: item, playhead: playhead, covering: requested)
+        let receipt: AVPlayerLoadedRangeReceipt
+        do {
+            receipt = try await driver.waitForLoadedTimeRanges(
+                item: item, playhead: playhead, covering: requested)
+        } catch { probe.reportFailure(error); throw error }
+        probe.stage = "loaded.native_ranges_returned"
         XCTAssertEqual(receipt, .init(item: item, playhead: playhead,
                                       requested: requested))
         XCTAssertEqual(driver.activeWaiterCount, 0)
@@ -249,6 +281,7 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
             _ = try await driver.waitUntilReady(item: item)
             XCTFail("Malformed media must report the native item failure")
         } catch {
+            probe.reportFailure(error)
             let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot)
             let nativeError = try XCTUnwrap(invalidItem.error)
             XCTAssertEqual(diagnostic, PlaybackErrorDiagnostics.snapshot(nativeError))
