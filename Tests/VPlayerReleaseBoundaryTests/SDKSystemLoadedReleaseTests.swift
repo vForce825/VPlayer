@@ -22,6 +22,9 @@ private struct ReleaseScopedRuntimeObservation {
 private final class ReleasePreparationProgressProbe {
     var stage: String
     weak var driver: SystemAVPlayerDriver?
+    weak var server: LoopbackHTTPServer?
+    var setupGETs: LoopbackAcceptedGETSnapshot?
+    var requestedRange: FMP4PresentationRange?
     private var task: Task<Void, Never>?
 
     init(stage: String) {
@@ -31,14 +34,47 @@ private final class ReleasePreparationProgressProbe {
             catch { return }
             guard !Task.isCancelled, let self else { return }
             let player = driver?.player
-            print("RELEASE_PREPARATION_WAIT stage=\(stage) "
+            // These bounded test-only facts are read once. Never retain an item,
+            // URL, or production callback owner in the suspended probe task.
+            let ranges = player?.currentItem?.loadedTimeRanges ?? []
+            let first = ranges.count <= 128 ? ranges.first?.timeRangeValue : nil
+            let last = ranges.count <= 128 ? ranges.last?.timeRangeValue : nil
+            let requests = server?.acceptedGETSnapshot()
+            let usage = server?.usage
+            print("RELEASE_PREPARATION_WAIT stage=\(self.stage) "
+                + "waitPhase=\(driver?.prepareWait.activePhase.map { String(describing: $0) } ?? "none") "
                 + "itemStatus=\(player?.currentItem?.status.rawValue ?? -1) "
                 + "timeControlStatus=\(player?.timeControlStatus.rawValue ?? -1) "
-                + "rangeCount=\(player?.currentItem?.loadedTimeRanges.count ?? 0) "
+                + "rangeCount=\(ranges.count) "
+                + "firstStart=\(Self.timeFact(first?.start)) "
+                + "firstDuration=\(Self.timeFact(first?.duration)) "
+                + "lastStart=\(Self.timeFact(last?.start)) "
+                + "lastDuration=\(Self.timeFact(last?.duration)) "
+                + "requestedStart=\(Self.timeFact(requestedRange?.start.cmTime)) "
+                + "requestedDuration=\(Self.timeFact(requestedRange?.duration.cmTime)) "
                 + "disconnected=\(driver?.disconnectedFromSystemAudio ?? false) "
                 + "waiterCount=\(driver?.activeWaiterCount ?? 0) "
+                + "setupGETs=\(Self.requestFact(setupGETs)) "
+                + "currentGETs=\(Self.requestFact(requests)) "
+                + "connections=\(usage?.connections ?? -1) "
+                + "activeResponses=\(usage?.activeResponses ?? -1) "
                 + "contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes)")
         }
+    }
+
+    func observeRequests(afterSetup server: LoopbackHTTPServer) {
+        self.server = server
+        setupGETs = server.acceptedGETSnapshot()
+    }
+
+    private static func requestFact(_ snapshot: LoopbackAcceptedGETSnapshot?) -> String {
+        guard let snapshot else { return "none" }
+        return "playlist:\(snapshot.playlistCount),init:\(snapshot.initializationCount),media:\(snapshot.mediaCount)"
+    }
+
+    private static func timeFact(_ time: CMTime?) -> String {
+        guard let time else { return "none" }
+        return "\(time.value)/\(time.timescale):flags\(time.flags.rawValue)"
     }
 
     func cancel() { task?.cancel(); task = nil }
@@ -96,6 +132,7 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
         var fixture: ReleaseAACPublicationFixture? = try await .make(lifecycle: lifecycle)
         defer { try? fixture?.teardown() }
+        probe.observeRequests(afterSetup: try XCTUnwrap(fixture).server)
         let item = try XCTUnwrap(fixture).request.item
         var driver: SystemAVPlayerDriver? = try .make(player: AVPlayer())
         probe.driver = driver
@@ -141,6 +178,7 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         let lifecycle = try ReleaseIdentityFixture.lifecycle(using: allocator)
         let fixture = try await ReleaseAACPublicationFixture.make(lifecycle: lifecycle)
         defer { try? fixture.teardown() }
+        probe.observeRequests(afterSetup: fixture.server)
         probe.stage = "loaded.timeline_mapping"
         let playhead = try await fixture.makePreparedPlayhead()
         let item = fixture.request.item
@@ -152,6 +190,7 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         let requested = try FMP4PresentationRange(
             start: playhead.playerItemTime,
             duration: ExactMediaTime(value: 1, timescale: 100))
+        probe.requestedRange = requested
         probe.stage = "loaded.native_ranges"
         let receipt = try await driver.waitForLoadedTimeRanges(
             item: item, playhead: playhead, covering: requested)

@@ -7,6 +7,27 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SDKFixedRangeReleaseTests: XCTestCase {
+    func testWaitPhaseSnapshotTracksOnlyCurrentToken() throws {
+        let slot = AVPlayerPrepareWaitSlot()
+        XCTAssertNil(slot.activePhase)
+        for phase in [AVPlayerPrepareWaitSlot.Phase.ready, .mapping, .seek, .loaded, .preroll] {
+            let retired = try slot.begin(phase)
+            XCTAssertEqual(slot.activePhase, phase)
+            slot.cancelCurrent()
+            XCTAssertEqual(slot.activePhase, phase,
+                           "A terminal result must not retire the physical wait token")
+            slot.retire(retired)
+            XCTAssertNil(slot.activePhase)
+
+            let current = try slot.begin(phase)
+            slot.retire(retired)
+            XCTAssertEqual(slot.activePhase, phase,
+                           "A stale token must not hide the current wait phase")
+            slot.retire(current)
+            XCTAssertNil(slot.activePhase)
+        }
+    }
+
     func testFixedRangeKernel() {
         func range(_ start: Int64, _ duration: Int64, scale: Int32 = 1) -> CMTimeRange {
             CMTimeRange(start: CMTime(value: start, timescale: scale),

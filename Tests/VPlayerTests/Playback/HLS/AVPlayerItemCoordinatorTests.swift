@@ -6926,7 +6926,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
 
         let audioSink = Task19SystemSink(binding: audioBinding)
         let videoSink = Task19SystemSink(binding: videoBinding)
-        let additionalAudioSink = additionalAudioBinding.map(Task19SystemSink.init(binding:))
+        let additionalAudioSink = additionalAudioBinding.map { Task19SystemSink(binding: $0) }
         let audioRelay = SegmentReportRelay(binding: audioBinding, limits: .audio,
             capacity: 8, objectSink: audioSink.collect)
         let videoRelay = SegmentReportRelay(binding: videoBinding, limits: .video,

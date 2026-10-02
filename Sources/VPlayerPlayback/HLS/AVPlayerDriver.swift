@@ -1165,6 +1165,7 @@ final class AVPlayerPrepareWaitSlot: @unchecked Sendable {
     private var terminal: Result<Bool, AVPlayerFixedPreparationFailure>?
 
     var isActive: Bool { lock.withLock { current != nil } }
+    var activePhase: Phase? { lock.withLock { current?.phase } }
 
     func begin(_ phase: Phase) throws -> Token {
         try lock.withLock {

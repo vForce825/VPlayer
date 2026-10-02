@@ -3793,6 +3793,256 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(readiness.snapshot.map(\.change), [.available])
     }
 
+    func testCompressedPrerollDoesNotUseInflatedLogicalPacketDuration() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: false)
+        let logicalDuration = CMTime(value: 1, timescale: 2)
+        let sample = try makeSample(id: 1, pts: .zero, duration: logicalDuration)
+        let physicalDuration = CMSampleBufferGetOutputDuration(sample.sampleBuffer)
+        XCTAssertEqual(CMTimeCompare(physicalDuration, CMTime(value: 1_024, timescale: 48_000)), 0)
+
+        try perform(on: harness.executor) { try harness.pipeline.enqueue(sample) }
+
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback,
+            "one physical AAC packet cannot supply the logical half-second interval as preroll")
+        let coverage = try XCTUnwrap(harness.pipeline.acceptedCoverage)
+        XCTAssertEqual(coverage.firstPTS, .zero)
+        XCTAssertEqual(coverage.endPTS, physicalDuration)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [.zero])
+        XCTAssertEqual(harness.pipeline.diagnostics.acceptedCompressedMediaDurationSeconds,
+            logicalDuration.seconds)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testCompressedPrerollDoesNotBridgeSubMillisecondPhysicalOutputGaps() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: false)
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(
+            category: .bluetooth,
+            reason: .routeConfigurationChange,
+            revision: 1,
+            outputLatency: 0.20,
+            ioBufferDuration: 0.01
+        ))
+        drain(harness.executor)
+        let duration = CMTime(value: 1_024, timescale: 48_000)
+        let stride = CMTimeAdd(duration, CMTime(value: 9, timescale: 10_000))
+        try perform(on: harness.executor) {
+            for index in 0..<21 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTimeMultiply(stride, multiplier: Int32(index)),
+                    duration: duration
+                ))
+            }
+        }
+
+        // The health observer intentionally tolerates 1 ms timestamp rounding.
+        // Its 466 ms span must not count 18 ms of holes toward the 460 ms
+        // Bluetooth startup floor: physically accepted packets total 448 ms.
+        let coverage = try XCTUnwrap(harness.pipeline.acceptedCoverage)
+        XCTAssertEqual(CMTimeSubtract(coverage.endPTS, coverage.firstPTS).seconds,
+            0.466, accuracy: 0.000_001)
+        XCTAssertEqual(CMTimeMultiply(duration, multiplier: 21).seconds,
+            0.448, accuracy: 0.000_001)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        XCTAssertFalse(renderer.hasSufficientMediaDataForReliablePlaybackStart)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 21)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testCompressedPrerollRestartsAtPhysicalOutputGap() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true, sufficient: false)
+        let duration = CMTime(value: 1_024, timescale: 48_000)
+        let secondRunStart = CMTime(value: 1, timescale: 2)
+        try perform(on: harness.executor) {
+            for index in 0..<6 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTimeMultiply(duration, multiplier: Int32(index)),
+                    duration: duration
+                ))
+            }
+            for index in 0..<6 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 7),
+                    pts: CMTimeAdd(secondRunStart, CMTimeMultiply(duration, multiplier: Int32(index))),
+                    duration: duration
+                ))
+            }
+        }
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback,
+            "two separated 128 ms runs must not combine into a startup window")
+        let partial = try XCTUnwrap(harness.pipeline.acceptedCoverage)
+        XCTAssertEqual(partial.firstPTS, secondRunStart)
+        XCTAssertEqual(CMTimeSubtract(partial.endPTS, partial.firstPTS).seconds,
+            0.128, accuracy: 0.000_001)
+
+        try perform(on: harness.executor) {
+            for index in 6..<12 {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 7),
+                    pts: CMTimeAdd(secondRunStart, CMTimeMultiply(duration, multiplier: Int32(index))),
+                    duration: duration
+                ))
+            }
+        }
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 18)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testCompressedAnchorReplayRebuildsPrerollFromCurrentQueueAcceptance() throws {
+        let harness = try makeHarness(clockMode: .externallyManaged)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        // tvOS 27's receiver has no renderer-sufficiency signal. The accepted
+        // queue itself must prove preroll, including after a destructive flush.
+        renderer.configureReadiness(ready: true, sufficient: false)
+        let duration = CMTime(value: 1_024, timescale: 48_000)
+        let samplePTS = (0..<13).map { CMTimeMultiply(duration, multiplier: Int32($0)) }
+        try perform(on: harness.executor) {
+            for (index, pts) in samplePTS.enumerated() {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1), pts: pts, duration: duration
+                ))
+            }
+        }
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+        let original = try XCTUnwrap(harness.pipeline.acceptedCoverage)
+        let acceptedDuration = harness.pipeline.diagnostics.acceptedCompressedMediaDurationSeconds
+        XCTAssertEqual(acceptedDuration, CMTimeMultiply(duration, multiplier: 13).seconds,
+            accuracy: 0.000_001)
+        let initialFlushCount = renderer.snapshot.operations.filter { $0 == "flush" }.count
+
+        renderer.configureReadiness(ready: false, sufficient: false)
+        try perform(on: harness.executor) {
+            try harness.pipeline.prepareAnchor(at: .zero, in: .init(rawValue: 1))
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, (1...13).map(UInt64.init))
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 26)
+        }
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        XCTAssertNil(harness.pipeline.acceptedCoverage)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, samplePTS)
+        XCTAssertTrue(renderer.snapshot.pendingPTS.isEmpty)
+        XCTAssertEqual(harness.pipeline.diagnostics.pendingSampleCount, 13)
+
+        // Half the old queue is insufficient. Historical acceptance must not
+        // survive the flush or be counted as new media while replay is blocked.
+        renderer.configureReadiness(ready: true, sufficient: false, maximumEnqueuesPerCallback: 6)
+        renderer.fireReady()
+        drain(harness.executor)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        let partial = try XCTUnwrap(harness.pipeline.acceptedCoverage)
+        XCTAssertGreaterThan(partial.queueEpisode, original.queueEpisode)
+        XCTAssertEqual(partial.firstPTS, .zero)
+        XCTAssertEqual(CMTimeCompare(partial.endPTS, CMTimeMultiply(duration, multiplier: 6)), 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.pendingSampleCount, 7)
+        XCTAssertEqual(harness.pipeline.diagnostics.acceptedCompressedMediaDurationSeconds,
+            acceptedDuration)
+
+        renderer.configureReadiness(ready: true, sufficient: false)
+        renderer.fireReady()
+        drain(harness.executor)
+
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback,
+            "reaccepted current-queue media must rebuild native compressed preroll")
+        XCTAssertFalse(renderer.hasSufficientMediaDataForReliablePlaybackStart)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, samplePTS + samplePTS)
+        XCTAssertEqual(renderer.snapshot.pendingPTS, samplePTS)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count,
+            initialFlushCount + 1)
+        XCTAssertEqual(harness.pipeline.diagnostics.pendingSampleCount, 0)
+        XCTAssertEqual(harness.pipeline.diagnostics.acceptedCompressedMediaDurationSeconds,
+            acceptedDuration)
+        let replayed = try XCTUnwrap(harness.pipeline.acceptedCoverage)
+        XCTAssertEqual(replayed.epoch, original.epoch)
+        XCTAssertEqual(replayed.generation, original.generation)
+        XCTAssertEqual(replayed.continuityIslandID, original.continuityIslandID)
+        XCTAssertEqual(replayed.queueEpisode, partial.queueEpisode)
+        XCTAssertEqual(replayed.firstPTS, original.firstPTS)
+        XCTAssertEqual(replayed.endPTS, original.endPTS)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testSynchronousReadinessAnchorPreparationReplaysOnceWithoutAnotherInput() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.reentrant-anchor")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let preparation = SynchronousAudioAnchorPreparation(executor: executor)
+        let failures = LockedAudioFailures(executor: executor)
+        let pipeline = AudioRenderPipeline(
+            synchronizer: synchronizer,
+            executor: executor,
+            failureSink: { error, generation in
+                failures.append(error, generation: generation)
+            },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { _ in [] },
+            routeMonitor: FakeAudioRouteMonitor(),
+            decodeCapabilityChecker: FakeAudioFormatSupportChecker(),
+            pcmOutputValidator: FakeAudioFormatSupportChecker(),
+            clockMode: .externallyManaged,
+            readinessSink: { change, generation in
+                readiness.append(change, generation: generation)
+                preparation.receive(change)
+            }
+        )
+        let generation = MediaGeneration(rawValue: 1)
+        let island = AudioContinuityIslandID(rawValue: 1)
+        preparation.install(pipeline, island: island)
+        try perform(on: executor) {
+            try pipeline.configure(
+                format: try self.makeFormat(codec: .aac),
+                codec: .aac,
+                generation: generation,
+                fingerprint: self.fingerprint(1)
+            )
+            pipeline.activateContinuityIsland(island, generation: generation)
+        }
+        let renderer = try XCTUnwrap(renderers.snapshot.first)
+        let sample = try makeSample(id: 1, pts: .zero)
+        let expectedEnd = CMTimeAdd(
+            CMSampleBufferGetOutputPresentationTimeStamp(sample.sampleBuffer),
+            CMSampleBufferGetOutputDuration(sample.sampleBuffer)
+        )
+        let initialFlushCount = renderer.snapshot.operations.filter { $0 == "flush" }.count
+        renderer.configureReadiness(ready: true, sufficient: true)
+
+        // The real shared gate calls prepareAnchor synchronously from the first
+        // .available callback. No later packet or synthetic ready callback may
+        // be needed to refill the queue that this preparation just flushed.
+        try perform(on: executor) { try pipeline.enqueue(sample) }
+        drain(executor)
+
+        let prepared = preparation.snapshot
+        XCTAssertEqual(prepared.count, 1)
+        XCTAssertNil(prepared.error)
+        let before = try XCTUnwrap(prepared.coverageBefore)
+        XCTAssertEqual(before.generation, generation)
+        XCTAssertEqual(before.continuityIslandID, island)
+        XCTAssertEqual(before.firstPTS, .zero)
+        XCTAssertEqual(before.endPTS, expectedEnd)
+        XCTAssertEqual(renderer.snapshot.operations.filter { $0 == "flush" }.count,
+            initialFlushCount + 1)
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS, [.zero, .zero])
+        XCTAssertEqual(renderer.snapshot.pendingPTS, [.zero])
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .invalidated, .available])
+        XCTAssertTrue(failures.snapshot.isEmpty)
+        let after = try XCTUnwrap(pipeline.acceptedCoverage)
+        XCTAssertEqual(after.epoch, before.epoch)
+        XCTAssertEqual(after.generation, before.generation)
+        XCTAssertEqual(after.continuityIslandID, before.continuityIslandID)
+        XCTAssertGreaterThan(after.queueEpisode, before.queueEpisode)
+        XCTAssertEqual(after.firstPTS, before.firstPTS)
+        XCTAssertEqual(after.endPTS, before.endPTS)
+    }
+
     func testPrepareAnchorInvalidatesRunningTimelineReadinessUntilRendererReprerolls() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.anchor-preroll")
         let synchronizer = FakeAudioSynchronizer()
@@ -7140,6 +7390,46 @@ private final class LockedAudioReadinessChanges: @unchecked Sendable {
         lock.withLock { records.append(.init(change: change, generation: generation)) }
     }
     var snapshot: [AudioReadinessRecord] { lock.withLock { records } }
+}
+
+private final class SynchronousAudioAnchorPreparation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let executor: PlaybackSerialExecutor
+    private weak var pipeline: AudioRenderPipeline?
+    private var island: AudioContinuityIslandID?
+    private var count = 0
+    private var coverageBefore: AudioRendererAcceptedCoverage?
+    private var error: (any Error)?
+
+    init(executor: PlaybackSerialExecutor) { self.executor = executor }
+
+    func install(_ pipeline: AudioRenderPipeline, island: AudioContinuityIslandID) {
+        lock.withLock {
+            self.pipeline = pipeline
+            self.island = island
+        }
+    }
+
+    func receive(_ change: AudioRenderReadinessChange) {
+        XCTAssertTrue(executor.isIsolated)
+        guard change == .available else { return }
+        let target = lock.withLock { () -> (AudioRenderPipeline, AudioContinuityIslandID)? in
+            guard count == 0, let pipeline, let island else { return nil }
+            count += 1
+            coverageBefore = pipeline.acceptedCoverage
+            return (pipeline, island)
+        }
+        guard let (pipeline, island) = target else { return }
+        do {
+            try pipeline.prepareAnchor(at: .zero, in: island)
+        } catch {
+            lock.withLock { self.error = error }
+        }
+    }
+
+    var snapshot: (count: Int, coverageBefore: AudioRendererAcceptedCoverage?, error: (any Error)?) {
+        lock.withLock { (count, coverageBefore, error) }
+    }
 }
 
 private final class LockedRouteSnapshots: @unchecked Sendable {

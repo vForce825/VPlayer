@@ -137,6 +137,11 @@ jobs:
             -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testResetFoldPreservesFirstAnchorAndLatestRoot \
             -only-testing:VPlayerTests/SynchronousSafetyIngressTests/testResetOutsideInterruptionUsesSeparateFirstResetAnchor \
             -only-testing:VPlayerTests/HLSResourceStoreTests/testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testCompressedAnchorReplayRebuildsPrerollFromCurrentQueueAcceptance \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testSynchronousReadinessAnchorPreparationReplaysOnceWithoutAnotherInput \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testCompressedPrerollDoesNotUseInflatedLogicalPacketDuration \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testCompressedPrerollDoesNotBridgeSubMillisecondPhysicalOutputGaps \
+            -only-testing:VPlayerTests/AudioRenderPipelineTests/testCompressedPrerollRestartsAtPhysicalOutputGap \
             -only-testing:VPlayerTests/Task9ProductionDeadlineTests \
             -only-testing:VPlayerTests/FFmpegDemuxerTests/testRecorderRecognizesEveryTerminalBeforeWaiting \
             -only-testing:VPlayerTests/FFmpegDemuxerTests/testRecorderRetainsNonterminalBurstAndExactFailedTerminal \

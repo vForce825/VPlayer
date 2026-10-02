@@ -22,7 +22,7 @@ final class FFmpegDemuxerTests: XCTestCase {
 
     func testRecorderRetainsNonterminalBurstAndExactFailedTerminal() {
         let recorder = DemuxEventRecorder()
-        let packet = DemuxEvent.packet(DemuxPacket(streamIndex: 0, codec: .h264,
+        let packet = DemuxEvent.packet(DemuxPacket(streamIndex: 0, codec: .video(.h264),
             data: Data([0]), presentationTimeStamp: .zero, decodeTimeStamp: .zero,
             duration: CMTime(value: 1, timescale: 25), isKey: true, isCorrupt: false))
         for _ in 0..<128 { recorder.record(packet) }
