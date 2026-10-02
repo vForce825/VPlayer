@@ -1,4 +1,4 @@
-name: Coalesced native EOS event diagnostic
+name: Interim complete Debug unit and UI regression
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-eos-batch-${{ github.ref }}
+  group: macos-ci-interim-full-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-test:
     name: Xcode 27.0 / tvOS 27.0
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
       TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
@@ -58,44 +58,13 @@ jobs:
           python3 Scripts/Tests/test_tvos27_deployment.py
           ./Scripts/Tests/test_precompiled_metal_library.sh
 
-      - name: Compile complete Debug test targets for diagnostic isolation
-        id: debug_build
+      - name: Compile and run unit and UI tests
         run: |
-          ./Scripts/bootstrap.sh --check
-          ./Scripts/verify-licenses.sh
-          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Verify coalesced EOS and current fault ordering
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/EOSBatch.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesCoalescedPausedRelayAndRejectsChangedSecondRead \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesLaterPausedRelayAndRejectsChangedSecondRead \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeCoalescedCurrentAccessFaultWinsOverEndpointAndPausedRelay \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeCurrentItemAccessFaultCancelsPendingEndpointVerification \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeUnexpectedPauseWithoutEndpointNotificationStillRetires \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageOwnedEOSDeadlineSharesTimerAndStopRevokesPendingDelivery
-      - name: Report scoped EOSBatch failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/EOSBatch.xcresult"
+          ./Scripts/test.sh -resultBundlePath "$RUNNER_TEMP/DebugFull.xcresult" -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
 
-      - name: Observe original native EOS batch and authority rejection
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeEOSBatch.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageSystemEOSPublicationAndStopRaceNeverPublishAfterClose
-      - name: Report scoped NativeEOSBatch failures
+      - name: Report scoped Debug test failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeEOSBatch.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/DebugFull.xcresult"
 
