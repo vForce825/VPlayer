@@ -10,7 +10,8 @@ enum VideoFormatDescriptionBuilder {
     /// 借用栈中存在，绝不能先收集后离开某个 Entry 的借用窗口。
     static func make(
         codec: VideoCodec,
-        parameterSetOwner: HLSVideoParameterSetRetention
+        parameterSetOwner: HLSVideoParameterSetRetention,
+        videoMetadata: DemuxVideoMetadata = DemuxVideoMetadata()
     ) throws -> CMVideoFormatDescription {
         let entries = parameterSetOwner.entries
         guard !entries.isEmpty, entries.allSatisfy({ $0.byteCount > 0 }) else {
@@ -33,6 +34,7 @@ enum VideoFormatDescriptionBuilder {
                     codec: codec,
                     pointers: stablePointers,
                     sizes: stableSizes,
+                    extensions: colorExtensions(videoMetadata),
                     formatDescription: &formatDescription
                 )
             }
@@ -45,7 +47,8 @@ enum VideoFormatDescriptionBuilder {
 
     static func make(
         codec: VideoCodec,
-        parameterSets: [Data]
+        parameterSets: [Data],
+        videoMetadata: DemuxVideoMetadata = DemuxVideoMetadata()
     ) throws -> CMVideoFormatDescription {
         guard !parameterSets.isEmpty, parameterSets.allSatisfy({ !$0.isEmpty }) else {
             throw PlaybackCoreError.videoFormatDescription(kCMFormatDescriptionError_InvalidParameter)
@@ -63,6 +66,7 @@ enum VideoFormatDescriptionBuilder {
                 codec: codec,
                 pointers: stablePointers,
                 sizes: sizes,
+                extensions: colorExtensions(videoMetadata),
                 formatDescription: &formatDescription
             )
         }
@@ -76,6 +80,7 @@ enum VideoFormatDescriptionBuilder {
         codec: VideoCodec,
         pointers: [UnsafePointer<UInt8>],
         sizes: [Int],
+        extensions: CFDictionary?,
         formatDescription: inout CMFormatDescription?
     ) -> OSStatus {
         pointers.withUnsafeBufferPointer { pointerBuffer in
@@ -101,12 +106,42 @@ enum VideoFormatDescriptionBuilder {
                         parameterSetPointers: pointerBase,
                         parameterSetSizes: sizeBase,
                         nalUnitHeaderLength: 4,
-                        extensions: nil,
+                        extensions: extensions,
                         formatDescriptionOut: &formatDescription
                     )
                 }
             }
         }
+    }
+
+    /// 解复用器会结合 SEI 解析有效传递函数；只从 SPS 重建会把兼容写法的 HLG
+    /// 当作 SDR。显式传递已有色彩证据，缺失的字段继续交给 Core Media 解析。
+    private static func colorExtensions(_ metadata: DemuxVideoMetadata) -> CFDictionary? {
+        var result: [String: Any] = [:]
+        if let range = metadata.range {
+            result[kCMFormatDescriptionExtension_FullRangeVideo as String] = range == .full
+        }
+        if let primaries = metadata.primaries {
+            result[kCMFormatDescriptionExtension_ColorPrimaries as String] = switch primaries {
+            case .bt709: kCMFormatDescriptionColorPrimaries_ITU_R_709_2
+            case .bt2020: kCMFormatDescriptionColorPrimaries_ITU_R_2020
+            }
+        }
+        if let transfer = metadata.transfer {
+            result[kCMFormatDescriptionExtension_TransferFunction as String] = switch transfer {
+            case .bt709: kCMFormatDescriptionTransferFunction_ITU_R_709_2
+            case .bt2020, .bt2020_12: kCMFormatDescriptionTransferFunction_ITU_R_2020
+            case .pq: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
+            case .hlg: kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
+            }
+        }
+        if let matrix = metadata.matrix {
+            result[kCMFormatDescriptionExtension_YCbCrMatrix as String] = switch matrix {
+            case .bt709: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2
+            case .bt2020Nonconstant: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020
+            }
+        }
+        return result.isEmpty ? nil : result as CFDictionary
     }
 
     private static func checkedPointerWorkspaceBytes(_ count: Int) throws -> Int {

@@ -9,6 +9,49 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class HLSTimelineTests: XCTestCase {
+    func testHEVCEOSSurvivesFormatReplayAndFollowingCRAChanges() throws {
+        let factory = ScriptedFFmpegParserFactory { handle, _, bytes, pts, dts, _ in
+            try handle.emit(FFmpegParsedFrame(bytes: bytes, pts: pts, dts: dts,
+                duration: CMTime(value: 3_000, timescale: 90_000),
+                fieldOrder: Int32(CodedFieldOrder.progressive.rawValue),
+                pictureStructure: Int32(PictureStructure.frame.rawValue), keyFrame: true,
+                repeatPicture: false, topFieldFirst: nil, interlaced: false,
+                sampleRate: 0, channels: 0, frameSamples: 0, channelLayout: nil))
+        }
+        let subject = HLSTimelineCoordinator(parserFactory: factory)
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: audioVideoTracks().video,
+            audio: audioTracks(extradata: Data()).audio)
+        _ = try subject.consume(.tracks(tracks))
+        let audio = makeADTSFrame(payload: Data([0x21, 0x10, 0x56, 0xE5]))
+        _ = try subject.consume(.packet(audioPacket(data: audio, pts: .zero)))
+        let sei = Data([0, 0, 1, 0x4E, 1, 147, 1, 18, 0x80])
+        for index in 0...8 {
+            let video = sei + AssemblerTestFixtures.hevcAccessUnit(
+                includeParameterSets: index == 0,
+                nal: Data([index == 8 ? 0x26 : 0x02, 1, 0x80]))
+            _ = try subject.consume(.packet(videoPacket(data: video,
+                pts: CMTime(value: Int64(index + 1) * 3_000, timescale: 90_000))))
+        }
+        // 先让音频接收当前 HLG 指纹，随后 EOS 不应再触发音频格式事件。
+        _ = try subject.consume(.packet(audioPacket(data: audio,
+            pts: CMTime(value: 27_500, timescale: 90_000))))
+        _ = try subject.consume(.packet(videoPacket(data: annexB([
+            Data([0x02, 1, 0x80]), Data([0x48, 1, 0x80])]),
+            pts: CMTime(value: 30_000, timescale: 90_000))))
+        let unchangedAudio = try subject.consume(.packet(audioPacket(data: audio,
+            pts: CMTime(value: 31_000, timescale: 90_000))))
+        XCTAssertTrue(unchangedAudio.endedGenerations.isEmpty)
+        let afterEOS = try subject.consume(.packet(videoPacket(data: annexB([Data([0x2A, 1, 0x80])]),
+            pts: CMTime(value: 33_000, timescale: 90_000))))
+        XCTAssertEqual(afterEOS.endedGenerations.count, 1,
+            "EOS 后无 ATC 的 CRA 应回到 SPS 曲线，格式重放不能恢复旧 HLG")
+        let returnedHLG = try subject.consume(.packet(videoPacket(data:
+            sei + annexB([Data([0x2A, 1, 0x80])]),
+            pts: CMTime(value: 36_000, timescale: 90_000))))
+        XCTAssertEqual(returnedHLG.endedGenerations.count, 1,
+            "重放必须正确打开格式 gate，后续 ATC 变化不能被旧 replay target 吞掉")
+    }
+
     func testAudioOnlyUsesFirstValidatedCompleteAUWithoutCreatingOrWaitingForVideo() throws {
         let parserFactory = ScriptedFFmpegParserFactory()
         let subject = HLSTimelineCoordinator(parserFactory: parserFactory)
