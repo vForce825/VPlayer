@@ -4330,7 +4330,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             configuration.urlCache = nil
             configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
             let session = URLSession(configuration: configuration)
-            func retire() async throws {
+            @MainActor func retire() async throws {
                 session.invalidateAndCancel()
                 reservedSource?.retirePreparation()
                 await harness.branch.cancelAndAwait()
@@ -4350,7 +4350,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             do {
             let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
                 itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in },
-                prepare: { token in try await harness.startPublication(loopbackSession: token) })
+                prepare: { @Sendable token in try await harness.startPublication(loopbackSession: token) })
             reservedServer = server
             let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
             reservedSource = source
