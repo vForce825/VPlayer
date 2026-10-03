@@ -816,13 +816,14 @@ final class HLSTimelineTests: XCTestCase {
                                 generation: timed.source.generation, track: actualVideo, sampleEntry: .avc3)
                         }
                         stage = "inspect/admit"
-                        let inspection = try XCTUnwrap(videoInspection)
+                        var inspection = try XCTUnwrap(videoInspection)
                         let eligibility = try XCTUnwrap(videoEligibility)
                         let proof = try inspection.inspect(.init(
                             backing: backing, byteRange: byteRange, sourceSHA256: sourceSHA256,
                             codec: actualVideo.codec, scanClassification: timed.source.scanClassification,
                             presentationTimeStamp: sourcePTS, decodeTimeStamp: sourceDTS,
                             duration: sourceDuration, expectedFormat: actualVideo))
+                        videoInspection = inspection
                         let decision = try eligibility.evaluate(proof)
                         try require(decision.path == .remux && decision.transcodeReason == nil && !decision.requiresNewItem,
                                     "Video sample \(videoSampleCount): fixture must remux; path=\(decision.path), "
