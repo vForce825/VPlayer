@@ -14,7 +14,11 @@ limit=128*1024
 failures=[]
 with TemporaryDirectory(prefix='vplayer-control-log-review-') as tmp:
     tmp=Path(tmp); log=tmp/'gate.log'; ir=tmp/'Synthetic.ll'
-    cases=[('healthy',b'compiler output\n','passed','',0,'passed'),
+    cases=[('caller_chain_excerpt',b'unknown native chain\n','failed',
+            '  %3 = getelementptr inbounds nuw i8, ptr @descriptor, i64 4\n'
+            '  %4 = load i32, ptr %3, align 4\n'
+            '  %5 = zext nneg i32 %4 to i64\n',1,'failed'),
+           ('healthy',b'compiler output\n','passed','',0,'passed'),
            ('oversized_success',b'x'*(limit+1),'passed','',1,'failed'),
            ('failure_plus_excerpt',b'x'*limit,'failed','\n'.join('%swift.async_func_pointer '+'x'*1100 for _ in range(32))+'\n',1,'failed'),
            ('unicode_failure',b'x'*(limit-32768),'failed','\n'.join('%swift.async_func_pointer '+'\U0001f9ea'*1100 for _ in range(32))+'\n',1,'failed')]
@@ -23,6 +27,8 @@ with TemporaryDirectory(prefix='vplayer-control-log-review-') as tmp:
         run=subprocess.run([sys.executable,'-',str(log),'Debug',result,str(tmp)],input=code,text=True,capture_output=True)
         report=json.loads(run.stdout.splitlines()[0]); size=len(run.stdout.encode('utf-8'))
         good=run.returncode==expected_exit and report['result']==expected_result and size<=limit
+        if name == 'caller_chain_excerpt':
+            good = good and all(line in run.stdout for line in irtext.splitlines())
         print(f'{name}: exit={run.returncode}; reported={report["result"]}; bytes={size}; PASS={good}')
         if not good: failures.append(name)
 print('Synthetic temporary files removed.')

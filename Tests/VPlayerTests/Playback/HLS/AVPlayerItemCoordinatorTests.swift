@@ -622,7 +622,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(harness.driver.operations.dropFirst(before).filter { $0 == .preroll }.count, 1)
             XCTAssertEqual(harness.driver.loadedRangeCallCount, loadedBefore + 1)
             XCTAssertEqual(harness.driver.lastRequestedLoadedRange,
-                try FMP4PresentationRange(start: target, duration: prepared.minimumCoverageDuration))
+                ExactMediaInterval(try FMP4PresentationRange(start: target, duration: prepared.minimumCoverageDuration)))
             XCTAssertEqual(harness.driver.directStateCallCount, directBefore + 1)
             XCTAssertEqual(harness.driver.pausedTimeReadCount, cursorReadsBefore + 1,
                 "Only final paused readback may read again; it cannot replace the captured target")
@@ -632,6 +632,40 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(harness.driver.currentItemIdentity, prepared.item)
             XCTAssertEqual(harness.driver.operations.filter { $0 == .install }.count, 1)
             XCTAssertFalse(harness.coordinator.accept(receipt))
+        }
+    }
+
+    func testPausedResumePreservesObservedNanosecondCursorThroughRealCoverage() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            let timeline = prepared.identity.timelineMappingAuthority
+            let target = ExactMediaTime(value: 259_475_417, timescale: 1_000_000_000)
+            let source = try timeline.sourceTime(for: target)
+            let sourceEnd = try source.adding(ExactMediaTime(value: 3, timescale: 1))
+            let final = try harness.pausedFinalPublication()
+            XCTAssertLessThan(CMTimeCompare(sourceEnd.cmTime, final.effectivePlaybackHorizon.cmTime), 0)
+            _ = try await harness.activate()
+            harness.driver.observedPausedTime = target.cmTime
+            let receipt = try await harness.stop()
+            XCTAssertEqual(harness.coordinator.capturedPausedCursor(for: receipt)?.time, target)
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            harness.driver.applySeekToObservedPausedTime = true
+            harness.driver.reconnectedPausedTime = try target.adding(
+                ExactMediaTime(value: 1, timescale: 1_000_000)).cmTime
+            let result = try await harness.resumeThroughRegistry()
+            XCTAssertEqual(result, .armed(harness.activation))
+            XCTAssertEqual(harness.driver.requestedSeekTime, target)
+            XCTAssertEqual(harness.driver.lastPlayedPausedTime, target)
+            XCTAssertEqual(harness.driver.lastRequestedLoadedRange?.start, target)
+            XCTAssertEqual(harness.driver.lastRequestedLoadedRange?.end,
+                try target.adding(ExactMediaTime(value: 3, timescale: 1)))
+            XCTAssertEqual(harness.driver.playCallCount, 2)
+            XCTAssertTrue(harness.driver.observedPlayheads.allSatisfy {
+                $0.timelineMappingAuthority === timeline
+            })
         }
     }
 
@@ -894,7 +928,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(harness.driver.requestedSeekTime, target)
             XCTAssertEqual(harness.driver.lastPlayedPausedTime, target)
             XCTAssertEqual(harness.driver.lastRequestedLoadedRange,
-                try FMP4PresentationRange(start: target, duration: lead))
+                ExactMediaInterval(try FMP4PresentationRange(start: target, duration: lead)))
             XCTAssertEqual(harness.driver.playCallCount, 2)
             XCTAssertTrue(harness.driver.observedPlayheads.dropFirst(observationsBefore).allSatisfy {
                 $0.timelineMappingAuthority === timeline && $0.playerItemTime == target
@@ -937,7 +971,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(result, .armed(harness.activation))
             XCTAssertEqual(harness.driver.requestedSeekTime, target)
             XCTAssertEqual(harness.driver.lastPlayedPausedTime, target)
-            XCTAssertEqual(harness.driver.lastRequestedLoadedRange, expected)
+            XCTAssertEqual(harness.driver.lastRequestedLoadedRange, ExactMediaInterval(expected))
             XCTAssertEqual(harness.driver.lastRequestedLoadedRange?.end, itemEnd)
             XCTAssertEqual(harness.driver.playCallCount, 2)
             XCTAssertEqual(harness.driver.prerollCallCount, 2)
@@ -1612,6 +1646,34 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.item, harness.item)
     }
 
+    func testSDKLoadedEndpointScanPreservesUnrepresentableDurationAndRejectsGap() throws {
+        let start = ExactMediaTime(value: 259_475_417, timescale: 1_000_000_000)
+        let end = ExactMediaTime(value: 104, timescale: 375)
+        XCTAssertThrowsError(try end.subtracting(start))
+        func scan(_ ranges: [CMTimeRange], from first: CMTime, through last: CMTime) -> UInt32 {
+            ranges.withUnsafeBufferPointer {
+                VPScanLoadedIntervalBuffer($0.baseAddress, $0.count, first, last).code
+            }
+        }
+        let complete = CMTimeRange(start: .zero, duration: end.cmTime)
+        XCTAssertEqual(scan([complete], from: start.cmTime, through: end.cmTime), 0)
+        let beforeEnd = try end.subtracting(ExactMediaTime(value: 1, timescale: 48_000))
+        XCTAssertEqual(scan([.init(start: .zero, duration: beforeEnd.cmTime)],
+            from: start.cmTime, through: end.cmTime), 1)
+        let afterStart = try start.adding(ExactMediaTime(value: 1, timescale: 1_000_000_000))
+        XCTAssertEqual(scan([.init(start: afterStart.cmTime, duration: CMTime(value: 1, timescale: 1))],
+            from: start.cmTime, through: end.cmTime), 1)
+        XCTAssertEqual(scan([complete], from: end.cmTime, through: end.cmTime), 3)
+        XCTAssertEqual(scan([complete], from: end.cmTime, through: start.cmTime), 3)
+        XCTAssertEqual(scan([complete, .invalid], from: start.cmTime, through: end.cmTime), 3)
+        XCTAssertEqual(scan(Array(repeating: complete, count: 129),
+            from: start.cmTime, through: end.cmTime), 2)
+        let laterStart = ExactMediaTime(value: 10_259_475_417, timescale: 1_000_000_000)
+        let laterEnd = try laterStart.adding(ExactMediaTime(value: 3, timescale: 1))
+        XCTAssertEqual(scan([.init(start: laterStart.cmTime, duration: CMTime(value: 3, timescale: 1))],
+            from: laterStart.cmTime, through: laterEnd.cmTime), 0)
+    }
+
     func testSDKFixedRangeKernelBoundariesAndExactUnion() {
         func range(_ start: Int64, _ duration: Int64) -> CMTimeRange {
             CMTimeRange(start: CMTime(value: start, timescale: 1),
@@ -1721,8 +1783,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 XCTAssertEqual(sought.actualTime, playhead.playerItemTime)
                 try await requireReleasedTail("seek_\(pass)")
                 let loaded = try await driver.waitForLoadedTimeRanges(
-                    item: item, playhead: playhead, covering: requested)
-                XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: requested))
+                    item: item, playhead: playhead, covering: ExactMediaInterval(requested))
+                XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: ExactMediaInterval(requested)))
                 try await requireReleasedTail("loaded_\(pass)")
                 let preroll = try await driver.preroll(item: item, playhead: playhead)
                 XCTAssertTrue(preroll.succeeded)
@@ -1825,10 +1887,10 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
                 duration: ExactMediaTime(value: 1, timescale: 100))
             print("SDK_FIXED_NATIVE_STAGE loaded_begin")
-            let loaded = try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead, covering: requested)
+            let loaded = try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead, covering: ExactMediaInterval(requested))
             try await requireReleasedTail("loaded")
             print("SDK_FIXED_NATIVE_STAGE loaded_returned")
-            XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: requested))
+            XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: ExactMediaInterval(requested)))
             XCTAssertEqual(driver.activeWaiterCount, 0)
             let attachment = XCTAttachment(string:
                 "systemDriverIdentity=\(ObjectIdentifier(driver)), systemDriverMalloc=\(malloc_size(Unmanaged.passUnretained(driver).toOpaque())), "
@@ -2875,17 +2937,52 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testRevocationWhilePlayRunningWaitsForTerminalBeforeStop() async throws {
-        let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        harness.driver.holdPlayCompletion = true
-        let activation = Task { try await harness.activate() }
-        await harness.driver.waitForPlayCall()
-        let stop = Task { try await harness.stop() }
-        await Task.yield()
-        XCTAssertEqual(harness.driver.pauseCallCount, 0)
-        harness.driver.releasePlayCompletion()
-        _ = try await activation.value; _ = try await stop.value
-        XCTAssertEqual(harness.driver.pauseCallCount, 1)
+        try await withConnectedPlayerLifecycleHarness { harness in
+            _ = try await harness.prepare()
+            harness.driver.holdPlayCompletion = true
+            defer {
+                harness.driver.releasePlayCompletion()
+                harness.driver.holdAudioConnectionCompletion = false
+                harness.driver.releaseAudioConnection()
+            }
+            let activation = Task { try await harness.activate() }
+            await harness.driver.waitForPlayCall()
+            let invocation = try XCTUnwrap(harness.driver.lastPositiveRateInvocation)
+            harness.driver.holdAudioConnectionCompletion = true
+            let stop = Task { try await harness.stop() }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while harness.graph.registry.outputResourceContextSnapshot()?.suspend == nil,
+                  ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+            guard !invocation.revalidateCurrentAuthority() else {
+                throw AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            XCTAssertEqual(harness.driver.pauseCallCount, 0,
+                           "Revocation must join the running positive-rate call before pausing")
+            XCTAssertEqual(harness.backend.suspendCallCount, 0)
+            harness.driver.releasePlayCompletion()
+            let rollbackHeld = await harness.driver.waitForHeldAudioConnection()
+            XCTAssertTrue(rollbackHeld, "The original activation must own its rollback disconnect")
+            guard rollbackHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+            XCTAssertEqual(harness.driver.pauseCallCount, 1)
+            XCTAssertEqual(harness.backend.suspendCallCount, 0,
+                           "The signed stop must join activation rollback through its physical terminal")
+            XCTAssertEqual(harness.coordinator.stopTaskCount, 0)
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            let activationResult = try await activation.value
+            let receipt = try await stop.value
+            XCTAssertEqual(activationResult, .rejected)
+            XCTAssertEqual(harness.driver.pauseCallCount, 2,
+                           "One activation rollback pause precedes the one signed stop pause")
+            XCTAssertEqual(harness.backend.suspendCallCount, 1)
+            XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+            XCTAssertEqual(receipt.priorActivationEpoch, invocation.activation)
+            XCTAssertTrue(harness.coordinator.accept(receipt))
+            XCTAssertEqual(harness.driver.operations.suffix(5),
+                           [.cancelPrerolls, .pause, .cancelPrerolls, .pause, .readPausedState])
+        }
     }
 
     func testSuspendBeforeActivationUsesNilPriorAuthorizationButRunsFullStop() async throws {
@@ -3564,7 +3661,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(prepared.identity.mediaTime, try XCTUnwrap(expectedSourceBoundary))
             XCTAssertEqual(prepared.identity.playerItemTime, expected.start)
             XCTAssertEqual(harness.driver.requestedSeekTime, expected.start)
-            XCTAssertEqual(harness.driver.lastRequestedLoadedRange, expected,
+            XCTAssertEqual(harness.driver.lastRequestedLoadedRange, ExactMediaInterval(expected),
                            "The complete loaded request must match the independent mapped start and literal three-second duration")
         }
 
@@ -3841,7 +3938,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             let waiter = Task {
                 defer { finished.set() }
                 return try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
-                                                                 covering: requested)
+                                                                 covering: ExactMediaInterval(requested))
             }
             defer { waiter.cancel() }
             let deadline = ContinuousClock.now.advanced(by: .seconds(2))
@@ -4528,7 +4625,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                                                   duration: Task21Fixtures.time(3))
         let waiter = Task {
             try await waiting.waitForLoadedTimeRanges(item: item, playhead: playhead,
-                                                      covering: requested)
+                                                      covering: ExactMediaInterval(requested))
         }
         let waiterDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while waiting.activeWaiterCount == 0, ContinuousClock.now < waiterDeadline {
@@ -4577,7 +4674,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                                                   duration: Task21Fixtures.time(3))
         let first = Task {
             try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
-                                                     covering: requested)
+                                                     covering: ExactMediaInterval(requested))
         }
         let firstDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while driver.activeWaiterCount == 0, ContinuousClock.now < firstDeadline {
@@ -4593,7 +4690,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let overlap = Task {
             defer { overlapFinished.set() }
             return try await driver.waitForLoadedTimeRanges(
-                item: item, playhead: playhead, covering: requested)
+                item: item, playhead: playhead, covering: ExactMediaInterval(requested))
         }
         let overlapDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while !overlapFinished.value, ContinuousClock.now < overlapDeadline {
@@ -4615,7 +4712,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
         let successor = Task {
             try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead,
-                                                     covering: requested)
+                                                     covering: ExactMediaInterval(requested))
         }
         let successorDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while driver.activeWaiterCount == 0, ContinuousClock.now < successorDeadline {
@@ -4833,8 +4930,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(driver.activeWaiterCount, 1)
         let loaded = Task {
             try await driver.waitForLoadedTimeRanges(item: harness.item, playhead: prepared.identity,
-                covering: FMP4PresentationRange(start: Task21Fixtures.time(0),
-                    duration: Task21Fixtures.time(3)))
+                covering: ExactMediaInterval(FMP4PresentationRange(start: Task21Fixtures.time(0),
+                    duration: Task21Fixtures.time(3))))
         }
         for _ in 0..<16 { await Task.yield() }
         XCTAssertEqual(driver.activeWaiterCount, 1, "串行 prepare 只有一个真实等待槽")
@@ -6284,7 +6381,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var seekCancellationGate: Task21PrepareCancellationGate?
     private(set) var lastPlayedPausedTime: ExactMediaTime?
     private(set) var loadedRangeCallCount = 0
-    private(set) var lastRequestedLoadedRange: FMP4PresentationRange?
+    private(set) var lastRequestedLoadedRange: ExactMediaInterval?
     var constrainedPlaybackEnd: ExactMediaTime?
     var holdPlayCompletion = false
     var holdDirectPausedRead = false
@@ -6370,7 +6467,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
 
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt {
         loadedRangeCallCount += 1
         lastRequestedLoadedRange = requested
@@ -6378,8 +6475,8 @@ private final class Task21FakeDriver: AVPlayerDriving {
             CMTimeRange(start: $0.start.cmTime, duration: $0.duration.cmTime)
         }
         let result = ranges.withUnsafeBufferPointer {
-            VPScanLoadedRangeBuffer($0.baseAddress, $0.count,
-                CMTimeRange(start: requested.start.cmTime, duration: requested.duration.cmTime))
+            VPScanLoadedIntervalBuffer($0.baseAddress, $0.count,
+                requested.start.cmTime, requested.end.cmTime)
         }
         guard result.code == 0 else { throw AVPlayerItemCoordinatorFailure.loadedRangeMismatch }
         let modifiedPlayhead = PreparedPlayheadIdentity(
@@ -6397,11 +6494,12 @@ private final class Task21FakeDriver: AVPlayerDriving {
             ? .init(outputLifecycleEpoch: item.outputLifecycleEpoch, itemGeneration: item.itemGeneration + 1) : item,
             playhead: modifiedPlayhead,
             requested: loadedReceiptMutation == 2
-                ? try FMP4PresentationRange(start: requested.start, duration: Task21Fixtures.time(4)) : requested)
+                ? try ExactMediaInterval(start: requested.start,
+                    end: requested.start.adding(Task21Fixtures.time(4))) : requested)
     }
 
     private func loadedRanges(playhead: PreparedPlayheadIdentity,
-                              requested: FMP4PresentationRange) throws
+                              requested: ExactMediaInterval) throws
         -> [FMP4PresentationRange] {
         observedPlayheads.append(playhead)
         if prepareMutation == .loadedTimeout {
@@ -6697,6 +6795,7 @@ struct Task22PausedPrefixResumeFixture {
 
 @MainActor
 func task22VerifyPrefixFinalizesWhilePaused(
+    nanosecondCursor: Bool = false,
     make: @MainActor (OutputLifecycleEpoch) async throws -> Task22PausedPrefixResumeFixture
 ) async throws {
     let driver = Task21FakeDriver()
@@ -6730,8 +6829,17 @@ func task22VerifyPrefixFinalizesWhilePaused(
         let timeline = prepared.identity.timelineMappingAuthority
         let prefix = try XCTUnwrap(timeline.aacPrefixReceipt)
         XCTAssertNil(timeline.aacEndpointReceipt)
-        let targetSource = try fixture.prefixHorizon.subtracting(ExactMediaTime(value: 1, timescale: 4))
-        let target = try timeline.playerItemTime(for: targetSource)
+        let target: ExactMediaTime
+        if nanosecondCursor {
+            let prefixEnd = try timeline.playerItemTime(for: fixture.prefixHorizon)
+            let wholeSeconds = prefixEnd.value / Int64(prefixEnd.timescale)
+            target = .init(value: wholeSeconds * 1_000_000_000 - 250_000_001,
+                           timescale: 1_000_000_000)
+        } else {
+            target = try timeline.playerItemTime(for: fixture.prefixHorizon.subtracting(
+                ExactMediaTime(value: 1, timescale: 4)))
+        }
+        let targetSource = try timeline.sourceTime(for: target)
         XCTAssertGreaterThanOrEqual(target.value, 0)
         guard case .armed = try await activate() else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         driver.observedPausedTime = target.cmTime
@@ -6750,13 +6858,22 @@ func task22VerifyPrefixFinalizesWhilePaused(
         XCTAssertTrue(driver.disconnectedFromSystemAudio)
         let final = try await fixture.finish(prefix)
         XCTAssertGreaterThan(final.publicationSequence, prepared.identity.publicationSequence)
-        let remaining = try final.effectivePlaybackHorizon.subtracting(targetSource)
-        guard remaining.value > 0,
-              try HLSChecked.compare(remaining, ExactMediaTime(value: 3, timescale: 1)) < 0 else {
+        let itemEnd = try timeline.playerItemTime(for: final.effectivePlaybackHorizon)
+        guard try HLSChecked.compare(targetSource, final.effectivePlaybackHorizon) < 0,
+              try HLSChecked.compare(final.effectivePlaybackHorizon,
+                targetSource.adding(ExactMediaTime(value: 3, timescale: 1))) < 0 else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
-        let expected = try FMP4PresentationRange(start: target, duration: remaining)
-        driver.loadedRangesOverride = [expected]
+        if nanosecondCursor {
+            XCTAssertEqual(target.timescale, 1_000_000_000)
+            XCTAssertThrowsError(try itemEnd.subtracting(target)) {
+                XCTAssertEqual($0 as? HLSTimelineError, .arithmeticOverflow)
+            }
+        }
+        let expected = try ExactMediaInterval(start: target, end: itemEnd)
+        // Actual SDK ranges can start earlier; their exact final end is the oracle.
+        driver.loadedRangesOverride = [try .init(start: ExactMediaTime(value: 0, timescale: 1),
+                                                 duration: itemEnd)]
         driver.applySeekToObservedPausedTime = true
         driver.reconnectedPausedTime = try target.adding(ExactMediaTime(value: 1, timescale: 1_000_000)).cmTime
         XCTAssertTrue(graph.registry.finishOutputPause(owner: owner))
@@ -6857,7 +6974,7 @@ private final class Task21UnsafeDefaultDriver: AVPlayerDriving {
 
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt { .init(item: item, playhead: playhead, requested: requested) }
 
     func preroll(item: AVPlayerItemInstanceIdentity,
@@ -7225,6 +7342,7 @@ private final class FinalManualAVPlayerDeadlineScheduler:
     private var entries: [Entry] = []
 
     var activeSlotCount: Int { lock.withLock { entries.count } }
+    var nextIdentity: UUID? { lock.withLock { entries.first?.identity } }
 
     // Retain the real scheduled callback to model a delivery already copied by
     // the timer before cancellation; do not manufacture a new deadline identity.
@@ -9319,17 +9437,26 @@ private final class Task21RealIntegrationFixture {
         try await waitForNaturalEndDeadline()
         print("COALESCED_EOS_STAGE coalesced=\(coalescedPause) phase=first_read_admitted")
         let firstRead = try XCTUnwrap(driver.naturalEndObservation).firstCurrentTime
+        let originalDeadline = try XCTUnwrap(deadlineScheduler.nextIdentity)
         XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
         XCTAssertNil(driver.naturalEndTerminalResult)
         // The default case delivers paused in a later native KVO/main-queue
         // batch; the coalesced case must have admitted the same bounded read.
         if !coalescedPause { player.pause() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while coordinator.lastPublishedTimeControlStatus != .paused,
+        while (coordinator.lastPublishedTimeControlStatus != .paused
+               || player.rate != 0 || player.timeControlStatus != .paused),
               !hasRegisteredSuspend, ContinuousClock.now < deadline {
             await Self.awaitMainQueueTurn()
         }
         XCTAssertEqual(coordinator.lastPublishedTimeControlStatus, .paused)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused,
+                       "The strict pending query requires a physically paused item")
+        XCTAssertEqual(driver.naturalEndObservation?.firstCurrentTime, firstRead,
+                       "Waiting for native pause must not replace the admitted first read")
+        XCTAssertEqual(deadlineScheduler.nextIdentity, originalDeadline,
+                       "Waiting for native pause must not renew the original deadline")
         XCTAssertFalse(hasRegisteredSuspend,
                        "An admitted endpoint read must retain its original bounded second read")
         XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
@@ -9875,11 +10002,14 @@ private final class Task21RealIntegrationFixture {
         traceNativeStage("eos-http-close-begin")
         let ticket = server.closeAdmission()
         traceNativeStage("eos-http-close-return")
-        guard finalWaitUntil(timeout: 2, condition: {
-            server.usage.connections == 0 && server.usage.activeResponses == 0
-        }) else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        let drainDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(try server.drainIfIdle(cleanupTicket: ticket)) {
+            guard ContinuousClock.now < drainDeadline else {
+                throw AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            await Self.awaitMainQueueTurn()
+        }
         traceNativeStage("eos-http-owner-drain-return")
-        try server.drain(cleanupTicket: ticket)
         traceNativeStage("eos-http-drain-return")
         try server.retire(cleanupTicket: ticket)
         traceNativeStage("eos-http-retire-return")

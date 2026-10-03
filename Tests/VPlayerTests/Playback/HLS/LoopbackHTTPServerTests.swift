@@ -362,19 +362,19 @@ final class LoopbackHTTPServerTests: XCTestCase {
             try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
             let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
             XCTAssertEqual(try PausedDecodeCoverageOrder.intersection(
-                map: map, ordinals: UnsafeBufferPointer(order), requested: request),
-                try map.intersection(with: request))
+                map: map, ordinals: UnsafeBufferPointer(order), requested: ExactMediaInterval(request)),
+                try map.intersection(with: request).map(ExactMediaInterval.init))
             var cursor = 0
             var actual: [FMP4PresentationRange] = []
             while let next = try PausedDecodeCoverageOrder.nextRange(map: map,
                 ordinals: UnsafeBufferPointer(order), cursor: &cursor,
-                requested: request, eligibility: eligibility) {
+                requested: ExactMediaInterval(request), eligibility: eligibility) {
                 if let previous = actual.last, CMTimeCompare(next.start.cmTime, previous.end.cmTime) <= 0 {
                     let end = CMTimeCompare(next.end.cmTime, previous.end.cmTime) > 0
                         ? next.end : previous.end
                     actual[actual.count - 1] = try .init(start: previous.start,
                         duration: end.subtracting(previous.start))
-                } else { actual.append(next) }
+                } else { actual.append(try .init(start: next.start, duration: next.end.subtracting(next.start))) }
             }
             XCTAssertEqual(actual, try map.coveredFragments(by: evidence, intersecting: request))
         }
@@ -389,6 +389,68 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertThrowsError(try pausedFragments(nearLimit, evidence: evidence, requested: nearLimitRequest))
     }
 
+    func testPausedDecodeIntervalsPreserveNanosecondCursorWithoutDerivedDuration() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) { fixture.server.completedEvidence(for: key)?.isComplete == true })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        let cases: [(Int64, ExactMediaTime)] = [
+            (0, HLSChecked.zero), (10, HLSChecked.zero),
+            (0, ExactMediaTime(value: 1, timescale: 375))
+        ]
+        for (wholeSeconds, offset) in cases {
+            let native = ExactMediaTime(value: wholeSeconds * 1_000_000_000 + 259_475_417,
+                                        timescale: 1_000_000_000)
+            let sample = try FMP4PresentationRange(
+                start: .init(value: wholeSeconds * 375 + 96, timescale: 375),
+                duration: .init(value: 8, timescale: 375))
+            XCTAssertThrowsError(try sample.end.subtracting(native)) {
+                XCTAssertEqual($0 as? HLSTimelineError, .arithmeticOverflow)
+            }
+            if offset != HLSChecked.zero {
+                XCTAssertThrowsError(try native.subtracting(offset)) {
+                    XCTAssertEqual($0 as? HLSTimelineError, .arithmeticOverflow)
+                }
+            }
+            let requested = try ExactMediaInterval(start: native, end: sample.end.adding(offset))
+            let map = try SealedDecodeCoverageMap(mediaType: .audio,
+                sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+                samples: [.init(decodeOrdinal: 0, presentationRange: sample, byteSpan: 8..<16,
+                    nearestRandomAccessOrdinal: 0, isRandomAccess: true, containsInBandConfiguration: false)])
+            try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1) { order in
+                try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+                let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
+                XCTAssertEqual(try PausedDecodeCoverageOrder.intersection(map: map,
+                    ordinals: UnsafeBufferPointer(order), requested: requested,
+                    presentationOffset: offset), requested)
+                XCTAssertTrue(try PausedDecodeCoverageOrder.canContribute(map: map,
+                    requested: requested, presentationOffset: offset))
+                var cursor = 0
+                XCTAssertEqual(try PausedDecodeCoverageOrder.nextRange(map: map,
+                    ordinals: UnsafeBufferPointer(order), cursor: &cursor, requested: requested,
+                    eligibility: eligibility, presentationOffset: offset), requested)
+                XCTAssertNil(try PausedDecodeCoverageOrder.nextRange(map: map,
+                    ordinals: UnsafeBufferPointer(order), cursor: &cursor, requested: requested,
+                    eligibility: eligibility, presentationOffset: offset))
+            }
+        }
+    }
+
+    func testExactComparisonAcceptsValidNanosecondPointsBeyondInt64CrossProduct() throws {
+        let start = ExactMediaTime(value: 10_259_475_417, timescale: 1_000_000_000)
+        let end = try start.adding(ExactMediaTime(value: 3, timescale: 1))
+        XCTAssertEqual(try HLSChecked.compare(start, end), -1)
+        XCTAssertEqual(try HLSChecked.compare(end, start), 1)
+        XCTAssertEqual(try HLSChecked.compare(start, start), 0)
+        let minimum = ExactMediaTime(value: .min, timescale: .max)
+        let maximum = ExactMediaTime(value: .max, timescale: .max - 1)
+        XCTAssertEqual(try HLSChecked.compare(minimum, maximum), -1)
+        XCTAssertEqual(try HLSChecked.compare(maximum, minimum), 1)
+    }
+
     func testPausedCoverageWorkspaceRejectsReentryWithoutInvalidatingOuterScope() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
@@ -401,12 +463,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let charged = PlaybackResourceContextLedger.shared.chargedBytes
         try workspace.withExclusiveUse {
             XCTAssertThrowsError(try store.pausedWindowCoverageReceipt(workspace: workspace,
-                rendition: .init(rawValue: 1), requested: request))
+                rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
             XCTAssertThrowsError(try workspace.withExclusiveUse { XCTFail("Nested body must not run") })
             XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
         }
         XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
-            rendition: .init(rawValue: 1), requested: request))
+            rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
     }
 
@@ -449,14 +511,14 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try owner.freezeCompletedResources()
         let request = try XCTUnwrap(store.decodeCoverageMap(for: media)?.samples.first).presentationRange
         XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
-            rendition: .init(rawValue: 1), requested: request))
+            rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
         XCTAssertEqual(try rawRequest(port: fixture.server.port,
             target: fixture.server.path(for: initialization)).status, 200)
         XCTAssertTrue(waitUntil(timeout: 2) {
             store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
         })
         XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
-            rendition: .init(rawValue: 1), requested: request))
+            rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
         XCTAssertNil(owner.coverage(at: 0))
     }
 
@@ -470,13 +532,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
             var ranges: [FMP4PresentationRange] = []
             while let next = try PausedDecodeCoverageOrder.nextRange(map: map,
                 ordinals: UnsafeBufferPointer(order), cursor: &cursor,
-                requested: requested, eligibility: eligibility) {
+                requested: ExactMediaInterval(requested), eligibility: eligibility) {
                 if let previous = ranges.last,
                    CMTimeCompare(next.start.cmTime, previous.end.cmTime) <= 0 {
                     let end = CMTimeCompare(next.end.cmTime, previous.end.cmTime) > 0 ? next.end : previous.end
                     ranges[ranges.count - 1] = try .init(start: previous.start,
                         duration: end.subtracting(previous.start))
-                } else { ranges.append(next) }
+                } else { ranges.append(try .init(start: next.start, duration: next.end.subtracting(next.start))) }
             }
             return ranges
         }
@@ -538,14 +600,14 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 var count = 0
                 for index in 0..<2 {
                     try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
-                        count: &count, rangeAt: { current[$0] })
+                        count: &count, rangeAt: { ExactMediaInterval(current[$0]) })
                 }
                 var cursor = requested.start
                 var gap = false
                 var emitted = 0
                 while count > 0 {
                     let index = Int(try PausedCoverageTimeHeap.pop(storage: heap,
-                        count: &count, rangeAt: { current[$0] }))
+                        count: &count, rangeAt: { ExactMediaInterval(current[$0]) }))
                     let next = current[index]
                     if CMTimeCompare(next.start.cmTime, cursor.cmTime) > 0 { gap = true }
                     if !gap, CMTimeCompare(next.end.cmTime, cursor.cmTime) > 0 { cursor = next.end }
@@ -554,7 +616,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                     if positions[index] < maps[index].count {
                         current[index] = maps[index][positions[index]]
                         try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
-                            count: &count, rangeAt: { current[$0] })
+                            count: &count, rangeAt: { ExactMediaInterval(current[$0]) })
                     }
                 }
                 XCTAssertEqual(emitted, 4, "Every dependency stream must be drained")
@@ -683,7 +745,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             }
             let eligibilityComputed = ContinuousClock.now
             var positions = Array(repeating: 0, count: 128)
-            var current = Array<FMP4PresentationRange?>(repeating: nil, count: 128)
+            var current = Array<ExactMediaInterval?>(repeating: nil, count: 128)
             let heapBacking = UnsafeMutablePointer<UInt8>.allocate(capacity: 128)
             heapBacking.initialize(repeating: 0, count: 128)
             defer { heapBacking.deinitialize(count: 128); heapBacking.deallocate() }
@@ -692,7 +754,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             func advance(_ index: Int) throws {
                 current[index] = try PausedDecodeCoverageOrder.nextRange(map: maps[index],
                     ordinals: .init(start: storage + index * 256, count: 256), cursor: &positions[index],
-                    requested: request, eligibility: eligibility[index])
+                    requested: ExactMediaInterval(request), eligibility: eligibility[index])
             }
             for index in maps.indices {
                 try advance(index)
@@ -1502,6 +1564,52 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try fixture.server.retire(cleanupTicket: ticket)
         XCTAssertEqual(fixture.server.lifecyclePhase, .retired)
         XCTAssertFalse(callbacks.values.isEmpty)
+    }
+
+    func testOwnedDrainRejectsForeignTicketAndWaitsForLateRealConnection() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        let other = try await Task20HTTPFixture.start()
+        defer { other.shutdown() }
+        let foreignTicket = other.server.closeAdmission()
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: foreignTicket)) {
+            XCTAssertEqual($0 as? LoopbackHTTPServerError, .invalidConfiguration)
+        }
+        let ticket = fixture.server.closeAdmission()
+        XCTAssertEqual(fixture.server.usage.connections, 0)
+        // Reproduce the original ordering with an actual late socket owner:
+        // the caller has observed zero, but .closed still accepts tracked peers.
+        let late = try ConnectedSocket(port: fixture.server.port)
+        defer { late.reset(); fixture.shutdown() }
+        XCTAssertTrue(waitUntil { fixture.server.usage.connections == 1 })
+        XCTAssertEqual(fixture.server.lifecyclePhase, .closed)
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: foreignTicket)) {
+            XCTAssertEqual($0 as? LoopbackHTTPServerError, .invalidConfiguration)
+        }
+        XCTAssertFalse(try fixture.server.drainIfIdle(cleanupTicket: ticket),
+                       "An actual accepted socket remains owned until its terminal")
+        XCTAssertEqual(fixture.server.lifecyclePhase, .closed)
+        XCTAssertThrowsError(try fixture.server.drain(cleanupTicket: ticket),
+                             "The strict drain API must retain its busy-owner error")
+        late.reset()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(try fixture.server.drainIfIdle(cleanupTicket: ticket)) {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("The released real socket did not reach its owned terminal")
+                throw LoopbackHTTPServerError.invalidConfiguration
+            }
+            await Task.yield()
+        }
+        XCTAssertEqual(fixture.server.lifecyclePhase, .drained)
+        XCTAssertEqual(fixture.server.usage.connections, 0)
+        XCTAssertEqual(fixture.server.usage.activeResponses, 0)
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: ticket),
+                             "A completed drain must not silently accept a second transition")
+        XCTAssertThrowsError(try fixture.server.retire(cleanupTicket: foreignTicket))
+        try fixture.server.retire(cleanupTicket: ticket)
+        XCTAssertEqual(fixture.server.lifecyclePhase, .retired)
+        XCTAssertEqual(fixture.server.usage.distinctBackingBytes, 0)
+        XCTAssertEqual(fixture.server.usage.parserAndStagingBytes, 0)
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: ticket))
     }
 
     func testFinalAACParticipantsRequireExactTerminalAndTimelineSetsBeforeServerVisibility()
@@ -5500,7 +5608,7 @@ private final class Review2LoopbackDriver: AVPlayerDriving {
 
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt { .init(item: item, playhead: playhead, requested: requested) }
 
     func preroll(item: AVPlayerItemInstanceIdentity,

@@ -947,7 +947,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func waitForLoadedTimeRanges(item identity: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt {
         guard currentItemIdentity == identity, let item else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
@@ -1467,9 +1467,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     nonisolated private static func hasLoadedCoverage(_ item: AVPlayerItem,
-        requested: FMP4PresentationRange) throws(AVPlayerItemCoordinatorFailure) -> Bool {
-        let result = VPReadLoadedRangeCoverage(item,
-            CMTimeRange(start: requested.start.cmTime, duration: requested.duration.cmTime))
+        requested: ExactMediaInterval) throws(AVPlayerItemCoordinatorFailure) -> Bool {
+        let result = VPReadLoadedIntervalCoverage(item, requested.start.cmTime, requested.end.cmTime)
         switch result.code {
         case 0: return true
         case 1: return false

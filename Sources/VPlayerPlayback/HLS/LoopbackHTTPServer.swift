@@ -931,14 +931,14 @@ final class LoopbackPausedResumeCoverage: @unchecked Sendable {
     fileprivate let server: LoopbackHTTPServer
     fileprivate let originalOwner: FrozenPreparationOwner
     let scope: AVPlayerPausedResumeScope
-    let requested: FMP4PresentationRange
+    let requested: ExactMediaInterval
     fileprivate let lease: PausedWindowCoverageLease
     fileprivate let workspace: PausedCoverageWorkspace
     fileprivate var verified = false
     private let reservation: PlaybackResourceContextReservation
 
     fileprivate static func make(server: LoopbackHTTPServer, originalOwner: FrozenPreparationOwner,
-        scope: AVPlayerPausedResumeScope, requested: FMP4PresentationRange,
+        scope: AVPlayerPausedResumeScope, requested: ExactMediaInterval,
         lease: PausedWindowCoverageLease, workspace: PausedCoverageWorkspace) throws -> Self {
         let root = malloc_good_size(class_getInstanceSize(Self.self))
         let context = malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self))
@@ -963,7 +963,7 @@ final class LoopbackPausedResumeCoverage: @unchecked Sendable {
     }
 
     private init(server: LoopbackHTTPServer, originalOwner: FrozenPreparationOwner,
-        scope: AVPlayerPausedResumeScope, requested: FMP4PresentationRange,
+        scope: AVPlayerPausedResumeScope, requested: ExactMediaInterval,
         lease: PausedWindowCoverageLease, workspace: PausedCoverageWorkspace,
         reservation: PlaybackResourceContextReservation) {
         self.server = server; self.originalOwner = originalOwner; self.scope = scope
@@ -3005,7 +3005,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
 
     private func validatePausedResumeScope(_ scope: AVPlayerPausedResumeScope,
         originalOwner: FrozenPreparationOwner) throws
-        -> (participants: FrozenParticipantHistoryTable, requested: FMP4PresentationRange) {
+        -> (participants: FrozenParticipantHistoryTable, requested: ExactMediaInterval) {
         if let terminal = timelineFailureEvent {
             switch terminal {
             case .publicationTerminated(_, _, _, let failure): throw failure
@@ -3125,7 +3125,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         guard try HLSChecked.compare(start, end) < 0 else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }
-        return (current, try FMP4PresentationRange(start: start, duration: end.subtracting(start)))
+        return (current, try ExactMediaInterval(start: start, end: end))
     }
 
     private func validatePausedResumeCoverageScope(_ value: LoopbackPausedResumeCoverage) throws
@@ -3157,17 +3157,22 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 guard try HLSChecked.compare(requested.end, participant.effectivePlaybackHorizon) <= 0 else {
                     throw AVPlayerItemCoordinatorFailure.insufficientCoverage
                 }
-                let physical = participant.mediaType == .audio
-                    ? try scope.timeline.physicalRange(forEffectiveSourceRange: requested) : requested
+                // Shift authenticated media-grid endpoints into the effective
+                // source coordinate; never force a native cursor onto that grid.
+                let offset = participant.mediaType == .audio
+                    ? try scope.timeline.writtenEffectiveBase.subtracting(scope.timeline.writtenPhysicalBase)
+                    : HLSChecked.zero
                 for key in participant.mediaKeys {
-                    try store.retainPausedDecodeClosure(key: key, requested: physical, owner: lease)
+                    try store.retainPausedDecodeClosure(key: key, requested: requested, owner: lease,
+                        presentationOffset: offset)
                 }
                 // A rolling publication can drop earlier resources that remain
                 // valid only through the original item's retained membership.
                 for resource in LoopbackCompletedResourceCollection(owner: originalOwner,
                     participantID: participant.participantID, mode: 1) {
                     try store.retainPausedDecodeClosure(key: resource.key,
-                        requested: physical, owner: lease)
+                        requested: requested, owner: lease,
+                        presentationOffset: offset)
                 }
             }
             guard (1...2).contains(participantCount) else {
@@ -3187,13 +3192,15 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             try value.lease.freezeCompletedResources()
             for participant in current where participant.mediaType == .video
                 || participant.participantID == value.scope.selection.participantID {
-                let physical = participant.mediaType == .audio
-                    ? try value.scope.timeline.physicalRange(forEffectiveSourceRange: value.requested)
-                    : value.requested
+                let offset = participant.mediaType == .audio
+                    ? try value.scope.timeline.writtenEffectiveBase.subtracting(value.scope.timeline.writtenPhysicalBase)
+                    : HLSChecked.zero
                 guard let receipt = try store.pausedWindowCoverageReceipt(workspace: value.workspace,
-                    rendition: participant.renditionIdentity, requested: physical),
+                    rendition: participant.renditionIdentity, requested: value.requested,
+                    presentationOffset: offset),
                       receipt.itemGeneration == value.scope.cursor.item.itemGeneration,
-                      receipt.presentationRange == physical, !receipt.dependencies.isEmpty else {
+                      receipt.presentationRange == value.requested, receipt.presentationOffset == offset,
+                      !receipt.dependencies.isEmpty else {
                     throw AVPlayerItemCoordinatorFailure.insufficientCoverage
                 }
             }
@@ -3447,13 +3454,23 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     }
 
     func drain(cleanupTicket: LoopbackHTTPCleanupTicket) throws {
+        guard try drainIfIdle(cleanupTicket: cleanupTicket) else {
+            throw LoopbackHTTPServerError.invalidConfiguration
+        }
+    }
+
+    /// Validate the exact owner and atomically close late connection admission
+    /// only once all currently owned connections and responses have terminated.
+    /// Busy owners are pending work; a wrong ticket or phase is still an error.
+    func drainIfIdle(cleanupTicket: LoopbackHTTPCleanupTicket) throws -> Bool {
         try queueSync {
-            guard case .closed(let expected) = phase, expected === cleanupTicket,
-                  connections.isEmpty, closingConnections.isEmpty,
-                  activeResponses == 0 else {
+            guard case .closed(let expected) = phase, expected === cleanupTicket else {
                 throw LoopbackHTTPServerError.invalidConfiguration
             }
+            guard connections.isEmpty, closingConnections.isEmpty,
+                  activeResponses == 0 else { return false }
             phase = .drained(cleanupTicket)
+            return true
         }
     }
 

@@ -33,7 +33,7 @@ struct AVPlayerPrerollReceipt: Sendable, Equatable {
 struct AVPlayerLoadedRangeReceipt: Sendable, Equatable {
     let item: AVPlayerItemInstanceIdentity
     let playhead: PreparedPlayheadIdentity
-    let requested: FMP4PresentationRange
+    let requested: ExactMediaInterval
 }
 
 struct AVPlayerDirectState: Sendable, Equatable {
@@ -74,7 +74,7 @@ protocol AVPlayerDriving: AnyObject {
               playhead: PreparedPlayheadIdentity) async throws -> AVPlayerSeekReceipt
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt
     func preroll(item: AVPlayerItemInstanceIdentity,
                  playhead: PreparedPlayheadIdentity) async throws -> AVPlayerPrerollReceipt
@@ -1496,7 +1496,7 @@ final class AVPlayerItemCoordinator {
             try pass(.loadedTimeRanges, request.item, preparationTicket: operationTicket)
             try validatePreparationLoaded(
                 try await driver.waitForLoadedTimeRanges(item: request.item,
-                    playhead: context.playhead, covering: context.playerItemRequested),
+                    playhead: context.playhead, covering: ExactMediaInterval(context.playerItemRequested)),
                 request: request, context: context)
             PlaybackDiagnosticTracker.shared.append("avprep_loaded_ready")
             try pass(.loadedTimeRanges, request.item, preparationTicket: operationTicket)
@@ -1687,7 +1687,7 @@ final class AVPlayerItemCoordinator {
     private func validatePreparationLoaded(_ loaded: AVPlayerLoadedRangeReceipt,
         request: AVPlayerItemPreparationRequest, context: PreparationSeekContext) throws {
         guard loaded.item == request.item, loaded.playhead == context.playhead,
-              loaded.requested == context.playerItemRequested else {
+              loaded.requested == ExactMediaInterval(context.playerItemRequested) else {
             throw AVPlayerItemCoordinatorFailure.loadedRangeMismatch
         }
     }
@@ -1851,8 +1851,8 @@ final class AVPlayerItemCoordinator {
                 guard seek.item == item, seek.playhead == playhead, seek.actualTime == scope.cursor.time else {
                     throw AVPlayerItemCoordinatorFailure.seekMismatch
                 }
-                let itemRange = try FMP4PresentationRange(start: scope.cursor.time,
-                    duration: coverage.requested.duration)
+                let itemRange = try ExactMediaInterval(start: scope.cursor.time,
+                    end: scope.timeline.playerItemTime(for: coverage.requested.end))
                 let loaded = try await driver.waitForLoadedTimeRanges(item: item,
                     playhead: playhead, covering: itemRange)
                 try validateActivation(invocation, request: request, resumeScope: scope)

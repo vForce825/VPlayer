@@ -4322,7 +4322,17 @@ final class SegmentedFMP4WriterTests: XCTestCase {
 
     @MainActor
     func testPausedPrefixResumesAuthenticatedFinalTailAfterIncrementalFinalization() async throws {
-        try await task22VerifyPrefixFinalizesWhilePaused { lifecycle in
+        try await verifyPausedPrefixFinalization(nanosecondCursor: false)
+    }
+
+    @MainActor
+    func testPausedFinalizedTailPreservesNanosecondCursorWithUnrepresentableDuration() async throws {
+        try await verifyPausedPrefixFinalization(nanosecondCursor: true)
+    }
+
+    @MainActor
+    private func verifyPausedPrefixFinalization(nanosecondCursor: Bool) async throws {
+        try await task22VerifyPrefixFinalizesWhilePaused(nanosecondCursor: nanosecondCursor) { lifecycle in
             let harness = try await Task22LongRenditionHarness.make(outputLifecycleEpoch: lifecycle)
             var reservedServer: LoopbackHTTPServer?
             var reservedSource: LoopbackAVPlayerPreparationEvidenceSource?

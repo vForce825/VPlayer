@@ -59,14 +59,14 @@ def fake_demangle(args,**kw):
         rows.append('async function pointer to '+module+'.'+name+'()')
     return SimpleNamespace(stdout='\n'.join(rows)+'\n')
 
-def run_case(reader, addend):
+def run_case(reader, addend, gep_flags="inbounds"):
     with TemporaryDirectory(prefix='vplayer-control-review-') as tmp:
         tmp=Path(tmp); inp=tmp/'Synthetic.swift'
         inp.write_text('// Synthetic parser fixture, never compiled.\n')
         manifest={'schema':1,'compiler_version':VERSION,'driver_version':'swift-driver version: 1.168.6','target':TARGET,'sdk_path':SDK,'sdk_version':'27.0','configuration':'Debug','optimization':'-Onone','scope':'controls','pairs':[]}
         for role,syms in [('control',CONTROLS),('caller',CALLERS)]:
             ll=tmp/(role+'.ll'); obj=tmp/(role+'.o')
-            ll.write_text(make_ir(syms,role=='caller')); obj.write_bytes(make_object(syms,addend))
+            ll.write_text(make_ir(syms,role=='caller').replace('getelementptr inbounds (', 'getelementptr '+gep_flags+' (')); obj.write_bytes(make_object(syms,addend))
             common=['xcrun','swiftc','-target',TARGET,'-sdk',SDK,'-Onone',str(inp)]
             manifest['pairs'].append({'role':role,'ir':str(ll),'object':str(obj),'ir_sha256':sha(ll),'object_sha256':sha(obj),'ir_argv':common+['-emit-ir','-o',str(ll)],'object_argv':common+['-emit-object','-o',str(obj)],'inputs':{str(inp):sha(inp)}})
         path=tmp/'artifact-set.json'; path.write_text(json.dumps(manifest))
@@ -89,5 +89,31 @@ if __name__=='__main__':
         accepted,reason,output=run_case(reader,addend)
         print(f'SYNTHETIC addend={addend}: accepted={accepted}; reason={reason}; success_marker={"diagnostic_complete" in output}')
         if accepted != (addend==0) or (("diagnostic_complete" in output) != (addend==0)): failures.append(addend)
+    # Observed native spelling: no-wrap constrains GEP arithmetic, while exact
+    # descriptor, field, type and same-function SSA evidence remain mandatory.
+    accepted,reason,output=run_case(reader,0,'inbounds nuw')
+    if not accepted or 'diagnostic_complete' not in output: failures.append('inbounds nuw')
+    print(f'SYNTHETIC inbounds nuw: accepted={accepted}; reason={reason}')
+    caller=make_ir(CALLERS,True).replace('getelementptr inbounds (','getelementptr inbounds nuw (')
+    symbol=CONTROLS[0][0]
+    negatives={
+        'unknown flag': caller.replace('inbounds nuw (','inbounds unknown ('),
+        'reversed flags': caller.replace('inbounds nuw (','nuw inbounds ('),
+        'duplicate flag': caller.replace('inbounds nuw (','inbounds nuw nuw ('),
+        'missing inbounds': caller.replace('inbounds nuw (','nuw ('),
+        'wrong descriptor': caller.replace(symbol,symbol+'Decoy'),
+        'wrong GEP type': caller.replace('(%swift.async_func_pointer,','(i8,'),
+        'wrong field': caller.replace('i32 0, i32 1)','i32 0, i32 0)'),
+        'wrong load type': caller.replace('load i32,','load i64,'),
+        'signed extension': caller.replace('zext i32','sext i32'),
+        'unknown extension flag': caller.replace('zext i32','zext nneg i32'),
+        'wrong loaded SSA': caller.replace('zext i32 %1','zext i32 %9'),
+        'wrong allocator SSA': caller.replace('swift_task_alloc(i64 %2)','swift_task_alloc(i64 %9)'),
+        'constant allocation': caller.replace('swift_task_alloc(i64 %2)','swift_task_alloc(i64 128)'),
+        'cross-function chain': caller.replace(' %2 = zext',' ret void\n}\ndefine void @"decoy"() {\n %2 = zext'),
+    }
+    for name,ir in negatives.items():
+        if reader['allocator_size_chain'](ir,symbol) is not None: failures.append(name)
+    print(f'SYNTHETIC exact-chain rejection cases={len(negatives)}')
     print('Synthetic temporary artifacts removed. No native compiler was used.')
     sys.exit(bool(failures))

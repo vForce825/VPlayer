@@ -103,7 +103,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
         var position: UInt16 = 0
         var identity: SealedMediaBackingIdentity?
         var eligibility = PausedDecodeCoverageEligibility()
-        var next: FMP4PresentationRange?
+        var next: ExactMediaInterval?
         var selected = false
         var input: SealedCoverageInput?
     }
@@ -263,8 +263,8 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     }
 
     private func intersection(_ map: SealedDecodeCoverageMap, at index: Int,
-                              requested: FMP4PresentationRange) throws -> FMP4PresentationRange? {
-        try PausedDecodeCoverageOrder.intersection(map: map, ordinals: order(at: index), requested: requested)
+                              requested: ExactMediaInterval, presentationOffset: ExactMediaTime) throws -> ExactMediaInterval? {
+        try PausedDecodeCoverageOrder.intersection(map: map, ordinals: order(at: index), requested: requested, presentationOffset: presentationOffset)
     }
 
     private func insertHeap(_ index: Int) throws {
@@ -279,30 +279,30 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     }
 
     private func advance(_ index: Int, view: ServedCoverageDependencies,
-                         requested: FMP4PresentationRange) throws {
+                         requested: ExactMediaInterval, presentationOffset: ExactMediaTime) throws {
         guard let input = cursors[index].input else {
             throw CompletedMediaEvidenceError.identityMismatch
         }
         var position = Int(cursors[index].position)
         cursors[index].next = try PausedDecodeCoverageOrder.nextRange(map: input.map,
             ordinals: order(at: index), cursor: &position, requested: requested,
-            eligibility: cursors[index].eligibility)
+            eligibility: cursors[index].eligibility, presentationOffset: presentationOffset)
         cursors[index].position = UInt16(position)
     }
 
     /// Drains all eligible ranges, including after coverage reaches the end, so
     /// checked arithmetic failures in later samples cannot be hidden by early exit.
-    private func covers(requested: FMP4PresentationRange, view: ServedCoverageDependencies,
-                        samples: Bool) throws -> Bool {
+    private func covers(requested: ExactMediaInterval, view: ServedCoverageDependencies,
+                        samples: Bool, presentationOffset: ExactMediaTime) throws -> Bool {
         heapCount = 0
         for index in 0..<mapCount where cursors[index].selected {
             cursors[index].position = 0
-            if samples { try advance(index, view: view, requested: requested) }
+            if samples { try advance(index, view: view, requested: requested, presentationOffset: presentationOffset) }
             else {
                 guard let input = cursors[index].input else {
                     throw CompletedMediaEvidenceError.identityMismatch
                 }
-                cursors[index].next = try intersection(input.map, at: index, requested: requested)
+                cursors[index].next = try intersection(input.map, at: index, requested: requested, presentationOffset: presentationOffset)
             }
             if cursors[index].next != nil { try insertHeap(index) }
         }
@@ -314,7 +314,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             if try HLSChecked.compare(range.start, cursor) > 0 { gap = true }
             if !gap, try HLSChecked.compare(range.end, cursor) > 0 { cursor = range.end }
             if samples {
-                try advance(index, view: view, requested: requested)
+                try advance(index, view: view, requested: requested, presentationOffset: presentationOffset)
                 if cursors[index].next != nil { try insertHeap(index) }
             }
         }
@@ -322,23 +322,24 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     }
 
     fileprivate func receipt(authority: SealedCoverageIssuanceAuthority, itemGeneration: UInt64,
-                             rendition: AudioRenditionIdentity, requested: FMP4PresentationRange) throws
-        -> FrozenRenditionCoverageReceipt? {
+                             rendition: AudioRenditionIdentity, requested: ExactMediaInterval, presentationOffset: ExactMediaTime) throws
+        -> PausedRenditionCoverageReceipt? {
         try withExclusiveUse {
             try receiptLocked(authority: authority, itemGeneration: itemGeneration,
-                rendition: rendition, requested: requested)
+                rendition: rendition, requested: requested, presentationOffset: presentationOffset)
         }
     }
 
     private func receiptLocked(authority: SealedCoverageIssuanceAuthority, itemGeneration: UInt64,
-                               rendition: AudioRenditionIdentity, requested: FMP4PresentationRange) throws
-        -> FrozenRenditionCoverageReceipt? {
+                               rendition: AudioRenditionIdentity, requested: ExactMediaInterval, presentationOffset: ExactMediaTime) throws
+        -> PausedRenditionCoverageReceipt? {
         try validateMembership()
         guard owner.completionIsFrozen else { return nil }
         var existingIndex: UInt8?
         for index in UInt8(0)..<2 {
             if let coverage = owner.coverage(at: index),
-               coverage.rendition == rendition, coverage.requested == requested { existingIndex = index }
+               coverage.rendition == rendition, coverage.requested == requested,
+               coverage.presentationOffset == presentationOffset { existingIndex = index }
         }
         if existingIndex == nil, owner.coverage(at: 1) != nil {
             throw CompletedMediaEvidenceError.capacityExceeded
@@ -351,14 +352,14 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             cursors[index].next = nil
             guard let input = view.input(at: Int(cursors[index].slot)),
                   input.media.renditionIdentity == rendition,
-                  let clipped = try intersection(input.map, at: index, requested: requested) else { continue }
+                  let clipped = try intersection(input.map, at: index, requested: requested, presentationOffset: presentationOffset) else { continue }
             cursors[index].input = input
             let eligibility = try PausedDecodeCoverageOrder.eligibility(map: input.map, evidence: input.media)
             cursors[index].eligibility = eligibility
             var position = 0
             var contributes = false
             while try PausedDecodeCoverageOrder.nextRange(map: input.map, ordinals: order(at: index),
-                cursor: &position, requested: clipped, eligibility: eligibility) != nil { contributes = true }
+                cursor: &position, requested: clipped, eligibility: eligibility, presentationOffset: presentationOffset) != nil { contributes = true }
             guard contributes else { continue }
             cursors[index].selected = true
             let candidate = view.dependency(input)
@@ -377,8 +378,8 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
         guard previousCount + Int(indices.count) <= 128 else {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
-        guard indices.count > 0, try covers(requested: requested, view: view, samples: true),
-              try covers(requested: requested, view: view, samples: false) else { return nil }
+        guard indices.count > 0, try covers(requested: requested, view: view, samples: true, presentationOffset: presentationOffset),
+              try covers(requested: requested, view: view, samples: false, presentationOffset: presentationOffset) else { return nil }
         var resourceSlots = FrozenCoverageIndices()
         resourceSlots.count = indices.count
         for ordinal in 0..<Int(indices.count) {
@@ -395,7 +396,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             }
         } else {
             owner.setCoverage(.init(rendition: rendition, requested: requested,
-                offset: UInt8(previousCount), count: indices.count), indices: resourceSlots, at: coverageIndex)
+                offset: UInt8(previousCount), count: indices.count, presentationOffset: presentationOffset), indices: resourceSlots, at: coverageIndex)
         }
         var hash = SHA256()
         func append<T: FixedWidthInteger>(_ value: T) {
@@ -413,7 +414,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             let index = Int(indices[ordinal])
             let input = cursors[index].input!
             let dependency = view.dependency(input)
-            let range = try intersection(input.map, at: index, requested: requested)!
+            let range = try intersection(input.map, at: index, requested: requested, presentationOffset: presentationOffset)!
             append(dependency.mediaEpoch)
             appendUUID(dependency.epochProofIdentity)
             appendUUID(dependency.segmentReceiptIdentity)
@@ -429,7 +430,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             append(UInt64(range.end.timescale))
         }
         return .init(authority: authority, renditionIdentity: rendition, itemGeneration: itemGeneration,
-            canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested, dependencies: view)
+            canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested, presentationOffset: presentationOffset, dependencies: view)
     }
 
     deinit {
@@ -1370,12 +1371,19 @@ final class SealedMediaStore: @unchecked Sendable {
     /// that can contribute to this exact interval and their real initialization.
     func retainPausedDecodeClosure(key: HLSResourceKey, requested: FMP4PresentationRange,
                                    owner: PausedWindowCoverageLease) throws {
+        try retainPausedDecodeClosure(key: key, requested: ExactMediaInterval(requested), owner: owner)
+    }
+
+    func retainPausedDecodeClosure(key: HLSResourceKey, requested: ExactMediaInterval,
+                                   owner: PausedWindowCoverageLease,
+                                   presentationOffset: ExactMediaTime = HLSChecked.zero) throws {
         try domain.sync {
             guard !closed, let resource = resources[key], let map = resource.decodeMap,
                   resource.object.kind == .media else {
                 throw CompletedMediaEvidenceError.retired
             }
-            guard try PausedDecodeCoverageOrder.canContribute(map: map, requested: requested) else {
+            guard try PausedDecodeCoverageOrder.canContribute(map: map, requested: requested,
+                presentationOffset: presentationOffset) else {
                 return
             }
             guard let initializationKey = resource.initializationKey,
@@ -1412,11 +1420,19 @@ final class SealedMediaStore: @unchecked Sendable {
 
     func pausedWindowCoverageReceipt(workspace: PausedCoverageWorkspace,
                                      rendition: AudioRenditionIdentity,
-                                     requested: FMP4PresentationRange) throws -> FrozenRenditionCoverageReceipt? {
+                                     requested: FMP4PresentationRange) throws -> PausedRenditionCoverageReceipt? {
+        try pausedWindowCoverageReceipt(workspace: workspace, rendition: rendition,
+                                        requested: ExactMediaInterval(requested))
+    }
+
+    func pausedWindowCoverageReceipt(workspace: PausedCoverageWorkspace,
+                                     rendition: AudioRenditionIdentity,
+                                     requested: ExactMediaInterval,
+                                     presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> PausedRenditionCoverageReceipt? {
         try domain.sync {
             guard workspace.store === self else { throw CompletedMediaEvidenceError.identityMismatch }
             return try workspace.receipt(authority: coverageAuthority, itemGeneration: itemGeneration,
-                rendition: rendition, requested: requested)
+                rendition: rendition, requested: requested, presentationOffset: presentationOffset)
         }
     }
 

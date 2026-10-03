@@ -246,11 +246,11 @@ final class SDKSystemLoadedReleaseTests: XCTestCase {
         let receipt: AVPlayerLoadedRangeReceipt
         do {
             receipt = try await driver.waitForLoadedTimeRanges(
-                item: item, playhead: playhead, covering: requested)
+                item: item, playhead: playhead, covering: ExactMediaInterval(requested))
         } catch { probe.reportFailure(error); throw error }
         probe.stage = "loaded.native_ranges_returned"
         XCTAssertEqual(receipt, .init(item: item, playhead: playhead,
-                                      requested: requested))
+                                      requested: ExactMediaInterval(requested)))
         XCTAssertEqual(driver.activeWaiterCount, 0)
 
         let text = "systemDriverIdentity=\(ObjectIdentifier(driver)), "

@@ -41,7 +41,8 @@ if result != 'passed':
         body += '\nUNVALIDATED_CONTROL_IR_EXCERPT: ' + path.name + '\n'
         for line in path.read_text().splitlines():
             if remaining and ('target triple =' in line or 'async_func_pointer' in line
-                              or '@swift_task_alloc(' in line):
+                              or '@swift_task_alloc(' in line or ' = zext ' in line
+                              or ' = load i32,' in line or ' = getelementptr ' in line):
                 body += line[:1000] + (' [excerpt truncated]' if len(line) > 1000 else '') + '\n'
                 remaining -= 1
 # Bound the complete UTF-8 report, including metadata and excerpts, before
