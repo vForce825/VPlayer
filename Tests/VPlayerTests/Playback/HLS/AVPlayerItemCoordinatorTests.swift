@@ -3126,7 +3126,8 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let nativeSession = try Task21NativeAudioSessionReference()
         addTeardownBlock { try await nativeSession.close() }
         try await nativeSession.activate()
-        let reference = try Task21LocalPCMTapReference(association: .wholeMix)
+        let reference = try Task21LocalPCMTapReference(association: .wholeMix,
+            sessionDiagnosticID: nativeSession.diagnosticID)
         addTeardownBlock { try await reference.close() }
         try await reference.playThroughNaturalEnd()
     }

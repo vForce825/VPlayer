@@ -3054,38 +3054,71 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             }
         }
         if try HLSChecked.compare(end, ordinaryEnd) < 0 {
-            // Only the installed finite item's original committed final
-            // snapshots can shorten its ordinary lead. A later prefix horizon
-            // or ENDLIST text cannot create this authority.
-            guard audio.audioCodec == .aac,
-                  let endpoint = originalOwner.timelineStorage?.endpointAuthority,
-                  scope.timeline.matchesEndpoint(endpoint),
-                  let mapping = audio.aacTimelineMapping,
-                  endpoint.receipt.binding == audio.writerBinding,
-                  endpoint.receipt.timelineOffset == mapping.offset,
-                  endpoint.receipt.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
-                  endpoint.receipt.writtenEffectiveBase == scope.timeline.writtenEffectiveBase else {
+            guard audio.audioCodec == .aac, let mapping = audio.aacTimelineMapping else {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            let originalEndpoint = originalOwner.timelineStorage?.endpointAuthority
+            let originalPrefix = originalOwner.timelineStorage?.prefixReceipt
+            let endpoint: AACEffectiveEndpointAuthority
+            if let originalEndpoint {
+                guard scope.timeline.matchesEndpoint(originalEndpoint),
+                      originalEndpoint.receipt.binding == audio.writerBinding,
+                      originalEndpoint.receipt.timelineOffset == mapping.offset,
+                      originalEndpoint.receipt.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
+                      originalEndpoint.receipt.writtenEffectiveBase == scope.timeline.writtenEffectiveBase else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                endpoint = originalEndpoint
+            } else {
+                // The original prefix stays the installed mapping. Only its
+                // same rendition's private final seal can authorize a later tail.
+                guard let originalPrefix,
+                      scope.timeline.aacPrefixReceipt === originalPrefix,
+                      originalPrefix.publicationSequence == original.authorityBinding.publicationSequence,
+                      originalPrefix.mapping == mapping,
+                      let currentEndpoint = aacRenditionBindings[audio.participantID]?.endpointAuthority else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                endpoint = currentEndpoint
             }
             let completed = LoopbackCompletedPublicationEvidence(preparationOwner: originalOwner)
             for participant in current where participant.mediaType == .video
                 || participant.participantID == scope.selection.participantID {
+                let finalBinding = participant.participantID == scope.selection.participantID
+                    ? endpoint.receipt.binding : participant.writerBinding
+                let currentFinal = participant.mediaType == .video
+                    ? store.currentFinalVideoPublication(continuing: participant.writerBinding)
+                    : store.currentFinalPublication(matching: finalBinding)
                 guard let originalParticipant = completed.participants.first(where: {
                     $0.participantID == participant.participantID
                         && $0.renditionIdentity == participant.renditionIdentity
                         && $0.mediaType == participant.mediaType
-                }), let final = store.currentFinalPublication(matching: participant.writerBinding),
+                }), let final = currentFinal,
                       store.validatesCurrentFinalPublication(final),
                       final.matchesSnapshot(identity: participant.playlistIdentity,
                         publicationSequence: participant.playlistVersion),
-                      final.matchesSnapshot(identity: originalParticipant.mediaPlaylistSnapshotIdentity,
-                        publicationSequence: originalParticipant.mediaPlaylistVersion),
+                      final.publicationSequence >= originalParticipant.mediaPlaylistVersion,
                       final.effectivePlaybackHorizon == participant.effectivePlaybackHorizon else {
                     throw AVPlayerItemCoordinatorFailure.insufficientCoverage
                 }
+                if originalEndpoint != nil {
+                    guard final.matchesSnapshot(identity: originalParticipant.mediaPlaylistSnapshotIdentity,
+                        publicationSequence: originalParticipant.mediaPlaylistVersion) else {
+                        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                    }
+                }
                 if participant.participantID == scope.selection.participantID {
-                    _ = try AVPlayerAACEndpointValidator.preflight(authority: endpoint,
-                        completedPublication: completed, currentFinalPublication: final, store: store)
+                    if let originalPrefix, originalEndpoint == nil {
+                        guard let originalTerminal = aacTerminalBindings[participant.participantID] else {
+                            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                        }
+                        _ = try AVPlayerAACEndpointValidator.preflight(authority: endpoint,
+                            currentFinalPublication: final, store: store, originalPrefix: originalPrefix,
+                            originalTerminalBinding: originalTerminal)
+                    } else {
+                        _ = try AVPlayerAACEndpointValidator.preflight(authority: endpoint,
+                            completedPublication: completed, currentFinalPublication: final, store: store)
+                    }
                 }
             }
         }

@@ -15,9 +15,11 @@ def main():
     parser.add_argument('--flags-json',type=pathlib.Path,help='Reviewed additional flag array; excludes SDK/target/module/action/output/optimization')
     args=parser.parse_args(); source=pathlib.Path(__file__).resolve().parent
     work=args.output.resolve(); work.mkdir(parents=True,exist_ok=False)
-    version=output('xcrun','swiftc','--version')
+    # The supported swiftc entry point emits compiler stdout and driver stderr.
+    toolchain=subprocess.run(['xcrun','swiftc','--version'],text=True,capture_output=True,check=True)
+    version=toolchain.stdout.strip()
     if version!=(source/'expected-swift-version.txt').read_text().strip(): raise RuntimeError('Pinned compiler mismatch')
-    driver=output('xcrun','swift-driver','--version')
+    driver=toolchain.stderr.strip()
     if driver!='swift-driver version: 1.168.6': raise RuntimeError('Pinned swift-driver mismatch')
     sdk=output('xcrun','--sdk','appletvsimulator','--show-sdk-path')
     sdk_version=output('xcrun','--sdk','appletvsimulator','--show-sdk-version')

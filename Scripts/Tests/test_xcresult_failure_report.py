@@ -4,6 +4,7 @@
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 """Portable allowlist and byte-bound tests; no Apple SDK or result export required."""
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -23,8 +24,12 @@ def schema():
 
 class XCResultFailureReportTests(unittest.TestCase):
     def test_empty_failures_are_explicit(self):
-        self.assertEqual(REPORT.report(schema(), {"testFailures": []}),
-                         ["CI_TEST_FAILURE_SCHEMA_VERIFIED=1", "CI_TEST_FAILURE_COUNT=0"])
+        lines = REPORT.report(schema(), {"testFailures": []})
+        self.assertEqual(lines[:3], ["CI_TEST_FAILURE_SCHEMA_VERIFIED=1",
+                                     "CI_TEST_FAILURE_COUNT=0", "CI_TEST_FAILURE_COUNT_KIND=records"])
+        self.assertIn("CI_TEST_SUMMARY_SCALARS={}", lines)
+        self.assertIn('"passedTests"', lines[4])
+        self.assertEqual(lines[5], "CI_TEST_SUMMARY_UNKNOWN_FIELDS=[]")
 
     def test_only_schema_approved_failure_fields_and_source_location_are_emitted(self):
         failure = {"testName": "Suite.test", "testIdentifierString": "Suite/test()",
@@ -58,6 +63,92 @@ class XCResultFailureReportTests(unittest.TestCase):
         self.assertEqual(lines[-1], "CI_TEST_FAILURE_OUTPUT_TRUNCATED=1")
         self.assertLessEqual(len(("\n".join(lines) + "\n").encode("utf-8")), REPORT.MAX_OUTPUT)
         self.assertIn("CI_TEST_FAILURE_COUNT=30", lines)
+
+
+class XCResultSummaryReportTests(unittest.TestCase):
+    """Synthetic schemas verify fail-closed behavior, not native availability."""
+    def summary(self, description, document):
+        lines = REPORT.report(description, {"testFailures": [], **document})
+        result = {}
+        for key in ("SCALARS", "UNAVAILABLE_FIELDS", "UNKNOWN_FIELDS"):
+            prefix = "CI_TEST_SUMMARY_" + key + "="
+            matches = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+            self.assertEqual(len(matches), 1, f"one explicit {key} record is required")
+            result[key] = json.loads(matches[0])
+        return result
+
+    def advertised_schema(self):
+        result = schema()
+        result["properties"].update({
+            "result": {"type": "string"},
+            "totalTestCount": {"type": "integer"},
+            "passedTests": {"type": "integer"},
+            "failedTests": {"type": "integer"},
+            "skippedTests": {"type": "integer"},
+            "expectedFailures": {"type": "integer"},
+            "notRunTests": {"type": "integer"},
+        })
+        return result
+
+    def test_actual_advertised_scalars_are_verbatim_and_failure_records_are_distinct(self):
+        values = {"result": "Failed", "totalTestCount": 19, "passedTests": 8,
+                  "failedTests": 4, "skippedTests": 3, "expectedFailures": 1,
+                  "notRunTests": 3}
+        result = self.summary(self.advertised_schema(), values)
+        self.assertEqual(result["SCALARS"], values)
+        self.assertEqual(result["UNAVAILABLE_FIELDS"], [])
+        self.assertEqual(result["UNKNOWN_FIELDS"], [])
+        lines = REPORT.report(self.advertised_schema(), {**values, "testFailures": [
+            {"failureText": "one record is not the failed test count"}]})
+        self.assertIn("CI_TEST_FAILURE_COUNT=1", lines)
+        self.assertIn("CI_TEST_FAILURE_COUNT_KIND=records", lines)
+        self.assertIn('"failedTests": 4', "\n".join(lines))
+
+    def test_missing_summary_or_schema_fields_stay_unavailable_without_inferred_zero(self):
+        result = self.summary(self.advertised_schema(), {"totalTestCount": 10, "passedTests": 10})
+        self.assertEqual(result["SCALARS"], {"totalTestCount": 10, "passedTests": 10})
+        for key in ("failedTests", "skippedTests", "notRunTests", "result"):
+            self.assertIn(key, result["UNAVAILABLE_FIELDS"])
+        self.assertEqual(result["UNKNOWN_FIELDS"], [])
+        result = self.summary(schema(), {"passedTests": 10})
+        self.assertEqual(result["SCALARS"], {})
+        self.assertIn("passedTests", result["UNAVAILABLE_FIELDS"])
+
+    def test_nested_properties_cannot_authorize_a_root_summary_scalar(self):
+        description = schema()
+        description["properties"]["testFailures"]["items"]["properties"]["passedTests"] = {"type": "integer"}
+        result = self.summary(description, {"passedTests": 7})
+        self.assertEqual(result["SCALARS"], {})
+        self.assertIn("passedTests", result["UNAVAILABLE_FIELDS"])
+
+    def test_wrong_scalar_types_negative_counts_and_bools_are_unknown_not_coerced(self):
+        for value in (True, False, -1, 3.5, "7", None, [], {}, 2**80):
+            with self.subTest(value=value):
+                result = self.summary(self.advertised_schema(), {"passedTests": value})
+                self.assertEqual(result["SCALARS"], {})
+                self.assertIn("passedTests", result["UNKNOWN_FIELDS"])
+                self.assertNotIn("passedTests", result["UNAVAILABLE_FIELDS"])
+
+    def test_unadvertised_types_and_private_or_oversized_fields_are_not_emitted(self):
+        description = self.advertised_schema()
+        description["properties"]["passedTests"] = {"type": "string"}
+        description["properties"]["privateData"] = {"type": "string"}
+        result = self.summary(description, {"passedTests": 7, "privateData": "SECRET",
+                                            "result": "x" * 1000})
+        self.assertEqual(result["SCALARS"], {})
+        self.assertIn("passedTests", result["UNAVAILABLE_FIELDS"])
+        self.assertIn("result", result["UNKNOWN_FIELDS"])
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertNotIn("x" * 100, json.dumps(result))
+
+    def test_missing_counts_never_change_failure_status_or_output_budget(self):
+        failures = [{"testName": "Suite.test", "failureText": "界" * 5000}] * 30
+        lines = REPORT.report(self.advertised_schema(), {
+            "result": "Failed", "failedTests": 30, "testFailures": failures})
+        self.assertIn('"result": "Failed"', "\n".join(lines))
+        self.assertIn("CI_TEST_FAILURE_COUNT=30", lines)
+        self.assertEqual(lines[-1], "CI_TEST_FAILURE_OUTPUT_TRUNCATED=1")
+        self.assertLessEqual(len(("\n".join(lines) + "\n").encode("utf-8")), REPORT.MAX_OUTPUT)
 
 
 if __name__ == "__main__":

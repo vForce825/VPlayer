@@ -151,7 +151,10 @@ def artifact_mode(path, actual):
     if manifest.get('schema') != 1 or manifest.get('compiler_version') != actual: fail('Build record compiler/schema mismatch')
     target=manifest['target']; version=target_version(target)
     if version != (27,0,0): fail('This reviewed control is restricted to tvOS 27.0 Simulator')
-    driver=subprocess.check_output(['xcrun','swift-driver','--version'],text=True).strip()
+    # Query the same supported entry point used to compile the artifacts.
+    toolchain=subprocess.run(['xcrun','swiftc','--version'],text=True,capture_output=True,check=True)
+    if toolchain.stdout.strip()!=actual: fail('Pinned compiler version mismatch')
+    driver=toolchain.stderr.strip()
     if driver!='swift-driver version: 1.168.6' or manifest.get('driver_version')!=driver: fail('Pinned driver mismatch')
     sdk_path=subprocess.check_output(['xcrun','--sdk','appletvsimulator','--show-sdk-path'],text=True).strip()
     sdk_version=subprocess.check_output(['xcrun','--sdk','appletvsimulator','--show-sdk-version'],text=True).strip()

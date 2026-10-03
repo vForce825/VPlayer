@@ -45,12 +45,13 @@ def make_ir(symbols, caller=False):
 
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def fake_output(args,**kw):
-    if args==['xcrun','swift-driver','--version']: return 'swift-driver version: 1.168.6'
     if args[-1]=='--show-sdk-path': return SDK
     if args[-1]=='--show-sdk-version': return '27.0'
     raise AssertionError(args)
 
 def fake_demangle(args,**kw):
+    if args==['xcrun','swiftc','--version']:
+        return SimpleNamespace(stdout=VERSION+'\n',stderr='swift-driver version: 1.168.6 \n')
     rows=[]
     for x in kw['input'].splitlines():
         name=x.removeprefix('_$s').removesuffix('Tu')

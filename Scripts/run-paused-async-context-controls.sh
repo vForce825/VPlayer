@@ -5,6 +5,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 stage="$root/Scripts/Support/paused-async-context"
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/vplayer-async-controls.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
+python3 -B "$root/Scripts/Tests/test_paused_async_context_toolchain.py"
 python3 -B "$root/Scripts/Tests/test_paused_async_context_addend.py" \
   "$root/Scripts/inspect-paused-async-contexts.py"
 python3 -B "$root/Scripts/Tests/test_paused_async_context_output.py" \

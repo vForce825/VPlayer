@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 VPlayer contributors
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
-"""Print bounded test-failure text only; never export result bundles or attachments."""
+"""Print bounded summary scalars/failure text; never export bundles or attachments."""
 import json
 import subprocess
 import sys
@@ -13,6 +13,44 @@ MAX_JSON = 8 * 1024 * 1024
 MAX_OUTPUT = 64 * 1024
 ALLOWED = {"testName", "testCaseName", "testIdentifier", "testIdentifierString", "testIdentifierURL", "failureText", "message",
            "filePath", "fileName", "lineNumber", "line", "columnNumber"}
+
+# Candidate names are emitted only if the installed tool's root schema declares
+# the exact scalar type and the current result supplies a valid value. These are
+# not assumptions about SDK availability; absent fields stay unavailable.
+SUMMARY_FIELD_TYPES = {
+    "result": "string", "totalTestCount": "integer", "passedTests": "integer",
+    "failedTests": "integer", "skippedTests": "integer",
+    "expectedFailures": "integer", "notRunTests": "integer",
+}
+
+
+def summary_lines(schema, summary):
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    if not isinstance(properties, dict):
+        properties = {}
+    scalars, unavailable, unknown = {}, [], []
+    for key, expected_type in SUMMARY_FIELD_TYPES.items():
+        declaration = properties.get(key)
+        if (not isinstance(declaration, dict) or declaration.get("type") != expected_type
+                or key not in summary):
+            unavailable.append(key)
+            continue
+        value = summary[key]
+        if expected_type == "integer":
+            valid = type(value) is int and 0 <= value <= 2**63 - 1
+        else:
+            valid = isinstance(value, str) and 0 < len(value.encode("utf-8")) <= 128
+        if valid:
+            scalars[key] = value
+        else:
+            unknown.append(key)
+    # Do not infer not-run, failed or skipped counts by subtraction, and do not
+    # substitute the failure-record count for the number of failed tests.
+    return [
+        "CI_TEST_SUMMARY_SCALARS=" + json.dumps(scalars, ensure_ascii=True, sort_keys=True),
+        "CI_TEST_SUMMARY_UNAVAILABLE_FIELDS=" + json.dumps(sorted(unavailable)),
+        "CI_TEST_SUMMARY_UNKNOWN_FIELDS=" + json.dumps(sorted(unknown)),
+    ]
 
 
 def run(args):
@@ -62,7 +100,8 @@ def report(schema, summary):
     approved &= ALLOWED
     if not approved.intersection({"failureText", "message"}):
         raise ValueError("verified schema lacks supported failure-message field")
-    lines = ["CI_TEST_FAILURE_SCHEMA_VERIFIED=1", "CI_TEST_FAILURE_COUNT=" + str(len(failures))]
+    lines = ["CI_TEST_FAILURE_SCHEMA_VERIFIED=1", "CI_TEST_FAILURE_COUNT=" + str(len(failures)),
+             "CI_TEST_FAILURE_COUNT_KIND=records", *summary_lines(schema, summary)]
     total = sum(len(line.encode("utf-8")) + 1 for line in lines)
     marker = "CI_TEST_FAILURE_OUTPUT_TRUNCATED=1"
     marker_bytes = len(marker.encode("utf-8")) + 1

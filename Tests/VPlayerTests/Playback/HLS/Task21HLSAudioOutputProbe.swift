@@ -162,6 +162,8 @@ final class Task21HLSAudioOutputProbe {
         }
     }
 
+    /// Normal-actor facts for diagnostic classification only; never gates HLS.
+    private(set) var configurationStayedValid = true
     private let scope: String
     private let physicalItemIdentity: ObjectIdentifier
     private let tappedTrackID: CMPersistentTrackID
@@ -252,6 +254,10 @@ final class Task21HLSAudioOutputProbe {
             $0.trackID == tappedTrackID && $0.audioTapProcessor === tap
         }.count
         let originalMixInstalled = installedMix != nil && item?.audioMix === installedMix
+        configurationStayedValid = configurationStayedValid && player.currentItem === item
+            && originalMixInstalled && parameters.count == 1 && associatedTapCount == 1
+            && !player.isMuted && player.volume > 0 && !player.disconnectedFromSystemAudio
+            && !player.isExternalPlaybackActive && player.status != .failed && item?.status != .failed
         print("AAC_TAP_SETUP \(scope) phase=\(phase) originalItemCurrent=\(player.currentItem === item) "
             + "originalMixInstalled=\(originalMixInstalled) parameters=\(parameters.count) mixTapCount=\(mixTapCount) "
             + "tappedTrackID=\(tappedTrackID) associatedTapCount=\(associatedTapCount) "
@@ -552,6 +558,7 @@ private func task21TapProcess(_ tap: MTAudioProcessingTap, _ requested: CMItemCo
 final class Task21NativeAudioSessionReference {
     enum Failure: Error { case requiresSimulator, alreadyOwned, activationRejected, deactivationRejected, restorationMismatch }
     private static var owned = false
+    let diagnosticID = UUID()
     private let session: AVAudioSession
     private let priorCategory: AVAudioSession.Category
     private let priorMode: AVAudioSession.Mode
@@ -621,6 +628,7 @@ final class Task21NativeAudioSessionReference {
         }
         closed = true
         Self.owned = false
+        print("AAC_NATIVE_SESSION cleanupSucceeded=true diagnosticID=\(diagnosticID.uuidString)")
     }
 
     static func logRoute(stage: String) {
@@ -649,6 +657,7 @@ final class Task21LocalPCMTapReference {
     }
     private let directory: URL
     private let association: Association
+    private let sessionDiagnosticID: UUID?
     private let player = AVPlayer()
     private let endSignal = EndSignal()
     private var item: AVPlayerItem?
@@ -656,8 +665,9 @@ final class Task21LocalPCMTapReference {
     private var endObserver: (any NSObjectProtocol)?
     private var closed = false
 
-    init(association: Association = .assetTrack) throws {
+    init(association: Association = .assetTrack, sessionDiagnosticID: UUID? = nil) throws {
         self.association = association
+        self.sessionDiagnosticID = sessionDiagnosticID
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("Task21-local-PCM-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -715,6 +725,8 @@ final class Task21LocalPCMTapReference {
         guard !closed else { return }
         closed = true
         var failure: (any Error)?
+        var noProcessingCandidate = false
+        var referenceCleanupSucceeded = true
         probe?.mark(.retiring, player: player)
         player.pause()
         player.cancelPendingPrerolls()
@@ -728,12 +740,23 @@ final class Task21LocalPCMTapReference {
         player.replaceCurrentItem(with: nil)
         item = nil
         if player.currentItem != nil || player.rate != 0 || !player.disconnectedFromSystemAudio {
+            referenceCleanupSucceeded = false
             failure = Failure.cleanup
         }
         if let probe {
             do {
                 let snapshot = try await probe.detachAndDrain()
                 snapshot.log()
+                // Exact completed absence signature only. Partial preparation,
+                // any process callback, sticky fault or setup mismatch is not it.
+                noProcessingCandidate = association == .wholeMix && probe.configurationStayedValid
+                    && snapshot.firstFailure == 0 && snapshot.records.count == 2
+                    && snapshot.records.first?.kind == .initialize
+                    && snapshot.records.last?.kind == .finalize
+                    && snapshot.records.allSatisfy({ $0.frames == 0 && $0.status == noErr })
+                    && snapshot.markers.contains(where: { $0.phase == .prepared })
+                    && snapshot.markers.contains(where: { $0.phase == .activationReturned && $0.rate > 0 })
+                    && snapshot.markers.contains(where: { $0.phase == .naturalEnd })
                 try snapshot.requireLocalPCMCallbackFeasibility()
                 print("LOCAL_PCM_REFERENCE callbackFeasibility=true physicalTapFinalized=true endpointOracle=false")
             } catch {
@@ -743,10 +766,23 @@ final class Task21LocalPCMTapReference {
         }
         probe = nil
         do { try FileManager.default.removeItem(at: directory) }
-        catch { if failure == nil { failure = error } }
+        catch {
+            referenceCleanupSucceeded = false
+            if failure == nil { failure = error }
+        }
         print("LOCAL_PCM_REFERENCE cleanup itemAbsent=\(player.currentItem == nil) "
             + "rate=\(player.rate) disconnected=\(player.disconnectedFromSystemAudio) "
             + "temporaryDirectoryRemoved=\(!FileManager.default.fileExists(atPath: directory.path))")
+        if let sessionDiagnosticID, noProcessingCandidate && referenceCleanupSucceeded
+            && player.timeControlStatus == .paused {
+            // Count only with the matching diagnosticID from this invocation's
+            // later session-cleanup marker. Never pair markers across tests.
+            print("AUDIO_CAPABILITY_OBSERVATION classification=wholeMixCallbacksNotObserved "
+                + "diagnosticID=\(sessionDiagnosticID.uuidString) "
+                + "capability=unverified observedUnavailableCount=1 endpointVerifiedCount=0 "
+                + "referenceCleanupSucceeded=true sessionCleanup=requiresSeparateConfirmation")
+        }
+        // Preserve the existing strict failure; this marker never passes/skips it.
         if let failure { throw failure }
     }
 
