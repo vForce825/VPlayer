@@ -21,6 +21,13 @@ private final class WeakSystemAVPlayerDriverProbe {
 }
 
 @MainActor
+private final class Task21NativeResumeObservationState {
+    var finished = false
+    var poolIdentity: ObjectIdentifier?
+    weak var pool: AVPlayerSDKCallbackCreditPool?
+}
+
+@MainActor
 private final class WeakPreparedTimelineProbe {
     weak var value: PlayerItemTimelineMappingAuthority?
     let identity: ObjectIdentifier
@@ -8953,25 +8960,23 @@ private final class Task21RealIntegrationFixture {
         let activation = try XCTUnwrap(graph.registry.beginOutputActivation(contextNonce: context.contextNonce))
         backend.clearActivationResult()
         XCTAssertTrue(graph.registry.startOutputActivationOperation(activation))
-        var finished = false
+        let observationState = Task21NativeResumeObservationState()
         var timedOut = false
         var sampledSeek = false
         var sampledLoaded = false
         var sampledPreroll = false
         var sawReturnWaiter = false
-        var observedPoolIdentity: ObjectIdentifier?
-        weak var observedPool: AVPlayerSDKCallbackCreditPool?
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         let observation = Task { @MainActor in
-            while !finished {
+            while !observationState.finished {
                 // Reflection reads only the MainActor-owned pool reference. All
                 // mutable credit/waiter state stays behind its existing lock API.
                 if let pool = nativePausedResumePoolForDiagnostics() {
-                    if let observedPoolIdentity {
+                    if let observedPoolIdentity = observationState.poolIdentity {
                         XCTAssertEqual(ObjectIdentifier(pool), observedPoolIdentity)
                     } else {
-                        observedPoolIdentity = ObjectIdentifier(pool)
-                        observedPool = pool
+                        observationState.poolIdentity = ObjectIdentifier(pool)
+                        observationState.pool = pool
                         let usage = pool.allocationUsage()
                         XCTAssertNotNil(usage)
                         if let usage {
@@ -9004,7 +9009,7 @@ private final class Task21RealIntegrationFixture {
             }
         }
         let result = await graph.registry.joinOutputBackendOperation(activation)
-        finished = true
+        observationState.finished = true
         try await observation.value
         guard !timedOut, case .succeeded = result, case .armed = backend.activationResult else {
             throw backend.lastActivationError ?? AVPlayerItemCoordinatorFailure.operationInFlight
@@ -9020,14 +9025,14 @@ private final class Task21RealIntegrationFixture {
         // native callback deinit; global occupiedCount cannot prove borrow state.
         do {
             let pool = try XCTUnwrap(nativePausedResumePoolForDiagnostics())
-            if let observedPoolIdentity { XCTAssertEqual(ObjectIdentifier(pool), observedPoolIdentity) }
-            observedPool = pool
-            observedPoolIdentity = ObjectIdentifier(pool)
+            if let observedPoolIdentity = observationState.poolIdentity { XCTAssertEqual(ObjectIdentifier(pool), observedPoolIdentity) }
+            observationState.pool = pool
+            observationState.poolIdentity = ObjectIdentifier(pool)
             XCTAssertFalse(pool.hasOperationReturnWaiter)
         }
         print("NATIVE_PROGRESS_RESUME armed sampledSeek=\(sampledSeek) sampledLoaded=\(sampledLoaded) "
             + "sampledPreroll=\(sampledPreroll) sawReturnWaiter=\(sawReturnWaiter) "
-            + "pool=\(String(describing: observedPoolIdentity)) "
+            + "pool=\(String(describing: observationState.poolIdentity)) "
             + "loadedCallbackGuaranteed=false prePlayExactReadbackGuaranteed=false completeAllocationGraphMeasured=false")
         try await awaitControlProgress(from: captured.time)
         let (successor, successorCursor) = try await ownedPause()
@@ -9037,10 +9042,10 @@ private final class Task21RealIntegrationFixture {
         XCTAssertEqual(captured.physicalItemIdentity, successorCursor.physicalItemIdentity)
         XCTAssertNil(nativePausedResumePoolForDiagnostics())
         let drainDeadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while observedPool != nil, ContinuousClock.now < drainDeadline {
+        while observationState.pool != nil, ContinuousClock.now < drainDeadline {
             await Self.awaitMainQueueTurn()
         }
-        XCTAssertNil(observedPool, "Original native callback aliases must release the retired pool")
+        XCTAssertNil(observationState.pool, "Original native callback aliases must release the retired pool")
         XCTAssertEqual(driver.activeWaiterCount, 0)
         XCTAssertEqual(backend.suspendCallCount, 2)
         // The test's existing Owner teardown performs terminal retirement and
