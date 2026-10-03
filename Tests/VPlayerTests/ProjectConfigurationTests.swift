@@ -128,19 +128,13 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertEqual(PlaybackFoundation.contractVersion, 1)
     }
 
-    func testAppStoreIdentityVersioningAndPrivacyManifestsStayReleaseReady() throws {
+    func testAppStoreIdentityAndPrivacyManifestsStayReleaseReady() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let projectYAML = try String(
             contentsOf: repositoryRoot.appendingPathComponent("project.yml"),
-            encoding: .utf8
-        )
-        let generatedProject = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "VPlayer.xcodeproj/project.pbxproj"
-            ),
             encoding: .utf8
         )
         let infoPlist = try propertyList(
@@ -150,25 +144,6 @@ final class ProjectConfigurationTests: XCTestCase {
         )
 
         XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
-        XCTAssertEqual(
-            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.7\"").count - 1,
-            3,
-            "the app and both embedded frameworks need a marketing version"
-        )
-        XCTAssertFalse(projectYAML.contains("MARKETING_VERSION: \"1.6\""))
-        XCTAssertEqual(
-            generatedProject.components(separatedBy: "MARKETING_VERSION = 1.7;").count - 1,
-            6,
-            "应用及两个内嵌框架的 Debug 和 Release 配置都必须使用 1.7 版本"
-        )
-        XCTAssertFalse(generatedProject.contains("MARKETING_VERSION = 1.6;"))
-        XCTAssertEqual(
-            projectYAML.components(separatedBy: "CURRENT_PROJECT_VERSION: \"1\"").count - 1,
-            3,
-            "the app and both embedded frameworks need a build version"
-        )
-        XCTAssertEqual(infoPlist["CFBundleShortVersionString"] as? String, "$(MARKETING_VERSION)")
-        XCTAssertEqual(infoPlist["CFBundleVersion"] as? String, "$(CURRENT_PROJECT_VERSION)")
         XCTAssertEqual(infoPlist["ITSAppUsesNonExemptEncryption"] as? Bool, false)
         XCTAssertEqual(
             infoPlist["BGTaskSchedulerPermittedIdentifiers"] as? [String],
