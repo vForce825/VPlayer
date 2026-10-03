@@ -107,114 +107,125 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(harness.clock.snapshot().rate, 1)
     }
 
-    func testAudioOnlyReadinessUpdatesPreserveSupplyObservationAndAdjustedRate() async throws {
+    func testSteadyLiveAudioSupplyNeverRetimesTheSharedClock() async throws {
+        // 同步器在两个非零速率之间切换会让系统 audio renderer 自动清空已排队音频，
+        // 实机表现为约每 30 秒一次断音。稳态供给即使低于旧补偿目标也只能保持名义速率 1。
         let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
+        let holds = ManualPipelineDelayScheduler()
         let harness = makeHarness(
             useRealCompressedAudio: true,
             audioDiagnosticsNow: virtualTime.now,
-            audioSupplyTimeProvider: virtualTime.now
+            audioSupplyHoldScheduler: holds.schedule
         )
         let generation = try await openRealAudioSupplyTimeline(harness)
+        let baseline = harness.clock.snapshot()
+        var observedRates: Set<Float> = []
+        // 1_500 个 AAC 包约 32 秒，跨过旧策略的 30 秒观察窗口。
         _ = try await feedRealAACSupply(
             harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001
+            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001,
+            onEachFrame: { observedRates.insert(harness.clock.snapshot().rate) }
         )
 
-        let adjustedRate = harness.clock.snapshot().rate
-        XCTAssertLessThan(adjustedRate, 1,
-                          "持续低水位必须形成调速；重复的 ready 状态不能每包清空观察窗口")
-        XCTAssertGreaterThanOrEqual(adjustedRate, 0.998 - 0.000_001)
-        XCTAssertTrue(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
-
-        // 同一就绪周期的刷新必须保留已应用倍率，不得重新应用名义速率 1。
-        for _ in 0..<4 {
-            harness.pipeline.receive(audioReadiness: .available, generation: generation)
-            harness.pipeline.refreshReadiness()
-            _ = await harness.pipeline.debugSnapshot()
-            XCTAssertEqual(harness.clock.snapshot().rate, adjustedRate)
-        }
+        XCTAssertEqual(observedRates, [1], "稳态供给不能把共享时钟调到 1 以外的任何速率")
+        XCTAssertEqual(harness.clock.snapshot().anchors.count, baseline.anchors.count,
+                       "稳态供给不能重新锚定共享时钟")
+        XCTAssertEqual(harness.clock.snapshot().pauses, baseline.pauses,
+                       "供给余量健康时不能暂停共享时钟")
+        XCTAssertEqual(holds.pendingCount, 0)
     }
 
-    func testRevokedAudioSupplyRateCannotRestartFromLateCoverageAndReauthorizationIsFresh() async throws {
+    func testAudioSupplyDeficitBrieflyHoldsTheSameClockWithoutReanchorOrFlush() async throws {
         let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
+        let holds = ManualPipelineDelayScheduler()
         let harness = makeHarness(
             useRealCompressedAudio: true,
             audioDiagnosticsNow: virtualTime.now,
-            audioSupplyTimeProvider: virtualTime.now
+            audioSupplyHoldScheduler: holds.schedule
         )
         let generation = try await openRealAudioSupplyTimeline(harness)
-        let nextFrame = try await feedRealAACSupply(
-            harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001
-        )
-        XCTAssertLessThan(harness.clock.snapshot().rate, 1)
-
-        harness.pipeline.setPlaybackRate(0)
-        _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 0)
-        virtualTime.set(1_100)
-        for frame in nextFrame..<(nextFrame + 48) {
-            harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
-                id: frame + 1, generation: generation,
-                pts: CMTime(value: Int64(frame) * 1_024, timescale: 48_000),
-                duration: CMTime(value: 1_024, timescale: 48_000)
-            )))
-        }
-        harness.pipeline.receive(audioReadiness: .available, generation: generation)
-        harness.pipeline.refreshReadiness()
-        _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 0,
-                       "晚到的连续覆盖及 readiness 刷新不能重新签发播放授权")
-
-        harness.pipeline.setPlaybackRate(1)
-        harness.pipeline.refreshReadiness()
-        _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 1,
-                       "新的播放授权必须丢弃上一轮已经形成的补偿倍率")
-        _ = try await feedRealAACSupply(
-            harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: nextFrame + 48, frameCount: 470,
-            firstObservationTime: 1_101
-        )
-        XCTAssertEqual(harness.clock.snapshot().rate, 1,
-                       "新观察不足十几秒，不能沿用旧的三十秒窗口立即调速")
-    }
-
-    func testNonUnitNominalRateDoesNotReuseOrAccumulateLiveAudioSupplyAdjustment() async throws {
-        let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
-        let harness = makeHarness(
-            useRealCompressedAudio: true,
-            audioDiagnosticsNow: virtualTime.now,
-            audioSupplyTimeProvider: virtualTime.now
-        )
-        let generation = try await openRealAudioSupplyTimeline(harness)
+        let audio = try XCTUnwrap(harness.compressedAudio)
+        let baseline = harness.clock.snapshot()
         var nextFrame = try await feedRealAACSupply(
             harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001
+            firstFrame: 16, frameCount: 48, firstObservationTime: 1_001
         )
-        XCTAssertLessThan(harness.clock.snapshot().rate, 1)
+        XCTAssertEqual(holds.pendingCount, 0)
 
-        // 本次直播补偿只作用于名义速率 1；其他授权速率保持调用方请求。
-        harness.pipeline.setPlaybackRate(2)
+        // 供给落后于硬件时钟：已接纳音频只领先 10ms，低于输出延迟加安全余量。
+        let deficitLead = CMTime(value: 1, timescale: 100)
+        nextFrame = try await feedRealAACSupply(
+            harness, generation: generation, virtualTime: virtualTime,
+            firstFrame: nextFrame, frameCount: 1, firstObservationTime: 1_002,
+            lead: deficitLead
+        )
+
+        let held = harness.clock.snapshot()
+        XCTAssertEqual(held.rate, 0, "余量不足时必须以普通暂停补足余量")
+        XCTAssertEqual(held.pauses, baseline.pauses + 1)
+        XCTAssertEqual(held.anchors.count, baseline.anchors.count,
+                       "补足余量不能重新锚定，避免 flush 与重播")
+        XCTAssertTrue(audio.pipeline.isReadyForPlayback, "普通暂停不能清空音频队列")
+        XCTAssertNotNil(audio.pipeline.acceptedCoverage)
+        XCTAssertEqual(holds.pendingCount, 1)
+        let delay = try XCTUnwrap(Self.seconds(of: try XCTUnwrap(holds.delays.last)))
+        // 低余量可能在最新一包被接纳前或接纳后被观察到，因此允许一个 AAC 包的差异。
+        let expectedHold = audio.pipeline.anchorLeadTime.seconds + 0.2 - deficitLead.seconds
+        let packetSeconds = CMTime(value: 1_024, timescale: 48_000).seconds
+        XCTAssertGreaterThanOrEqual(delay, expectedHold - 0.002, "暂停时长应把余量补回目标值")
+        XCTAssertLessThanOrEqual(delay, expectedHold + packetSeconds + 0.002)
+
+        // 暂停期间继续到达的音频不能叠加第二次暂停。
+        _ = try await feedRealAACSupply(
+            harness, generation: generation, virtualTime: virtualTime,
+            firstFrame: nextFrame, frameCount: 4, firstObservationTime: 1_003,
+            lead: deficitLead
+        )
+        XCTAssertEqual(holds.pendingCount, 1)
+        XCTAssertEqual(harness.clock.snapshot().pauses, baseline.pauses + 1)
+
+        XCTAssertTrue(holds.fireNext())
         _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 2,
-                       "切换名义速率必须丢弃此前的直播补偿倍率")
+        let resumed = harness.clock.snapshot()
+        XCTAssertEqual(resumed.rate, 1, "暂停结束后以原名义速率继续，系统不会 flush")
+        XCTAssertEqual(resumed.anchors.count, baseline.anchors.count)
+        XCTAssertTrue(audio.pipeline.isReadyForPlayback)
+    }
 
-        // 再推进约 34 秒低水位，跨过完整观察窗口，不能形成新的二倍速补偿。
-        let chunkDuration = 200 * CMTime(value: 1_024, timescale: 48_000).seconds
-        for chunk in 0..<8 {
-            nextFrame = try await feedRealAACSupply(
-                harness, generation: generation, virtualTime: virtualTime,
-                firstFrame: nextFrame, frameCount: 200,
-                firstObservationTime: 1_040 + Double(chunk) * chunkDuration
+    func testExpiredAudioSupplyHoldCannotRestartRevokedOrPausedOutput() async throws {
+        for revokeByPause in [false, true] {
+            let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
+            let holds = ManualPipelineDelayScheduler()
+            let harness = makeHarness(
+                useRealCompressedAudio: true,
+                audioDiagnosticsNow: virtualTime.now,
+                audioSupplyHoldScheduler: holds.schedule
             )
-            harness.pipeline.receive(audioReadiness: .available, generation: generation)
-            harness.pipeline.refreshReadiness()
+            let generation = try await openRealAudioSupplyTimeline(harness)
+            let nextFrame = try await feedRealAACSupply(
+                harness, generation: generation, virtualTime: virtualTime,
+                firstFrame: 16, frameCount: 48, firstObservationTime: 1_001
+            )
+            _ = try await feedRealAACSupply(
+                harness, generation: generation, virtualTime: virtualTime,
+                firstFrame: nextFrame, frameCount: 1, firstObservationTime: 1_002,
+                lead: CMTime(value: 1, timescale: 100)
+            )
+            XCTAssertEqual(holds.pendingCount, 1)
+
+            if revokeByPause {
+                harness.pipeline.setPaused(true, readinessCycle: 1)
+            } else {
+                harness.pipeline.setPlaybackRate(0)
+            }
             _ = await harness.pipeline.debugSnapshot()
-            XCTAssertEqual(harness.clock.snapshot().rate, 2,
-                           "超过观察窗口的有效覆盖和 readiness 更新也必须保留名义速率 2")
+            XCTAssertTrue(holds.fireNext())
+            _ = await harness.pipeline.debugSnapshot()
+            XCTAssertEqual(harness.clock.snapshot().rate, 0,
+                           "过期的补余量暂停不能重新签发播放授权 (pause=\(revokeByPause))")
         }
     }
+
 
     func testAuthorizedOutputRateResumesAfterDisplayReanchor() async throws {
         let harness = makeHarness()
@@ -7921,13 +7932,17 @@ final class PlaybackPipelineTests: XCTestCase {
         virtualTime: PipelineAudioDiagnosticsClock,
         firstFrame: UInt64,
         frameCount: UInt64,
-        firstObservationTime: TimeInterval
+        firstObservationTime: TimeInterval,
+        lead: CMTime = CMTime(value: 8, timescale: 100),
+        onEachFrame: () -> Void = {}
     ) async throws -> UInt64 {
         let audio = try XCTUnwrap(harness.compressedAudio)
         let packetDuration = CMTime(value: 1_024, timescale: 48_000)
+        defer { onEachFrame() }
         for frame in firstFrame..<(firstFrame + frameCount) {
+            onEachFrame()
             let end = CMTime(value: Int64(frame + 1) * 1_024, timescale: 48_000)
-            let clockTime = CMTimeSubtract(end, CMTime(value: 8, timescale: 100))
+            let clockTime = CMTimeSubtract(end, lead)
             harness.clock.setTime(clockTime)
             audio.synchronizer.setCurrentTime(clockTime)
             virtualTime.set(firstObservationTime
@@ -7939,6 +7954,17 @@ final class PlaybackPipelineTests: XCTestCase {
             _ = await harness.pipeline.debugSnapshot()
         }
         return firstFrame + frameCount
+    }
+
+    private static func seconds(of interval: DispatchTimeInterval) -> Double? {
+        switch interval {
+        case let .seconds(value): Double(value)
+        case let .milliseconds(value): Double(value) / 1_000
+        case let .microseconds(value): Double(value) / 1_000_000
+        case let .nanoseconds(value): Double(value) / 1_000_000_000
+        case .never: nil
+        @unknown default: nil
+        }
     }
 
     private func configure(
@@ -8117,7 +8143,7 @@ final class PlaybackPipelineTests: XCTestCase {
         useRealCompressedAudio: Bool = false,
         routeMonitor: (any AudioRouteMonitoring)? = nil,
         audioDiagnosticsNow: AudioRenderPipeline.DiagnosticsNow? = nil,
-        audioSupplyTimeProvider: (@Sendable () -> TimeInterval)? = nil,
+        audioSupplyHoldScheduler: PlaybackPipeline.VideoDecodeStallScheduler? = nil,
         automaticallyCompleteDecoderTransitions: Bool = true,
         automaticallyCompleteDecoderSubmissions: Bool = true,
         decoderTransitionEventsInline: Bool = false,
@@ -8208,8 +8234,7 @@ final class PlaybackPipelineTests: XCTestCase {
                 eventForwarder?.send(event)
             },
             metrics: metrics,
-            audioSupplyTimeProvider: audioSupplyTimeProvider
-                ?? { ProcessInfo.processInfo.systemUptime }
+            audioSupplyHoldScheduler: audioSupplyHoldScheduler
         )
         audioRelay?.install(pipeline)
         decoder.setTransitionEventSink(
@@ -8509,15 +8534,20 @@ private struct Harness: @unchecked Sendable {
 private final class ManualPipelineDelayScheduler: @unchecked Sendable {
     private let lock = NSLock()
     private var operations: [@Sendable () -> Void] = []
+    private var requestedDelays: [DispatchTimeInterval] = []
 
     func schedule(
-        after _: DispatchTimeInterval,
+        after delay: DispatchTimeInterval,
         _ operation: @escaping @Sendable () -> Void
     ) {
-        lock.withLock { operations.append(operation) }
+        lock.withLock {
+            requestedDelays.append(delay)
+            operations.append(operation)
+        }
     }
 
     var pendingCount: Int { lock.withLock { operations.count } }
+    var delays: [DispatchTimeInterval] { lock.withLock { requestedDelays } }
 
     func fireNext() -> Bool {
         let operation = lock.withLock { () -> (@Sendable () -> Void)? in

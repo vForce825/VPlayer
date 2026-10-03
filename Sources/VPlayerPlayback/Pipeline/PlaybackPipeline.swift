@@ -7,6 +7,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import OSLog
 import VideoToolbox
 import VPlayerCore
 
@@ -224,18 +225,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         let routeRevision: UInt64?
     }
 
-    private struct AudioSupplyCoverageIdentity: Equatable {
-        let epoch: UInt64
-        let generation: MediaGeneration
-        let island: AudioContinuityIslandID
-        let queueEpisode: UInt64
-
-        init(_ coverage: AudioRendererAcceptedCoverage) {
-            epoch = coverage.epoch
-            generation = coverage.generation
-            island = coverage.continuityIslandID
-            queueEpisode = coverage.queueEpisode
-        }
+    /// 一次补余量暂停只属于开始它的就绪周期；暂停、停止、撤销授权或重新锚定后，
+    /// 过期的恢复回调不能重新签发播放速率。
+    private struct AudioSupplyHold: Equatable {
+        let token: UInt64
+        let readinessCycleID: UInt64
     }
 
     private struct AnchorPreparationTransaction {
@@ -284,6 +278,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         }
     }
 
+    private static let logger = Logger(
+        subsystem: "com.vforce.vplayer",
+        category: "PlaybackPipeline"
+    )
     static let deferredPacketCapacity = 32
     static let pendingTrackMediaCapacity = 96
     // Compressed access units are tiny beside decoded 4K P010 surfaces. This
@@ -397,7 +395,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private let signposts: PlaybackSignposts?
     private let videoDecodeStallTimeout: DispatchTimeInterval
     private let videoDecodeStallScheduler: VideoDecodeStallScheduler
-    private let audioSupplyTimeProvider: @Sendable () -> TimeInterval
+    private let audioSupplyHoldScheduler: VideoDecodeStallScheduler
     private let pendingTrackAudioRetentionLimits: CompressedAudioRetentionLimits
     private var videoCoordinator: VideoPipelineCoordinator!
 
@@ -460,11 +458,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private var readinessCycle: UInt64 = 0
     private var permittedOutputRate: Float = 0
     private var outputRateInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
-    private var audioSupplyClockPolicy = PlaybackAudioSupplyClockPolicy()
-    private var audioSupplyClockMultiplier: Float = 1
-    private var audioSupplyCoverageIdentity: AudioSupplyCoverageIdentity?
-    private var audioSupplyLastObservationAt: TimeInterval?
-    private var audioSupplyReadinessCycle: UInt64?
+    // 已为哪个就绪周期打开共享时间线并应用正速率；同一周期的 readiness 刷新不重复应用。
+    private var sharedTimelineRateCycle: UInt64?
+    private var audioSupplyHold: AudioSupplyHold?
+    private var nextAudioSupplyHoldToken: UInt64 = 0
+#if DEBUG
+    private var lastAudioSupplyDiagnosticLogUptime: TimeInterval?
+#endif
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
     private var pendingTrackVideo = CompressedVideoReservoir(
@@ -528,9 +528,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         presentationContext: PlaybackPresentationContext? = nil,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil,
-        audioSupplyTimeProvider: @escaping @Sendable () -> TimeInterval = {
-            ProcessInfo.processInfo.systemUptime
-        }
+        audioSupplyHoldScheduler: VideoDecodeStallScheduler? = nil
     ) {
         self.executor = executor
         self.tuning = tuning
@@ -543,6 +541,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             }
         } else {
             self.videoDecodeStallScheduler = { delay, operation in
+                executor.submit(after: delay, operation)
+            }
+        }
+        if let audioSupplyHoldScheduler {
+            self.audioSupplyHoldScheduler = { delay, operation in
+                audioSupplyHoldScheduler(delay) {
+                    executor.submit(operation)
+                }
+            }
+        } else {
+            self.audioSupplyHoldScheduler = { delay, operation in
                 executor.submit(after: delay, operation)
             }
         }
@@ -564,7 +573,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         self.presentationContext = presentationContext
         self.metrics = metrics
         self.signposts = signposts
-        self.audioSupplyTimeProvider = audioSupplyTimeProvider
         videoCoordinator = VideoPipelineCoordinator(
             decoder: decoder,
             passthrough: processor,
@@ -666,7 +674,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 }
                 permittedOutputRate = 0
                 outputRateInvocation = nil
-                resetAudioSupplyClockAdjustmentIsolated()
+                audioSupplyHold = nil
                 systemClock.setRate(0)
                 continuation.resume(returning: systemClock.synchronizer.rate)
             }
@@ -2506,8 +2514,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         assertIsolated()
         guard started, !terminal else { return }
         permittedOutputRate = rate
-        if rate != 1 { resetAudioSupplyClockAdjustmentIsolated() }
         if rate <= 0 {
+            audioSupplyHold = nil
             outputRateInvocation = nil
             clock.setRate(rate)
         } else {
@@ -2521,14 +2529,18 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
               !paused,
               readiness?.isOpen == true,
               audio.isOutputRouteReadyForSharedAnchor else { return }
-        // 微补偿仅覆盖直播的一倍速；其他名义速率不能继承上一轮补偿。
-        let supplyMultiplier: Float = permittedOutputRate == 1 ? audioSupplyClockMultiplier : 1
-        let rate = permittedOutputRate * supplyMultiplier
+        if let hold = audioSupplyHold {
+            if hold.readinessCycleID == readiness?.cycleID {
+                return
+            }
+            audioSupplyHold = nil
+        }
+        let rate = permittedOutputRate
         if let invocation = outputRateInvocation {
             guard invocation.performCurrentPlaybackRateSideEffect({ clock.setRate(rate) }) else {
                 permittedOutputRate = 0
                 outputRateInvocation = nil
-                resetAudioSupplyClockAdjustmentIsolated()
+                audioSupplyHold = nil
                 clock.setRate(0)
                 return
             }
@@ -2536,7 +2548,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             // 真实 SDK 时钟不能接受缺少当前授权的正速率；隔离测试的时钟无需 Registry。
             guard !(clock is RenderSynchronizerClock) else {
                 permittedOutputRate = 0
-                resetAudioSupplyClockAdjustmentIsolated()
+                audioSupplyHold = nil
                 clock.setRate(0)
                 return
             }
@@ -2544,54 +2556,52 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         }
     }
 
-    private func resetAudioSupplyClockAdjustmentIsolated() {
-        audioSupplyClockPolicy.reset()
-        audioSupplyClockMultiplier = 1
-        audioSupplyCoverageIdentity = nil
-        audioSupplyLastObservationAt = nil
-        audioSupplyReadinessCycle = nil
-    }
-
-    private func updateAudioSupplyClockIsolated() {
+    private func updateAudioSupplyHoldIsolated() {
         assertIsolated()
         guard let observer = audio as? any AudioRendererCoverageObserving,
-              permittedOutputRate == 1, !paused, !terminal,
-              mediaAdmissionOpen, hasOpenedReadinessForCurrentMedia,
-              readiness?.isOpen == true, anchorPreparationTransaction == nil,
-              audio.isOutputRouteReadyForSharedAnchor else {
-            resetAudioSupplyClockAdjustmentIsolated()
-            return
-        }
-        let now = audioSupplyTimeProvider()
-        guard now.isFinite,
-              audioSupplyLastObservationAt.map({ now - $0 >= 1 }) ?? true else { return }
-        audioSupplyLastObservationAt = now
+              permittedOutputRate > 0,
+              !paused,
+              !terminal,
+              mediaAdmissionOpen,
+              hasOpenedReadinessForCurrentMedia,
+              let readiness,
+              readiness.isOpen,
+              anchorPreparationTransaction == nil,
+              audio.isOutputRouteReadyForSharedAnchor,
+              audioSupplyHold == nil else { return }
         guard let coverage = observer.acceptedCoverage,
-              coverage.generation == generationController.current else {
-            // 同一授权期间的系统清空只撤销观察窗口，不反复改变非零速率。
-            audioSupplyCoverageIdentity = nil
-            audioSupplyClockPolicy.reset(keepingMultiplier: audioSupplyClockMultiplier)
-            return
-        }
-        let identity = AudioSupplyCoverageIdentity(coverage)
-        if audioSupplyCoverageIdentity != identity {
-            audioSupplyCoverageIdentity = identity
-            audioSupplyClockPolicy.reset(keepingMultiplier: audioSupplyClockMultiplier)
-        }
-        let clockTime = clock.currentTime
-        guard clockTime.isNumeric,
-              coverage.firstPTS.isNumeric, coverage.endPTS.isNumeric,
-              CMTimeCompare(clockTime, coverage.firstPTS) >= 0 else { return }
-        let targetLead = CMTimeAdd(audio.anchorLeadTime, CMTime(value: 1, timescale: 10))
-        guard let multiplier = audioSupplyClockPolicy.observe(
-            acceptedEnd: coverage.endPTS,
-            clockTime: clockTime,
-            monotonicTime: now,
-            targetLead: targetLead
+              coverage.generation == generationController.current else { return }
+        let lead = CMTimeSubtract(coverage.endPTS, clock.currentTime)
+        guard let duration = PlaybackAudioSupplyHoldPolicy.holdDuration(
+            lead: lead,
+            outputLatency: audio.outputLatency,
+            anchorLeadTime: audio.anchorLeadTime
         ) else { return }
-        audioSupplyClockMultiplier = multiplier
-        // 观察和调节不发行播放权限，只能沿既有 rate owner 使用仍有效的授权。
-        applyPermittedOutputRateIsolated()
+#if DEBUG
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastAudioSupplyDiagnosticLogUptime.map({ now - $0 >= 1 }) ?? true {
+            lastAudioSupplyDiagnosticLogUptime = now
+            let leadMs = Int((lead.seconds * 1_000).rounded())
+            let holdMs = Int((duration.seconds * 1_000).rounded())
+            Self.logger.debug("audio supply hold: lead=\(leadMs)ms duration=\(holdMs)ms")
+        }
+#endif
+        nextAudioSupplyHoldToken &+= 1
+        let token = nextAudioSupplyHoldToken
+        let hold = AudioSupplyHold(token: token, readinessCycleID: readiness.cycleID)
+        audioSupplyHold = hold
+        clock.pause()
+        audioSupplyHoldScheduler(.nanoseconds(Int(duration.seconds * 1e9))) { [weak self] in
+            guard let self else { return }
+            guard self.audioSupplyHold == hold else { return }
+            guard self.readiness?.cycleID == hold.readinessCycleID,
+                  self.readiness?.isOpen == true else {
+                self.audioSupplyHold = nil
+                return
+            }
+            self.audioSupplyHold = nil
+            self.applyPermittedOutputRateIsolated()
+        }
     }
 
     private func setPausedIsolated(_ shouldPause: Bool, readinessCycle: UInt64) {
@@ -2600,7 +2610,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         self.readinessCycle = readinessCycle
         paused = shouldPause
         if shouldPause {
-            resetAudioSupplyClockAdjustmentIsolated()
+            audioSupplyHold = nil
             invalidateVideoDecodeStallWatchdogIsolated()
             permittedOutputRate = 0
             outputRateInvocation = nil
@@ -2673,7 +2683,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
 
     private func updateReadinessIsolated() {
         assertIsolated()
-        defer { updateAudioSupplyClockIsolated() }
+        defer { updateAudioSupplyHoldIsolated() }
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         readiness.setAnchorLeadTime(audio.anchorLeadTime)
         guard audio.isOutputRouteReadyForSharedAnchor else {
@@ -2946,7 +2956,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         guard synchronizeAudioRecoveryFloorIsolated(
             readiness.minimumRecoveryAnchorPTS
         ) else { return }
-        if !readyPublished || audioSupplyReadinessCycle != readiness.cycleID {
+        if !readyPublished || sharedTimelineRateCycle != readiness.cycleID {
             setSharedTimelineOpenedIsolated(true)
             applyPermittedOutputRateIsolated()
         }
@@ -3423,7 +3433,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         normalStopInProgress = true
         permittedOutputRate = 0
         outputRateInvocation = nil
-        resetAudioSupplyClockAdjustmentIsolated()
+        audioSupplyHold = nil
         normalStopPublishes = publish
         if let completion { stopCompletions.append(completion) }
         finishModeSwitchSignpostIsolated()
@@ -3555,9 +3565,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private func setSharedTimelineOpenedIsolated(_ opened: Bool) {
         assertIsolated()
         let cycle = opened ? readiness?.cycleID : nil
-        if !opened || audioSupplyReadinessCycle != cycle {
-            resetAudioSupplyClockAdjustmentIsolated()
-            audioSupplyReadinessCycle = cycle
+        if !opened || sharedTimelineRateCycle != cycle {
+            audioSupplyHold = nil
+            sharedTimelineRateCycle = cycle
         }
         hasOpenedReadinessForCurrentMedia = opened
         resetInterlacedStartupPrerollIsolated()

@@ -123,127 +123,29 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(authorized.2, 1)
     }
 
-    func test稳态微调每次使用最新媒体和host映射而不复用起播锚点() {
+    func testSteadyStatePauseAndResumeNeverReanchorsTheSynchronizer() {
+        // 补余量暂停只能是“非零→0→同一非零速率”；重新提交时间映射会移动 timebase，
+        // 系统 audio renderer 可能因此自动清空队列。
         let synchronizer = AVSampleBufferRenderSynchronizer()
-        var media = CMTime(value: 9, timescale: 1)
-        var host = CMTime(value: 99, timescale: 1)
-        var anchors: [(media: CMTime, host: CMTime, rate: Float)] = []
+        var anchors: [(CMTime, CMTime, Float)] = []
+        var pauses = 0
         let clock = RenderSynchronizerClock(
             synchronizer: synchronizer,
-            currentTime: { media },
-            pause: {},
-            anchor: { anchors.append(($0, $1, $2)) },
-            hostTime: { host },
-            rateMapping: { .init(media: media, host: host) }
+            currentTime: { .zero },
+            pause: { pauses += 1 },
+            anchor: { anchors.append(($0, $1, $2)) }
         )
-        // 首次仍消费真实pending future start；其媒体/host映射不能被稳态调节复用。
-        clock.anchor(mediaTime: CMTime(value: 10, timescale: 1),
-                     atHostTime: CMTime(value: 100, timescale: 1), rate: 0)
+        clock.anchor(mediaTime: .zero, atHostTime: .zero, rate: 0)
         clock.setRate(1)
-        XCTAssertEqual(anchors.map(\.media), [CMTime(value: 10, timescale: 1), CMTime(value: 10, timescale: 1)])
-        XCTAssertEqual(anchors.map(\.host), [CMTime(value: 100, timescale: 1), CMTime(value: 100, timescale: 1)])
-        XCTAssertEqual(anchors.map(\.rate), [0, 1])
+        XCTAssertEqual(anchors.count, 2)
 
-        media = CMTime(value: 20, timescale: 1)
-        host = CMTime(value: 110, timescale: 1)
-        clock.setRate(0.999)
-        media = CMTime(value: 24_995, timescale: 1_000)
-        host = CMTime(value: 115, timescale: 1)
-        clock.setRate(1.001)
-        // 每次注入新的系统一致映射，不允许复用上一轮或起播映射。
-        media = CMTime(value: 30_007, timescale: 1_000)
-        host = CMTime(value: 120, timescale: 1)
+        clock.pause()
+        clock.setRate(1)
         clock.setRate(1)
 
-        let steadyChanges = Array(anchors.dropFirst(2))
-        XCTAssertEqual(steadyChanges.count, 3)
-        XCTAssertEqual(steadyChanges.map(\.media), [
-            CMTime(value: 20, timescale: 1),
-            CMTime(value: 24_995, timescale: 1_000),
-            CMTime(value: 30_007, timescale: 1_000)
-        ])
-        XCTAssertEqual(steadyChanges.map(\.host), [
-            CMTime(value: 110, timescale: 1),
-            CMTime(value: 115, timescale: 1),
-            CMTime(value: 120, timescale: 1)
-        ])
-        XCTAssertEqual(steadyChanges.map(\.rate), [0.999, 1.001, 1])
-        clock.setRate(1)
-        clock.setRate(2)
-        clock.setRate(1)
-        XCTAssertEqual(anchors.count, 5,
-                       "相同速率和非micro速率转换保留原路径，不重复建立稳态映射")
-        // 这里只验证SDK调用参数，不证明真实时钟没有相位缺口或声学停顿。
-    }
-
-    func test暂停或归零撤销稳态微调使下一次正速率沿原启动路径() {
-        for useZeroRate in [false, true] {
-            let synchronizer = AVSampleBufferRenderSynchronizer()
-            var media = CMTime(value: 9, timescale: 1)
-            var host = CMTime(value: 99, timescale: 1)
-            var anchors: [(CMTime, CMTime, Float)] = []
-            let clock = RenderSynchronizerClock(
-                synchronizer: synchronizer,
-                currentTime: { media },
-                pause: {},
-                anchor: { anchors.append(($0, $1, $2)) },
-                hostTime: { host },
-                rateMapping: { .init(media: media, host: host) }
-            )
-            clock.anchor(mediaTime: CMTime(value: 10, timescale: 1),
-                         atHostTime: CMTime(value: 100, timescale: 1), rate: 0)
-            clock.setRate(1)
-            media = CMTime(value: 20, timescale: 1)
-            host = CMTime(value: 110, timescale: 1)
-            clock.setRate(0.999)
-            XCTAssertEqual(anchors.count, 3, "取消前必须真正进入稳态micro映射路径")
-            let countBeforeCancellation = anchors.count
-            if useZeroRate {
-                clock.setRate(0)
-            } else {
-                clock.pause()
-            }
-            media = CMTime(value: 30, timescale: 1)
-            host = CMTime(value: 120, timescale: 1)
-            clock.setRate(1)
-            XCTAssertEqual(anchors.count, countBeforeCancellation,
-                           "0→1不能沿用暂停前的requestedRate或稳态映射")
-            synchronizer.rate = 0
-        }
-    }
-
-    func test一致映射以实际旧倍率投影当前时刻包括读取期间的推进() throws {
-        // 旧锚点可以很早；50ms 虚拟抢占发生后，应只投影一次这段时间。
-        let mapping = try XCTUnwrap(RenderSynchronizerClock.hostMapping(
-            relativeRate: 0.9997,
-            mediaAnchor: CMTime(value: 10, timescale: 1),
-            hostAnchor: CMTime(value: 100, timescale: 1),
-            currentHost: CMTime(value: 1_300_050, timescale: 1_000)
-        ))
-        XCTAssertEqual(mapping.host, CMTime(value: 1_300_050, timescale: 1_000))
-        XCTAssertEqual(mapping.media.seconds, 10 + 1_200.05 * 0.9997, accuracy: 0.000001,
-                       "投影使用实际旧倍率；新倍率不能重算旧锚点以来的历史")
-    }
-
-    func test一致映射拒绝无效倍率时间和负媒体位置() {
-        for rate in [0, -1, Double.nan, .infinity] {
-            XCTAssertNil(RenderSynchronizerClock.hostMapping(
-                relativeRate: rate, mediaAnchor: .zero, hostAnchor: .zero, currentHost: .zero))
-        }
-        for invalid in [CMTime.invalid, .indefinite, .positiveInfinity] {
-            XCTAssertNil(RenderSynchronizerClock.hostMapping(
-                relativeRate: 1, mediaAnchor: invalid, hostAnchor: .zero, currentHost: .zero))
-            XCTAssertNil(RenderSynchronizerClock.hostMapping(
-                relativeRate: 1, mediaAnchor: .zero, hostAnchor: invalid, currentHost: .zero))
-            XCTAssertNil(RenderSynchronizerClock.hostMapping(
-                relativeRate: 1, mediaAnchor: .zero, hostAnchor: .zero, currentHost: invalid))
-        }
-        XCTAssertNil(RenderSynchronizerClock.hostMapping(
-            relativeRate: 1, mediaAnchor: .zero, hostAnchor: CMTime(value: 10, timescale: 1),
-            currentHost: CMTime(value: 9, timescale: 1)))
-        XCTAssertNil(RenderSynchronizerClock.hostMapping(
-            relativeRate: 1, mediaAnchor: CMTime(value: 10, timescale: 1), hostAnchor: .zero,
-            currentHost: CMTime(value: -1, timescale: 1)))
+        XCTAssertEqual(pauses, 1)
+        XCTAssertEqual(anchors.count, 2, "稳态暂停后的恢复不能重新锚定同步器")
+        synchronizer.rate = 0
     }
 
     func testPublicReadinessInitializerAcceptsOriginalVoidPrepareAnchorClosure() {
@@ -815,192 +717,5 @@ private final class FakePlaybackClock: PlaybackClock {
 
     func setRate(_ rate: Float) {
         // Mock setRate
-    }
-}
-
-final class PlaybackAudioSupplyClockPolicyTests: XCTestCase {
-    func testSlowProducerKeepsAcceptedAudioAheadOfHardwareClockForTwentyMinutes() {
-        var policy = PlaybackAudioSupplyClockPolicy()
-        let result = simulate(
-            SupplyScenario(duration: 1_200, producerPPM: -180),
-            policy: &policy
-        )
-
-        // 取消全部倍率决策时，虚拟播放末段的批首余量约为 -134ms。
-        XCTAssertGreaterThan(result.minimumLead, 0.1,
-                             "每次成功接受音频仍必须保住下一批到达前的连续覆盖")
-        XCTAssertLessThan(result.maximumLead, 0.65,
-                          "补偿应维持有界余量，不能持续以最大减速积累直播延迟")
-        assertBoundedDecisions(result, duration: 1_200)
-    }
-
-    func testSlowerProducerKeepsAcceptedAudioAheadOfHardwareClockForThirtyMinutes() {
-        var policy = PlaybackAudioSupplyClockPolicy()
-        let result = simulate(
-            SupplyScenario(duration: 1_800, producerPPM: -300),
-            policy: &policy
-        )
-
-        // 取消全部倍率决策时，虚拟播放末段的批首余量约为 -494ms。
-        XCTAssertGreaterThan(result.minimumLead, 0.1,
-                             "数百 ppm 的输入偏差不能在长播放中耗尽音频覆盖")
-        XCTAssertLessThan(result.maximumLead, 0.65)
-        assertBoundedDecisions(result, duration: 1_800)
-    }
-
-    func testStableSupplyWithJitterAndSegmentBurstDoesNotChaseEveryAccessUnit() {
-        var policy = PlaybackAudioSupplyClockPolicy()
-        var scenario = SupplyScenario(duration: 1_200, producerPPM: 0)
-        scenario.hardwarePPM = 0
-        scenario.jitterAmplitude = 0.012
-        scenario.segmentBurst = 120..<125
-        let result = simulate(scenario, policy: &policy)
-
-        XCTAssertGreaterThan(result.minimumLead, 0.1)
-        XCTAssertGreaterThan(result.finalLead, 0.15)
-        XCTAssertLessThan(result.finalLead, 0.45,
-                          "五秒突发之后应恢复正常余量，不能误认为永久输入加速")
-        assertBoundedDecisions(result, duration: 1_200)
-    }
-
-    func testResetDiscardsPreviousTimelinePhaseBeforeNewSupplyObservations() {
-        var reusedPolicy = PlaybackAudioSupplyClockPolicy()
-        _ = simulate(
-            SupplyScenario(duration: 1_200, producerPPM: -300),
-            policy: &reusedPolicy
-        )
-        reusedPolicy.reset()
-
-        var nextScenario = SupplyScenario(duration: 600, producerPPM: 0)
-        nextScenario.hardwarePPM = 0
-        nextScenario.mediaOrigin = 7
-        nextScenario.monotonicOrigin = 5_000
-        let afterReset = simulate(nextScenario, policy: &reusedPolicy)
-        var freshPolicy = PlaybackAudioSupplyClockPolicy()
-        let fresh = simulate(nextScenario, policy: &freshPolicy)
-
-        XCTAssertEqual(afterReset.minimumLead, fresh.minimumLead, accuracy: 0.000_001)
-        XCTAssertEqual(afterReset.finalLead, fresh.finalLead, accuracy: 0.000_001)
-        XCTAssertEqual(afterReset.decisions.count, fresh.decisions.count,
-                       "重置后的新时间线必须与全新策略具有相同的实际调速行为")
-        for (reused, new) in zip(afterReset.decisions, fresh.decisions) {
-            XCTAssertEqual(reused.elapsed, new.elapsed, accuracy: 0.000_001)
-            XCTAssertEqual(reused.multiplier, new.multiplier, accuracy: 0.000_001)
-        }
-    }
-
-    private struct SupplyScenario {
-        let duration: TimeInterval
-        let producerPPM: Double
-        var hardwarePPM: Double = 60
-        var initialLead: TimeInterval = 0.25
-        var targetLead: TimeInterval = 0.3
-        var mediaOrigin: TimeInterval = 20_000
-        var monotonicOrigin: TimeInterval = 1_000
-        var jitterAmplitude: TimeInterval = 0
-        var segmentBurst: Range<TimeInterval>?
-    }
-
-    private struct RateDecision {
-        let elapsed: TimeInterval
-        let multiplier: Float
-    }
-
-    private struct SupplyResult {
-        var minimumLead: TimeInterval
-        var maximumLead: TimeInterval
-        var finalLead: TimeInterval
-        var decisions: [RateDecision] = []
-    }
-
-    private func simulate(
-        _ scenario: SupplyScenario,
-        policy: inout PlaybackAudioSupplyClockPolicy
-    ) -> SupplyResult {
-        // 只替代真实等待及硬件时钟；倍率决策始终来自生产策略。
-        // 每批三个相邻 32ms AU，共享相同交付时刻，保留真实输入的批次锯齿。
-        let frameDuration = 0.032
-        let batchDuration = 0.096
-        let producerGain = 1 + scenario.producerPPM / 1_000_000
-        let hardwareGain = 1 + scenario.hardwarePPM / 1_000_000
-        let batchCount = Int(scenario.duration * producerGain / batchDuration)
-        let jitterPattern: [Double] = [-1, -0.5, 0, 0.5, 1, 0.5, 0, -0.5]
-        var acceptedEnd = scenario.mediaOrigin + scenario.initialLead
-        var clockTime = scenario.mediaOrigin
-        var elapsed: TimeInterval = 0
-        var multiplier: Float = 1
-        var result = SupplyResult(
-            minimumLead: scenario.initialLead,
-            maximumLead: scenario.initialLead,
-            finalLead: scenario.initialLead
-        )
-
-        func acceptDecision(_ decision: Float?, at observationTime: TimeInterval) {
-            guard let decision else { return }
-            multiplier = decision
-            result.decisions.append(RateDecision(elapsed: observationTime,
-                                                 multiplier: decision))
-        }
-
-        acceptDecision(policy.observe(
-            acceptedEnd: mediaTime(acceptedEnd),
-            clockTime: mediaTime(clockTime),
-            monotonicTime: scenario.monotonicOrigin,
-            targetLead: mediaTime(scenario.targetLead)
-        ), at: 0)
-
-        for batch in 1...batchCount {
-            let scheduledArrival = Double(batch) * batchDuration / producerGain
-            var arrival = scheduledArrival
-                + jitterPattern[batch % jitterPattern.count] * scenario.jitterAmplitude
-            if let burst = scenario.segmentBurst, burst.contains(scheduledArrival) {
-                // 将这一段媒体提前成一个 HLS 突发，之后等待正常输入继续。
-                arrival = burst.lowerBound
-            }
-            arrival = max(elapsed, arrival)
-            clockTime += (arrival - elapsed) * hardwareGain * Double(multiplier)
-            elapsed = arrival
-
-            // 检查旧覆盖在下一批到达前是否耗尽，而非仅检查新入队后的余量。
-            result.minimumLead = min(result.minimumLead, acceptedEnd - clockTime)
-            for _ in 0..<3 {
-                acceptedEnd += frameDuration
-                acceptDecision(policy.observe(
-                    acceptedEnd: mediaTime(acceptedEnd),
-                    clockTime: mediaTime(clockTime),
-                    monotonicTime: scenario.monotonicOrigin + elapsed,
-                    targetLead: mediaTime(scenario.targetLead)
-                ), at: elapsed)
-            }
-            result.maximumLead = max(result.maximumLead, acceptedEnd - clockTime)
-        }
-        result.finalLead = acceptedEnd - clockTime
-        return result
-    }
-
-    private func assertBoundedDecisions(
-        _ result: SupplyResult,
-        duration: TimeInterval,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        for decision in result.decisions {
-            XCTAssertTrue(decision.multiplier.isFinite, file: file, line: line)
-            XCTAssertGreaterThanOrEqual(decision.multiplier, 0.998 - 0.000_001,
-                                       file: file, line: line)
-            XCTAssertLessThanOrEqual(decision.multiplier, 1.002 + 0.000_001,
-                                    file: file, line: line)
-        }
-        // 不能把每个 AU 或交付抖动直接转换成调速；也计入重复返回的倍率。
-        XCTAssertLessThanOrEqual(result.decisions.count, Int(duration / 2) + 4,
-                                "调速决策不应持续追随每个交付批次", file: file, line: line)
-        for (previous, current) in zip(result.decisions, result.decisions.dropFirst()) {
-            XCTAssertGreaterThanOrEqual(current.elapsed - previous.elapsed, 0.95,
-                                        "同批 AU 不能连续触发调速", file: file, line: line)
-        }
-    }
-
-    private func mediaTime(_ seconds: TimeInterval) -> CMTime {
-        CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
     }
 }
