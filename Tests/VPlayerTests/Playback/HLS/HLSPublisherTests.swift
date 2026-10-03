@@ -1413,6 +1413,14 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
     weak var relay: SegmentReportRelay?
     private let lock = NSCondition()
     private var objects: [SealedMediaObject] = []
+    private var objectsRetired = false
+    static let objectDeliveryTimeout: TimeInterval = 10
+    var collectedObjectCounts: (initialization: Int, media: Int) {
+        lock.withLock {
+            (objects.filter { $0.kind == .initialization }.count,
+             objects.filter { $0.kind == .media }.count)
+        }
+    }
     private var sequence: UInt64 = 0
     private var formalAACIdentity: AACEncoderIdentity?
     private let retainAACEndpointInputs: Bool
@@ -1451,14 +1459,31 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
             formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
     }
     func releaseEndpointInputs() { lock.withLock { endpointInputs.removeAll() } }
-    func collect(_ object: SealedMediaObject) { lock.withLock { objects.append(object); lock.broadcast() } }
+    func collect(_ object: SealedMediaObject) {
+        let release = lock.withLock { () -> Bool in
+            guard !objectsRetired else { return true }
+            objects.append(object)
+            lock.broadcast()
+            return false
+        }
+        if release { XCTAssertTrue(relay?.releaseForControl(object) == true) }
+    }
+    func retireCollectedObjects() {
+        let retired = lock.withLock { () -> [SealedMediaObject] in
+            objectsRetired = true
+            defer { objects.removeAll(keepingCapacity: false) }
+            return objects
+        }
+        for object in retired { XCTAssertTrue(relay?.releaseForControl(object) == true) }
+    }
     func take(_ kind: SealedMediaObjectKind) -> SealedMediaObject? {
         lock.withLock {
             guard let index = objects.firstIndex(where: { $0.kind == kind }) else { return nil }
             return objects.remove(at: index)
         }
     }
-    func waitAndTake(_ kind: SealedMediaObjectKind, timeout: TimeInterval = 10) -> SealedMediaObject? {
+    func waitAndTake(_ kind: SealedMediaObjectKind,
+                     timeout: TimeInterval = Task19SystemSink.objectDeliveryTimeout) -> SealedMediaObject? {
         lock.lock()
         let deadline = Date().addingTimeInterval(timeout)
         while !objects.contains(where: { $0.kind == kind }) {

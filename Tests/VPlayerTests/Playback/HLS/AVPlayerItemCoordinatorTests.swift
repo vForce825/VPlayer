@@ -5526,6 +5526,84 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testPendingPrefixWaitsForAllRealPublicationsWithoutFinishingWriter() async throws {
+        let gate = Task21PrefixPublicationGate()
+        defer { gate.release() }
+        let pending = try await Task21RealAACSeed.makePending(publicationGate: gate)
+        do {
+            let completed = FinalLockedFlag()
+            let waiting = FinalLockedFlag()
+            let readiness = Task {
+                defer { completed.set() }
+                try await pending.awaitMaterializedPrefix(onPending: waiting.set)
+            }
+            defer { readiness.cancel() }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while (!gate.isHolding || !waiting.value), ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertTrue(gate.isHolding)
+            XCTAssertTrue(waiting.value, "The original readiness operation must have reached its pending state")
+            XCTAssertEqual(pending.sink.collectedObjectCounts.media, 5)
+            XCTAssertNil(pending.writer.terminalReceipt)
+            XCTAssertFalse(completed.value,
+                           "An appended epoch must still wait for its held sixth real publication")
+            gate.release()
+            try await readiness.value
+            let prefix = pending.sink.collectedObjectCounts
+            XCTAssertEqual(prefix.initialization, 1)
+            XCTAssertGreaterThanOrEqual(prefix.media, 6)
+            XCTAssertEqual(prefix.media, pending.relay.usage.unpublishedLogicalSegmentCount)
+            XCTAssertEqual(pending.writer.usage.pendingCallbackCount, 0)
+            XCTAssertNil(pending.writer.terminalReceipt,
+                         "Prefix readiness must not manufacture writer EOS")
+            let terminal = try await pending.writer.finish()
+            XCTAssertEqual(terminal.terminalReason, .finished)
+            XCTAssertEqual(pending.sink.collectedObjectCounts.media, prefix.media + 1,
+                           "Only the real terminal tail may arrive after prefix readiness")
+            await pending.retireUnpublishedSeed()
+            XCTAssertEqual(pending.relay.usage.sealedObjectByteCount, 0)
+        } catch {
+            gate.release()
+            await pending.retireUnpublishedSeed()
+            throw error
+        }
+    }
+
+    func testPendingPrefixCancellationRetiresOriginalWriterAndLatePublications() async throws {
+        let gate = Task21PrefixPublicationGate()
+        defer { gate.release() }
+        let pending = try await Task21RealAACSeed.makePending(publicationGate: gate)
+        let waiting = FinalLockedFlag()
+        let completed = FinalLockedFlag()
+        let readiness = Task {
+            defer { completed.set() }
+            try await pending.awaitMaterializedPrefix(onPending: waiting.set)
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (!gate.isHolding || !waiting.value), ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertTrue(gate.isHolding)
+        XCTAssertTrue(waiting.value)
+        XCTAssertEqual(pending.sink.collectedObjectCounts.media, 5)
+        readiness.cancel()
+        let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while pending.writer.terminalReceipt == nil, ContinuousClock.now < cancellationDeadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(pending.writer.terminalReceipt?.terminalReason, .cancelled,
+                       "Cancellation must promptly retire the original native writer")
+        XCTAssertFalse(completed.value,
+                       "The caller must still own the held publication tail until its actual release")
+        gate.release()
+        do { try await readiness.value; XCTFail("Canceled prefix readiness must retain cancellation") }
+        catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        XCTAssertEqual(pending.writer.terminalReceipt?.terminalReason, .cancelled)
+        XCTAssertEqual(pending.writer.usage.pendingCallbackCount, 0)
+        XCTAssertEqual(pending.relay.usage.reservedSlots, 0)
+        XCTAssertEqual(pending.relay.usage.publicationCapabilityCount, 0)
+        XCTAssertEqual(pending.relay.usage.sealedObjectByteCount, 0)
+        XCTAssertEqual(pending.sink.collectedObjectCounts.initialization, 0)
+        XCTAssertEqual(pending.sink.collectedObjectCounts.media, 0)
+    }
+
     func testStorageDriverCancellationRetiresMappingBeforeSlotReuseAndRejectsOldRetry() async throws {
         let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch:
             AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 23_276), itemGeneration: 19)
@@ -10653,7 +10731,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
     fileprivate static func makePending(
         itemGeneration: UInt64 = 19,
         outputLifecycleEpoch: OutputLifecycleEpoch? = nil,
-        layoutLabels: [RenditionChannelLabel] = [.l, .r]
+        layoutLabels: [RenditionChannelLabel] = [.l, .r],
+        publicationGate: Task21PrefixPublicationGate? = nil
     ) async throws
         -> Task21PendingAACSeed {
         let input = try await makeEncodedInput(layoutLabels: layoutLabels)
@@ -10699,7 +10778,10 @@ final class Task21RealAACSeed: @unchecked Sendable {
             firstEffectiveStart: effectiveStart)
         let sink = Task19SystemSink(binding: binding)
         let relay = SegmentReportRelay(binding: binding, limits: .audio,
-            capacity: 8, objectSink: sink.collect)
+            capacity: 8, objectSink: { object in
+                publicationGate?.beforeDelivery(object)
+                sink.collect(object)
+            })
         sink.relay = relay
         let writer = try SegmentedFMP4Writer(binding: binding, trackKind: .aac,
             sourceFormatHint: format, boundarySession: boundary.session,
@@ -10974,6 +11056,28 @@ private final class Task21AACEncodedTemplate: @unchecked Sendable {
     }
 }
 
+/// Test-only ordering gate on the original publication queue, after five real
+/// media objects. Native append/callback production remains free to complete.
+private final class Task21PrefixPublicationGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var mediaCount = 0
+    private var holding = false
+    private var released = false
+    var isHolding: Bool { condition.withLock { holding } }
+    func beforeDelivery(_ object: SealedMediaObject) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard object.kind == .media else { return }
+        mediaCount += 1
+        guard mediaCount == 6 else { return }
+        holding = true
+        while !released { condition.wait() }
+    }
+    func release() {
+        condition.withLock { released = true; condition.broadcast() }
+    }
+}
+
 private final class Task21PendingAACSeed: @unchecked Sendable {
     let writer: SegmentedFMP4Writer
     let sink: Task19SystemSink
@@ -10991,6 +11095,57 @@ private final class Task21PendingAACSeed: @unchecked Sendable {
         self.epoch = epoch
         self.encodedBuffers = encodedBuffers
         self.streamSummary = streamSummary
+    }
+
+    func awaitMaterializedPrefix(onPending: (@Sendable () -> Void)? = nil) async throws {
+        let deadline = ContinuousClock.now.advanced(
+            by: .seconds(Task19SystemSink.objectDeliveryTimeout))
+        do {
+            while true {
+                try Task.checkCancellation()
+                if let terminal = writer.terminalReceipt {
+                    switch terminal.terminalReason {
+                    case .cancelled: throw CancellationError()
+                    case .failed: throw SegmentedFMP4WriterFailure.systemFailure
+                    case .finished: throw SegmentedFMP4WriterFailure.illegalState
+                    }
+                }
+                let callbacks = writer.usage.pendingCallbackCount
+                let published = relay.usage.unpublishedLogicalSegmentCount
+                let collected = sink.collectedObjectCounts
+                if callbacks == 0, collected.initialization == 1,
+                   collected.media >= 6, collected.media == published {
+                    try Task.checkCancellation()
+                    guard writer.terminalReceipt == nil else { continue }
+                    return
+                }
+                guard ContinuousClock.now < deadline else {
+                    print("PENDING_PREFIX_FAILURE pendingCallbacks=\(callbacks) published=\(published) "
+                        + "initialization=\(collected.initialization) media=\(collected.media)")
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                onPending?()
+                await Task.yield()
+            }
+        } catch {
+            let firstFailure = error
+            await retireUnpublishedSeed()
+            throw firstFailure
+        }
+    }
+
+    func retireUnpublishedSeed() async {
+        _ = await writer.cancelAwaitingCompletion()
+        sink.retireCollectedObjects()
+        // Cancellation joins native input/cleanup, not the separate publication
+        // queue. Keep this original relay alive while late sink deliveries release
+        // their exact objects; the caller cannot abandon those transfers.
+        while relay.usage.sealedObjectByteCount != 0 {
+            await Task.yield()
+        }
+        XCTAssertEqual(writer.usage.pendingCallbackCount, 0)
+        XCTAssertEqual(relay.usage.reservedSlots, 0)
+        XCTAssertEqual(relay.usage.publicationCapabilityCount, 0)
     }
 
     var terminalBinding: AACWriterTerminalBinding {
@@ -11082,6 +11237,7 @@ private final class FinalWriterTerminalHTTPFixture: @unchecked Sendable {
     static func start(pending: Task21PendingAACSeed,
                       item: AVPlayerItemInstanceIdentity) async throws
         -> FinalWriterTerminalHTTPFixture {
+        try await pending.awaitMaterializedPrefix()
         let box = FinalLockedValue<FinalWriterTerminalPublicationHarness>()
         let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 19, now: { 0 }, logger: { _ in },
@@ -11114,6 +11270,7 @@ private final class FinalWriterTerminalHTTPFixture: @unchecked Sendable {
     static func startPrefix(pending: Task21PendingAACSeed,
                             item: AVPlayerItemInstanceIdentity) async throws
         -> FinalWriterTerminalHTTPFixture {
+        try await pending.awaitMaterializedPrefix()
         let box = FinalLockedValue<FinalWriterTerminalPublicationHarness>()
         let server = try await LoopbackHTTPSessionFactory().start(
             itemGeneration: 19, now: { 0 }, logger: { _ in },
