@@ -136,6 +136,12 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
                 // App deactivation is settled exclusively by its original async call permit.
                 break
             case .becameInactive(systemInitiated: true):
+                // The typed stream has no shared episode identity with legacy notifications.
+                // A late inactive cannot restart an ended episode whose manual veto remains;
+                // a new legacy began or explicit user resume must first supersede that decision.
+                if current.interruptionState == .ended(shouldResume: false), current.interruptionVeto {
+                    break
+                }
                 if current.interruptionState == .began {
                     if typedInterruption?.epoch != epoch {
                         typedInterruption = .init(epoch: epoch, recommendation: nil)

@@ -785,18 +785,57 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     private func withConnectedPlayerLifecycleHarness(
+        prepareMutation: Task21PrepareMutation = .none,
         _ body: @MainActor (Task21Harness) async throws -> Void
     ) async throws {
-        let harness = try await Task21Harness()
+        let harness = try await Task21Harness(prepareMutation: prepareMutation)
         var operationError: (any Error)?
         do { try await body(harness) }
         catch { operationError = error }
         harness.driver.holdAudioConnectionCompletion = false
         harness.driver.releaseAudioConnection()
-        do { try await harness.shutdown() }
+        do { try await harness.shutdownAndRetireTransport() }
         catch {
             if let operationError {
                 XCTFail("Lifecycle cleanup also failed after the primary failure: \(error)")
+                throw operationError
+            }
+            throw error
+        }
+        if let operationError { throw operationError }
+    }
+
+    /// Keep the original failed stop and its honest unconfirmed retirement
+    /// through cleanup, then release this fixture before another subcase starts.
+    private func withOwnedStopFailureHarness(
+        _ body: @MainActor (Task21Harness) async throws -> Void
+    ) async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let owner: Task21OwnedTestHarness
+        var operationError: (any Error)?
+        do {
+            let harness = try await Task21Harness()
+            owner = Task21OwnedTestHarness(harness, resourceBaseline: baseline)
+            do { try await body(harness) }
+            catch { operationError = error }
+            do {
+                if harness.backend.lastSuspendInvocation != nil,
+                   harness.backend.lastError != nil,
+                   harness.backend.quiescenceReceipt == nil {
+                    try await owner.tearDownFailedTransport()
+                }
+            } catch {
+                if let operationError {
+                    XCTFail("Failed-stop transport cleanup also failed: \(error)")
+                    throw operationError
+                }
+                throw error
+            }
+        }
+        do { try await owner.tearDown() }
+        catch {
+            if let operationError {
+                XCTFail("Failed-stop owner cleanup also failed: \(error)")
                 throw operationError
             }
             throw error
@@ -823,31 +862,52 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testTVOS27DisconnectCallbackWithoutDisconnectedStateCannotSignReceipt() async throws {
-        let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        _ = try await harness.activate()
-        harness.driver.ignoreDisconnectStateChange = true
-        await XCTAssertThrowsErrorAsync(try await harness.stop())
-        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
-        XCTAssertFalse(harness.driver.systemAudioDisconnected)
+        try await withOwnedStopFailureHarness { harness in
+            _ = try await harness.prepare()
+            _ = try await harness.activate()
+            harness.driver.ignoreDisconnectStateChange = true
+            let stopping = Task { try await harness.stop() }
+            defer { harness.backend.allowRetirementCompletion(); stopping.cancel() }
+            let retiring = await harness.backend.waitForRetirementCall(timeout: .seconds(2))
+            XCTAssertTrue(retiring, "The failed physical disconnect must enter its original retirement")
+            XCTAssertEqual(harness.backend.lastError as? AVPlayerItemCoordinatorFailure,
+                           .systemAudioConnectionNotConfirmed)
+            harness.backend.allowRetirementCompletion()
+            await XCTAssertThrowsErrorAsync(try await stopping.value)
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNil(harness.backend.lastRetiredEpoch)
+            XCTAssertFalse(harness.driver.systemAudioDisconnected)
+        }
     }
 
     func testTVOS27ReconnectDuringDirectPauseReadCannotSignReceipt() async throws {
-        let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        _ = try await harness.activate()
-        let priorReads = harness.driver.directStateCallCount
-        harness.driver.holdDirectPausedRead = true
-        let stopping = Task { try await harness.stop() }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while harness.driver.directStateCallCount == priorReads,
-              ContinuousClock.now < deadline { await Task.yield() }
-        XCTAssertGreaterThan(harness.driver.directStateCallCount, priorReads)
-        // Simulate a changed physical state at the final async proof boundary.
-        harness.driver.systemAudioDisconnected = false
-        harness.driver.releaseDirectPausedRead(rate: 0, status: .paused)
-        await XCTAssertThrowsErrorAsync(try await stopping.value)
-        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        try await withOwnedStopFailureHarness { harness in
+            _ = try await harness.prepare()
+            _ = try await harness.activate()
+            let priorReads = harness.driver.directStateCallCount
+            harness.driver.holdDirectPausedRead = true
+            let stopping = Task { try await harness.stop() }
+            defer {
+                harness.driver.releaseDirectPausedRead(rate: 0, status: .paused)
+                harness.backend.allowRetirementCompletion()
+                stopping.cancel()
+            }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while harness.driver.directStateCallCount == priorReads,
+                  ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertGreaterThan(harness.driver.directStateCallCount, priorReads)
+            // Simulate a changed physical state at the final async proof boundary.
+            harness.driver.systemAudioDisconnected = false
+            harness.driver.releaseDirectPausedRead(rate: 0, status: .paused)
+            let retiring = await harness.backend.waitForRetirementCall(timeout: .seconds(2))
+            XCTAssertTrue(retiring, "The changed direct pause proof must enter its original retirement")
+            XCTAssertEqual(harness.backend.lastError as? AVPlayerItemCoordinatorFailure,
+                           .directPauseNotConfirmed)
+            harness.backend.allowRetirementCompletion()
+            await XCTAssertThrowsErrorAsync(try await stopping.value)
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNil(harness.backend.lastRetiredEpoch)
+        }
     }
 
     func testTVOS27CancelledResumeReconnectSettlesBeforeStopAndCannotPlayAgain() async throws {
@@ -885,6 +945,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             let graph = try OutputGraphFixture(backendObject: forwarding)
             let fixture = try await Task21HarnessAuthorityFixture.make(
                 lifecycle: graph.lifecycle, audioOnly: false)
+            let transport = Task21LogTransportOwner(fixture: fixture)
             defer { fixture.shutdown() }
             let driver = Task21FakeDriver()
             driver.prepareMutation = .readyTimeout
@@ -900,23 +961,44 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 coordinator: coordinator, bundleBuilder: builder,
                 replacementSlot: forwarding.backendPublicationReplacementAuthoritySlot)
             forwarding.attach(backend)
-            let prepare = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
-            XCTAssertTrue(graph.registry.startOutputPrepareOperation(prepare))
-            _ = await graph.registry.joinOutputBackendOperation(prepare)
-            XCTAssertEqual(backend.outputItemGeneration, fixture.request.item.itemGeneration,
-                "An installed failed item must retain its bundle and coordinator cleanup owner")
-            let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
-            let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
-                reason: .stop, at: graph.registry.clock.nowNanoseconds))
-            let joined = await graph.registry.joinOutputBackendOperations(owner: owner)
-            XCTAssertTrue(joined)
-            let suspend = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
-            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner))
-            _ = await graph.registry.joinOutputBackendOperation(suspend.task)
-            let retired = await backend.retireOutput(epoch: graph.lifecycle)
-            XCTAssertEqual(retired, .confirmedLocalOutputStopped)
-            XCTAssertNil(driver.currentItemIdentity)
-            XCTAssertTrue(driver.systemAudioDisconnected)
+            var operationError: (any Error)?
+            do {
+                let prepare = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+                XCTAssertTrue(graph.registry.startOutputPrepareOperation(prepare))
+                _ = await graph.registry.joinOutputBackendOperation(prepare)
+                XCTAssertEqual(backend.outputItemGeneration, fixture.request.item.itemGeneration,
+                    "An installed failed item must retain its bundle and coordinator cleanup owner")
+            } catch { operationError = error }
+            var cleanupError: (any Error)?
+            do {
+                let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+                let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+                    reason: .stop, at: graph.registry.clock.nowNanoseconds, teardown: true))
+                let receiver = Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+                let started = graph.registry.startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+                    terminalState: .stopped)
+                XCTAssertTrue(started, "A .stop owner must run the original owned terminal cleanup")
+                await graph.registry.joinOwnedTerminalCleanup(session: context.sessionIdentity)
+                try receiver.result()
+                XCTAssertNil(graph.registry.outputResourceContextSnapshot())
+                XCTAssertNil(graph.registry.ownedResourceSnapshot())
+                XCTAssertNil(graph.registry.cleanupReservationSnapshot())
+                XCTAssertNil(driver.currentItemIdentity)
+                XCTAssertTrue(driver.systemAudioDisconnected)
+            } catch { cleanupError = error }
+            do { try await transport.retire() }
+            catch {
+                XCTFail("Failed-preparation transport did not drain: \(error)")
+                throw operationError ?? cleanupError ?? error
+            }
+            if let cleanupError {
+                if let operationError {
+                    XCTFail("Failed-preparation terminal cleanup also failed: \(cleanupError)")
+                    throw operationError
+                }
+                throw cleanupError
+            }
+            if let operationError { throw operationError }
         }
     }
 
@@ -1367,10 +1449,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testSDKFixedSystemLoopbackLoadedReceiptAndItemFailure() async throws {
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        print("SDK_FIXED_NATIVE_STAGE fixture_begin")
         let fixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 24_101), audioOnly: false)
+        print("SDK_FIXED_NATIVE_STAGE fixture_returned")
         defer { fixture.shutdown() }
+        print("SDK_FIXED_NATIVE_STAGE playhead_begin")
         let playhead = try await fixture.makePreparedPlayhead()
+        print("SDK_FIXED_NATIVE_STAGE playhead_returned")
         let item = fixture.request.item
         try driver.install(url: fixture.request.itemURL, identity: item)
         defer { driver.replaceCurrentItemWithNil(item: item) }
@@ -1460,43 +1546,52 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testSDKFixedStopReplaysExactFailureAndMeasuresObjects() async throws {
         for failure in [AVPlayerItemCoordinatorFailure.staleIdentity, .directPauseNotConfirmed, .itemFailed] {
-            let harness = try await Task21Harness()
-            _ = try await harness.prepare()
-            _ = try await harness.activate()
-            harness.driver.directFailure = failure
-            _ = try? await harness.stop()
-            let invocation = try XCTUnwrap(harness.backend.lastSuspendInvocation)
-            let reads = harness.driver.directStateCallCount
-            harness.driver.directFailure = nil
-            for _ in 0..<2 {
-                do { _ = try await harness.coordinator.stop(invocation); XCTFail("必须重放原失败") }
-                catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, failure) }
+            try await withOwnedStopFailureHarness { harness in
+                _ = try await harness.prepare()
+                _ = try await harness.activate()
+                harness.driver.directFailure = failure
+                let stopping = Task { try await harness.stop() }
+                defer { harness.backend.allowRetirementCompletion(); stopping.cancel() }
+                let retiring = await harness.backend.waitForRetirementCall(timeout: .seconds(2))
+                XCTAssertTrue(retiring, "The original \(failure) stop must reach retirement")
+                XCTAssertEqual(harness.backend.lastError as? AVPlayerItemCoordinatorFailure, failure)
+                harness.backend.allowRetirementCompletion()
+                await XCTAssertThrowsErrorAsync(try await stopping.value)
+                XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+                XCTAssertNil(harness.backend.lastRetiredEpoch)
+                let invocation = try XCTUnwrap(harness.backend.lastSuspendInvocation)
+                let reads = harness.driver.directStateCallCount
+                harness.driver.directFailure = nil
+                for _ in 0..<2 {
+                    do { _ = try await harness.coordinator.stop(invocation); XCTFail("必须重放原失败") }
+                    catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, failure) }
+                }
+                XCTAssertEqual(harness.driver.directStateCallCount, reads)
+                let task = OutputPlayerStopTask(item: harness.item,
+                    registryIssuerIdentity: invocation.registryIssuerIdentity,
+                    suspendTicket: invocation.suspendTicket, closeClaim: invocation.closeClaim)
+                task.complete(.failure(failure))
+                task.complete(.failure(.capacityExceeded))
+                do {
+                    _ = try await task.value(registryIssuerIdentity: invocation.registryIssuerIdentity,
+                        suspendTicket: invocation.suspendTicket, closeClaim: invocation.closeClaim)
+                    XCTFail("单次终态不得被第二次完成覆盖")
+                } catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, failure) }
+                do {
+                    _ = try await task.value(registryIssuerIdentity: invocation.registryIssuerIdentity + 1,
+                        suspendTicket: invocation.suspendTicket, closeClaim: invocation.closeClaim)
+                    XCTFail("外来 issuer 不得读取终态")
+                } catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .operationInFlight) }
+                let attachment = XCTAttachment(string:
+                    "stopIdentity=\(ObjectIdentifier(task)), stopMalloc=\(malloc_size(Unmanaged.passUnretained(task).toOpaque())), "
+                    + "driverIdentity=\(ObjectIdentifier(harness.driver)), driverMalloc=\(malloc_size(Unmanaged.passUnretained(harness.driver).toOpaque())), "
+                    + "fixedFailureStride=\(MemoryLayout<AVPlayerItemCoordinatorFailure>.stride), "
+                    + "cResultStride=\(MemoryLayout<VPLoadedRangeCoverage>.stride), "
+                    + "receiptStride=\(MemoryLayout<AVPlayerLoadedRangeReceipt>.stride), "
+                    + "errorReservation=\(ControlTaskRegistry.ownedControlAllocationReservation.fixedErrorReservation)")
+                attachment.lifetime = .keepAlways
+                add(attachment)
             }
-            XCTAssertEqual(harness.driver.directStateCallCount, reads)
-            let task = OutputPlayerStopTask(item: harness.item,
-                registryIssuerIdentity: invocation.registryIssuerIdentity,
-                suspendTicket: invocation.suspendTicket, closeClaim: invocation.closeClaim)
-            task.complete(.failure(failure))
-            task.complete(.failure(.capacityExceeded))
-            do {
-                _ = try await task.value(registryIssuerIdentity: invocation.registryIssuerIdentity,
-                    suspendTicket: invocation.suspendTicket, closeClaim: invocation.closeClaim)
-                XCTFail("单次终态不得被第二次完成覆盖")
-            } catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, failure) }
-            do {
-                _ = try await task.value(registryIssuerIdentity: invocation.registryIssuerIdentity + 1,
-                    suspendTicket: invocation.suspendTicket, closeClaim: invocation.closeClaim)
-                XCTFail("外来 issuer 不得读取终态")
-            } catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .operationInFlight) }
-            let attachment = XCTAttachment(string:
-                "stopIdentity=\(ObjectIdentifier(task)), stopMalloc=\(malloc_size(Unmanaged.passUnretained(task).toOpaque())), "
-                + "driverIdentity=\(ObjectIdentifier(harness.driver)), driverMalloc=\(malloc_size(Unmanaged.passUnretained(harness.driver).toOpaque())), "
-                + "fixedFailureStride=\(MemoryLayout<AVPlayerItemCoordinatorFailure>.stride), "
-                + "cResultStride=\(MemoryLayout<VPLoadedRangeCoverage>.stride), "
-                + "receiptStride=\(MemoryLayout<AVPlayerLoadedRangeReceipt>.stride), "
-                + "errorReservation=\(ControlTaskRegistry.ownedControlAllocationReservation.fixedErrorReservation)")
-            attachment.lifetime = .keepAlways
-            add(attachment)
         }
     }
 
@@ -1796,18 +1891,20 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testStorageReadinessChecksOriginalURLGenerationAndSequenceAtBindAndRevalidation() async throws {
         for mutation in [Task21FakeEvidenceSource.ReadinessIdentityMutation.url, .generation, .sequence] {
-            let binding = try await Task21Harness()
-            binding.evidence.readinessIdentityMutation = mutation
-            await XCTAssertThrowsErrorAsync(try await binding.prepare())
-            XCTAssertEqual(binding.driver.playCallCount, 0)
+            try await withConnectedPlayerLifecycleHarness { binding in
+                binding.evidence.readinessIdentityMutation = mutation
+                await XCTAssertThrowsErrorAsync(try await binding.prepare())
+                XCTAssertEqual(binding.driver.playCallCount, 0)
+            }
 
-            let revalidation = try await Task21Harness()
-            _ = try await revalidation.prepare()
-            revalidation.evidence.readinessIdentityMutation = mutation
-            let result = try await revalidation.activate()
-            XCTAssertEqual(result, .rejected, "\(mutation)不能把当前身份补进冻结旧证据")
-            XCTAssertEqual(revalidation.driver.playCallCount, 0)
-            XCTAssertEqual(revalidation.coordinator.invalidationCount, 1)
+            try await withConnectedPlayerLifecycleHarness { revalidation in
+                _ = try await revalidation.prepare()
+                revalidation.evidence.readinessIdentityMutation = mutation
+                let result = try await revalidation.activate()
+                XCTAssertEqual(result, .rejected, "\(mutation)不能把当前身份补进冻结旧证据")
+                XCTAssertEqual(revalidation.driver.playCallCount, 0)
+                XCTAssertEqual(revalidation.coordinator.invalidationCount, 1)
+            }
         }
     }
     func testInstallConfiguresPausedLiveItemAndNeverRequestsPositiveRate() async throws {
@@ -2575,6 +2672,24 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.player.rate, 0)
     }
 
+    /// Feasibility only: retain the old endpoint assertions until this native
+    /// trace establishes what the tap actually observes across preroll and EOS.
+    func testTVOS27HLSTapReportsRawOutputThroughNaturalEOSAndFinalizes() async throws {
+        let fixture = try await Task21RealIntegrationFixture.make(endList: false, audioOutputProbe: true)
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
+        _ = try await fixture.primeCompletedSocketBodies()
+        _ = try await fixture.prepare()
+        try fixture.reportIndependentAudioProbeExpectation()
+        let result = try await fixture.playToEnd()
+        XCTAssertTrue(result.didReachStableEnd)
+        XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
+        XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
+        XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
+        // Owner teardown performs normal Registry retirement, then clears the
+        // exact item's tap, awaits native finalize, logs and validates raw facts.
+    }
+
     func testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations() async throws {
         try await withFinalEOSFixture { fixture in
             let result = try await fixture.playToEnd()
@@ -2698,23 +2813,31 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testStopRequiresRegistrySuspendClaimAndDoesNotJoinDifferentParameters() async throws {
-        let neverActivated = try await Task21Harness()
-        _ = try await neverActivated.prepare()
-        let inactiveReceipt = try await neverActivated.stop()
-        XCTAssertNil(inactiveReceipt.closeClaim,
-                     "未开放 interval 时 Registry 签发的 close claim 必须为 nil")
+        try await withConnectedPlayerLifecycleHarness { neverActivated in
+            _ = try await neverActivated.prepare()
+            let inactiveReceipt = try await neverActivated.stop()
+            XCTAssertNil(inactiveReceipt.closeClaim,
+                         "未开放 interval 时 Registry 签发的 close claim 必须为 nil")
+        }
 
-        let active = try await Task21Harness()
-        _ = try await active.prepare()
-        _ = try await active.activate()
-        active.driver.holdDirectPausedRead = true
-        let first = Task { try await active.stop() }
-        await active.driver.waitForPauseCall()
-        let second = Task { try await active.stop(strongerReason: true) }
-        active.driver.releaseDirectPausedRead(rate: 0, status: .paused)
-        _ = try await first.value
-        await XCTAssertThrowsErrorAsync(try await second.value,
-                                        "不同参数不能收到首个 stop task 的 receipt")
+        try await withConnectedPlayerLifecycleHarness { active in
+            _ = try await active.prepare()
+            _ = try await active.activate()
+            active.driver.holdDirectPausedRead = true
+            let first = Task { try await active.stop() }
+            defer {
+                active.driver.releaseDirectPausedRead(rate: 0, status: .paused)
+                first.cancel()
+            }
+            let paused = await active.driver.waitForPauseCall(timeout: .seconds(2))
+            XCTAssertTrue(paused, "The first owned suspend must reach its physical pause")
+            let second = Task { try await active.stop(strongerReason: true) }
+            defer { second.cancel() }
+            active.driver.releaseDirectPausedRead(rate: 0, status: .paused)
+            _ = try await first.value
+            await XCTAssertThrowsErrorAsync(try await second.value,
+                                            "不同参数不能收到首个 stop task 的 receipt")
+        }
     }
 
     func testQuiescenceReceiptRemainsVerifiableAfterCleanupAndDirectStateMatchesInstalledItem() async throws {
@@ -2963,20 +3086,54 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testSeekUsesTrackTimescaleAndLoadedRangesWaitMergeToContinuousThreeSeconds() async throws {
-        let harness = try await Task21Harness()
-        harness.driver.loadedRangesOverride = [
-            try FMP4PresentationRange(start: Task21Fixtures.time(4),
-                                      duration: Task21Fixtures.time(1.5)),
-            try FMP4PresentationRange(start: Task21Fixtures.time(5.5),
-                                      duration: Task21Fixtures.time(1.5)),
-        ]
-        _ = try await harness.prepare()
+        try await withConnectedPlayerLifecycleHarness { harness in
+            let threeSeconds = ExactMediaTime(value: 3, timescale: 1)
+            let half = ExactMediaTime(value: 3, timescale: 2)
+            var expectedSourceBoundary: ExactMediaTime?
+            var expectedLoadedRange: FMP4PresentationRange?
+            harness.driver.onPreparationFence = { [weak driver = harness.driver] fence, _ in
+                guard fence == .loadedTimeRanges, expectedLoadedRange == nil,
+                      let driver else { return }
+                do {
+                    // Read only the authenticated mapping facts. Neither the
+                    // actual seek position nor the SDK range argument defines
+                    // the expected boundary or the literal three-second window.
+                    let authority = try XCTUnwrap(driver.observedPlayheads.first)
+                        .timelineMappingAuthority
+                    let limit = try authority.effectivePlaybackHorizon.subtracting(threeSeconds)
+                    let boundary = try XCTUnwrap(authority.commonSampleBoundaries
+                        .filter { CMTimeCompare($0.cmTime, limit.cmTime) <= 0 }
+                        .max { CMTimeCompare($0.cmTime, $1.cmTime) < 0 })
+                    let expectedStart = try boundary.subtracting(authority.effectiveSourceOrigin)
+                    expectedSourceBoundary = boundary
+                    expectedLoadedRange = try FMP4PresentationRange(
+                        start: expectedStart, duration: threeSeconds)
+                    driver.loadedRangesOverride = [
+                        try FMP4PresentationRange(start: expectedStart, duration: half),
+                        try FMP4PresentationRange(start: expectedStart.adding(half), duration: half),
+                    ]
+                } catch {
+                    XCTFail("Could not derive the independent authenticated three-second range: \(error)")
+                }
+            }
+            defer { harness.driver.onPreparationFence = nil }
+            let prepared = try await harness.prepare()
+            let expected = try XCTUnwrap(expectedLoadedRange)
+            XCTAssertEqual(prepared.identity.mediaTime, try XCTUnwrap(expectedSourceBoundary))
+            XCTAssertEqual(prepared.identity.playerItemTime, expected.start)
+            XCTAssertEqual(harness.driver.requestedSeekTime, expected.start)
+            XCTAssertEqual(harness.driver.lastRequestedLoadedRange, expected,
+                           "The complete loaded request must match the independent mapped start and literal three-second duration")
+        }
 
         for mutation in [Task21PrepareMutation.seekBeforeOneTick, .seekAfterOneTick] {
-            let rejected = try await Task21Harness(prepareMutation: mutation)
-            await XCTAssertThrowsErrorAsync(try await rejected.prepare(), "\(mutation)")
+            try await withConnectedPlayerLifecycleHarness(prepareMutation: mutation) { rejected in
+                await XCTAssertThrowsErrorAsync(try await rejected.prepare(), "\(mutation)")
+            }
         }
-        _ = try await Task21Harness(prepareMutation: .exactBoundaries).prepare()
+        try await withConnectedPlayerLifecycleHarness(prepareMutation: .exactBoundaries) { exact in
+            _ = try await exact.prepare()
+        }
     }
 
     func testPrerollCompletionRechecksSameIdentityRateZeroAndNonPlayingState() async throws {
@@ -3286,24 +3443,30 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testStorageStopReadsDirectlyAndLatePausedRelayCannotRepairFailedReceipt() async throws {
-        let harness = try await Task21Harness()
-        _ = try await harness.prepare()
-        _ = try await harness.activate()
-        harness.driver.pauseLeavesWaiting = true
-        let readsBeforeStop = harness.driver.directStateCallCount
-        let stop = Task { try await harness.stop() }
-        await harness.driver.waitForPauseCall()
-        for _ in 0..<8 { await Task.yield() }
-        let readsBeforePausedRelay = harness.driver.directStateCallCount
-        harness.driver.emitTimeControlStatus(.paused)
-        await XCTAssertThrowsErrorAsync(try await stop.value,
-            "pause 后真实 direct state 非 paused 必须失败闭合")
+        try await withOwnedStopFailureHarness { harness in
+            _ = try await harness.prepare()
+            _ = try await harness.activate()
+            harness.driver.pauseLeavesWaiting = true
+            let readsBeforeStop = harness.driver.directStateCallCount
+            let stop = Task { try await harness.stop() }
+            defer { harness.backend.allowRetirementCompletion(); stop.cancel() }
+            let retiring = await harness.backend.waitForRetirementCall(timeout: .seconds(2))
+            XCTAssertTrue(retiring, "The original non-paused direct read must reach retirement before the late relay")
+            XCTAssertEqual(harness.backend.lastError as? AVPlayerItemCoordinatorFailure,
+                           .directPauseNotConfirmed)
+            let readsBeforePausedRelay = harness.driver.directStateCallCount
+            harness.driver.emitTimeControlStatus(.paused)
+            harness.backend.allowRetirementCompletion()
+            await XCTAssertThrowsErrorAsync(try await stop.value,
+                "pause 后真实 direct state 非 paused 必须失败闭合")
 
-        XCTAssertEqual(readsBeforePausedRelay, readsBeforeStop + 1,
-                       "pause 后立即 direct read；KVO 无权推迟或签发 receipt")
-        XCTAssertEqual(harness.driver.directStateCallCount, readsBeforeStop + 1,
-                       "迟到 KVO 不能重试或改写原停止终态")
-        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertEqual(readsBeforePausedRelay, readsBeforeStop + 1,
+                           "pause 后立即 direct read；KVO 无权推迟或签发 receipt")
+            XCTAssertEqual(harness.driver.directStateCallCount, readsBeforeStop + 1,
+                           "迟到 KVO 不能重试或改写原停止终态")
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNil(harness.backend.lastRetiredEpoch)
+        }
     }
 
     func testCurrentAuthorityMalformedAccessLogFailsClosedThroughDirectAndInstalledObserver() async throws {
@@ -5301,6 +5464,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         // 此 selector 验证 Driver 的自然 EOS 两次 direct read；夹具不应先被
         // publication naturalEnd 的独立 identity 合同截断。
         do {
+            print("FINAL_EOS_SCENARIO begin=success")
             try await withFinalEOSFixture { success in
                 assertIndependentAuthority(success)
                 let playback = try await success.playToEnd()
@@ -5325,6 +5489,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             ("endpoint +1 sample", 1),
         ]
         for (label, sampleDelta) in endpointMutations {
+            print("FINAL_EOS_SCENARIO begin=\(label)")
             try await withFinalEOSFixture { fixture in
                 assertIndependentAuthority(fixture)
                 try await fixture.activateForFinalEOSProbe()
@@ -5340,6 +5505,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             }
         }
 
+        print("FINAL_EOS_SCENARIO begin=early")
         try await withFinalEOSFixture { early in
             assertIndependentAuthority(early)
             try await early.activateForFinalEOSProbe()
@@ -5352,6 +5518,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(early.coordinatorPhase, .stopping)
         }
 
+        print("FINAL_EOS_SCENARIO begin=unstable")
         try await withFinalEOSFixture { unstable in
             assertIndependentAuthority(unstable)
             try await unstable.activateForFinalEOSProbe()
@@ -5367,6 +5534,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertEqual(unstable.coordinatorPhase, .stopping)
         }
 
+        print("FINAL_EOS_SCENARIO begin=timedOut")
         try await withFinalEOSFixture { timedOut in
             assertIndependentAuthority(timedOut)
             try await timedOut.activateForFinalEOSProbe()
@@ -7079,6 +7247,15 @@ private final class Task21Harness {
         authorityFixture.shutdown()
     }
 
+    /// Sequential subcases must observe actual history and socket retirement;
+    /// the synchronous best-effort shutdown remains only a fallback elsewhere.
+    func shutdownAndRetireTransport() async throws {
+        try await stopAndRetireTask21RegistryOutput(graph: graph, backend: backend)
+        // Join the original transport drain even if the test caller was canceled.
+        let retirement = Task { try await authorityFixture.retireTransportAwaitingCompletion() }
+        try await retirement.value
+    }
+
     func retireFailedTestTransport() async throws {
         guard backend.quiescenceReceipt == nil, backend.lastError != nil,
               let invocation = backend.lastSuspendInvocation else {
@@ -7644,6 +7821,7 @@ private final class Task21RealIntegrationFixture {
     private let diagnosticIdentity = UUID().uuidString
     private var diagnosticStage = "installed"
     private var diagnosticAttemptMarker: String?
+    private var audioOutputProbe: Task21HLSAudioOutputProbe?
 
     private var diagnosticScope: String {
         let session = item.outputLifecycleEpoch.backendIdentity.sessionIdentity
@@ -7755,7 +7933,7 @@ private final class Task21RealIntegrationFixture {
     }
 
     static func make(endList: Bool = true, includeVideo: Bool = false,
-                     startupPrefix: Bool = false) async throws
+                     startupPrefix: Bool = false, audioOutputProbe: Bool = false) async throws
         -> Task21RealIntegrationFixture {
         // Registry 先冻结正式 output lifecycle；writer、publisher、server 与 item
         // 随后全部绑定这一身份，避免只比较 generation 的跨 lifecycle 拼接。
@@ -7817,6 +7995,18 @@ private final class Task21RealIntegrationFixture {
             backend: backend, item: item, itemURL: preparation.request.itemURL,
             resourceBaseline: resourceBaseline, applicationBaseline: applicationBaseline,
             callbackBaseline: callbackBaseline)
+        if audioOutputProbe {
+            do {
+                let physical = try XCTUnwrap(player.currentItem)
+                fixture.audioOutputProbe = try Task21HLSAudioOutputProbe.attach(
+                    to: physical, player: player, scope: fixture.diagnosticScope)
+            } catch {
+                let attachError = error
+                do { try await fixture.shutdownThroughRegistry() }
+                catch { XCTFail("Tap setup failed and Registry cleanup also failed: \(error)") }
+                throw attachError
+            }
+        }
         if startupPrefix { fixture.startStartupProducer() }
         return fixture
     }
@@ -8009,6 +8199,7 @@ private final class Task21RealIntegrationFixture {
                     + "accessEvents=\(accessEvents)；底层：\(error)"])
         }
         prepared = value
+        audioOutputProbe?.mark(.prepared, player: player)
         traceNativeStage("prepare-return")
         print("NATIVE_PREPARE_ATTEMPT_RETURN attempt=\(attemptIdentity) \(attemptScope) "
             + "elapsed=\(preparationStarted.duration(to: .now))")
@@ -8043,6 +8234,7 @@ private final class Task21RealIntegrationFixture {
         }
         let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
         traceNativeStage("eos-activation-begin")
+        audioOutputProbe?.mark(.activationRequested, player: player)
         guard let activationTicket = try graph.registry.beginOutputActivation(
             contextNonce: context.contextNonce
         ), graph.registry.startOutputActivationOperation(activationTicket),
@@ -8051,6 +8243,7 @@ private final class Task21RealIntegrationFixture {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         traceNativeStage("eos-activation-return")
+        audioOutputProbe?.mark(.activationReturned, player: player)
         let currentItemIdentity = ObjectIdentifier(currentItem)
         traceNativeStage("eos-notification-wait-begin")
         let reachedEnd = try await withThrowingTaskGroup(of: Bool.self) { group in
@@ -8075,6 +8268,7 @@ private final class Task21RealIntegrationFixture {
         }
         traceNativeStage("eos-notification-wait-return")
         guard reachedEnd else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
+        audioOutputProbe?.mark(.naturalEnd, player: player)
         try await fireNaturalEndDeadline()
         guard case .success = try await naturalEndTerminalResult() else {
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
@@ -8098,6 +8292,22 @@ private final class Task21RealIntegrationFixture {
         return PlaybackResult(presentedEnd: stableEnd, endpointEnd: endpoint,
             didReachStableEnd: firstItemTime == stableItemTime
                 && naturalEndObservation?.stableCurrentTime == stableItemTime)
+    }
+
+    func reportIndependentAudioProbeExpectation() throws {
+        let identity = try XCTUnwrap(prepared).identity
+        let seed = publication.seed
+        let firstInput = try XCTUnwrap(seed.encodedBuffers.first)
+        let inputBase = try ExactMediaTime(CMSampleBufferGetOutputPresentationTimeStamp(firstInput))
+        let originalFrames = seed.streamSummary.realSampleCount
+        let inputEnd = try inputBase.adding(ExactMediaTime(value: originalFrames, timescale: 48_000))
+        let sourceEnd = try inputEnd.adding(seed.endpoint.timelineOffset)
+        let itemEnd = try identity.timelineMappingAuthority.playerItemTime(for: sourceEnd)
+        // These expectations never enter the tap accumulator or crop its output.
+        // The fixture plays a suffix; originalFrames describes all eight seconds.
+        print("AAC_TAP_EXPECT \(diagnosticScope) originalFrames=\(originalFrames) inputBase=\(inputBase) "
+            + "inputEnd=\(inputEnd) writerOffset=\(seed.endpoint.timelineOffset) sourceEnd=\(sourceEnd) "
+            + "sourceEntry=\(identity.mediaTime) itemEntry=\(identity.playerItemTime) itemEnd=\(itemEnd)")
     }
 
     func activateForFinalEOSProbe() async throws {
@@ -8176,6 +8386,7 @@ private final class Task21RealIntegrationFixture {
     }
 
     func verifyEndpointReadAcrossLaterPausedRelay(coalescedPause: Bool = false) async throws {
+        print("COALESCED_EOS_STAGE coalesced=\(coalescedPause) phase=activation_begin")
         try await activateForFinalEOSProbe()
         guard case .armed(let activation) = backend.activationResult else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
@@ -8199,6 +8410,7 @@ private final class Task21RealIntegrationFixture {
             XCTAssertEqual(deadlineScheduler.activeSlotCount, 0)
         }
         try await waitForNaturalEndDeadline()
+        print("COALESCED_EOS_STAGE coalesced=\(coalescedPause) phase=first_read_admitted")
         let firstRead = try XCTUnwrap(driver.naturalEndObservation).firstCurrentTime
         XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
         XCTAssertNil(driver.naturalEndTerminalResult)
@@ -8215,7 +8427,8 @@ private final class Task21RealIntegrationFixture {
                        "An admitted endpoint read must retain its original bounded second read")
         XCTAssertEqual(deadlineScheduler.activeSlotCount, 1)
         guard !hasRegisteredSuspend, deadlineScheduler.activeSlotCount == 1 else { return }
-        XCTAssertTrue(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
+        XCTAssertTrue(driver.hasPendingNaturalEndVerification(item: item, activation: activation),
+                      "The matching item/activation must retain its first read and original deadline; coalesced=\(coalescedPause)")
         XCTAssertFalse(driver.hasPendingNaturalEndVerification(
             item: Task21Fixtures.staleGenerationItem(from: item), activation: activation))
         let staleActivation = ActivationEpoch(outputLifecycleEpoch: activation.outputLifecycleEpoch,
@@ -8226,13 +8439,16 @@ private final class Task21RealIntegrationFixture {
         XCTAssertLessThan(CMTimeCompare(changedTime.cmTime, try endpointItemTime.cmTime), 0)
         let secondRead = try await seekAndAwaitCompletion(to: changedTime, expectedItem: physical)
         XCTAssertNotEqual(secondRead, firstRead)
-        XCTAssertTrue(deadlineScheduler.fireNext())
+        XCTAssertTrue(deadlineScheduler.fireNext(),
+                      "The original second-read deadline must still be fireable; coalesced=\(coalescedPause)")
+        print("COALESCED_EOS_STAGE coalesced=\(coalescedPause) phase=second_read_fired")
         let terminal = try await naturalEndTerminalResult()
         XCTAssertEqual(terminal, .failure(.unstableDirectRead),
                        "Deferring paused cannot turn a changed native second read into EOS success")
         XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: item, activation: activation))
         let retired = await waitForRegisteredSuspend()
-        XCTAssertTrue(retired)
+        XCTAssertTrue(retired,
+                      "The failed second read must reach exactly one Registry suspend and retirement; coalesced=\(coalescedPause) suspend=\(backendSuspendCount) retire=\(backendRetireCount)")
         XCTAssertEqual(backendRetireCount, 1)
     }
 
@@ -8655,6 +8871,7 @@ private final class Task21RealIntegrationFixture {
     }
 
     private func shutdownThroughRegistry() async throws {
+        audioOutputProbe?.mark(.retiring, player: player)
         traceNativeStage("owned-shutdown-begin")
         let watchdog = nativeStageWatchdog()
         defer { watchdog.cancel() }
@@ -8691,6 +8908,17 @@ private final class Task21RealIntegrationFixture {
         } catch {
             if cleanupError == nil { cleanupError = error }
             else { XCTFail("Native fixture HTTP cleanup also failed: \(error)") }
+        }
+        do {
+            if let audioOutputProbe {
+                let snapshot = try await audioOutputProbe.detachAndDrain()
+                snapshot.log()
+                try snapshot.requireUsableRawEvidence()
+                self.audioOutputProbe = nil
+            }
+        } catch {
+            if cleanupError == nil { cleanupError = error }
+            else { XCTFail("Native tap physical cleanup also failed: \(error)") }
         }
         if let cleanupError { throw cleanupError }
         traceNativeStage("owned-shutdown-return")
@@ -8854,12 +9082,14 @@ private func withFinalEOSFixture(
         fixture.traceNativeStage("eos-body-return")
     } catch {
         fixture.traceNativeFailure("eos-body-failure")
+        print("FINAL_EOS_FAILURE phase=body error=\(error)")
         operationError = error
     }
     do {
         try await fixture.teardown()
     } catch {
         fixture.traceNativeFailure("eos-teardown-failure")
+        print("FINAL_EOS_FAILURE phase=teardown error=\(error)")
         if let operationError {
             XCTFail("EOS 主断言失败后 cleanup 也失败：\(error)")
             throw operationError
