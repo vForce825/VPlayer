@@ -132,10 +132,37 @@ enum AVPlayerAACEndpointValidator {
             throw AVPlayerAACEndpointValidationFailure.identityMismatch
         }
         let receipt = try preflightRenditionIdentity(authority: authority, rendition: rendition)
-        let final = currentFinalPublication
         guard let writerFinal = rendition.finalWriterReceipt,
               writerFinal.terminalBinding === authority.terminalBinding,
-              writerFinal.binding == receipt.binding,
+              writerFinal.binding == receipt.binding else {
+            throw AVPlayerAACEndpointValidationFailure.identityMismatch
+        }
+        return try preflightCurrentFinal(authority: authority, receipt: receipt,
+            currentFinalPublication: currentFinalPublication, store: store)
+    }
+
+    /// Recheck the installed finite item's original authority without consuming
+    /// it again. The caller must also match every original participant snapshot
+    /// to the current committed final publication before shortening coverage.
+    static func preflight(
+        authority: AACEffectiveEndpointAuthority,
+        completedPublication: some LoopbackPublicationFacts,
+        currentFinalPublication: HLSCurrentFinalPublication,
+        store: SealedMediaStore
+    ) throws -> AACEffectiveEndpointReceipt {
+        let receipt = try preflight(authority: authority, completedPublication: completedPublication)
+        return try preflightCurrentFinal(authority: authority, receipt: receipt,
+            currentFinalPublication: currentFinalPublication, store: store)
+    }
+
+    private static func preflightCurrentFinal(
+        authority: AACEffectiveEndpointAuthority,
+        receipt: AACEffectiveEndpointReceipt,
+        currentFinalPublication: HLSCurrentFinalPublication,
+        store: SealedMediaStore
+    ) throws -> AACEffectiveEndpointReceipt {
+        let final = currentFinalPublication
+        guard store.validatesCurrentFinalPublication(final),
               authority.terminalBinding.binding == receipt.binding,
               final.binding == receipt.binding, final.mediaType == .audio,
               final.initializationKey == authority.initialization.key,

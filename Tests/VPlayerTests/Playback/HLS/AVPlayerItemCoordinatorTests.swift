@@ -944,6 +944,47 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testPausedResumeFinalTailRetirementAtEachAwaitRejectsBeforeNextEffect() async throws {
+        for (index, fence) in Task21ResumeAwaitFence.allCases.enumerated() {
+            try await withOwnedSelectionHarness {
+                try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+            } body: { harness in
+                let originalFinal = try harness.pausedFinalPublication()
+                let prepared = try await harness.prepare()
+                let timeline = prepared.identity.timelineMappingAuthority
+                let endpoint = try XCTUnwrap(timeline.aacEndpointReceipt)
+                XCTAssertEqual(originalFinal.publicationSequence, prepared.identity.publicationSequence)
+                XCTAssertEqual(originalFinal.effectivePlaybackHorizon, endpoint.lastEffectiveEnd)
+                let remaining = ExactMediaTime(value: 1, timescale: 4)
+                let target = try timeline.playerItemTime(for: endpoint.lastEffectiveEnd).subtracting(remaining)
+                _ = try await harness.activate()
+                harness.driver.observedPausedTime = target.cmTime
+                _ = try await harness.stop()
+                let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+                XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+                harness.driver.applySeekToObservedPausedTime = true
+                harness.driver.loadedRangesOverride = [try FMP4PresentationRange(start: target, duration: remaining)]
+                var observed: [Task21ResumeAwaitFence] = []
+                harness.driver.onResumeAwaitCompletion = { completed in
+                    observed.append(completed)
+                    if completed == fence { harness.retirePausedFinalParticipant() }
+                }
+                defer { harness.driver.onResumeAwaitCompletion = nil }
+
+                let result = try await harness.resumeThroughRegistry()
+
+                XCTAssertEqual(observed, Array(Task21ResumeAwaitFence.allCases.prefix(index + 1)),
+                    "The actual final publication must be invalidated at the intended await")
+                XCTAssertEqual(result, .rejected)
+                XCTAssertEqual(harness.backend.lastActivationError as? AVPlayerItemCoordinatorFailure,
+                    .insufficientCoverage)
+                XCTAssertEqual(harness.driver.playCallCount, 1)
+                XCTAssertEqual(harness.driver.rate, 0)
+                XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            }
+        }
+    }
+
     func testPausedResumeAtOrBeyondCommittedEndpointRejectsBeforeReconnect() async throws {
         for delta in [ExactMediaTime(value: 0, timescale: 1), ExactMediaTime(value: 1, timescale: 48_000)] {
             try await withOwnedSelectionHarness {
@@ -3075,6 +3116,17 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let reference = try Task21LocalPCMTapReference()
         // LIFO: remove the local item, physically finalize its tap and delete the
         // generated file before restoring/deactivating the native audio session.
+        addTeardownBlock { try await reference.close() }
+        try await reference.playThroughNaturalEnd()
+    }
+
+    /// The local PCM control changes only association from its real track to
+    /// tvOS 27 mixID. This proves callback feasibility only, never an endpoint.
+    func testTVOS27LocalPCMMixIDTapHasCallbackFeasibilityAndFinalizes() async throws {
+        let nativeSession = try Task21NativeAudioSessionReference()
+        addTeardownBlock { try await nativeSession.close() }
+        try await nativeSession.activate()
+        let reference = try Task21LocalPCMTapReference(association: .wholeMix)
         addTeardownBlock { try await reference.close() }
         try await reference.playThroughNaturalEnd()
     }
@@ -6136,6 +6188,10 @@ private enum Task21DriverOperation: Equatable {
     case install, seek, preroll, play, cancelPrerolls, pause, readPausedState, replaceNil, removeObservers
 }
 
+private enum Task21ResumeAwaitFence: CaseIterable, Equatable {
+    case reconnect, seek, loaded, preroll, direct
+}
+
 @MainActor
 private final class Task21FakeDriver: AVPlayerDriving {
     var failAccessLogObservation = false
@@ -6171,6 +6227,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
         if !disconnected, let reconnectedPausedTime {
             observedPausedTime = reconnectedPausedTime
         }
+        if !disconnected { await resumeAwaitCompleted(.reconnect) }
     }
 
     func waitForHeldAudioConnection() async -> Bool {
@@ -6222,6 +6279,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var applySeekToObservedPausedTime = false
     var onSeekCompletion: (() -> Void)?
     var onPrerollCompletion: (() async throws -> Void)?
+    var onResumeAwaitCompletion: ((Task21ResumeAwaitFence) -> Void)?
     var seekCancellationGate: Task21PrepareCancellationGate?
     private(set) var lastPlayedPausedTime: ExactMediaTime?
     private(set) var loadedRangeCallCount = 0
@@ -6305,6 +6363,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
             await Task.yield()
             onSeekCompletion()
         }
+        await resumeAwaitCompleted(.seek)
         return AVPlayerSeekReceipt(item: item, playhead: playhead, actualTime: actual)
     }
 
@@ -6332,6 +6391,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
             renditionSelectionSlotNonce: playhead.renditionSelectionSlotNonce + (loadedReceiptMutation == 8 ? 1 : 0),
             audioSelectionCapability: playhead.audioSelectionCapability,
             timelineMappingAuthority: playhead.timelineMappingAuthority)
+        await resumeAwaitCompleted(.loaded)
         return .init(item: loadedReceiptMutation == 1
             ? .init(outputLifecycleEpoch: item.outputLifecycleEpoch, itemGeneration: item.itemGeneration + 1) : item,
             playhead: modifiedPlayhead,
@@ -6389,6 +6449,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
             currentItemIdentity = stateAfterPreroll.item
         }
         if let onPrerollCompletion { try await onPrerollCompletion() }
+        await resumeAwaitCompleted(.preroll)
         return AVPlayerPrerollReceipt(
             item: prepareMutation == .stalePreroll
                 ? Task21Fixtures.staleGenerationItem(from: item) : item,
@@ -6465,8 +6526,15 @@ private final class Task21FakeDriver: AVPlayerDriving {
         guard let currentItemIdentity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        await resumeAwaitCompleted(.direct)
         return AVPlayerDirectState(item: currentItemIdentity, rate: rate,
                                    timeControlStatus: timeControlStatus)
+    }
+
+    private func resumeAwaitCompleted(_ fence: Task21ResumeAwaitFence) async {
+        guard let onResumeAwaitCompletion else { return }
+        await Task.yield()
+        onResumeAwaitCompletion(fence)
     }
 
     func waitUntilPaused(item: AVPlayerItemInstanceIdentity) async throws {
@@ -7291,6 +7359,11 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
         return value
     }
 
+    func retirePausedFinalParticipant() {
+        publication.store.retireParticipants([2])
+        XCTAssertNil(publication.store.currentFinalPublication(matching: publication.seed.endpoint.binding))
+    }
+
     func advancePausedPrefixAndCompleteBodies() async throws
         -> (sequence: UInt64, horizon: ExactMediaTime, isFinal: Bool) {
         try publication.assertStartupPrefix()
@@ -7599,6 +7672,8 @@ private final class Task21Harness {
     func pausedFinalPublication() throws -> HLSCurrentFinalPublication {
         try authorityFixture.pausedFinalPublication()
     }
+
+    func retirePausedFinalParticipant() { authorityFixture.retirePausedFinalParticipant() }
 
     func advancePausedPrefixAndCompleteBodies() async throws
         -> (sequence: UInt64, horizon: ExactMediaTime, isFinal: Bool) {

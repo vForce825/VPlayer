@@ -561,6 +561,12 @@ struct HLSCurrentFinalPublication: Sendable, Equatable {
     let terminalDigest: FMP4Digest
     let terminalByteCount: Int
 
+    /// Snapshot identity is immutable metadata; freshness still requires the
+    /// original store's validatesCurrentFinalPublication check.
+    func matchesSnapshot(identity: UUID, publicationSequence: UInt64) -> Bool {
+        snapshotIdentity == identity && self.publicationSequence == publicationSequence
+    }
+
     fileprivate init(storeIdentity: UUID, snapshot: HLSPlaylistSnapshot,
                      binding: FMP4WriterBinding, mediaType: FinalFMP4MediaType,
                      isAudioOnly: Bool, effectivePlaybackHorizon: ExactMediaTime,

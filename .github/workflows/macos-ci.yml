@@ -1,4 +1,4 @@
-name: Paused resume ownership and native boundaries
+name: Final-tail authority and native output controls
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -155,7 +155,10 @@ jobs:
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeBeyondStartupWindowUsesAdvancedPrefixFullLead \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeCommittedFinalTailUsesExactRemainingInterval \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeAtOrBeyondCommittedEndpointRejectsBeforeReconnect \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeNonfinalShortLeadRejectsBeforeReconnect
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeNonfinalShortLeadRejectsBeforeReconnect \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeFinalTailRetirementAtEachAwaitRejectsBeforeNextEffect \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointReceiptRequiresSameWriterProofPlaylistHTTPBackingAndEffectiveEnd \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointMutationTableRejectsDeletedTrimPlusMinusOneAndPrematureNonfinalTrim
       - name: Report RemainingPausedBoundaries failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/RemainingPausedBoundaries.xcresult"
@@ -253,6 +256,19 @@ jobs:
       - name: Report LocalPCMOutput failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/LocalPCMOutput.xcresult"
+      - name: Validate LocalPCMMixOutput
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/LocalPCMMixOutput.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27LocalPCMMixIDTapHasCallbackFeasibilityAndFinalizes
+      - name: Report LocalPCMMixOutput failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/LocalPCMMixOutput.xcresult"
       - name: Run HTTP playback and strict 900-second 4K remux assertions
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         timeout-minutes: 30

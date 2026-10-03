@@ -1837,6 +1837,7 @@ final class AVPlayerItemCoordinator {
             }
             try await driver.setDisconnectedFromSystemAudio(false, item: item)
             try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            try resumeCoverage?.revalidateScope()
             if let coverage = resumeCoverage, let scope = resumeScope {
                 let playhead = PreparedPlayheadIdentity(
                     outputLifecycleEpoch: item.outputLifecycleEpoch, itemGeneration: item.itemGeneration,
@@ -1846,6 +1847,7 @@ final class AVPlayerItemCoordinator {
                     audioSelectionCapability: scope.selection, timelineMappingAuthority: scope.timeline)
                 let seek = try await driver.seek(to: scope.cursor.time, item: item, playhead: playhead)
                 try validateActivation(invocation, request: request, resumeScope: scope)
+                try coverage.revalidateScope()
                 guard seek.item == item, seek.playhead == playhead, seek.actualTime == scope.cursor.time else {
                     throw AVPlayerItemCoordinatorFailure.seekMismatch
                 }
@@ -1854,6 +1856,7 @@ final class AVPlayerItemCoordinator {
                 let loaded = try await driver.waitForLoadedTimeRanges(item: item,
                     playhead: playhead, covering: itemRange)
                 try validateActivation(invocation, request: request, resumeScope: scope)
+                try coverage.revalidateScope()
                 guard loaded.item == item, loaded.playhead == playhead, loaded.requested == itemRange else {
                     throw AVPlayerItemCoordinatorFailure.loadedRangeMismatch
                 }
@@ -1862,6 +1865,7 @@ final class AVPlayerItemCoordinator {
                 try evidenceSource.revalidatePausedResumeCoverage(coverage)
                 let preroll = try await driver.preroll(item: item, playhead: playhead)
                 try validateActivation(invocation, request: request, resumeScope: scope)
+                try evidenceSource.revalidatePausedResumeCoverage(coverage)
                 guard preroll.item == item, preroll.playhead == playhead, preroll.succeeded else {
                     throw AVPlayerItemCoordinatorFailure.prerollFailed
                 }

@@ -64,6 +64,50 @@ final class Task21HLSAudioOutputProbe {
             }
         }
 
+        /// Separate local renderer feasibility, not the HLS endpoint gate.
+        /// Apple's source-EOS flag describes asynchronous audio-queue stopping;
+        /// it is not documented as identical to AVPlayerItem's end notification.
+        /// Keep its absence explicit. Never crop or fit raw frames to file length.
+        func requireLocalPCMCallbackFeasibility() throws {
+            let processes = records.filter { $0.kind == .process }
+            let sourceEOS = processes.contains { $0.sourceFlags & kMTAudioProcessingTapFlag_EndOfStream != 0 }
+            print("LOCAL_PCM_CALLBACK_FACTS \(scope) sourceEOSObserved=\(sourceEOS) "
+                + "sourceEOSRequired=false endpointOracle=false processCallbacks=\(processes.count) "
+                + "rawFrameTotal=\(processes.reduce(0) { $0 + $1.frames })")
+            guard firstFailure == 0 else { throw Failure.unusable("stickyFailure=\(firstFailure)") }
+            guard records.first?.kind == .initialize, records.last?.kind == .finalize,
+                  records.filter({ $0.kind == .initialize }).count == 1,
+                  records.filter({ $0.kind == .finalize }).count == 1 else {
+                throw Failure.unusable("missing unique physical initialize/finalize")
+            }
+            let preparations = records.filter { $0.kind == .prepare }
+            guard !preparations.isEmpty,
+                  preparations.count == records.filter({ $0.kind == .unprepare }).count,
+                  processes.contains(where: { $0.frames > 0 }) else {
+                throw Failure.unusable("missing prepared source frames or balanced unprepare")
+            }
+            guard markers.contains(where: { $0.phase == .naturalEnd }),
+                  markers.contains(where: { $0.phase == .activationReturned && $0.rate > 0 }) else {
+                throw Failure.unusable("missing normal activation/genuine item EOS")
+            }
+            for record in processes where record.frames > 0 {
+                guard record.assetRange.isValid, !record.assetRange.isEmpty,
+                      record.assetRange.start.isNumeric, record.assetRange.duration.isNumeric,
+                      record.format.mFormatID == kAudioFormatLinearPCM,
+                      record.format.mSampleRate == 48_000, record.format.mChannelsPerFrame == 2,
+                      record.format.mBitsPerChannel == 32,
+                      record.format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
+                    throw Failure.unusable("invalid local PCM format/range at callback \(record.ordinal)")
+                }
+            }
+            // The sticky callback gate additionally verifies packing, interleave,
+            // byte counts, preparation order and every source API status.
+            guard samples.allSatisfy({ $0.isFinite }),
+                  samples.contains(where: { abs($0) > 0.00001 }) else {
+                throw Failure.unusable("missing finite nonzero local PCM window")
+            }
+        }
+
         /// Call only after detachAndDrain(), on the normal test actor. Every raw
         /// callback is printed, including rate-zero, restarts and zero-frame EOS.
         func log() {
@@ -593,16 +637,18 @@ final class Task21NativeAudioSessionReference {
 }
 
 /// Separate simulator renderer/tap control. This uses a generated local PCM
-/// asset and ordinary track association, not the HLS/Registry endpoint fixture.
+/// asset and a documented track/mix association, not the HLS endpoint fixture.
 /// Register close() before calling playThroughNaturalEnd(), after registering
 /// the native-session owner's close(), so player/tap cleanup runs first.
 @MainActor
 final class Task21LocalPCMTapReference {
     enum Failure: Error { case format, asset, native(String), timeout(String), cleanup }
+    enum Association: String { case assetTrack, wholeMix }
     private final class EndSignal: Sendable {
         let received = Atomic<Bool>(false)
     }
     private let directory: URL
+    private let association: Association
     private let player = AVPlayer()
     private let endSignal = EndSignal()
     private var item: AVPlayerItem?
@@ -610,7 +656,8 @@ final class Task21LocalPCMTapReference {
     private var endObserver: (any NSObjectProtocol)?
     private var closed = false
 
-    init() throws {
+    init(association: Association = .assetTrack) throws {
+        self.association = association
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("Task21-local-PCM-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -631,15 +678,23 @@ final class Task21LocalPCMTapReference {
         let physical = AVPlayerItem(asset: asset)
         item = physical
         player.replaceCurrentItem(with: physical)
-        probe = try Task21HLSAudioOutputProbe.attachLocalReference(
-            to: physical, player: player, track: tracks[0], scope: "LOCAL_PCM_REFERENCE")
+        let scope = "LOCAL_PCM_REFERENCE association=\(association.rawValue)"
+        switch association {
+        case .assetTrack:
+            probe = try Task21HLSAudioOutputProbe.attachLocalReference(
+                to: physical, player: player, track: tracks[0], scope: scope)
+        case .wholeMix:
+            // mixID is documented for the mix of all audio tracks, with streaming
+            // as a useful case rather than a restriction to streaming assets.
+            probe = try Task21HLSAudioOutputProbe.attach(to: physical, player: player, scope: scope)
+        }
         let signal = endSignal
         endObserver = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.didPlayToEndTimeNotification, object: physical, queue: nil) { _ in
                 signal.received.store(true, ordering: .releasing)
             }
         print("LOCAL_PCM_REFERENCE assetFrames=96000 assetRate=48000 channels=2 "
-            + "source=syntheticFloatPCM association=assetTrack registryPath=false endpointOracle=false")
+            + "source=syntheticFloatPCM association=\(association.rawValue) registryPath=false endpointOracle=false")
         try await waitFor("ready") { player.status == .readyToPlay && physical.status == .readyToPlay }
         guard player.rate == 0, !player.disconnectedFromSystemAudio else { throw Failure.native("preroll-precondition") }
         // This is the same native preroll operation used by the HLS path. A
@@ -679,11 +734,8 @@ final class Task21LocalPCMTapReference {
             do {
                 let snapshot = try await probe.detachAndDrain()
                 snapshot.log()
-                try snapshot.requireUsableRawEvidence()
-                guard snapshot.samples.contains(where: { $0.isFinite && abs($0) > 0.00001 }) else {
-                    throw Failure.native("no nonzero synthetic PCM window")
-                }
-                print("LOCAL_PCM_REFERENCE usableSourceFrames=true physicalTapFinalized=true")
+                try snapshot.requireLocalPCMCallbackFeasibility()
+                print("LOCAL_PCM_REFERENCE callbackFeasibility=true physicalTapFinalized=true endpointOracle=false")
             } catch {
                 if failure == nil { failure = error }
                 print("LOCAL_PCM_REFERENCE evidenceFailure=\(error)")

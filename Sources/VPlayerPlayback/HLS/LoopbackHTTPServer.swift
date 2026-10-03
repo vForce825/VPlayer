@@ -972,6 +972,10 @@ final class LoopbackPausedResumeCoverage: @unchecked Sendable {
     }
 
     deinit { PlaybackResourceContextLedger.shared.release(reservation) }
+
+    /// Scope freshness is required even before HTTP coverage has frozen. This
+    /// does not grant the verified-coverage permission used before play.
+    func revalidateScope() throws { try server.revalidatePausedResumeScope(self) }
 }
 
 /// timeline admission 明确区分“selection 尚未被真实 E-3...E response 签出”和
@@ -3000,7 +3004,8 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     }
 
     private func validatePausedResumeScope(_ scope: AVPlayerPausedResumeScope,
-                                          originalOwner: FrozenPreparationOwner) throws -> FrozenParticipantHistoryTable {
+        originalOwner: FrozenPreparationOwner) throws
+        -> (participants: FrozenParticipantHistoryTable, requested: FMP4PresentationRange) {
         if let terminal = timelineFailureEvent {
             switch terminal {
             case .publicationTerminated(_, _, _, let failure): throw failure
@@ -3039,30 +3044,83 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 throw AVPlayerItemCoordinatorFailure.invalidTimeline
             }
         }
-        let end = try scope.timeline.sourceTime(for: scope.cursor.time).adding(scope.lead)
+        let start = try scope.timeline.sourceTime(for: scope.cursor.time)
+        let ordinaryEnd = try start.adding(scope.lead)
+        var end = ordinaryEnd
         for participant in current where participant.mediaType == .video
             || participant.participantID == scope.selection.participantID {
-            guard try HLSChecked.compare(end, participant.effectivePlaybackHorizon) <= 0 else {
-                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            if try HLSChecked.compare(participant.effectivePlaybackHorizon, end) < 0 {
+                end = participant.effectivePlaybackHorizon
             }
         }
-        return current
+        if try HLSChecked.compare(end, ordinaryEnd) < 0 {
+            // Only the installed finite item's original committed final
+            // snapshots can shorten its ordinary lead. A later prefix horizon
+            // or ENDLIST text cannot create this authority.
+            guard audio.audioCodec == .aac,
+                  let endpoint = originalOwner.timelineStorage?.endpointAuthority,
+                  scope.timeline.matchesEndpoint(endpoint),
+                  let mapping = audio.aacTimelineMapping,
+                  endpoint.receipt.binding == audio.writerBinding,
+                  endpoint.receipt.timelineOffset == mapping.offset,
+                  endpoint.receipt.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
+                  endpoint.receipt.writtenEffectiveBase == scope.timeline.writtenEffectiveBase else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            let completed = LoopbackCompletedPublicationEvidence(preparationOwner: originalOwner)
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == scope.selection.participantID {
+                guard let originalParticipant = completed.participants.first(where: {
+                    $0.participantID == participant.participantID
+                        && $0.renditionIdentity == participant.renditionIdentity
+                        && $0.mediaType == participant.mediaType
+                }), let final = store.currentFinalPublication(matching: participant.writerBinding),
+                      store.validatesCurrentFinalPublication(final),
+                      final.matchesSnapshot(identity: participant.playlistIdentity,
+                        publicationSequence: participant.playlistVersion),
+                      final.matchesSnapshot(identity: originalParticipant.mediaPlaylistSnapshotIdentity,
+                        publicationSequence: originalParticipant.mediaPlaylistVersion),
+                      final.effectivePlaybackHorizon == participant.effectivePlaybackHorizon else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                if participant.participantID == scope.selection.participantID {
+                    _ = try AVPlayerAACEndpointValidator.preflight(authority: endpoint,
+                        completedPublication: completed, currentFinalPublication: final, store: store)
+                }
+            }
+        }
+        guard try HLSChecked.compare(start, end) < 0 else {
+            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        return (current, try FMP4PresentationRange(start: start, duration: end.subtracting(start)))
+    }
+
+    private func validatePausedResumeCoverageScope(_ value: LoopbackPausedResumeCoverage) throws
+        -> FrozenParticipantHistoryTable {
+        guard value.server === self else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        let validated = try validatePausedResumeScope(value.scope, originalOwner: value.originalOwner)
+        guard validated.requested == value.requested else {
+            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        return validated.participants
+    }
+
+    fileprivate func revalidatePausedResumeScope(_ value: LoopbackPausedResumeCoverage) throws {
+        try queueSync { try store.domain.sync {
+            _ = try validatePausedResumeCoverageScope(value)
+        } }
     }
 
     func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope,
                                     originalOwner: FrozenPreparationOwner) throws
         -> LoopbackPausedResumeCoverage {
-        try queueSync {
-            let current = try validatePausedResumeScope(scope, originalOwner: originalOwner)
-            let requested = try FMP4PresentationRange(
-                start: scope.timeline.sourceTime(for: scope.cursor.time), duration: scope.lead)
+        try queueSync { try store.domain.sync {
+            let (current, requested) = try validatePausedResumeScope(scope, originalOwner: originalOwner)
             let lease = try PausedWindowCoverageLease.reserve()
             var participantCount = 0
             for participant in current where participant.mediaType == .video
                 || participant.participantID == scope.selection.participantID {
                 participantCount += 1
-                // This ordinary-lead transaction cannot infer an endpoint or
-                // shorten its interval from the startup selection's horizon.
                 guard try HLSChecked.compare(requested.end, participant.effectivePlaybackHorizon) <= 0 else {
                     throw AVPlayerItemCoordinatorFailure.insufficientCoverage
                 }
@@ -3085,13 +3143,12 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             let workspace = try store.reservePausedCoverageWorkspace(owner: lease)
             return try .make(server: self, originalOwner: originalOwner, scope: scope,
                 requested: requested, lease: lease, workspace: workspace)
-        }
+        } }
     }
 
     func freezePausedResumeCoverage(_ value: LoopbackPausedResumeCoverage) throws -> Bool {
-        try queueSync {
-            guard value.server === self else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
-            let current = try validatePausedResumeScope(value.scope, originalOwner: value.originalOwner)
+        try queueSync { try store.domain.sync {
+            let current = try validatePausedResumeCoverageScope(value)
             if value.verified { return true }
             guard store.pausedCoverageBodiesComplete(owner: value.lease) else { return false }
             try value.lease.freezeCompletedResources()
@@ -3109,16 +3166,16 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             }
             value.verified = true
             return true
-        }
+        } }
     }
 
     func revalidatePausedResumeCoverage(_ value: LoopbackPausedResumeCoverage) throws {
-        try queueSync {
+        try queueSync { try store.domain.sync {
             guard value.server === self, value.verified else {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
             }
-            _ = try validatePausedResumeScope(value.scope, originalOwner: value.originalOwner)
-        }
+            _ = try validatePausedResumeCoverageScope(value)
+        } }
     }
 
     func verifiedCoverage(using evidence: LoopbackCompletedPublicationEvidence,
