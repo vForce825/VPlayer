@@ -3165,43 +3165,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.player.rate, 0)
     }
 
-    /// Feasibility only: retain the old endpoint assertions until this native
-    /// trace establishes what the tap actually observes across preroll and EOS.
+    /// Raw software-output probe. Exact whole-mix absence is unverified only
+    /// after fresh same-file track/mix controls and all physical cleanup succeed.
     func testTVOS27HLSTapReportsRawOutputThroughNaturalEOSAndFinalizes() async throws {
-        let fixture = try await Task21RealIntegrationFixture.make(endList: false, audioOutputProbe: true)
-        let owner = Task21RealIntegrationFixture.Owner(fixture)
-        addTeardownBlock { try await owner.tearDown() }
-        _ = try await fixture.primeCompletedSocketBodies()
-        _ = try await fixture.prepare()
-        try fixture.reportIndependentAudioProbeExpectation()
-        let result = try await fixture.playToEnd()
-        XCTAssertTrue(result.didReachStableEnd)
-        XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
-        XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
-        XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
-        // Owner teardown performs normal Registry retirement, then clears the
-        // exact item's tap, awaits native finalize, logs and validates raw facts.
+        try await checkHLSWholeMixCapability(explicitNativeSession: false)
     }
 
-    /// Controlled reference: same HLS fixture/tap/Registry path with one explicit
-    /// native playback-session setup. Run alone in a fresh simulator process;
-    /// this does not replace the canonical output or exact-end acceptance gates.
     func testTVOS27HLSTapWithExplicitNativeSessionReportsRawOutput() async throws {
-        let nativeSession = try Task21NativeAudioSessionReference()
-        addTeardownBlock { try await nativeSession.close() }
-        try await nativeSession.activate()
-        let fixture = try await Task21RealIntegrationFixture.make(endList: false, audioOutputProbe: true)
-        let owner = Task21RealIntegrationFixture.Owner(fixture)
-        // LIFO teardown: retire Registry/player and finalize tap before session.
-        addTeardownBlock { try await owner.tearDown() }
-        _ = try await fixture.primeCompletedSocketBodies()
-        _ = try await fixture.prepare()
-        try fixture.reportIndependentAudioProbeExpectation()
-        let result = try await fixture.playToEnd()
-        XCTAssertTrue(result.didReachStableEnd)
-        XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
-        XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
-        XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
+        try await checkHLSWholeMixCapability(explicitNativeSession: true)
     }
 
     /// Renderer/tap control: a synthetic local PCM track, the identical raw tap,
@@ -3217,25 +3188,160 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         try await reference.playThroughNaturalEnd()
     }
 
-    /// The local PCM control changes only association from its real track to
-    /// tvOS 27 mixID. This proves callback feasibility only, never an endpoint.
+    /// Same generated file, session, constructor and callbacks; only association
+    /// changes. The real track must produce nonzero PCM in this invocation.
     func testTVOS27LocalPCMMixIDTapHasCallbackFeasibilityAndFinalizes() async throws {
         let nativeSession = try Task21NativeAudioSessionReference()
         addTeardownBlock { try await nativeSession.close() }
         try await nativeSession.activate()
-        let reference = try Task21LocalPCMTapReference(association: .wholeMix,
-            sessionDiagnosticID: nativeSession.diagnosticID)
-        addTeardownBlock { try await reference.close() }
-        try await reference.playThroughNaturalEnd()
+        let unavailable = try await checkSameAssetWholeMixControl(nativeSession)
+        try await nativeSession.close()
+        if unavailable { try recordWholeMixCapabilitySkip(scope: "localPCM", session: nativeSession) }
     }
 
-    func testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations() async throws {
+    private func checkHLSWholeMixCapability(explicitNativeSession: Bool) async throws {
+        let nativeSession: Task21NativeAudioSessionReference?
+        if explicitNativeSession { nativeSession = try Task21NativeAudioSessionReference() }
+        else { nativeSession = nil }
+        if let nativeSession {
+            addTeardownBlock { try await nativeSession.close() }
+            try await nativeSession.activate()
+            try nativeSession.requireActiveConfiguration()
+        }
+        let observation = Task21WholeMixCapabilityObservation()
+        // This helper's return ends its fixture alias before Owner checks deinit.
+        let owner = try await playHLSWholeMixProbe(observation)
+        if let nativeSession { try nativeSession.requireActiveConfiguration() }
+        try await owner.tearDown()
+        guard owner.cleanRetirementVerified else {
+            throw Task21HLSAudioOutputProbe.Failure.unusable("HLS owner baselines did not retire")
+        }
+        guard observation.callbacksNotObserved else {
+            if let nativeSession { try await nativeSession.close() }
+            return
+        }
+        // Baseline HLS keeps its original session setup; calibration begins only
+        // after that original player/Registry owner is completely retired.
+        let controlSession = try nativeSession ?? Task21NativeAudioSessionReference()
+        if nativeSession == nil {
+            addTeardownBlock { try await controlSession.close() }
+            try await controlSession.activate()
+        }
+        guard try await checkSameAssetWholeMixControl(controlSession) else {
+            throw Task21HLSAudioOutputProbe.Failure.unusable(
+                "HLS callback absence not reproduced by same-asset whole-mix control")
+        }
+        try await controlSession.close()
+        try recordWholeMixCapabilitySkip(scope: explicitNativeSession ? "HLS-explicit-session" : "HLS-baseline",
+                                     session: controlSession)
+    }
+
+    private func playHLSWholeMixProbe(_ observation: Task21WholeMixCapabilityObservation) async throws
+        -> Task21RealIntegrationFixture.Owner {
+        let fixture = try await Task21RealIntegrationFixture.make(endList: false, audioOutputProbe: true)
+        fixture.audioCapabilityObservation = observation
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        addTeardownBlock { try await owner.tearDown() }
+        _ = try await fixture.primeCompletedSocketBodies()
+        _ = try await fixture.prepare()
+        try fixture.reportIndependentAudioProbeExpectation()
+        let result = try await fixture.playToEnd()
+        XCTAssertTrue(result.didReachStableEnd)
+        XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
+        XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
+        XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
+        guard result.didReachStableEnd, fixture.acceptedGETs.playlistCount > 0,
+              fixture.acceptedGETs.initializationCount > 0, fixture.acceptedGETs.mediaCount > 0 else {
+            throw Task21HLSAudioOutputProbe.Failure.unusable("HLS playback prerequisites failed")
+        }
+        return owner
+    }
+
+    private func checkSameAssetWholeMixControl(_ nativeSession: Task21NativeAudioSessionReference)
+        async throws -> Bool {
+        try nativeSession.requireActiveConfiguration()
+        let source = try Task21LocalPCMTapReference.PCMSource()
+        addTeardownBlock { try await source.close() }
+        let track = try Task21LocalPCMTapReference(sessionDiagnosticID: nativeSession.diagnosticID, source: source)
+        addTeardownBlock { try await track.close() }
+        try await track.playThroughNaturalEnd()
+        try nativeSession.requireActiveConfiguration()
+        try await track.close()
+        guard track.callbackFeasibilityVerified else {
+            throw Task21HLSAudioOutputProbe.Failure.unusable("same-asset real-track control failed")
+        }
+        let observation = Task21WholeMixCapabilityObservation()
+        let mix = try Task21LocalPCMTapReference(association: .wholeMix,
+            sessionDiagnosticID: nativeSession.diagnosticID, source: source,
+            capabilityObservation: observation)
+        addTeardownBlock { try await mix.close() }
+        try nativeSession.requireActiveConfiguration()
+        try await mix.playThroughNaturalEnd()
+        try nativeSession.requireActiveConfiguration()
+        try await mix.close()
+        try source.close()
+        print("WHOLE_MIX_SAME_ASSET_CONTROL diagnosticID=\(nativeSession.diagnosticID.uuidString) "
+            + "trackNonzeroPCM=true sameFile=true trackAndMixFinalized=true sourceRemoved=true "
+            + "mixCallbacksNotObserved=\(observation.callbacksNotObserved) endpointOracle=false")
+        return observation.callbacksNotObserved
+    }
+
+    private func recordWholeMixCapabilitySkip(scope: String, session: Task21NativeAudioSessionReference) throws {
+        // A previously recorded nonthrowing XCTest issue is never relabelled as
+        // unsupported. Require the live run for this exact test, with zero issues.
+        guard let run = testRun, run.test === self, run.totalFailureCount == 0 else {
+            throw Task21HLSAudioOutputProbe.Failure.unusable("recorded XCTest failure prevents capability skip")
+        }
+        // Reached only after this invocation's track-positive/mix-absent pair,
+        // exact target absence and successful source/player/owner/session cleanup.
+        // This count is unsupported/unverified coverage, never output success.
+        print("AUDIO_CAPABILITY_RESULT scope=\(scope) diagnosticID=\(session.diagnosticID.uuidString) "
+            + "classification=wholeMixCallbacksNotObserved capability=unverified "
+            + "unsupportedUnverifiedCount=1 endpointVerifiedCount=0 cleanupSucceeded=true")
+        throw XCTSkip("Whole-mix tap callbacks unavailable/unverified in this invocation; "
+            + "same-asset real-track PCM passed, exact init/finalize-only mix outcome reproduced. "
+            + "Physical audio endpoint and trim sensitivity remain unverified.")
+    }
+
+    /// Validates native HLS transport EOS and the original one-shot authority.
+    /// Exact AAC output extent/content and served-trim mutation sensitivity remain
+    /// separate, unverified acceptance requirements; item clocks cannot prove them.
+    func testRealAVPlayerLoopbackReachesNaturalEOSWithOriginalEndpointAuthorityAndRejectsReplay() async throws {
         try await withFinalEOSFixture { fixture in
+            let prepared = try await fixture.prepare()
+            let physicalItem = try XCTUnwrap(fixture.player.currentItem)
+            let originalWriter = fixture.writerBinding
+            let originalAuthority = fixture.endpointAuthorityIdentity
+            let expectedItemEndpoint = try fixture.endpointItemTime
             let result = try await fixture.playToEnd()
-            XCTAssertEqual(result.presentedEnd, result.endpointEnd,
-                           accuracy: Task21Fixtures.oneSample)
+            let observation = try XCTUnwrap(fixture.naturalEndObservation)
+            let stableItemClock = try XCTUnwrap(observation.stableCurrentTime)
+
+            XCTAssertTrue(result.didReachStableEnd,
+                          "The original AVPlayer item must reach genuine EOS with stable native clock reads")
+            XCTAssertTrue(fixture.player.currentItem === physicalItem)
+            XCTAssertEqual(observation.item, prepared.item)
+            XCTAssertEqual(fixture.writerBinding, originalWriter)
+            XCTAssertEqual(fixture.endpointAuthorityIdentity, originalAuthority)
+            XCTAssertEqual(observation.expectedEndpoint, expectedItemEndpoint)
+            XCTAssertEqual(observation.constrainedEndpoint, expectedItemEndpoint)
+            XCTAssertEqual(try ExactMediaTime(physicalItem.forwardPlaybackEndTime), expectedItemEndpoint,
+                           "The installed transport constraint must remain the exact original mapped endpoint")
+            XCTAssertEqual(observation.firstCurrentTime, stableItemClock)
+            XCTAssertEqual(fixture.player.rate, 0)
+            XCTAssertEqual(fixture.player.timeControlStatus, .paused)
+            XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
+            XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
+            XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
+            // PlaybackResult.presentedEnd is a legacy name for the sampled item
+            // clock. Retain both values as diagnostics, never compare them as PCM.
+            print("HLS_TRANSPORT_EOS stableItemClock=\(result.presentedEnd) "
+                + "expectedItemEndpoint=\(result.endpointEnd) "
+                + "exactAACOutputVerified=false servedTrimMutationsVerified=false")
             XCTAssertThrowsError(try fixture.validateEndpoint(),
-                                 "Task17/20 authority 已由 production admission 消费，不得重放")
+                                 "The original production-consumed endpoint authority must reject replay") { error in
+                XCTAssertEqual(error as? AVPlayerAACEndpointValidationFailure, .authorityAlreadyConsumed)
+            }
         }
     }
 
@@ -8575,6 +8681,7 @@ private final class Task21RealIntegrationFixture {
         private let applicationBaseline: Int
         private let callbackBaseline: Int
         private let diagnosticScope: String
+        private(set) var cleanRetirementVerified = false
 
         init(_ fixture: Task21RealIntegrationFixture) {
             self.fixture = fixture
@@ -8621,6 +8728,10 @@ private final class Task21RealIntegrationFixture {
                            applicationBaseline, "The retired fixture must release its metadata",
                            file: file, line: line)
             if let cleanupError { throw cleanupError }
+            cleanRetirementVerified = driver == nil
+                && AVPlayerSDKCallbackLease.occupiedCount == callbackBaseline
+                && PlaybackResourceContextLedger.shared.chargedBytes == resourceBaseline
+                && HLSDeliveryApplicationChargeLedger.shared.chargedBytes == applicationBaseline
         }
 
         private func releaseFixture() async throws {
@@ -8663,6 +8774,7 @@ private final class Task21RealIntegrationFixture {
     private var diagnosticStage = "installed"
     private var diagnosticAttemptMarker: String?
     private var audioOutputProbe: Task21HLSAudioOutputProbe?
+    var audioCapabilityObservation: Task21WholeMixCapabilityObservation?
 
     private var diagnosticScope: String {
         let session = item.outputLifecycleEpoch.backendIdentity.sessionIdentity
@@ -9947,7 +10059,14 @@ private final class Task21RealIntegrationFixture {
             if let audioOutputProbe {
                 let snapshot = try await audioOutputProbe.detachAndDrain()
                 snapshot.log()
-                try snapshot.requireUsableRawEvidence()
+                if let audioCapabilityObservation {
+                    try audioCapabilityObservation.validate(snapshot,
+                        configurationValid: audioOutputProbe.configurationStayedValid) {
+                        try snapshot.requireUsableRawEvidence()
+                    }
+                } else {
+                    try snapshot.requireUsableRawEvidence()
+                }
                 self.audioOutputProbe = nil
             }
         } catch {

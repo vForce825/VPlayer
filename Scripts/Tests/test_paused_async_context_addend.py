@@ -43,6 +43,14 @@ def make_ir(symbols, caller=False):
         out+=' ret void\n}\n'
     return out
 
+def make_byte_caller(ir):
+    # Exact observed Release spelling; all other optimized forms stay unknown.
+    return (ir.replace('getelementptr inbounds (%swift.async_func_pointer,',
+                       'getelementptr inbounds nuw (i8,')
+              .replace('i32 0, i32 1)', 'i64 4)')
+              .replace('call swiftcc ptr @swift_task_alloc(',
+                       'tail call swiftcc ptr @swift_task_alloc('))
+
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def fake_output(args,**kw):
     if args[-1]=='--show-sdk-path': return SDK
@@ -59,14 +67,16 @@ def fake_demangle(args,**kw):
         rows.append('async function pointer to '+module+'.'+name+'()')
     return SimpleNamespace(stdout='\n'.join(rows)+'\n')
 
-def run_case(reader, addend, gep_flags="inbounds"):
+def run_case(reader, addend, gep_flags="inbounds", caller_transform=None):
     with TemporaryDirectory(prefix='vplayer-control-review-') as tmp:
         tmp=Path(tmp); inp=tmp/'Synthetic.swift'
         inp.write_text('// Synthetic parser fixture, never compiled.\n')
         manifest={'schema':1,'compiler_version':VERSION,'driver_version':'swift-driver version: 1.168.6','target':TARGET,'sdk_path':SDK,'sdk_version':'27.0','configuration':'Debug','optimization':'-Onone','scope':'controls','pairs':[]}
         for role,syms in [('control',CONTROLS),('caller',CALLERS)]:
             ll=tmp/(role+'.ll'); obj=tmp/(role+'.o')
-            ll.write_text(make_ir(syms,role=='caller').replace('getelementptr inbounds (', 'getelementptr '+gep_flags+' (')); obj.write_bytes(make_object(syms,addend))
+            ir=make_ir(syms,role=='caller').replace('getelementptr inbounds (', 'getelementptr '+gep_flags+' (')
+            if role=='caller' and caller_transform: ir=caller_transform(ir)
+            ll.write_text(ir); obj.write_bytes(make_object(syms,addend))
             common=['xcrun','swiftc','-target',TARGET,'-sdk',SDK,'-Onone',str(inp)]
             manifest['pairs'].append({'role':role,'ir':str(ll),'object':str(obj),'ir_sha256':sha(ll),'object_sha256':sha(obj),'ir_argv':common+['-emit-ir','-o',str(ll)],'object_argv':common+['-emit-object','-o',str(obj)],'inputs':{str(inp):sha(inp)}})
         path=tmp/'artifact-set.json'; path.write_text(json.dumps(manifest))
@@ -115,5 +125,48 @@ if __name__=='__main__':
     for name,ir in negatives.items():
         if reader['allocator_size_chain'](ir,symbol) is not None: failures.append(name)
     print(f'SYNTHETIC exact-chain rejection cases={len(negatives)}')
+    # The exact packed <{ i32, i32 }> layout establishes field 1 at byte 4.
+    # These are synthetic artifact/SSA checks, never native allocation evidence.
+    for addend in (0,4,-4):
+        accepted,reason,output=run_case(reader,addend,caller_transform=make_byte_caller)
+        expected=addend==0
+        if accepted!=expected or ('diagnostic_complete' in output)!=expected:
+            failures.append(('byte GEP artifact',addend))
+        print(f'SYNTHETIC byte GEP addend={addend}: accepted={accepted}; reason={reason}')
+    byte_caller=make_byte_caller(make_ir(CALLERS,True))
+    byte_negatives={
+        'zero offset': byte_caller.replace('i64 4)', 'i64 0)'),
+        'off-by-one offset': byte_caller.replace('i64 4)', 'i64 5)'),
+        'next field offset': byte_caller.replace('i64 4)', 'i64 8)'),
+        'negative offset': byte_caller.replace('i64 4)', 'i64 -4)'),
+        'wrong offset width': byte_caller.replace('i64 4)', 'i32 4)'),
+        'wrong GEP element type': byte_caller.replace('(i8, ptr', '(i32, ptr'),
+        'wrong descriptor': byte_caller.replace(symbol, symbol+'Decoy'),
+        'wrong load width': byte_caller.replace('load i32,', 'load i64,'),
+        'signed extension': byte_caller.replace('zext i32', 'sext i32'),
+        'unknown extension flag': byte_caller.replace('zext i32', 'zext nneg i32'),
+        'wrong extension width': byte_caller.replace(' to i64', ' to i32'),
+        'wrong loaded SSA': byte_caller.replace('zext i32 %1', 'zext i32 %9'),
+        'wrong allocated SSA': byte_caller.replace('swift_task_alloc(i64 %2)', 'swift_task_alloc(i64 %9)'),
+        'constant allocation': byte_caller.replace('swift_task_alloc(i64 %2)', 'swift_task_alloc(i64 128)'),
+        'wrong allocator': byte_caller.replace('@swift_task_alloc(', '@other_alloc('),
+        'unknown GEP flag': byte_caller.replace('inbounds nuw (', 'inbounds unknown ('),
+        'reversed GEP flags': byte_caller.replace('inbounds nuw (', 'nuw inbounds ('),
+        'missing inbounds': byte_caller.replace('inbounds nuw (', 'nuw ('),
+        'unobserved missing nuw': byte_caller.replace('inbounds nuw (', 'inbounds ('),
+        'cross-function chain': byte_caller.replace(' %2 = zext', ' ret void\n}\ndefine void @"decoy"() {\n %2 = zext'),
+        'missing layout': byte_caller.replace('%swift.async_func_pointer = type <{ i32, i32 }>\n', ''),
+        'different layout': byte_caller.replace('type <{ i32, i32 }>', 'type <{ i64, i32 }>'),
+        'unpacked layout': byte_caller.replace('type <{ i32, i32 }>', 'type { i32, i32 }'),
+    }
+    for name,ir in byte_negatives.items():
+        if reader['allocator_size_chain'](ir,symbol) is not None:
+            failures.append(('byte GEP decoy',name))
+    print(f'SYNTHETIC byte-GEP exact-chain rejection cases={len(byte_negatives)}')
+    for layout in ('<{ i64, i32 }>', '{ i32, i32 }'):
+        transform=lambda ir: make_byte_caller(ir).replace('type <{ i32, i32 }>', 'type '+layout)
+        accepted,reason,output=run_case(reader,0,caller_transform=transform)
+        if accepted or 'diagnostic_complete' in output: failures.append(('byte GEP layout',layout))
+    if failures: print('SYNTHETIC failures: '+repr(failures))
     print('Synthetic temporary artifacts removed. No native compiler was used.')
     sys.exit(bool(failures))

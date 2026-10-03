@@ -2500,6 +2500,58 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
     }
 
+    func testDeliverySoftBoundarySnapshotRetainsExactChargeAcrossOriginalOwnerRelease() throws {
+        let soft = HLSDeliveryApplicationChargeLedger.documentedApplicationSoftBytes
+        let parserBytes = LoopbackStorageLayout.current.parserAllocationBytes
+        let stagingBytes = LoopbackStorageLayout.current.stagingAllocationBytes
+        for retainSnapshot in [false, true] {
+            let ledger = HLSDeliveryApplicationChargeLedger()
+            let originalIdentity = UUID()
+            let original = try ledger.reserve(allocationIdentity: originalIdentity, bytes: 64)
+            defer { ledger.release(original) }
+            let boundary = try (retainSnapshot ? ledger.retainCurrentAllocationsForTesting() : nil)
+            defer { boundary?.reservations.forEach(ledger.release) }
+            if let boundary {
+                XCTAssertEqual(boundary.chargedBytes, 64)
+                XCTAssertEqual(boundary.distinctAllocationCount, 1)
+                XCTAssertEqual(boundary.reservations.count, 1)
+                XCTAssertEqual(boundary.reservations.first?.allocationIdentity,
+                               original.allocationIdentity)
+                XCTAssertEqual(ledger.snapshot(ownedBy: boundary.reservations),
+                    HLSDeliveryOwnedChargeSnapshot(reservationCount: 1,
+                        registeredReservationCount: 1, distinctAllocationCount: 1, chargedBytes: 64))
+            }
+            // Both cases use exactly the same filler. The original owner then
+            // retires at the formerly uncontrolled point before parser admission.
+            let filler = try ledger.reserve(allocationIdentity: UUID(),
+                                             bytes: soft - 64 - parserBytes)
+            defer { ledger.release(filler) }
+            XCTAssertEqual(ledger.chargedBytes, soft - parserBytes)
+            ledger.release(original)
+            let parser = try ledger.reserve(allocationIdentity: UUID(), bytes: parserBytes)
+            defer { ledger.release(parser) }
+            XCTAssertEqual(ledger.chargedBytes, retainSnapshot ? soft : soft - 64)
+            if let boundary {
+                XCTAssertThrowsError(try ledger.reserve(allocationIdentity: UUID(), bytes: stagingBytes)) {
+                    XCTAssertEqual($0 as? LoopbackHTTPReservationError, .backpressure)
+                }
+                XCTAssertEqual(ledger.chargedBytes, soft)
+                boundary.reservations.forEach(ledger.release)
+                XCTAssertEqual(ledger.snapshot(ownedBy: boundary.reservations),
+                    HLSDeliveryOwnedChargeSnapshot(reservationCount: 1,
+                        registeredReservationCount: 0, distinctAllocationCount: 0, chargedBytes: 0))
+                XCTAssertEqual(ledger.chargedBytes, soft - 64)
+            }
+            let staging = try ledger.reserve(allocationIdentity: UUID(), bytes: stagingBytes)
+            XCTAssertEqual(ledger.chargedBytes, soft - 64 + stagingBytes,
+                           "Below-soft admission must still allow its documented crossing allocation")
+            ledger.release(staging)
+            ledger.release(parser)
+            ledger.release(filler)
+            XCTAssertEqual(ledger.chargedBytes, 0)
+        }
+    }
+
     func testReview5DeliverySoftAdmissionAggregatesAcrossStoresAndServers() async throws {
         let soft = HLSDeliveryApplicationChargeLedger.documentedApplicationSoftBytes
         let directLedger = HLSDeliveryApplicationChargeLedger()
@@ -2580,17 +2632,34 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let held = try ConnectedSocket(port: firstFixture.server.port)
         defer { held.reset() }
         XCTAssertTrue(waitUntil { firstFixture.server.usage.connections == 1 })
-        let serverBaseline = shared.chargedBytes
+        let boundary = try shared.retainCurrentAllocationsForTesting()
+        defer {
+            boundary.reservations.forEach(shared.release)
+            XCTAssertEqual(shared.snapshot(ownedBy: boundary.reservations).registeredReservationCount, 0)
+        }
+        let retainedBoundary = shared.snapshot(ownedBy: boundary.reservations)
+        XCTAssertTrue(retainedBoundary.allReservationsRegistered)
+        XCTAssertEqual(retainedBoundary.reservationCount, boundary.distinctAllocationCount)
+        XCTAssertEqual(retainedBoundary.distinctAllocationCount, boundary.distinctAllocationCount)
+        XCTAssertEqual(retainedBoundary.chargedBytes + shared.fixedBookkeepingChargeBytes,
+                       boundary.chargedBytes)
+        let serverBaseline = boundary.chargedBytes
+        XCTAssertEqual(shared.chargedBytes, serverBaseline,
+                       "The captured aliases must retain exactly the sampled global charge")
         let parserBytes = LoopbackStorageLayout.current.parserAllocationBytes
         XCTAssertLessThan(serverBaseline + parserBytes, soft)
         let serverFiller = try shared.reserve(allocationIdentity: UUID(),
             bytes: soft - serverBaseline - parserBytes)
         defer { shared.release(serverFiller) }
+        XCTAssertEqual(shared.chargedBytes, soft - parserBytes,
+                       "Leave exactly one parser allocation before the real staging admission")
         let blocked = try rawRequest(port: secondFixture.server.port,
                                      target: secondFixture.server.masterPath)
         XCTAssertEqual(blocked.status, 503,
                        "第二个 server 的新 staging allocation 必须传播为正常 HTTP 背压")
         XCTAssertTrue(waitUntil { secondFixture.server.usage.softBackpressureCount >= 1 })
+        XCTAssertEqual(shared.snapshot(ownedBy: boundary.reservations), retainedBoundary,
+                       "A late original-owner release must not lower the retained boundary")
         shared.release(serverFiller)
         XCTAssertEqual(try rawRequest(port: secondFixture.server.port,
                                       target: secondFixture.server.masterPath).status, 200)

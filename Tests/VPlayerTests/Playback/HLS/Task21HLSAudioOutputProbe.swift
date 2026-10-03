@@ -108,6 +108,24 @@ final class Task21HLSAudioOutputProbe {
             }
         }
 
+        /// Exactly the independently reproduced whole-mix absence signature.
+        /// Partial callbacks, source/API faults, missing EOS or extra markers fail.
+        var hasExactUnprocessedLifecycle: Bool {
+            firstFailure == 0 && records.count == 2
+                && records[0].kind == .initialize && records[0].ordinal == 0
+                && records[1].kind == .finalize && records[1].ordinal == 1
+                && records.allSatisfy {
+                    $0.frames == 0 && $0.requestedFrames == 0 && $0.maxFrames == 0
+                        && $0.formatGeneration == 0 && $0.streamGeneration == 0
+                        && $0.windowFrames == 0 && $0.status == noErr
+                        && $0.inputFlags == 0 && $0.sourceFlags == 0
+                }
+                && samples.allSatisfy { $0 == 0 }
+                && markers.map(\.phase) == [.installed, .prepared, .activationRequested,
+                                             .activationReturned, .naturalEnd, .retiring]
+                && markers[3].rate > 0
+        }
+
         /// Call only after detachAndDrain(), on the normal test actor. Every raw
         /// callback is printed, including rate-zero, restarts and zero-frame EOS.
         func log() {
@@ -320,6 +338,29 @@ final class Task21HLSAudioOutputProbe {
         }
         guard currentMix === installedMix else { throw Failure.replacedMix }
         item.audioMix = nil
+    }
+}
+
+/// Per-invocation pending evidence, never a cached platform capability result.
+/// The caller must run the original validator; only its exact no-callback outcome
+/// can be deferred until the same-asset control and every cleanup have succeeded.
+@MainActor
+final class Task21WholeMixCapabilityObservation {
+    private(set) var callbacksNotObserved = false
+
+    func validate(_ snapshot: Task21HLSAudioOutputProbe.Snapshot,
+                  configurationValid: Bool, strict: () throws -> Void) throws {
+        do {
+            try strict()
+            guard configurationValid else {
+                throw Task21HLSAudioOutputProbe.Failure.unusable("whole-mix item/tap configuration changed")
+            }
+        } catch {
+            print("WHOLE_MIX_STRICT_DIAGNOSTIC scope=\(snapshot.scope) failure=\(error)")
+            guard configurationValid, snapshot.hasExactUnprocessedLifecycle else { throw error }
+            callbacksNotObserved = true
+            print("WHOLE_MIX_PENDING capability=unverified endpointOracle=false cleanupAndControlRequired=true")
+        }
     }
 }
 
@@ -566,6 +607,7 @@ final class Task21NativeAudioSessionReference {
     private let priorOptions: AVAudioSession.CategoryOptions
     private var configurationAttempted = false
     private var activationAttempted = false
+    private var activated = false
     private var closed = false
 
     /// Register close() as an XCTest teardown block immediately after init, before
@@ -595,6 +637,7 @@ final class Task21NativeAudioSessionReference {
         let activated = try await session.activate(options: [])
         print("AAC_NATIVE_SESSION activateReturned=\(activated)")
         guard activated else { throw Failure.activationRejected }
+        self.activated = true
         Self.logRoute(stage: "reference-activation-return")
     }
 
@@ -631,6 +674,16 @@ final class Task21NativeAudioSessionReference {
         print("AAC_NATIVE_SESSION cleanupSucceeded=true diagnosticID=\(diagnosticID.uuidString)")
     }
 
+    /// Only the exact live owner may validate calibration. No cross-test UUID or
+    /// prior-run log is accepted as an active-session capability certificate.
+    func requireActiveConfiguration() throws {
+        guard Self.owned, !closed, activated, session === AVAudioSession.sharedInstance(),
+              session.category == .playback, session.mode == .moviePlayback,
+              session.routeSharingPolicy == .default, session.categoryOptions.isEmpty,
+              !session.currentRoute.outputs.isEmpty, session.outputNumberOfChannels == 2,
+              session.sampleRate == 48_000 else { throw Failure.activationRejected }
+    }
+
     static func logRoute(stage: String) {
         let session = AVAudioSession.sharedInstance()
         let outputs = session.currentRoute.outputs
@@ -655,7 +708,34 @@ final class Task21LocalPCMTapReference {
     private final class EndSignal: Sendable {
         let received = Atomic<Bool>(false)
     }
-    private let directory: URL
+    @MainActor
+    final class PCMSource {
+        let directory: URL
+        let url: URL
+        private var closed = false
+
+        init() throws {
+            directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("Task21-local-PCM-\(UUID().uuidString)", isDirectory: true)
+            url = directory.appendingPathComponent("reference.caf")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            do { try Task21LocalPCMTapReference.writePCM(to: url) }
+            catch {
+                try FileManager.default.removeItem(at: directory)
+                throw error
+            }
+        }
+
+        func close() throws {
+            guard !closed else { return }
+            try FileManager.default.removeItem(at: directory)
+            closed = true
+        }
+    }
+    private let source: PCMSource
+    private let ownsSource: Bool
+    private let capabilityObservation: Task21WholeMixCapabilityObservation?
+    private(set) var callbackFeasibilityVerified = false
     private let association: Association
     private let sessionDiagnosticID: UUID?
     private let player = AVPlayer()
@@ -665,18 +745,18 @@ final class Task21LocalPCMTapReference {
     private var endObserver: (any NSObjectProtocol)?
     private var closed = false
 
-    init(association: Association = .assetTrack, sessionDiagnosticID: UUID? = nil) throws {
+    init(association: Association = .assetTrack, sessionDiagnosticID: UUID? = nil,
+         source: PCMSource? = nil,
+         capabilityObservation: Task21WholeMixCapabilityObservation? = nil) throws {
         self.association = association
         self.sessionDiagnosticID = sessionDiagnosticID
-        directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("Task21-local-PCM-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        self.source = try source ?? PCMSource()
+        ownsSource = source == nil
+        self.capabilityObservation = capabilityObservation
     }
 
     func playThroughNaturalEnd() async throws {
-        let url = directory.appendingPathComponent("reference.caf")
-        try Self.writePCM(to: url)
-        let asset = AVURLAsset(url: url)
+        let asset = AVURLAsset(url: source.url)
         let playable = try await asset.load(.isPlayable)
         print("LOCAL_PCM_REFERENCE assetIsPlayable=\(playable)")
         guard playable else { throw Failure.asset }
@@ -757,22 +837,32 @@ final class Task21LocalPCMTapReference {
                     && snapshot.markers.contains(where: { $0.phase == .prepared })
                     && snapshot.markers.contains(where: { $0.phase == .activationReturned && $0.rate > 0 })
                     && snapshot.markers.contains(where: { $0.phase == .naturalEnd })
-                try snapshot.requireLocalPCMCallbackFeasibility()
-                print("LOCAL_PCM_REFERENCE callbackFeasibility=true physicalTapFinalized=true endpointOracle=false")
+                if association == .wholeMix, let capabilityObservation {
+                    try capabilityObservation.validate(snapshot,
+                        configurationValid: probe.configurationStayedValid) {
+                        try snapshot.requireLocalPCMCallbackFeasibility()
+                    }
+                } else {
+                    try snapshot.requireLocalPCMCallbackFeasibility()
+                }
+                callbackFeasibilityVerified = !noProcessingCandidate && probe.configurationStayedValid
+                print("LOCAL_PCM_REFERENCE callbackFeasibility=\(callbackFeasibilityVerified) "
+                    + "physicalTapFinalized=true endpointOracle=false")
             } catch {
                 if failure == nil { failure = error }
                 print("LOCAL_PCM_REFERENCE evidenceFailure=\(error)")
             }
         }
         probe = nil
-        do { try FileManager.default.removeItem(at: directory) }
+        do { if ownsSource { try source.close() } }
         catch {
             referenceCleanupSucceeded = false
             if failure == nil { failure = error }
         }
         print("LOCAL_PCM_REFERENCE cleanup itemAbsent=\(player.currentItem == nil) "
             + "rate=\(player.rate) disconnected=\(player.disconnectedFromSystemAudio) "
-            + "temporaryDirectoryRemoved=\(!FileManager.default.fileExists(atPath: directory.path))")
+            + "temporaryDirectoryRemoved=\(!FileManager.default.fileExists(atPath: source.directory.path)) "
+            + "sourceRetainedBySameAssetControl=\(!ownsSource)")
         if let sessionDiagnosticID, noProcessingCandidate && referenceCleanupSucceeded
             && player.timeControlStatus == .paused {
             // Count only with the matching diagnosticID from this invocation's
@@ -782,8 +872,10 @@ final class Task21LocalPCMTapReference {
                 + "capability=unverified observedUnavailableCount=1 endpointVerifiedCount=0 "
                 + "referenceCleanupSucceeded=true sessionCleanup=requiresSeparateConfirmation")
         }
-        // Preserve the existing strict failure; this marker never passes/skips it.
+        // Only an explicitly supplied observation can defer exact callback
+        // absence. Setup, partial processing and cleanup errors still throw here.
         if let failure { throw failure }
+        guard player.timeControlStatus == .paused else { throw Failure.cleanup }
     }
 
     private func waitFor(_ stage: String, until ready: () -> Bool) async throws {

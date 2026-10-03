@@ -119,8 +119,13 @@ def allocator_size_chain(ir, symbol):
     # Deliberately narrow SSA pattern, bounded to one function. Unknown syntax
     # rejects; this is not a general LLVM interpreter or a constant-size guess.
     # Observed optional nuw constrains GEP arithmetic; field/index checks stay exact.
+    # Packed i32/i32 has no padding: the observed i8 + 4 form also selects field 1.
+    # Require that exact layout before interpreting a byte GEP; guess no offsets.
+    packed_layout=re.search(r'^%swift\.async_func_pointer = type <\{ i32, i32 \}>$',ir,re.M)
     for function,body in re.findall(r'^define\b[^\n]*@"([^"\n]+)"[^\n]*\{\n(.*?)^\}',ir,re.M|re.S):
         load=re.search(r'(%[\w.]+) = load i32, ptr getelementptr inbounds(?: nuw)? \(%swift\.async_func_pointer, ptr @"'+re.escape(symbol)+r'", i32 0, i32 1\)',body)
+        if not load and packed_layout:
+            load=re.search(r'(%[\w.]+) = load i32, ptr getelementptr inbounds nuw \(i8, ptr @"'+re.escape(symbol)+r'", i64 4\)',body)
         if not load: continue
         rest=body[load.end():]
         extend=re.search(r'(%[\w.]+) = zext i32 '+re.escape(load[1])+r' to i64\b',rest)
