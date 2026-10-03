@@ -2747,7 +2747,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = appletvos;
@@ -2771,7 +2771,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core;
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
@@ -2821,7 +2821,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback;
 				PUBLIC_HEADERS_FOLDER_PATH = "$(CONTENTS_FOLDER_PATH)/Headers";
@@ -2845,7 +2845,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = appletvos;
@@ -2924,7 +2924,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core;
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
@@ -3032,7 +3032,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback;
 				PUBLIC_HEADERS_FOLDER_PATH = "$(CONTENTS_FOLDER_PATH)/Headers";
