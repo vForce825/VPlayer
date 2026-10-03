@@ -4320,6 +4320,101 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                       "后继真实首 media mapping 偏移变化必须失败闭合")
     }
 
+    @MainActor
+    func testPausedPrefixResumesAuthenticatedFinalTailAfterIncrementalFinalization() async throws {
+        try await task22VerifyPrefixFinalizesWhilePaused { lifecycle in
+            let harness = try await Task22LongRenditionHarness.make(outputLifecycleEpoch: lifecycle)
+            var reservedServer: LoopbackHTTPServer?
+            var reservedSource: LoopbackAVPlayerPreparationEvidenceSource?
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.urlCache = nil
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            let session = URLSession(configuration: configuration)
+            func retire() async throws {
+                session.invalidateAndCancel()
+                reservedSource?.retirePreparation()
+                await harness.branch.cancelAndAwait()
+                guard let server = reservedServer else { return }
+                let ticket = server.closeAdmission()
+                let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                while (server.usage.connections != 0 || server.usage.activeResponses != 0
+                        || FrozenPreparationOwner.activeHistoryServer === server),
+                      ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                guard server.usage.connections == 0, server.usage.activeResponses == 0,
+                      FrozenPreparationOwner.activeHistoryServer !== server else {
+                    throw AVPlayerItemCoordinatorFailure.operationInFlight
+                }
+                try server.drain(cleanupTicket: ticket)
+                try server.retire(cleanupTicket: ticket)
+            }
+            do {
+            let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
+                itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in },
+                prepare: { token in try await harness.startPublication(loopbackSession: token) })
+            reservedServer = server
+            let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+            reservedSource = source
+            let itemURL = try XCTUnwrap(URL(string: try harness.declaration.playlistURI(participantID: 2),
+                relativeTo: server.baseURL)?.absoluteURL)
+            func serve(_ snapshot: HLSPublishedSnapshot) async throws {
+                let media = try XCTUnwrap(snapshot.media[2])
+                let keys = media.initializationResources + media.resources
+                for url in [itemURL] + (try keys.map {
+                    try XCTUnwrap(URL(string: server.path(for: $0), relativeTo: server.baseURL)?.absoluteURL)
+                }) {
+                    let (body, response) = try await session.data(from: url)
+                    XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+                    XCTAssertFalse(body.isEmpty)
+                }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                while !keys.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }),
+                      ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                guard keys.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }) else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+            }
+            let original = try XCTUnwrap(harness.publisher.visible)
+            let originalMedia = try XCTUnwrap(original.media[2])
+            let originalTerminal = try XCTUnwrap(original.aacTerminalBindings[2])
+            XCTAssertFalse(originalMedia.isFinal)
+            XCTAssertNil(harness.renditionBinding.finalWriterReceipt)
+            XCTAssertNil(harness.renditionBinding.endpointAuthority)
+            try await serve(original)
+            let bundle = try LoopbackAVPlayerPreparationBundle(evidenceSource: source,
+                item: harness.itemIdentity, publicationSequence: original.publicationSequence)
+            return Task22PausedPrefixResumeFixture(request: bundle.request, source: source,
+                prefixHorizon: try XCTUnwrap(originalMedia.effectivePlaybackHorizon), finish: { prefix in
+                    XCTAssertEqual(prefix.publicationSequence, original.publicationSequence)
+                    XCTAssertNil(harness.store.currentFinalPublication(matching: prefix.mapping.binding))
+                    let encoderFinal = try await harness.finishStream(totalPCMInputs: 350)
+                    let writerFinal = try await harness.branch.finishRendition()
+                    XCTAssertEqual(writerFinal.inputCount, encoderFinal.emissionCount)
+                    XCTAssertEqual(writerFinal.inputDigest, encoderFinal.cumulativeDigest)
+                    try harness.finishPublication()
+                    let published = try XCTUnwrap(harness.publisher.visible)
+                    XCTAssertTrue(try XCTUnwrap(published.media[2]).isFinal)
+                    XCTAssertNil(harness.store.currentFinalPublication(matching: writerFinal.binding),
+                        "Committed final metadata cannot replace the unsent terminal HTTP body")
+                    try await serve(published)
+                    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                    while harness.renditionBinding.endpointAuthority == nil,
+                          ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                    let authority = try XCTUnwrap(harness.renditionBinding.endpointAuthority)
+                    let final = try XCTUnwrap(harness.store.currentFinalPublication(matching: writerFinal.binding))
+                    XCTAssertEqual(final.effectivePlaybackHorizon, writerFinal.lastEffectiveEnd)
+                    XCTAssertEqual(try AVPlayerAACEndpointValidator.preflight(authority: authority,
+                        currentFinalPublication: final, store: harness.store, originalPrefix: prefix,
+                        originalTerminalBinding: originalTerminal), authority.receipt)
+                    return final
+                }, retire: { try await retire() })
+            } catch {
+                let first = error
+                do { try await retire() } catch { XCTFail("Prefix setup cleanup failed: \(error)") }
+                throw first
+            }
+        }
+    }
+
     func testAACContinuousBranchExceeds384SignedEmissionsAndFinalCoordinatorConsumesAutomaticHTTPSeal()
         async throws {
         let harness = try await Task22LongRenditionHarness.make()
@@ -5783,6 +5878,10 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
     }
 
+    func testCurrentFinalVideoProjectionAuthenticatesLogicalScopeAcrossRealWriterRollover() async throws {
+        try await exerciseRealRemuxAndCompressedAudioPublication(.ac3, verifyFinalVideoContinuation: true)
+    }
+
     func testRealRemuxThreeWriterWindowsKeepCanonicalInitAndServeEachWindowOverHTTP()
         async throws {
         try await exerciseRealRemuxAndCompressedAudioPublication(.ac3)
@@ -5809,7 +5908,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
 
     private func exerciseRealRemuxAndCompressedAudioPublication(
         _ audioKind: SegmentedFMP4TrackKind,
-        videoMode: Task22GenericVideoPublicationHarness.VideoMode = .remux
+        videoMode: Task22GenericVideoPublicationHarness.VideoMode = .remux,
+        verifyFinalVideoContinuation: Bool = false
     ) async throws {
         let harness = try Task22GenericVideoPublicationHarness(
             audioKind: audioKind, videoMode: videoMode)
@@ -5833,6 +5933,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         var canonicalBodies: [UInt64: Data] = [:]
         var servedMedia: Set<HLSResourceKey> = []
         var windowsWithHTTP: [UInt64: Set<UInt64>] = [:]
+        let originalVideo = try XCTUnwrap(harness.observation.snapshot.participantVector.first {
+            $0.participantID == harness.participantID
+        }).binding
+        let originalTicket = harness.publisher.ticket
+        var continuedFinal: HLSCurrentFinalPublication?
         func serve(_ observation: Task22GenericVideoPublicationHarness.Observation) async throws {
             let snapshot = observation.snapshot
             for participantID in [harness.participantID, harness.audioParticipantID] {
@@ -5881,6 +5986,39 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         }
         try await serve(harness.observation)
         try await harness.finish { try await serve($0) }
+        if verifyFinalVideoContinuation {
+            let currentVideo = try XCTUnwrap(harness.observation.snapshot.participantVector.first {
+                $0.participantID == harness.participantID
+            }).binding
+            XCTAssertNotEqual(currentVideo.writerIdentity, originalVideo.writerIdentity)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while harness.store.currentFinalPublication(matching: currentVideo) == nil,
+                  ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+            let exact = try XCTUnwrap(harness.store.currentFinalPublication(matching: currentVideo))
+            XCTAssertNil(harness.store.currentFinalPublication(matching: originalVideo),
+                "The existing exact-physical-binding lookup must remain strict")
+            let continued = try XCTUnwrap(harness.store.currentFinalVideoPublication(continuing: originalVideo))
+            continuedFinal = continued
+            XCTAssertEqual(continued, exact)
+            XCTAssertEqual(continued.binding, currentVideo)
+            XCTAssertTrue(harness.store.validatesCurrentFinalPublication(continued))
+            for mutation in 0..<5 {
+                let wrong = FMP4WriterBinding(
+                    outputLifecycleEpoch: mutation == 0
+                        ? AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 99_910) : originalVideo.outputLifecycleEpoch,
+                    itemGeneration: .init(rawValue: originalVideo.itemGeneration.rawValue + (mutation == 1 ? 1 : 0)),
+                    mediaEpoch: .init(rawValue: originalVideo.mediaEpoch.rawValue + (mutation == 2 ? 1 : 0)),
+                    publicationParticipantID: .init(rawValue: originalVideo.publicationParticipantID.rawValue + (mutation == 3 ? 1 : 0)),
+                    renditionIdentity: .init(rawValue: originalVideo.renditionIdentity.rawValue + (mutation == 4 ? 1 : 0)),
+                    writerIdentity: originalVideo.writerIdentity)
+                XCTAssertNotEqual(wrong, originalVideo)
+                XCTAssertNil(harness.store.currentFinalVideoPublication(continuing: wrong))
+            }
+            let audio = try XCTUnwrap(harness.observation.snapshot.participantVector.first {
+                $0.participantID == harness.audioParticipantID
+            }).binding
+            XCTAssertNil(harness.store.currentFinalVideoPublication(continuing: audio))
+        }
         XCTAssertGreaterThanOrEqual(harness.videoWriterWindowCount, 3)
         XCTAssertGreaterThanOrEqual(harness.audioWriterWindowCount, 3)
         XCTAssertGreaterThanOrEqual(windowsWithHTTP[harness.participantID]?.count ?? 0, 3)
@@ -5900,8 +6038,20 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let retainedKey = try XCTUnwrap(
             harness.observation.snapshot.media[harness.participantID]?.resources.last)
         let retainedResponse = try harness.retainResponseAlias(for: retainedKey)
+        defer { harness.releaseResponseAlias(retainedResponse) }
         XCTAssertEqual(harness.responseBackingBytes, retainedResponse.residentByteCount)
         XCTAssertGreaterThan(harness.responseBackingBytes, 0)
+        if let continuedFinal {
+            XCTAssertThrowsError(try harness.publisher.reconfigure(retiring: [harness.participantID],
+                ticket: originalTicket)) {
+                XCTAssertEqual($0 as? HLSPublicationFailure, .staleTicket)
+            }
+            XCTAssertEqual(harness.store.currentFinalVideoPublication(continuing: originalVideo), continuedFinal,
+                "A stale caller ticket cannot change the committed final authority")
+            _ = try harness.publisher.reconfigure(retiring: [harness.participantID], ticket: harness.publisher.ticket)
+            XCTAssertNil(harness.store.currentFinalVideoPublication(continuing: originalVideo))
+            XCTAssertFalse(harness.store.validatesCurrentFinalPublication(continuedFinal))
+        }
         let cleanupTicket = server.closeAdmission()
         try server.drain(cleanupTicket: cleanupTicket)
         try server.retire(cleanupTicket: cleanupTicket)
@@ -6337,6 +6487,8 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
         sink.store?.decodeCoverageMap(for: key)
     }
     var responseBackingBytes: Int { sink.store?.usage.responseBackingBytes ?? 0 }
+    var store: SealedMediaStore { sink.store! }
+    var publisher: HLSPublicationCoordinator { sink.publisher! }
     func retainResponseAlias(for key: HLSResourceKey) throws -> HLSMediaResponseLease {
         try XCTUnwrap(try sink.store?.acquireResponse(
             key, token: sink.declaration!.token, now: 0))
@@ -7061,21 +7213,25 @@ private final class Task22LongRenditionHarness: @unchecked Sendable {
               itemGeneration: initialBinding.itemGeneration.rawValue)
     }
 
-    static func make() async throws -> Task22LongRenditionHarness {
+    static func make(outputLifecycleEpoch: OutputLifecycleEpoch? = nil) async throws -> Task22LongRenditionHarness {
         let calibration = try await AACPrimingCalibrator().calibrate(plan:
             AACCalibrationPlan.build([try AACRenditionRequest(
                 layout: RenditionAudioLayout(labels: [.l, .r]),
                 capabilityVersion: "task22-b-385-emissions")]))
         return try Task22LongRenditionHarness(
-            encoder: XCTUnwrap(calibration.encoders.first))
+            encoder: XCTUnwrap(calibration.encoders.first), outputLifecycleEpoch: outputLifecycleEpoch)
     }
 
-    private init(encoder: AACRenditionEncoder) throws {
+    private init(encoder: AACRenditionEncoder, outputLifecycleEpoch: OutputLifecycleEpoch?) throws {
         self.encoder = encoder
         format = try encoder.incrementalFormatDescription()
         boundary = try SegmentBoundaryCoordinator(
             mode: .audioOnly(epochStart: CMTime(value: 10, timescale: 1)))
-        initialBinding = Task19.binding(id: 2, epoch: 1, writer: 32_000, item: 19)
+        let legacy = Task19.binding(id: 2, epoch: 1, writer: 32_000, item: 19)
+        initialBinding = FMP4WriterBinding(outputLifecycleEpoch: outputLifecycleEpoch ?? legacy.outputLifecycleEpoch,
+            itemGeneration: legacy.itemGeneration, mediaEpoch: legacy.mediaEpoch,
+            publicationParticipantID: legacy.publicationParticipantID,
+            renditionIdentity: legacy.renditionIdentity, writerIdentity: legacy.writerIdentity)
         sink = Task22LongPublicationSink(initialBinding: initialBinding)
         try boundary.registerAudioRendition(
             initialBinding.renditionIdentity,

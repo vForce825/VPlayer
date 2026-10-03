@@ -6683,6 +6683,109 @@ func task22PrepareFinalThroughCoordinator(
     return (expected, driver.constrainedPlaybackEnd)
 }
 
+/// Test-only bridge from the real incremental writer fixture into the existing
+/// Registry coordinator/driver fixture. All final authority remains server-issued.
+@MainActor
+struct Task22PausedPrefixResumeFixture {
+    let request: AVPlayerItemPreparationRequest
+    let source: LoopbackAVPlayerPreparationEvidenceSource
+    let prefixHorizon: ExactMediaTime
+    let finish: @MainActor (AACPrefixPlaybackMappingReceipt) async throws -> HLSCurrentFinalPublication
+    let retire: @MainActor () async throws -> Void
+}
+
+@MainActor
+func task22VerifyPrefixFinalizesWhilePaused(
+    make: @MainActor (OutputLifecycleEpoch) async throws -> Task22PausedPrefixResumeFixture
+) async throws {
+    let driver = Task21FakeDriver()
+    let backend = Task21RegistryBackend()
+    let graph = try OutputGraphFixture(backendObject: backend)
+    backend.configure(identity: graph.lifecycle.backendIdentity, itemGeneration: 19)
+    backend.configureNeverInstalledRetirement(driver: driver, lifecycle: graph.lifecycle)
+    var reservedFixture: Task22PausedPrefixResumeFixture?
+    func activate() async throws -> BackendActivationResult {
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let ticket = try XCTUnwrap(graph.registry.beginOutputActivation(contextNonce: context.contextNonce))
+        backend.clearActivationResult()
+        guard graph.registry.startOutputActivationOperation(ticket),
+              case .succeeded = await graph.registry.joinOutputBackendOperation(ticket) else { return .rejected }
+        return try XCTUnwrap(backend.activationResult)
+    }
+    func run() async throws {
+        let fixture = try await make(graph.lifecycle)
+        reservedFixture = fixture
+        let coordinator = try AVPlayerItemCoordinator(driver: driver, evidenceSource: fixture.source,
+            backendPublicationReplacementAuthoritySlot: backend.backendPublicationReplacementAuthoritySlot)
+        backend.attach(coordinator, physicalDriver: driver)
+        backend.configure(identity: graph.lifecycle.backendIdentity, itemGeneration: fixture.request.item.itemGeneration)
+        try coordinator.install(fixture.request)
+        let preparation = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(graph.registry.startOutputPrepareOperation(preparation))
+        guard case .succeeded = await graph.registry.joinOutputBackendOperation(preparation) else {
+            throw backend.lastError ?? AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        let prepared = try XCTUnwrap(backend.prepared)
+        let timeline = prepared.identity.timelineMappingAuthority
+        let prefix = try XCTUnwrap(timeline.aacPrefixReceipt)
+        XCTAssertNil(timeline.aacEndpointReceipt)
+        let targetSource = try fixture.prefixHorizon.subtracting(ExactMediaTime(value: 1, timescale: 4))
+        let target = try timeline.playerItemTime(for: targetSource)
+        XCTAssertGreaterThanOrEqual(target.value, 0)
+        guard case .armed = try await activate() else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        driver.observedPausedTime = target.cmTime
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .pause, at: graph.registry.clock.nowNanoseconds))
+        let joined = await graph.registry.joinOutputBackendOperations(owner: owner)
+        XCTAssertTrue(joined)
+        let stop = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
+        XCTAssertTrue(graph.registry.startOutputSuspendOperation(stop.task, owner: owner))
+        guard case .succeeded = await graph.registry.joinOutputBackendOperation(stop.task) else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
+        let receipt = try XCTUnwrap(backend.quiescenceReceipt)
+        XCTAssertEqual(coordinator.capturedPausedCursor(for: receipt)?.time, target)
+        XCTAssertTrue(driver.disconnectedFromSystemAudio)
+        let final = try await fixture.finish(prefix)
+        XCTAssertGreaterThan(final.publicationSequence, prepared.identity.publicationSequence)
+        let remaining = try final.effectivePlaybackHorizon.subtracting(targetSource)
+        guard remaining.value > 0,
+              try HLSChecked.compare(remaining, ExactMediaTime(value: 3, timescale: 1)) < 0 else {
+            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        let expected = try FMP4PresentationRange(start: target, duration: remaining)
+        driver.loadedRangesOverride = [expected]
+        driver.applySeekToObservedPausedTime = true
+        driver.reconnectedPausedTime = try target.adding(ExactMediaTime(value: 1, timescale: 1_000_000)).cmTime
+        XCTAssertTrue(graph.registry.finishOutputPause(owner: owner))
+        let result = try await activate()
+        guard case .armed = result else {
+            XCTFail("Authenticated same-rendition finalization while paused must resume the original cursor")
+            return
+        }
+        XCTAssertEqual(driver.requestedSeekTime, target)
+        XCTAssertEqual(driver.lastPlayedPausedTime, target)
+        XCTAssertEqual(driver.lastRequestedLoadedRange, expected)
+        XCTAssertEqual(driver.lastRequestedLoadedRange?.end,
+            try timeline.playerItemTime(for: final.effectivePlaybackHorizon))
+        XCTAssertEqual(driver.playCallCount, 2)
+        XCTAssertEqual(driver.prerollCallCount, 2)
+        XCTAssertEqual(driver.operations.filter { $0 == .install }.count, 1)
+        XCTAssertTrue(driver.observedPlayheads.allSatisfy { $0.timelineMappingAuthority === timeline })
+        XCTAssertNil(timeline.aacEndpointReceipt, "The original prefix mapping must remain unchanged")
+    }
+    var firstFailure: (any Error)?
+    do { try await run() } catch { firstFailure = error }
+    driver.observedPlayheads.removeAll()
+    backend.discardPreparedObservation()
+    do { try await stopAndRetireTask21RegistryOutput(graph: graph, backend: backend) }
+    catch { if firstFailure == nil { firstFailure = error } else { XCTFail("Owned cleanup failed: \(error)") } }
+    do { try await reservedFixture?.retire() }
+    catch { if firstFailure == nil { firstFailure = error } else { XCTFail("Transport retirement failed: \(error)") } }
+    if let firstFailure { throw firstFailure }
+}
+
 private final class Task21PrepareCancellationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
@@ -7914,6 +8017,13 @@ private final class Task21RegistryBackend: PlaybackBackend,
         sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0
     )
     private weak var physicalDriver: (any AVPlayerDriving)?
+    private var neverInstalledRetirement: (driver: Task21FakeDriver, lifecycle: OutputLifecycleEpoch)?
+
+    @MainActor
+    func configureNeverInstalledRetirement(driver: Task21FakeDriver, lifecycle: OutputLifecycleEpoch) {
+        lock.withLock { neverInstalledRetirement = (driver, lifecycle) }
+    }
+
     private var configuredItemGeneration: UInt64?
     private var preparedValue: PreparedAVPlayerItem?
     private var activationValue: BackendActivationResult?
@@ -8076,6 +8186,20 @@ private final class Task21RegistryBackend: PlaybackBackend,
         // 原子升级同一 owner；否则 Control 可在测试 MainActor 恢复前完成 reprepare
         // handoff。闸门只延迟这个真实调用的 completion，不伪造任何 proof/authority。
         await retirementCompletionGate.wait()
+        let uninstalled = lock.withLock { () -> Task21FakeDriver? in
+            guard let candidate = neverInstalledRetirement,
+                  candidate.lifecycle == epoch, configuredIdentity == epoch.backendIdentity else { return nil }
+            return candidate.driver
+        }
+        if let uninstalled, await MainActor.run(body: {
+            !uninstalled.operations.contains(.install) && uninstalled.currentItemIdentity == nil
+                && uninstalled.rate == 0 && uninstalled.timeControlStatus == .paused
+        }) {
+            // This opt-in test driver never installed an item. No quiescence
+            // receipt is created; every installed path still uses its owned stop.
+            lock.withLock { lastRetiredEpochValue = epoch }
+            return .confirmedLocalOutputStopped
+        }
         let cleanup = lock.withLock { () -> (
             AVPlayerItemCoordinator, AVPlayerQuiescenceReceipt
         )? in

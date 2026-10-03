@@ -1,4 +1,4 @@
-name: Final-tail authority and native output controls
+name: Prefix finality and exact owner cancellation
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -91,6 +91,10 @@ jobs:
           ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
+      - name: Validate artifact-local async context controls
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: bash Scripts/run-paused-async-context-controls.sh
       - name: Validate PausedResume
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
@@ -158,7 +162,9 @@ jobs:
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeNonfinalShortLeadRejectsBeforeReconnect \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeFinalTailRetirementAtEachAwaitRejectsBeforeNextEffect \
             -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointReceiptRequiresSameWriterProofPlaylistHTTPBackingAndEffectiveEnd \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointMutationTableRejectsDeletedTrimPlusMinusOneAndPrematureNonfinalTrim
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testAACEndpointMutationTableRejectsDeletedTrimPlusMinusOneAndPrematureNonfinalTrim \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testPausedPrefixResumesAuthenticatedFinalTailAfterIncrementalFinalization \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testCurrentFinalVideoProjectionAuthenticatesLogicalScopeAcrossRealWriterRollover
       - name: Report RemainingPausedBoundaries failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/RemainingPausedBoundaries.xcresult"

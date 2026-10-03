@@ -4507,11 +4507,20 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     func joinOutputBackendOperation(_ ticket: ControlTaskTicket) async -> PlaybackBackendOperationResult {
-        let runner: OwnedPlaybackBackendOperation? = try? transaction { _ in
-            authority.commands.first(where: { $0?.controlTaskTicket == ticket })??.backendOperation
+        let execution: (runner: OwnedPlaybackBackendOperation, task: Task<Void, Never>?,
+            shouldCancel: Bool)? = try? transaction { _ in
+            guard let record = authority.commands.first(where: { $0?.controlTaskTicket == ticket }) ?? nil,
+                  let runner = record.backendOperation else { return nil }
+            return (runner, runner.task, record.slot == .activation &&
+                runner.operation.slot == .activation && record.phase == .cancelRequested)
         }
-        guard let runner else { return .canceled }
-        await runner.task?.value
+        guard let execution else { return .canceled }
+        // Join delivers only a cancellation already authorized for this exact
+        // activation. Never cancel cleanup/suspend runners or newer work, and
+        // never invoke a cancellation handler while the Cell lock is held.
+        if execution.shouldCancel { execution.task?.cancel() }
+        await execution.task?.value
+        let runner = execution.runner
         return (try? transaction { _ in
             guard let index = authority.commands.firstIndex(where: { $0?.controlTaskTicket == ticket }),
                   case .terminal = authority.commands[index]?.phase,

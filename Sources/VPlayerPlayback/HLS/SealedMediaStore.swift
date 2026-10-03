@@ -1101,6 +1101,27 @@ final class SealedMediaStore: @unchecked Sendable {
         domain.sync { currentFinalPublicationLocked(matching: binding) }
     }
 
+    /// The server supplies its authenticated original logical binding. Resolve
+    /// the current physical video writer only from this store's committed ticket;
+    /// no caller-provided successor writer can authorize a final publication.
+    func currentFinalVideoPublication(continuing original: FMP4WriterBinding)
+        -> HLSCurrentFinalPublication? {
+        domain.sync {
+            guard let participant = expectedTicket?.participantVector.first(where: {
+                $0.participantID == original.publicationParticipantID.rawValue
+            }) else { return nil }
+            let current = participant.binding
+            guard current.outputLifecycleEpoch == original.outputLifecycleEpoch,
+                  current.itemGeneration == original.itemGeneration,
+                  current.mediaEpoch == original.mediaEpoch,
+                  current.publicationParticipantID == original.publicationParticipantID,
+                  current.renditionIdentity == original.renditionIdentity,
+                  let final = currentFinalPublicationLocked(matching: current),
+                  final.mediaType == .video else { return nil }
+            return final
+        }
+    }
+
     /// 不执行外部回调；调用方在同一 domain 内把 freshness 与覆盖验证组合。
     func validatesCurrentFinalPublication(_ value: HLSCurrentFinalPublication) -> Bool {
         domain.sync {
