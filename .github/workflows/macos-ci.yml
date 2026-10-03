@@ -1,4 +1,4 @@
-name: Native fixture and interruption validation
+name: Paused resume regressions and strict native fixtures
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-native-diagnostics-${{ github.sha }}
+  group: macos-ci-native-reference-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
           '
 
       - name: Install build tooling
-        run: brew install mint jq ripgrep
+        run: brew install mint jq ripgrep ffmpeg
 
       - name: Build and audit pinned FFmpeg
         run: ./ci_scripts/ci_post_clone.sh
@@ -59,30 +59,27 @@ jobs:
           python3 Scripts/Tests/test_tvos27_deployment.py
           ./Scripts/Tests/test_precompiled_metal_library.sh
 
-      - name: Generate the project for the new test-only output probe
-        id: generated_project
+      - name: Inspect the exact Swift toolchain ABI availability
         run: |
-          ./Scripts/bootstrap.sh --generate
-          ./Scripts/verify-licenses.sh
-      - name: Export the generated project for reproducible commit
-        if: ${{ !cancelled() && steps.generated_project.outcome == 'success' }}
-        run: |
-          python3 - <<'PYPROJECT'
-          import base64, hashlib, pathlib
-          data = pathlib.Path("VPlayer.xcodeproj/project.pbxproj").read_bytes()
-          encoded = base64.b64encode(data).decode("ascii")
-          print("CI_GENERATED_PROJECT_BEGIN sha256=" + hashlib.sha256(data).hexdigest())
-          for offset in range(0, len(encoded), 4096):
-              print("CI_GENERATED_PROJECT_CHUNK=" + encoded[offset:offset + 4096])
-          print("CI_GENERATED_PROJECT_END")
-          PYPROJECT
-      - name: Compile complete Debug targets with the output probe
+          xcrun swiftc --version
+          toolchain="$(dirname "$(dirname "$(xcrun --find swiftc)")")"
+          found=0
+          while IFS= read -r header; do
+            found=1
+            echo "SWIFT_EXECUTOR_ABI_HEADER_BEGIN $header"
+            shasum -a 256 "$header"
+            sed -n '/class AsyncFunctionPointer/,/^};/p' "$header"
+            echo "SWIFT_EXECUTOR_ABI_HEADER_END"
+          done < <(find "$toolchain" -type f -path '*/swift/ABI/Executor.h')
+          echo "SWIFT_EXECUTOR_ABI_HEADER_FOUND=$found"
+      - name: Compile complete Debug targets
         id: debug_build
         run: |
           ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
           xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayer \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO
-      - name: Validate TypedInterruption
+      - name: Validate PausedResume
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -90,13 +87,18 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/TypedInterruption.xcresult" \
-            -only-testing:VPlayerTests/SystemAudioSessionConfiguratorTests \
-            -only-testing:VPlayerTests/PlaybackControllerTests/testLateTypedInterruptionCannotAutomaticallyReactivateManualResumeVeto
-      - name: Report TypedInterruption failures
+            -resultBundlePath "$RUNNER_TEMP/PausedResume.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeRestoresOwnedCursorAfterReconnectWithoutChangingTimeline \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeWithoutOwnedCursorRejectsBeforeReconnect \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeRevalidatesPublicationAfterExactSeekAwait \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeCancellationDuringExactSeekSettlesDisconnectedWithoutPlaying \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeCapacityFailureRejectsBeforeReconnect \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRegistryPauseResumePauseReusesPreparedItemButRetiresOldReceipt \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageReadinessChecksOriginalURLGenerationAndSequenceAtBindAndRevalidation
+      - name: Report PausedResume failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/TypedInterruption.xcresult"
-      - name: Validate CoordinatorFixtures
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedResume.xcresult"
+      - name: Validate PausedReviewRegressions
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -104,33 +106,18 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/CoordinatorFixtures.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSDKFixedStopReplaysExactFailureAndMeasuresObjects \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageStopReadsDirectlyAndLatePausedRelayCannotRepairFailedReceipt \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27DisconnectCallbackWithoutDisconnectedStateCannotSignReceipt \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27ReconnectDuringDirectPauseReadCannotSignReceipt \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStopRequiresRegistrySuspendClaimAndDoesNotJoinDifferentParameters \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testStorageReadinessChecksOriginalURLGenerationAndSequenceAtBindAndRevalidation \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSeekUsesTrackTimescaleAndLoadedRangesWaitMergeToContinuousThreeSeconds \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27FailedPreparationRetainsInstalledOwnerUntilPhysicalRetirement \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorFailedOriginalStopCannotPublishOrRetryItsCapturedTime \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testReview3BackendQuiescenceReceiptRequiresExactPrivateIssuerIdentityAndSingleConsumption
-      - name: Report CoordinatorFixtures failures
+            -resultBundlePath "$RUNNER_TEMP/PausedReviewRegressions.xcresult" \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedResumeDecodePinsExcludeUnfetchedNoncontributingVideoHold \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumePreservesSeekFailureWhenRollbackAlsoFails \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeRejectsLatchedSourceFailureWhilePaused \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeRejectsLatchedSourceFailureAfterCoverageFreeze \
+            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests/testOperationReturnWaitCloseWakesWithoutReturningPhysicalCredit \
+            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests/testOperationReturnWaitCancelWakesWithoutReturningPhysicalCredit \
+            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests/testOperationReturnWaitRejectsSecondWaiterAndCancellationAllowsReplacement \
+            -only-testing:VPlayerTests/AVPlayerSDKCallbackCreditPoolTests/testOperationReturnPhysicalDeinitRacingCancellationResolvesOnce
+      - name: Report PausedReviewRegressions failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CoordinatorFixtures.xcresult"
-      - name: Validate AudioOutputProbe
-        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
-        run: |
-          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
-            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO -collect-test-diagnostics never \
-            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/AudioOutputProbe.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27HLSTapReportsRawOutputThroughNaturalEOSAndFinalizes
-      - name: Report AudioOutputProbe failures
-        if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/AudioOutputProbe.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedReviewRegressions.xcresult"
       - name: Validate NativeLoaded
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
@@ -144,7 +131,7 @@ jobs:
       - name: Report NativeLoaded failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeLoaded.xcresult"
-      - name: Validate NativeEOS
+      - name: Validate CanonicalOutput
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -152,12 +139,12 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeEOS.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testFinalEOSRequiresTwoStableDirectReadsAndRetiresOnTrimMutationTimeoutOrEndpointMismatch
-      - name: Report NativeEOS failures
+            -resultBundlePath "$RUNNER_TEMP/CanonicalOutput.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27HLSTapReportsRawOutputThroughNaturalEOSAndFinalizes
+      - name: Report CanonicalOutput failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeEOS.xcresult"
-      - name: Validate NativeCoalesced
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CanonicalOutput.xcresult"
+      - name: Validate NativeSessionOutput
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
           xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
@@ -165,9 +152,24 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -resultBundlePath "$RUNNER_TEMP/NativeCoalesced.xcresult" \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesCoalescedPausedRelayAndRejectsChangedSecondRead \
-            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeEndpointFirstReadSurvivesLaterPausedRelayAndRejectsChangedSecondRead
-      - name: Report NativeCoalesced failures
+            -resultBundlePath "$RUNNER_TEMP/NativeSessionOutput.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27HLSTapWithExplicitNativeSessionReportsRawOutput
+      - name: Report NativeSessionOutput failures
         if: ${{ always() }}
-        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeCoalesced.xcresult"
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeSessionOutput.xcresult"
+      - name: Run HTTP playback and strict 900-second 4K remux assertions
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/vplayer-timeline.XXXXXX")"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 Scripts/generate-timeline-fixture.py "$fixture_dir/timeline.ts"
+          ./Scripts/run-playback-integration-tests.sh \
+            --timeline-fixture "$fixture_dir/timeline.ts" \
+            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
+            --only-testing VPlayerTests/HLSTimelineTests \
+            -- -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300

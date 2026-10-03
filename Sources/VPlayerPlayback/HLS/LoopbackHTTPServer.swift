@@ -925,6 +925,55 @@ struct LoopbackAVPlayerCoverageEvidence {
     let effectivePresentationRange: FMP4PresentationRange
 }
 
+/// This exact server-issued transaction owns its independent paused HTTP
+/// freeze and bounded workspace. It cannot issue a startup mapping or selection.
+final class LoopbackPausedResumeCoverage: @unchecked Sendable {
+    fileprivate let server: LoopbackHTTPServer
+    fileprivate let originalOwner: FrozenPreparationOwner
+    let scope: AVPlayerPausedResumeScope
+    let requested: FMP4PresentationRange
+    fileprivate let lease: PausedWindowCoverageLease
+    fileprivate let workspace: PausedCoverageWorkspace
+    fileprivate var verified = false
+    private let reservation: PlaybackResourceContextReservation
+
+    fileprivate static func make(server: LoopbackHTTPServer, originalOwner: FrozenPreparationOwner,
+        scope: AVPlayerPausedResumeScope, requested: FMP4PresentationRange,
+        lease: PausedWindowCoverageLease, workspace: PausedCoverageWorkspace) throws -> Self {
+        let root = malloc_good_size(class_getInstanceSize(Self.self))
+        let context = malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self))
+        let application = malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: root + context + application)
+        do {
+            let value = Self(server: server, originalOwner: originalOwner, scope: scope,
+                requested: requested, lease: lease, workspace: workspace, reservation: reservation)
+            try PlaybackResourceContextLedger.shared.rebind(reservation,
+                to: .object(ObjectIdentifier(value)))
+            guard malloc_size(Unmanaged.passUnretained(value).toOpaque()) <= root,
+                  let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation),
+                  tokens.context <= context, tokens.application <= application else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            return value
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(server: LoopbackHTTPServer, originalOwner: FrozenPreparationOwner,
+        scope: AVPlayerPausedResumeScope, requested: FMP4PresentationRange,
+        lease: PausedWindowCoverageLease, workspace: PausedCoverageWorkspace,
+        reservation: PlaybackResourceContextReservation) {
+        self.server = server; self.originalOwner = originalOwner; self.scope = scope
+        self.requested = requested; self.lease = lease; self.workspace = workspace
+        self.reservation = reservation
+    }
+
+    deinit { PlaybackResourceContextLedger.shared.release(reservation) }
+}
+
 /// timeline admission 明确区分“selection 尚未被真实 E-3...E response 签出”和
 /// 永久身份冲突；evidence source 只对前者保留固定单槽 waiter。
 enum LoopbackPlayerItemTimelineMappingAdmission {
@@ -2947,6 +2996,122 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             }
             guard let selected else { return .unrelated }
             return participant.renditionIdentity == selected ? .matching : .conflicting
+        }
+    }
+
+    private func validatePausedResumeScope(_ scope: AVPlayerPausedResumeScope,
+                                          originalOwner: FrozenPreparationOwner) throws -> FrozenParticipantHistoryTable {
+        guard isAdmissionOpen, !originalOwner.isRetired, originalOwner.completionIsFrozen,
+              originalOwner.metadataStore === store,
+              let original = originalOwner.frozenPublication,
+              original.authorityBinding.origin === authorityBinding.origin,
+              original.itemURL == scope.itemURL,
+              original.audioSelectionCapability === scope.selection,
+              scope.timeline.belongs(to: original.authorityBinding, selection: scope.selection),
+              scope.timeline.matches(itemURL: scope.itemURL, item: scope.cursor.item,
+                publicationSequence: original.authorityBinding.publicationSequence,
+                selection: scope.selection),
+              let sequence = authorityBindings.keys.max(),
+              let current = participantsByPublication[sequence],
+              current.count == frozenParticipants.count,
+              current.allSatisfy({ $0.definition === frozenParticipants[$0.participantID]?.definition }),
+              let audio = current[scope.selection.participantID],
+              audio.renditionIdentity == scope.selection.renditionIdentity,
+              audio.writerBinding.outputLifecycleEpoch == scope.cursor.item.outputLifecycleEpoch,
+              audio.writerBinding.itemGeneration.rawValue == scope.cursor.item.itemGeneration else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        if let latest = audioSelectionByPublication[sequence],
+           latest.renditionIdentity != scope.selection.renditionIdentity {
+            throw AVPlayerItemCoordinatorFailure.selectionChanged
+        }
+        if audio.audioCodec == .aac {
+            guard let mapping = audio.aacTimelineMapping,
+                  mapping.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
+                  mapping.writtenEffectiveBase == scope.timeline.writtenEffectiveBase,
+                  mapping.binding == audio.writerBinding else {
+                throw AVPlayerItemCoordinatorFailure.invalidTimeline
+            }
+        }
+        let end = try scope.timeline.sourceTime(for: scope.cursor.time).adding(scope.lead)
+        for participant in current where participant.mediaType == .video
+            || participant.participantID == scope.selection.participantID {
+            guard try HLSChecked.compare(end, participant.effectivePlaybackHorizon) <= 0 else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+        }
+        return current
+    }
+
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope,
+                                    originalOwner: FrozenPreparationOwner) throws
+        -> LoopbackPausedResumeCoverage {
+        try queueSync {
+            let current = try validatePausedResumeScope(scope, originalOwner: originalOwner)
+            let requested = try FMP4PresentationRange(
+                start: scope.timeline.sourceTime(for: scope.cursor.time), duration: scope.lead)
+            let lease = try PausedWindowCoverageLease.reserve()
+            var participantCount = 0
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == scope.selection.participantID {
+                participantCount += 1
+                // This ordinary-lead transaction cannot infer an endpoint or
+                // shorten its interval from the startup selection's horizon.
+                guard try HLSChecked.compare(requested.end, participant.effectivePlaybackHorizon) <= 0 else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                let physical = participant.mediaType == .audio
+                    ? try scope.timeline.physicalRange(forEffectiveSourceRange: requested) : requested
+                for key in participant.mediaKeys {
+                    try store.retainPausedDecodeClosure(key: key, requested: physical, owner: lease)
+                }
+                // A rolling publication can drop earlier resources that remain
+                // valid only through the original item's retained membership.
+                for resource in LoopbackCompletedResourceCollection(owner: originalOwner,
+                    participantID: participant.participantID, mode: 1) {
+                    try store.retainPausedDecodeClosure(key: resource.key,
+                        requested: physical, owner: lease)
+                }
+            }
+            guard (1...2).contains(participantCount) else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            let workspace = try store.reservePausedCoverageWorkspace(owner: lease)
+            return try .make(server: self, originalOwner: originalOwner, scope: scope,
+                requested: requested, lease: lease, workspace: workspace)
+        }
+    }
+
+    func freezePausedResumeCoverage(_ value: LoopbackPausedResumeCoverage) throws -> Bool {
+        try queueSync {
+            guard value.server === self else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+            let current = try validatePausedResumeScope(value.scope, originalOwner: value.originalOwner)
+            if value.verified { return true }
+            guard store.pausedCoverageBodiesComplete(owner: value.lease) else { return false }
+            try value.lease.freezeCompletedResources()
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == value.scope.selection.participantID {
+                let physical = participant.mediaType == .audio
+                    ? try value.scope.timeline.physicalRange(forEffectiveSourceRange: value.requested)
+                    : value.requested
+                guard let receipt = try store.pausedWindowCoverageReceipt(workspace: value.workspace,
+                    rendition: participant.renditionIdentity, requested: physical),
+                      receipt.itemGeneration == value.scope.cursor.item.itemGeneration,
+                      receipt.presentationRange == physical, !receipt.dependencies.isEmpty else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+            }
+            value.verified = true
+            return true
+        }
+    }
+
+    func revalidatePausedResumeCoverage(_ value: LoopbackPausedResumeCoverage) throws {
+        try queueSync {
+            guard value.server === self, value.verified else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            _ = try validatePausedResumeScope(value.scope, originalOwner: value.originalOwner)
         }
     }
 

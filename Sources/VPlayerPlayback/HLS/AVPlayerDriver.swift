@@ -243,6 +243,41 @@ final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
     private var cancelled = false
     private var closed = false
     private var rollbackProtected = false
+    private var operationReturnWaiter: (UUID, CheckedContinuation<Void, any Error>)?
+    var hasOperationReturnWaiter: Bool {
+        SystemAVPlayerDriver.creationLock.withLock { operationReturnWaiter != nil }
+    }
+
+    /// A completed SDK operation may still retain its callback. Reuse the one
+    /// prepaid operation credit only after that exact physical alias releases.
+    func waitForOperationReturn() async throws {
+        let identity = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let immediate: Result<Void, any Error>? = SystemAVPlayerDriver.creationLock.withLock {
+                    guard !Task.isCancelled else { return .failure(CancellationError()) }
+                    guard !closed, !cancelled else {
+                        return .failure(AVPlayerItemCoordinatorFailure.staleIdentity)
+                    }
+                    if !operation.borrowed { return .success(()) }
+                    guard operationReturnWaiter == nil else {
+                        return .failure(AVPlayerItemCoordinatorFailure.operationInFlight)
+                    }
+                    operationReturnWaiter = (identity, continuation)
+                    return nil
+                }
+                if let immediate { continuation.resume(with: immediate) }
+            }
+        } onCancel: {
+            let waiter = SystemAVPlayerDriver.creationLock.withLock {
+                () -> CheckedContinuation<Void, any Error>? in
+                guard self.operationReturnWaiter?.0 == identity else { return nil }
+                defer { self.operationReturnWaiter = nil }
+                return self.operationReturnWaiter?.1
+            }
+            waiter?.resume(throwing: CancellationError())
+        }
+    }
 
     static func allocationBreakdown() throws -> AllocationBreakdown {
         let pool = malloc_good_size(class_getInstanceSize(Self.self))
@@ -449,7 +484,8 @@ final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
 
     fileprivate func returnFromPhysicalDeinit(_ borrow: Borrow, slot: UInt8,
         reservation: PlaybackResourceContextReservation) {
-        SystemAVPlayerDriver.creationLock.withLock {
+        let waiter = SystemAVPlayerDriver.creationLock.withLock {
+            () -> CheckedContinuation<Void, any Error>? in
             assertBorrowedLocked(borrow, slot: slot)
             let keepReserved = !closed || (borrow.role == .rollback && rollbackProtected)
             withCredit(borrow.role) { credit in
@@ -465,7 +501,11 @@ final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
                     PlaybackResourceContextLedger.shared.release(reservation)
                 }
             }
+            guard borrow.role == .operation else { return nil }
+            defer { operationReturnWaiter = nil }
+            return operationReturnWaiter?.1
         }
+        waiter?.resume()
     }
 
     private static func releaseUnusedLocked(_ credit: inout Credit, admission: AVPlayerDriverAdmission) {
@@ -607,6 +647,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private var logRefreshTask: Task<Void, Never>?
     private let logReader: any AVPlayerLogReading
     private var systemAudioTransitionInFlight = false
+    private var pausedResumeCallbackPool: AVPlayerSDKCallbackCreditPool?
     private var endpointObserver: NSObjectProtocol?
     private var endpointStabilityDeadline: UUID?
     private var endpointObservationIdentity: UUID?
@@ -638,8 +679,42 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     deinit { Self.creationLock.withLock { Self.releaseAdmissionLocked(eventHub.admission) } }
 
     func reserveSDKCallbackLease(_ kind: AVPlayerSDKCallbackLease.Kind) throws -> AVPlayerSDKCallbackLease {
-        try .reserve(kind, admission: eventHub.admission,
+        if let pool = pausedResumeCallbackPool {
+            switch kind {
+            case .seek, .loaded, .preroll: return try borrowSDKOperationCredit(kind, from: pool)
+            case .timeControl: return try borrowSDKObserverCredit(from: pool)
+            default: break
+            }
+        }
+        return try .reserve(kind, admission: eventHub.admission,
             installationResourceContextReservation: installationResourceContextReservation)
+    }
+
+    func reservePausedResumeCallbacks(item identity: AVPlayerItemInstanceIdentity) throws {
+        guard pausedResumeCallbackPool == nil, pausedItemObjectIdentity(item: identity) != nil,
+              disconnectedFromSystemAudio else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        pausedResumeCallbackPool = try reserveSDKCallbackCredits(includingObserver: true)
+    }
+
+    func finishPausedResumeCallbacks(item identity: AVPlayerItemInstanceIdentity) {
+        guard let pool = pausedResumeCallbackPool, pool.itemIdentity == identity else { return }
+        pool.close()
+        // After play, the driver keeps prepaid rollback until the original
+        // physical disconnect. Callback aliases retain their exact pool too.
+        if ownsCurrentCallbackCreditPool(pool), !systemAudioTransitionInFlight,
+           player.disconnectedFromSystemAudio, player.rate == 0, player.timeControlStatus == .paused {
+            _ = releaseUnusedSDKRollbackCreditIfDisconnected(pool)
+            pausedResumeCallbackPool = nil
+        }
+    }
+
+    private func awaitPausedResumeOperationCredit(item identity: AVPlayerItemInstanceIdentity) async throws {
+        guard let pool = pausedResumeCallbackPool else { return }
+        try Task.checkCancellation()
+        try await pool.waitForOperationReturn()
+        try Task.checkCancellation()
+        guard pool === pausedResumeCallbackPool, pool.itemIdentity == identity,
+              ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
     }
 
     /// Capacity only: no native method is invoked and no activation is authorized.
@@ -705,9 +780,17 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         // it is also false while a physical transition is still in flight.
         // Callers retain cancellation/authority checks around this operation;
         // cleanup must still be able to settle audio after cancellation.
-        guard player.disconnectedFromSystemAudio != disconnected else { return }
+        guard player.disconnectedFromSystemAudio != disconnected else {
+            if disconnected { finishPausedResumeCallbacks(item: identity) }
+            return
+        }
         let lease: AVPlayerSDKCallbackLease
-        do { lease = try reserveSDKCallbackLease(.systemAudio) }
+        do {
+            if let pool = pausedResumeCallbackPool {
+                lease = try disconnected ? borrowSDKRollbackCredit(from: pool)
+                    : borrowSDKOperationCredit(.systemAudio, from: pool)
+            } else { lease = try reserveSDKCallbackLease(.systemAudio) }
+        }
         catch {
 #if DEBUG
             print("NATIVE_ADMISSION system-audio-reserve-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount)")
@@ -728,12 +811,17 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard player.disconnectedFromSystemAudio == disconnected else {
             throw .systemAudioConnectionNotConfirmed
         }
+        if disconnected {
+            systemAudioTransitionInFlight = false
+            finishPausedResumeCallbacks(item: identity)
+        }
     }
 
     var rate: Float { player.rate }
     var timeControlStatus: AVPlayer.TimeControlStatus { player.timeControlStatus }
     var activeWaiterCount: Int {
-        prepareWait.isActive ? 1 : 0
+        (prepareWait.isActive ? 1 : 0)
+            + (pausedResumeCallbackPool?.hasOperationReturnWaiter == true ? 1 : 0)
     }
     var fixedTimerCount: Int { 0 }
 
@@ -819,6 +907,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.seek)
         let gate = prepareWait
         let token = try gate.begin(.seek)
@@ -853,6 +942,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         if try Self.hasLoadedCoverage(item, requested: requested) {
             return .init(item: identity, playhead: playhead, requested: requested)
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.loaded)
         let gate = prepareWait
         let token = try gate.begin(.loaded)
@@ -925,6 +1015,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.preroll)
         let gate = prepareWait
         let token = try gate.begin(.preroll)
@@ -1137,6 +1228,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         // ExactMediaTime rejects nonnumeric times, nonpositive timescales and
         // nonzero epochs instead of dropping epoch or converting via seconds.
         return try? ExactMediaTime(player.currentTime())
+    }
+
+    func pausedItemObjectIdentity(item identity: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              !systemAudioTransitionInFlight else { return nil }
+        return ObjectIdentifier(item)
     }
 
     func constrainPlaybackEnd(to time: ExactMediaTime,

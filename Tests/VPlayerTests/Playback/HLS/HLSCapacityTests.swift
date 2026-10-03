@@ -721,6 +721,101 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
         XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
     }
 
+    func testOperationReturnWaitCloseWakesWithoutReturningPhysicalCredit() async throws {
+        try await assertOperationReturnWaitWake(closing: true)
+    }
+
+    func testOperationReturnWaitCancelWakesWithoutReturningPhysicalCredit() async throws {
+        try await assertOperationReturnWaitWake(closing: false)
+    }
+
+    private func assertOperationReturnWaitWake(closing: Bool) async throws {
+        let driver = try await makeDisconnectedEmptyDriver()
+        let pool = try driver.reserveSDKCallbackCredits()
+        var physical: AVPlayerSDKCallbackLease? = try driver.borrowSDKOperationCredit(.seek, from: pool)
+        let charged = context.chargedBytes
+        var finished = false
+        let waiting = Task { @MainActor in
+            defer { finished = true }
+            try await pool.waitForOperationReturn()
+        }
+        defer { waiting.cancel() }
+        let startedDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !pool.hasOperationReturnWaiter, ContinuousClock.now < startedDeadline { await Task.yield() }
+        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        if closing { pool.close() } else { pool.cancel() }
+        let wakeDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !finished, ContinuousClock.now < wakeDeadline { await Task.yield() }
+        let wokeBeforeRelease = finished
+        if !finished { waiting.cancel() }
+        do { try await waiting.value; XCTFail("Closed/canceled admission must reject its waiter") }
+        catch { XCTAssertTrue(error is CancellationError || error is AVPlayerItemCoordinatorFailure) }
+        XCTAssertTrue(wokeBeforeRelease, "Close/cancel must wake without waiting for the native alias to die")
+        XCTAssertFalse(pool.hasOperationReturnWaiter)
+        physical?.assertRegistered()
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 2)
+        XCTAssertEqual(context.chargedBytes, charged)
+        XCTAssertFalse(driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool),
+            "The still-borrowed physical operation prevents releasing rollback")
+        physical = nil
+        pool.close()
+        XCTAssertTrue(driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool))
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
+    }
+
+    func testOperationReturnWaitRejectsSecondWaiterAndCancellationAllowsReplacement() async throws {
+        let driver = try await makeDisconnectedEmptyDriver()
+        let pool = try driver.reserveSDKCallbackCredits()
+        var physical: AVPlayerSDKCallbackLease? = try driver.borrowSDKOperationCredit(.seek, from: pool)
+        let first = Task { try await pool.waitForOperationReturn() }
+        defer { first.cancel() }
+        let firstDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !pool.hasOperationReturnWaiter, ContinuousClock.now < firstDeadline { await Task.yield() }
+        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        do { try await pool.waitForOperationReturn(); XCTFail("A second waiter must not replace the first") }
+        catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .operationInFlight) }
+        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        first.cancel()
+        do { try await first.value; XCTFail("Original waiter must observe cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(pool.hasOperationReturnWaiter)
+        physical?.assertRegistered()
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 2)
+        let replacement = Task { try await pool.waitForOperationReturn() }
+        defer { replacement.cancel() }
+        let replacementDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !pool.hasOperationReturnWaiter, ContinuousClock.now < replacementDeadline { await Task.yield() }
+        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        physical = nil
+        try await replacement.value
+        XCTAssertFalse(pool.hasOperationReturnWaiter)
+        var next: AVPlayerSDKCallbackLease? = try driver.borrowSDKOperationCredit(.loaded, from: pool)
+        next?.assertRegistered()
+        next = nil
+        pool.close()
+        XCTAssertTrue(driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool))
+    }
+
+    func testOperationReturnPhysicalDeinitRacingCancellationResolvesOnce() async throws {
+        let driver = try await makeDisconnectedEmptyDriver()
+        for _ in 0..<32 {
+            let pool = try driver.reserveSDKCallbackCredits()
+            let tail = CallbackCreditTailBox(try driver.borrowSDKOperationCredit(.seek, from: pool))
+            let waiter = Task { try await pool.waitForOperationReturn() }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !pool.hasOperationReturnWaiter, ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertTrue(pool.hasOperationReturnWaiter)
+            DispatchQueue.concurrentPerform(iterations: 2) { index in
+                if index == 0 { waiter.cancel() } else { tail.release() }
+            }
+            do { try await waiter.value } catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertFalse(pool.hasOperationReturnWaiter)
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 2)
+            pool.close()
+            XCTAssertTrue(driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool))
+        }
+    }
+
     /// Actual empty-player native readback fixture only. It does not activate an
     /// audio session, install an item, play, or assert installed-item quiescence.
     private func makeDisconnectedEmptyDriver() async throws -> SystemAVPlayerDriver {

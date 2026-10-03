@@ -260,6 +260,56 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
     }
 
+    func testPausedResumeDecodePinsExcludeUnfetchedNoncontributingVideoHold() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        XCTAssertGreaterThanOrEqual(playlist.resources.count, 2)
+        let priorKey = playlist.resources[0]
+        let nextKey = playlist.resources[1]
+        let prior = try XCTUnwrap(store.decodeCoverageMap(for: priorKey))
+        let next = try XCTUnwrap(store.decodeCoverageMap(for: nextKey))
+        let first = try XCTUnwrap(next.samples.first)
+        let requested = first.presentationRange
+        let priorEnd = try XCTUnwrap(prior.samples.max {
+            CMTimeCompare($0.presentationRange.end.cmTime, $1.presentationRange.end.cmTime) < 0
+        }).presentationRange.end
+        let hold = try XCTUnwrap(PausedDecodeCoverageOrder.videoHold(map: prior))
+        XCTAssertLessThanOrEqual(CMTimeCompare(priorEnd.cmTime, requested.start.cmTime), 0)
+        XCTAssertGreaterThan(CMTimeCompare(try priorEnd.adding(hold).cmTime, requested.start.cmTime), 0)
+        XCTAssertTrue(first.isRandomAccess)
+        XCTAssertEqual(first.nearestRandomAccessOrdinal, first.decodeOrdinal,
+            "The next map must decode independently of the prior map")
+        let initialization = try XCTUnwrap(playlist.initializationResources.first {
+            store.completedEvidenceSnapshot(for: $0)?.resourceIdentity == next.initializationBackingIdentity
+        })
+        for key in [initialization, nextKey] {
+            XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                target: fixture.server.path(for: key)).status, 200)
+        }
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+                && store.completedEvidenceSnapshot(for: nextKey)?.isComplete == true
+        })
+        XCTAssertFalse(store.completedEvidenceSnapshot(for: priorKey)?.isComplete == true)
+        let owner = try PausedWindowCoverageLease.reserve()
+        try store.retainPausedDecodeClosure(key: priorKey, requested: requested, owner: owner)
+        try store.retainPausedDecodeClosure(key: nextKey, requested: requested, owner: owner)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+
+        XCTAssertEqual(workspace.mapCount, 1,
+            "A hold extension cannot admit a map discarded by the exact coverage verifier")
+        XCTAssertTrue(store.pausedCoverageBodiesComplete(owner: owner),
+            "The unfetched prior map must not gate the independently decodable current interval")
+        try owner.freezeCompletedResources()
+        let receipt = try XCTUnwrap(store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: requested))
+        XCTAssertEqual(receipt.dependencies.count, 1)
+        XCTAssertEqual(receipt.dependencies.first?.mediaBackingIdentity, next.resourceIdentity)
+        XCTAssertFalse(receipt.dependencies.contains { $0.mediaBackingIdentity == prior.resourceIdentity })
+    }
+
     func testPausedCoverageWorkspaceRejectsExpandedPinsAndInvalidCapacities() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }

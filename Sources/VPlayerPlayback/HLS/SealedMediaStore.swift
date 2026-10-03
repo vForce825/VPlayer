@@ -1339,6 +1339,47 @@ final class SealedMediaStore: @unchecked Sendable {
         try domain.sync { try PausedCoverageWorkspace.reserve(store: self, owner: owner) }
     }
 
+    /// The authenticated server chooses membership; the store pins only maps
+    /// that can contribute to this exact interval and their real initialization.
+    func retainPausedDecodeClosure(key: HLSResourceKey, requested: FMP4PresentationRange,
+                                   owner: PausedWindowCoverageLease) throws {
+        try domain.sync {
+            guard !closed, let resource = resources[key], let map = resource.decodeMap,
+                  resource.object.kind == .media else {
+                throw CompletedMediaEvidenceError.retired
+            }
+            let hold = try PausedDecodeCoverageOrder.videoHold(map: map)
+            var contributes = false
+            for sample in map.samples {
+                let end = try hold.map { try sample.presentationRange.end.adding($0) }
+                    ?? sample.presentationRange.end
+                if try HLSChecked.compare(sample.presentationRange.start, requested.end) < 0,
+                   try HLSChecked.compare(end, requested.start) > 0 { contributes = true; break }
+            }
+            guard contributes else { return }
+            guard let initializationKey = resource.initializationKey,
+                  let initialization = resources[initializationKey],
+                  initialization.object.backing.identity == map.initializationBackingIdentity,
+                  initialization.evidence.stateIdentity == map.initializationStateIdentity else {
+                throw CompletedMediaEvidenceError.identityMismatch
+            }
+            _ = try owner.retainMetadata(in: self, key: initializationKey)
+            _ = try owner.retainMetadata(in: self, key: key)
+        }
+    }
+
+    func pausedCoverageBodiesComplete(owner: PausedWindowCoverageLease) -> Bool {
+        domain.sync {
+            guard !closed, owner.metadataStore === self else { return false }
+            var hasMedia = false
+            for resource in resources.values where resource.preparationPins & owner.slot != 0 {
+                guard resource.evidence.isComplete else { return false }
+                hasMedia = hasMedia || resource.object.kind == .media
+            }
+            return hasMedia
+        }
+    }
+
     fileprivate func pausedWorkspaceMap(slot: Int, owner: PausedWindowCoverageLease)
         -> SealedDecodeCoverageMap? {
         guard owner.metadataStore === self else { return nil }

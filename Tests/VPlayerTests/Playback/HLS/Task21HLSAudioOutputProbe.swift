@@ -176,6 +176,24 @@ final class Task21HLSAudioOutputProbe {
         guard markers.count < 16 else { state.fail(.markerOverflow); return }
         markers.append(Marker(phase: phase, hostTicks: mach_continuous_time(),
                               rate: player.rate, itemTime: player.currentTime()))
+        logConfiguration(phase: phase, player: player)
+    }
+
+    private func logConfiguration(phase: Phase, player: AVPlayer) {
+        // Read-only main-actor diagnostics. Never query AVFoundation from a tap
+        // callback, and never infer audible output from any of these properties.
+        let parameters = item?.audioMix?.inputParameters ?? []
+        let mixTapCount = parameters.filter {
+            $0.trackID == AVAudioMixInputParametersTrackID.mixID.rawValue
+                && $0.audioTapProcessor === tap
+        }.count
+        let originalMixInstalled = installedMix != nil && item?.audioMix === installedMix
+        print("AAC_TAP_SETUP \(scope) phase=\(phase) originalItemCurrent=\(player.currentItem === item) "
+            + "originalMixInstalled=\(originalMixInstalled) parameters=\(parameters.count) mixTapCount=\(mixTapCount) "
+            + "playerMuted=\(player.isMuted) playerVolume=\(player.volume) rate=\(player.rate) "
+            + "timeControl=\(player.timeControlStatus.rawValue) disconnected=\(player.disconnectedFromSystemAudio) "
+            + "externalVideoPlayback=\(player.isExternalPlaybackActive)")
+        Task21NativeAudioSessionReference.logRoute(stage: "tap-\(phase)")
     }
 
     /// Invoke AFTER normal Registry retirement has removed the physical item.
@@ -457,5 +475,98 @@ private func task21TapProcess(_ tap: MTAudioProcessingTap, _ requested: CMItemCo
     if entered {
         state.process(requested: requested, inputFlags: flags, frames: framesOut.pointee,
                       sourceFlags: flagsOut.pointee, status: status, range: range, buffers: buffers)
+    }
+}
+
+/// A separate native-session reference experiment, not production session
+/// authority and not an endpoint oracle. Run its sole selector in a fresh,
+/// nonparallel simulator test process. The original graph session is synthetic.
+/// This scope ends inactive and restores prior category settings; it does NOT
+/// claim to discover/restore an unknown pre-existing activation state.
+@MainActor
+final class Task21NativeAudioSessionReference {
+    enum Failure: Error { case requiresSimulator, alreadyOwned, activationRejected, deactivationRejected, restorationMismatch }
+    private static var owned = false
+    private let session: AVAudioSession
+    private let priorCategory: AVAudioSession.Category
+    private let priorMode: AVAudioSession.Mode
+    private let priorPolicy: AVAudioSession.RouteSharingPolicy
+    private let priorOptions: AVAudioSession.CategoryOptions
+    private var configurationAttempted = false
+    private var activationAttempted = false
+    private var closed = false
+
+    /// Register close() as an XCTest teardown block immediately after init, before
+    /// calling activate(). Register fixture teardown later, so XCTest's LIFO order
+    /// retires the player and finalizes its tap before deactivating the session.
+    init() throws {
+        #if !targetEnvironment(simulator)
+        throw Failure.requiresSimulator
+        #else
+        guard !Self.owned else { throw Failure.alreadyOwned }
+        session = AVAudioSession.sharedInstance()
+        priorCategory = session.category
+        priorMode = session.mode
+        priorPolicy = session.routeSharingPolicy
+        priorOptions = session.categoryOptions
+        Self.owned = true
+        Self.logRoute(stage: "reference-before-setup")
+        #endif
+    }
+
+    func activate() async throws {
+        configurationAttempted = true
+        // One controlled setup change: explicitly establish a local playback
+        // session. No output-device override, volume change or preferred-rate fix.
+        try session.setCategory(.playback, mode: .moviePlayback, policy: .default, options: [])
+        activationAttempted = true
+        let activated = try await session.activate(options: [])
+        print("AAC_NATIVE_SESSION activateReturned=\(activated)")
+        guard activated else { throw Failure.activationRejected }
+        Self.logRoute(stage: "reference-activation-return")
+    }
+
+    func close() async throws {
+        guard !closed else { return }
+        var cleanupError: (any Error)?
+        if activationAttempted {
+            do {
+                let deactivated = try await session.deactivate(options: .notifyOthersOnDeactivation)
+                print("AAC_NATIVE_SESSION deactivateReturned=\(deactivated)")
+                guard deactivated else { throw Failure.deactivationRejected }
+            } catch { cleanupError = error }
+        }
+        if configurationAttempted {
+            do {
+                try session.setCategory(priorCategory, mode: priorMode, policy: priorPolicy, options: priorOptions)
+                guard session.category == priorCategory, session.mode == priorMode,
+                      session.routeSharingPolicy == priorPolicy, session.categoryOptions == priorOptions else {
+                    throw Failure.restorationMismatch
+                }
+            } catch {
+                print("AAC_NATIVE_SESSION restoreFailed=\(error)")
+                if cleanupError == nil { cleanupError = error }
+            }
+        }
+        Self.logRoute(stage: "reference-cleanup-return")
+        if let cleanupError {
+            // Keep the reference reservation failed/owned: a later reference must
+            // not silently proceed after unproven native-session cleanup.
+            throw cleanupError
+        }
+        closed = true
+        Self.owned = false
+    }
+
+    static func logRoute(stage: String) {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+        // Port types and counts only, no route UIDs, device names or user media.
+        let ports = outputs.prefix(4).map { "\($0.portType.rawValue):\($0.channels?.count ?? 0)" }.joined(separator: ",")
+        print("AAC_NATIVE_ROUTE stage=\(stage) category=\(session.category.rawValue) mode=\(session.mode.rawValue) "
+            + "policy=\(session.routeSharingPolicy.rawValue) options=\(session.categoryOptions.rawValue) "
+            + "outputCount=\(outputs.count) portTypesAndChannels=\(ports) outputChannels=\(session.outputNumberOfChannels) "
+            + "sampleRate=\(session.sampleRate) ioDuration=\(session.ioBufferDuration) outputLatency=\(session.outputLatency) "
+            + "outputVolume=\(session.outputVolume)")
     }
 }

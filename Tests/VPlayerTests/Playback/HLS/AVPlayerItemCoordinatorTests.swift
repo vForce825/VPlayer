@@ -750,6 +750,94 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testPausedResumePreservesSeekFailureWhenRollbackAlsoFails() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            let oldReceipt = try await harness.stop()
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            harness.driver.prepareMutation = .seekAfterOneTick
+            harness.driver.disconnectFailure = .systemAudioConnectionNotConfirmed
+            defer {
+                harness.driver.prepareMutation = .none
+                harness.driver.disconnectFailure = nil
+            }
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertEqual(result, .rejected)
+            XCTAssertEqual(harness.backend.lastActivationError as? AVPlayerItemCoordinatorFailure, .seekMismatch,
+                "The original seek failure must survive a second physical rollback failure")
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertFalse(harness.driver.disconnectedFromSystemAudio,
+                "A failed disconnect must remain physically unconfirmed")
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertFalse(harness.coordinator.accept(oldReceipt))
+            XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval,
+                "Only a later successful original-owner cleanup may close the interval")
+        }
+    }
+
+    func testPausedResumeRejectsLatchedSourceFailureWhilePaused() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            _ = try await harness.stop()
+            let requested = try FMP4PresentationRange(start: prepared.identity.mediaTime,
+                duration: ExactMediaTime(value: 3, timescale: 1))
+            try await harness.publishUnrelatedPausedSourceFailure(excluding: requested)
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let changes = harness.driver.audioConnectionChanges
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertEqual(result, .rejected)
+            XCTAssertEqual(harness.backend.lastActivationError as? CompletedMediaEvidenceError, .capacityExceeded)
+            XCTAssertEqual(harness.driver.audioConnectionChanges, changes)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+        }
+    }
+
+    func testPausedResumeRejectsLatchedSourceFailureAfterCoverageFreeze() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            _ = try await harness.stop()
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let requested = try FMP4PresentationRange(start: prepared.identity.mediaTime,
+                duration: ExactMediaTime(value: 3, timescale: 1))
+            var failedAfterFreeze = false
+            harness.driver.onPrerollCompletion = {
+                try await harness.publishUnrelatedPausedSourceFailure(excluding: requested)
+                failedAfterFreeze = true
+            }
+            defer { harness.driver.onPrerollCompletion = nil }
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertTrue(failedAfterFreeze, "The terminal event must arrive after resume coverage was frozen")
+            XCTAssertEqual(result, .rejected)
+            XCTAssertEqual(harness.backend.lastActivationError as? CompletedMediaEvidenceError, .capacityExceeded)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+        }
+    }
+
     func testTVOS27InitialPreparationStaysConnectedUntilActualSuspension() async throws {
         try await withConnectedPlayerLifecycleHarness { harness in
             _ = try await harness.prepare()
@@ -1448,6 +1536,11 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testSDKFixedSystemLoopbackLoadedReceiptAndItemFailure() async throws {
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0,
+                       "Run this direct native-driver test in a fresh process")
+        guard AVPlayerSDKCallbackLease.occupiedCount == 0 else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
         let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         print("SDK_FIXED_NATIVE_STAGE fixture_begin")
         let fixture = try await Task21HarnessAuthorityFixture.make(
@@ -1460,55 +1553,126 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let item = fixture.request.item
         try driver.install(url: fixture.request.itemURL, identity: item)
         defer { driver.replaceCurrentItemWithNil(item: item) }
-        let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
-            duration: ExactMediaTime(value: 1, timescale: 100))
-        print("SDK_FIXED_NATIVE_STAGE loaded_begin")
-        let loaded = try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead, covering: requested)
-        print("SDK_FIXED_NATIVE_STAGE loaded_returned")
-        XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: requested))
-        XCTAssertEqual(driver.activeWaiterCount, 0)
-        let attachment = XCTAttachment(string:
-            "systemDriverIdentity=\(ObjectIdentifier(driver)), systemDriverMalloc=\(malloc_size(Unmanaged.passUnretained(driver).toOpaque())), "
-            + "waitSlotIdentity=\(ObjectIdentifier(driver.prepareWait)), waitSlotMalloc=\(malloc_size(Unmanaged.passUnretained(driver.prepareWait).toOpaque())), "
-            + "receiptStride=\(MemoryLayout<AVPlayerLoadedRangeReceipt>.stride), cResultStride=\(MemoryLayout<VPLoadedRangeCoverage>.stride)")
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        driver.replaceCurrentItemWithNil(item: item)
-        // Same 43-byte failure input validated by the raw Release controls.
-        // A missing file-scheme .m3u8 did not reliably reach item failure.
-        let invalidURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("VPlayer-readiness-failure-\(UUID().uuidString).mp4")
-        let invalidBytes = Data("VPlayer deliberately malformed MP4 fixture\n".utf8)
-        try invalidBytes.write(to: invalidURL, options: .atomic)
-        defer {
+        @MainActor func requireReleasedTail(_ phase: String) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while AVPlayerSDKCallbackLease.occupiedCount != 0,
+                  ContinuousClock.now < deadline {
+                try Task.checkCancellation()
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            let remaining = AVPlayerSDKCallbackLease.occupiedCount
+            XCTAssertEqual(remaining, 0,
+                           "The original native callback tail must retire before the next phase: \(phase)")
+            guard remaining == 0 else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            XCTAssertEqual(driver.rate, 0)
+        }
+        var operationError: (any Error)?
+        do {
+            // The playhead above authenticates a position; it does not prepare or
+            // move the native player. Drive the same physical prerequisites as the
+            // coordinator before observing coverage at that exact frozen position.
+            print("SDK_FIXED_NATIVE_STAGE ready_begin")
+            let ready = try await driver.waitUntilReady(item: item)
+            XCTAssertEqual(ready, item)
+            XCTAssertFalse(driver.disconnectedFromSystemAudio)
+            try await requireReleasedTail("ready")
+            print("SDK_FIXED_NATIVE_STAGE ready_returned")
+            print("SDK_FIXED_NATIVE_STAGE selection_begin")
+            try await driver.selectAudibleMedia(item: item)
+            try await requireReleasedTail("selection")
+            print("SDK_FIXED_NATIVE_STAGE selection_returned")
+            print("SDK_FIXED_NATIVE_STAGE prime_begin")
+            try await driver.primeMediaData(item: item)
+            try await requireReleasedTail("prime")
+            print("SDK_FIXED_NATIVE_STAGE prime_returned")
+            print("SDK_FIXED_NATIVE_STAGE seek_begin")
+            let sought = try await driver.seek(to: playhead.playerItemTime,
+                item: item, playhead: playhead)
+            XCTAssertEqual(sought.item, item)
+            XCTAssertEqual(sought.playhead, playhead)
+            XCTAssertEqual(sought.actualTime, playhead.playerItemTime)
+            XCTAssertEqual(driver.rate, 0)
+            XCTAssertNotEqual(driver.timeControlStatus, .playing)
+            try await requireReleasedTail("seek")
+            print("SDK_FIXED_NATIVE_STAGE seek_returned")
+            let requested = try FMP4PresentationRange(start: playhead.playerItemTime,
+                duration: ExactMediaTime(value: 1, timescale: 100))
+            print("SDK_FIXED_NATIVE_STAGE loaded_begin")
+            let loaded = try await driver.waitForLoadedTimeRanges(item: item, playhead: playhead, covering: requested)
+            try await requireReleasedTail("loaded")
+            print("SDK_FIXED_NATIVE_STAGE loaded_returned")
+            XCTAssertEqual(loaded, .init(item: item, playhead: playhead, requested: requested))
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            let attachment = XCTAttachment(string:
+                "systemDriverIdentity=\(ObjectIdentifier(driver)), systemDriverMalloc=\(malloc_size(Unmanaged.passUnretained(driver).toOpaque())), "
+                + "waitSlotIdentity=\(ObjectIdentifier(driver.prepareWait)), waitSlotMalloc=\(malloc_size(Unmanaged.passUnretained(driver.prepareWait).toOpaque())), "
+                + "receiptStride=\(MemoryLayout<AVPlayerLoadedRangeReceipt>.stride), cResultStride=\(MemoryLayout<VPLoadedRangeCoverage>.stride)")
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            driver.replaceCurrentItemWithNil(item: item)
+            // Same 43-byte failure input validated by the raw Release controls.
+            // A missing file-scheme .m3u8 did not reliably reach item failure.
+            let invalidURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                .appendingPathComponent("VPlayer-readiness-failure-\(UUID().uuidString).mp4")
+            let invalidBytes = Data("VPlayer deliberately malformed MP4 fixture\n".utf8)
+            try invalidBytes.write(to: invalidURL, options: .atomic)
+            defer {
+                driver.replaceCurrentItemWithNil(item: item)
+                driver.removeObservers(item: item)
+                XCTAssertNoThrow(try FileManager.default.removeItem(at: invalidURL))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: invalidURL.path))
+            let bytes = try Data(contentsOf: invalidURL)
+            XCTAssertEqual(bytes, invalidBytes)
+            guard bytes == invalidBytes else {
+                throw NSError(domain: "NativeReadinessFixture", code: 1)
+            }
+            try driver.install(url: invalidURL, identity: item)
+            let invalidItem = try XCTUnwrap(driver.player.currentItem)
+            print("SDK_FIXED_NATIVE_STAGE invalid_ready_begin")
+            do {
+                _ = try await driver.waitUntilReady(item: item)
+                XCTFail("Malformed media must report the native item failure")
+            } catch {
+                let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot)
+                let nativeError = try XCTUnwrap(invalidItem.error)
+                XCTAssertEqual(diagnostic, PlaybackErrorDiagnostics.snapshot(nativeError))
+            }
+            XCTAssertTrue(driver.player.currentItem === invalidItem)
+            XCTAssertEqual(invalidItem.status, .failed)
+            XCTAssertNotNil(invalidItem.error)
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            try await requireReleasedTail("invalid_ready")
+            print("SDK_FIXED_NATIVE_STAGE native_failure_observed")
             driver.replaceCurrentItemWithNil(item: item)
             driver.removeObservers(item: item)
-            XCTAssertNoThrow(try FileManager.default.removeItem(at: invalidURL))
-        }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: invalidURL.path))
-        let bytes = try Data(contentsOf: invalidURL)
-        XCTAssertEqual(bytes, invalidBytes)
-        guard bytes == invalidBytes else {
-            throw NSError(domain: "NativeReadinessFixture", code: 1)
-        }
-        try driver.install(url: invalidURL, identity: item)
-        let invalidItem = try XCTUnwrap(driver.player.currentItem)
-        print("SDK_FIXED_NATIVE_STAGE invalid_ready_begin")
+        } catch { operationError = error }
         do {
-            _ = try await driver.waitUntilReady(item: item)
-            XCTFail("Malformed media must report the native item failure")
+            // As in the native callback-tail control, join the original cleanup
+            // even if the test caller was canceled; no success proof is forged.
+            let cleanup = Task { @MainActor in
+                if driver.currentItemIdentity == item {
+                    driver.cancelPendingPrerolls(item: item)
+                    driver.pause(item: item)
+                    try await driver.setDisconnectedFromSystemAudio(true, item: item)
+                    XCTAssertTrue(driver.disconnectedFromSystemAudio)
+                }
+                driver.replaceCurrentItemWithNil(item: item)
+                driver.removeObservers(item: item)
+                try await requireReleasedTail("cleanup")
+                try await fixture.retireTransportAwaitingCompletion()
+            }
+            try await cleanup.value
         } catch {
-            let diagnostic = try XCTUnwrap(error as? ErrorDiagnosticSnapshot)
-            let nativeError = try XCTUnwrap(invalidItem.error)
-            XCTAssertEqual(diagnostic, PlaybackErrorDiagnostics.snapshot(nativeError))
+            XCTFail("Native loaded-receipt cleanup failed: \(error)")
+            throw operationError ?? error
         }
-        XCTAssertTrue(driver.player.currentItem === invalidItem)
-        XCTAssertEqual(invalidItem.status, .failed)
-        XCTAssertNotNil(invalidItem.error)
-        XCTAssertEqual(driver.activeWaiterCount, 0)
-        print("SDK_FIXED_NATIVE_STAGE native_failure_observed")
-        driver.replaceCurrentItemWithNil(item: item)
-        driver.removeObservers(item: item)
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertNil(driver.player.currentItem)
+        if let operationError { throw operationError }
     }
 
     func testSystemDriverUsesConfiguredStartupBufferForHomePodHLS() throws {
@@ -2688,6 +2852,27 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
         // Owner teardown performs normal Registry retirement, then clears the
         // exact item's tap, awaits native finalize, logs and validates raw facts.
+    }
+
+    /// Controlled reference: same HLS fixture/tap/Registry path with one explicit
+    /// native playback-session setup. Run alone in a fresh simulator process;
+    /// this does not replace the canonical output or exact-end acceptance gates.
+    func testTVOS27HLSTapWithExplicitNativeSessionReportsRawOutput() async throws {
+        let nativeSession = try Task21NativeAudioSessionReference()
+        addTeardownBlock { try await nativeSession.close() }
+        try await nativeSession.activate()
+        let fixture = try await Task21RealIntegrationFixture.make(endList: false, audioOutputProbe: true)
+        let owner = Task21RealIntegrationFixture.Owner(fixture)
+        // LIFO teardown: retire Registry/player and finalize tap before session.
+        addTeardownBlock { try await owner.tearDown() }
+        _ = try await fixture.primeCompletedSocketBodies()
+        _ = try await fixture.prepare()
+        try fixture.reportIndependentAudioProbeExpectation()
+        let result = try await fixture.playToEnd()
+        XCTAssertTrue(result.didReachStableEnd)
+        XCTAssertGreaterThan(fixture.acceptedGETs.playlistCount, 0)
+        XCTAssertGreaterThan(fixture.acceptedGETs.initializationCount, 0)
+        XCTAssertGreaterThan(fixture.acceptedGETs.mediaCount, 0)
     }
 
     func testRealAVPlayerLoopbackPresentsAACExactlyThroughEffectiveEndpointAndRejectsTrimMutations() async throws {
@@ -5751,6 +5936,7 @@ private enum Task21DriverOperation: Equatable {
 private final class Task21FakeDriver: AVPlayerDriving {
     var failAccessLogObservation = false
     var ignoreDisconnectStateChange = false
+    var disconnectFailure: AVPlayerItemCoordinatorFailure?
     var systemAudioDisconnected = false
     var disconnectedFromSystemAudio: Bool {
         pendingAudioConnection == nil && systemAudioDisconnected
@@ -5768,6 +5954,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
         guard pendingAudioConnection == nil else { throw .operationInFlight }
         guard systemAudioDisconnected != disconnected else { return }
         audioConnectionChanges.append(disconnected)
+        if disconnected, let disconnectFailure { throw disconnectFailure }
         if holdAudioConnectionCompletion {
             await withCheckedContinuation { continuation in
                 pendingAudioConnection = (disconnected, continuation)
@@ -5830,6 +6017,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var requestedSeekTime: ExactMediaTime?
     var applySeekToObservedPausedTime = false
     var onSeekCompletion: (() -> Void)?
+    var onPrerollCompletion: (() async throws -> Void)?
     var seekCancellationGate: Task21PrepareCancellationGate?
     private(set) var lastPlayedPausedTime: ExactMediaTime?
     private(set) var loadedRangeCallCount = 0
@@ -5996,6 +6184,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
             timeControlStatus = stateAfterPreroll.timeControlStatus
             currentItemIdentity = stateAfterPreroll.item
         }
+        if let onPrerollCompletion { try await onPrerollCompletion() }
         return AVPlayerPrerollReceipt(
             item: prepareMutation == .stalePreroll
                 ? Task21Fixtures.staleGenerationItem(from: item) : item,
@@ -6045,6 +6234,20 @@ private final class Task21FakeDriver: AVPlayerDriving {
         guard currentItemIdentity == item, pendingAudioConnection == nil,
               rate == 0, timeControlStatus == .paused, !pausedTimeUnavailable else { return nil }
         return try? ExactMediaTime(observedPausedTime)
+    }
+
+    func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? {
+        guard currentItemIdentity == item, pendingAudioConnection == nil else { return nil }
+        return ObjectIdentifier(self)
+    }
+
+    func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {
+        guard currentItemIdentity == item, disconnectedFromSystemAudio,
+              rate == 0, timeControlStatus == .paused else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        // This fake has no SDK callbacks. Real coverage/workspace admission
+        // still runs against the original server and shared bounded ledger.
     }
 
     func directState(item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState {
@@ -6344,6 +6547,19 @@ private final class Task21UnsafeDefaultDriver: AVPlayerDriving {
 }
 
 private final class Task21FakeEvidenceSource: AVPlayerPreparationEvidenceProviding, @unchecked Sendable {
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage {
+        try source.reservePausedResumeCoverage(scope)
+    }
+
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws {
+        try await source.awaitPausedResumeCoverage(coverage)
+    }
+
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws {
+        try source.revalidatePausedResumeCoverage(coverage)
+    }
+
     enum ReadinessIdentityMutation { case none, url, generation, sequence }
     var readinessIdentityMutation: ReadinessIdentityMutation = .none
     private let source: LoopbackAVPlayerPreparationEvidenceSource
@@ -6820,6 +7036,40 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
                      diagnosticPhases: diagnosticPhases)
     }
 
+    func publishUnrelatedPausedSourceFailure(excluding requested: FMP4PresentationRange) async throws {
+        let snapshot = try XCTUnwrap(publication.publisher.visible)
+        let media = try XCTUnwrap(snapshot.media[2])
+        let key = try XCTUnwrap(media.resources.last { key in
+            guard let map = publication.store.decodeCoverageMap(for: key) else { return false }
+            return map.samples.allSatisfy {
+                CMTimeCompare($0.presentationRange.end.cmTime, requested.start.cmTime) <= 0
+                    || CMTimeCompare($0.presentationRange.start.cmTime, requested.end.cmTime) >= 0
+            }
+        })
+        let before = try XCTUnwrap(server.completedEvidence(for: key))
+        XCTAssertTrue(before.isComplete)
+        XCTAssertGreaterThanOrEqual(before.sealedBodyLength, 64)
+        let url = try XCTUnwrap(URL(string: server.path(for: key), relativeTo: server.baseURL)?.absoluteURL)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        // Initial full-body completion plus 64 distinct byte responses reaches
+        // the real bounded HTTP evidence terminal, without poisoning target maps.
+        for offset in 0..<64 {
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+            request.setValue("bytes=\(offset)-\(offset)", forHTTPHeaderField: "Range")
+            let (_, response) = try await session.data(for: request)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 206)
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while server.completedEvidence(for: key)?.evidence != .capacityExceeded,
+              ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(server.completedEvidence(for: key)?.evidence, .capacityExceeded)
+        _ = server.acceptedGETSnapshot() // Join the server lane after recording the terminal.
+        let (_, response) = try await session.data(from: request.itemURL)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200,
+            "Publication termination is latched even while the server remains open")
+    }
+
     func assertLiveAVPrefixPrerequisites(file: StaticString = #filePath, line: UInt = #line) throws {
         let avSeed = try XCTUnwrap(publication.avSeed, file: file, line: line)
         let snapshot = try XCTUnwrap(publication.publisher.visible, file: file, line: line)
@@ -7089,6 +7339,10 @@ private final class Task21Harness {
         try coordinator.install(preparation)
     }
 
+    func publishUnrelatedPausedSourceFailure(excluding requested: FMP4PresentationRange) async throws {
+        try await authorityFixture.publishUnrelatedPausedSourceFailure(excluding: requested)
+    }
+
     func malformedCurrentAuthorityURL() throws -> URL {
         var components = try XCTUnwrap(URLComponents(url: authorityFixture.request.itemURL,
                                                      resolvingAgainstBaseURL: false))
@@ -7329,6 +7583,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
     private var quiescenceValue: AVPlayerQuiescenceReceipt?
     private var quiescenceInvocation: ControlTaskRegistry.BackendSuspendInvocation?
     private var errorValue: Error?
+    private var activationErrorValue: Error?
     private var suspendCallCountValue = 0
     private var retireCallCountValue = 0
     private var lastRetiredEpochValue: OutputLifecycleEpoch?
@@ -7373,6 +7628,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
     var activationResult: BackendActivationResult? { lock.withLock { activationValue } }
     var quiescenceReceipt: AVPlayerQuiescenceReceipt? { lock.withLock { quiescenceValue } }
     var lastError: Error? { lock.withLock { errorValue } }
+    var lastActivationError: Error? { lock.withLock { activationErrorValue } }
     var suspendCallCount: Int { lock.withLock { suspendCallCountValue } }
     var retireCallCount: Int { lock.withLock { retireCallCountValue } }
     var lastRetiredEpoch: OutputLifecycleEpoch? { lock.withLock { lastRetiredEpochValue } }
@@ -7441,9 +7697,14 @@ private final class Task21RegistryBackend: PlaybackBackend,
         }
         hook?(invocation)
         let coordinator = try requiredCoordinator()
-        let value = try await coordinator.activate(invocation)
-        lock.withLock { activationValue = value }
-        guard value != .rejected else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        do {
+            let value = try await coordinator.activate(invocation)
+            lock.withLock { activationValue = value }
+            guard value != .rejected else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        } catch {
+            lock.withLock { if activationErrorValue == nil { activationErrorValue = error } }
+            throw error
+        }
     }
 
     func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async

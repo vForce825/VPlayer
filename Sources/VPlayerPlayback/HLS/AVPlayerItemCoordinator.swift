@@ -98,6 +98,9 @@ protocol AVPlayerDriving: AnyObject {
     func directState(item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState
     /// Best-effort synchronous metadata read; failure never prevents physical stop.
     func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime?
+    func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier?
+    func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws
+    func finishPausedResumeCallbacks(item: AVPlayerItemInstanceIdentity)
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item: AVPlayerItemInstanceIdentity) throws
     func installNaturalEndTerminalHandler(
@@ -128,6 +131,11 @@ extension AVPlayerDriving {
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws {}
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws {}
     func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime? { nil }
+    func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? { nil }
+    func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {
+        throw AVPlayerItemCoordinatorFailure.capacityExceeded
+    }
+    func finishPausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) {}
     func retainInstallationResourceContext(_ reservation: PlaybackResourceContextReservation) {}
 }
 
@@ -290,6 +298,10 @@ private struct AVPlayerPublicationBindingReadiness {
 }
 
 protocol AVPlayerPreparationEvidenceProviding: AnyObject, Sendable {
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws
     func consumeCompletedPublication(itemURL: URL,
                                      item: AVPlayerItemInstanceIdentity,
                                      publicationSequence: UInt64)
@@ -325,6 +337,14 @@ protocol AVPlayerPreparationEvidenceProviding: AnyObject, Sendable {
 }
 
 extension AVPlayerPreparationEvidenceProviding {
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws {
+        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+    }
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws {
+        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+    }
     func awaitCoverageReadiness(contexts: [LoopbackCoverageContext],
                                 requested: FMP4PresentationRange) async throws {}
 }
@@ -548,12 +568,34 @@ struct AVPlayerPausedCursorBinding: Sendable {
     let stopIdentity: AVPlayerQuiescenceReceiptIdentity
     let item: AVPlayerItemInstanceIdentity
     let time: ExactMediaTime
+    let physicalItemIdentity: ObjectIdentifier
 
     fileprivate init(stopIdentity: AVPlayerQuiescenceReceiptIdentity,
-                     item: AVPlayerItemInstanceIdentity, time: ExactMediaTime) {
+                     item: AVPlayerItemInstanceIdentity, time: ExactMediaTime,
+                     physicalItemIdentity: ObjectIdentifier) {
         self.stopIdentity = stopIdentity
         self.item = item
         self.time = time
+        self.physicalItemIdentity = physicalItemIdentity
+    }
+}
+
+/// Minted only while the coordinator still owns the successful stopped scope.
+/// The server separately authenticates its timeline, selection and media facts.
+struct AVPlayerPausedResumeScope: Sendable {
+    let cursor: AVPlayerPausedCursorBinding
+    let itemURL: URL
+    let timeline: PlayerItemTimelineMappingAuthority
+    let selection: LoopbackAudioMediaSelectionCapability
+    let selectionRevision: UInt64
+    let lead: ExactMediaTime
+
+    fileprivate init(cursor: AVPlayerPausedCursorBinding, itemURL: URL,
+        timeline: PlayerItemTimelineMappingAuthority,
+        selection: LoopbackAudioMediaSelectionCapability, selectionRevision: UInt64,
+        lead: ExactMediaTime) {
+        self.cursor = cursor; self.itemURL = itemURL; self.timeline = timeline
+        self.selection = selection; self.selectionRevision = selectionRevision; self.lead = lead
     }
 }
 
@@ -1729,26 +1771,33 @@ final class AVPlayerItemCoordinator {
               state.phase == .prepared || authorization == invocation || state.phase == .stopping,
               invocationSnapshot.interval.outputLifecycle == item.outputLifecycleEpoch,
               invocationSnapshot.interval.itemGeneration == item.itemGeneration,
-              !invalidated, state.phase != .quiescent else {
-            return .rejected
-        }
+              !invalidated, state.phase != .quiescent else { return .rejected }
         guard let request else { return .rejected }
-        try revalidateCompletedPublication(for: request)
         if authorizationArmed, authorization == invocation {
+            try revalidateCompletedPublication(for: request)
             return .alreadyArmed(invocation.activation)
         }
-        if state.phase == .stopping {
-            // Registry 只能在 finishOutputPause 已退休原 suspend/activation record 后
-            // 签发新的 invocation。此处仅消费旧 coordinator 静止终态：不 prepare、
-            // seek 或重装 item；旧 receipt identity 随即失去 cleanup 签名能力。
+        let resuming = state.phase == .stopping
+        var resumeScope: AVPlayerPausedResumeScope?
+        if resuming {
             guard authorization == nil, !activationInFlight,
-                  lastQuiescenceReceipt != nil, stopTask != nil else {
-                return .rejected
+                  let stopIdentity = lastQuiescenceReceipt,
+                  stopTask?.receiptIdentity === stopIdentity else { return .rejected }
+            // Copy the original owned cursor and all immutable scope before
+            // consuming the predecessor terminal. Never sample after reconnect.
+            if let cursor = pausedCursorBinding, cursor.stopIdentity === stopIdentity,
+               cursor.item == item, driver.disconnectedFromSystemAudio,
+               driver.pausedItemObjectIdentity(item: item) == cursor.physicalItemIdentity,
+               let timeline = preparedTimelineMapping,
+               let selection = renditionSelectionSlot.capability {
+                resumeScope = .init(cursor: cursor, itemURL: request.itemURL,
+                    timeline: timeline, selection: selection,
+                    selectionRevision: state.selectionRevision,
+                    lead: AVPlayerStartupBufferPolicy.coverageDuration(
+                        seconds: driver.preferredForwardBufferDuration))
             }
             authorizationArmed = false
             lastQuiescenceReceipt = nil
-            // A future resume issuer must copy its immutable scope before this
-            // accepted activation consumes the old quiescence terminal.
             pausedCursorBinding = nil
             stopTask = nil
             state.phase = .prepared
@@ -1756,15 +1805,9 @@ final class AVPlayerItemCoordinator {
         authorization = invocation
         authorizationCount = try Self.checkedIncrement(authorizationCount, allocator: allocator)
         state.phase = .authorized
-        try driver.installTimeControlStatusRelay(
-            item: item,
-            activation: invocation.activation
-        ) { [weak self] status, observedItem, activation in
-            self?.observeTimeControlStatus(status, item: observedItem,
-                                           activation: activation)
-        }
         activationInFlight = true
         defer {
+            if resuming { driver.finishPausedResumeCallbacks(item: item) }
             activationInFlight = false
         }
         do {
@@ -1772,29 +1815,94 @@ final class AVPlayerItemCoordinator {
             guard invocation.revalidateCurrentAuthority() else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
-            try await driver.setDisconnectedFromSystemAudio(false, item: item)
-            try Task.checkCancellation()
-            guard self.request?.item == item, authorization == invocation, !invalidated,
-                  state.phase != .stopping, state.phase != .quiescent,
-                  invocation.revalidateCurrentAuthority() else {
-                throw AVPlayerItemCoordinatorFailure.staleIdentity
-            }
+            // Registry already owns an opened interval. Adopt its cleanup
+            // responsibility before a fallible publication check, without
+            // consuming positive-rate authority or performing a native effect.
             try revalidateCompletedPublication(for: request)
+            var resumeCoverage: LoopbackPausedResumeCoverage?
+            if resuming {
+                guard let resumeScope else { throw AVPlayerItemCoordinatorFailure.seekMismatch }
+                resumeCoverage = try evidenceSource.reservePausedResumeCoverage(resumeScope)
+                try driver.reservePausedResumeCallbacks(item: item)
+            }
+            // Both coverage/workspace and every native callback credit precede
+            // observer installation and the first physical reconnect side effect.
+            try driver.installTimeControlStatusRelay(item: item, activation: invocation.activation) {
+                [weak self] status, observedItem, activation in
+                self?.observeTimeControlStatus(status, item: observedItem, activation: activation)
+            }
+            try await driver.setDisconnectedFromSystemAudio(false, item: item)
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            if let coverage = resumeCoverage, let scope = resumeScope {
+                let playhead = PreparedPlayheadIdentity(
+                    outputLifecycleEpoch: item.outputLifecycleEpoch, itemGeneration: item.itemGeneration,
+                    publicationSequence: request.publicationSequence,
+                    mediaTime: coverage.requested.start, playerItemTime: scope.cursor.time,
+                    seekNonce: try issueNonce(), renditionSelectionSlotNonce: try issueNonce(),
+                    audioSelectionCapability: scope.selection, timelineMappingAuthority: scope.timeline)
+                let seek = try await driver.seek(to: scope.cursor.time, item: item, playhead: playhead)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                guard seek.item == item, seek.playhead == playhead, seek.actualTime == scope.cursor.time else {
+                    throw AVPlayerItemCoordinatorFailure.seekMismatch
+                }
+                let itemRange = try FMP4PresentationRange(start: scope.cursor.time,
+                    duration: coverage.requested.duration)
+                let loaded = try await driver.waitForLoadedTimeRanges(item: item,
+                    playhead: playhead, covering: itemRange)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                guard loaded.item == item, loaded.playhead == playhead, loaded.requested == itemRange else {
+                    throw AVPlayerItemCoordinatorFailure.loadedRangeMismatch
+                }
+                try await evidenceSource.awaitPausedResumeCoverage(coverage)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                try evidenceSource.revalidatePausedResumeCoverage(coverage)
+                let preroll = try await driver.preroll(item: item, playhead: playhead)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                guard preroll.item == item, preroll.playhead == playhead, preroll.succeeded else {
+                    throw AVPlayerItemCoordinatorFailure.prerollFailed
+                }
+                let direct = try await driver.directState(item: item)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                guard direct.item == item, direct.rate == 0, direct.timeControlStatus == .paused,
+                      driver.pausedTime(item: item) == scope.cursor.time,
+                      !driver.disconnectedFromSystemAudio else {
+                    throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+                }
+                try evidenceSource.revalidatePausedResumeCoverage(coverage)
+            }
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
             try await driver.play(invocation: invocation, item: item)
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            if let resumeCoverage { try evidenceSource.revalidatePausedResumeCoverage(resumeCoverage) }
         } catch {
-            // This is still the original signed activation runner. Stop joins it;
-            // task cancellation must not abandon a late physical reconnect.
+            // The original signed runner owns rollback even after cancellation;
+            // stop joins it before beginning the next physical suspension.
             driver.cancelPendingPrerolls(item: item)
             driver.pause(item: item)
             try await driver.setDisconnectedFromSystemAudio(true, item: item)
             throw error
         }
-        guard self.request?.item == item, authorization == invocation, !invalidated,
-              state.phase != .stopping, state.phase != .quiescent,
-              invocation.revalidateCurrentAuthority() else { return .rejected }
-        try revalidateCompletedPublication(for: request)
         authorizationArmed = true
         return .armed(invocation.activation)
+    }
+
+    private func validateActivation(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
+        request: AVPlayerItemPreparationRequest, resumeScope: AVPlayerPausedResumeScope?) throws {
+        try Task.checkCancellation()
+        guard self.request?.item == request.item, authorization == invocation, !invalidated,
+              state.phase != .stopping, state.phase != .quiescent,
+              invocation.revalidateCurrentAuthority() else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        try revalidateCompletedPublication(for: request)
+        if let scope = resumeScope {
+            guard preparedTimelineMapping === scope.timeline,
+                  renditionSelectionSlot.capability === scope.selection,
+                  state.selectionRevision == scope.selectionRevision,
+                  driver.pausedItemObjectIdentity(item: request.item) == scope.cursor.physicalItemIdentity else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+        }
     }
 
     func observeTimeControlStatus(_ status: AVPlayer.TimeControlStatus,
@@ -1914,6 +2022,7 @@ final class AVPlayerItemCoordinator {
             // Read on this owned synchronous stack before disconnect can reset
             // AVPlayer time. Keep it local until this exact stop commits.
             let pausedTime = driver.pausedTime(item: item)
+            let pausedItemObject = driver.pausedItemObjectIdentity(item: item)
             try await driver.setDisconnectedFromSystemAudio(true, item: item)
             guard driver.disconnectedFromSystemAudio else {
                 throw AVPlayerItemCoordinatorFailure.systemAudioConnectionNotConfirmed
@@ -1945,9 +2054,11 @@ final class AVPlayerItemCoordinator {
                 // This exact successful stop owns the slot even when its
                 // metadata read failed. Never retain a predecessor's cursor.
                 pausedCursorBinding = nil
-                if !invalidated, driver.currentItemIdentity == item, let pausedTime {
+                if !invalidated, driver.currentItemIdentity == item, let pausedTime,
+                   let pausedItemObject,
+                   driver.pausedItemObjectIdentity(item: item) == pausedItemObject {
                     pausedCursorBinding = .init(stopIdentity: receipt.identity,
-                                               item: item, time: pausedTime)
+                        item: item, time: pausedTime, physicalItemIdentity: pausedItemObject)
                 }
             }
             return receipt
@@ -3101,6 +3212,27 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
             itemGeneration: receipt.itemGeneration,
             presentationRange: verified.effectivePresentationRange,
             dependencies: .init(served: receipt.dependencies))
+    }
+
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage {
+        try server.reservePausedResumeCoverage(scope, originalOwner: preparationOwner)
+    }
+
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while true {
+            try Task.checkCancellation()
+            if try server.freezePausedResumeCoverage(coverage) { return }
+            guard ContinuousClock.now < deadline else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws {
+        try server.revalidatePausedResumeCoverage(coverage)
     }
 
     func awaitCoverageReadiness(

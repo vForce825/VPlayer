@@ -679,23 +679,14 @@ final class HLSTimelineTests: XCTestCase {
     }
 
     func testReal4KDemuxAndTimelineOrigin() throws {
-        let logURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("4k-timeline-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: logURL) }
-        func log(_ str: String) {
-            if let data = (str + "\n").data(using: .utf8) {
-                if FileManager.default.fileExists(atPath: logURL.path) {
-                    if let handle = try? FileHandle(forWritingTo: logURL) {
-                        handle.seekToEndOfFile()
-                        handle.write(data)
-                        try? handle.close()
-                    }
-                } else {
-                    try? data.write(to: logURL)
-                }
+        // Fail at the first bad AU instead of producing tens of thousands of diagnostics.
+        func require(_ condition: Bool, _ message: @autoclosure () -> String) throws {
+            guard condition else {
+                throw NSError(domain: "HLSTimeline4KAcceptance", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: message(),
+                ])
             }
         }
-        log("=== testReal4KDemuxAndTimelineOrigin START ===")
         let fixtureURL = try timelineFixtureURL()
         let server: LoopbackHTTPFixtureServer?
         if fixtureURL.isFileURL {
@@ -709,8 +700,8 @@ final class HLSTimelineTests: XCTestCase {
         try demuxer.start(url: server?.sourceURL ?? fixtureURL, sink: recorder.record)
         defer { demuxer.cancel() }
         let events = recorder.waitForTerminal(timeout: 10)
-        XCTAssertTrue(events.contains { if case .endOfStream = $0 { true } else { false } },
-                      "The full 15-minute fixture must reach EOF, not merely yield a playable prefix")
+        try require(events.contains { if case .endOfStream = $0 { true } else { false } },
+                    "The full 15-minute fixture must reach EOF, not merely yield a playable prefix")
         let tracks = try XCTUnwrap(events.compactMap { event -> DemuxTrackSet? in
             if case let .tracks(value) = event { return value }
             return nil
@@ -720,111 +711,175 @@ final class HLSTimelineTests: XCTestCase {
         XCTAssertEqual(actualVideo.height, 2_160)
         XCTAssertEqual(actualVideo.codec, .h264)
         XCTAssertEqual(actualVideo.frameRate, MediaRational(num: 25, den: 1))
+        XCTAssertEqual(actualVideo.videoDelay, 0, "The synthetic fixture has no B-frames")
         let actualAudio = try XCTUnwrap(tracks.audio)
         XCTAssertEqual(actualAudio.codec, .aac)
         XCTAssertEqual(actualAudio.sampleRate, 48_000)
+        XCTAssertEqual(actualAudio.channelLayout.channelCount, 2)
         let videoPackets = events.compactMap { event -> DemuxPacket? in
             if case let .packet(packet) = event, packet.streamIndex == actualVideo.streamIndex {
                 return packet
             }
             return nil
         }
-        XCTAssertEqual(videoPackets.count, 22_500, "The fixture must contain every 25fps frame for 900 seconds")
+        let expectedPacketCount = 22_500
+        let frameDuration = ExactMediaTime(value: 1, timescale: 25)
+        try require(videoPackets.count == expectedPacketCount,
+                    "Expected all \(expectedPacketCount) video packets, got \(videoPackets.count)")
         let firstPacket = try XCTUnwrap(videoPackets.first)
         let lastPacket = try XCTUnwrap(videoPackets.last)
-        let videoSpan = CMTimeSubtract(
-            CMTimeAdd(lastPacket.presentationTimeStamp, lastPacket.duration),
-            firstPacket.presentationTimeStamp)
-        XCTAssertEqual(CMTimeGetSeconds(videoSpan), 900, accuracy: 0.001)
-        log("[TEST_4K] events count: \(events.count)")
+        let firstSourcePTS = try ExactMediaTime(firstPacket.presentationTimeStamp)
+        for (index, packet) in videoPackets.enumerated() {
+            let expectedPTS = try firstSourcePTS.adding(ExactMediaTime(value: Int64(index), timescale: 25))
+            let pts = try ExactMediaTime(packet.presentationTimeStamp)
+            let dts = try ExactMediaTime(packet.decodeTimeStamp)
+            let duration = try ExactMediaTime(packet.duration)
+            try require(pts == expectedPTS && dts == expectedPTS && duration == frameDuration,
+                        "Video packet \(index): expected PTS/DTS=\(expectedPTS), duration=\(frameDuration); "
+                        + "got PTS=\(pts), DTS=\(dts), duration=\(duration)")
+            try require(!packet.isCorrupt && packet.isKey == (index.isMultiple(of: 50)),
+                        "Video packet \(index): fixture must have an uncorrupted closed 50-frame GOP")
+        }
+        let sourceEnd = try ExactMediaTime(lastPacket.presentationTimeStamp).adding(frameDuration)
+        XCTAssertEqual(try sourceEnd.subtracting(firstSourcePTS), ExactMediaTime(value: 900, timescale: 1))
+
+        // The real classifier needs eight progressive frames. The first eligible IDR
+        // in this 50-frame-GOP fixture is packet 50, two seconds after the first PTS.
+        // Fix this expectation independently of what the coordinator happens to emit.
+        let expectedLeadingVideoPackets = 50
+        let expectedVideoSampleCount = expectedPacketCount - expectedLeadingVideoPackets
+        let expectedOriginPTS = try firstSourcePTS.adding(ExactMediaTime(value: 2, timescale: 1))
+        let expectedEffectiveStart = ExactMediaTime(value: 10, timescale: 1)
+        let expectedNormalizedEnd = try expectedEffectiveStart.adding(sourceEnd.subtracting(expectedOriginPTS))
         let coordinator = HLSTimelineCoordinator()
-        var originEvents: [HLSTimelineEvent] = []
+        var origins: [MediaOriginReceipt] = []
+        var terminals: [HLSTimelineTerminal] = []
         var videoSampleCount = 0
+        var videoSubmissionCount = 0
         var audioSampleCount = 0
-        var videoTrack: VideoTrackDescriptor?
+        var lastSubmissionEnd: ExactMediaTime?
         var videoInspection: VideoAccessUnitInspectionSession?
         var videoEligibility: VideoRemuxEligibility?
         var videoBuilder: HLSVideoRemuxSubmissionBuilder?
-        for (i, event) in events.enumerated() {
-            if case let .tracks(tracks) = event {
-                videoTrack = tracks.video
-            }
+        defer {
+            // Audio is observed, not an all-packets claim: pre-origin AAC is dropped
+            // and the boundary AU may be trimmed by the timeline coordinator.
+            print("[TEST_4K] packets=\(videoPackets.count), leadingVideoPackets=\(expectedLeadingVideoPackets), "
+                  + "expectedVideoSamples=\(expectedVideoSampleCount), videoSamples=\(videoSampleCount), "
+                  + "videoSubmissions=\(videoSubmissionCount), observedAudioSamples=\(audioSampleCount), "
+                  + "origins=\(origins.count), terminals=\(terminals)")
+        }
+        for (eventIndex, event) in events.enumerated() {
+            var stage = "consume"
             do {
                 let emissions = try coordinator.consume(event)
-                for em in emissions {
-                    switch em {
+                for emission in emissions {
+                    switch emission {
                     case .originEstablished(let receipt):
-                        log("[TEST_4K] Origin established at event \(i): \(receipt)")
-                        originEvents.append(em)
+                        stage = "origin"
+                        try require(origins.isEmpty && receipt.source == .videoIDR
+                                    && receipt.sourceTime == expectedOriginPTS
+                                    && receipt.effectiveStart == expectedEffectiveStart,
+                                    "Expected one real video IDR origin at \(expectedOriginPTS), got \(receipt)")
+                        origins.append(receipt)
+                        print("[TEST_4K] origin=\(receipt), expectedVideoSpan=898 seconds")
                     case .videoSample(let timed):
+                        stage = "video source/timing"
+                        let packetIndex = expectedLeadingVideoPackets + videoSampleCount
                         videoSampleCount += 1
-                        if let track = videoTrack {
-                            if videoInspection == nil {
-                                videoInspection = VideoAccessUnitInspectionSession(
-                                    generation: timed.source.generation, codec: track.codec)
-                                videoEligibility = try VideoRemuxEligibility(
-                                    generation: timed.source.generation, track: track,
-                                    sampleEntry: track.codec == VideoCodec.h264 ? .avc3 : .hev1)
-                            }
-                            if let backing = timed.source.sourceBacking,
-                               let byteRange = timed.source.sourceByteRange,
-                               let sourceSHA256 = timed.source.sourceSHA256 {
-                                let sourcePTS = try ExactMediaTime(
-                                    CMSampleBufferGetPresentationTimeStamp(timed.source.sampleBuffer))
-                                let sourceDTSValue = CMSampleBufferGetDecodeTimeStamp(timed.source.sampleBuffer)
-                                let proof = try videoInspection!.inspect(.init(
-                                    backing: backing, byteRange: byteRange, sourceSHA256: sourceSHA256,
-                                    codec: track.codec, scanClassification: timed.source.scanClassification,
-                                    presentationTimeStamp: sourcePTS,
-                                    decodeTimeStamp: sourceDTSValue.isNumeric ? try ExactMediaTime(sourceDTSValue) : nil,
-                                    duration: try ExactMediaTime(CMSampleBufferGetDuration(timed.source.sampleBuffer)),
-                                    expectedFormat: track))
-                                let decision = try videoEligibility!.evaluate(proof)
-                                log("[TEST_4K] Video #\(videoSampleCount) Decision: path=\(decision.path), transcodeReason=\(String(describing: decision.transcodeReason)), proof=\(decision.proof != nil)")
-                                if videoBuilder == nil, let admission = decision.proof {
-                                    let binding = FMP4WriterBinding(
-                                        outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 18),
-                                        itemGeneration: .init(rawValue: 20),
-                                        mediaEpoch: .init(rawValue: 21),
-                                        publicationParticipantID: .init(rawValue: 22),
-                                        renditionIdentity: .init(rawValue: 23),
-                                        writerIdentity: .init(rawValue: 24)
-                                    )
-                                    do {
-                                        let builder = try HLSVideoRemuxSubmissionBuilder(
-                                            reference: timed, admission: admission, writerBinding: binding)
-                                        videoBuilder = builder
-                                        log("[TEST_4K] HLSVideoRemuxSubmissionBuilder SUCCESS: formatDescription=\(builder.formatDescription)")
-                                    } catch {
-                                        log("[TEST_4K] HLSVideoRemuxSubmissionBuilder FAILED: \(error)")
-                                    }
-                                }
-                                if let builder = videoBuilder, let admission = decision.proof {
-                                    do {
-                                        _ = try builder.makeSubmission(for: timed, admission: admission)
-                                        log("[TEST_4K] makeSubmission #\(videoSampleCount) SUCCESS")
-                                    } catch {
-                                        log("[TEST_4K] makeSubmission #\(videoSampleCount) FAILED: \(error)")
-                                    }
-                                }
-                            }
+                        let origin = try XCTUnwrap(origins.first, "Video emission requires the validated real origin")
+                        try require(packetIndex < videoPackets.count,
+                                    "Unexpected extra video sample \(videoSampleCount)")
+                        let expectedPacket = videoPackets[packetIndex]
+                        let sourcePTS = try ExactMediaTime(
+                            CMSampleBufferGetPresentationTimeStamp(timed.source.sampleBuffer))
+                        let sourceDTS = try ExactMediaTime(
+                            CMSampleBufferGetDecodeTimeStamp(timed.source.sampleBuffer))
+                        let sourceDuration = try ExactMediaTime(CMSampleBufferGetDuration(timed.source.sampleBuffer))
+                        let expectedPTS = try ExactMediaTime(expectedPacket.presentationTimeStamp)
+                        let expectedTimingPTS = try expectedEffectiveStart.adding(expectedPTS.subtracting(expectedOriginPTS))
+                        try require(sourcePTS == expectedPTS && sourceDTS == expectedPTS && sourceDuration == frameDuration
+                                    && timed.generation == origin.generation
+                                    && timed.timing.presentationTimeStamp == expectedTimingPTS
+                                    && timed.timing.decodeTimeStamp == expectedTimingPTS
+                                    && timed.timing.duration == frameDuration,
+                                    "Video sample \(videoSampleCount), packet \(packetIndex): source or normalized timing mismatch; "
+                                    + "sourcePTS=\(sourcePTS), sourceDTS=\(sourceDTS), duration=\(sourceDuration), "
+                                    + "timing=\(timed.timing), expectedPTS=\(expectedPTS), normalizedPTS=\(expectedTimingPTS)")
+                        let backing = try XCTUnwrap(timed.source.sourceBacking, "Missing real AU backing")
+                        let byteRange = try XCTUnwrap(timed.source.sourceByteRange, "Missing real AU byte range")
+                        let sourceSHA256 = try XCTUnwrap(timed.source.sourceSHA256, "Missing real AU digest")
+                        if videoInspection == nil {
+                            videoInspection = VideoAccessUnitInspectionSession(
+                                generation: timed.source.generation, codec: actualVideo.codec)
+                            videoEligibility = try VideoRemuxEligibility(
+                                generation: timed.source.generation, track: actualVideo, sampleEntry: .avc3)
                         }
+                        stage = "inspect/admit"
+                        let inspection = try XCTUnwrap(videoInspection)
+                        let eligibility = try XCTUnwrap(videoEligibility)
+                        let proof = try inspection.inspect(.init(
+                            backing: backing, byteRange: byteRange, sourceSHA256: sourceSHA256,
+                            codec: actualVideo.codec, scanClassification: timed.source.scanClassification,
+                            presentationTimeStamp: sourcePTS, decodeTimeStamp: sourceDTS,
+                            duration: sourceDuration, expectedFormat: actualVideo))
+                        let decision = try eligibility.evaluate(proof)
+                        try require(decision.path == .remux && decision.transcodeReason == nil && !decision.requiresNewItem,
+                                    "Video sample \(videoSampleCount): fixture must remux; path=\(decision.path), "
+                                    + "reason=\(String(describing: decision.transcodeReason)), newItem=\(decision.requiresNewItem)")
+                        let admission = try XCTUnwrap(decision.proof, "Remux requires a real inspector-issued admission")
+                        if videoBuilder == nil {
+                            stage = "construct remux builder"
+                            let binding = FMP4WriterBinding(
+                                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 18),
+                                itemGeneration: .init(rawValue: 20),
+                                mediaEpoch: .init(rawValue: 21),
+                                publicationParticipantID: .init(rawValue: 22),
+                                renditionIdentity: .init(rawValue: 23),
+                                writerIdentity: .init(rawValue: 24)
+                            )
+                            videoBuilder = try HLSVideoRemuxSubmissionBuilder(
+                                reference: timed, admission: admission, writerBinding: binding)
+                        }
+                        stage = "make/validate remux submission"
+                        let builder = try XCTUnwrap(videoBuilder)
+                        let submission = try builder.makeSubmission(for: timed, admission: admission)
+                        try require(submission.presentationTimeStamp == expectedTimingPTS
+                                    && submission.decodeTimeStamp == expectedTimingPTS
+                                    && submission.duration == frameDuration
+                                    && submission.sourceBacking === backing
+                                    && submission.sourceByteRange == byteRange
+                                    && submission.sourceSHA256 == sourceSHA256
+                                    && submission.isIDR == expectedPacket.isKey,
+                                    "Video submission \(videoSampleCount): source binding or exact timing mismatch")
+                        try require(try submission.validatesFrozenIdentity(),
+                                    "Video submission \(videoSampleCount): frozen identity validation failed")
+                        videoSubmissionCount += 1
+                        lastSubmissionEnd = try submission.presentationTimeStamp.adding(submission.duration)
                     case .audioSample:
                         audioSampleCount += 1
+                    case .terminal(let terminal):
+                        terminals.append(terminal)
                     default:
                         break
                     }
                 }
             } catch {
-                log("[TEST_4K] consume error at event \(i): \(error)")
+                print("[TEST_4K] FAILED event=\(eventIndex), sample=\(videoSampleCount), stage=\(stage): "
+                      + String(String(reflecting: error).prefix(512)))
                 throw error
             }
         }
-        log("[TEST_4K] Finished: origins=\(originEvents.count), videoSamples=\(videoSampleCount), audioSamples=\(audioSampleCount)")
-        XCTAssertFalse(originEvents.isEmpty, "4K stream must establish origin!")
-        XCTAssertGreaterThan(videoSampleCount, 0)
-        XCTAssertGreaterThan(audioSampleCount, 0)
-        XCTAssertNotNil(videoBuilder, "4K fixture must obtain a real remux admission and submission builder")
+        XCTAssertEqual(origins.count, 1)
+        XCTAssertEqual(terminals, [.endOfStream], "The timeline must drain the complete fixture")
+        XCTAssertEqual(videoSampleCount, expectedVideoSampleCount,
+                       "Every one of the 22,450 post-origin video packets must become a timed sample")
+        XCTAssertEqual(videoSubmissionCount, expectedVideoSampleCount,
+                       "Every one of the 22,450 post-origin video packets must produce a validated remux submission")
+        XCTAssertEqual(lastSubmissionEnd, expectedNormalizedEnd,
+                       "Remux submissions must cover all 898 seconds after the intentional 2-second origin wait")
+        XCTAssertGreaterThan(audioSampleCount, 0, "Observed audio emission is required; complete AAC coverage is not asserted")
+        XCTAssertNotNil(videoBuilder)
     }
 
     func testReal4KProductionMediaGraph() async throws {
