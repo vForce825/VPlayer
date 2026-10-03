@@ -782,6 +782,37 @@ enum PausedDecodeCoverageOrder {
         return try .init(start: start, duration: end.subtracting(start))
     }
 
+    /// Admission examines metadata only: HTTP eligibility is checked later.
+    /// Match the verifier's lexicographic raw-map bounds and unextended sample
+    /// overlap without allocating ordinals before workspace admission.
+    static func canContribute(map: SealedDecodeCoverageMap,
+                              requested: FMP4PresentationRange) throws -> Bool {
+        guard let first = map.samples.first, map.samples.count <= 256 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        func precedes(_ lhs: FMP4PresentationRange, _ rhs: FMP4PresentationRange) throws -> Bool {
+            let start = try HLSChecked.compare(lhs.start, rhs.start)
+            if start != 0 { return start < 0 }
+            return try HLSChecked.compare(lhs.end, rhs.end) < 0
+        }
+        var minimum = first.presentationRange
+        var maximum = first.presentationRange
+        for sample in map.samples.dropFirst() {
+            if try precedes(sample.presentationRange, minimum) { minimum = sample.presentationRange }
+            if try precedes(maximum, sample.presentationRange) { maximum = sample.presentationRange }
+        }
+        let start = try HLSChecked.compare(minimum.start, requested.start) > 0
+            ? minimum.start : requested.start
+        let end = try HLSChecked.compare(maximum.end, requested.end) < 0
+            ? maximum.end : requested.end
+        guard try HLSChecked.compare(start, end) < 0 else { return false }
+        for sample in map.samples {
+            if try HLSChecked.compare(sample.presentationRange.start, end) < 0,
+               try HLSChecked.compare(start, sample.presentationRange.end) < 0 { return true }
+        }
+        return false
+    }
+
     static func videoHold(map: SealedDecodeCoverageMap) throws -> ExactMediaTime? {
         guard map.mediaType == .video, let first = map.samples.first else { return nil }
         var maximum = first.presentationRange.duration

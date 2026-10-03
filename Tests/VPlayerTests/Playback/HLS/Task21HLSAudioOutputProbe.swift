@@ -120,6 +120,7 @@ final class Task21HLSAudioOutputProbe {
 
     private let scope: String
     private let physicalItemIdentity: ObjectIdentifier
+    private let tappedTrackID: CMPersistentTrackID
     private let state: Task21HLSTapStorage
     private var item: AVPlayerItem?
     /// AVPlayerItem copies the assigned mix. Track the installed copy weakly so
@@ -130,16 +131,33 @@ final class Task21HLSAudioOutputProbe {
     private var markers: [Marker] = []
     private var drained: Snapshot?
 
-    private init(item: AVPlayerItem, scope: String, state: Task21HLSTapStorage, tap: MTAudioProcessingTap) {
+    private init(item: AVPlayerItem, scope: String, trackID: CMPersistentTrackID,
+                 state: Task21HLSTapStorage, tap: MTAudioProcessingTap) {
         self.item = item
         self.scope = scope
         physicalItemIdentity = ObjectIdentifier(item)
+        tappedTrackID = trackID
         self.state = state
         self.tap = tap
         markers.reserveCapacity(16)
     }
 
     static func attach(to item: AVPlayerItem, player: AVPlayer, scope: String) throws -> Task21HLSAudioOutputProbe {
+        let parameters = AVMutableAudioMixInputParameters()
+        parameters.trackID = AVAudioMixInputParametersTrackID.mixID.rawValue
+        return try attach(to: item, player: player, scope: scope, parameters: parameters)
+    }
+
+    /// Local-asset control only. All tap construction, callbacks and storage are
+    /// identical to HLS; only ordinary asset-track association differs.
+    static func attachLocalReference(to item: AVPlayerItem, player: AVPlayer, track: AVAssetTrack,
+                                     scope: String) throws -> Task21HLSAudioOutputProbe {
+        try attach(to: item, player: player, scope: scope,
+                   parameters: AVMutableAudioMixInputParameters(track: track))
+    }
+
+    private static func attach(to item: AVPlayerItem, player: AVPlayer, scope: String,
+                               parameters: AVMutableAudioMixInputParameters) throws -> Task21HLSAudioOutputProbe {
         guard player.currentItem === item, item.audioMix == nil else { throw Failure.existingMix }
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
                                         channels: 2, interleaved: false) else { throw Failure.formatCreation }
@@ -154,12 +172,11 @@ final class Task21HLSAudioOutputProbe {
         let status = MTAudioProcessingTapCreateWithPreferredFormat(kCFAllocatorDefault, &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects, format.formatDescription, &tap)
         guard status == noErr, let tap else { throw Failure.tapCreation(status) }
-        let probe = Task21HLSAudioOutputProbe(item: item, scope: scope, state: state, tap: tap)
+        let probe = Task21HLSAudioOutputProbe(item: item, scope: scope, trackID: parameters.trackID,
+                                            state: state, tap: tap)
         probe.rateObservation = player.observe(\.rate, options: [.initial, .new]) { _, change in
             if let rate = change.newValue { state.observedRate.store(rate.bitPattern, ordering: .releasing) }
         }
-        let parameters = AVMutableAudioMixInputParameters()
-        parameters.trackID = AVAudioMixInputParametersTrackID.mixID.rawValue
         parameters.audioTapProcessor = tap
         let mix = AVMutableAudioMix()
         mix.inputParameters = [parameters]
@@ -187,9 +204,13 @@ final class Task21HLSAudioOutputProbe {
             $0.trackID == AVAudioMixInputParametersTrackID.mixID.rawValue
                 && $0.audioTapProcessor === tap
         }.count
+        let associatedTapCount = parameters.filter {
+            $0.trackID == tappedTrackID && $0.audioTapProcessor === tap
+        }.count
         let originalMixInstalled = installedMix != nil && item?.audioMix === installedMix
         print("AAC_TAP_SETUP \(scope) phase=\(phase) originalItemCurrent=\(player.currentItem === item) "
             + "originalMixInstalled=\(originalMixInstalled) parameters=\(parameters.count) mixTapCount=\(mixTapCount) "
+            + "tappedTrackID=\(tappedTrackID) associatedTapCount=\(associatedTapCount) "
             + "playerMuted=\(player.isMuted) playerVolume=\(player.volume) rate=\(player.rate) "
             + "timeControl=\(player.timeControlStatus.rawValue) disconnected=\(player.disconnectedFromSystemAudio) "
             + "externalVideoPlayback=\(player.isExternalPlaybackActive)")
@@ -568,5 +589,143 @@ final class Task21NativeAudioSessionReference {
             + "outputCount=\(outputs.count) portTypesAndChannels=\(ports) outputChannels=\(session.outputNumberOfChannels) "
             + "sampleRate=\(session.sampleRate) ioDuration=\(session.ioBufferDuration) outputLatency=\(session.outputLatency) "
             + "outputVolume=\(session.outputVolume)")
+    }
+}
+
+/// Separate simulator renderer/tap control. This uses a generated local PCM
+/// asset and ordinary track association, not the HLS/Registry endpoint fixture.
+/// Register close() before calling playThroughNaturalEnd(), after registering
+/// the native-session owner's close(), so player/tap cleanup runs first.
+@MainActor
+final class Task21LocalPCMTapReference {
+    enum Failure: Error { case format, asset, native(String), timeout(String), cleanup }
+    private final class EndSignal: Sendable {
+        let received = Atomic<Bool>(false)
+    }
+    private let directory: URL
+    private let player = AVPlayer()
+    private let endSignal = EndSignal()
+    private var item: AVPlayerItem?
+    private var probe: Task21HLSAudioOutputProbe?
+    private var endObserver: (any NSObjectProtocol)?
+    private var closed = false
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Task21-local-PCM-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    }
+
+    func playThroughNaturalEnd() async throws {
+        let url = directory.appendingPathComponent("reference.caf")
+        try Self.writePCM(to: url)
+        let asset = AVURLAsset(url: url)
+        let playable = try await asset.load(.isPlayable)
+        print("LOCAL_PCM_REFERENCE assetIsPlayable=\(playable)")
+        guard playable else { throw Failure.asset }
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let duration = try await asset.load(.duration)
+        guard tracks.count == 1, CMTimeCompare(duration, CMTime(value: 2, timescale: 1)) == 0 else {
+            throw Failure.asset
+        }
+        let physical = AVPlayerItem(asset: asset)
+        item = physical
+        player.replaceCurrentItem(with: physical)
+        probe = try Task21HLSAudioOutputProbe.attachLocalReference(
+            to: physical, player: player, track: tracks[0], scope: "LOCAL_PCM_REFERENCE")
+        let signal = endSignal
+        endObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification, object: physical, queue: nil) { _ in
+                signal.received.store(true, ordering: .releasing)
+            }
+        print("LOCAL_PCM_REFERENCE assetFrames=96000 assetRate=48000 channels=2 "
+            + "source=syntheticFloatPCM association=assetTrack registryPath=false endpointOracle=false")
+        try await waitFor("ready") { player.status == .readyToPlay && physical.status == .readyToPlay }
+        guard player.rate == 0, !player.disconnectedFromSystemAudio else { throw Failure.native("preroll-precondition") }
+        // This is the same native preroll operation used by the HLS path. A
+        // missing SDK completion remains subject to the outer XCTest timeout;
+        // no timeout race fabricates return or abandons an outstanding callback.
+        guard await player.preroll(atRate: 1) else { throw Failure.native("preroll") }
+        probe?.mark(.prepared, player: player)
+        probe?.mark(.activationRequested, player: player)
+        player.play()
+        try await waitFor("positive-rate") { player.rate > 0 }
+        probe?.mark(.activationReturned, player: player)
+        try await waitFor("natural-EOS") { signal.received.load(ordering: .acquiring) }
+        probe?.mark(.naturalEnd, player: player)
+        print("LOCAL_PCM_REFERENCE genuineItemEOS=true currentTimeIsOutputEvidence=false")
+    }
+
+    func close() async throws {
+        guard !closed else { return }
+        closed = true
+        var failure: (any Error)?
+        probe?.mark(.retiring, player: player)
+        player.pause()
+        player.cancelPendingPrerolls()
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        endObserver = nil
+        // Complete the actual physical disconnect before releasing the player
+        // item. As with preroll, a lost native completion is an external timeout.
+        await withCheckedContinuation { continuation in
+            player.setDisconnectedFromSystemAudio(true) { continuation.resume() }
+        }
+        player.replaceCurrentItem(with: nil)
+        item = nil
+        if player.currentItem != nil || player.rate != 0 || !player.disconnectedFromSystemAudio {
+            failure = Failure.cleanup
+        }
+        if let probe {
+            do {
+                let snapshot = try await probe.detachAndDrain()
+                snapshot.log()
+                try snapshot.requireUsableRawEvidence()
+                guard snapshot.samples.contains(where: { $0.isFinite && abs($0) > 0.00001 }) else {
+                    throw Failure.native("no nonzero synthetic PCM window")
+                }
+                print("LOCAL_PCM_REFERENCE usableSourceFrames=true physicalTapFinalized=true")
+            } catch {
+                if failure == nil { failure = error }
+                print("LOCAL_PCM_REFERENCE evidenceFailure=\(error)")
+            }
+        }
+        probe = nil
+        do { try FileManager.default.removeItem(at: directory) }
+        catch { if failure == nil { failure = error } }
+        print("LOCAL_PCM_REFERENCE cleanup itemAbsent=\(player.currentItem == nil) "
+            + "rate=\(player.rate) disconnected=\(player.disconnectedFromSystemAudio) "
+            + "temporaryDirectoryRemoved=\(!FileManager.default.fileExists(atPath: directory.path))")
+        if let failure { throw failure }
+    }
+
+    private func waitFor(_ stage: String, until ready: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while !ready() {
+            if player.status == .failed || item?.status == .failed {
+                throw Failure.native("\(stage): player=\(String(describing: player.error)) item=\(String(describing: item?.error))")
+            }
+            guard player.currentItem === item else { throw Failure.native("item-replaced") }
+            guard ContinuousClock.now < deadline else { throw Failure.timeout(stage) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        print("LOCAL_PCM_REFERENCE completedStage=\(stage) rate=\(player.rate)")
+    }
+
+    private static func writePCM(to url: URL) throws {
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                        channels: 2, interleaved: true) else { throw Failure.format }
+        let file = try AVAudioFile(forWriting: url, settings: format.settings,
+                                   commonFormat: .pcmFormatFloat32, interleaved: false)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 96_000),
+              let channels = buffer.floatChannelData else { throw Failure.format }
+        buffer.frameLength = 96_000
+        for frame in 0..<Int(buffer.frameLength) {
+            // Synthetic, quiet and deterministic stereo tones; no downloaded or
+            // user media. Generation and allocations run only on the test actor.
+            channels[0][frame] = Float(0.05 * sin(2 * Double.pi * Double(frame) / 480))
+            channels[1][frame] = Float(0.05 * sin(2 * Double.pi * Double(frame) / 240))
+        }
+        try file.write(from: buffer)
+        // The writer's synchronous scope ends before AVURLAsset opens its URL.
     }
 }

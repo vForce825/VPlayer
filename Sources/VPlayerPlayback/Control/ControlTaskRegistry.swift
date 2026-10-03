@@ -7958,13 +7958,32 @@ final class ControlTaskRegistry: @unchecked Sendable {
     func beginOutputTransition(contextNonce: UInt64, reason: OutputTransitionReason,
         anchorInstant: UInt64, teardown: Bool, sourceActivation: ActivationEpoch? = nil) throws -> OutputTransitionOwnerTicket? {
         defer { notifyPlaybackProgress() }
-        return try transaction(operationDescriptor: .resourceOwnership, safetyFailureFallback: { output in
+        var activationTask: Task<Void, Never>?
+        let owner = try transaction(operationDescriptor: .resourceOwnership, safetyFailureFallback: { output in
             try self.beginOutputTransitionLocked(contextNonce: contextNonce, reason: .terminal,
                 anchorInstant: anchorInstant, teardown: true, sourceActivation: sourceActivation, output: &output)
         }) { output in
-            try beginOutputTransitionLocked(contextNonce: contextNonce, reason: reason,
+            let owner = try beginOutputTransitionLocked(contextNonce: contextNonce, reason: reason,
                 anchorInstant: anchorInstant, teardown: teardown, sourceActivation: sourceActivation, output: &output)
+            if let owner, owner.reason == .pause,
+               let context = authority.outputContext, context.owner == owner,
+               let source = context.sourceTask,
+               let index = authority.commands.firstIndex(where: { $0?.controlTaskTicket == source }),
+               let record = authority.commands[index], record.slot == .activation,
+               record.groupTicket == context.reservation.workGroup,
+               record.phase == .queued || record.phase == .running || record.phase == .cancelRequested {
+                // Revoke only this activation; ordinary pause must not seal the
+                // work group needed by the next resume or cancel cleanup work.
+                authority.cancel(index)
+                activationTask = record.backendOperation?.task
+            }
+            return owner
         }
+        // Capture the original handle in the same Cell transaction as revocation,
+        // then invoke cancellation handlers outside its lock. The original runner
+        // still owns rollback and must actually exit before suspend/join settles.
+        activationTask?.cancel()
+        return owner
     }
 
     private func beginOutputTransitionLocked(contextNonce: UInt64, reason: OutputTransitionReason,

@@ -9,6 +9,39 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class ControlTaskRegistryTests: XCTestCase {
+    func testPauseCancelsExactActivationBeforeJoinAndKeepsWorkGroupReusable() throws {
+        let fixture = try OutputGraphFixture()
+        let registry = fixture.registry
+        let prepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(registry.claimStart(prepare))
+        XCTAssertTrue(registry.completeOutputPrepare(prepare))
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let activation = try XCTUnwrap(registry.beginOutputActivation(contextNonce: context.contextNonce))
+        XCTAssertTrue(registry.claimStart(activation))
+        let interval = try XCTUnwrap(registry.openOutputInterval(activation, itemGeneration: nil))
+
+        let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .pause, at: registry.clock.nowNanoseconds))
+        XCTAssertEqual(registry.phase(of: activation), .cancelRequested,
+            "Pause must revoke its original activation before any caller waits for that runner")
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, owner)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.interval, interval,
+            "Cancellation cannot impersonate physical output quiescence")
+        let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        let suspension = try claimGraphSuspend(registry, stop)
+        XCTAssertFalse(suspension.complete(in: registry, preparedPreserved: true),
+            "The original activation must actually finish before suspend may settle")
+        XCTAssertTrue(registry.complete(activation))
+        XCTAssertTrue(suspension.complete(in: registry, preparedPreserved: true))
+        XCTAssertTrue(registry.finishOutputPause(owner: owner))
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.reservation.workGroup,
+            context.reservation.workGroup)
+        let resumed = try XCTUnwrap(registry.beginOutputActivation(contextNonce: context.contextNonce),
+            "Pause must leave the original work group open for a later resume")
+        XCTAssertEqual(resumed.group, activation.group)
+        XCTAssertNotEqual(resumed, activation)
+    }
+
     func test已消费的同一播放授权允许重复倍率副作用但不重复激活() async throws {
         let fixture = try await CurrentPlaybackRateGateFixture.make()
         let invocation = try XCTUnwrap(fixture.backend.lastActivation)

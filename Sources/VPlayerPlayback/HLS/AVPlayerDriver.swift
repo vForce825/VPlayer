@@ -208,8 +208,9 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
 }
 
 /// Prepaid callback capacity for one original driver/item. This object contains
-/// no task, timer, native callback, proof, or escaping closure. Its caller must
-/// retain it through registered cleanup; closing it is not quiescence evidence.
+/// no task, timer, native callback or proof. One inline continuation can wait
+/// for a physical credit return. Its caller retains it through registered
+/// cleanup; closing it is not quiescence evidence.
 final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
     struct AllocationBreakdown: Sendable {
         let poolBytes: Int
@@ -446,12 +447,23 @@ final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
         return lease
     }
 
-    func cancel() { SystemAVPlayerDriver.creationLock.withLock { cancelled = true } }
+    private func takeOperationReturnWaiterLocked() -> CheckedContinuation<Void, any Error>? {
+        defer { operationReturnWaiter = nil }
+        return operationReturnWaiter?.1
+    }
+
+    func cancel() {
+        let waiter = SystemAVPlayerDriver.creationLock.withLock {
+            cancelled = true
+            return takeOperationReturnWaiterLocked()
+        }
+        waiter?.resume(throwing: CancellationError())
+    }
 
     /// Never-started admission can release everything. Once any borrower was
     /// admitted, only an original-driver native readback can release rollback.
     func close() {
-        SystemAVPlayerDriver.creationLock.withLock {
+        let waiter = SystemAVPlayerDriver.creationLock.withLock {
             closed = true; cancelled = true
             Self.releaseUnusedLocked(&operation, admission: admission)
             Self.releaseUnusedLocked(&observer, admission: admission)
@@ -459,7 +471,9 @@ final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
                 Self.releaseUnusedLocked(&rollback, admission: admission)
                 installationResourceContextReservation = nil
             }
+            return takeOperationReturnWaiterLocked()
         }
+        waiter?.resume(throwing: CancellationError())
     }
 
     fileprivate func resolveUnusedRollbackAfterDriverReadback() -> Bool {

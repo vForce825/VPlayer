@@ -3001,6 +3001,12 @@ final class LoopbackHTTPServer: @unchecked Sendable {
 
     private func validatePausedResumeScope(_ scope: AVPlayerPausedResumeScope,
                                           originalOwner: FrozenPreparationOwner) throws -> FrozenParticipantHistoryTable {
+        if let terminal = timelineFailureEvent {
+            switch terminal {
+            case .publicationTerminated(_, _, _, let failure): throw failure
+            case .serverTerminated: throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+        }
         guard isAdmissionOpen, !originalOwner.isRetired, originalOwner.completionIsFrozen,
               originalOwner.metadataStore === store,
               let original = originalOwner.frozenPublication,

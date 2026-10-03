@@ -1,4 +1,4 @@
-name: Paused resume regressions and strict native fixtures
+name: Paused resume ownership and native boundaries
 
 # Standard GitHub-hosted runners are free for this public repository.
 # Do not add larger runners, artifact uploads, or persistent caches without
@@ -72,6 +72,18 @@ jobs:
             echo "SWIFT_EXECUTOR_ABI_HEADER_END"
           done < <(find "$toolchain" -type f -path '*/swift/ABI/Executor.h')
           echo "SWIFT_EXECUTOR_ABI_HEADER_FOUND=$found"
+      - name: Inspect native allocation capture tools
+        run: |
+          if xcrun --find xctrace >/dev/null 2>&1; then
+            xcrun xctrace list templates || echo "NATIVE_ALLOCATION_CAPTURE_TEMPLATE_LIST_FAILED=1"
+            xcrun xctrace help record || echo "NATIVE_ALLOCATION_CAPTURE_RECORD_HELP_FAILED=1"
+            xcrun xctrace help export || echo "NATIVE_ALLOCATION_CAPTURE_EXPORT_HELP_FAILED=1"
+          else
+            echo "NATIVE_ALLOCATION_CAPTURE_XCTRACE_UNAVAILABLE=1"
+          fi
+          for tool in heap leaks malloc_history notifyutil; do
+            command -v "$tool" || true
+          done
       - name: Compile complete Debug targets
         id: debug_build
         run: |
@@ -118,6 +130,77 @@ jobs:
       - name: Report PausedReviewRegressions failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedReviewRegressions.xcresult"
+      - name: Validate ControlPause
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/ControlPause.xcresult" \
+            -only-testing:VPlayerTests/ControlTaskRegistryTests
+      - name: Report ControlPause failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ControlPause.xcresult"
+      - name: Validate RemainingPausedBoundaries
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/RemainingPausedBoundaries.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeBeyondStartupWindowUsesAdvancedPrefixFullLead \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeCommittedFinalTailUsesExactRemainingInterval \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeAtOrBeyondCommittedEndpointRejectsBeforeReconnect \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPausedResumeNonfinalShortLeadRejectsBeforeReconnect
+      - name: Report RemainingPausedBoundaries failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/RemainingPausedBoundaries.xcresult"
+      - name: Validate CursorCompatibility
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/CursorCompatibility.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorPriorValidBindingCannotSurviveNewUnavailableCaptureOrReplay \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOwnedPauseCursorAcceptedResumeRetiresPredecessorAndLateStopCannotOverwriteSuccessor \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testSuccessfulTimelineIdentitySurvivesDroppedReceiptsAndOwnedPauseUntilCleanup \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27CancelledResumeReconnectSettlesBeforeStopAndCannotPlayAgain
+      - name: Report CursorCompatibility failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/CursorCompatibility.xcresult"
+      - name: Validate NativeExistingResume
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/NativeExistingResume.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27NativePrepareActivateSuspendResumeSuspendPreservesItem
+      - name: Report NativeExistingResume failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeExistingResume.xcresult"
+      - name: Validate NativeProgressedResume
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/NativeProgressedResume.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27NativeProgressedPauseResumeReusesPrepaidCallbacksAndRetiresOriginalPool
+      - name: Report NativeProgressedResume failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeProgressedResume.xcresult"
       - name: Validate NativeLoaded
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         run: |
@@ -157,6 +240,19 @@ jobs:
       - name: Report NativeSessionOutput failures
         if: ${{ always() }}
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/NativeSessionOutput.xcresult"
+      - name: Validate LocalPCMOutput
+        if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayer \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/LocalPCMOutput.xcresult" \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testTVOS27LocalPCMTrackTapReportsRawOutputAndFinalizes
+      - name: Report LocalPCMOutput failures
+        if: ${{ always() }}
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/LocalPCMOutput.xcresult"
       - name: Run HTTP playback and strict 900-second 4K remux assertions
         if: ${{ !cancelled() && steps.debug_build.outcome == 'success' }}
         timeout-minutes: 30

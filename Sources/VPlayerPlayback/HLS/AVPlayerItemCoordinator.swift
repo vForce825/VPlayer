@@ -1014,6 +1014,9 @@ final class AVPlayerItemCoordinator {
     // receipt field, callback, wait slot, reservation, or renewable budget.
     private var pausedCursorBinding: AVPlayerPausedCursorBinding?
     private var invalidationFailure: AVPlayerItemCoordinatorFailure?
+    // Diagnostic only; ownership remains the original Registry invocation.
+    // Only a later committed physical stop clears an unresolved rollback.
+    private(set) var unresolvedActivationRollbackFailure: AVPlayerItemCoordinatorFailure?
     private var invalidated: Bool { invalidationFailure != nil }
     // An alias to the bundle's existing charged relay; it never captures this coordinator.
     // This pointer is inside the coordinator's measured malloc allocation and its
@@ -1255,6 +1258,7 @@ final class AVPlayerItemCoordinator {
         preparedTimelineMapping = nil
         publicationReadiness = nil
         invalidationFailure = nil
+        unresolvedActivationRollbackFailure = nil
         runtimeFailureRelay = nil
         automaticStopRequested = false
         renditionSelectionSlot = initialSelection.map(RenditionSelectionSlot.bound)
@@ -1875,12 +1879,22 @@ final class AVPlayerItemCoordinator {
             try validateActivation(invocation, request: request, resumeScope: resumeScope)
             if let resumeCoverage { try evidenceSource.revalidatePausedResumeCoverage(resumeCoverage) }
         } catch {
+            let first = AVPlayerFixedPreparationFailure(error)
             // The original signed runner owns rollback even after cancellation;
             // stop joins it before beginning the next physical suspension.
             driver.cancelPendingPrerolls(item: item)
             driver.pause(item: item)
-            try await driver.setDisconnectedFromSystemAudio(true, item: item)
-            throw error
+            do throws(AVPlayerItemCoordinatorFailure) {
+                try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            } catch {
+                if self.request?.item == item, authorization == invocation {
+                    unresolvedActivationRollbackFailure = error
+                }
+                // No quiescence receipt or disconnected state is manufactured.
+                // The current invocation and protected native rollback remain
+                // owned; the original failure still reaches Registry's owner.
+            }
+            throw first.boundaryError
         }
         authorizationArmed = true
         return .armed(invocation.activation)
@@ -2045,6 +2059,7 @@ final class AVPlayerItemCoordinator {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
             lastQuiescenceReceipt = receipt.identity
+            unresolvedActivationRollbackFailure = nil
             // Registry 的 replacement retirement 仍需消费同一停止终态；真正卸载
             // 完成前保持 stopping，避免把“已静止”和“已退休”混成一个阶段。
             state.phase = .stopping
@@ -2942,7 +2957,8 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
             else if case .pending = mappingStorage { mappingStorage = .idle }
         }
     }
-    private var timelineTerminalFailed = false
+    private var timelineTerminalFailure: AVPlayerFixedPreparationFailure?
+    private var timelineTerminalFailed: Bool { timelineTerminalFailure != nil }
     private var timelineRetry = TimelineMappingRetryState()
     private var prepareWait: AVPlayerPrepareWaitSlot?
     private var completedMapping: PlayerItemTimelineMappingAuthority? {
@@ -3214,15 +3230,21 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
             dependencies: .init(served: receipt.dependencies))
     }
 
+    private func validatePausedSourceTerminal() throws {
+        if let failure = lock.withLock({ timelineTerminalFailure }) { throw failure.boundaryError }
+    }
+
     func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
         -> LoopbackPausedResumeCoverage {
-        try server.reservePausedResumeCoverage(scope, originalOwner: preparationOwner)
+        try validatePausedSourceTerminal()
+        return try server.reservePausedResumeCoverage(scope, originalOwner: preparationOwner)
     }
 
     func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while true {
             try Task.checkCancellation()
+            try validatePausedSourceTerminal()
             if try server.freezePausedResumeCoverage(coverage) { return }
             guard ContinuousClock.now < deadline else {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
@@ -3232,6 +3254,7 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
     }
 
     func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws {
+        try validatePausedSourceTerminal()
         try server.revalidatePausedResumeCoverage(coverage)
     }
 
@@ -3473,7 +3496,10 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
     private func receiveTimelineFailure(_ event: LoopbackTimelineFailureEvent) {
         let delivery = lock.withLock { () -> (PendingTimelineMapping, AVPlayerPrepareWaitSlot)? in
             guard !timelineTerminalFailed else { return nil }
-            timelineTerminalFailed = true
+            switch event {
+            case .publicationTerminated(_, _, _, let failure): timelineTerminalFailure = .completed(failure)
+            case .serverTerminated: timelineTerminalFailure = .coordinator(.insufficientCoverage)
+            }
             guard let pending = pendingTimelineMapping, let gate = prepareWait else { return nil }
             pendingTimelineMapping = nil
             timelineRetry.cancelPending()

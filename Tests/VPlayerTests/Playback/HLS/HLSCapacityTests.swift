@@ -742,7 +742,15 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
         defer { waiting.cancel() }
         let startedDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while !pool.hasOperationReturnWaiter, ContinuousClock.now < startedDeadline { await Task.yield() }
-        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        guard pool.hasOperationReturnWaiter else {
+            waiting.cancel()
+            _ = try? await waiting.value
+            physical = nil
+            pool.close()
+            _ = driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool)
+            XCTFail("The first physical-credit waiter did not register within its fixture bound")
+            return
+        }
         if closing { pool.close() } else { pool.cancel() }
         let wakeDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while !finished, ContinuousClock.now < wakeDeadline { await Task.yield() }
@@ -771,7 +779,15 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
         defer { first.cancel() }
         let firstDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while !pool.hasOperationReturnWaiter, ContinuousClock.now < firstDeadline { await Task.yield() }
-        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        guard pool.hasOperationReturnWaiter else {
+            first.cancel()
+            _ = try? await first.value
+            physical = nil
+            pool.close()
+            _ = driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool)
+            XCTFail("The first physical-credit waiter did not register within its fixture bound")
+            return
+        }
         do { try await pool.waitForOperationReturn(); XCTFail("A second waiter must not replace the first") }
         catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .operationInFlight) }
         XCTAssertTrue(pool.hasOperationReturnWaiter)
@@ -785,7 +801,15 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
         defer { replacement.cancel() }
         let replacementDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         while !pool.hasOperationReturnWaiter, ContinuousClock.now < replacementDeadline { await Task.yield() }
-        XCTAssertTrue(pool.hasOperationReturnWaiter)
+        guard pool.hasOperationReturnWaiter else {
+            replacement.cancel()
+            _ = try? await replacement.value
+            physical = nil
+            pool.close()
+            _ = driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool)
+            XCTFail("The first physical-credit waiter did not register within its fixture bound")
+            return
+        }
         physical = nil
         try await replacement.value
         XCTAssertFalse(pool.hasOperationReturnWaiter)
@@ -804,7 +828,15 @@ final class AVPlayerSDKCallbackCreditPoolTests: XCTestCase {
             let waiter = Task { try await pool.waitForOperationReturn() }
             let deadline = ContinuousClock.now.advanced(by: .seconds(2))
             while !pool.hasOperationReturnWaiter, ContinuousClock.now < deadline { await Task.yield() }
-            XCTAssertTrue(pool.hasOperationReturnWaiter)
+            guard pool.hasOperationReturnWaiter else {
+                waiter.cancel()
+                _ = try? await waiter.value
+                tail.release()
+                pool.close()
+                _ = driver.releaseUnusedSDKRollbackCreditIfDisconnected(pool)
+                XCTFail("The first physical-credit waiter did not register within its fixture bound")
+                return
+            }
             DispatchQueue.concurrentPerform(iterations: 2) { index in
                 if index == 0 { waiter.cancel() } else { tail.release() }
             }

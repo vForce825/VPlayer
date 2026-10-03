@@ -1348,15 +1348,9 @@ final class SealedMediaStore: @unchecked Sendable {
                   resource.object.kind == .media else {
                 throw CompletedMediaEvidenceError.retired
             }
-            let hold = try PausedDecodeCoverageOrder.videoHold(map: map)
-            var contributes = false
-            for sample in map.samples {
-                let end = try hold.map { try sample.presentationRange.end.adding($0) }
-                    ?? sample.presentationRange.end
-                if try HLSChecked.compare(sample.presentationRange.start, requested.end) < 0,
-                   try HLSChecked.compare(end, requested.start) > 0 { contributes = true; break }
+            guard try PausedDecodeCoverageOrder.canContribute(map: map, requested: requested) else {
+                return
             }
-            guard contributes else { return }
             guard let initializationKey = resource.initializationKey,
                   let initialization = resources[initializationKey],
                   initialization.object.backing.identity == map.initializationBackingIdentity,
