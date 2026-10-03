@@ -573,6 +573,183 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testPausedResumeRestoresOwnedCursorAfterReconnectWithoutChangingTimeline() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            let timeline = prepared.identity.timelineMappingAuthority
+            let target = try prepared.identity.playerItemTime.adding(
+                ExactMediaTime(value: 1, timescale: 4))
+            let endpoint = try XCTUnwrap(timeline.aacEndpointReceipt)
+            let targetSource = try timeline.sourceTime(for: target)
+            XCTAssertLessThanOrEqual(CMTimeCompare(
+                try targetSource.adding(prepared.minimumCoverageDuration).cmTime,
+                endpoint.lastEffectiveEnd.cmTime), 0,
+                "The owned cursor must have a full ordinary lead in real completed media")
+            _ = try await harness.activate()
+            harness.driver.observedPausedTime = target.cmTime
+            let receipt = try await harness.stop()
+            XCTAssertEqual(harness.coordinator.capturedPausedCursor(for: receipt)?.time, target)
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let before = harness.driver.operations.count
+            let loadedBefore = harness.driver.loadedRangeCallCount
+            let directBefore = harness.driver.directStateCallCount
+            let observationsBefore = harness.driver.observedPlayheads.count
+            let cursorReadsBefore = harness.driver.pausedTimeReadCount
+            // A real disconnect/reconnect can shift currentTime. The new seek
+            // must use the stop's owned value, never this later SDK observation.
+            harness.driver.reconnectedPausedTime = try target.adding(
+                ExactMediaTime(value: 1, timescale: 1_000_000)).cmTime
+            harness.driver.applySeekToObservedPausedTime = true
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertEqual(result, .armed(harness.activation))
+            XCTAssertEqual(harness.driver.requestedSeekTime, target)
+            XCTAssertEqual(harness.driver.lastPlayedPausedTime, target)
+            XCTAssertEqual(harness.driver.operations.dropFirst(before).filter { $0 == .seek }.count, 1)
+            XCTAssertEqual(harness.driver.operations.dropFirst(before).filter { $0 == .preroll }.count, 1)
+            XCTAssertEqual(harness.driver.loadedRangeCallCount, loadedBefore + 1)
+            XCTAssertEqual(harness.driver.lastRequestedLoadedRange,
+                try FMP4PresentationRange(start: target, duration: prepared.minimumCoverageDuration))
+            XCTAssertEqual(harness.driver.directStateCallCount, directBefore + 1)
+            XCTAssertEqual(harness.driver.pausedTimeReadCount, cursorReadsBefore + 1,
+                "Only final paused readback may read again; it cannot replace the captured target")
+            XCTAssertTrue(harness.driver.observedPlayheads.dropFirst(observationsBefore).allSatisfy {
+                $0.timelineMappingAuthority === timeline && $0.playerItemTime == target
+            })
+            XCTAssertEqual(harness.driver.currentItemIdentity, prepared.item)
+            XCTAssertEqual(harness.driver.operations.filter { $0 == .install }.count, 1)
+            XCTAssertFalse(harness.coordinator.accept(receipt))
+        }
+    }
+
+    func testPausedResumeWithoutOwnedCursorRejectsBeforeReconnect() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            _ = try await harness.prepare()
+            _ = try await harness.activate()
+            harness.driver.pausedTimeUnavailable = true
+            let receipt = try await harness.stop()
+            XCTAssertNil(harness.coordinator.capturedPausedCursor(for: receipt))
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            harness.driver.pausedTimeUnavailable = false
+            let changes = harness.driver.audioConnectionChanges
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertEqual(result, .rejected)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertEqual(harness.driver.audioConnectionChanges, changes)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(harness.driver.rate, 0)
+        }
+    }
+
+    func testPausedResumeRevalidatesPublicationAfterExactSeekAwait() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            _ = try await harness.stop()
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            var completedResumeSeek = false
+            harness.driver.onSeekCompletion = {
+                completedResumeSeek = true
+                harness.evidence.readinessIdentityMutation = .sequence
+            }
+            defer {
+                harness.driver.onSeekCompletion = nil
+                harness.evidence.readinessIdentityMutation = .none
+            }
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertTrue(completedResumeSeek, "Resume must reach its owned exact seek")
+            XCTAssertEqual(result, .rejected)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(harness.driver.rate, 0)
+        }
+    }
+
+    func testPausedResumeCancellationDuringExactSeekSettlesDisconnectedWithoutPlaying() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            _ = try await harness.stop()
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let gate = Task21PrepareCancellationGate()
+            harness.driver.seekCancellationGate = gate
+            defer {
+                harness.driver.seekCancellationGate = nil
+                gate.releaseForFailedRED()
+            }
+            let activation = Task { try await harness.resumeThroughRegistry() }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !gate.started, ContinuousClock.now < deadline { await Task.yield() }
+            guard gate.started else {
+                _ = try await activation.value
+                XCTFail("Resume skipped the exact seek await and its cancellation boundary")
+                return
+            }
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            let stop = Task { try await harness.stop(strongerReason: true) }
+            let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !gate.cancellationObserved, ContinuousClock.now < cancellationDeadline { await Task.yield() }
+            let canceled = gate.cancellationObserved
+            if !canceled { gate.releaseForFailedRED() }
+            _ = try await activation.value
+            _ = try await stop.value
+            XCTAssertTrue(canceled, "The original Registry runner must own and cancel the seek")
+            XCTAssertFalse(gate.hasWaiter)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(harness.driver.rate, 0)
+        }
+    }
+
+    func testPausedResumeCapacityFailureRejectsBeforeReconnect() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            _ = try await harness.stop()
+            let owner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let ledger = PlaybackResourceContextLedger.shared
+            let blocker = try ledger.reserve(allocationIdentity: .stable(UUID()),
+                bytes: PlaybackResourceContextLedger.hardBytes - ledger.chargedBytes)
+            defer { ledger.release(blocker) }
+            let changes = harness.driver.audioConnectionChanges
+            let before = harness.driver.operations.count
+
+            let result = try await harness.resumeThroughRegistry()
+
+            XCTAssertEqual(result, .rejected)
+            XCTAssertEqual(harness.driver.playCallCount, 1)
+            XCTAssertEqual(harness.driver.audioConnectionChanges, changes,
+                "Exact lease/workspace/callback admission must precede physical reconnect")
+            XCTAssertFalse(harness.driver.operations.dropFirst(before).contains(.seek))
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(harness.driver.rate, 0)
+        }
+    }
+
     func testTVOS27InitialPreparationStaysConnectedUntilActualSuspension() async throws {
         try await withConnectedPlayerLifecycleHarness { harness in
             _ = try await harness.prepare()
@@ -2010,6 +2187,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let harness = try await Task21Harness(
             directAudioOnlyRendition: .init(rawValue: 2))
         let prepared = try await harness.prepare()
+        harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
         let sourceIdentity = harness.sourceIdentity
         let installedBeforeResume = harness.driver.operations.filter { $0 == .install }.count
         let seeksBeforeResume = harness.driver.operations.filter { $0 == .seek }.count
@@ -2025,14 +2203,14 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertNotEqual(firstActivation, secondActivation)
         XCTAssertEqual(harness.driver.playCallCount, 2)
         XCTAssertEqual(harness.driver.pauseCallCount, 1)
-        XCTAssertEqual(harness.driver.prerollCallCount, 1)
+        XCTAssertEqual(harness.driver.prerollCallCount, 2)
         XCTAssertEqual(harness.coordinator.currentItemIdentity, prepared.item)
         XCTAssertEqual(prepared.item, harness.item)
         XCTAssertEqual(harness.sourceIdentity, sourceIdentity)
         XCTAssertEqual(harness.driver.operations.filter { $0 == .install }.count,
                        installedBeforeResume)
         XCTAssertEqual(harness.driver.operations.filter { $0 == .seek }.count,
-                       seeksBeforeResume)
+                       seeksBeforeResume + 1)
         XCTAssertFalse(harness.coordinator.accept(firstReceipt),
                        "恢复后旧静止回执不得保留卸载权")
         XCTAssertThrowsError(try harness.coordinator.completeLifecycleCleanup(firstReceipt))
@@ -5413,6 +5591,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var readyConnectionStates: [Bool] = []
     var playedWhileDisconnected = false
     var holdAudioConnectionCompletion = false
+    var reconnectedPausedTime: CMTime?
     private var pendingAudioConnection: (Bool, CheckedContinuation<Void, Never>)?
 
     func setDisconnectedFromSystemAudio(_ disconnected: Bool,
@@ -5429,6 +5608,9 @@ private final class Task21FakeDriver: AVPlayerDriving {
         guard currentItemIdentity == item else { throw .staleIdentity }
         if !disconnected || !ignoreDisconnectStateChange {
             systemAudioDisconnected = disconnected
+        }
+        if !disconnected, let reconnectedPausedTime {
+            observedPausedTime = reconnectedPausedTime
         }
     }
 
@@ -5478,6 +5660,12 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var onPrimeMediaData: (() -> Void)?
     var manualLatencyShiftCallCount = 0
     var requestedSeekTime: ExactMediaTime?
+    var applySeekToObservedPausedTime = false
+    var onSeekCompletion: (() -> Void)?
+    var seekCancellationGate: Task21PrepareCancellationGate?
+    private(set) var lastPlayedPausedTime: ExactMediaTime?
+    private(set) var loadedRangeCallCount = 0
+    private(set) var lastRequestedLoadedRange: FMP4PresentationRange?
     var constrainedPlaybackEnd: ExactMediaTime?
     var holdPlayCompletion = false
     var holdDirectPausedRead = false
@@ -5544,12 +5732,18 @@ private final class Task21FakeDriver: AVPlayerDriving {
               playhead: PreparedPlayheadIdentity) async throws -> AVPlayerSeekReceipt {
         task21FixturePhase("prepare.seek", enabled: diagnosticPhases)
         operations.append(.seek); requestedSeekTime = time; observedPlayheads.append(playhead)
+        if let seekCancellationGate { try await seekCancellationGate.wait() }
         let tick = ExactMediaTime(value: 1, timescale: 48_000)
         let actual: ExactMediaTime
         switch prepareMutation {
         case .seekBeforeOneTick: actual = try time.subtracting(tick)
         case .seekAfterOneTick: actual = try time.adding(tick)
         default: actual = time
+        }
+        if applySeekToObservedPausedTime { observedPausedTime = actual.cmTime }
+        if let onSeekCompletion {
+            await Task.yield()
+            onSeekCompletion()
         }
         return AVPlayerSeekReceipt(item: item, playhead: playhead, actualTime: actual)
     }
@@ -5558,6 +5752,8 @@ private final class Task21FakeDriver: AVPlayerDriving {
                                  playhead: PreparedPlayheadIdentity,
                                  covering requested: FMP4PresentationRange) async throws
         -> AVPlayerLoadedRangeReceipt {
+        loadedRangeCallCount += 1
+        lastRequestedLoadedRange = requested
         let ranges = try loadedRanges(playhead: playhead, requested: requested).map {
             CMTimeRange(start: $0.start.cmTime, duration: $0.duration.cmTime)
         }
@@ -5655,6 +5851,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
         afterPositiveRateCapabilityConsumeBeforeSideEffect?(invocation)
         guard invocation.performPositiveRateSideEffect({
             playedWhileDisconnected = systemAudioDisconnected
+            lastPlayedPausedTime = try? ExactMediaTime(observedPausedTime)
             operations.append(.play); playCallCount += 1
             rate = 1; timeControlStatus = .waitingToPlayAtSpecifiedRate
         }) else {

@@ -55,6 +55,135 @@ final class SystemAudioSessionConfiguratorTests: XCTestCase {
         XCTAssertTrue(registry.executor.safetyIngress.snapshot.interruptionVeto)
     }
 
+    func testLateTypedInactiveCannotRestartLegacyManualResumeEpisode() {
+        let registry = ControlTaskRegistry()
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+        monitor.emit(.interruptionBegan)
+        monitor.emit(.interruptionEnded(shouldResume: false))
+        let manual = registry.executor.safetyIngress.snapshot
+
+        XCTAssertNil(monitor.emitLifecycle(.becameInactive(systemInitiated: true)),
+            "A delayed advisory inactive must not manufacture a new interruption")
+        XCTAssertNil(monitor.emitLifecycle(.resumptionRecommended(shouldResume: true)),
+            "The same episode must not emit a positive automatic-recovery event")
+
+        let after = registry.executor.safetyIngress.snapshot
+        XCTAssertEqual(after.interruptionState, .ended(shouldResume: false))
+        XCTAssertTrue(after.interruptionVeto)
+        XCTAssertEqual(after.interruptionEpoch, manual.interruptionEpoch)
+        XCTAssertEqual(after.throughRevision, manual.throughRevision)
+        XCTAssertFalse(after.outputPermitPresent)
+    }
+
+    func testManualResumeVetoSurvivesEveryTypedLegacyInterleaving() {
+        for order in InterruptionDeliveryStep.orderPreservingInterleavings {
+            let registry = ControlTaskRegistry()
+            let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+            var manualRevision: UInt64?
+            for step in order {
+                let event = step.deliver(to: monitor)?.event
+                if step == .legacyEnded { manualRevision = registry.executor.safetyIngress.snapshot.throughRevision }
+                if let manualRevision {
+                    XCTAssertNotEqual(event, .interruptionEnded(shouldResume: true), "Order: \(order)")
+                    let safety = registry.executor.safetyIngress.snapshot
+                    XCTAssertEqual(safety.interruptionState, .ended(shouldResume: false), "Order: \(order)")
+                    XCTAssertTrue(safety.interruptionVeto, "Order: \(order)")
+                    XCTAssertEqual(safety.throughRevision, manualRevision, "Order: \(order)")
+                }
+            }
+        }
+    }
+
+    func testResetVetoSurvivesEveryTypedLegacyInterleaving() {
+        for order in InterruptionDeliveryStep.orderPreservingInterleavings {
+            let registry = ControlTaskRegistry()
+            let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+            var resetEpoch: UInt64?
+            for step in order {
+                let event = step.deliver(to: monitor)?.event
+                if step == .legacyEnded {
+                    monitor.emit(.mediaServicesWereReset)
+                    resetEpoch = registry.executor.safetyIngress.snapshot.mediaServicesEpoch
+                }
+                if let resetEpoch {
+                    XCTAssertNotEqual(event, .interruptionEnded(shouldResume: true), "Order: \(order)")
+                    let safety = registry.executor.safetyIngress.snapshot
+                    XCTAssertEqual(safety.mediaServicesEpoch, resetEpoch, "Order: \(order)")
+                    XCTAssertTrue(safety.mediaServicesResumeRequired, "Order: \(order)")
+                    XCTAssertTrue(safety.interruptionVeto, "Order: \(order)")
+                    XCTAssertFalse(safety.outputPermitPresent, "Order: \(order)")
+                }
+            }
+        }
+    }
+
+    func testUserPauseSurvivesEveryTypedLegacyInterleaving() async throws {
+        for order in InterruptionDeliveryStep.orderPreservingInterleavings {
+            let harness = try AudioSessionLifecycleTestHarness(categoryResults: [.success])
+            let handoff = try await harness.acquire()
+            let context = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+            let before = harness.registry.executor.safetyIngress.snapshot
+            let result = harness.registry.performOutputUserControl(.init(kind: .pause,
+                sessionIdentity: context.sessionIdentity, expectedOwner: context.owner, contextNonce: context.contextNonce,
+                interruptionEpoch: before.interruptionEpoch, mediaServicesEpoch: before.mediaServicesEpoch,
+                resetPreRouteBinding: context.resetPreRouteBinding))
+            XCTAssertNotEqual(result, .rejected)
+            for step in order {
+                step.deliver(to: harness.owner.monitor)
+                XCTAssertTrue(harness.registry.executor.safetyIngress.snapshot.userPaused, "Order: \(order)")
+                XCTAssertFalse(harness.registry.executor.safetyIngress.snapshot.outputPermitPresent, "Order: \(order)")
+                XCTAssertFalse(harness.registry.executor.safetyIngress.snapshot.readinessOpen, "Order: \(order)")
+            }
+            XCTAssertEqual(harness.registry.executor.safetyIngress.snapshot.interruptionState,
+                .ended(shouldResume: false), "Order: \(order)")
+            XCTAssertTrue(harness.registry.executor.safetyIngress.snapshot.interruptionVeto, "Order: \(order)")
+            try await harness.release(handoff)
+        }
+    }
+
+    func testTypedOnlyInterruptionStillRecommendsResume() {
+        let registry = ControlTaskRegistry()
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+        XCTAssertEqual(monitor.emitLifecycle(.becameInactive(systemInitiated: true))?.event, .interruptionBegan)
+        XCTAssertEqual(monitor.emitLifecycle(.resumptionRecommended(shouldResume: true))?.event,
+            .interruptionEnded(shouldResume: true))
+        XCTAssertFalse(registry.executor.safetyIngress.snapshot.interruptionVeto)
+        XCTAssertFalse(registry.executor.safetyIngress.snapshot.outputPermitPresent)
+    }
+
+    func testNewLegacyBeganPermitsTypedRecoveryAfterManualResumeVeto() {
+        let registry = ControlTaskRegistry()
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
+        monitor.emit(.interruptionBegan)
+        monitor.emit(.interruptionEnded(shouldResume: false))
+        monitor.emitLifecycle(.becameInactive(systemInitiated: true))
+        monitor.emitLifecycle(.resumptionRecommended(shouldResume: true))
+        monitor.emit(.interruptionBegan)
+        let newEpisode = registry.executor.safetyIngress.snapshot.interruptionEpoch
+        monitor.emitLifecycle(.becameInactive(systemInitiated: true))
+        XCTAssertEqual(registry.executor.safetyIngress.snapshot.interruptionEpoch, newEpisode)
+        XCTAssertEqual(monitor.emitLifecycle(.resumptionRecommended(shouldResume: true))?.event,
+            .interruptionEnded(shouldResume: true))
+        XCTAssertFalse(registry.executor.safetyIngress.snapshot.interruptionVeto)
+    }
+
+    func testStoppedTypedObserverCannotDeliverIntoRestartedMonitor() {
+        let registry = ControlTaskRegistry()
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress,
+            notificationCenter: NotificationCenter())
+        monitor.start()
+        monitor.emitLifecycle(.becameInactive(systemInitiated: true), observationGeneration: 1)
+        monitor.stop()
+        monitor.start()
+        defer { monitor.stop() }
+        let before = registry.executor.safetyIngress.snapshot
+        XCTAssertNil(monitor.emitLifecycle(.becameInactive(systemInitiated: true), observationGeneration: 1))
+        XCTAssertNil(monitor.emitLifecycle(.resumptionRecommended(shouldResume: true), observationGeneration: 1))
+        XCTAssertNil(monitor.emitLifecycle(.becameActive, observationGeneration: 1))
+        XCTAssertEqual(registry.executor.safetyIngress.snapshot.throughRevision, before.throughRevision)
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.interruptionVeto)
+    }
+
     func testNewLegacyInterruptionInvalidatesOlderTypedRecommendation() {
         let registry = ControlTaskRegistry()
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)
@@ -231,5 +360,29 @@ final class SystemAudioSessionConfiguratorTests: XCTestCase {
         harness.registry.executor.safetyIngress.performSyncIngress(.interruptionBegan)
         XCTAssertGreaterThan(harness.registry.executor.safetyIngress.snapshot.throughRevision, before)
         try await harness.release(handoff)
+    }
+}
+
+private enum InterruptionDeliveryStep: Sendable, Equatable {
+    case legacyBegan, legacyEnded, typedInactive, typedResume
+
+    // Every merge of [legacyBegan, legacyEnded] and [typedInactive, typedResume].
+    static let orderPreservingInterleavings: [[Self]] = [
+        [.legacyBegan, .legacyEnded, .typedInactive, .typedResume],
+        [.legacyBegan, .typedInactive, .legacyEnded, .typedResume],
+        [.legacyBegan, .typedInactive, .typedResume, .legacyEnded],
+        [.typedInactive, .legacyBegan, .legacyEnded, .typedResume],
+        [.typedInactive, .legacyBegan, .typedResume, .legacyEnded],
+        [.typedInactive, .typedResume, .legacyBegan, .legacyEnded],
+    ]
+
+    @discardableResult
+    func deliver(to monitor: SystemAudioEventMonitor) -> PlaybackAudioSessionEventEnvelope? {
+        switch self {
+        case .legacyBegan: monitor.emit(.interruptionBegan)
+        case .legacyEnded: monitor.emit(.interruptionEnded(shouldResume: false))
+        case .typedInactive: monitor.emitLifecycle(.becameInactive(systemInitiated: true))
+        case .typedResume: monitor.emitLifecycle(.resumptionRecommended(shouldResume: true))
+        }
     }
 }

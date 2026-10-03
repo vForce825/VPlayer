@@ -1130,6 +1130,41 @@ final class PlaybackControllerTests: XCTestCase {
         await f.controller.stop()
     }
 
+    func testLateTypedInterruptionCannotAutomaticallyReactivateManualResumeVeto() async throws {
+        let f = ControllerRecoveryFixture(channelID: "late-typed-manual-veto", owner: RecordingPlaybackAudioSessionOwner())
+        try await start(f)
+        _ = f.owner.monitor.emit(.interruptionBegan)
+        try await eventually { f.first.snapshot().completedStopCount == 1 }
+        _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+        try await eventually {
+            let interrupted = await f.controller.audioSessionInterruptedForTesting
+            let state = await f.controller.currentStateForTesting
+            return !interrupted && state == .paused(f.request)
+        }
+        let automaticActivation = expectation(description: "No SDK activation without explicit user resume")
+        automaticActivation.isInverted = true
+        f.owner.sdk.lock.withLock { f.owner.sdk.onActivate = { automaticActivation.fulfill() } }
+
+        _ = f.owner.monitor.emitLifecycle(.becameInactive(systemInitiated: true))
+        _ = f.owner.monitor.emitLifecycle(.resumptionRecommended(shouldResume: true))
+        let safety = f.owner.registry.executor.safetyIngress.snapshot
+        XCTAssertEqual(safety.interruptionState, .ended(shouldResume: false))
+        XCTAssertTrue(safety.interruptionVeto)
+        await fulfillment(of: [automaticActivation], timeout: 0.2)
+        f.owner.sdk.lock.withLock { f.owner.sdk.onActivate = nil }
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
+
+        // A real user action still releases the manual veto and recovers this lease.
+        await f.controller.setPaused(false)
+        try await eventually { f.successor.snapshot().starts.count == 1 }
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 2)
+        let cycle = await f.controller.readinessCycleForTesting
+        f.successor.emit(.ready(readinessCycle: cycle))
+        try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
+        await f.controller.stop()
+    }
+
     func testExplicitResumeAfterVetoActivatesCurrentLeaseBeforeResuming() async throws {
         let f = ControllerRecoveryFixture(channelID: "explicit-resume", owner: RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true))
         try await start(f)
