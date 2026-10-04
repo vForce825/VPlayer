@@ -351,7 +351,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
         let first = app.buttons["channel.focus-probe.000"]
         let second = app.buttons["channel.focus-probe.001"]
         XCTAssertTrue(first.waitForExistence(timeout: 10))
-        XCTAssertTrue(first.wait(for: \.hasFocus, toEqual: true, timeout: 5))
+        try enterChannelGrid(app: app, first: first)
 
         // Calibrate on rendered pixels before asserting anything about residual
         // scale. AX frame widths are logged only, never used as the visual oracle.
@@ -433,6 +433,62 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             attach(snapshot, name: "focus-returned-\(grouping)-\(cycle)")
         }
         print("CARD_FOCUS_RESULT grouping=\(grouping) calibrated=true cycles=2 residualScale=notObserved")
+    }
+
+    @MainActor
+    private func enterChannelGrid(app: XCUIApplication, first: XCUIElement) throws {
+        logEntryFocus(app: app, phase: "launch")
+        if first.hasFocus { return }
+
+        // defaultFocus chooses an item when the grid receives focus; it does not
+        // promise that a freshly launched TabView has entered that region. Use
+        // the same real remote tab-entry flow as the existing application tests.
+        let channelTab = app.tabBars.buttons["频道"]
+        for _ in 0..<8 where !app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) {
+            XCUIRemote.shared.press(.up)
+        }
+        guard app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) else {
+            throw entryFailure(app: app, reason: "Could not acquire the tab bar")
+        }
+        for _ in 0..<3 { XCUIRemote.shared.press(.left) }
+        for _ in 0..<4 where !channelTab.hasFocus { XCUIRemote.shared.press(.right) }
+        guard channelTab.hasFocus else {
+            throw entryFailure(app: app, reason: "Could not focus the channels tab")
+        }
+        XCUIRemote.shared.press(.select)
+        // Some tvOS configurations retain focus on the selected tab until Down.
+        // Never Select a channel here: the experiment must not open playback.
+        for _ in 0..<4 {
+            if first.wait(for: \.hasFocus, toEqual: true, timeout: 2) {
+                logEntryFocus(app: app, phase: "entered-grid")
+                return
+            }
+            XCUIRemote.shared.press(.down)
+        }
+        guard first.wait(for: \.hasFocus, toEqual: true, timeout: 2) else {
+            throw entryFailure(app: app, reason: "Channels tab entry did not focus the first probe card")
+        }
+        logEntryFocus(app: app, phase: "entered-grid")
+    }
+
+    @MainActor
+    private func logEntryFocus(app: XCUIApplication, phase: String) {
+        let tabs = app.tabBars.buttons.allElementsBoundByIndex.map {
+            "\($0.label):focus=\($0.hasFocus)"
+        }.joined(separator: " ")
+        let first = app.buttons["channel.focus-probe.000"]
+        print("CARD_FOCUS_ENTRY phase=\(phase) firstFocus=\(first.hasFocus) tabs=[\(tabs)]")
+    }
+
+    @MainActor
+    private func entryFailure(app: XCUIApplication, reason: String) -> CardFocusProbeError {
+        logEntryFocus(app: app, phase: "failed-entry")
+        print("CARD_FOCUS_ENTRY_HIERARCHY \(app.debugDescription)")
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = "focus-entry-unavailable"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        return .unavailable(reason)
     }
 
     @MainActor

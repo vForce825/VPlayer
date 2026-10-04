@@ -884,9 +884,15 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             await controller.play(request)
             let lifecycle = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
             await controller.setPaused(true)
+            let pausedState = await controller.currentStateForTesting
+            XCTAssertEqual(pausedState, .paused(request))
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepared, true)
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.owner)
             // Keep the original route authority admissible. This exercises the
             // retained-pause helper, not physical empty-to-AirPlay restoration.
-            await controller.suspendActiveOutputForRouteUnavailable()
+            // The physical pause already settled; do not issue a second suspend
+            // against its consumed output interval merely to change UI state.
+            await controller.publishRouteRecovering(request: request)
             await controller.invalidatePreparedMediaInformation(for: lifecycle)
             let cleared = await self.currentMediaInformation(controller)
             XCTAssertNil(cleared)
@@ -911,12 +917,14 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-first",
                 streamURL: fixture.source, title: "First"))
             let first = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
-            let retiredBackend = try XCTUnwrap(factory.backend)
-            XCTAssertNotNil(retiredBackend.preparedMediaInformation(for: first))
+            weak var retiredBackend = try XCTUnwrap(factory.backend)
+            XCTAssertNotNil(retiredBackend?.preparedMediaInformation(for: first))
 
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-second",
                 streamURL: fixture.source, title: "Second"))
-            let second = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let secondDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let second = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
+                secondDiagnostic)
             XCTAssertNotEqual(first, second)
             let current = await self.currentMediaInformation(controller)
             XCTAssertEqual(current?.width, 1_280)
@@ -925,7 +933,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let afterStaleCallbacks = await self.currentMediaInformation(controller)
             XCTAssertEqual(afterStaleCallbacks, current,
                 "Equal dimensions do not make the retired graph's callbacks current")
-            XCTAssertNil(retiredBackend.preparedMediaInformation(for: first))
+            XCTAssertNil(retiredBackend?.preparedMediaInformation(for: first))
             XCTAssertNil(registry.preparedHLSMediaInformation(for: first))
 
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-radio",
@@ -947,7 +955,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         try await withProductionMediaController { controller, registry, _, sdk in
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-route",
                 streamURL: fixture.source, title: "Route metadata"))
-            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let startupDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
+                startupDiagnostic)
             let stream = await controller.playbackMediaInformation()
             let values = PlaybackStreamRecorder<PlaybackMediaInformation?>()
             let collector = Task { for await value in stream { values.append(value) } }
@@ -1096,6 +1106,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 _ = await bundle.retireProducerGraph()
                 throw error
             }
+            // Production's coordinator retires the preparation history before
+            // the producer graph. Keep the stale bundle alias, not its active
+            // singleton history domain, while the successor creates a prefix.
+            let evidence = try XCTUnwrap(bundle.replacement.evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource)
+            evidence.retirePreparation()
             let retired = await bundle.retireProducerGraph()
             XCTAssertTrue(retired)
             XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle))
@@ -1108,25 +1123,53 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         return await iterator.next() ?? nil
     }
 
+    private func mediaControllerDiagnostic(_ controller: PlaybackController,
+                                           registry: ControlTaskRegistry) async -> String {
+        let state = await controller.currentStateForTesting
+        return "state=\(state); context=\(String(describing: registry.outputResourceContextSnapshot())); "
+            + "resourceBytes=\(PlaybackResourceContextLedger.shared.chargedBytes); "
+            + "applicationBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes); "
+            + "callbacks=\(AVPlayerSDKCallbackLease.occupiedCount); "
+            + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)"
+    }
+
     private func withProductionMediaController(
         factory: AudioReviewProductionBackendFactory = AudioReviewProductionBackendFactory(),
         _ body: (PlaybackController, ControlTaskRegistry, AudioReviewProductionBackendFactory,
                  FakeAudioSessionSDK) async throws -> Void
     ) async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
-        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        // The SDK route/session is controlled by this fixture. Native AVPlayer
+        // audio notifications from other fixtures must not mutate that fake
+        // session's safety epochs halfway through prepare or replacement.
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress,
+            notificationCenter: NotificationCenter())
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: routes, backendFactory: factory)
+        var bodyError: (any Error)?
         do { try await body(controller, registry, factory, sdk) }
-        catch {
-            await controller.stop()
-            await registry.joinOwnedTerminalCleanup()
-            throw error
-        }
+        catch { bodyError = error }
         await controller.stop()
         await registry.joinOwnedTerminalCleanup()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (PlaybackResourceContextLedger.shared.chargedBytes > resourceBaseline
+               || HLSDeliveryApplicationChargeLedger.shared.chargedBytes > applicationBaseline
+               || AVPlayerSDKCallbackLease.occupiedCount > callbackBaseline),
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let diagnostic = await mediaControllerDiagnostic(controller, registry: registry)
+        XCTAssertNil(registry.outputResourceContextSnapshot(), diagnostic)
+        XCTAssertLessThanOrEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline, diagnostic)
+        XCTAssertLessThanOrEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, applicationBaseline, diagnostic)
+        XCTAssertLessThanOrEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline, diagnostic)
+        if let bodyError { throw bodyError }
     }
 
     func testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute() throws {
@@ -1149,7 +1192,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(muted.silentShortWindows, 3)
     }
 
-    func testSyntheticHLG50AC3AudioRemainsContinuousAcrossWriterWindows() async throws {
+    func testSyntheticHLG50AC3CapturesOriginalFragmentsAndDecodesAnalysisCopy() async throws {
         guard let file = Bundle(for: Self.self).url(
             forResource: "synthetic-hlg50-ac3-64s.ts", withExtension: nil, subdirectory: "Video") else {
             throw XCTSkip("Synthetic diagnostic fixture is generated by the dedicated CI job")
@@ -1195,11 +1238,27 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             var bytes = initial.bytes
             for segment in media { bytes.append(segment.bytes) }
             try bytes.write(to: output)
-            // This uses the first, canonical initialization across every successor
-            // writer, exactly as the production playlist does. Real AVAssetReader
-            // decode detects missing media, repeated priming, and inserted silence.
-            let decoded = try await inspectSyntheticAACPCM(output)
-            print("AC3_DIAGNOSTIC decodedFrames=\(decoded.frames) maxGapSamples=\(decoded.maximumGapSamples) " +
+            // A flat concatenation is only a control: HLS resources have their
+            // own indexes and physical-writer sequence IDs. It is not AVPlayer HLS.
+            let rawControl = try await inspectSyntheticAACPCM(output)
+            print("AC3_DIAGNOSTIC rawFlatFileControlFrames=\(rawControl.frames)")
+            for index in [1, media.count / 2, media.count - 1] where media.indices.contains(index) {
+                let segment = media[index]
+                let own = try XCTUnwrap(records.first { $0.kind == .initialization && $0.writer == segment.writer })
+                let canonicalURL = directory.appendingPathComponent("canonical-window-\(index).mp4")
+                let ownURL = directory.appendingPathComponent("own-window-\(index).mp4")
+                try (initial.bytes + segment.bytes).write(to: canonicalURL)
+                try (own.bytes + segment.bytes).write(to: ownURL)
+                let canonicalPCM = try await inspectSyntheticAACPCM(canonicalURL)
+                let ownPCM = try await inspectSyntheticAACPCM(ownURL)
+                print("AC3_WINDOW_CONTROL sequence=\(segment.sequence) canonicalFrames=\(canonicalPCM.frames) ownFrames=\(ownPCM.frames)")
+            }
+            let analysisOutput = directory.appendingPathComponent("analysis-aac.mp4")
+            try SyntheticAACFileJoin.make(initialization: initial.bytes, media: media).write(to: analysisOutput)
+            // Analysis-only packaging retains original tfdt, trun and AAC payload,
+            // but strips local indexes and renumbers mfhd. Never publish these bytes.
+            let decoded = try await inspectSyntheticAACPCM(analysisOutput)
+            print("AC3_ANALYSIS_COPY originalHLSPlaybackVerified=false decodedFrames=\(decoded.frames) maxGapSamples=\(decoded.maximumGapSamples) " +
                 "silent100msWindows=\(decoded.silentWindows) silent5msInteriorWindows=\(decoded.silentShortWindows) " +
                 "minRMS=\(decoded.minimumRMS) min5msInteriorRMS=\(decoded.minimumShortRMS)")
             XCTAssertGreaterThanOrEqual(decoded.frames, 63 * 48_000)
@@ -1221,6 +1280,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
 
     private func inspectSyntheticAACPCM(_ url: URL) async throws -> SyntheticAACPCMStatistics {
         let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        print("AC3_READER file=\(url.lastPathComponent) assetDuration=\(duration.seconds)")
         let tracks = try await asset.loadTracks(withMediaType: .audio)
         let track = try XCTUnwrap(tracks.first)
         let reader = try AVAssetReader(asset: asset)
@@ -1672,7 +1733,8 @@ private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
 private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let lock = NSLock()
     private let factory: SystemPlaybackBackendFactory
-    private var created: HLSAVPlayerPlaybackBackend?
+    // Observation must not extend a retired backend's one-native-driver lease.
+    private weak var created: HLSAVPlayerPlaybackBackend?
     init(factory: SystemPlaybackBackendFactory = SystemPlaybackBackendFactory()) { self.factory = factory }
     var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { created } }
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
@@ -1849,5 +1911,108 @@ private struct SyntheticAACPCMStatistics {
         }
         XCTAssertEqual(nonfiniteSamples, 0)
         frames += count
+    }
+}
+
+/// A media-playlist fragment is not a standalone movie-file append operation.
+/// Preserve all AAC payload/timestamps while removing per-resource indexes and
+/// giving the analysis-only movie monotonically increasing mfhd sequence IDs.
+private enum SyntheticAACFileJoin {
+    struct Box {
+        let type: String
+        let start: Int
+        let payload: Int
+        let end: Int
+    }
+
+    static func boxes(_ bytes: Data, from start: Int = 0, through end: Int? = nil) throws -> [Box] {
+        let end = end ?? bytes.count
+        var offset = start
+        var result: [Box] = []
+        while offset < end {
+            guard offset + 8 <= end, result.count < 128 else { throw AACRenditionFailure.invalidInput }
+            let size32 = read32(bytes, offset)
+            let header = size32 == 1 ? 16 : 8
+            guard offset + header <= end else { throw AACRenditionFailure.invalidInput }
+            let size64 = size32 == 1 ? read64(bytes, offset + 8) : UInt64(size32 == 0 ? end - offset : Int(size32))
+            guard let size = Int(exactly: size64), size >= header, size <= end - offset else {
+                throw AACRenditionFailure.invalidInput
+            }
+            let type = String(decoding: bytes[(offset + 4)..<(offset + 8)], as: UTF8.self)
+            result.append(Box(type: type, start: offset, payload: offset + header, end: offset + size))
+            offset += size
+        }
+        return result
+    }
+
+    static func make(initialization: Data, media: [SyntheticAACContinuityCapture.Record]) throws -> Data {
+        var joined = initialization
+        for (index, record) in media.enumerated() {
+            let top = try boxes(record.bytes)
+            guard top.filter({ $0.type == "moof" }).count == 1,
+                  top.filter({ $0.type == "mdat" }).count == 1 else {
+                throw AACRenditionFailure.invalidInput
+            }
+            let moof = try XCTUnwrap(top.first { $0.type == "moof" })
+            let mdat = try XCTUnwrap(top.first { $0.type == "mdat" })
+            guard moof.end <= mdat.start,
+                  !top.contains(where: { ["styp", "sidx", "mfra"].contains($0.type)
+                      && $0.start >= moof.end && $0.start < mdat.start }) else {
+                throw AACRenditionFailure.invalidInput
+            }
+            let children = try boxes(record.bytes, from: moof.payload, through: moof.end)
+            guard children.filter({ $0.type == "traf" }).count == 1 else {
+                throw AACRenditionFailure.invalidInput
+            }
+            let mfhd = try XCTUnwrap(children.first { $0.type == "mfhd" })
+            let traf = try XCTUnwrap(children.first { $0.type == "traf" })
+            let track = try boxes(record.bytes, from: traf.payload, through: traf.end)
+            let tfhd = try XCTUnwrap(track.first { $0.type == "tfhd" })
+            let tfdt = try XCTUnwrap(track.first { $0.type == "tfdt" })
+            let trun = try XCTUnwrap(track.first { $0.type == "trun" })
+            guard mfhd.payload + 8 <= mfhd.end, tfhd.payload + 8 <= tfhd.end,
+                  tfdt.payload + 8 <= tfdt.end, trun.payload + 8 <= trun.end else {
+                throw AACRenditionFailure.invalidInput
+            }
+            let tfhdFlags = read32(record.bytes, tfhd.payload) & 0x00FF_FFFF
+            guard tfhdFlags & 1 == 0 else {
+                // Rebuilding a file must never silently leave absolute data offsets stale.
+                throw AACRenditionFailure.invalidInput
+            }
+            guard record.bytes[tfdt.payload] <= 1 else { throw AACRenditionFailure.invalidInput }
+            let decodeTime: UInt64
+            if record.bytes[tfdt.payload] == 1 {
+                guard tfdt.payload + 12 <= tfdt.end else { throw AACRenditionFailure.invalidInput }
+                decodeTime = read64(record.bytes, tfdt.payload + 4)
+            } else { decodeTime = UInt64(read32(record.bytes, tfdt.payload + 4)) }
+            print("AC3_FRAGMENT sequence=\(record.sequence) top=\(top.map(\.type).joined(separator: ",")) " +
+                "mfhd=\(read32(record.bytes, mfhd.payload + 4)) tfdt=\(decodeTime) samples=\(read32(record.bytes, trun.payload + 4))")
+            for box in top {
+                switch box.type {
+                case "styp", "sidx", "mfra":
+                    continue
+                case "moof":
+                    var copy = record.bytes.subdata(in: box.start..<box.end)
+                    var sequence = UInt32(index + 1).bigEndian
+                    withUnsafeBytes(of: &sequence) { bytes in
+                        let start = mfhd.payload + 4 - box.start
+                        copy.replaceSubrange(start..<(start + 4), with: bytes)
+                    }
+                    joined.append(copy)
+                case "mdat", "free", "skip":
+                    joined.append(record.bytes.subdata(in: box.start..<box.end))
+                default:
+                    throw AACRenditionFailure.invalidInput
+                }
+            }
+        }
+        return joined
+    }
+
+    private static func read32(_ bytes: Data, _ offset: Int) -> UInt32 {
+        bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian }
+    }
+    private static func read64(_ bytes: Data, _ offset: Int) -> UInt64 {
+        bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self).bigEndian }
     }
 }
