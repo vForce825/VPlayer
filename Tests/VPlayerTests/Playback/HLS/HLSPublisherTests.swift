@@ -405,6 +405,36 @@ final class HLSPublisherTests: XCTestCase {
         h.publisher.close()
     }
 
+    func testLiveCapacityReleaseUsesPublicationClockInsteadOfHTTPStoreUptime() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(audioCount: 3, publicationClock: timing)
+        defer { h.publisher.close() }
+        try await h.initial()
+        let pinned = try (1...4).map {
+            try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0))
+        }
+        try await h.offerBoth(count: 1)
+        clock.set(100 + UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
+        try await h.offerBoth(count: 1, now: Task19.second)
+        clock.set(100 + 2 * UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 2 * Task19.second), .waiting)
+        XCTAssertEqual(h.store.capacityWaiterCount, 1)
+        // Production HTTP releases use host uptime. A capacity wake must re-read
+        // the injected publication clock rather than expire its still-valid ticket
+        // against an unrelated store timestamp.
+        for lease in pinned {
+            h.store.release(lease, completedAt: nil, now: 4_000_000_000_000)
+        }
+        await assertNaturalEndEventually { h.publisher.visible?.publicationSequence == 3 }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 3,
+            "Ordinary live capacity release must publish a valid pending segment without another callback")
+        XCTAssertEqual(h.publisher.ticket.previousPublishInstant, 2 * Task19.second)
+        XCTAssertEqual(h.store.capacityWaiterCount, 0)
+        XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+    }
+
     func testNaturalEndCapacityWakeUsesOneSlotAndCommitAnchorIncludesOrdinaryWake() async throws {
         let clock = ManualPlaybackClock(100)
         let timing = try HLSNaturalEndPublicationClock.make(clock: clock)

@@ -252,6 +252,144 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertTrue(retired, "测试必须退休真实 writer/server 图")
     }
 
+    func testLivePublicationCommitUsesTheLoopbackMonotonicTimeDomain() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let server = try Task22LatePublicationFixtureServer(fileURL: file)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_201))
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        let before = SystemHLSLoopbackClock.nowNanoseconds()
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let after = SystemHLSLoopbackClock.nowNanoseconds()
+            let committed = try XCTUnwrap(publication.publisher?.ticket.previousPublishInstant)
+            XCTAssertGreaterThanOrEqual(committed, before,
+                "Production publication must use the same monotonic domain as HTTP residency, not segment ordinals")
+            XCTAssertLessThanOrEqual(committed, after)
+            XCTAssertFalse(server.hasSentSourceEOF)
+        } catch {
+            XCTFail("The real writer must reach its live prefix before the clock assertion: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    func testLiveLongGOPPendingSegmentPublishesWithoutAnotherCallback() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        let server = try Task22LatePublicationFixtureServer(
+            fileURL: file, sendEntireBodyWithoutEOF: true)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_202))
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        // Keep the deliberately incomplete live HTTP body inside its read budget
+        // for the whole publication observation; network timeout is a different test.
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            let initial = try XCTUnwrap(publisher.visible)
+            let video = try XCTUnwrap(publication.declaration?.video?.participantID)
+            XCTAssertEqual(initial.media[video]?.logicalSequences.last, 2)
+            gate.releaseThrough(3)
+            let nextBlocked = await Task.detached { gate.waitUntilBlocked(atLeast: 4) }.value
+            XCTAssertTrue(nextBlocked, "The next callback must be held outside the real publication graph")
+            let deadline = ContinuousClock.now + .seconds(7)
+            while publisher.visible?.media[video]?.logicalSequences.last == 2,
+                  authority.failureDiagnostic == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertNil(authority.failureDiagnostic)
+            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 3,
+                "A sealed pending 5s segment must publish when its real-time gate opens, with no callback or EOF to drive it")
+            XCTAssertFalse(publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertFalse(server.hasSentSourceEOF)
+            XCTAssertFalse(gate.didTimeout)
+        } catch {
+            XCTFail("The real long-GOP writer must reach the live gate assertion: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    func testLiveLongGOPBurstContinuesBeyondSixtyFiveSecondsWithoutEOF() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        let server = try Task22LatePublicationFixtureServer(
+            fileURL: file, sendEntireBodyWithoutEOF: true)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_203))
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        // Keep the deliberately incomplete live HTTP body inside its read budget
+        // for the whole publication observation; network timeout is a different test.
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            let video = try XCTUnwrap(publication.declaration?.video?.participantID)
+            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 2)
+            gate.release()
+            // The body arrives as a burst, but the production graph must bound its
+            // producer and keep publishing on real five-second gates. No test calls
+            // publisher.publish, finishes a writer, or manufactures a receipt.
+            let deadline = ContinuousClock.now + .seconds(75)
+            var lastSequence: UInt64 = 2
+            var maximumPending = 0
+            while lastSequence < 13, authority.failureDiagnostic == nil,
+                  ContinuousClock.now < deadline {
+                let snapshot = try XCTUnwrap(publisher.visible)
+                let current = try XCTUnwrap(snapshot.media[video]?.logicalSequences.last)
+                XCTAssertGreaterThanOrEqual(current, lastSequence)
+                lastSequence = current
+                maximumPending = max(maximumPending, publisher.pendingLogicalSequenceCount)
+                XCTAssertFalse(snapshot.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            XCTAssertNil(authority.failureDiagnostic,
+                "Continuous long-GOP input must not fail at callback 12 with an eight-segment backlog")
+            XCTAssertGreaterThanOrEqual(lastSequence, 13,
+                "A live playlist must cover at least 70 seconds of real media without natural-end drain")
+            XCTAssertLessThanOrEqual(maximumPending, 8,
+                "Fixing the clock must preserve the bounded publication backlog")
+            let coverage = try XCTUnwrap(publisher.visible?.coverage.participants.first {
+                $0.participantID == video
+            })
+            let horizon = try XCTUnwrap(coverage.ranges.last?.end)
+            XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(horizon.cmTime), 70)
+            for range in coverage.ranges {
+                XCTAssertEqual(CMTimeGetSeconds(range.duration.cmTime), 5, accuracy: 0.001,
+                    "This fixture must exercise genuine 5s GOP segments, not one-second callbacks")
+            }
+            XCTAssertFalse(server.hasSentSourceEOF)
+        } catch {
+            XCTFail("The production continuous-live path failed before its progress assertion: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired, "The continuous source must retire without relying on source EOF")
+    }
+
     func testNestedTranscodeFailuresKeepOriginalDiagnosticWithoutRewrapping() {
         let original = ErrorDiagnosticSnapshot(NSError(domain: "HLS.Transcode.Native", code: -93,
             userInfo: [NSLocalizedDescriptionKey: String(repeating: "原始原因", count: 80)]))
@@ -1370,6 +1508,8 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var released = false
     private var blocked = 0
+    private var highestBlockedSequence: UInt64 = 0
+    private var permittedThrough: UInt64 = 2
     private var timedOut = false
 
     var didTimeout: Bool { condition.withLock { timedOut } }
@@ -1378,11 +1518,12 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
         guard object.kind == .media, object.logicalSequence >= 3 else { return }
         condition.lock()
         defer { condition.unlock() }
-        guard !released else { return }
+        guard !released, object.logicalSequence > permittedThrough else { return }
         blocked += 1
+        highestBlockedSequence = max(highestBlockedSequence, object.logicalSequence)
         condition.broadcast()
         let deadline = Date().addingTimeInterval(15)
-        while !released {
+        while !released, object.logicalSequence > permittedThrough {
             if !condition.wait(until: deadline) {
                 timedOut = true
                 return
@@ -1390,14 +1531,18 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
         }
     }
 
-    func waitUntilBlocked() -> Bool {
+    func waitUntilBlocked(atLeast sequence: UInt64 = 3) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(10)
-        while blocked == 0, !released {
+        while (blocked == 0 || highestBlockedSequence < sequence), !released {
             if !condition.wait(until: deadline) { return false }
         }
-        return blocked > 0
+        return blocked > 0 && highestBlockedSequence >= sequence
+    }
+
+    func releaseThrough(_ sequence: UInt64) {
+        condition.withLock { permittedThrough = max(permittedThrough, sequence); condition.broadcast() }
     }
 
     func release() {
@@ -1440,9 +1585,13 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
     let sourceURL: URL
     var hasSentSourceEOF: Bool { connections.hasSentEOF }
 
-    init(fileURL: URL) throws {
+    init(fileURL: URL, sendEntireBodyWithoutEOF: Bool = false) throws {
         let payload = try Data(contentsOf: fileURL)
-        let prefixBytes = (payload.count * 3 / 8) / 188 * 188
+        // Retain one whole TS packet and keep the declared response incomplete.
+        // This tests live publication; no EOF can activate the separate drain.
+        let prefixBytes = sendEntireBodyWithoutEOF
+            ? (payload.count / 188 - 1) * 188
+            : (payload.count * 3 / 8) / 188 * 188
         guard prefixBytes > 0, prefixBytes < payload.count else {
             throw NSError(domain: "Task22LatePublicationFixtureServer", code: 1)
         }

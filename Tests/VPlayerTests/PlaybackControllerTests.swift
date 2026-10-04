@@ -17,6 +17,113 @@ private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
 }
 
 final class PlaybackControllerTests: XCTestCase {
+    func testHLSActivationAloneDoesNotArmWatchdogBeforeMediaProgress() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        let context = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+        XCTAssertTrue(context.prepared)
+        XCTAssertNotNil(context.activation, "Exercise a genuinely committed Registry activation")
+        let armed = await harness.controller.watchdog.isArmed
+        XCTAssertFalse(armed,
+            "Positive-rate admission and a playing UI state are not observed AVPlayer media progress")
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+    }
+
+    func testHLSWatchdogRecoveryRetainsCurrentRelayAndRejectsOldPrepareFailure() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        do {
+            let before = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+            let oldPrepare = try XCTUnwrap(before.prepareTicket)
+            let backend = try XCTUnwrap(harness.factory.createdBackends.first)
+            await harness.controller.handleWatchdogRecovery(reason: .playbackStalled)
+            let after = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+            let currentPrepare = try XCTUnwrap(after.prepareTicket)
+            XCTAssertEqual(after.sessionIdentity, before.sessionIdentity,
+                "Recovery must preserve the user's intended source and request")
+            XCTAssertNotEqual(currentPrepare, oldPrepare,
+                "The retained backend must actually receive a new prepare attempt")
+            XCTAssertEqual(harness.backendCreationCount, 1)
+            XCTAssertEqual(harness.currentAudibleOutputs, 1)
+            XCTAssertEqual(harness.maximumPotentiallyAudibleOutputs, 1)
+            let cycle = await harness.controller.readinessCycleForTesting
+            harness.factory.emit(.backendFailed(
+                ErrorDiagnosticSnapshot(typeName: "HLS.RetiredAttempt", message: "retired attempt"),
+                prepareScope: .init(ticket: oldPrepare),
+                metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)),
+                from: backend.identity)
+            // A current-cycle FIFO sentinel proves that the retained real relay
+            // survived cleanup and consumed the preceding stale failure safely.
+            harness.factory.emit(.phase(.buffering, readinessCycle: cycle), from: backend.identity)
+            try await eventually {
+                if case .buffering = await harness.controller.currentStateForTesting { return true }
+                return false
+            }
+            XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.prepareTicket, currentPrepare)
+            harness.factory.emit(.backendFailed(
+                ErrorDiagnosticSnapshot(typeName: "HLS.CurrentAttempt", message: "current attempt"),
+                prepareScope: .init(ticket: currentPrepare),
+                metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)),
+                from: backend.identity)
+            try await eventually {
+                if case .failed = await harness.controller.currentStateForTesting { return true }
+                return false
+            }
+        } catch {
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+        XCTAssertEqual(harness.currentAudibleOutputs, 0)
+        XCTAssertNil(harness.registry.ownedResourceSnapshot())
+    }
+
+    func testHLSAutomaticReplacementAuthorityWithRealRelayRepreparesAndReactivates() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        do {
+            let before = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+            let oldPrepare = try XCTUnwrap(before.prepareTicket)
+            let backend = try XCTUnwrap(harness.factory.createdBackends.first)
+            XCTAssertTrue(backend.backendPublicationReplacementAuthoritySlot.requestReplacement(),
+                "Use the same scoped, single-use admission the native coordinator uses")
+            try await eventually {
+                guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                return context.owner == nil && context.prepared
+                    && context.prepareTicket != oldPrepare && harness.currentAudibleOutputs == 1
+            }
+            let after = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+            XCTAssertTrue(after.prepared)
+            XCTAssertNil(after.owner)
+            XCTAssertNotEqual(after.prepareTicket, oldPrepare,
+                "A retained real event-drain payload must not prevent the owned runner's handoff")
+            XCTAssertEqual(after.sessionIdentity, before.sessionIdentity)
+            XCTAssertEqual(harness.backendCreationCount, 1)
+            XCTAssertEqual(harness.currentAudibleOutputs, 1)
+            XCTAssertEqual(harness.maximumPotentiallyAudibleOutputs, 1)
+            let cycle = await harness.controller.readinessCycleForTesting
+            harness.factory.emit(.phase(.buffering, readinessCycle: cycle), from: backend.identity)
+            try await eventually {
+                if case .buffering = await harness.controller.currentStateForTesting { return true }
+                return false
+            }
+        } catch {
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+        XCTAssertEqual(harness.currentAudibleOutputs, 0)
+        XCTAssertNil(harness.registry.ownedResourceSnapshot())
+    }
+
     func testCancelledScopedPauseAndPlayCannotAdoptSameRequestRetryRun() async throws {
         for paused in [true, false] {
             let first = FakeControllerPipeline()
