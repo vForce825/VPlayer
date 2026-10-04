@@ -30,7 +30,7 @@ enum SystemHLSLoopbackPreparation {
         let server = try await LoopbackHTTPServer.start(
             store: store, declaration: declaration, publishedSnapshot: snapshot,
             sessionCapability: token,
-            now: SystemHLSLoopbackClock.nowNanoseconds, logger: { _ in }
+            now: { store.monotonicNowNanoseconds }, logger: { _ in }
         )
         return try Prepared(
             server: server,

@@ -657,6 +657,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         lifecycle: OutputLifecycleEpoch,
         publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
         initialWindowMinimumSeconds: Int = 3,
+        publicationClock: (any PlaybackMonotonicClock)? = nil,
         failureSink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void = { _ in }
     ) throws {
         guard publicationDeadlineNanoseconds > 0 else {
@@ -671,7 +672,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         publication = try SystemHLSPublicationGraph(
             itemGeneration: lifecycle.outputNonce,
             publicationDeadlineNanoseconds: publicationDeadlineNanoseconds,
-            initialWindowMinimumSeconds: initialWindowMinimumSeconds)
+            initialWindowMinimumSeconds: initialWindowMinimumSeconds,
+            clock: publicationClock)
         let pair = AsyncStream<AdmittedDemuxEvent>.makeStream()
         stream = pair.stream
         streamContinuation = pair.continuation
@@ -728,6 +730,12 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     }
 
     private func consume(_ event: HLSTimelineEvent) async throws {
+        switch event {
+        case .audioSample, .videoSample:
+            try await publication.waitForProducerCapacity()
+        default:
+            break
+        }
         switch event {
         case .originEstablished(let origin):
             setDiagnosticStage("timeline.origin")
@@ -1878,6 +1886,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             publication.recordFailure(CancellationError())
         }
         streamContinuation.finish()
+        publication.cancelLivePublication()
         worker.cancel()
         let targets = condition.withLock {
             (audioBranch, interlacedVideoOutput, videoWriter, interlacedInputWakeup)

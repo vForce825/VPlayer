@@ -23,6 +23,42 @@ private final class TestClock: @unchecked Sendable {
 }
 
 final class BackendDiagnosticsTests: XCTestCase {
+    func testExpiredProgressDeadlineNeverRequestsNanosecondPolling() {
+        var watch = HLSPlaybackProgressWatch()
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 0))
+        XCTAssertFalse(watch.observe(mediaTime: 1, at: 250_000_000))
+        XCTAssertEqual(watch.nextPollDelay(at: 3_250_000_000), 250_000_000,
+            "An unavailable observation must never produce a one-nanosecond polling loop")
+    }
+
+    func testLiveProgressWatchNeedsStrictAdvanceAndLatchesOneStall() {
+        var watch = HLSPlaybackProgressWatch()
+        XCTAssertFalse(watch.observe(mediaTime: Double.nan, at: 0))
+        XCTAssertFalse(watch.observe(mediaTime: 10, at: 0))
+        XCTAssertFalse(watch.observe(mediaTime: 10, at: 90_000_000_000),
+            "A startup waiting item has not yet made real progress")
+        XCTAssertFalse(watch.hasObservedProgress)
+        XCTAssertFalse(watch.observe(mediaTime: 10.5, at: 90_250_000_000))
+        XCTAssertTrue(watch.hasObservedProgress)
+        XCTAssertFalse(watch.observe(mediaTime: 10.5, at: 93_249_999_999))
+        XCTAssertTrue(watch.observe(mediaTime: 10.5, at: 93_250_000_000))
+        XCTAssertFalse(watch.observe(mediaTime: 100, at: 96_250_000_000),
+            "A retired observation cannot reopen itself even if a late sample advances")
+    }
+
+    func testLiveProgressWatchFreshActivationRequiresFreshProgress() {
+        var watch = HLSPlaybackProgressWatch()
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 0))
+        for sample in 1...280 {
+            XCTAssertFalse(watch.observe(mediaTime: Double(sample) / 4,
+                at: UInt64(sample) * 250_000_000))
+        }
+        XCTAssertTrue(watch.observe(mediaTime: 70, at: 73_000_000_000))
+        watch = .init()
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 74_000_000_000))
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 90_000_000_000))
+        XCTAssertFalse(watch.hasObservedProgress)
+    }
 
     func testHLSWatchdogCompletedRecoveryCannotLoopWithoutNewActivation() async {
         let recovery = PlaybackRecoveryCoordinator()

@@ -212,6 +212,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     private let publicationDeadlineNanoseconds: Int64
     private let initialWindowMinimumSeconds: Int
     private let publicationClock: HLSNaturalEndPublicationClock?
+    private let livePublicationIsScoped: Bool
     private var naturalEndDrainInProgress = false
     private var participants: [UInt64: HLSInitialParticipant] = [:]
     private var initializationKeys: [UInt64: HLSResourceKey] = [:]
@@ -259,6 +260,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
         self.initialWindowMinimumSeconds = initialWindowMinimumSeconds
         self.publicationClock = publicationClock
+        livePublicationIsScoped = publicationClock?.hasLiveWakeHandler == true
         participantGeneration = try PlaybackIdentityAllocator.shared.next(in: .admissionFence)
         owner = try store.claimPublicationOwner()
         do { try store.domain.sync {
@@ -282,6 +284,43 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         sequence > 0 && pendingCount >= 4 || store.usage.shouldBackpressure
             || writerSlots.values.contains { $0.contains { $0.retiring } }
     } }
+    /// Producer suspension is safe only when every participant already owns
+    /// a drainable common prefix. Union backlog alone can strand lagging audio.
+    var shouldBackpressureProducer: Bool { store.domain.sync {
+        guard sequence > 0 else { return false }
+        let common = participants.keys.map { id in
+            records[id]?.filter { $0.receipt.logicalSequence >= nextLogicalSequence }.count ?? 0
+        }.min() ?? 0
+        return common >= 4 || common > 0 && store.usage.shouldBackpressure
+    } }
+
+    /// A normal live publication must be woken even when no new media callback
+    /// arrives. When data/capacity is missing, preserve the ticket's original
+    /// deadline rather than busy-retry or silently renew it.
+    func nextLivePublicationWake(now: Int64) throws -> Int64? { try store.domain.sync {
+        try revalidate(_ticket, now: nil)
+        guard sequence > 0, !ended, !naturalEndDrainInProgress else { return nil }
+        guard let previousInstant, let deadline = _ticket.absoluteDeadline else {
+            throw HLSPublicationFailure.identityMismatch
+        }
+        guard deadline > now else {
+            _ = try self.deadline(ticket: _ticket, now: now)
+            throw HLSPublicationFailure.deadlineExceeded
+        }
+        let ready = participants.keys.allSatisfy { id in
+            records[id]?.contains { $0.receipt.logicalSequence == nextLogicalSequence } == true
+        }
+        guard ready else { return deadline }
+        let duration = declaration.video.flatMap { video in
+            records[video.participantID]?.first {
+                $0.receipt.logicalSequence == nextLogicalSequence
+            }?.commonDuration
+        } ?? HLSChecked.one
+        let interval = max(Int64(1_000_000_000), try HLSChecked.nanoseconds(duration))
+        let earliest = try HLSChecked.add(previousInstant, interval)
+        return earliest > now ? min(earliest, deadline) : deadline
+    } }
+
     private var pendingCount: Int { Set(records.values.flatMap { $0.filter { $0.receipt.logicalSequence >= nextLogicalSequence }.map { $0.receipt.logicalSequence } }).count }
 
     /// 只预约紧邻下一次 publication。若中间发生别的 CAS，真实 completed-response
@@ -588,10 +627,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             guard let reservation = try store.reserveSnapshotBatch(mediaCount: participants.count, includeMaster: sequence == 0 && declaration.video != nil) else {
                 if ticket.absoluteDeadline.map({ now >= $0 }) == true { _closed = true; throw HLSPublicationFailure.deadlineExceeded }
                 try store.waitForSnapshotCapacity(owner: owner, ticket: ticket,
-                    publicationClock: naturalEndDrainInProgress ? publicationClock : nil) { [weak self] instant in
+                    publicationClock: publicationClock) { [weak self] instant in
                     guard let self else { return }
-                    if self.naturalEndDrainInProgress {
-                        // 同一容量槽只唤醒原 finish runner；它会重读真实 clock 与准确 ticket。
+                    if self.naturalEndDrainInProgress || self.livePublicationIsScoped {
+                        // Live graph/EOF runner re-enter their own failure/lifecycle
+                        // scope and resample the current clock and ticket.
                         self.publicationClock?.signal()
                     } else {
                         do { _ = try self.publish(ticket: ticket, now: instant) }

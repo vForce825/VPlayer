@@ -17,6 +17,151 @@ private struct ErrorReportingPipelineFactory: PlaybackPipelineFactory {
 }
 
 final class PlaybackControllerTests: XCTestCase {
+    func testHLSResumeDoesNotInventProgressAndArmCompatibilityWatchdog() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        await harness.controller.setPaused(true)
+        await harness.controller.setPaused(false)
+        let armed = await harness.controller.watchdog.isArmed
+        XCTAssertFalse(armed, "Resume admission is not an observed AVPlayer clock advance")
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+    }
+
+    func testRepeatedHLSRouteReplacementReclaimsDestroyedRelayChildren() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        try await exerciseRepeatedHLSRouteReplacement()
+        try await eventually { PlaybackResourceContextLedger.shared.chargedBytes == baseline }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    private func exerciseRepeatedHLSRouteReplacement() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        let initial = harness.registry.occupancy
+        do {
+            for _ in 0..<36 {
+                for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
+                    harness.setRoute(kind)
+                    await harness.controller.requestRouteHandoff(to: kind)
+                    try await eventually {
+                        guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                        return context.owner == nil && context.prepared && context.desiredBackendKind == kind
+                            && harness.currentAudibleOutputs == 1
+                    }
+                    if kind == .hlsAVPlayer {
+                        let settled = harness.registry.occupancy
+                        XCTAssertEqual(settled.groups, initial.groups,
+                            "Destroyed backend relay groups cannot accumulate outside the renewable work cycle")
+                        XCTAssertEqual(settled.ordinarySlots, initial.ordinarySlots)
+                        let currentBackend = try XCTUnwrap(harness.factory.createdBackends.last)
+                        let cycle = await harness.controller.readinessCycleForTesting
+                        harness.factory.emit(.phase(.buffering, readinessCycle: cycle),
+                            from: currentBackend.identity)
+                        try await eventually {
+                            if case .buffering = await harness.controller.currentStateForTesting { return true }
+                            return false
+                        }
+                    }
+                    XCTAssertEqual(harness.maximumPotentiallyAudibleOutputs, 1)
+                }
+            }
+        } catch {
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(harness.registry.ownedResourceSnapshot())
+        XCTAssertEqual(harness.registry.occupancy.groups, 0)
+        XCTAssertEqual(harness.registry.occupancy.ordinarySlots, 0)
+        XCTAssertEqual(harness.currentAudibleOutputs, 0)
+    }
+
+    func testHLSWatchdogRecoveryBudgetSurvivesFreshPrepareAndActivation() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        do {
+            let session = try XCTUnwrap(harness.registry.outputResourceContextSnapshot()?.sessionIdentity)
+            let oldActivation = try XCTUnwrap(harness.registry.outputResourceContextSnapshot()?.activation)
+            let oldAuthority = try XCTUnwrap(harness.factory.createdBackends.first?
+                .backendPublicationReplacementAuthoritySlot.currentAuthority())
+            for attempt in 1...2 {
+                let old = try XCTUnwrap(harness.registry.outputResourceContextSnapshot()?.prepareTicket)
+                await harness.controller.handleWatchdogRecovery(reason: .playbackStalled)
+                try await eventually {
+                    guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                    return context.owner == nil && context.prepared && context.prepareTicket != old
+                        && harness.currentAudibleOutputs == 1
+                }
+                XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.sessionIdentity, session)
+                XCTAssertEqual(harness.factory.createdBackends.first?.retirementSnapshot.count, attempt)
+            }
+            let priorOrdinary = harness.registry.outputResourceContextSnapshot()?.prepareTicket
+            XCTAssertTrue(harness.factory.createdBackends.first?
+                .backendPublicationReplacementAuthoritySlot.requestReplacement() == true,
+                "Legitimate publication replacements do not consume the watchdog-only budget")
+            try await eventually {
+                guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                return context.owner == nil && context.prepared && context.prepareTicket != priorOrdinary
+                    && harness.currentAudibleOutputs == 1
+            }
+            // Explicit route changes may create new backend objects within the
+            // same source request; neither transition replenishes stall retries.
+            for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
+                harness.setRoute(kind)
+                await harness.controller.requestRouteHandoff(to: kind)
+                try await eventually {
+                    guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                    return context.desiredBackendKind == kind && context.owner == nil
+                        && context.prepared && harness.currentAudibleOutputs == 1
+                }
+                XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.sessionIdentity, session)
+            }
+            XCTAssertEqual(harness.backendCreationCount, 3)
+            XCTAssertFalse(oldAuthority.requestWatchdogRecovery(activation: oldActivation),
+                "A queued old backend/activation cannot control the route successor or its budget")
+            await harness.controller.handleWatchdogRecovery(reason: .playbackStalled)
+            try await eventually {
+                if case .failed(let failure) = await harness.controller.currentStateForTesting {
+                    return failure.code == "hls.watchdog.recovery-exhausted"
+                }
+                return false
+            }
+            await harness.registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(harness.registry.ownedResourceSnapshot())
+            XCTAssertEqual(harness.currentAudibleOutputs, 0)
+            XCTAssertEqual(harness.maximumPotentiallyAudibleOutputs, 1)
+        } catch {
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await harness.controller.stop()
+    }
+
+    func testHLSWatchdogRecoveryCannotOverrideIntentionalPause() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        await harness.controller.setPaused(true)
+        let before = harness.registry.outputResourceContextSnapshot()
+        await harness.controller.handleWatchdogRecovery(reason: .playbackStalled)
+        XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.prepareTicket, before?.prepareTicket)
+        XCTAssertEqual(harness.factory.createdBackends.first?.retirementSnapshot.count, 0)
+        let state = await harness.controller.currentStateForTesting
+        guard case .paused = state else {
+            await harness.controller.stop()
+            return XCTFail("Stale watchdog delivery must preserve explicit pause")
+        }
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+    }
+
     func testHLSActivationAloneDoesNotArmWatchdogBeforeMediaProgress() async throws {
         let harness = BackendOwnershipTestHarness()
         harness.setRoute(.hlsAVPlayer)
@@ -40,6 +185,11 @@ final class PlaybackControllerTests: XCTestCase {
             let oldPrepare = try XCTUnwrap(before.prepareTicket)
             let backend = try XCTUnwrap(harness.factory.createdBackends.first)
             await harness.controller.handleWatchdogRecovery(reason: .playbackStalled)
+            try await eventually {
+                guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                return context.owner == nil && context.prepared
+                    && context.prepareTicket != oldPrepare && harness.currentAudibleOutputs == 1
+            }
             let after = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
             let currentPrepare = try XCTUnwrap(after.prepareTicket)
             XCTAssertEqual(after.sessionIdentity, before.sessionIdentity,
@@ -177,8 +327,11 @@ final class PlaybackControllerTests: XCTestCase {
         factory.succeed(callID: 1, with: first)
         await firstPlay.value
         let oldSession = try XCTUnwrap(owner.registry.outputResourceContextSnapshot()?.sessionIdentity)
-        let oldEpochValue = await controller.watchdog.currentActivationEpoch
-        let oldEpoch = try XCTUnwrap(oldEpochValue)
+        let oldEpoch: UInt64 = 1
+        // Supply explicit progress for this stale-arm fencing regression. A
+        // successful controller activation no longer invents that observation.
+        await controller.watchdog.arm(activationEpoch: oldEpoch, hasObservedProgress: true,
+            session: oldSession, controlRevision: 0)
         let nextPlay = Task { await controller.play(replacementRequest) }
         try await eventually { factory.isPending(callID: 2) }
         // B has crossed its exact new-play disarm but is still held in prepare.
@@ -192,7 +345,7 @@ final class PlaybackControllerTests: XCTestCase {
         factory.succeed(callID: 2, with: replacement)
         await nextPlay.value
         let armedForReplacement = await controller.watchdog.isArmed
-        XCTAssertTrue(armedForReplacement)
+        XCTAssertFalse(armedForReplacement, "The replacement still has no observed media advance")
         await controller.stop()
     }
 

@@ -377,6 +377,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
         }
     }
 
+    func requestWatchdogRecovery(activation: ActivationEpoch) async -> Bool {
+        guard let coordinator = lock.withLock({ self.coordinator }) else { return false }
+        return await coordinator.requestWatchdogRecovery(activation: activation)
+    }
+
     func activateOutput(
         invocation: ControlTaskRegistry.BackendPositiveRateInvocation
     ) async throws {

@@ -608,7 +608,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 let relay = PlaybackSessionEventRelay(identity: runIdentity) { [weak self] identity, event in
                     await self?.receivePipelineEvent(event, identity: identity, backendIdentity: candidateID)
                 }
-                let relayGroup = try registry.createGroup(resource: .backend(candidateID), parent: creation.reservation.workGroup)
+                let relayParent = kind == .hlsAVPlayer
+                    ? creation.reservation.ownerGroup : creation.reservation.workGroup
+                let relayGroup = try registry.createGroup(resource: .backend(candidateID), parent: relayParent)
                 let relayDrain = try registry.enqueue(group: relayGroup, slot: .accounting, policy: .routeNeutral)
                 guard registry.bindEventRelay(relay, to: relayDrain) else {
                     diagnosticStage = "bind_factory_relay_failed"
@@ -698,9 +700,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                         }
                         publish(.playing(request))
                     }
-                    await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds,
-                        hasObservedProgress: true, session: sessionIdentity,
-                        controlRevision: activationControlRevision)
+                    // HLS observation starts from direct AVPlayer media-clock
+                    // samples under its exact Registry activation. Successful
+                    // rate admission alone must not arm a stall watchdog.
                     guard ownsUserControl(runIdentity, revision: activationControlRevision) else { return }
                     diagnosticStage = isHLS ? "hls_playing" : "activation_succeeded_waiting_for_pipeline"
                 case .failed(let error):
@@ -874,9 +876,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             guard ownsUserControl(controlRun, revision: controlRevision) else { return }
             switch outcome {
             case .succeeded:
-                await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds,
-                    hasObservedProgress: true, session: sessionIdentity, controlRevision: controlRevision)
-                guard ownsUserControl(controlRun, revision: controlRevision) else { return }
+                break // The resumed item must establish fresh media-clock progress.
             case .failed(let error):
                 if let context = registry.outputResourceContextSnapshot() {
                     beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
@@ -1273,7 +1273,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard controllerState.request != nil, admittedRun != nil else { return }
         switch reason {
         case .playbackStalled, .bufferStarvation, .playbackBacklogExceeded:
-            await requestQuiescentEndpointHandoff()
+            guard !controllerState.userPaused, !systemPauseRequired else { return }
+            _ = await registry.requestCurrentHLSWatchdogRecovery()
         case .prepareBacklogExceeded, .hardCapacityExceeded:
             if let context = registry.outputResourceContextSnapshot() {
                 beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.watchdogHardCapacityFailure))

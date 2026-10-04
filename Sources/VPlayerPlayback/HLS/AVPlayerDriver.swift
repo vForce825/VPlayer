@@ -833,6 +833,16 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     var rate: Float { player.rate }
     var timeControlStatus: AVPlayer.TimeControlStatus { player.timeControlStatus }
+
+    func playbackTime(item identity: AVPlayerItemInstanceIdentity) -> ExactMediaTime? {
+        guard case .currentItem(let time) = playbackClockObservation(item: identity) else { return nil }
+        return time
+    }
+
+    func playbackClockObservation(item identity: AVPlayerItemInstanceIdentity) -> AVPlayerPlaybackClockObservation {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { return .staleItem }
+        return .currentItem(try? ExactMediaTime(player.currentTime()))
+    }
     var activeWaiterCount: Int {
         (prepareWait.isActive ? 1 : 0)
             + (pausedResumeCallbackPool?.hasOperationReturnWaiter == true ? 1 : 0)
