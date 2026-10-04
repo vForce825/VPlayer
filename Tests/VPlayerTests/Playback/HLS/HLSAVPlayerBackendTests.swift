@@ -6,6 +6,7 @@ import AudioToolbox
 import XCTest
 import Network
 import VPlayerCore
+@testable import VPlayer
 @testable import VPlayerPlayback
 
 /// Task22-F 的 production 装配边界。整图 fixture 由 root runner 在模拟器上执行；这里先
@@ -788,6 +789,58 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             CMTimeAdd(start, CMTime(value: 1, timescale: 4))), 0, String(describing: item.error))
         XCTAssertFalse(item.loadedTimeRanges.isEmpty)
         print("AUDIO_ONLY_NATIVE_PLAYBACK ready=\(item.status.rawValue) time=\(player.currentTime())")
+    }
+
+    func testProductionAirPlayPublishesMediaInformationThroughControllerToPresentation() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let factory = AudioReviewProductionBackendFactory()
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let owner = try PlaybackAudioSessionOwner(registry: registry,
+            sdk: FakeAudioSessionSDK(initialPorts: .airPlay))
+        let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: routes, backendFactory: factory)
+        let stream = await controller.playbackMediaInformation()
+        let information = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+        let collector = Task {
+            for await value in stream { information.append(value) }
+        }
+        defer { collector.cancel() }
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "homepod-metadata",
+            streamURL: fixture.source, title: "Progressive HomePod fixture")
+
+        await controller.play(request)
+        do {
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepared, true,
+                "The real HLS startup must remain successful: \(state)")
+            XCTAssertEqual(state, .playing(request))
+            XCTAssertNotNil(factory.backend, "AirPlay must use the real HLS backend")
+            XCTAssertFalse(factory.backend?.isAudioOnly ?? true)
+
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while !information.snapshot.contains(where: { $0 != nil }), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let published = try XCTUnwrap(information.snapshot.compactMap { $0 }.last,
+                "Playing HLS must supply the controller's public media stream instead of leaving the UI detecting")
+            XCTAssertEqual(published.width, 1_280)
+            XCTAssertEqual(published.height, 720)
+            XCTAssertEqual(published.scanMode, .progressive)
+            XCTAssertEqual(published.sourceFrameRate, MediaRational(num: 25, den: 1))
+            XCTAssertEqual(published.outputFrameRate, 25)
+            XCTAssertFalse(published.isSmoothMotionEnhanced)
+            XCTAssertEqual(PlaybackMediaInformationPresentation(information: published).visualText,
+                "1280×720p · 25 fps")
+        } catch {
+            await controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await controller.stop()
+        await registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(registry.outputResourceContextSnapshot())
     }
 
     func testProductionProgressiveGraphPublishesSixSecondLoopbackPrefixAndRetires()
