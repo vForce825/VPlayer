@@ -10257,9 +10257,16 @@ private final class Task21RealIntegrationFixture {
             ), let participant = evidence.participants.first(where: {
                    $0.participantID
                     == publication.seed.endpoint.binding.publicationParticipantID.rawValue
-               }), Set(participant.completedMedia.map(\.key)).isSuperset(of: expectedMediaKeys) {
-                completed = evidence
-                break
+               }) {
+                // This is deliberately still a live (unfrozen) completion view.
+                // map may size an Array from count before another response adds
+                // a completed resource, invalidating that allocation assumption.
+                var observedKeys = Set<HLSResourceKey>()
+                for resource in participant.completedMedia { observedKeys.insert(resource.key) }
+                if observedKeys.isSuperset(of: expectedMediaKeys) {
+                    completed = evidence
+                    break
+                }
             }
             try await Task.sleep(for: .milliseconds(10))
         }

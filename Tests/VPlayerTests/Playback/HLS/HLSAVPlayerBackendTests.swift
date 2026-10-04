@@ -884,9 +884,15 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             await controller.play(request)
             let lifecycle = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
             await controller.setPaused(true)
+            let pausedState = await controller.currentStateForTesting
+            XCTAssertEqual(pausedState, .paused(request))
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepared, true)
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.owner)
             // Keep the original route authority admissible. This exercises the
             // retained-pause helper, not physical empty-to-AirPlay restoration.
-            await controller.suspendActiveOutputForRouteUnavailable()
+            // The physical pause already settled; do not issue a second suspend
+            // against its consumed output interval merely to change UI state.
+            await controller.publishRouteRecovering(request: request)
             await controller.invalidatePreparedMediaInformation(for: lifecycle)
             let cleared = await self.currentMediaInformation(controller)
             XCTAssertNil(cleared)
@@ -911,12 +917,14 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-first",
                 streamURL: fixture.source, title: "First"))
             let first = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
-            let retiredBackend = try XCTUnwrap(factory.backend)
-            XCTAssertNotNil(retiredBackend.preparedMediaInformation(for: first))
+            weak var retiredBackend = try XCTUnwrap(factory.backend)
+            XCTAssertNotNil(retiredBackend?.preparedMediaInformation(for: first))
 
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-second",
                 streamURL: fixture.source, title: "Second"))
-            let second = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let secondDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let second = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
+                secondDiagnostic)
             XCTAssertNotEqual(first, second)
             let current = await self.currentMediaInformation(controller)
             XCTAssertEqual(current?.width, 1_280)
@@ -925,7 +933,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let afterStaleCallbacks = await self.currentMediaInformation(controller)
             XCTAssertEqual(afterStaleCallbacks, current,
                 "Equal dimensions do not make the retired graph's callbacks current")
-            XCTAssertNil(retiredBackend.preparedMediaInformation(for: first))
+            XCTAssertNil(retiredBackend?.preparedMediaInformation(for: first))
             XCTAssertNil(registry.preparedHLSMediaInformation(for: first))
 
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-radio",
@@ -947,7 +955,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         try await withProductionMediaController { controller, registry, _, sdk in
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-route",
                 streamURL: fixture.source, title: "Route metadata"))
-            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let startupDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
+                startupDiagnostic)
             let stream = await controller.playbackMediaInformation()
             let values = PlaybackStreamRecorder<PlaybackMediaInformation?>()
             let collector = Task { for await value in stream { values.append(value) } }
@@ -1096,6 +1106,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 _ = await bundle.retireProducerGraph()
                 throw error
             }
+            // Production's coordinator retires the preparation history before
+            // the producer graph. Keep the stale bundle alias, not its active
+            // singleton history domain, while the successor creates a prefix.
+            let evidence = try XCTUnwrap(bundle.replacement.evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource)
+            evidence.retirePreparation()
             let retired = await bundle.retireProducerGraph()
             XCTAssertTrue(retired)
             XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle))
@@ -1108,25 +1123,53 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         return await iterator.next() ?? nil
     }
 
+    private func mediaControllerDiagnostic(_ controller: PlaybackController,
+                                           registry: ControlTaskRegistry) async -> String {
+        let state = await controller.currentStateForTesting
+        return "state=\(state); context=\(String(describing: registry.outputResourceContextSnapshot())); "
+            + "resourceBytes=\(PlaybackResourceContextLedger.shared.chargedBytes); "
+            + "applicationBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes); "
+            + "callbacks=\(AVPlayerSDKCallbackLease.occupiedCount); "
+            + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)"
+    }
+
     private func withProductionMediaController(
         factory: AudioReviewProductionBackendFactory = AudioReviewProductionBackendFactory(),
         _ body: (PlaybackController, ControlTaskRegistry, AudioReviewProductionBackendFactory,
                  FakeAudioSessionSDK) async throws -> Void
     ) async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
-        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        // The SDK route/session is controlled by this fixture. Native AVPlayer
+        // audio notifications from other fixtures must not mutate that fake
+        // session's safety epochs halfway through prepare or replacement.
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress,
+            notificationCenter: NotificationCenter())
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: routes, backendFactory: factory)
+        var bodyError: (any Error)?
         do { try await body(controller, registry, factory, sdk) }
-        catch {
-            await controller.stop()
-            await registry.joinOwnedTerminalCleanup()
-            throw error
-        }
+        catch { bodyError = error }
         await controller.stop()
         await registry.joinOwnedTerminalCleanup()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (PlaybackResourceContextLedger.shared.chargedBytes > resourceBaseline
+               || HLSDeliveryApplicationChargeLedger.shared.chargedBytes > applicationBaseline
+               || AVPlayerSDKCallbackLease.occupiedCount > callbackBaseline),
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let diagnostic = await mediaControllerDiagnostic(controller, registry: registry)
+        XCTAssertNil(registry.outputResourceContextSnapshot(), diagnostic)
+        XCTAssertLessThanOrEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline, diagnostic)
+        XCTAssertLessThanOrEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, applicationBaseline, diagnostic)
+        XCTAssertLessThanOrEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline, diagnostic)
+        if let bodyError { throw bodyError }
     }
 
     func testProductionProgressiveGraphPublishesSixSecondLoopbackPrefixAndRetires()
@@ -1558,7 +1601,8 @@ private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
 private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let lock = NSLock()
     private let factory: SystemPlaybackBackendFactory
-    private var created: HLSAVPlayerPlaybackBackend?
+    // Observation must not extend a retired backend's one-native-driver lease.
+    private weak var created: HLSAVPlayerPlaybackBackend?
     init(factory: SystemPlaybackBackendFactory = SystemPlaybackBackendFactory()) { self.factory = factory }
     var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { created } }
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
