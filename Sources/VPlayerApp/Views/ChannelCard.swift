@@ -34,6 +34,20 @@ struct ChannelCard: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
+            #if DEBUG
+            // Diagnostic-only, layout-neutral fiducial. Measuring its screenshot
+            // pixels observes CardButtonStyle's actual transform, not AX bounds.
+            .overlay(alignment: .top) {
+                if channel.attributes["ui-card-focus-probe"] == "true" {
+                    Rectangle()
+                        .fill(Color(red: 1, green: 0, blue: 1))
+                        .frame(height: 6)
+                        .padding(.horizontal, 20)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            #endif
         }
     }
 
