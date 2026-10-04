@@ -611,6 +611,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var loopbackServer: LoopbackHTTPServer?
     private var prefixPreparationInFlight = false
     private var prefixRetirementWaiter: CheckedContinuation<Void, Never>?
+    /// Written from inspected video facts, read under condition only when the
+    /// real all-track prefix has proved that the selected output branch works.
+    private var mediaInformation: PlaybackMediaInformation?
 
     // 以下只由 worker 访问，retire 在 worker 终止后才释放。
     private var tracks: DemuxTrackSet?
@@ -934,6 +937,16 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
         if !videoFrameRateConfigured {
             try publication.configureVideo(frameRate: track.frameRate)
+            condition.withLock {
+                mediaInformation = PlaybackMediaInformation(
+                    width: proof.format.width, height: proof.format.height,
+                    scanMode: .progressive,
+                    sourceFrameRate: track.frameRate ?? proof.format.frameRate,
+                    outputFrameRate: (track.frameRate ?? proof.format.frameRate).map {
+                        Double($0.num) / Double($0.den)
+                    },
+                    isSmoothMotionEnhanced: false)
+            }
             videoFrameRateConfigured = true
         }
         if boundary == nil {
@@ -1028,6 +1041,13 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
         if !videoFrameRateConfigured {
             try publication.configureVideo(frameRate: outputFrameRate)
+            condition.withLock {
+                mediaInformation = PlaybackMediaInformation(
+                    width: inspection.format.width, height: inspection.format.height,
+                    scanMode: .interlaced, sourceFrameRate: sourceFrameRate,
+                    outputFrameRate: Double(outputFrameRate.num) / Double(outputFrameRate.den),
+                    isSmoothMotionEnhanced: true)
+            }
             videoFrameRateConfigured = true
         }
         if interlacedVideoBranch == nil {
@@ -1799,15 +1819,16 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_loopback_ready")
             #endif
-            let mayCommit = condition.withLock { () -> Bool in
+            return condition.withLock {
                 // retirement 必须等 prefix preparation 结束；新建 server 仍归同一 owner。
                 loopbackServer = prepared.server
-                guard state != .failed, state != .retiring, state != .retired else { return false }
+                guard state != .failed, state != .retiring, state != .retired else { return nil }
                 state = .playable
-                return true
+                return AVPlayerItemReplacementBundle(
+                    request: prepared.replacement.request,
+                    evidenceSource: prepared.replacement.evidenceSource,
+                    mediaInformation: mediaInformation)
             }
-            guard mayCommit else { return nil }
-            return prepared.replacement
         } catch {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_fail")

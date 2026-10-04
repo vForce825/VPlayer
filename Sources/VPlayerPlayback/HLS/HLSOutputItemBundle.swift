@@ -75,9 +75,12 @@ final class HLSRuntimeFailureRelay: @unchecked Sendable {
         // 256B 覆盖两处函数 reabstraction；64B 覆盖 bundle/builder 新引用的分配级差。
         // Coordinator's relay alias is part of its separately measured 12 KiB
         // resource-context root; this metadata bound does not prove that root's capacity.
+        // Three existing graph owners retain the inline media value: authority,
+        // assembler prefix, and output bundle. No additional capture or queue.
+        let mediaSnapshots = 3 * malloc_good_size(MemoryLayout<PlaybackMediaInformation?>.stride)
         return actual(self) + actual(lock) + metadataOwner.knownAllocationBytes +
             ErrorDiagnosticSnapshot.maximumStorageAllocationBytes +
-            bridgeCapture + relayCapture + publicationCapture + 256 + 64
+            bridgeCapture + relayCapture + publicationCapture + 256 + 64 + mediaSnapshots
     }
 
     func record(_ diagnostic: ErrorDiagnosticSnapshot) {
@@ -174,6 +177,14 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         lock.withLock { replacementStorage?.request.directAudioOnlyRendition != nil }
     }
     var currentLifecycle: Lifecycle { lock.withLock { lifecycle } }
+
+    func preparedMediaInformation(for epoch: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
+        lock.withLock {
+            guard lifecycle == .producing, let replacement = replacementStorage,
+                  replacement.request.item.outputLifecycleEpoch == epoch else { return nil }
+            return .init(lifecycle: epoch, information: replacement.mediaInformation)
+        }
+    }
 
     /// producer 的 source read 只可启动一次。调用方在成功返回后才可把同一 request
     /// 安装进 coordinator；若启动失败，bundle 立即回到 retired，禁止后续激活半成品。

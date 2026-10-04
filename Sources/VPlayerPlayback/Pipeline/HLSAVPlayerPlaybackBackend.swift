@@ -154,6 +154,10 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
 
     var outputItemGeneration: UInt64? { lock.withLock { bundle?.itemGeneration } }
 
+    func preparedMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
+        lock.withLock { bundle?.preparedMediaInformation(for: lifecycle) }
+    }
+
     func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
         let maximumAttemptCount = audioOnlySelector == nil ? 2 : 1
         var completedAttemptCount = 0

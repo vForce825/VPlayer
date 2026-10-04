@@ -16,7 +16,7 @@ final class DefaultAudioSessionCompletionReceiver: PlaybackAudioSessionCompletio
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit, completion: AudioSessionBlockingCallCompletion) {}
 }
 
-public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving {
+public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving, PlaybackBackendMediaInformationReceiving {
     private let registry: ControlTaskRegistry
     private let deadlineScheduler: PlaybackDeadlineScheduler
     private let audioSessionOwner: PlaybackAudioSessionOwner
@@ -35,6 +35,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     private var terminalMetricsProvider: (any PlaybackTerminalMetricsProviding)?
     private var mediaGeneration: MediaGeneration?
     private var currentMediaInformation: PlaybackMediaInformation?
+    private var mediaInformationLifecycle: OutputLifecycleEpoch?
     private var interruptionActive = false
     private var systemPauseRequired = false
     private var resumeVetoRequired = false
@@ -322,6 +323,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         } else {
             presentationRelay.finish()
         }
+        clearMediaInformation()
         // 入口时冻结身份与预算；前驱排空、SDK配置及route稳定都不能重置起点。
         let sessionIdentity: PlaybackSessionIdentity
         let parentDeadline: CurrentPlaybackOperationDeadlineTicket
@@ -855,6 +857,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             guard case .succeeded = await registry.joinOutputBackendOperation(stop.task),
                   ownsUserControl(controlRun, revision: controlRevision),
                   registry.finishOutputPause(owner: owner) else { return }
+            // A prepare notification can lose to this pause owner. Replay after
+            // the retained pause settles, even when there will be no activation.
+            refreshPreparedMediaInformation(for: stop.lifecycle)
             await watchdog.disarm(session: sessionIdentity, controlRevision: controlRevision)
             guard ownsUserControl(controlRun, revision: controlRevision) else { return }
             registry.updatePreparedSampleBufferPause(contextNonce: original.contextNonce,
@@ -1228,6 +1233,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
               context.owner == nil, context.phase == .installed, context.prepared else {
             return
         }
+        if case .backend(_, let lifecycle?, _, _, _) = registry.ownedResourceSnapshot()?.payload {
+            refreshPreparedMediaInformation(for: lifecycle)
+        }
         // Route loss may temporarily publish recovering, but restoring a route
         // must return manual pause to an actionable state without activating it.
         guard !controllerState.userPaused else {
@@ -1561,7 +1569,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         #endif
         switch event {
         case let .mediaInformation(information, generation: eventGeneration?):
+            guard finishedPresentationSession != backendIdentity.sessionIdentity else { return }
             guard mediaGeneration.map({ eventGeneration >= $0 }) ?? true else { return }
+            mediaInformationLifecycle = nil
             if mediaGeneration != eventGeneration {
                 mediaGeneration = eventGeneration
                 if currentMediaInformation != nil, information != nil {
@@ -1570,6 +1580,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             }
             publishMediaInformation(information)
         case let .mediaInformation(information, generation: nil):
+            guard finishedPresentationSession != backendIdentity.sessionIdentity else { return }
+            mediaInformationLifecycle = nil
             publishMediaInformation(information)
         case let .ready(eventCycle):
             let readinessResult = registry.completeSampleBufferReadiness(backendIdentity)
@@ -1686,6 +1698,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     private func clearPresentation() {
+        clearMediaInformation()
         do {
             try presentationRelay.replace(with: nil)
         } catch PlaybackPresentationRelayError.identitySpaceExhausted {
@@ -1712,9 +1725,29 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         registry.publishMediaInformation(information)
     }
 
+    /// No await: the notifying Registry runner may itself be awaited by play or
+    /// pause. Revalidate its exact scope without joining or changing ownership.
+    func refreshPreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) {
+        guard let run = admittedRun, isCurrent(run),
+              finishedPresentationSession != lifecycle.backendIdentity.sessionIdentity,
+              let snapshot = registry.preparedHLSMediaInformation(for: lifecycle) else { return }
+        if mediaInformationLifecycle != lifecycle { clearMediaInformation() }
+        guard mediaInformationLifecycle != lifecycle || currentMediaInformation != snapshot.information else { return }
+        mediaInformationLifecycle = lifecycle
+        publishMediaInformation(snapshot.information)
+    }
+
+    func invalidatePreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) {
+        guard mediaInformationLifecycle == lifecycle,
+              let run = admittedRun, isCurrent(run),
+              registry.outputResourceContextSnapshot()?.candidateBackendIdentity == lifecycle.backendIdentity else { return }
+        clearMediaInformation()
+    }
+
     private func clearMediaInformation() {
-        guard currentMediaInformation != nil || mediaGeneration != nil else { return }
+        guard currentMediaInformation != nil || mediaGeneration != nil || mediaInformationLifecycle != nil else { return }
         mediaGeneration = nil
+        mediaInformationLifecycle = nil
         publishMediaInformation(nil)
     }
 

@@ -4016,6 +4016,13 @@ final class ControlTaskRegistry: @unchecked Sendable {
         publicationReplacement: BackendPublicationReplacementTransition?
     ) async {
         defer { notifyPlaybackProgress() }
+        if let publicationReplacement,
+           isCurrentBackendPublicationReplacement(publicationReplacement, ticket: ticket, runner: runner) {
+            // The old work-cycle event relay is already closed. Use the existing
+            // owned runner and weak receiver, before any suspension/retirement.
+            await mediaInformationReceiver()?.invalidatePreparedMediaInformation(
+                for: publicationReplacement.retiredLifecycle)
+        }
         if case .suspend = runner.operation {
             // 固定扫描原owner work图，只join正向backend调用，不join自己或另一cleanup。
             for index in 0..<32 {
@@ -4104,6 +4111,12 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         PlaybackDiagnosticTracker.shared.set("registry_prepare_backend_returned")
                         #endif
                         result = completeOutputPrepare(ticket) ? .succeeded : .canceled
+                        if backend is HLSAVPlayerPlaybackBackend {
+                            // Completion's Bool includes rejected results. The
+                            // receiver must pull an exact, still-prepared scope.
+                            await mediaInformationReceiver()?.refreshPreparedMediaInformation(
+                                for: prepare.outputLifecycleEpoch)
+                        }
                     } else {
                         #if DEBUG
                         PlaybackDiagnosticTracker.shared.set("registry_prepare_invocation_nil")
@@ -4450,6 +4463,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     invocation: handoff.invocation)
                 result = completeOutputPrepare(handoff.ticket)
                     ? .succeeded : .canceled
+                if handoff.backend is HLSAVPlayerPlaybackBackend {
+                    await mediaInformationReceiver()?.refreshPreparedMediaInformation(
+                        for: handoff.invocation.outputLifecycleEpoch)
+                }
             } catch is CancellationError {
                 result = .canceled
             } catch {
@@ -5047,6 +5064,22 @@ final class ControlTaskRegistry: @unchecked Sendable {
             lifecycle: lifecycle,
             presentation: presentation
         )
+    }
+
+    private func mediaInformationReceiver() -> (any PlaybackBackendMediaInformationReceiving)? {
+        executor.sync { terminalReceiver as? any PlaybackBackendMediaInformationReceiving }
+    }
+
+    /// A nil result means stale/unsafe, while a scoped nil information value is
+    /// a genuinely prepared audio-only graph. No sink is called under these locks.
+    func preparedHLSMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
+        try? transaction { output in
+            guard let candidate = currentMountablePresentationLocked(output: output),
+                  candidate.lifecycle == lifecycle,
+                  let backend = authority.ownedBackendResources?.object as? HLSAVPlayerPlaybackBackend,
+                  backend.identity == candidate.backendIdentity else { return nil }
+            return backend.preparedMediaInformation(for: lifecycle)
+        }
     }
 
     /// 最终route/safety fence与Relay固定状态提交属于同一个权威事务；continuation副作用锁外执行。

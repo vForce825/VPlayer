@@ -843,6 +843,292 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertNil(registry.outputResourceContextSnapshot())
     }
 
+    func testProductionHLSMediaInformationReplaysWhilePausedAndRejectsStoppedScope() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "paused-metadata",
+                streamURL: fixture.source, title: "Paused metadata")
+            await controller.play(request)
+            let lifecycle = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let initial = await self.currentMediaInformation(controller)
+            XCTAssertEqual(initial?.width, 1_280, "A subscriber joining after prepare must receive the snapshot")
+
+            // Model a notification that lost the pause-owner race. A successful
+            // retained pause must replay even though it does not activate again.
+            await controller.invalidatePreparedMediaInformation(for: lifecycle)
+            let cleared = await self.currentMediaInformation(controller)
+            XCTAssertNil(cleared)
+            await controller.setPaused(true)
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, .paused(request))
+            let paused = await self.currentMediaInformation(controller)
+            XCTAssertEqual(paused, initial)
+            XCTAssertNotNil(registry.preparedHLSMediaInformation(for: lifecycle))
+
+            await controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            await controller.refreshPreparedMediaInformation(for: lifecycle)
+            let stopped = await self.currentMediaInformation(controller)
+            XCTAssertNil(stopped)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: lifecycle))
+        }
+    }
+
+    func testProductionHLSAdmissibleRetainedPauseReplaysMediaWithoutActivation() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "paused-route-metadata",
+                streamURL: fixture.source, title: "Paused route recovery")
+            await controller.play(request)
+            let lifecycle = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            await controller.setPaused(true)
+            // Keep the original route authority admissible. This exercises the
+            // retained-pause helper, not physical empty-to-AirPlay restoration.
+            await controller.suspendActiveOutputForRouteUnavailable()
+            await controller.invalidatePreparedMediaInformation(for: lifecycle)
+            let cleared = await self.currentMediaInformation(controller)
+            XCTAssertNil(cleared)
+            await controller.resumeActiveOutputFromRouteRecovery()
+            let information = await self.currentMediaInformation(controller)
+            XCTAssertEqual(information?.width, 1_280,
+                "Retained route recovery must replay a refresh lost to the pause owner without activating")
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, .paused(request))
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.interval)
+        }
+    }
+
+    func testProductionHLSChannelReplacementRejectsOldRefreshAndClearThenPublishesAudioOnlyNil() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let audioFile = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "review-audio-only-stereo-8s.ts", withExtension: nil, subdirectory: "Video"))
+        let audioServer = try Task22BundledHTTPFixtureServer(fileURL: audioFile)
+        defer { audioServer.stop() }
+        try await withProductionMediaController { controller, registry, factory, _ in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-first",
+                streamURL: fixture.source, title: "First"))
+            let first = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let retiredBackend = try XCTUnwrap(factory.backend)
+            XCTAssertNotNil(retiredBackend.preparedMediaInformation(for: first))
+
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-second",
+                streamURL: fixture.source, title: "Second"))
+            let second = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            XCTAssertNotEqual(first, second)
+            let current = await self.currentMediaInformation(controller)
+            XCTAssertEqual(current?.width, 1_280)
+            await controller.refreshPreparedMediaInformation(for: first)
+            await controller.invalidatePreparedMediaInformation(for: first)
+            let afterStaleCallbacks = await self.currentMediaInformation(controller)
+            XCTAssertEqual(afterStaleCallbacks, current,
+                "Equal dimensions do not make the retired graph's callbacks current")
+            XCTAssertNil(retiredBackend.preparedMediaInformation(for: first))
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: first))
+
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-radio",
+                streamURL: audioServer.sourceURL, title: "Radio"))
+            let audio = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let snapshot = try XCTUnwrap(registry.preparedHLSMediaInformation(for: audio))
+            XCTAssertEqual(snapshot.lifecycle, audio)
+            XCTAssertNil(snapshot.information, "A prepared audio-only nil is distinct from a rejected projection")
+            await controller.refreshPreparedMediaInformation(for: second)
+            await controller.invalidatePreparedMediaInformation(for: second)
+            let audioInformation = await self.currentMediaInformation(controller)
+            XCTAssertNil(audioInformation)
+        }
+    }
+
+    func testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, sdk in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-route",
+                streamURL: fixture.source, title: "Route metadata"))
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let stream = await controller.playbackMediaInformation()
+            let values = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+            let collector = Task { for await value in stream { values.append(value) } }
+            defer { collector.cancel() }
+            sdk.lock.withLock { sdk.initialPorts = .hdmi }
+            await controller.requestRouteHandoff(to: .sampleBuffer)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !(values.snapshot.contains(where: { $0 == nil }) && values.snapshot.last.flatMap({ $0 }) != nil),
+                  ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.desiredBackendKind, .sampleBuffer)
+            XCTAssertTrue(values.snapshot.contains(where: { $0 == nil }), "Route retirement must clear the old facts")
+            let local = try XCTUnwrap(values.snapshot.last.flatMap { $0 })
+            XCTAssertEqual(local.width, 1_280)
+            await controller.refreshPreparedMediaInformation(for: old)
+            await controller.invalidatePreparedMediaInformation(for: old)
+            let afterStaleCallbacks = await self.currentMediaInformation(controller)
+            XCTAssertEqual(afterStaleCallbacks, local)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+        }
+    }
+
+    func testProductionHLSFailedReplacementDoesNotRepublishRetiredMediaInformation() async throws {
+        let first = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        let short = try makeProductionFixture(named: "task22-progressive-h264-aac-0.8s-short.ts")
+        defer { first.server?.stop(); short.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-good",
+                streamURL: first.source, title: "Good"))
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-short",
+                streamURL: short.source, title: "Short"))
+            let state = await controller.currentStateForTesting
+            guard case .failed = state else { return XCTFail("The real short source must fail prepare: \(state)") }
+            await controller.refreshPreparedMediaInformation(for: old)
+            let information = await self.currentMediaInformation(controller)
+            XCTAssertNil(information)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+        }
+    }
+
+    func testProductionHLSPrepareWhilePausedPublishesButCanceledPrepareDoesNot() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        for cancelPreparation in [false, true] {
+            let gate = HLSMediaInformationPrefixGate()
+            let factory = AudioReviewProductionBackendFactory(factory: SystemPlaybackBackendFactory(
+                hlsGraphFactory: { source, invocation, ledger, failureSink in
+                    let authority = try SystemHLSMediaGraphAuthority(
+                        lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
+                    return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
+                        graph: HLSMediaInformationGatedGraph(
+                            graph: SystemHLSDeliveryGraph(authority: authority), gate: gate))
+                }))
+            try await withProductionMediaController(factory: factory) { controller, registry, _, _ in
+                let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "metadata-prepare-race",
+                    streamURL: fixture.source, title: "Prepare race")
+                let play = Task { await controller.play(request) }
+                defer { gate.release(); play.cancel() }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+                while !gate.isWaiting, ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertTrue(gate.isWaiting, "Wait for an actual playable prefix, not a synthetic ready event")
+                XCTAssertFalse(registry.outputResourceContextSnapshot()?.prepared ?? true)
+                if cancelPreparation {
+                    let stop = Task { await controller.stop() }
+                    let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+                    while registry.outputResourceContextSnapshot()?.owner == nil,
+                          ContinuousClock.now < cancellationDeadline {
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    XCTAssertNotNil(registry.outputResourceContextSnapshot()?.owner)
+                    gate.release()
+                    await play.value
+                    await stop.value
+                    let information = await self.currentMediaInformation(controller)
+                    XCTAssertNil(information)
+                } else {
+                    await controller.setPaused(true)
+                    gate.release()
+                    await play.value
+                    let state = await controller.currentStateForTesting
+                    XCTAssertEqual(state, .paused(request))
+                    let information = await self.currentMediaInformation(controller)
+                    XCTAssertEqual(information?.width, 1_280,
+                        "A paused prepare must publish without relying on activation")
+                    XCTAssertNil(registry.outputResourceContextSnapshot()?.interval)
+                }
+            }
+        }
+    }
+
+    func testProductionHLSAutomaticReplacementInvalidatesMediaBeforeRetirement() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, factory, _ in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-auto-replacement",
+                streamURL: fixture.source, title: "Automatic replacement"))
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let information = await self.currentMediaInformation(controller)
+            XCTAssertEqual(information?.width, 1_280)
+            let backend = try XCTUnwrap(factory.backend)
+            let authority = try XCTUnwrap(backend.backendPublicationReplacementAuthoritySlot.currentAuthority())
+            XCTAssertTrue(authority.requestReplacement(), "Use the actual Registry-signed replacement authority")
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            var observed = await self.currentMediaInformation(controller)
+            while observed != nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+                observed = await self.currentMediaInformation(controller)
+            }
+            XCTAssertNil(observed,
+                "The registered replacement runner must invalidate even if later retirement or handoff fails")
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+            await controller.refreshPreparedMediaInformation(for: old)
+            let afterOldRefresh = await self.currentMediaInformation(controller)
+            XCTAssertNil(afterOldRefresh)
+        }
+    }
+
+    func testRealHLSReplacementSnapshotsAreScopedToProducingOutputLifecycle() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let first = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_201)
+        let second = OutputLifecycleEpoch(backendIdentity: first.backendIdentity, outputNonce: 22_202)
+        var previous: HLSOutputItemBundle?
+        for lifecycle in [first, second] {
+            let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
+            let assembler = HLSMediaGraphAssembler(sourceURL: fixture.source,
+                applicationLedger: HLSDeliveryApplicationChargeLedger(),
+                graph: SystemHLSDeliveryGraph(authority: authority))
+            let bundle = HLSOutputItemBundle(
+                startProducer: { try await assembler.startUntilPlayablePrefix() },
+                retireProducer: { await assembler.retireAndAwaitReceipt() })
+            XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle))
+            do {
+                try await bundle.prepareProducer()
+                let snapshot = try XCTUnwrap(bundle.preparedMediaInformation(for: lifecycle))
+                XCTAssertEqual(snapshot.information?.width, 1_280)
+                XCTAssertEqual(snapshot.information?.sourceFrameRate, MediaRational(num: 25, den: 1))
+                XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle == first ? second : first),
+                    "A new graph can restart demux generation zero but cannot reuse an output lifecycle")
+                XCTAssertNil(previous?.preparedMediaInformation(for: first))
+            } catch {
+                _ = await bundle.retireProducerGraph()
+                throw error
+            }
+            let retired = await bundle.retireProducerGraph()
+            XCTAssertTrue(retired)
+            XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle))
+            previous = bundle
+        }
+    }
+
+    private func currentMediaInformation(_ controller: PlaybackController) async -> PlaybackMediaInformation? {
+        var iterator = await controller.playbackMediaInformation().makeAsyncIterator()
+        return await iterator.next() ?? nil
+    }
+
+    private func withProductionMediaController(
+        factory: AudioReviewProductionBackendFactory = AudioReviewProductionBackendFactory(),
+        _ body: (PlaybackController, ControlTaskRegistry, AudioReviewProductionBackendFactory,
+                 FakeAudioSessionSDK) async throws -> Void
+    ) async throws {
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: routes, backendFactory: factory)
+        do { try await body(controller, registry, factory, sdk) }
+        catch {
+            await controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await controller.stop()
+        await registry.joinOwnedTerminalCleanup()
+    }
+
     func testProductionProgressiveGraphPublishesSixSecondLoopbackPrefixAndRetires()
         async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
@@ -865,6 +1151,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertEqual(replacement.request.itemURL.host, "127.0.0.1")
         XCTAssertNotEqual(replacement.request.itemURL, source)
         XCTAssertEqual(replacement.request.item.outputLifecycleEpoch, lifecycle)
+        XCTAssertEqual(replacement.mediaInformation, PlaybackMediaInformation(
+            width: 1_280, height: 720, scanMode: .progressive,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 25,
+            isSmoothMotionEnhanced: false))
         let reachedNaturalEOF = await authority.finishAllTracksAtNaturalEOF()
         XCTAssertTrue(
             reachedNaturalEOF,
@@ -937,6 +1227,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             return
         }
         XCTAssertNotEqual(replacement.request.itemURL, source)
+        XCTAssertEqual(replacement.mediaInformation, PlaybackMediaInformation(
+            width: 1_920, height: 1_080, scanMode: .interlaced,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 50,
+            isSmoothMotionEnhanced: true))
         let finished = await authority.finishAllTracksAtNaturalEOF()
         XCTAssertTrue(
             finished,
@@ -1263,8 +1557,9 @@ private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
 /// Observes the real factory result; does not replace media, AVPlayer, readiness, or retirement.
 private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let lock = NSLock()
-    private let factory = SystemPlaybackBackendFactory()
+    private let factory: SystemPlaybackBackendFactory
     private var created: HLSAVPlayerPlaybackBackend?
+    init(factory: SystemPlaybackBackendFactory = SystemPlaybackBackendFactory()) { self.factory = factory }
     var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { created } }
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
                      tuning: PlaybackTuning, channelID: String, url: URL,
@@ -1274,4 +1569,49 @@ private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory,
         lock.withLock { created = value as? HLSAVPlayerPlaybackBackend }
         return value
     }
+}
+
+/// Stops only the handoff of an already-proven real prefix. All source, writer,
+/// server, AVPlayer, and retirement behavior remains production behavior.
+private final class HLSMediaInformationPrefixGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    var isWaiting: Bool { lock.withLock { continuation != nil } }
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resume = lock.withLock {
+                guard !released else { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resume { continuation.resume() }
+        }
+    }
+    func release() {
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume()
+    }
+}
+
+private final class HLSMediaInformationGatedGraph: HLSMediaGraphAssembler.DeliveryGraph, @unchecked Sendable {
+    private let graph: SystemHLSDeliveryGraph
+    private let gate: HLSMediaInformationPrefixGate
+    init(graph: SystemHLSDeliveryGraph, gate: HLSMediaInformationPrefixGate) {
+        self.graph = graph
+        self.gate = gate
+    }
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { graph.failureDiagnostic }
+    func accept(_ event: AdmittedDemuxEvent) { graph.accept(event) }
+    func waitUntilPlayablePrefix() async -> HLSMediaGraphAssembler.HLSMediaGraphPlayablePrefix? {
+        guard let prefix = await graph.waitUntilPlayablePrefix() else { return nil }
+        await gate.wait()
+        return prefix
+    }
+    func finishNaturalEOF() async -> Bool { await graph.finishNaturalEOF() }
+    func retireAndAwaitReceipt() async -> Bool { await graph.retireAndAwaitReceipt() }
 }
