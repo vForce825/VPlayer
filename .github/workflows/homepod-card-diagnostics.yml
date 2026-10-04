@@ -58,7 +58,7 @@ jobs:
           python3 Scripts/generate-homepod-audio-diagnostic-fixture.py
           test -s Tests/Fixtures/Video/synthetic-hlg50-ac3-64s.ts
           shasum -a 256 Tests/Fixtures/Video/synthetic-hlg50-ac3-64s.ts
-      - name: Compare original AAC fragments with Apple-decoded analysis packaging
+      - name: Verify unmodified AAC fragments and Apple-decoded continuity
         if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
         timeout-minutes: 30
         run: |
@@ -68,8 +68,12 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 300 \
             -maximum-test-execution-time-allowance 300 \
-            -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3CapturesOriginalFragmentsAndDecodesAnalysisCopy \
+            -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously \
             -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testTrackBundlesUseIndependentOneInputHLSWritersAndRetainDelegate \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testAACNativeMovieFragmentSequenceContinuesAcrossWriterWindows \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testWriterWindowFragmentSequenceAdvancesByMediaCountNotWriterIdentity \
+            -only-testing:VPlayerTests/SegmentedFMP4WriterTests/testNativeMovieFragmentSequenceUInt32BoundaryAndInvalidConfigurations \
             2>&1 | tee "$RUNNER_TEMP/audio-diagnostic-tests.log"
       - name: Report audio diagnostics
         if: ${{ always() }}

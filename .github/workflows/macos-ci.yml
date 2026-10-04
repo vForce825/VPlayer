@@ -28,10 +28,12 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 # Jobs have no cross-job dependencies. A failure cannot cancel another gate.
+# Temporary diagnostic branch runs its focused workflow between experiments.
+# Remove this branch exclusion before final acceptance/integration.
 jobs:
   complete-tests:
     name: Complete Debug unit and UI tests
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27') && github.head_ref != 'test/homepod-audio-card-diagnostics' }}
     runs-on: xcode-27
     timeout-minutes: 120
     steps:
@@ -87,7 +89,7 @@ jobs:
 
   release-contracts:
     name: Optimized boundaries, startup and six cold starts
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27') && github.head_ref != 'test/homepod-audio-card-diagnostics' }}
     runs-on: xcode-27
     timeout-minutes: 100
     steps:
@@ -169,7 +171,7 @@ jobs:
 
   sanitizer-validation:
     name: Existing physical-storage Address Sanitizer subset
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27') && github.head_ref != 'test/homepod-audio-card-diagnostics' }}
     runs-on: xcode-27
     timeout-minutes: 90
     steps:
@@ -237,7 +239,7 @@ jobs:
 
   artifact-validation:
     name: FFmpeg, deployment and reproducibility contracts
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27') && github.head_ref != 'test/homepod-audio-card-diagnostics' }}
     runs-on: xcode-27
     timeout-minutes: 100
     steps:
@@ -298,7 +300,7 @@ jobs:
 
   fixture-validation:
     name: Strict HTTP playback and 900-second 4K timeline
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27') && github.head_ref != 'test/homepod-audio-card-diagnostics' }}
     runs-on: xcode-27
     timeout-minutes: 90
     steps:
@@ -360,7 +362,7 @@ jobs:
 
   compiler-controls:
     name: Artifact-local compiler controls (no production allocation proof)
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27') && github.head_ref != 'test/homepod-audio-card-diagnostics' }}
     runs-on: xcode-27
     timeout-minutes: 10
     steps:

@@ -10,8 +10,14 @@ import re
 CASES = {
     "audio": {
         "HLSAVPlayerBackendTests": [
-            "testSyntheticHLG50AC3CapturesOriginalFragmentsAndDecodesAnalysisCopy",
+            "testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously",
             "testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute",
+        ],
+        "SegmentedFMP4WriterTests": [
+            "testTrackBundlesUseIndependentOneInputHLSWritersAndRetainDelegate",
+            "testAACNativeMovieFragmentSequenceContinuesAcrossWriterWindows",
+            "testWriterWindowFragmentSequenceAdvancesByMediaCountNotWriterIdentity",
+            "testNativeMovieFragmentSequenceUInt32BoundaryAndInvalidConfigurations",
         ],
     },
     "focus": {

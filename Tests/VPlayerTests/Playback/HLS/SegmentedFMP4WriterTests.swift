@@ -563,6 +563,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             XCTAssertNotNil(configuration.sourceFormatHintIdentity)
             XCTAssertEqual(configuration.inputCount, 1)
             XCTAssertEqual(configuration.videoMediaTimeScale, 720_000)
+            XCTAssertEqual(configuration.initialMovieFragmentSequenceNumber, 1)
+            XCTAssertTrue(configuration.producesCombinableFragments)
         }
         XCTAssertEqual(Set(factory.delegateObjectIdentifiers.compactMap { $0 }).count, 4)
         writers.removeAll()
@@ -4230,6 +4232,110 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertTrue(systemWriter.isTerminal)
     }
 
+    func testAACNativeMovieFragmentSequenceContinuesAcrossWriterWindows() async throws {
+        let collector = Task17ObjectCollector()
+        let factory = Task17RecordingNativeSystemWriterFactory()
+        let predecessor = try await Task17Fixtures.makeWindowPredecessor(
+            seed: 31_600, factory: factory, collector: collector)
+        defer { predecessor.encoder.dispose() }
+        let nextBinding = Task17Fixtures.rolloverBinding(
+            from: predecessor.binding, writerIdentity: .init(rawValue: 8_000_017))
+        let next = try Task17Fixtures.makeWindowWriter(
+            binding: nextBinding, format: predecessor.format, boundary: predecessor.boundary,
+            factory: factory, continuation: predecessor.continuation,
+            ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 64),
+            collector: collector)
+        defer { _ = next.cancel() }
+        try next.start(at: .zero)
+        for emission in predecessor.pending {
+            try await assertWriterEqual(try await next.appendAACIncrementalAwaitingReadiness(
+                emission, coordinator: predecessor.boundary), .appended)
+        }
+        var reachedBoundary = false
+        for batch in 0..<80 where !reachedBoundary {
+            let samples = (0..<(1_024 * 2)).map {
+                sin(Float(batch * 2_048 + $0) * 0.003125) * 0.25
+            }
+            var emissions: [AACIncrementalEmission] = []
+            _ = try predecessor.encoder.pumpSigned(.pcm(samples)) { emissions.append($0) }
+            for emission in emissions where !reachedBoundary {
+                do {
+                    _ = try await next.appendAACIncrementalAwaitingReadiness(
+                        emission, coordinator: predecessor.boundary)
+                } catch SegmentedFMP4WriterFailure.rolloverRequired {
+                    reachedBoundary = true
+                }
+            }
+        }
+        XCTAssertTrue(reachedBoundary)
+        _ = try await next.finishAACWriterWindow()
+        let media = collector.objects.filter { $0.kind == .media }
+        XCTAssertEqual(try media.map { try Task17Fixtures.movieFragmentSequence(in: $0.bytes) }, [1, 2],
+            "Unmodified native mfhd must continue across physical AAC writers")
+        XCTAssertEqual(factory.configurations.map(\.initialMovieFragmentSequenceNumber), [1, 2])
+        XCTAssertTrue(factory.configurations.allSatisfy(\.producesCombinableFragments))
+    }
+
+    func testWriterWindowFragmentSequenceAdvancesByMediaCountNotWriterIdentity() async throws {
+        let collector = Task17ObjectCollector()
+        let predecessor = try await makeRealRemuxWindowContinuation(
+            seed: 39_400, acceptedInputCount: 2, collector: collector, retainPending: true)
+        XCTAssertEqual(predecessor.continuation.predecessorTerminal.mediaCallbackCount, 2)
+        let factory = Task17RecordingNativeSystemWriterFactory()
+        let next = try Task17Fixtures.makeWriter(
+            seed: 39_401, kind: .video,
+            writerBinding: Task17Fixtures.rolloverBinding(
+                from: predecessor.binding, writerIdentity: .init(rawValue: 7)),
+            sourceFormatHint: predecessor.format, boundary: predecessor.boundary,
+            factory: factory, collector: collector,
+            writerWindowContinuation: predecessor.continuation,
+            releaseTransfersImmediately: true)
+        XCTAssertEqual(factory.configurations.map(\.initialMovieFragmentSequenceNumber), [3],
+            "A physical writer can emit multiple fragments; its identity is not a sequence")
+        let pending = try XCTUnwrap(predecessor.pending)
+        let attempt = try pending.claimWriterAttempt(
+            binding: next.binding, admission: XCTUnwrap(next.writerWindowAdmission))
+        try next.start(at: .zero)
+        try await next.appendRemuxVideoAwaitingReadiness(attempt,
+            ticket: predecessor.boundary.issueRemuxVideoAppend(for: attempt))
+        let terminal = try await next.finish()
+        XCTAssertEqual(terminal.mediaCallbackCount, 1)
+        let media = collector.objects.filter { $0.kind == .media }
+        XCTAssertEqual(try media.map { try Task17Fixtures.movieFragmentSequence(in: $0.bytes) }, [1, 2, 3],
+            "The real successor must emit its configured sequence in untouched native bytes")
+    }
+
+    func testNativeMovieFragmentSequenceUInt32BoundaryAndInvalidConfigurations() async throws {
+        let sample = try Task17Fixtures.realH264Sample()
+        let sink = Task17NativeFragmentCollector()
+        let factory = AVAssetSegmentedFMP4SystemWriterFactory()
+        func configuration(_ sequence: Int) -> SegmentedFMP4SystemConfiguration {
+            .init(contentTypeIdentifier: UTType.mpeg4Movie.identifier,
+                  outputFileTypeProfile: AVFileTypeProfile.mpeg4AppleHLS.rawValue,
+                  preferredOutputSegmentInterval: .indefinite, mediaType: .video,
+                  outputSettingsAreNil: true, sourceFormatHintIdentity: ObjectIdentifier(sample.format),
+                  inputCount: 1, initialMovieFragmentSequenceNumber: sequence)
+        }
+        for invalid in [-1, 0, Int(UInt32.max) + 1, Int.max] {
+            XCTAssertThrowsError(try factory.makeWriter(configuration: configuration(invalid),
+                sourceFormatHint: sample.format, callbackSink: sink)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .invalidSystemConfiguration)
+            }
+        }
+        let writer = try factory.makeWriter(configuration: configuration(Int(UInt32.max)),
+            sourceFormatHint: sample.format, callbackSink: sink)
+        XCTAssertTrue(writer.startWriting(at: .zero))
+        try await writer.appendAwaitingReadiness(makeReadyWriterFixtureSample(copying: sample.sample))
+        writer.markInputAsFinished()
+        let finished = expectation(description: "Native writer accepts the last UInt32 fragment number")
+        writer.finishWriting { succeeded in
+            XCTAssertTrue(succeeded)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 10)
+        XCTAssertEqual(try sink.media.map { try Task17Fixtures.movieFragmentSequence(in: $0) }, [UInt32.max])
+    }
+
     func testAACContinuousWriterWindowsCarrySameSignedEmissionAndRejectContinuationReplay()
         async throws {
         let calibration = try await AACPrimingCalibrator().calibrate(plan:
@@ -5763,12 +5869,15 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         codec: VideoCodec = .h264,
         sampleEntry: HLSVideoSampleEntry = .avc1,
         parameterSets: [Data]? = nil,
-        acceptedInputCount: Int = 1
+        acceptedInputCount: Int = 1,
+        collector: Task17ObjectCollector? = nil,
+        retainPending: Bool = false
     ) async throws -> (
         binding: FMP4WriterBinding,
         format: CMFormatDescription,
         boundary: SegmentBoundaryCoordinator,
-        continuation: WriterWindowContinuation
+        continuation: WriterWindowContinuation,
+        pending: HLSVideoRemuxSubmission?
     ) {
         let frames: [Task17Fixtures.RemuxFrame] = (0...acceptedInputCount).map { index in
             let timestamp = Int64(10_000 + index * 1_000)
@@ -5782,12 +5891,13 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let writer = try Task17Fixtures.makeWriter(
             seed: seed, kind: .video, writerBinding: fixture.binding,
             sourceFormatHint: fixture.builder.formatDescription,
-            boundary: fixture.boundary,
+            boundary: fixture.boundary, collector: collector,
             ownershipLimits: .init(
                 rolloverThreshold: acceptedInputCount,
                 hardCapacity: acceptedInputCount + 1),
             releaseTransfersImmediately: true)
         try writer.start(at: CMTime(value: 10, timescale: 1))
+        var pending: HLSVideoRemuxSubmission?
         for index in 0...acceptedInputCount {
             let submission = try fixture.builder.makeSubmission(
                 for: fixture.timed[index], admission: fixture.admissions[index])
@@ -5798,10 +5908,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                         for: submission, writerBinding: writer.binding))
             } catch SegmentedFMP4WriterFailure.rolloverRequired {
                 XCTAssertEqual(index, acceptedInputCount)
+                if retainPending { pending = submission }
             }
         }
         return (fixture.binding, fixture.builder.formatDescription,
-                fixture.boundary, try await writer.finishWriterWindow())
+                fixture.boundary, try await writer.finishWriterWindow(), pending)
     }
 
     func testRealInitializationCompatibilityFactsIncludeSampleEntryAndCodecBoxes()
@@ -7625,6 +7736,36 @@ private final class Task17ForeignSystemWriterIdentity: @unchecked Sendable {
     private init() {}
 }
 
+private final class Task17NativeFragmentCollector: SegmentedFMP4SystemCallbackSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Data] = []
+    var media: [Data] { lock.withLock { storage } }
+
+    func receiveSystemSegment(writerObjectIdentity: ObjectIdentifier, bytes: Data,
+                              type: AVAssetSegmentType, report: SegmentedFMP4SystemReportEvidence) {
+        guard type == .separable else { return }
+        lock.withLock { storage.append(bytes) }
+    }
+}
+
+/// Records only configuration; the real adapter still owns its callback identity.
+private final class Task17RecordingNativeSystemWriterFactory:
+    SegmentedFMP4SystemWriterFactory, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SegmentedFMP4SystemConfiguration] = []
+    var configurations: [SegmentedFMP4SystemConfiguration] { lock.withLock { storage } }
+
+    func makeWriter(configuration: SegmentedFMP4SystemConfiguration,
+                    sourceFormatHint: CMFormatDescription,
+                    callbackSink: any SegmentedFMP4SystemCallbackSink) throws
+        -> any SegmentedFMP4SystemWriting {
+        lock.withLock { storage.append(configuration) }
+        return try AVAssetSegmentedFMP4SystemWriterFactory().makeWriter(
+            configuration: configuration, sourceFormatHint: sourceFormatHint,
+            callbackSink: callbackSink)
+    }
+}
+
 private final class Task17FakeSystemWriterFactory: SegmentedFMP4SystemWriterFactory, @unchecked Sendable {
     private let lock = NSLock()
     private let failurePoint: Task17SystemFailurePoint?
@@ -8651,12 +8792,16 @@ private enum Task17Fixtures {
         boundary: SegmentBoundaryCoordinator,
         factory: any SegmentedFMP4SystemWriterFactory,
         continuation: AACWriterWindowContinuation? = nil,
-        ownershipLimits: SegmentedFMP4WriterOwnershipLimits = .standard
+        ownershipLimits: SegmentedFMP4WriterOwnershipLimits = .standard,
+        collector: Task17ObjectCollector? = nil
     ) throws -> SegmentedFMP4Writer {
         let holder = Task17RelayHolder()
         let relay = SegmentReportRelay(
             binding: binding, limits: .audio, capacity: 8,
-            objectSink: { object in _ = holder.relay?.releaseForControl(object) })
+            objectSink: { object in
+                collector?.append(object)
+                _ = holder.relay?.releaseForControl(object)
+            })
         holder.relay = relay
         return try SegmentedFMP4Writer(
             binding: binding, trackKind: .aac, sourceFormatHint: format,
@@ -8667,8 +8812,11 @@ private enum Task17Fixtures {
             aacContinuation: continuation)
     }
 
-    static func makeWindowPredecessor(seed: UInt64) async throws
-        -> WindowPredecessor {
+    static func makeWindowPredecessor(
+        seed: UInt64,
+        factory: any SegmentedFMP4SystemWriterFactory = AVAssetSegmentedFMP4SystemWriterFactory(),
+        collector: Task17ObjectCollector? = nil
+    ) async throws -> WindowPredecessor {
         let calibration = try await AACPrimingCalibrator().calibrate(plan:
             AACCalibrationPlan.build([try AACRenditionRequest(
                 layout: RenditionAudioLayout(labels: [.l, .r]),
@@ -8683,8 +8831,9 @@ private enum Task17Fixtures {
             firstEffectiveStart: CMTime(value: 10, timescale: 1))
         let writer = try makeWindowWriter(
             binding: binding, format: format, boundary: boundary,
-            factory: AVAssetSegmentedFMP4SystemWriterFactory(),
-            ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 64))
+            factory: factory,
+            ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 64),
+            collector: collector)
         try writer.start(at: CMTime(value: 10, timescale: 1))
         var pending: [AACIncrementalEmission] = []
         for batch in 0..<80 where pending.isEmpty {
@@ -9204,6 +9353,40 @@ private enum Task17Fixtures {
                 dataLength: payload.count
             ))
         }
+    }
+
+    /// Read-only parser for the actual native callback's moof/mfhd; never rewrites bytes.
+    static func movieFragmentSequence(in data: Data) throws -> UInt32 {
+        func read32(_ offset: Int) -> UInt32 {
+            data[offset..<(offset + 4)].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        }
+        func boxes(_ range: Range<Int>) throws -> [(type: String, payload: Int, end: Int)] {
+            var result: [(String, Int, Int)] = []
+            var offset = range.lowerBound
+            while offset < range.upperBound {
+                guard range.upperBound - offset >= 8 else {
+                    throw SegmentedFMP4WriterFailure.systemFailure
+                }
+                let size = Int(read32(offset))
+                guard size >= 8, size <= range.upperBound - offset else {
+                    throw SegmentedFMP4WriterFailure.systemFailure
+                }
+                result.append((String(decoding: data[(offset + 4)..<(offset + 8)], as: UTF8.self),
+                               offset + 8, offset + size))
+                offset += size
+            }
+            return result
+        }
+        let fragments = try boxes(0..<data.count).filter { $0.type == "moof" }
+        XCTAssertEqual(fragments.count, 1)
+        let fragment = try XCTUnwrap(fragments.first)
+        let headers = try boxes(fragment.payload..<fragment.end).filter { $0.type == "mfhd" }
+        XCTAssertEqual(headers.count, 1)
+        let header = try XCTUnwrap(headers.first)
+        guard header.end - header.payload == 8 else {
+            throw SegmentedFMP4WriterFailure.systemFailure
+        }
+        return read32(header.payload + 4)
     }
 
     static func hasTopLevelMarker(_ marker: String, in data: Data) -> Bool {

@@ -501,16 +501,26 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
         var samples = 0
         while Date() < deadline {
             samples += 1
+            // Capture the hierarchy once. Live index-bound XCUIElement proxies
+            // can change identity or disappear as LazyVGrid realizes/removes rows;
+            // querying each attribute also used to cost 10+ seconds per checkpoint.
+            let hierarchy: any XCUIElementSnapshot
+            do {
+                hierarchy = try app.snapshot()
+            } catch {
+                lastReason = "Could not capture the AX hierarchy: \(error)"
+                previous = nil
+                Thread.sleep(forTimeInterval: 0.15)
+                continue
+            }
+            let candidates = probeAttributes(in: hierarchy)
             let screenshot = XCUIScreen.main.screenshot()
             lastScreenshot = screenshot
-            let screenFrame = app.frame
+            let screenFrame = hierarchy.frame
             guard let image = screenshot.image.cgImage else {
                 throw CardFocusProbeError.unavailable("Screenshot has no CGImage")
             }
             let raster = try CardFocusRaster(image: image, screenFrame: screenFrame)
-            let candidates = app.buttons.matching(NSPredicate(
-                format: "identifier BEGINSWITH %@", "channel.focus-probe."
-            )).allElementsBoundByIndex
             var observations: [CardFocusObservation] = []
             var incompleteReason: String?
             for candidate in candidates {
@@ -567,6 +577,23 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
     }
 
     @MainActor
+    private func probeAttributes(in hierarchy: any XCUIElementSnapshot) -> [CardFocusAttributes] {
+        var pending: [any XCUIElementSnapshot] = [hierarchy]
+        var result: [CardFocusAttributes] = []
+        while let snapshot = pending.popLast() {
+            if snapshot.elementType == .button,
+               snapshot.identifier.hasPrefix("channel.focus-probe.") {
+                result.append(CardFocusAttributes(
+                    identifier: snapshot.identifier, frame: snapshot.frame,
+                    hasFocus: snapshot.hasFocus
+                ))
+            }
+            pending.append(contentsOf: snapshot.children)
+        }
+        return result
+    }
+
+    @MainActor
     private func assertUnfocusedWidths(
         _ snapshot: CardFocusSnapshot, baseline: CGFloat, tolerance: CGFloat, label: String
     ) throws {
@@ -604,6 +631,14 @@ private enum CardFocusProbeError: Error, CustomStringConvertible {
         case .residualScale: "CARD_FOCUS_RESIDUAL: a nonfocused card retained measured visual expansion"
         }
     }
+}
+
+/// Value-only projection of one immutable AX hierarchy; reading these values
+/// never resolves an element by index or makes another automation round trip.
+private struct CardFocusAttributes {
+    let identifier: String
+    let frame: CGRect
+    let hasFocus: Bool
 }
 
 private struct CardFocusObservation {
