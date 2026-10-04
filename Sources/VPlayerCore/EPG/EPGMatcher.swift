@@ -66,9 +66,10 @@ public enum EPGMatcher {
                     xmltvChannelID: $0
                 )
             }
-            matches[channel.id] = index.match(
+            matches[channel.id] = try index.match(
                 channel: channel,
-                manualMapping: manualMapping
+                manualMapping: manualMapping,
+                cancellationCheck: cancellationCheck
             )
         }
         return matches
@@ -81,7 +82,8 @@ public enum EPGMatcher {
     ) -> EPGMatchResult {
         EPGMatchIndex(epgChannels: epgChannels, cancellationCheck: {}).match(
             channel: channel,
-            manualMapping: manualMapping
+            manualMapping: manualMapping,
+            cancellationCheck: {}
         )
     }
 }
@@ -114,24 +116,31 @@ private struct EPGMatchIndex: Sendable {
         for epgChannel in epgChannels {
             try cancellationCheck()
             channelIDs.insert(epgChannel.id)
-            let normalizedNames = Set(epgChannel.displayNames.compactMap { displayName in
+            var normalizedNames: Set<String> = []
+            for displayName in epgChannel.displayNames {
+                try cancellationCheck()
                 let normalized = EPGNameNormalizer.normalize(displayName)
-                return normalized.isEmpty ? nil : normalized
-            })
+                try cancellationCheck()
+                if !normalized.isEmpty { normalizedNames.insert(normalized) }
+            }
             for normalizedName in normalizedNames {
+                try cancellationCheck()
                 candidateIDsByNormalizedName[normalizedName, default: []]
                     .insert(epgChannel.id)
                 guard EPGNameNormalizer.isFuzzyMatchEligible(normalizedName) else {
                     continue
                 }
-                for deletion in Self.oneCharacterDeletions(of: normalizedName) {
-                    candidateIDsByOneDeletion[deletion.remainder, default: []]
+                let originalLength = normalizedName.count
+                try Self.forEachOneCharacterDeletion(
+                    of: normalizedName, cancellationCheck: cancellationCheck
+                ) { removedIndex, remainder in
+                    candidateIDsByOneDeletion[remainder, default: []]
                         .insert(epgChannel.id)
                     candidateIDsBySubstitutionSignature[
                         SubstitutionSignature(
-                            originalLength: normalizedName.count,
-                            removedIndex: deletion.index,
-                            remainder: deletion.remainder
+                            originalLength: originalLength,
+                            removedIndex: removedIndex,
+                            remainder: remainder
                         ),
                         default: []
                     ].insert(epgChannel.id)
@@ -147,8 +156,10 @@ private struct EPGMatchIndex: Sendable {
 
     func match(
         channel: Channel,
-        manualMapping: ManualEPGMapping?
-    ) -> EPGMatchResult {
+        manualMapping: ManualEPGMapping?,
+        cancellationCheck: () throws -> Void
+    ) rethrows -> EPGMatchResult {
+        try cancellationCheck()
         if let manualMapping,
            manualMapping.sourceProfileID == channel.sourceProfileID,
            manualMapping.channelID == channel.id,
@@ -161,9 +172,12 @@ private struct EPGMatchIndex: Sendable {
             return .matched(xmltvChannelID: tvgID, method: .exactID)
         }
 
-        let channelNames = Self.normalizedNames(for: channel)
+        let channelNames = try Self.normalizedNames(
+            for: channel, cancellationCheck: cancellationCheck
+        )
         var exactCandidateIDs: Set<String> = []
         for channelName in channelNames {
+            try cancellationCheck()
             exactCandidateIDs.formUnion(candidateIDsByNormalizedName[channelName] ?? [])
         }
         if let result = Self.result(for: exactCandidateIDs, method: .exactName) {
@@ -172,6 +186,7 @@ private struct EPGMatchIndex: Sendable {
 
         var fuzzyCandidateIDs: Set<String> = []
         for channelName in channelNames {
+            try cancellationCheck()
             guard EPGNameNormalizer.isFuzzyMatchEligible(channelName) else {
                 continue
             }
@@ -179,20 +194,23 @@ private struct EPGMatchIndex: Sendable {
             // XMLTV name is one character longer than the playlist name.
             fuzzyCandidateIDs.formUnion(candidateIDsByOneDeletion[channelName] ?? [])
 
-            for deletion in Self.oneCharacterDeletions(of: channelName) {
+            let originalLength = channelName.count
+            try Self.forEachOneCharacterDeletion(
+                of: channelName, cancellationCheck: cancellationCheck
+            ) { removedIndex, remainder in
                 // XMLTV name is one character shorter than the playlist name.
-                if EPGNameNormalizer.isFuzzyMatchEligible(deletion.remainder) {
+                if EPGNameNormalizer.isFuzzyMatchEligible(remainder) {
                     fuzzyCandidateIDs.formUnion(
-                        candidateIDsByNormalizedName[deletion.remainder] ?? []
+                        candidateIDsByNormalizedName[remainder] ?? []
                     )
                 }
 
                 // Equal-length names with one substitution share the same
                 // remainder when the differing position is removed.
                 let signature = SubstitutionSignature(
-                    originalLength: channelName.count,
-                    removedIndex: deletion.index,
-                    remainder: deletion.remainder
+                    originalLength: originalLength,
+                    removedIndex: removedIndex,
+                    remainder: remainder
                 )
                 fuzzyCandidateIDs.formUnion(
                     candidateIDsBySubstitutionSignature[signature] ?? []
@@ -206,27 +224,38 @@ private struct EPGMatchIndex: Sendable {
         return .unmatched
     }
 
-    private static func normalizedNames(for channel: Channel) -> Set<String> {
-        Set([channel.tvgID, channel.tvgName, channel.displayName].compactMap { name in
-            guard let name else { return nil }
+    private static func normalizedNames(
+        for channel: Channel,
+        cancellationCheck: () throws -> Void
+    ) rethrows -> Set<String> {
+        var result: Set<String> = []
+        for name in [channel.tvgID, channel.tvgName, channel.displayName] {
+            try cancellationCheck()
+            guard let name else { continue }
             let normalized = EPGNameNormalizer.normalize(name)
-            return normalized.isEmpty ? nil : normalized
-        })
+            try cancellationCheck()
+            if !normalized.isEmpty { result.insert(normalized) }
+        }
+        return result
     }
 
-    private static func oneCharacterDeletions(
-        of value: String
-    ) -> [(index: Int, remainder: String)] {
+    private static func forEachOneCharacterDeletion(
+        of value: String,
+        cancellationCheck: () throws -> Void,
+        body: (Int, String) -> Void
+    ) rethrows {
+        // Enforce the budget before allocating or traversing grapheme clusters,
+        // even if a future caller forgets to check eligibility.
+        guard EPGNameNormalizer.isFuzzyMatchEligible(value) else { return }
         let characters = Array(value)
-        return characters.indices.compactMap { removedIndex in
+        for removedIndex in characters.indices {
+            try cancellationCheck()
             guard !EPGNameNormalizer.isProtectedSemanticCharacter(
                 characters[removedIndex]
-            ) else {
-                return nil
-            }
+            ) else { continue }
             var remainder = characters
             remainder.remove(at: removedIndex)
-            return (removedIndex, String(remainder))
+            body(removedIndex, String(remainder))
         }
     }
 

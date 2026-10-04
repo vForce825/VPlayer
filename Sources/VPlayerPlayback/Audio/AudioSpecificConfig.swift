@@ -101,8 +101,20 @@ struct AudioSpecificConfig: Sendable, Hashable {
         let extensionFlag = try reader.read(1)
         guard frameLengthFlag == 0,
               dependsOnCoreCoder == 0,
-              extensionFlag == 0,
-              reader.remainingBitCount <= 7,
+              extensionFlag == 0 else {
+            throw AudioCodecProfileValidation.error()
+        }
+        // MPEG-4 LC encoders commonly append syncExtensionType + AOT 5 with
+        // sbrPresentFlag = 0. This explicitly confirms LC, not HE-AAC. Parse the
+        // complete supported syntax; arbitrary tails and implicit SBR remain invalid.
+        if outerObjectType == 2, reader.remainingBitCount > 7 {
+            guard try reader.read(11) == 0x2B7,
+                  try readObjectType(from: &reader) == 5,
+                  try reader.read(1) == 0 else {
+                throw AudioCodecProfileValidation.error()
+            }
+        }
+        guard reader.remainingBitCount <= 7,
               try reader.remainingBitsAreZero() else {
             throw AudioCodecProfileValidation.error()
         }

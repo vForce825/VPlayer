@@ -9,6 +9,35 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class OutputCleanupCoordinatorTests: XCTestCase {
+    func testGraphSuspensionRequiresOpaqueProofAndRejectsOriginalInvocationAfterPause() throws {
+        let fixture = try OutputGraphFixture()
+        let registry = fixture.registry
+        let initial = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let prepare = try XCTUnwrap(initial.sourceTask)
+        XCTAssertTrue(registry.claimStart(prepare))
+        XCTAssertTrue(registry.completeOutputPrepare(prepare))
+        let pause = try XCTUnwrap(fixture.coordinator.begin(contextNonce: initial.contextNonce,
+            reason: .pause, at: registry.clock.nowNanoseconds))
+        let original = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        let originalSuspension = try claimGraphSuspend(registry, original)
+        XCTAssertFalse(fixture.coordinator.completeSuspend(.init(suspendTicket: original,
+            closeClaim: nil, directlyConfirmedRateZero: true, preparedPreserved: true)))
+        XCTAssertFalse(registry.outputResourceContextSnapshot()?.suspendConfirmed == true)
+        XCTAssertTrue(originalSuspension.complete(in: registry, preparedPreserved: true))
+        XCTAssertFalse(originalSuspension.complete(in: registry, preparedPreserved: true))
+        XCTAssertTrue(registry.finishOutputPause(owner: pause))
+
+        _ = try XCTUnwrap(fixture.coordinator.begin(contextNonce: initial.contextNonce,
+            reason: .stop, at: registry.clock.nowNanoseconds))
+        let successor = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        XCTAssertNotEqual(successor, original)
+        XCTAssertFalse(originalSuspension.complete(in: registry, preparedPreserved: true))
+        XCTAssertFalse(registry.outputResourceContextSnapshot()?.suspendConfirmed == true)
+        let successorSuspension = try claimGraphSuspend(registry, successor)
+        XCTAssertTrue(successorSuspension.complete(in: registry, preparedPreserved: false))
+        XCTAssertTrue(registry.outputResourceContextSnapshot()?.suspendConfirmed == true)
+    }
+
     func testRawAvailableEmptyOrUnknownPortsFailsClosedAndSettlesOnlyOriginalCall() throws {
         for invalidPorts in [PlaybackRoutePorts(), PlaybackRoutePorts(rawValue: 128)] {
             let fixture = try AcquiringOutputFixture()
@@ -475,9 +504,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
                     reason: .pause, at: pauseAnchor, teardown: false)
                 let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
                 XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner?.reason, .pause)
-                XCTAssertTrue(registry.claimStart(suspend.task))
-                XCTAssertTrue(graph.coordinator.completeSuspend(.init(suspendTicket: suspend, closeClaim: nil,
-                    directlyConfirmedRateZero: true, preparedPreserved: true)))
+                let suspendSuspension = try claimGraphSuspend(registry, suspend)
+                XCTAssertTrue(suspendSuspension.complete(in: registry, preparedPreserved: true))
                 XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner?.reason, .pause)
                 XCTAssertNil(registry.outputResourceContextSnapshot()?.budget)
             }
@@ -596,9 +624,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: initial.contextNonce,
             reason: .recovery, at: fixture.stable.acquisition.clock.read(), teardown: false))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -1394,9 +1421,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: initial.contextNonce, reason: .recovery,
             at: fixture.stable.acquisition.clock.read(), teardown: false))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -1614,9 +1640,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: original.contextNonce,
             reason: .recovery, at: fixture.stable.acquisition.clock.read(), teardown: true))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -1671,7 +1696,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             result: .configuration(.multichannelCapability(true))), lane: fixture.lane)), .rejected, "原terminal只签一次receipt")
         XCTAssertEqual(registry.outputResourceContextSnapshot()?.systemRecoveryBinding?.inactiveConfigurationReceipt, receipt)
         XCTAssertNil(registry.phase(of: multichannel))
-        let activation = try XCTUnwrap(multichannelCompletion.followUp)
+        XCTAssertNil(multichannelCompletion.followUp,
+            "inactive reset configuration must not authorize automatic activation")
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        let configuredContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
+            contextNonce: configuredContext.contextNonce))
         let activationCompletion = try graphAudioCall(registry, lane: fixture.lane, activation, .activation(nil))
         XCTAssertEqual(activationCompletion.disposition, .accepted)
         XCTAssertNotNil(activationCompletion.followUp, "原activate完成必须交付准确首sampler")
@@ -1692,9 +1722,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: original.contextNonce,
             reason: .recovery, at: fixture.stable.acquisition.clock.read(), teardown: true))
         let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(suspend.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: suspend, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let suspendSuspension = try claimGraphSuspend(registry, suspend)
+        XCTAssertTrue(suspendSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -1787,9 +1816,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
                 let ordinaryOwner = try XCTUnwrap(registry.outputCleanupOwnerTask(recovery))
                 XCTAssertNotEqual(ordinaryOwner, reservation.task(for: .owner))
                 let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-                XCTAssertTrue(registry.claimStart(stop.task))
-                XCTAssertTrue(coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-                    directlyConfirmedRateZero: true, preparedPreserved: false)))
+                let stopSuspension = try claimGraphSuspend(registry, stop)
+                XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
                 let retirement = try XCTUnwrap(coordinator.advance(owner: recovery))
                 XCTAssertTrue(registry.claimStart(retirement))
                 XCTAssertTrue(coordinator.completeRetirement(retirement, lifecycle: lifecycle))
@@ -1865,9 +1893,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(registry.outputResourceContextSnapshot()?.budget?.anchorInstant, 200)
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
         XCTAssertEqual(stop.task, stopTask)
-        XCTAssertTrue(registry.claimStart(stopTask))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: terminal))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -2041,7 +2068,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         try fixture.configureAndHandoff()
         let registry = fixture.registry
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
-        let activation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce))
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry, contextNonce: context.contextNonce))
         let request = try claimGraphAudioCall(registry, lane: fixture.lane, activation)
         XCTAssertEqual(try allocator.next(in: .audioSessionConfigurationGeneration), 1)
         let completion = try completeGraphAudioCall(registry, lane: fixture.lane, request, .activation(nil))
@@ -2084,7 +2111,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let registry = fixture.registry
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
         let binding = try XCTUnwrap(context.systemRecoveryBinding)
-        let activation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce),
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry, contextNonce: context.contextNonce),
             "inactive交接后必须由独立reset-purpose activation前进")
         let request = try claimGraphAudioCall(registry, lane: fixture.lane, activation)
         XCTAssertNil(registry.processAudioSessionReceiptSnapshot(), "未返回的调用不能提升inactive候选")
@@ -2136,9 +2163,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(registry.outputResourceContextSnapshot()).poisoned)
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
         XCTAssertEqual(try fixture.coordinator.begin(contextNonce: context.contextNonce, reason: .stop, at: 201), owner)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -2164,7 +2190,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testResetInactiveConfigurationHandsOffWithoutActivationOrRetiringPreRouteClock() throws {
-        let fixture = try ResetAcquiringOutputFixture()
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let registry = fixture.registry
         try fixture.acceptLease()
         let original = try XCTUnwrap(registry.outputResourceContextSnapshot())
@@ -2219,21 +2245,34 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
 
     // 首reset消费必须已经拥有有效票；不能等旧acquire或backend drain后重锚。
     func testFirstSessionResetMaterializesDeadlineBeforeDrainAndTransfersSameTicketToNewRoot() throws {
-        let fixture = try AcquiringOutputFixture()
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let fixture = try AcquiringOutputFixture(audioLane: AudioSessionBlockingCallLane(sdk: sdk))
         let registry = fixture.registry
-        registry.executor.sync {
+        let configuration = try XCTUnwrap(registry.beginOutputAcquisitionConfiguration(
+            contextNonce: fixture.contextNonce, parent: fixture.parent))
+        XCTAssertEqual(registry.phase(of: configuration), .queued)
+        XCTAssertEqual(registry.registeredAudioSessionPhase()?.configurationProgress, .awaitingLongForm)
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "queued phase must not start an SDK call")
+        let materializedIdentity = try registry.executor.sync {
             fixture.clock.set(200)
             registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
+            _ = registry.executor.withSafetyIngressBarrier(operationDescriptor: .resourceOwnership) { _ in
+                XCTFail("pending reset must materialize its deadline before executing the target")
+            }
+            let identity = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot()?.ticketIdentity)
+            try authorizeGraphResetRecoveryClock(registry)
             fixture.clock.set(220)
             registry.executor.safetyIngress.performSyncIngress(.interruptionBegan)
             fixture.clock.set(270)
             registry.executor.safetyIngress.performSyncIngress(.interruptionEnded(shouldResume: false))
             fixture.clock.set(300)
             _ = registry.executor.withSafetyIngressBarrier(operationDescriptor: .resourceOwnership) { _ in
-                XCTFail("首票物化不能同时执行目标")
+                XCTFail("pending interruption ingress must be folded before executing the target")
             }
+            return identity
         }
         let first = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot(), "drain前必须有完整有效state")
+        XCTAssertEqual(first.ticketIdentity, materializedIdentity)
         let binding = try XCTUnwrap(registry.outputResourceContextSnapshot()?.resetPreRouteBinding)
         XCTAssertEqual(first.accumulatedEffectiveTime, 50)
         XCTAssertEqual(first.runningSince, 300, "ended(false)不再是物理冻结")
@@ -2249,9 +2288,17 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(next.ticketIdentity, first.ticketIdentity)
         XCTAssertEqual(next.accumulatedEffectiveTime, 150)
         XCTAssertEqual(next.boundaryEffectiveElapsed, first.boundaryEffectiveElapsed)
-        XCTAssertEqual(next.deadlineArm, first.deadlineArm, "仅换root不能换稳定边界的arm")
+        XCTAssertNil(next.runningSince, "新的reset必须再次等待新epoch的用户操作")
+        XCTAssertNil(next.deadlineArm)
+        try authorizeGraphResetRecoveryClock(registry)
+        let reauthorized = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
+        XCTAssertEqual(reauthorized.ticketIdentity, first.ticketIdentity)
+        XCTAssertEqual(reauthorized.boundaryEffectiveElapsed, first.boundaryEffectiveElapsed)
+        XCTAssertNotEqual(reauthorized.deadlineArm, first.deadlineArm,
+            "新用户操作只能重新arm原边界，不能复用旧freeze generation")
         XCTAssertNotEqual(registry.outputResourceContextSnapshot()?.resetPreRouteBinding, binding)
         XCTAssertNil(try registry.freezeOutputResetPreRouteClock(binding), "旧binding永久无权")
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "logical clock authorization must not invoke the SDK")
     }
 
     func testAcquisitionRejectsMissingOrUnpayableResetSuffixBeforeReservation() throws {
@@ -2268,13 +2315,20 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testLiveResetClockConsumesInterruptionOnlyWindowAndTimesOutDuringDrain() throws {
-        let fixture = try AcquiringOutputFixture()
+        let sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
+        let fixture = try AcquiringOutputFixture(audioLane: AudioSessionBlockingCallLane(sdk: sdk))
         let registry = fixture.registry
+        let configuration = try XCTUnwrap(registry.beginOutputAcquisitionConfiguration(
+            contextNonce: fixture.contextNonce, parent: fixture.parent))
+        XCTAssertEqual(registry.phase(of: configuration), .queued)
+        XCTAssertEqual(registry.registeredAudioSessionPhase()?.configurationProgress, .awaitingLongForm)
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "queued phase must not start an SDK call")
         registry.executor.sync {
             fixture.clock.set(200)
             registry.executor.safetyIngress.performSyncIngress(.mediaServicesReset)
             _ = registry.executor.withSafetyIngressBarrier(operationDescriptor: .resourceOwnership) { _ in }
         }
+        try authorizeGraphResetRecoveryClock(registry)
         let first = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         registry.executor.sync {
             fixture.clock.set(220)
@@ -2306,6 +2360,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let terminalOwner = try XCTUnwrap(registry.outputResourceContextSnapshot()?.owner)
         XCTAssertEqual(terminalOwner.reason, .terminal)
         XCTAssertNotNil(registry.outputCleanupOwnerTask(terminalOwner), "到界必须安装或join准确父owner record")
+        XCTAssertTrue(sdk.lock.withLock { sdk.calls.isEmpty }, "logical timeout must not fabricate a physical invocation")
     }
 
     func testFirstResetCheckedPreparationFailurePublishesNoPartialBindingAndKeepsOwnedLease() throws {
@@ -2334,7 +2389,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testResetClockSettlesOriginalParentAndTighteningPastElapsedPoisonsOwner() throws {
-        let fixture = try ResetAcquiringOutputFixture()
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let registry = fixture.registry
         let binding = try XCTUnwrap(registry.outputResourceContextSnapshot()?.resetAcquisitionBinding?.binding)
         XCTAssertTrue(registry.claimStart(fixture.acquire))
@@ -2346,10 +2401,11 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(parent.identity, fixture.parentIdentity)
         XCTAssertEqual(parent.accumulatedEffectiveTime, 2_000_000_000, "reset结算必须同步原parent，不能只更新边界副本")
         XCTAssertNil(parent.runningSince)
-        XCTAssertNil(try registry.tightenOutputResetPreRouteBoundary(binding, mandatorySuffix: 39_000_000_000))
+        let tightenedSuffix = parent.cap - 1_000_000_000
+        XCTAssertNil(try registry.tightenOutputResetPreRouteBoundary(binding, mandatorySuffix: tightenedSuffix))
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         XCTAssertEqual(state.boundaryEffectiveElapsed, 1_000_000_000)
-        XCTAssertEqual(state.mandatorySuffix, 39_000_000_000)
+        XCTAssertEqual(state.mandatorySuffix, tightenedSuffix)
         XCTAssertEqual(state.accumulatedEffectiveTime, 2_000_000_000)
         XCTAssertNil(state.deadlineArm)
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
@@ -2360,8 +2416,10 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
     }
 
     func testResetBoundaryRejectsQueuedAcquireBeforeTimerAndKeepsExactNoInvocationProof() throws {
-        let fixture = try ResetAcquiringOutputFixture()
-        fixture.clock.set(10_000_000_100)
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
+        let state = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
+        fixture.clock.set(try XCTUnwrap(state.runningSince)
+            + state.boundaryEffectiveElapsed - state.accumulatedEffectiveTime)
         XCTAssertFalse(fixture.registry.claimStart(fixture.acquire), "claim自身必须读唯一有效边界，不能等timer回调")
         let context = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
         XCTAssertTrue(context.poisoned)
@@ -2369,6 +2427,22 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(context.acquisitionNoLeaseReceipt?.acquisitionTicket, fixture.acquire)
         XCTAssertEqual(context.acquisitionNoLeaseReceipt?.outcome, .canceledBeforeClaim)
         XCTAssertEqual(fixture.registry.phase(of: fixture.acquire), .terminal(.canceled))
+    }
+
+    func testResetWithoutFreshUserActionKeepsQueuedRecoveryBudgetParked() throws {
+        let fixture = try ResetAcquiringOutputFixture()
+        let before = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
+        fixture.clock.set(fixture.clock.read() + before.boundaryEffectiveElapsed + 1)
+        let after = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
+        XCTAssertEqual(after.ticketIdentity, before.ticketIdentity)
+        XCTAssertEqual(after.effectiveElapsed(at: fixture.clock.read()), 0)
+        XCTAssertNil(after.runningSince)
+        XCTAssertNil(after.deadlineArm)
+        XCTAssertEqual(fixture.registry.phase(of: fixture.acquire), .queued)
+        XCTAssertFalse(fixture.registry.outputResourceContextSnapshot()?.poisoned == true,
+            "manual-wait time cannot expire the effective recovery budget")
+        XCTAssertTrue(fixture.registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        XCTAssertFalse(fixture.registry.executor.safetyIngress.snapshot.outputPermitPresent)
     }
 
     func testHandoffGenerationMismatchPoisonsOriginalOwnerWithoutPublishingCandidate() throws {
@@ -2490,7 +2564,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             return XCTFail("首reset inactive交接失败")
         }
         let firstContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
-        let firstActivation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(
+        let firstActivation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
             contextNonce: firstContext.contextNonce))
         let firstActivationRequest = try claimGraphAudioCall(registry, lane: ordinary.lane, firstActivation)
         let firstActivationCompletion = try completeGraphAudioCall(registry, lane: ordinary.lane, firstActivationRequest, .activation(nil))
@@ -2519,7 +2593,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let firstFactory = try XCTUnwrap(registry.claimOutputSuccessor(firstClaim))
         XCTAssertTrue(registry.claimStart(firstFactory))
         XCTAssertTrue(try registry.completeOutputFactory(firstFactory,
-            candidate: ResourceLifetimeSpy(ResourceLifetimeObservation(registry: registry))))
+            candidate: OutputGraphPlaybackBackend(identity: try XCTUnwrap(
+                registry.outputResourceContextSnapshot()?.candidateBackendIdentity))))
         XCTAssertEqual(try registry.retireOutputControlRecord(firstFactory), .retired(followUp: nil))
 
         let installed = try XCTUnwrap(registry.outputResourceContextSnapshot())
@@ -2530,9 +2605,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let secondOwner = try XCTUnwrap(coordinator.begin(contextNonce: installed.contextNonce,
             reason: .recovery, at: clock.read(), teardown: true))
         let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(suspend.task))
-        XCTAssertTrue(coordinator.completeSuspend(.init(suspendTicket: suspend, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let suspendSuspension = try claimGraphSuspend(registry, suspend)
+        XCTAssertTrue(suspendSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(coordinator.advance(owner: secondOwner))
         XCTAssertTrue(registry.claimStart(retirement))
         guard case .backend(_, let lifecycle?, _, _, _) = registry.ownedResourceSnapshot()?.payload else {
@@ -2561,7 +2635,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             .configuration(.multichannelCapability(true)))
         XCTAssertEqual(secondConfigurationCompletion.disposition, .accepted)
         XCTAssertNil(registry.phase(of: secondMultichannel))
-        let secondActivation = try XCTUnwrap(secondConfigurationCompletion.followUp)
+        XCTAssertNil(secondConfigurationCompletion.followUp,
+            "the second reset also needs a fresh current-epoch user action")
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        let secondConfiguredContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let secondActivation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
+            contextNonce: secondConfiguredContext.contextNonce))
         let secondActivationRequest = try claimGraphAudioCall(registry, lane: ordinary.lane, secondActivation)
         let secondActivationCompletion = try completeGraphAudioCall(registry, lane: ordinary.lane,
             secondActivationRequest, .activation(nil))
@@ -2579,9 +2658,15 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let registry = ControlTaskRegistry(clock: clock)
         let root = try capturedResetRoot(registry)
         let proof = try XCTUnwrap(registry.issueEmptyOutputResetDrainProof(root: root))
-        let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
-        let parent = CurrentPlaybackOperationDeadlineTicket.coldStart(.init(identity: .init(sessionIdentity: session, nonce: 1),
-            kind: .coldStart, originInstant: 50, cap: 40_000_000_000, accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        let parent = try registry.admitPlaybackRequest(requestID: UUID())
+        guard case .coldStart(let admittedParent) = parent else {
+            return XCTFail("fresh playback admission must supply its cold-start parent")
+        }
+        let session = admittedParent.identity.sessionIdentity
+        XCTAssertFalse(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        XCTAssertGreaterThan(admittedParent.cap, 32_000_000_000)
+        guard admittedParent.cap > 32_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
         let acquire = try XCTUnwrap(registry.beginResetOutputAcquisition(session: session, parent: parent,
             admission: .init(proof: proof, mandatorySuffix: 30_000_000_000, inheritedRouteAvailabilityConstraint: nil)),
             "reset-mode admission必须一次安装原parent、唯一边界及binding")
@@ -2596,7 +2681,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(reset.proof, proof)
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         XCTAssertEqual(state.ticketIdentity, reset.preRouteTicket.identity)
-        XCTAssertEqual(state.boundaryEffectiveElapsed, 10_000_000_000)
+        XCTAssertEqual(state.boundaryEffectiveElapsed, originalParent.cap - 30_000_000_000)
         XCTAssertEqual(state.runningSince, 100)
         XCTAssertNotNil(state.deadlineArm)
         XCTAssertNil(context.acquisitionDeadline, "acquire自己5秒必须从实际claim才启动")
@@ -2609,7 +2694,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         clock.set(2_000_000_100)
         let tightened = try XCTUnwrap(registry.tightenOutputResetPreRouteBoundary(reset.binding, mandatorySuffix: 32_000_000_000))
         XCTAssertEqual(tightened.ticketIdentity, state.ticketIdentity)
-        XCTAssertEqual(tightened.boundaryEffectiveElapsed, 8_000_000_000)
+        XCTAssertEqual(tightened.boundaryEffectiveElapsed, originalParent.cap - 32_000_000_000)
         XCTAssertEqual(tightened.accumulatedEffectiveTime, frozen.accumulatedEffectiveTime)
         XCTAssertNil(tightened.deadlineArm)
         let resumed = try XCTUnwrap(registry.resumeOutputResetPreRouteClock(reset.binding))
@@ -2735,9 +2820,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
                 reason: .recovery, at: UInt64(cycle), teardown: false))
             let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-            XCTAssertTrue(registry.claimStart(stop.task))
-            XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-                directlyConfirmedRateZero: true, preparedPreserved: false)))
+            let stopSuspension = try claimGraphSuspend(registry, stop)
+            XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
             let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
             XCTAssertTrue(registry.claimStart(retirement))
             XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: lifecycle))
@@ -2818,9 +2902,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: installed.contextNonce,
                 reason: .recovery, at: UInt64(300 + round), teardown: true))
             let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-            XCTAssertTrue(registry.claimStart(suspend.task))
-            XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: suspend, closeClaim: nil,
-                directlyConfirmedRateZero: true, preparedPreserved: false)))
+            let suspendSuspension = try claimGraphSuspend(registry, suspend)
+            XCTAssertTrue(suspendSuspension.complete(in: registry, preparedPreserved: false))
             let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
             XCTAssertTrue(registry.claimStart(retirement))
             XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: lifecycle))
@@ -2875,7 +2958,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             XCTAssertNil(try registry.claimOutputSuccessor(claim), "同一successor claim只能消费一次")
             XCTAssertTrue(registry.claimStart(factory))
             XCTAssertTrue(try registry.completeOutputFactory(factory,
-                candidate: ResourceLifetimeSpy(ResourceLifetimeObservation(registry: registry))))
+                candidate: OutputGraphPlaybackBackend(identity: try XCTUnwrap(
+                    registry.outputResourceContextSnapshot()?.candidateBackendIdentity))))
             XCTAssertEqual(try registry.retireOutputControlRecord(factory), .retired(followUp: nil))
             previousClaim = claim
         }
@@ -2944,9 +3028,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             "pause receipt只能在原真实producer终态后确认drain")
         _ = try fixture.coordinator.begin(contextNonce: context.contextNonce, reason: .pause, at: 10)
         let old = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(fixture.registry.claimStart(old.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: old, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: true)))
+        let oldSuspension = try claimGraphSuspend(fixture.registry, old)
+        XCTAssertTrue(oldSuspension.complete(in: fixture.registry, preparedPreserved: true))
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce, reason: .stop, at: 20))
         let updated = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
         XCTAssertNotEqual(updated.suspend?.task, old.task, "只有仍在途stop可join；已完成pause不可复用success")
@@ -3471,9 +3554,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             XCTAssertEqual(try fixture.registry.retireOutputControlRecord(prepare), .retired(followUp: nil))
         }
         let stop = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(fixture.registry.claimStart(stop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(fixture.registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: fixture.registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
         XCTAssertTrue(fixture.registry.claimStart(retirement))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -3515,7 +3597,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let context = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce, reason: .stop, at: 100))
         let stop = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(fixture.registry.claimStart(stop.task))
+        let stopSuspension = try claimGraphSuspend(fixture.registry, stop)
         fixture.stable.acquisition.clock.set(stop.anchorInstant + 1_000_000_000)
         XCTAssertTrue(fixture.registry.timeoutOutputSuspend(stop))
         XCTAssertEqual(fixture.registry.phase(of: stop.task), .running)
@@ -3525,8 +3607,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: terminal))
         XCTAssertTrue(fixture.registry.claimStart(retirement))
         XCTAssertFalse(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: true)))
+        XCTAssertTrue(stopSuspension.complete(in: fixture.registry, preparedPreserved: true))
         XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
         XCTAssertNotNil(try fixture.coordinator.advance(owner: terminal))
         XCTAssertTrue(try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()).poisoned)
@@ -3546,13 +3627,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             reason: .stop, at: fixture.stable.acquisition.clock.read()))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
         XCTAssertEqual(stop.priorActivation, activationEpoch)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        let receipt = OutputQuiescenceReceipt(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)
-        XCTAssertFalse(fixture.coordinator.completeSuspend(receipt),
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+
+        XCTAssertFalse(stopSuspension.complete(in: registry, preparedPreserved: false),
             "rate-0事实不能越过仍为cancelRequested的准确原activation record")
         XCTAssertTrue(registry.complete(activation), "迟到原activation必须先结束准确SDK责任")
-        XCTAssertTrue(fixture.coordinator.completeSuspend(receipt))
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         XCTAssertNotNil(try fixture.coordinator.advance(owner: owner))
     }
 
@@ -3566,7 +3646,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             reason: .recovery, at: anchor, teardown: false))
         let ownerTask = try XCTUnwrap(registry.outputCleanupOwnerTask(owner))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
         clock.set(anchor + 999_999_999)
         XCTAssertFalse(registry.timeoutOutputSuspend(stop), "1秒之前的early wake不能伪造timeout")
         XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, owner)
@@ -3578,8 +3658,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertEqual(registry.outputCleanupOwnerTask(terminal), ownerTask)
         XCTAssertNil(registry.phase(of: try XCTUnwrap(registry.cleanupReservationSnapshot()).task(for: .owner)),
             "在途owner尚未退休时不能提前消费最终预签owner")
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         XCTAssertNotNil(try fixture.coordinator.advance(owner: terminal))
     }
 
@@ -3595,10 +3674,9 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
             reason: .recovery, at: anchor, teardown: false))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
         clock.set(anchor + 1_000_000_000)
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: true)))
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: true))
         let forced = try XCTUnwrap(registry.outputResourceContextSnapshot())
         XCTAssertTrue(forced.suspendConfirmed, "迟到准确receipt仍须结束原stop record")
         XCTAssertTrue(forced.suspendTimedOut, "恰到边界只能由强制cleanup胜出")
@@ -3645,13 +3723,12 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         _ = try XCTUnwrap(fixture.coordinator.begin(contextNonce: current.contextNonce,
             reason: .stop, at: fixture.stable.acquisition.clock.read()))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        let receipt = OutputQuiescenceReceipt(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)
-        XCTAssertFalse(fixture.coordinator.completeSuspend(receipt),
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+
+        XCTAssertFalse(stopSuspension.complete(in: registry, preparedPreserved: false),
             "准确workGroup descendant仍持有producer责任时不能确认drain")
         XCTAssertTrue(registry.complete(descendant))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(receipt))
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
     }
 
     func testSuspendTimeoutUsesEarlierExistingCleanupBudgetBoundary() throws {
@@ -3666,9 +3743,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let pause = try XCTUnwrap(fixture.coordinator.begin(contextNonce: original.contextNonce,
             reason: .pause, at: firstAnchor, teardown: true))
         let firstStop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(firstStop.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: firstStop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: true)))
+        let firstStopSuspension = try claimGraphSuspend(registry, firstStop)
+        XCTAssertTrue(firstStopSuspension.complete(in: registry, preparedPreserved: true))
         XCTAssertTrue(registry.finishOutputPause(owner: pause))
         let budget = try XCTUnwrap(registry.outputResourceContextSnapshot()?.budget)
         clock.set(budget.deadlineInstant)
@@ -3699,12 +3775,15 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let stop = try XCTUnwrap(stopping.suspend)
         let claim = try XCTUnwrap(stopping.closeClaim)
         XCTAssertEqual(claim.intervalKey, interval)
-        XCTAssertTrue(fixture.registry.claimStart(stop.task))
+        let stopSuspension = try claimGraphSuspend(fixture.registry, stop)
         XCTAssertFalse(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
             directlyConfirmedRateZero: true, preparedPreserved: true)))
         XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.interval, interval)
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: claim,
-            directlyConfirmedRateZero: true, preparedPreserved: true)))
+        XCTAssertFalse(fixture.coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: claim,
+            directlyConfirmedRateZero: true, preparedPreserved: true)),
+            "Even exact caller-supplied booleans cannot replace the backend's opaque proof")
+        XCTAssertEqual(stopSuspension.closeClaim, claim)
+        XCTAssertTrue(stopSuspension.complete(in: fixture.registry, preparedPreserved: true))
         XCTAssertNil(fixture.registry.outputResourceContextSnapshot()?.interval)
         XCTAssertTrue(fixture.registry.finishOutputPause(owner: owner))
         XCTAssertNotNil(try fixture.coordinator.begin(contextNonce: context.contextNonce, reason: .stop, at: 2))
@@ -3805,10 +3884,9 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let stop = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.suspend)
         XCTAssertEqual(try coordinator.begin(contextNonce: installed.contextNonce, reason: .pause, at: 99), owner)
         XCTAssertNotNil(fixture.registry.phase(of: reservation.task(for: .owner)), "清理owner必须登记在父group")
-        XCTAssertTrue(fixture.registry.claimStart(stop.task))
+        let stopSuspension = try claimGraphSuspend(fixture.registry, stop)
         XCTAssertFalse(fixture.registry.complete(stop.task), "普通completion不得伪造静止")
-        XCTAssertTrue(coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        XCTAssertTrue(stopSuspension.complete(in: fixture.registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(coordinator.advance(owner: owner))
         XCTAssertEqual(try coordinator.advance(owner: owner), retirement)
         XCTAssertTrue(fixture.registry.claimStart(retirement))
@@ -3867,13 +3945,19 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let clock = OutputTestClock(100)
         let registry = ControlTaskRegistry(allocator: .init(), clock: clock)
         let lifetime = ResourceLifetimeObservation(registry: registry)
-        var strongBackend: ResourceLifetimeSpy? = ResourceLifetimeSpy(lifetime)
+        var strongBackend: OutputGraphPlaybackBackend?
         weak var registration: PlaybackAudioSessionRegistration?
-        weak var backend: ResourceLifetimeSpy?
-        backend = strongBackend
-        let fixture = try OutputGraphFixture(registry: registry, clock: clock, backendObject: strongBackend)
+        weak var backend: OutputGraphPlaybackBackend?
+        let fixture = try OutputGraphFixture(registry: registry, clock: clock,
+            backendFactory: { identity in
+                let candidate = OutputGraphPlaybackBackend(identity: identity, observation: lifetime)
+                strongBackend = candidate
+                backend = candidate
+                return candidate
+            })
         registration = registry.audioSessionRegistration(for: fixture.stable.acquisition.acquisition)
         XCTAssertNotNil(registration)
+        XCTAssertNotNil(strongBackend)
         strongBackend = nil
         let installed = try XCTUnwrap(registry.outputResourceContextSnapshot())
         let reservation = try XCTUnwrap(registry.cleanupReservationSnapshot())
@@ -3885,9 +3969,8 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         let coordinator = fixture.coordinator
         let owner = try XCTUnwrap(coordinator.begin(contextNonce: installed.contextNonce, reason: .stop, at: 1))
         let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(stop.task))
-        XCTAssertTrue(coordinator.completeSuspend(.init(suspendTicket: stop, closeClaim: nil,
-            directlyConfirmedRateZero: true, preparedPreserved: false)))
+        let stopSuspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(stopSuspension.complete(in: registry, preparedPreserved: false))
         let retirement = try XCTUnwrap(coordinator.advance(owner: owner))
         XCTAssertTrue(registry.claimStart(retirement))
         XCTAssertTrue(coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
@@ -4637,8 +4720,8 @@ func graphOwnedDeactivation(_ registry: ControlTaskRegistry) -> AudioSessionDeac
 private final class GraphAudioSessionSDK: PlaybackAudioSessionSDK, Sendable {
     func setPlaybackCategory(policy: AudioSessionActualPolicy) throws {}
     func setSupportsMultichannelContent() throws {}
-    func activate() throws {}
-    func deactivate() throws {}
+    func activate() async throws -> Bool { true }
+    func deactivate() async throws -> Bool { true }
     func currentRoute() -> any AudioSessionRouteSnapshot { GraphEmptyRoute() }
     func fillRandomBytes(_ bytes: UnsafeMutableRawBufferPointer) -> Bool {
         guard let base = bytes.baseAddress else { return false }
@@ -4701,6 +4784,34 @@ func completeGraphRoute(_ registry: ControlTaskRegistry, _ call: GraphRouteCall,
     return try completeGraphAudioCall(registry, lane: call.lane, call.request, .route(evidence))
 }
 
+/// Tests that need an active reset generation explicitly admit the user action first.
+func prepareGraphResetActivationAfterUserResume(_ registry: ControlTaskRegistry,
+    contextNonce: UInt64) throws -> ControlTaskTicket? {
+    let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+    XCTAssertEqual(context.contextNonce, contextNonce)
+    let lease = try XCTUnwrap(registry.audioSessionLease(session: context.sessionIdentity))
+    return registry.prepareExplicitResume(for: lease)
+}
+
+/// A fresh current-epoch user action starts logical recovery; it grants no
+/// physical activation or drain proof. Keep the reset-only parked state visible.
+func authorizeGraphResetRecoveryClock(_ registry: ControlTaskRegistry,
+    file: StaticString = #filePath, line: UInt = #line) throws {
+    let before = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot(), file: file, line: line)
+    XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
+        file: file, line: line)
+    XCTAssertNil(before.runningSince, file: file, line: line)
+    XCTAssertNil(before.deadlineArm, file: file, line: line)
+    XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .resume)),
+        .acceptedWaiting, file: file, line: line)
+    let after = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot(), file: file, line: line)
+    XCTAssertEqual(after.ticketIdentity, before.ticketIdentity, file: file, line: line)
+    XCTAssertEqual(after.accumulatedEffectiveTime, before.accumulatedEffectiveTime, file: file, line: line)
+    XCTAssertEqual(after.runningSince, registry.clock.nowNanoseconds, file: file, line: line)
+    XCTAssertNotNil(after.deadlineArm, file: file, line: line)
+    XCTAssertFalse(registry.executor.safetyIngress.snapshot.outputPermitPresent, file: file, line: line)
+}
+
 struct ResetAcquiringOutputFixture {
     let clock: OutputTestClock
     let registry: ControlTaskRegistry
@@ -4708,19 +4819,50 @@ struct ResetAcquiringOutputFixture {
     let acquire: ControlTaskTicket
     let parentIdentity: PlaybackProgressBudgetTicket.Identity
     init(allocator: PlaybackIdentityAllocator = .init(),
-        clock: OutputTestClock = .init(100)) throws {
+        clock: OutputTestClock = .init(100), freshUserPlayback: Bool = false) throws {
         self.clock = clock
         registry = ControlTaskRegistry(allocator: allocator, clock: clock)
         lane = try bindGraphAudioSessionLane(registry)
         let root = try capturedResetRoot(registry)
         let proof = try XCTUnwrap(registry.issueEmptyOutputResetDrainProof(root: root))
-        let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
-        parentIdentity = .init(sessionIdentity: session, nonce: 1)
-        let parent = CurrentPlaybackOperationDeadlineTicket.coldStart(.init(identity: parentIdentity,
-            kind: .coldStart, originInstant: 50, cap: 40_000_000_000,
-            accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
+        XCTAssertTrue(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
+            "reset alone must keep recovery parked until a fresh user action")
+        let parent: CurrentPlaybackOperationDeadlineTicket
+        if freshUserPlayback {
+            parent = try registry.admitPlaybackRequest(requestID: UUID())
+            guard case .coldStart(let admittedParent) = parent else {
+                throw ControlTaskRegistry.Failure.invalidGroup
+            }
+            parentIdentity = admittedParent.identity
+            XCTAssertEqual(registry.playbackRequestAdmissionSnapshot(), parent)
+            XCTAssertFalse(registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired)
+        } else {
+            parentIdentity = .init(sessionIdentity: .init(sessionID: 1, requestID: UUID()), nonce: 1)
+            parent = .coldStart(.init(identity: parentIdentity,
+                kind: .coldStart, originInstant: 50, cap: 40_000_000_000,
+                accumulatedEffectiveTime: 0, runningSince: nil, freezeGeneration: 0))
+        }
+        let session = parentIdentity.sessionIdentity
+        let parentCap: UInt64
+        switch parent {
+        case .coldStart(let budget), .outputRecovery(let budget): parentCap = budget.cap
+        }
+        XCTAssertGreaterThan(parentCap, 30_000_000_000)
+        guard parentCap > 30_000_000_000 else { throw ControlTaskRegistry.Failure.invalidGroup }
         acquire = try XCTUnwrap(registry.beginResetOutputAcquisition(session: session, parent: parent,
             admission: .init(proof: proof, mandatorySuffix: 30_000_000_000, inheritedRouteAvailabilityConstraint: nil)))
+        let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
+        XCTAssertEqual(state.boundaryEffectiveElapsed, parentCap - 30_000_000_000)
+        XCTAssertEqual(registry.phase(of: acquire), .queued)
+        XCTAssertNil(registry.outputResourceContextSnapshot()?.acquisitionDeadline,
+            "logical recovery authorization must not start an unclaimed physical acquire deadline")
+        if freshUserPlayback {
+            XCTAssertEqual(state.runningSince, clock.read())
+            XCTAssertNotNil(state.deadlineArm)
+        } else {
+            XCTAssertNil(state.runningSince)
+            XCTAssertNil(state.deadlineArm)
+        }
     }
     func acceptLease() throws {
         XCTAssertTrue(registry.claimStart(acquire))
@@ -4745,7 +4887,7 @@ struct ResetAcquiringOutputFixture {
     @discardableResult
     func activateResetAndCommit() throws -> ControlTaskTicket {
         let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
-        let activation = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(contextNonce: context.contextNonce))
+        let activation = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry, contextNonce: context.contextNonce))
         let completion = try graphAudioCall(registry, lane: lane, activation, .activation(nil))
         XCTAssertEqual(completion.disposition, .accepted)
         let sampler = try XCTUnwrap(completion.followUp)
@@ -4890,7 +5032,7 @@ struct ActualAudioActivationFixture {
             registry = fixture.registry
             lane = fixture.lane
             if kind == 1 {
-                ticket = try XCTUnwrap(registry.beginOutputResetConfigurationActivation(
+                ticket = try XCTUnwrap(prepareGraphResetActivationAfterUserResume(registry,
                     contextNonce: try XCTUnwrap(registry.outputResourceContextSnapshot()).contextNonce))
             } else {
                 let previous = try fixture.activateResetAndCommit()
@@ -4972,6 +5114,95 @@ private final class OutputNoopTerminalCleanupReceiver: PlaybackOwnedCleanupRecei
         task: ControlTaskTicket, terminalState: PlaybackState) async {}
 }
 
+/// A control-layer backend with a real registry-installed issuer and owned rate state.
+/// It does not turn caller booleans into authority or expose an issuer constructor.
+private final class OutputGraphPlaybackBackend: PlaybackBackend,
+    SampleBufferQuiescenceIssuerInstalling, @unchecked Sendable {
+    let identity: PlaybackBackendIdentity
+    var presentation: PlaybackPresentation? { nil }
+    private let lock = NSLock()
+    private var physicalRate: Float = 0
+    private var issuer: ControlTaskRegistry.SampleBufferQuiescenceIssuer?
+    private let observation: ResourceLifetimeObservation?
+
+    init(identity: PlaybackBackendIdentity, observation: ResourceLifetimeObservation? = nil) {
+        self.identity = identity
+        self.observation = observation
+    }
+
+    func installSampleBufferQuiescenceIssuer(
+        _ issuer: ControlTaskRegistry.SampleBufferQuiescenceIssuer
+    ) {
+        lock.withLock { self.issuer = issuer }
+    }
+
+    func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
+    func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
+    func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
+        guard invocation.performPositiveRateSideEffect({
+            lock.withLock { physicalRate = 1 }
+        }) else { throw PlaybackCoreError.outputActivationRejected }
+    }
+
+    func suspendOutput(invocation: ControlTaskRegistry.BackendSuspendInvocation) async
+        -> BackendSuspendResult {
+        stopAndReadBack(invocation: invocation, preparedPreserved: true)
+    }
+
+    func stopAndReadBack(invocation: ControlTaskRegistry.BackendSuspendInvocation,
+                        preparedPreserved: Bool) -> BackendSuspendResult {
+        lock.withLock {
+            physicalRate = 0
+            guard let proof = issuer?.issue(backendIdentity: identity,
+                invocation: invocation, observedRate: physicalRate,
+                preparedPreserved: preparedPreserved) else { return .requiresRetirement }
+            return .quiescent(proof)
+        }
+    }
+
+    func retireOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
+        lock.withLock { physicalRate = 0; issuer = nil }
+        return .confirmedLocalOutputStopped
+    }
+
+    deinit { observation?.released() }
+}
+
+/// Keeps the original claimed invocation, but does not extend backend lifetime beyond
+/// the registry's owner. This matters to tests that verify exact teardown release.
+final class OutputGraphSuspension {
+    private weak var backend: OutputGraphPlaybackBackend?
+    private let invocation: ControlTaskRegistry.BackendSuspendInvocation
+    var closeClaim: PotentiallyAudibleOutputCloseClaim? { invocation.closeClaim }
+
+    fileprivate init(backend: OutputGraphPlaybackBackend,
+                     invocation: ControlTaskRegistry.BackendSuspendInvocation) {
+        self.backend = backend
+        self.invocation = invocation
+    }
+
+    func complete(in registry: ControlTaskRegistry, preparedPreserved: Bool) -> Bool {
+        guard let backend else { return false }
+        let result = backend.stopAndReadBack(invocation: invocation,
+                                             preparedPreserved: preparedPreserved)
+        return registry.completeOutputSuspend(result, invocation: invocation, backend: backend)
+    }
+}
+
+func claimGraphSuspend(_ registry: ControlTaskRegistry, _ ticket: OutputSuspendTicket,
+                       file: StaticString = #filePath, line: UInt = #line) throws
+    -> OutputGraphSuspension {
+    let owner = try XCTUnwrap(registry.outputResourceContextSnapshot()?.owner,
+                             file: file, line: line)
+    let cleanup = try XCTUnwrap(registry.claimOutputBackendCleanup(ticket.task, owner: owner),
+                               file: file, line: line)
+    let invocation = try XCTUnwrap(cleanup.suspendInvocation, file: file, line: line)
+    XCTAssertEqual(invocation.suspendTicket, ticket, file: file, line: line)
+    let backend = try XCTUnwrap(cleanup.backend as? OutputGraphPlaybackBackend,
+                               file: file, line: line)
+    return OutputGraphSuspension(backend: backend, invocation: invocation)
+}
+
 struct OutputGraphFixture {
     let stable: StableOutputFixture
     let registry: ControlTaskRegistry
@@ -4981,6 +5212,7 @@ struct OutputGraphFixture {
     init(allocator: PlaybackIdentityAllocator = .init(), registry suppliedRegistry: ControlTaskRegistry? = nil,
         clock: OutputTestClock = .init(100),
         backendObject: (any OwnedPlaybackResource)? = nil,
+        backendFactory: ((PlaybackBackendIdentity) -> any OwnedPlaybackResource)? = nil,
         audioLane: AudioSessionBlockingCallLane? = nil) throws {
         stable = try StableOutputFixture(allocator: allocator, registry: suppliedRegistry, clock: clock,
             audioLane: audioLane)
@@ -4992,8 +5224,10 @@ struct OutputGraphFixture {
         let claim = try XCTUnwrap(rebase.successorClaim)
         let factory = try XCTUnwrap(registry.claimOutputSuccessor(claim))
         XCTAssertTrue(registry.claimStart(factory))
-        XCTAssertTrue(try registry.completeOutputFactory(factory,
-            candidate: backendObject ?? ResourceLifetimeSpy(ResourceLifetimeObservation(registry: registry))))
+        let identity = try XCTUnwrap(registry.outputResourceContextSnapshot()?.candidateBackendIdentity)
+        let candidate = backendObject ?? backendFactory?(identity)
+            ?? OutputGraphPlaybackBackend(identity: identity)
+        XCTAssertTrue(try registry.completeOutputFactory(factory, candidate: candidate))
         XCTAssertEqual(try registry.retireOutputControlRecord(factory), .retired(followUp: nil))
         guard case .backend(_, let current, _, _, _) = registry.ownedResourceSnapshot()?.payload else {
             throw ControlTaskRegistry.Failure.invalidGroup

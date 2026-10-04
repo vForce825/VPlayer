@@ -77,6 +77,26 @@ final class XMLTVParserTests: XCTestCase {
         )
     }
 
+    func testLegalLongDisplayNameParsesAndMatchesWithoutFuzzySignatureExpansion() throws {
+        let name = String(repeating: "a", count: 32_768)
+        guard !EPGNameNormalizer.isFuzzyMatchEligible(name) else {
+            return XCTFail("Do not allocate the old quadratic signature index on the test host")
+        }
+        let sink = CollectingXMLTVSink()
+        let xml = "<tv><channel id=\"long\"><display-name>\(name)</display-name></channel></tv>"
+        try withTemporaryXML(xml) {
+            XCTAssertEqual(try XMLTVParser().parse(fileURL: $0, into: sink).channelCount, 1)
+        }
+        XCTAssertEqual(sink.channels.first?.displayNames, [name])
+        let channel = Channel(
+            sourceProfileID: UUID(), displayName: name,
+            streamURL: URL(string: "https://stream.example/live")!,
+            tvgID: nil, tvgName: nil, logoURL: nil, groupTitle: nil, attributes: [:], order: 0
+        )
+        XCTAssertEqual(EPGMatcher.match(channel: channel, epgChannels: sink.channels, manualMapping: nil),
+                       .matched(xmltvChannelID: "long", method: .exactName))
+    }
+
     func testMalformedXMLDoesNotEmitACompletedProgramme() throws {
         let sink = CollectingXMLTVSink()
 

@@ -15,9 +15,15 @@ struct CompressedAudioFramingPacket {
 }
 
 protocol CompressedAudioFramingStrategy: AnyObject {
+    /// Only a framer with a proven AU/carry clock may accept an absent container PTS.
+    var canContinueWithoutTimestamp: Bool { get }
     func push(_ packet: CompressedAudioFramingPacket) throws
     func drain() throws
     func destroy()
+}
+
+extension CompressedAudioFramingStrategy {
+    var canContinueWithoutTimestamp: Bool { false }
 }
 
 final class RawAACFramingStrategy: CompressedAudioFramingStrategy {
@@ -64,6 +70,12 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
     private var carry = Data()
     private var provenance: [Provenance] = []
     private var currentFrameCorrupt = false
+    private var nextPresentationTimeStamp: CMTime?
+
+    var canContinueWithoutTimestamp: Bool {
+        nextPresentationTimeStamp != nil ||
+            (!carry.isEmpty && provenance.first?.presentationTimeStamp.isNumeric == true)
+    }
     /// 每段 lease 只覆盖 carry 中连续且明确的 byte range。不能把一个整包
     /// lease 交给首帧，否则同包的后续帧/残余 carry 会在首帧释放后失去费用。
     private struct CarryLeaseSegment {
@@ -117,6 +129,8 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
             }
             guard carry.count >= frameLength else { break }
             let timestamp = try takePresentationTimeStamp()
+            let nextTimestamp = CMTimeAdd(timestamp, CMTime(value: 1_024, timescale: sampleRate))
+            guard nextTimestamp.isNumeric else { throw AudioCodecProfileValidation.error() }
             // Data(carry.prefix) 是新的 backing；先为该准确 frame range 收费，再复制。
             let outputLease = hlsCopyOwnership?.admit(.framing, bytes: frameLength)
             guard hlsCopyOwnership == nil || outputLease != nil else {
@@ -132,6 +146,9 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
                 containerMarkedCorrupt: currentFrameCorrupt,
                 hlsCopyTail: outputLease.map(HLSAudioCopyTail.init)
             ))
+            // Only a complete AU accepted by the codec-profile receiver extends
+            // continuity; rejection destroys this framer and its previous anchor.
+            nextPresentationTimeStamp = nextTimestamp
             consumeLeaseBytes(frameLength)
             carry.removeFirst(frameLength)
             try consumeProvenanceBytes(frameLength)
@@ -151,6 +168,7 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
         provenance.removeAll(keepingCapacity: false)
         carryLeases.removeAll(keepingCapacity: false)
         currentFrameCorrupt = false
+        nextPresentationTimeStamp = nil
     }
 
     private func takePresentationTimeStamp() throws -> CMTime {
@@ -159,10 +177,20 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
         let (sampleOffset, overflow) = current.startedFrameCount
             .multipliedReportingOverflow(by: 1_024)
         guard !overflow else { throw AudioCodecProfileValidation.error() }
-        let timestamp = CMTimeAdd(
-            current.presentationTimeStamp,
-            CMTime(value: sampleOffset, timescale: sampleRate)
-        )
+        let timestamp: CMTime
+        if current.presentationTimeStamp.isNumeric {
+            // An explicit PTS always wins, including a real transport gap. If an AU
+            // spans packets, provenance[0] still identifies the packet where it began.
+            timestamp = CMTimeAdd(current.presentationTimeStamp,
+                                  CMTime(value: sampleOffset, timescale: sampleRate))
+        } else {
+            // FFmpeg can deliver the other AUs from the first probed TS PES without
+            // individual PTS/duration. ADTS LC proves 1,024 samples per complete AU;
+            // continue only an established clock, never invent the initial anchor.
+            guard !current.presentationTimeStamp.isValid,
+                  let nextPresentationTimeStamp else { throw AudioCodecProfileValidation.error() }
+            timestamp = nextPresentationTimeStamp
+        }
         guard timestamp.isNumeric else { throw AudioCodecProfileValidation.error() }
         let (nextCount, incrementOverflow) = current.startedFrameCount
             .addingReportingOverflow(1)

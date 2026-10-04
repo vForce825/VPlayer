@@ -20,8 +20,13 @@ public enum EPGNameNormalizer {
         character == "+"
     }
 
+    /// Deletion signatures retain at most 128 remainders of at most 127 UTF-8
+    /// bytes each per alias. Count bytes before building Character arrays: a
+    /// single extended grapheme cluster can otherwise contain unbounded text.
+    /// Longer names still participate in exact-name, exact-ID and manual matching.
     static func isFuzzyMatchEligible(_ normalizedName: String) -> Bool {
-        normalizedName.lazy.filter {
+        guard normalizedName.utf8.prefix(129).count <= 128 else { return false }
+        return normalizedName.lazy.filter {
             !isProtectedSemanticCharacter($0)
         }.prefix(5).count == 5
     }

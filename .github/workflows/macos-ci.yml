@@ -1,0 +1,384 @@
+name: Same-head tvOS 27 acceptance
+
+# Standard GitHub-hosted runners are free for this public repository.
+# No larger runners, uploaded artifacts, persistent caches, retries or releases.
+"on":
+  push:
+    branches: [migration/tvos27]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-complete-${{ github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+  TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+# Jobs have no cross-job dependencies. A failure cannot cancel another gate.
+jobs:
+  complete-tests:
+    name: Complete Debug unit and UI tests
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - name: Check out the exact acceptance head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source, Xcode and tvOS SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Prepare pinned application dependencies and build tools
+        id: prepare
+        timeout-minutes: 40
+        run: |
+          brew install mint jq ripgrep
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+          ./ci_scripts/ci_post_clone.sh
+          xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+      - name: State the supported acceptance coverage
+        if: ${{ !cancelled() }}
+        run: |
+          echo 'CI_FULL_RELEASE_UNIT=unavailable_compile_incompatible_DEBUG_only_test_hooks'
+          echo 'CI_FULL_RELEASE_UI=unavailable_DEBUG_only_ui_fixture'
+          echo 'CI_RELEASE_COVERAGE=optimized_boundary_startup_six_cold_starts'
+          echo 'CI_HLS_OUTPUT_ACCOUNTING=conditional_unsupported_is_not_pass_item_clock_is_not_PCM_proof'
+      - name: Run complete Debug unit and UI targets without a selection filter
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 70
+        run: |
+          # This is the entire existing VPlayer unit/UI scheme.
+          # Conditional unsupported output capability is separate from pass/failure.
+          # Item-clock observations do not prove decoded PCM output.
+          ./Scripts/test.sh -configuration Debug \
+            -derivedDataPath "$RUNNER_TEMP/Complete-Debug" \
+            -resultBundlePath "$RUNNER_TEMP/Complete-Debug.xcresult" \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Report complete test failures
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/Complete-Debug.xcresult"
+
+  release-contracts:
+    name: Optimized boundaries, startup and six cold starts
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    runs-on: xcode-27
+    timeout-minutes: 100
+    steps:
+      - name: Check out the exact acceptance head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source, Xcode and tvOS SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Prepare pinned application dependencies and build tools
+        id: prepare
+        timeout-minutes: 40
+        run: |
+          brew install mint jq ripgrep
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+          ./ci_scripts/ci_post_clone.sh
+          xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+      - name: Run all optimized Release boundary tests
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
+            -configuration Release ENABLE_TESTABILITY=YES \
+            -derivedDataPath "$RUNNER_TEMP/ReleaseBoundary" \
+            -resultBundlePath "$RUNNER_TEMP/ReleaseBoundary.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Report optimized boundary failures
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseBoundary.xcresult"
+      - name: Run production-configuration Release startup UI tests
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/ReleaseStartup" \
+            -resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+      - name: Report Release startup failures
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseStartup.xcresult"
+      - name: Check six Release cold starts including allocator accounting
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          # Refuse ambiguous selection rather than choosing an arbitrary device.
+          TVOS_SIMULATOR_UDID="$(xcrun simctl list devices available -j | jq -er '
+            [.devices["com.apple.CoreSimulator.SimRuntime.tvOS-27-0"][] |
+             select(.name == "Apple TV 4K (3rd generation)")] |
+            if length == 1 then .[0].udid else error("expected one tvOS 27 simulator") end')"
+          export TVOS_SIMULATOR_UDID
+          simulator_state="$(xcrun simctl list devices available -j | jq -er --arg id "$TVOS_SIMULATOR_UDID" '
+            .devices[][] | select(.udid == $id) | .state')"
+          if [[ "$simulator_state" != "Booted" ]]; then
+            xcrun simctl boot "$TVOS_SIMULATOR_UDID"
+          fi
+          xcrun simctl bootstatus "$TVOS_SIMULATOR_UDID" -b
+          VPLAYER_STARTUP_DERIVED_DATA="$RUNNER_TEMP/ReleaseColdStarts" \
+            ./Scripts/test-release-startup.sh
+
+  sanitizer-validation:
+    name: Existing physical-storage Address Sanitizer subset
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact acceptance head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source, Xcode and tvOS SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Prepare pinned application dependencies and build tools
+        id: prepare
+        timeout-minutes: 40
+        run: |
+          brew install mint jq ripgrep
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+          ./ci_scripts/ci_post_clone.sh
+          xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+      - name: Run all existing Address Sanitizer selectors
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 40
+        run: |
+          xcodebuild -help > "$RUNNER_TEMP/xcodebuild-asan-help.txt" 2>&1
+          grep -q -- '-enableAddressSanitizer' "$RUNNER_TEMP/xcodebuild-asan-help.txt"
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayer -configuration Debug \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/PausedStorageASan" -enableAddressSanitizer YES \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/PausedStorageASan.xcresult" \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceRejectsExpandedPinsAndInvalidCapacities \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderMatchesExistingNestedReorderedAndHeldFragments \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceRejectsReentryWithoutInvalidatingOuterScope \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceHardCapacityFailureDoesNotAllocateOrLosePins \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderRejectsMissingCommonSampleAndRAPPrefixBytes \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow \
+            -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
+            -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedWindowRequiresItsOwnFrozenInitializationCompletion \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadOverflowClearsAllReferencesDuringConcurrentProducers \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingReleasesQueuedReferencesAndDeinitializesAfterJoin
+      - name: Report Address Sanitizer failures
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/PausedStorageASan.xcresult"
+
+  artifact-validation:
+    name: FFmpeg, deployment and reproducibility contracts
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    runs-on: xcode-27
+    timeout-minutes: 100
+    steps:
+      - name: Check out the exact acceptance head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source, Xcode and tvOS SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Prepare pinned application dependencies and build tools
+        id: prepare
+        timeout-minutes: 40
+        run: |
+          brew install mint jq ripgrep
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+          ./ci_scripts/ci_post_clone.sh
+          xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+      - name: Check deployment floors and precompiled Metal reproducibility
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          python3 Scripts/Tests/test_tvos27_deployment.py
+          ./Scripts/Tests/test_precompiled_metal_library.sh
+      - name: Run dependency lock regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          ./Scripts/Tests/test_ffmpeg_lock.sh
+      - name: Run audit, tamper, promotion and reproducibility regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          ./Scripts/Tests/test_ffmpeg_audit.sh
+      - name: Check bootstrap and device runner contracts without hardware
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          ./Scripts/test-bootstrap-check.sh
+          ./Scripts/test-device-acceptance-signal.sh
+          ./Scripts/test-device-acceptance-signing.sh
+      - name: Check bounded failure and startup diagnostic reports
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          python3 Scripts/Tests/test_xcresult_failure_report.py
+          python3 Scripts/Tests/test_release_startup_diagnostics.py
+
+  fixture-validation:
+    name: Strict HTTP playback and 900-second 4K timeline
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact acceptance head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source, Xcode and tvOS SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Prepare pinned application dependencies and build tools
+        id: prepare
+        timeout-minutes: 40
+        run: |
+          brew install mint jq ripgrep ffmpeg
+          xcrun simctl list runtimes -j | jq -e '
+            .runtimes[] |
+            select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
+          '
+          ./ci_scripts/ci_post_clone.sh
+          xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+      - name: Check fixture runner, server and generator contracts
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          python3 Scripts/Tests/test_playback_fixture_runner.py
+          python3 Scripts/Tests/test_timeline_fixture.py
+          python3 Scripts/Support/fixture_server.py --self-test
+          ./Scripts/run-playback-integration-tests.sh --self-test
+          ./Scripts/generate-playback-fixtures.sh --self-test
+      - name: Run strict HTTP playback and full-length 4K remux assertions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/vplayer-timeline.XXXXXX")"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 Scripts/generate-timeline-fixture.py "$fixture_dir/timeline.ts"
+          # The runner owns one unique temporary xcresult, emits its failure
+          # summary before cleanup, and preserves the original test exit status.
+          # Do not pass a second -resultBundlePath or use mock/self-test overrides.
+          ./Scripts/run-playback-integration-tests.sh \
+            --timeline-fixture "$fixture_dir/timeline.ts" \
+            --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
+            --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
+            --only-testing VPlayerTests/HLSTimelineTests \
+            -- -parallel-testing-enabled NO -collect-test-diagnostics never -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
+
+  compiler-controls:
+    name: Artifact-local compiler controls (no production allocation proof)
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact acceptance head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source, Xcode and tvOS SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
+      - name: Validate exact-toolchain Debug and Release control artifacts
+        timeout-minutes: 5
+        run: |
+          # The script checks exact Swift identity, report bounds and both
+          # configurations. Success does not establish app slab/peak allocation.
+          bash Scripts/run-paused-async-context-controls.sh

@@ -1699,6 +1699,55 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
         XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
     }
 
+    func testCapacityReleaseWakeupCanImmediatelyReplayWholeYADIFBatch() throws {
+        let harness = try BranchHarness(capacity: 2)
+        let bridge = HLSVideoAtomicBackpressureBridge(
+            branch: harness.branch,
+            applicationLedger: harness.applicationLedger
+        )
+        let retryAttempted = expectation(description: "capacity wakeup retries the retained pair")
+        harness.branch.installCapacityReleaseSink { [weak bridge] in
+            bridge?.signalCapacityReleased()
+        }
+        bridge.installCapacityWakeup { [weak bridge, admission = harness.admission] in
+            guard let bridge, bridge.hasPendingBatch else { return }
+            // Force the consumer to run before the releasing tail's deinit
+            // returns. Its lease must already have returned both admission slots.
+            XCTAssertEqual(admission.usage.count, 0)
+            XCTAssertEqual(admission.availableUnits, 2)
+            XCTAssertEqual(bridge.retryPending(), .accepted,
+                           "the only wakeup must observe the capacity it announces")
+            retryAttempted.fulfill()
+        }
+
+        let first = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1)
+        let retry = try harness.makeYADIFBatch(accessUnitID: 2, firstSequence: 3)
+        XCTAssertEqual(bridge.submit(.batch(first), generation: harness.generation), .accepted)
+        XCTAssertEqual(bridge.submit(.batch(retry), generation: harness.generation), .retry)
+        harness.drain()
+
+        harness.encoder.completeFirstSuccessfully()
+        harness.drain()
+        XCTAssertTrue(bridge.hasPendingBatch)
+        XCTAssertEqual(harness.admission.usage.count, 2,
+                       "one completed field cannot release half an atomic pair")
+        XCTAssertEqual(harness.encoder.submittedFrames.map(\.identity.accessUnitID), [1, 1])
+
+        harness.encoder.completeFirstSuccessfully()
+        wait(for: [retryAttempted], timeout: 2)
+        harness.drain()
+        XCTAssertFalse(bridge.hasPendingBatch)
+        XCTAssertEqual(harness.admission.usage.count, 2)
+        XCTAssertEqual(harness.encoder.submittedFrames.map(\.identity.accessUnitID), [1, 1, 2, 2])
+
+        harness.encoder.completeFirstSuccessfully()
+        harness.drain()
+        harness.encoder.completeFirstSuccessfully()
+        harness.drain()
+        XCTAssertEqual(harness.admission.usage.count, 0)
+        XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+    }
+
     func testProductionInterlacedCadenceEncodesBothProgressiveFieldsAt50p() throws {
         let harness = try BranchHarness(
             capacity: 2,
@@ -1887,6 +1936,7 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
 
     func testExternallyCancelledAdmissionConvergesVideoAndRejectsLaterFinish() throws {
         let harness = try BranchHarness(capacity: 1)
+        harness.encoder.delaysCancelCompletion = true
         harness.admission.cancel()
         let finishRecorder = BranchFinishRecorder()
 
@@ -1898,6 +1948,17 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
             .rejected(.cancelled)
         )
         harness.branch.finish(completion: finishRecorder.record)
+        harness.drain()
+
+        XCTAssertNil(harness.branch.terminal,
+                     "cancelled admission cannot replace the encoder's actual cancel receipt")
+        XCTAssertEqual(finishRecorder.failures, [.cancelled],
+                       "later finish must reject while native cancellation is still pending")
+
+        // One queue drain only observes the cancel request. Hold the receipt to
+        // force that ordering, then join its callback and the branch's next hop.
+        harness.encoder.completeFirstDelayedSuccessfully()
+        XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
         harness.drain()
 
         XCTAssertEqual(harness.branch.terminal, .cancelled)

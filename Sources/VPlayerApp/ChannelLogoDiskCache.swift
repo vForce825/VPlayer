@@ -58,7 +58,9 @@ actor ChannelLogoDiskCache {
     }
 
     func store(_ data: Data, forKey key: String, maximumByteCount: Int) {
-        guard maximumByteCount >= 0,
+        // Cancellation can arrive while the caller waits to enter this actor.
+        guard !Task.isCancelled,
+              maximumByteCount >= 0,
               data.count <= maximumByteCount,
               data.count <= capacity else {
             return

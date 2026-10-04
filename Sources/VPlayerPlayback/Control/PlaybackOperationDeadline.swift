@@ -77,7 +77,9 @@ struct PlaybackDeadlineRearm<Arm: Sendable & Equatable>: Sendable, Equatable {
 struct AudioSessionAcquisitionDeadline: Sendable, Equatable {
     let acquisitionTicket: ControlTaskTicket
     let anchorInstant: UInt64
-    let deadlineInstant: UInt64
+    private(set) var deadlineInstant: UInt64
+    private var parkedRemainingNanoseconds: UInt64?
+    var isParked: Bool { parkedRemainingNanoseconds != nil }
 
     init(acquisitionTicket: ControlTaskTicket, anchorInstant: UInt64) throws {
         let (deadline, overflow) = anchorInstant.addingReportingOverflow(5_000_000_000)
@@ -88,9 +90,24 @@ struct AudioSessionAcquisitionDeadline: Sendable, Equatable {
     }
 
     func remainingNanoseconds(at instant: UInt64) -> UInt64 {
-        instant < deadlineInstant ? deadlineInstant - max(anchorInstant, instant) : 0
+        parkedRemainingNanoseconds ?? (instant < deadlineInstant ? deadlineInstant - max(anchorInstant, instant) : 0)
     }
-    func isExpired(at instant: UInt64) -> Bool { instant >= deadlineInstant }
+    func isExpired(at instant: UInt64) -> Bool { remainingNanoseconds(at: instant) == 0 }
+
+    /// Only the physically settled, configured lease may park for a user action.
+    mutating func park(at instant: UInt64) {
+        guard !isParked else { return }
+        parkedRemainingNanoseconds = remainingNanoseconds(at: instant)
+    }
+
+    /// The next physical claim consumes the same unspent allowance, never a fresh five seconds.
+    mutating func resume(at instant: UInt64) throws {
+        guard let remaining = parkedRemainingNanoseconds else { return }
+        let (deadline, overflow) = instant.addingReportingOverflow(remaining)
+        guard !overflow else { throw PlaybackSafetyFailure.clockOverflow }
+        deadlineInstant = deadline
+        parkedRemainingNanoseconds = nil
+    }
 }
 struct CleanupBudgetTicket: Sendable, Equatable {
     let predecessorIdentity: ControlResourceIdentity

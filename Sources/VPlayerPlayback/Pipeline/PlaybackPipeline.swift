@@ -7,6 +7,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import OSLog
 import VideoToolbox
 import VPlayerCore
 
@@ -155,6 +156,9 @@ extension PlaybackTunable {
 
 protocol PlaybackVideoRendering: AnyObject, Sendable, PlaybackTunable {
     func enqueue(_ frame: VideoPresentationFrame)
+    var isDrainedForNaturalEOF: Bool { get }
+    var naturalEOFDrainFailure: PlaybackCoreError? { get }
+    var naturalEOFAcceptedEndPTS: CMTime? { get }
     func flush(to generation: MediaGeneration)
     func reset(_ request: VideoRendererResetRequest, completion: @escaping SystemVideoOutput.Acceptance)
     func resetPresentationTiming()
@@ -163,6 +167,10 @@ protocol PlaybackVideoRendering: AnyObject, Sendable, PlaybackTunable {
 }
 
 extension PlaybackVideoRendering {
+    var isDrainedForNaturalEOF: Bool { true }
+    var naturalEOFDrainFailure: PlaybackCoreError? { nil }
+    var naturalEOFAcceptedEndPTS: CMTime? { nil }
+
     func reset(_ request: VideoRendererResetRequest, completion: @escaping SystemVideoOutput.Acceptance) {
         flush(to: request.generation)
         for frame in request.seedFrames { enqueue(frame) }
@@ -224,18 +232,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         let routeRevision: UInt64?
     }
 
-    private struct AudioSupplyCoverageIdentity: Equatable {
-        let epoch: UInt64
-        let generation: MediaGeneration
-        let island: AudioContinuityIslandID
-        let queueEpisode: UInt64
-
-        init(_ coverage: AudioRendererAcceptedCoverage) {
-            epoch = coverage.epoch
-            generation = coverage.generation
-            island = coverage.continuityIslandID
-            queueEpisode = coverage.queueEpisode
-        }
+    /// 一次补余量暂停只属于开始它的就绪周期；暂停、停止、撤销授权或重新锚定后，
+    /// 过期的恢复回调不能重新签发播放速率。
+    private struct AudioSupplyHold: Equatable {
+        let token: UInt64
+        let readinessCycleID: UInt64
     }
 
     private struct AnchorPreparationTransaction {
@@ -284,6 +285,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         }
     }
 
+    private static let logger = Logger(
+        subsystem: "com.vforce.vplayer",
+        category: "PlaybackPipeline"
+    )
     static let deferredPacketCapacity = 32
     static let pendingTrackMediaCapacity = 96
     // Compressed access units are tiny beside decoded 4K P010 surfaces. This
@@ -397,7 +402,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private let signposts: PlaybackSignposts?
     private let videoDecodeStallTimeout: DispatchTimeInterval
     private let videoDecodeStallScheduler: VideoDecodeStallScheduler
-    private let audioSupplyTimeProvider: @Sendable () -> TimeInterval
+    private let audioSupplyHoldScheduler: VideoDecodeStallScheduler
     private let pendingTrackAudioRetentionLimits: CompressedAudioRetentionLimits
     private var videoCoordinator: VideoPipelineCoordinator!
 
@@ -440,6 +445,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private var paused = false
     private var started = false
     private var terminal = false
+    private var inputEnded = false
+    private var naturalEOFAssemblersDrained = false
+    private var naturalEOFVideoDrainStarted = false
+    private var naturalEOFVideoDrained = false
+    private var naturalEOFProgressScheduled = false
+    private var advancingNaturalEOF = false
+    private var naturalEOFTailEndPTS: CMTime?
+    private var naturalEOFAudioEndPTS: CMTime?
+    private var naturalEOFVideoEndPTS: CMTime?
+    private var naturalEOFConsumedVideoEndPTS: CMTime?
+    private var pendingFiniteTailReset: UUID?
     private var normalStopInProgress = false
     private var normalStopCompleted = false
     private var displayClearInProgress = false
@@ -460,11 +476,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private var readinessCycle: UInt64 = 0
     private var permittedOutputRate: Float = 0
     private var outputRateInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
-    private var audioSupplyClockPolicy = PlaybackAudioSupplyClockPolicy()
-    private var audioSupplyClockMultiplier: Float = 1
-    private var audioSupplyCoverageIdentity: AudioSupplyCoverageIdentity?
-    private var audioSupplyLastObservationAt: TimeInterval?
-    private var audioSupplyReadinessCycle: UInt64?
+    // 已为哪个就绪周期打开共享时间线并应用正速率；同一周期的 readiness 刷新不重复应用。
+    private var sharedTimelineRateCycle: UInt64?
+    private var audioSupplyHold: AudioSupplyHold?
+    private var nextAudioSupplyHoldToken: UInt64 = 0
+#if DEBUG
+    private var lastAudioSupplyDiagnosticLogUptime: TimeInterval?
+#endif
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
     private var pendingTrackVideo = CompressedVideoReservoir(
@@ -528,9 +546,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         presentationContext: PlaybackPresentationContext? = nil,
         metrics: PlaybackMetrics? = nil,
         signposts: PlaybackSignposts? = nil,
-        audioSupplyTimeProvider: @escaping @Sendable () -> TimeInterval = {
-            ProcessInfo.processInfo.systemUptime
-        }
+        audioSupplyHoldScheduler: VideoDecodeStallScheduler? = nil
     ) {
         self.executor = executor
         self.tuning = tuning
@@ -543,6 +559,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             }
         } else {
             self.videoDecodeStallScheduler = { delay, operation in
+                executor.submit(after: delay, operation)
+            }
+        }
+        if let audioSupplyHoldScheduler {
+            self.audioSupplyHoldScheduler = { delay, operation in
+                audioSupplyHoldScheduler(delay) {
+                    executor.submit(operation)
+                }
+            }
+        } else {
+            self.audioSupplyHoldScheduler = { delay, operation in
                 executor.submit(after: delay, operation)
             }
         }
@@ -564,7 +591,6 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         self.presentationContext = presentationContext
         self.metrics = metrics
         self.signposts = signposts
-        self.audioSupplyTimeProvider = audioSupplyTimeProvider
         videoCoordinator = VideoPipelineCoordinator(
             decoder: decoder,
             passthrough: processor,
@@ -666,7 +692,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 }
                 permittedOutputRate = 0
                 outputRateInvocation = nil
-                resetAudioSupplyClockAdjustmentIsolated()
+                audioSupplyHold = nil
                 systemClock.setRate(0)
                 continuation.resume(returning: systemClock.synchronizer.rate)
             }
@@ -1009,7 +1035,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
 
     private func handleDemux(_ event: DemuxEvent, acknowledgement: DispatchSemaphore) {
         assertIsolated()
-        guard !terminal else {
+        guard !terminal, !inputEnded else {
             acknowledgement.signal()
             return
         }
@@ -1045,7 +1071,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                     timelineReset: reason == .timelineReset
                 )
             case .endOfStream:
-                stopIsolated(publish: true, completion: nil)
+                inputEnded = true
+                advanceNaturalEOFIsolated()
             case .cancelled:
                 failIsolated(.cancelled)
             case let .failure(error):
@@ -1458,6 +1485,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             effectiveCoverageStartPTS: admitted.effectiveCoverageStartPTS
         )
         try audio.enqueue(sample)
+        let audioEnd = CMTimeAdd(sample.presentationTimeStamp, sample.duration)
+        recordNaturalEOFTailEndIsolated(audioEnd)
+        if audioEnd.isNumeric,
+           naturalEOFAudioEndPTS.map({ CMTimeCompare(audioEnd, $0) > 0 }) ?? true {
+            naturalEOFAudioEndPTS = audioEnd
+        }
         drainPendingVideoDecodeIsolated()
         boundRetainedVideoIsolated()
         updateReadinessIsolated()
@@ -1590,7 +1623,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         _ accessUnit: CompressedVideoAccessUnit
     ) -> Bool {
         assertIsolated()
-        if retainedVideo.isEmpty,
+        if !inputEnded, retainedVideo.isEmpty,
            interlacedStartupPrerollGeneration == accessUnit.generation,
            !hasInterlacedStartupPrerollIsolated() {
             return true
@@ -2109,6 +2142,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             admittedFrames = frames
         }
         for frame in admittedFrames where generationController.accepts(frame.generation) {
+            let videoEnd = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+            recordNaturalEOFTailEndIsolated(videoEnd)
+            if videoEnd.isNumeric,
+               naturalEOFVideoEndPTS.map({ CMTimeCompare(videoEnd, $0) > 0 }) ?? true {
+                naturalEOFVideoEndPTS = videoEnd
+            }
             videoDecodeBufferHorizon = effectiveVideoBufferHorizon(for: frame)
             updateMaximumAnchorLagIsolated(for: frame)
             if frame.duration.isNumeric,
@@ -2426,6 +2465,13 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private func advanceGenerationAndRebindAssemblyIsolated() -> MediaGeneration {
         assertIsolated()
         let generation = generationController.forceAdvance()
+        naturalEOFVideoDrainStarted = false
+        naturalEOFVideoDrained = false
+        naturalEOFTailEndPTS = nil
+        naturalEOFAudioEndPTS = nil
+        naturalEOFVideoEndPTS = nil
+        naturalEOFConsumedVideoEndPTS = nil
+        pendingFiniteTailReset = nil
         _ = assembly?.binding.rebind()
         return generation
     }
@@ -2506,8 +2552,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         assertIsolated()
         guard started, !terminal else { return }
         permittedOutputRate = rate
-        if rate != 1 { resetAudioSupplyClockAdjustmentIsolated() }
         if rate <= 0 {
+            audioSupplyHold = nil
             outputRateInvocation = nil
             clock.setRate(rate)
         } else {
@@ -2521,14 +2567,18 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
               !paused,
               readiness?.isOpen == true,
               audio.isOutputRouteReadyForSharedAnchor else { return }
-        // 微补偿仅覆盖直播的一倍速；其他名义速率不能继承上一轮补偿。
-        let supplyMultiplier: Float = permittedOutputRate == 1 ? audioSupplyClockMultiplier : 1
-        let rate = permittedOutputRate * supplyMultiplier
+        if let hold = audioSupplyHold {
+            if hold.readinessCycleID == readiness?.cycleID {
+                return
+            }
+            audioSupplyHold = nil
+        }
+        let rate = permittedOutputRate
         if let invocation = outputRateInvocation {
             guard invocation.performCurrentPlaybackRateSideEffect({ clock.setRate(rate) }) else {
                 permittedOutputRate = 0
                 outputRateInvocation = nil
-                resetAudioSupplyClockAdjustmentIsolated()
+                audioSupplyHold = nil
                 clock.setRate(0)
                 return
             }
@@ -2536,7 +2586,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             // 真实 SDK 时钟不能接受缺少当前授权的正速率；隔离测试的时钟无需 Registry。
             guard !(clock is RenderSynchronizerClock) else {
                 permittedOutputRate = 0
-                resetAudioSupplyClockAdjustmentIsolated()
+                audioSupplyHold = nil
                 clock.setRate(0)
                 return
             }
@@ -2544,54 +2594,52 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         }
     }
 
-    private func resetAudioSupplyClockAdjustmentIsolated() {
-        audioSupplyClockPolicy.reset()
-        audioSupplyClockMultiplier = 1
-        audioSupplyCoverageIdentity = nil
-        audioSupplyLastObservationAt = nil
-        audioSupplyReadinessCycle = nil
-    }
-
-    private func updateAudioSupplyClockIsolated() {
+    private func updateAudioSupplyHoldIsolated() {
         assertIsolated()
-        guard let observer = audio as? any AudioRendererCoverageObserving,
-              permittedOutputRate == 1, !paused, !terminal,
-              mediaAdmissionOpen, hasOpenedReadinessForCurrentMedia,
-              readiness?.isOpen == true, anchorPreparationTransaction == nil,
-              audio.isOutputRouteReadyForSharedAnchor else {
-            resetAudioSupplyClockAdjustmentIsolated()
-            return
-        }
-        let now = audioSupplyTimeProvider()
-        guard now.isFinite,
-              audioSupplyLastObservationAt.map({ now - $0 >= 1 }) ?? true else { return }
-        audioSupplyLastObservationAt = now
+        guard !inputEnded, let observer = audio as? any AudioRendererCoverageObserving,
+              permittedOutputRate > 0,
+              !paused,
+              !terminal,
+              mediaAdmissionOpen,
+              hasOpenedReadinessForCurrentMedia,
+              let readiness,
+              readiness.isOpen,
+              anchorPreparationTransaction == nil,
+              audio.isOutputRouteReadyForSharedAnchor,
+              audioSupplyHold == nil else { return }
         guard let coverage = observer.acceptedCoverage,
-              coverage.generation == generationController.current else {
-            // 同一授权期间的系统清空只撤销观察窗口，不反复改变非零速率。
-            audioSupplyCoverageIdentity = nil
-            audioSupplyClockPolicy.reset(keepingMultiplier: audioSupplyClockMultiplier)
-            return
-        }
-        let identity = AudioSupplyCoverageIdentity(coverage)
-        if audioSupplyCoverageIdentity != identity {
-            audioSupplyCoverageIdentity = identity
-            audioSupplyClockPolicy.reset(keepingMultiplier: audioSupplyClockMultiplier)
-        }
-        let clockTime = clock.currentTime
-        guard clockTime.isNumeric,
-              coverage.firstPTS.isNumeric, coverage.endPTS.isNumeric,
-              CMTimeCompare(clockTime, coverage.firstPTS) >= 0 else { return }
-        let targetLead = CMTimeAdd(audio.anchorLeadTime, CMTime(value: 1, timescale: 10))
-        guard let multiplier = audioSupplyClockPolicy.observe(
-            acceptedEnd: coverage.endPTS,
-            clockTime: clockTime,
-            monotonicTime: now,
-            targetLead: targetLead
+              coverage.generation == generationController.current else { return }
+        let lead = CMTimeSubtract(coverage.endPTS, clock.currentTime)
+        guard let duration = PlaybackAudioSupplyHoldPolicy.holdDuration(
+            lead: lead,
+            outputLatency: audio.outputLatency,
+            anchorLeadTime: audio.anchorLeadTime
         ) else { return }
-        audioSupplyClockMultiplier = multiplier
-        // 观察和调节不发行播放权限，只能沿既有 rate owner 使用仍有效的授权。
-        applyPermittedOutputRateIsolated()
+#if DEBUG
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastAudioSupplyDiagnosticLogUptime.map({ now - $0 >= 1 }) ?? true {
+            lastAudioSupplyDiagnosticLogUptime = now
+            let leadMs = Int((lead.seconds * 1_000).rounded())
+            let holdMs = Int((duration.seconds * 1_000).rounded())
+            Self.logger.debug("audio supply hold: lead=\(leadMs)ms duration=\(holdMs)ms")
+        }
+#endif
+        nextAudioSupplyHoldToken &+= 1
+        let token = nextAudioSupplyHoldToken
+        let hold = AudioSupplyHold(token: token, readinessCycleID: readiness.cycleID)
+        audioSupplyHold = hold
+        clock.pause()
+        audioSupplyHoldScheduler(.nanoseconds(Int(duration.seconds * 1e9))) { [weak self] in
+            guard let self else { return }
+            guard self.audioSupplyHold == hold else { return }
+            guard self.readiness?.cycleID == hold.readinessCycleID,
+                  self.readiness?.isOpen == true else {
+                self.audioSupplyHold = nil
+                return
+            }
+            self.audioSupplyHold = nil
+            self.applyPermittedOutputRateIsolated()
+        }
     }
 
     private func setPausedIsolated(_ shouldPause: Bool, readinessCycle: UInt64) {
@@ -2600,7 +2648,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         self.readinessCycle = readinessCycle
         paused = shouldPause
         if shouldPause {
-            resetAudioSupplyClockAdjustmentIsolated()
+            audioSupplyHold = nil
             invalidateVideoDecodeStallWatchdogIsolated()
             permittedOutputRate = 0
             outputRateInvocation = nil
@@ -2646,6 +2694,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         reopenCoordinatorAdmissionIsolated()
         scheduleVideoDecodeStallWatchdogIfNeededIsolated()
         updateReadinessIsolated()
+        advanceNaturalEOFIsolated()
     }
 
     private func activeAudioIntervalIsolated() -> (first: CMTime, duration: CMTime)? {
@@ -2671,16 +2720,45 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         return false
     }
 
+    private var hasOnlyAudioTailAtNaturalEOF: Bool {
+        naturalEOFVideoDrained && !retainedVideo.contains { frame in
+            let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
+            return end.isNumeric && CMTimeCompare(end, clock.currentTime) > 0
+        }
+    }
+
+    private func drainedFiniteTailAnchorIsolated() -> (time: CMTime, end: CMTime)? {
+        guard inputEnded, naturalEOFVideoDrained, hasOpenedReadinessForCurrentMedia,
+              audio.isDrainedForNaturalEOF,
+              let audioEnd = audio.naturalEOFAcceptedEndPTS ?? naturalEOFAudioEndPTS,
+              let mediaEnd = naturalEOFTailEndPTS, clock.currentTime.isNumeric,
+              CMTimeCompare(clock.currentTime, audioEnd) >= 0 else { return nil }
+        var time = clock.currentTime
+        if let floor = readiness?.minimumRecoveryAnchorPTS { time = CMTimeMaximum(floor, time) }
+        let end = CMTimeAdd(mediaEnd, audio.outputLatency)
+        guard end.isNumeric, CMTimeCompare(time, end) < 0 else { return nil }
+        return (time, end)
+    }
+
     private func updateReadinessIsolated() {
         assertIsolated()
-        defer { updateAudioSupplyClockIsolated() }
+        defer { updateAudioSupplyHoldIsolated() }
         guard !terminal, mediaAdmissionOpen, !paused, let readiness else { return }
         readiness.setAnchorLeadTime(audio.anchorLeadTime)
         guard audio.isOutputRouteReadyForSharedAnchor else {
             updateReadinessDiagnosticsIsolated(readiness)
             return
         }
-        if tracks?.video == nil {
+        if let tail = drainedFiniteTailAnchorIsolated() {
+            if readiness.openDrainedFiniteTail(at: tail.time, through: tail.end),
+               !readyPublished || displayResumedCycle != readiness.cycleID {
+                displayResumedCycle = readiness.cycleID
+                resumeDisplayForOpenReadinessGateIsolated()
+            }
+            updateReadinessDiagnosticsIsolated(readiness)
+            return
+        }
+        if tracks?.video == nil || hasOnlyAudioTailAtNaturalEOF {
             updateAudioOnlyReadinessIsolated()
             updateReadinessDiagnosticsIsolated(readiness)
             return
@@ -2791,7 +2869,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     // floor reject every old anchor and retained frame before that paused time.
     private func resyncIfVideoTrailsClockIsolated() {
         assertIsolated()
-        guard let readiness, readiness.isOpen, !paused, !terminal,
+        guard !naturalEOFVideoDrained, let readiness, readiness.isOpen, !paused, !terminal,
               let newest = retainedVideo.last else { return }
         let newestEnd = CMTimeAdd(newest.presentationTimeStamp, newest.duration)
         let now = clock.currentTime
@@ -2946,7 +3024,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         guard synchronizeAudioRecoveryFloorIsolated(
             readiness.minimumRecoveryAnchorPTS
         ) else { return }
-        if !readyPublished || audioSupplyReadinessCycle != readiness.cycleID {
+        if !readyPublished || sharedTimelineRateCycle != readiness.cycleID {
             setSharedTimelineOpenedIsolated(true)
             applyPermittedOutputRateIsolated()
         }
@@ -3164,9 +3242,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
            CMTimeCompare(commonPTS, floor) < 0 {
             return false
         }
+        observeConsumedNaturalEOFVideoIsolated()
+        if let tail = drainedFiniteTailAnchorIsolated(),
+           CMTimeCompare(commonPTS, tail.time) == 0 {
+            return prepareDrainedFiniteTailIsolated(at: commonPTS)
+        }
         let expectedCycle = readiness.cycleID
         let expectedRouteRevision = audio.currentRouteSnapshot?.revision
-        let requiresVideo = tracks?.video != nil
+        let requiresVideo = tracks?.video != nil && !hasOnlyAudioTailAtNaturalEOF
         guard synchronizeAudioRecoveryFloorIsolated(
             readiness.minimumRecoveryAnchorPTS
         ) else { return false }
@@ -3265,6 +3348,52 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                   requireVideo: requiresVideo
               ) else { return false }
         return true
+    }
+
+    private func prepareDrainedFiniteTailIsolated(at time: CMTime) -> Bool {
+        guard pendingFiniteTailReset == nil, renderer.isDrainedForNaturalEOF else { return false }
+        guard let videoEnd = naturalEOFVideoEndPTS, CMTimeCompare(time, videoEnd) < 0 else {
+            return true // Only device output latency remains.
+        }
+        if let acceptedEnd = renderer.naturalEOFAcceptedEndPTS,
+           CMTimeCompare(acceptedEnd, videoEnd) >= 0 { return true }
+        // A renderer reset removed its previous queue proof. Replay only the
+        // retained unplayed video, including the frame spanning the paused time.
+        let seeds = retainedVideo.filter {
+            CMTimeCompare(CMTimeAdd($0.presentationTimeStamp, $0.duration), time) > 0
+        }
+        guard !seeds.isEmpty else {
+            failIsolated(.videoRendererFailed("renderer.eof-tail-unavailable"))
+            return false
+        }
+        let token = UUID()
+        let expectedGeneration = generationController.current
+        let expectedCycle = readiness?.cycleID
+        let expectedRoute = audio.currentRouteSnapshot?.revision
+        let expectedSequences = Set(seeds.map(\.sequenceNumber))
+        pendingFiniteTailReset = token
+        renderer.reset(.init(generation: expectedGeneration, reason: .decoderRecovery,
+            removeDisplayedImage: false, seedFrames: seeds)) { [weak self] result in
+            self?.executor.submit { [weak self] in
+                guard let self, pendingFiniteTailReset == token else { return }
+                pendingFiniteTailReset = nil
+                guard !terminal, !paused, naturalEOFVideoDrained,
+                      generationController.current == expectedGeneration,
+                      readiness?.cycleID == expectedCycle,
+                      outputRouteRevisionMatchesIsolated(expectedRoute) else { return }
+                switch result {
+                case let .success(receipt):
+                    guard receipt.generation == expectedGeneration,
+                          receipt.sequenceNumbers == expectedSequences else {
+                        failIsolated(.videoRendererFailed("renderer.eof-tail-receipt"))
+                        return
+                    }
+                    updateReadinessIsolated()
+                case let .failure(error): failIsolated(error)
+                }
+            }
+        }
+        return false
     }
 
     private func completeAnchorPreparationIsolated(
@@ -3393,9 +3522,131 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
             return end.isNumeric
                 && CMTimeCompare(end, commonPTS) > 0
-                && CMTimeCompare(end, audioEnd) <= 0
+                && (CMTimeCompare(end, audioEnd) <= 0
+                    || (naturalEOFVideoDrained && CMTimeCompare(frame.presentationTimeStamp, audioEnd) < 0))
         }.count
-        return coveredVideoCount >= videoCoordinator.requiredVideoFrameCount
+        return coveredVideoCount >= (naturalEOFVideoDrained ? 1 : videoCoordinator.requiredVideoFrameCount)
+    }
+
+    /// Sample the successful current-queue proof before an audio-only reanchor
+    /// clears video that has already played. An empty queue observed only after
+    /// a reset cannot manufacture this generation-scoped completion watermark.
+    private func observeConsumedNaturalEOFVideoIsolated() {
+        guard inputEnded, naturalEOFVideoDrained, renderer.isDrainedForNaturalEOF,
+              let acceptedEnd = renderer.naturalEOFAcceptedEndPTS,
+              clock.currentTime.isNumeric, CMTimeCompare(clock.currentTime, acceptedEnd) >= 0 else { return }
+        if naturalEOFConsumedVideoEndPTS.map({ CMTimeCompare(acceptedEnd, $0) > 0 }) ?? true {
+            naturalEOFConsumedVideoEndPTS = acceptedEnd
+        }
+    }
+
+    private func recordNaturalEOFTailEndIsolated(_ end: CMTime) {
+        guard end.isNumeric else { return }
+        if naturalEOFTailEndPTS.map({ CMTimeCompare(end, $0) > 0 }) ?? true {
+            naturalEOFTailEndPTS = end
+        }
+    }
+
+    /// Input completion is not output completion. Keep normal media admission,
+    /// current generation, and rate permission while draining already accepted work.
+    private func advanceNaturalEOFIsolated() {
+        assertIsolated()
+        guard inputEnded, !terminal, !paused, !advancingNaturalEOF else { return }
+        advancingNaturalEOF = true
+        defer {
+            advancingNaturalEOF = false
+            scheduleNaturalEOFProgressIsolated()
+        }
+        guard deferredPackets.isEmpty, pendingPacketAdmission == nil else { return }
+        if !naturalEOFAssemblersDrained {
+            naturalEOFAssemblersDrained = true
+            do {
+                try videoAssembler?.drain()
+                try audioAssembler?.drain()
+            } catch let error as PlaybackCoreError {
+                failIsolated(error)
+                return
+            } catch {
+                failIsolated(.capture(error, stage: "pipeline.eof"))
+                return
+            }
+        }
+        guard !terminal else { return }
+        // A pending format commit must enqueue its retained audio before closing
+        // the audio input. Its completion may occur after the parser drain above.
+        guard pendingVideoFormatCommit == nil, pendingTrackAudio.isEmpty,
+              pendingTrackVideo.isEmpty else { return }
+        audio.finishInputForNaturalEOF()
+        guard !terminal else { return }
+        drainPendingVideoDecodeIsolated()
+        if !naturalEOFVideoDrainStarted, pendingVideoDecode.isEmpty,
+           !videoCoordinator.isDecoderTransitionPending {
+            naturalEOFVideoDrainStarted = true
+            if videoFormat == nil {
+                naturalEOFVideoDrained = true
+            } else {
+                let expectedGeneration = generationController.current
+                videoCoordinator.drainForNaturalEOF { [weak self] outcome in
+                    guard let self else { return }
+                    executor.submit { [weak self] in
+                        guard let self, !terminal, inputEnded,
+                              generationController.accepts(expectedGeneration),
+                              naturalEOFVideoDrainStarted else { return }
+                        switch outcome {
+                        case .completed:
+                            naturalEOFVideoDrained = true
+                            advanceNaturalEOFIsolated()
+                        case let .failed(failure):
+                            failIsolated(Self.coreError(for: failure))
+                        }
+                    }
+                }
+            }
+        }
+        if naturalEOFVideoDrained {
+            if let failure = renderer.naturalEOFDrainFailure {
+                failIsolated(failure)
+                return
+            }
+            observeConsumedNaturalEOFVideoIsolated()
+            // EOF may contain fewer frames than the steady-state startup target.
+            // One final complete frame is enough; anchor/route/rate checks remain.
+            readiness?.configureForNaturalEOF()
+        }
+        updateReadinessIsolated()
+        guard naturalEOFVideoDrained, pendingVideoDecode.isEmpty,
+              outstandingVideoDecodeSubmissions.isEmpty,
+              anchorPreparationTransaction == nil,
+              audio.isDrainedForNaturalEOF, renderer.isDrainedForNaturalEOF else { return }
+        if let end = audio.naturalEOFAcceptedEndPTS { recordNaturalEOFTailEndIsolated(end) }
+        if let end = naturalEOFTailEndPTS {
+            let audibleEnd = CMTimeAdd(end, audio.outputLatency)
+            guard clock.currentTime.isNumeric, audibleEnd.isNumeric,
+                  CMTimeCompare(clock.currentTime, audibleEnd) >= 0 else { return }
+        }
+        if let videoEnd = naturalEOFVideoEndPTS {
+            let completedEnd = [renderer.naturalEOFAcceptedEndPTS, naturalEOFConsumedVideoEndPTS]
+                .compactMap { $0 }.max { CMTimeCompare($0, $1) < 0 }
+            guard let completedEnd, CMTimeCompare(completedEnd, videoEnd) >= 0 else {
+                // An empty replacement queue is not evidence that the old final
+                // image crossed the current renderer boundary.
+                failIsolated(.videoRendererFailed("renderer.eof-tail-unaccepted"))
+                return
+            }
+        }
+        stopIsolated(publish: true, completion: nil)
+    }
+
+    private func scheduleNaturalEOFProgressIsolated() {
+        guard inputEnded, !terminal, !paused, !naturalEOFProgressScheduled else { return }
+        naturalEOFProgressScheduled = true
+        // No source callback is expected after EOF. A single weak, serial timer
+        // advances credit-bound decode/output queues and observes the shared clock.
+        executor.submit(after: .milliseconds(20)) { [weak self] in
+            guard let self else { return }
+            naturalEOFProgressScheduled = false
+            advanceNaturalEOFIsolated()
+        }
     }
 
     private func stopIsolated(
@@ -3423,7 +3674,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         normalStopInProgress = true
         permittedOutputRate = 0
         outputRateInvocation = nil
-        resetAudioSupplyClockAdjustmentIsolated()
+        audioSupplyHold = nil
         normalStopPublishes = publish
         if let completion { stopCompletions.append(completion) }
         finishModeSwitchSignpostIsolated()
@@ -3438,8 +3689,10 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         clock.pause()
         // Normal teardown owns each deterministic stage independently. A malformed
         // tail in one component must not skip later waits or invalidation.
-        do { try videoAssembler?.drain() } catch {}
-        do { try audioAssembler?.drain() } catch {}
+        if !naturalEOFAssemblersDrained {
+            do { try videoAssembler?.drain() } catch {}
+            do { try audioAssembler?.drain() } catch {}
+        }
         videoCoordinator.stop(emergency: false)
         let generation = generationController.current
         renderer.flush(to: generation)
@@ -3555,9 +3808,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private func setSharedTimelineOpenedIsolated(_ opened: Bool) {
         assertIsolated()
         let cycle = opened ? readiness?.cycleID : nil
-        if !opened || audioSupplyReadinessCycle != cycle {
-            resetAudioSupplyClockAdjustmentIsolated()
-            audioSupplyReadinessCycle = cycle
+        if !opened || sharedTimelineRateCycle != cycle {
+            audioSupplyHold = nil
+            sharedTimelineRateCycle = cycle
         }
         hasOpenedReadinessForCurrentMedia = opened
         resetInterlacedStartupPrerollIsolated()
@@ -3701,7 +3954,6 @@ final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked S
         // This exact object belongs to the visible AVSampleBufferDisplayLayer.
         // Attach it before the output adapter exists, so no video sample can be
         // enqueued outside the audio renderer's shared system timebase.
-        synchronizer.addRenderer(videoRenderer)
         let recommendedPixelBufferAttributes = videoRenderer
             .recommendedPixelBufferAttributes
         #if DEBUG

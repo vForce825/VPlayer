@@ -5,6 +5,42 @@
 import Foundation
 
 final class StubURLProtocol: URLProtocol, @unchecked Sendable {
+    /// Withholds one chunk without blocking a URLSession or callback queue.
+    final class ChunkDeliveryGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private let onDeliveryAttempt: @Sendable () -> Void
+        private var isReleased = false
+        private var pendingDelivery: (@Sendable () -> Void)?
+
+        init(onDeliveryAttempt: @escaping @Sendable () -> Void) {
+            self.onDeliveryAttempt = onDeliveryAttempt
+        }
+
+        fileprivate func deliverWhenReleased(_ operation: @escaping @Sendable () -> Void) {
+            let delivery: @Sendable () -> Void = { [onDeliveryAttempt] in
+                operation()
+                onDeliveryAttempt()
+            }
+            let deliverNow = lock.withLock {
+                if isReleased { return true }
+                precondition(pendingDelivery == nil, "Use a separate gate for each chunk")
+                pendingDelivery = delivery
+                return false
+            }
+            if deliverNow { delivery() }
+        }
+
+        func release() {
+            let delivery = lock.withLock {
+                isReleased = true
+                let delivery = pendingDelivery
+                pendingDelivery = nil
+                return delivery
+            }
+            delivery?()
+        }
+    }
+
     struct Plan: @unchecked Sendable {
         enum Response: @unchecked Sendable {
             case http(statusCode: Int, headers: [String: String] = [:])
@@ -19,19 +55,22 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         var error: NSError?
         var completes: Bool
         var callbackDelay: TimeInterval
+        var chunkDeliveryGates: [Int: ChunkDeliveryGate]
 
         init(
             response: Response = .http(statusCode: 200),
             chunks: [Data] = [],
             error: NSError? = nil,
             completes: Bool = true,
-            callbackDelay: TimeInterval = 0.001
+            callbackDelay: TimeInterval = 0.001,
+            chunkDeliveryGates: [Int: ChunkDeliveryGate] = [:]
         ) {
             self.response = response
             self.chunks = chunks
             self.error = error
             self.completes = completes
             self.callbackDelay = callbackDelay
+            self.chunkDeliveryGates = chunkDeliveryGates
         }
     }
 
@@ -177,6 +216,18 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     private func deliver(plan: Plan, chunkAt index: Int) {
+        if let gate = plan.chunkDeliveryGates[index] {
+            gate.deliverWhenReleased { [self] in
+                deliverChunk(plan: plan, at: index)
+            }
+        } else {
+            deliverChunk(plan: plan, at: index)
+        }
+    }
+
+    private func deliverChunk(plan: Plan, at index: Int) {
+        // Recheck after a gate opens, including when stopLoading arrived before
+        // the withheld callback was scheduled.
         guard !stopped else { return }
         guard index < plan.chunks.count else {
             if let error = plan.error {

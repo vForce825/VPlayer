@@ -8,11 +8,16 @@ public actor URLSessionBoundedDownloader:
     BoundedHTTPDownloading,
     RemoteResourceDownloading {
     
+    private enum DownloadEvent: Sendable {
+        case responseURL(URL)
+        case data(Data)
+    }
+
     private final class SingleDownloadDelegate: NSObject, URLSessionDataDelegate, Sendable {
         let byteLimit: Int64
-        let continuation: AsyncThrowingStream<Data, any Error>.Continuation
+        let continuation: AsyncThrowingStream<DownloadEvent, any Error>.Continuation
         
-        init(byteLimit: Int64, continuation: AsyncThrowingStream<Data, any Error>.Continuation) {
+        init(byteLimit: Int64, continuation: AsyncThrowingStream<DownloadEvent, any Error>.Continuation) {
             self.byteLimit = byteLimit
             self.continuation = continuation
         }
@@ -28,7 +33,8 @@ public actor URLSessionBoundedDownloader:
                 completionHandler(.cancel)
                 return
             }
-            guard URLSessionBoundedDownloader.isRemoteHTTPURL(httpResponse.url) else {
+            guard let responseURL = httpResponse.url,
+                  URLSessionBoundedDownloader.isRemoteHTTPURL(responseURL) else {
                 continuation.yield(with: .failure(RemoteDownloadError.invalidResponse))
                 completionHandler(.cancel)
                 return
@@ -44,6 +50,7 @@ public actor URLSessionBoundedDownloader:
                 completionHandler(.cancel)
                 return
             }
+            continuation.yield(.responseURL(responseURL))
             completionHandler(.allow)
         }
         
@@ -68,7 +75,7 @@ public actor URLSessionBoundedDownloader:
             dataTask: URLSessionDataTask,
             didReceive data: Data
         ) {
-            continuation.yield(data)
+            continuation.yield(.data(data))
         }
         
         func urlSession(
@@ -218,7 +225,7 @@ public actor URLSessionBoundedDownloader:
         
         let (fileURL, fileHandle) = try makeTemporaryFile()
         
-        let (stream, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let (stream, continuation) = AsyncThrowingStream<DownloadEvent, any Error>.makeStream()
         let delegate = SingleDownloadDelegate(byteLimit: byteLimit, continuation: continuation)
         
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
@@ -230,22 +237,32 @@ public actor URLSessionBoundedDownloader:
         return try await withTaskCancellationHandler {
             task.resume()
             var byteCount: Int64 = 0
+            var responseURL: URL?
             do {
-                for try await data in stream {
+                for try await event in stream {
                     if Task.isCancelled {
                         throw RemoteDownloadError.cancelled
                     }
-                    if byteCount + Int64(data.count) > byteLimit {
-                        throw RemoteDownloadError.responseTooLarge(limit: byteLimit)
+                    switch event {
+                    case let .responseURL(url):
+                        responseURL = url
+                    case let .data(data):
+                        guard responseURL != nil else { throw RemoteDownloadError.invalidResponse }
+                        if byteCount + Int64(data.count) > byteLimit {
+                            throw RemoteDownloadError.responseTooLarge(limit: byteLimit)
+                        }
+                        try fileHandle.write(contentsOf: data)
+                        byteCount += Int64(data.count)
                     }
-                    try fileHandle.write(contentsOf: data)
-                    byteCount += Int64(data.count)
                 }
                 try fileHandle.close()
                 if Task.isCancelled {
                     throw RemoteDownloadError.cancelled
                 }
-                return DownloadedResource(temporaryFileURL: fileURL, byteCount: byteCount)
+                guard let responseURL else { throw RemoteDownloadError.invalidResponse }
+                return DownloadedResource(
+                    temporaryFileURL: fileURL, byteCount: byteCount, responseURL: responseURL
+                )
             } catch {
                 task.cancel()
                 continuation.finish()

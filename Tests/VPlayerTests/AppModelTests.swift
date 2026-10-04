@@ -4,6 +4,8 @@
 
 import Foundation
 import Observation
+import SwiftUI
+import UIKit
 import XCTest
 @testable import VPlayer
 @testable import VPlayerCore
@@ -11,6 +13,93 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testRecoveryCapacityWarningDoesNotBlockLibraryAndClearsAfterShrinking() async throws {
+        let suite = "AppModelTests.recovery-capacity.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let legacy = SwiftDataLibraryStore(modelContainer: container)
+        let input = try SourceProfileInput(
+            name: "Legacy", m3uURLString: "https://example.test/list.m3u",
+            epgURLString: "https://example.test/guide.xml",
+            m3uRefreshInterval: .sixHours, epgRefreshInterval: .daily
+        ).validated()
+        let profile = try await legacy.createProfile(input, now: Date())
+        for channelID in ["one", "two"] {
+            try await legacy.setManualMapping(
+                profileID: profile.id, channelID: channelID,
+                xmltvChannelID: String(repeating: "x", count: 145_000)
+            )
+        }
+        let repository = SwiftDataLibraryStore(modelContainer: container, profileMirror: SourceProfileMirror(defaults: defaults))
+        _ = try await repository.synchronizeProfileMirror()
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] })
+        let loaded = await model.reload()
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(model.activeProfile?.id, profile.id)
+        XCTAssertNotNil(model.recoveryWarningMessage)
+        XCTAssertNil(model.alertMessage)
+        let scene = try XCTUnwrap(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        )
+        let host = UIHostingController(rootView: SourceProfilesView(model: model)
+            .environment(\.colorScheme, .dark))
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1_920, height: 1_080)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        var warningPixels = 0
+        for _ in 0..<40 {
+            warningPixels = recoveryWarningOrangePixelCount(in: host.view)
+            if warningPixels > 20 { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertGreaterThan(warningPixels, 20,
+            "The production source list must visibly render its orange capacity warning")
+        try await repository.setManualMapping(profileID: profile.id, channelID: "one", xmltvChannelID: nil)
+        let reloaded = await model.reload()
+        XCTAssertTrue(reloaded)
+        XCTAssertNil(model.recoveryWarningMessage)
+        XCTAssertNil(model.alertMessage)
+        var remainingWarningPixels = warningPixels
+        for _ in 0..<40 {
+            remainingWarningPixels = recoveryWarningOrangePixelCount(in: host.view)
+            if remainingWarningPixels < warningPixels / 10 { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertLessThan(remainingWarningPixels, warningPixels / 10,
+            "Shrinking into the recovery budget must remove the visible warning")
+    }
+
+    private func recoveryWarningOrangePixelCount(in view: UIView) -> Int {
+        view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 0.25
+        format.preferredRange = .standard
+        let image = UIGraphicsImageRenderer(bounds: view.bounds, format: format).image { _ in
+            _ = view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        guard let image = image.cgImage else { return 0 }
+        let width = image.width
+        let height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        return pixels.withUnsafeMutableBytes { bytes in
+            guard let context = CGContext(
+                data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+            ) else { return 0 }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            let data = bytes.bindMemory(to: UInt8.self)
+            return stride(from: 0, to: data.count, by: 4).filter { offset in
+                data[offset] > 180 && data[offset + 1] > 60
+                    && data[offset + 1] < 200 && data[offset + 2] < 90
+            }.count
+        }
+    }
+
     func testReloadFailureShowsOriginalErrorTypeAndCase() async {
         let repository = RepositorySpy(profiles: [])
         await repository.setReadFailure(true)
@@ -5547,8 +5636,9 @@ private actor AppModelRefreshDownloader: RemoteResourceDownloading {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppModelRefreshDownloader-\(UUID().uuidString)")
         try payload.write(to: url, options: .atomic)
-        _ = request
-        return DownloadedResource(temporaryFileURL: url, byteCount: Int64(payload.count))
+        return DownloadedResource(
+            temporaryFileURL: url, byteCount: Int64(payload.count), responseURL: request.url
+        )
     }
 
     func waitUntilStarted() async {

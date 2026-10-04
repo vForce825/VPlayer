@@ -315,6 +315,45 @@ final class PlaybackRecoveryTestHarness: @unchecked Sendable {
 }
 
 final class PlaybackRecoveryTests: XCTestCase {
+    func testHLSResumePublishesPlayingWithoutSampleBufferReadyAndAllowsAnotherPause() async throws {
+        let harness = PlaybackRecoveryTestHarness()
+        await harness.playThroughHDMI()
+        await harness.switchToAirPlay()
+        let request = try XCTUnwrap(harness.currentRequest)
+        let backend = try XCTUnwrap(harness.createdBackends.last)
+        XCTAssertEqual(backend.kind, .hlsAVPlayer)
+        XCTAssertEqual(harness.currentState, .playing(request))
+        await harness.controller.setPaused(true)
+        XCTAssertEqual(harness.currentState, .paused(request))
+        await harness.controller.setPaused(false)
+        XCTAssertEqual(harness.currentState, .playing(request),
+            "HLS has no SampleBuffer ready event after successful activation")
+        await harness.controller.setPaused(true)
+        XCTAssertEqual(harness.currentState, .paused(request))
+        XCTAssertEqual(backend.activationCallCount, 2)
+        XCTAssertEqual(backend.suspendCallCount, 2)
+        await harness.stop()
+    }
+
+    func testPausedRouteRestorationRemainsActionableWithoutAutomaticActivation() async throws {
+        let harness = PlaybackRecoveryTestHarness()
+        await harness.playThroughHDMI()
+        let request = try XCTUnwrap(harness.currentRequest)
+        let backend = try XCTUnwrap(harness.createdBackends.first)
+        await harness.controller.setPaused(true)
+        XCTAssertEqual(harness.currentState, .paused(request))
+        let activationCount = backend.activationCallCount
+        await harness.switchToEmptyRoute()
+        await harness.switchToHDMI()
+        XCTAssertEqual(harness.currentState, .paused(request))
+        XCTAssertEqual(backend.activationCallCount, activationCount)
+        XCTAssertTrue(backend.isSuspendedSnapshot)
+        await harness.controller.setPaused(false)
+        XCTAssertEqual(backend.activationCallCount, activationCount + 1,
+            "The restored paused state must admit the user's explicit Resume")
+        await harness.stop()
+    }
+
     func testFullRouteHotSwitchHDMIToAirPlayAndBackToHDMI() async throws {
         let harness = PlaybackRecoveryTestHarness()
         await harness.playThroughHDMI()
@@ -452,7 +491,10 @@ final class PlaybackRecoveryTests: XCTestCase {
         for _ in 0..<40 {
             try? await Task.sleep(nanoseconds: 100_000_000)
             await harness.drainExecutor()
-            if harness.currentState == .failed(PlaybackController.routeUnavailableFailure) {
+            // First-failure publication intentionally precedes owned physical
+            // cleanup. The public state alone cannot certify backend retirement.
+            if harness.currentState == .failed(PlaybackController.routeUnavailableFailure),
+               initialBackend.isRetiredSnapshot {
                 break
             }
         }

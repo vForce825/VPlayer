@@ -384,10 +384,13 @@ public actor RefreshCoordinator {
 
             switch resource {
             case .playlist:
+                guard isRemoteHTTPURL(downloaded.responseURL) else {
+                    throw CoordinatorError.unsupportedRemoteURL
+                }
                 let data = try Data(contentsOf: downloaded.temporaryFileURL)
                 let channels = try M3UParser().parse(
                     data: data,
-                    sourceURL: sourceURL,
+                    sourceURL: downloaded.responseURL,
                     profileID: profileID
                 )
                 try Task.checkCancellation()

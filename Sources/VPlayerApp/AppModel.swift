@@ -65,6 +65,7 @@ final class AppModel {
     var programmesByChannelID: [String: [Programme]] = [:]
     var presentedPlaybackRequest: PlaybackRequest?
     var alertMessage: String?
+    private(set) var recoveryWarningMessage: String?
     var isLoading = false
 
     var alertTitle: String {
@@ -236,6 +237,10 @@ final class AppModel {
             try Task.checkCancellation()
             let loadedActiveProfile = try await repository.activeProfile()
             try Task.checkCancellation()
+            let recoveryStatus = await (repository as? any LibraryRecoveryStatusProviding)?.recoveryStatus()
+            try Task.checkCancellation()
+            guard reloadID == currentReloadID else { return .superseded }
+            recoveryWarningMessage = recoveryStatus?.warningMessage
 
             guard let loadedActiveProfile else {
                 return apply(
@@ -847,6 +852,10 @@ final class AppModel {
                 .manual
             )
             if let completionClaim {
+                // The persisted callback is awaited, but native observation has
+                // its own actor/stream delivery lane. Fence that lane before the
+                // claim closes so this same local commit cannot reload twice.
+                await libraryChanges?.flushCommittedChanges()
                 libraryChanges?.stopClaimingPersistedRefreshes(completionClaim)
             }
             guard let self else {

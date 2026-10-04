@@ -44,6 +44,7 @@ public final class PlaybackReadinessGate {
     private var video: VideoSnapshot?
     private var waitingForDisplayModeEnd = false
     private var audioOnlyOpen = false
+    private var permitsPartialFinalFrame = false
 
     public private(set) var isOpen = false
     public private(set) var cycleID: UInt64
@@ -102,6 +103,15 @@ public final class PlaybackReadinessGate {
 
     public func configure(requiredVideoFrameCount: Int) {
         self.requiredVideoFrameCount = max(1, requiredVideoFrameCount)
+        _ = attemptOpen()
+    }
+
+    /// A finite tail cannot meet a larger startup frame count or require audio
+    /// beyond EOF. Require a real overlapping interval and keep the normal anchor
+    /// veto, monotonic floor, display-mode gate, and rate-zero anchor.
+    func configureForNaturalEOF() {
+        permitsPartialFinalFrame = true
+        requiredVideoFrameCount = 1
         _ = attemptOpen()
     }
 
@@ -169,6 +179,27 @@ public final class PlaybackReadinessGate {
         clock.anchor(mediaTime: anchorPTS, atHostTime: anchorHostTime, rate: 0)
         minimumRecoveryAnchorPTS = nil
         audioOnlyOpen = true
+        isOpen = true
+        return true
+    }
+
+    /// Reopen only a previously started finite renderer tail that the caller has
+    /// proved fully accepted. Audio is exhausted, so seeking an audio anchor
+    /// would discard remaining video or strand the output-latency interval. The owner veto still validates
+    /// current output/generation/route permission; this method grants no rate.
+    @discardableResult
+    func openDrainedFiniteTail(at time: CMTime, through end: CMTime) -> Bool {
+        guard !isOpen else { return true }
+        guard permitsPartialFinalFrame, !waitingForDisplayModeEnd,
+              time.isNumeric, end.isNumeric, CMTimeCompare(time, end) < 0,
+              minimumRecoveryAnchorPTS.map({ CMTimeCompare(time, $0) >= 0 }) ?? true else { return false }
+        let openingCycle = cycleID
+        guard prepareAnchorVeto?(time) != false, cycleID == openingCycle,
+              !isOpen, !waitingForDisplayModeEnd else { return false }
+        let hostTime = CMTimeAdd(hostTimeProvider(), anchorLeadTime)
+        guard hostTime.isNumeric else { return false }
+        clock.anchor(mediaTime: time, atHostTime: hostTime, rate: 0)
+        minimumRecoveryAnchorPTS = nil
         isOpen = true
         return true
     }
@@ -341,7 +372,8 @@ public final class PlaybackReadinessGate {
         let coveredFrames = frames.filter { frame in
             let end = CMTimeAdd(frame.presentationTimeStamp, frame.duration)
             return CMTimeCompare(end, audio.firstPTS) > 0
-                && CMTimeCompare(end, audioEnd) <= 0
+                && (CMTimeCompare(end, audioEnd) <= 0
+                    || (permitsPartialFinalFrame && CMTimeCompare(frame.presentationTimeStamp, audioEnd) < 0))
         }
         guard coveredFrames.count >= requiredVideoFrameCount,
               let oldestCoveredFrame = coveredFrames.first else { return nil }

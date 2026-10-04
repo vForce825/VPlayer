@@ -47,7 +47,12 @@ fileprivate final class HLSVideoBatchAdmissionTail: @unchecked Sendable {
         self.onRelease = onRelease
     }
 
-    deinit { onRelease() }
+    deinit {
+        // Stored properties outlive this body. Return the credits before a
+        // consumer can retry from the wakeup, or it can miss the only release.
+        lease.release()
+        onRelease()
+    }
 }
 
 /// producer 所持有的有限合并唤醒器。owner 只设置一个待消费标志并广播条件，

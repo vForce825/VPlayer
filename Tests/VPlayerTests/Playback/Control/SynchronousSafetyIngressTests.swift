@@ -150,14 +150,19 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         let first = harness.cell.snapshot.system.latestResetIngress
         harness.system(.interruptionBegan, at: 120)
         harness.system(.interruptionEnded(shouldResume: true), at: 170)
+        XCTAssertEqual(harness.cell.snapshot.interruptionState, .ended(shouldResume: true))
+        XCTAssertTrue(harness.cell.snapshot.mediaServicesResumeRequired)
+        XCTAssertTrue(harness.cell.snapshot.interruptionVeto,
+            "A recommendation cannot replace the explicit post-reset user action")
         harness.system(.mediaServicesReset, at: 200)
         let state = harness.cell.snapshot
         XCTAssertEqual(state.system.firstUndrainedResetIngressInstant, 100)
         XCTAssertEqual(state.system.latestResetIngress?.ingressInstant, 200)
         XCTAssertNotEqual(first?.rootIdentity, state.system.latestResetIngress?.rootIdentity)
-        XCTAssertEqual(state.system.resetPreRouteClockFold?.effectiveNanoseconds, 50)
-        XCTAssertEqual(state.system.resetPreRouteClockFold?.frozen, false)
-        XCTAssertEqual(state.interruptionState, .ended(shouldResume: true))
+        XCTAssertEqual(state.system.resetPreRouteClockFold?.effectiveNanoseconds, 0)
+        XCTAssertEqual(state.system.resetPreRouteClockFold?.frozen, true)
+        XCTAssertEqual(state.interruptionState, .inactive)
+        XCTAssertTrue(state.mediaServicesResumeRequired)
         harness.releaseExecutor()
     }
 
@@ -167,10 +172,13 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         harness.system(.interruptionBegan, at: 100)
         harness.system(.mediaServicesReset, at: 110)
         harness.system(.interruptionEnded(shouldResume: false), at: 150)
-        harness.system(.mediaServicesReset, at: 200)
         XCTAssertEqual(harness.cell.snapshot.interruptionState, .ended(shouldResume: false))
         XCTAssertTrue(harness.cell.snapshot.interruptionVeto)
-        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 50)
+        harness.system(.mediaServicesReset, at: 200)
+        XCTAssertEqual(harness.cell.snapshot.interruptionState, .inactive)
+        XCTAssertTrue(harness.cell.snapshot.interruptionVeto)
+        XCTAssertTrue(harness.cell.snapshot.mediaServicesResumeRequired)
+        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 0)
         harness.releaseExecutor()
     }
 
@@ -392,8 +400,12 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         harness.system(.interruptionBegan, at: 130)
         harness.system(.interruptionEnded(shouldResume: true), at: 150)
         harness.system(.mediaServicesReset, at: 170)
-        XCTAssertEqual(harness.cell.snapshot.system.interruptionClockFold?.effectiveNanoseconds, 50)
-        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 30)
+        // Only the 100...120 pre-reset interval runs. No user action resumes
+        // either clock after reset; interruption recommendations cannot do so.
+        XCTAssertEqual(harness.cell.snapshot.system.interruptionClockFold?.effectiveNanoseconds, 20)
+        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.effectiveNanoseconds, 0)
+        XCTAssertEqual(harness.cell.snapshot.system.resetPreRouteClockFold?.frozen, true)
+        XCTAssertTrue(harness.cell.snapshot.mediaServicesResumeRequired)
         XCTAssertEqual(harness.cell.snapshot.system.firstUndrainedResetIngressInstant, 120)
         harness.releaseExecutor()
     }
@@ -415,9 +427,11 @@ final class SynchronousSafetyIngressTests: XCTestCase {
         XCTAssertEqual(snapshot.throughRevision, 13)
         XCTAssertEqual(snapshot.ownerSystemEventRevision, 23)
         XCTAssertEqual(snapshot.mediaServicesEpoch, 31)
-        XCTAssertEqual(snapshot.interruptionEpoch, 42)
+        XCTAssertEqual(snapshot.interruptionEpoch, 43,
+            "Reset, began and ended each consume the independent interruption domain")
         XCTAssertEqual(snapshot.system.latestResetIngress?.rootIdentity, 51)
-        XCTAssertEqual(snapshot.freezeGeneration, 62)
+        XCTAssertEqual(snapshot.freezeGeneration, 63,
+            "Reset invalidation, began and ended each advance freeze identity")
         XCTAssertEqual(snapshot.audioAdmissionFenceRevision, 3)
         harness.releaseExecutor()
     }
@@ -526,6 +540,106 @@ final class SynchronousSafetyIngressTests: XCTestCase {
             XCTAssertTrue(cleaned)
             XCTAssertFalse(harness.cell.snapshot.outputPermitPresent)
         }
+    }
+
+    func testFinalCallbackExitSignalsAgainAfterOriginalSourceDrainHasCompleted() {
+        let queue = DispatchQueue(label: "org.vplayer.tests.callback-exit-wake")
+        let source = DispatchSource.makeUserDataOrSource(queue: queue)
+        let wakes = SafetyIngressAuthority()
+        let handlerFinished = DispatchSemaphore(value: 0)
+        let callbackHeld = DispatchSemaphore(value: 0)
+        let releaseCallback = DispatchSemaphore(value: 0)
+        let callbackReturned = DispatchSemaphore(value: 0)
+        let cell = SynchronousSafetyIngressCell(allocator: PlaybackIdentityAllocator(), wakeSource: source,
+            clock: ManualPlaybackClock(100), applyIngress: { _ in .applied },
+            applyTerminalIngress: { _ in }, applyOutputControl: { _, _ in .rejected })
+        source.setEventHandler {
+            // Record actual dispatch-source delivery, not a manually cleared scheduling bit.
+            wakes.apply(cell.snapshot)
+            _ = cell.withSafetyIngressBarrier(operationDescriptor: .drain) { _ in }
+            handlerFinished.signal()
+        }
+        source.activate()
+        defer {
+            releaseCallback.signal()
+            source.cancel()
+            source.setEventHandler {}
+        }
+        DispatchQueue.global().async {
+            cell.performSyncIngressForTesting(.interruptionEnded(shouldResume: false)) {
+                callbackHeld.signal()
+                releaseCallback.wait()
+            }
+            callbackReturned.signal()
+        }
+        XCTAssertEqual(callbackHeld.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(handlerFinished.wait(timeout: .now() + 2), .success)
+        // The handler's signal precedes return; queue synchronization joins its actual tail.
+        // Only the one original or(data:) has occurred, and its delivery is now exhausted.
+        queue.sync {}
+        XCTAssertEqual(wakes.values.count, 1)
+        XCTAssertEqual(wakes.values.first?.callbackDepth, 1)
+        let held = cell.snapshot
+        XCTAssertEqual(held.callbackDepth, 1)
+        XCTAssertFalse(held.safetyIngressPending)
+        XCTAssertFalse(held.drainScheduled)
+
+        releaseCallback.signal()
+        XCTAssertEqual(callbackReturned.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(handlerFinished.wait(timeout: .now() + 2), .success,
+            "Removing only the final-callback-exit source signal must fail this distinct second delivery")
+        queue.sync {}
+        XCTAssertEqual(wakes.values.count, 2)
+        XCTAssertEqual(wakes.values.last?.callbackDepth, 0)
+        XCTAssertFalse(wakes.values.last?.safetyIngressPending ?? true,
+            "Quiescence must wake progress without manufacturing another ingress")
+        var expected = held
+        expected.callbackDepth = 0
+        XCTAssertEqual(cell.snapshot, expected,
+            "After both handlers return, callback depth is the only safety-state change")
+    }
+
+    func testMonitorStopAcknowledgementRemainsFailClosedDuringTerminalCleanup() {
+        let allocator = PlaybackIdentityAllocator(initialIssuedValue: .max - 1)
+        let harness = SafetyIngressTestHarness(allocator: allocator)
+        harness.executor.sync {
+            harness.routeCallback()
+            harness.routeCallback()
+            let first = harness.executor.withSafetyIngressBarrier(operationDescriptor: .monitorStopAcknowledgement) { _ in
+                XCTFail("Monitor stop must consume terminal ingress before its ownership CAS")
+            }
+            guard case .retry = first else { return XCTFail("Terminal ingress must fold first") }
+            XCTAssertEqual(harness.cell.snapshot.callbackDepth, 0)
+            let result = harness.executor.withSafetyIngressBarrier(operationDescriptor: .monitorStopAcknowledgement) { output in
+                output.outputPermitPresent = true
+                output.readinessOpen = true
+                return true
+            }
+            guard case .performed(true) = result else { return XCTFail("Existing monitor cleanup must survive terminal failure") }
+            XCTAssertEqual(harness.cell.snapshot.failure, .identitySpaceExhausted)
+            XCTAssertFalse(harness.cell.snapshot.outputPermitPresent)
+            XCTAssertFalse(harness.cell.snapshot.readinessOpen)
+        }
+    }
+
+    func testCallbackCannotEnterBetweenMonitorQuiescenceCheckAndAcknowledgement() {
+        let harness = SafetyIngressTestHarness()
+        let attempted = DispatchSemaphore(value: 0)
+        let returned = DispatchSemaphore(value: 0)
+        harness.executor.sync {
+            let result = harness.executor.withSafetyIngressBarrier(operationDescriptor: .monitorStopAcknowledgement) { _ in
+                DispatchQueue.global().async {
+                    attempted.signal()
+                    harness.system(.interruptionBegan, at: 100)
+                    returned.signal()
+                }
+                XCTAssertEqual(attempted.wait(timeout: .now() + 2), .success)
+                XCTAssertEqual(returned.wait(timeout: .now() + 0.05), .timedOut,
+                    "The live quiescence check and original monitor-stop CAS must share the Cell lock")
+            }
+            guard case .performed = result else { return XCTFail("Quiescent monitor-stop CAS must run") }
+        }
+        XCTAssertEqual(returned.wait(timeout: .now() + 2), .success)
     }
 
     private func assertFixedValueStorage(_ value: Any, file: StaticString = #filePath, line: UInt = #line) {

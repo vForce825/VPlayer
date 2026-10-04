@@ -7,6 +7,105 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VideoAccessUnitInspectorTests: XCTestCase {
+    func testHEVCAlternativeTransferSEIOverridesCompatibilityCurveAndPersistsWithFrozenSPS() throws {
+        let generation = MediaGeneration(rawValue: 31)
+        var session = VideoAccessUnitInspectionSession(generation: generation, codec: .hevc)
+        let parameters = [hevcVPS(), hevcSPS(colorTransfer: 14), hevcPPS()]
+        let first = try session.inspect(inspectionInput(
+            annexB(parameters + [makeHEVCNAL(type: 39, rbsp: Data([147, 1, 18, 0x80])),
+                hevcSlice(nalType: 19)]), generation: generation, accessUnitID: 1, codec: .hevc))
+        XCTAssertEqual(first.format.transfer, .hlg)
+        XCTAssertEqual(first.format.primaries, .bt2020)
+        let next = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: 1)]),
+            generation: generation, accessUnitID: 2, codec: .hevc))
+        XCTAssertEqual(next.format.transfer, .hlg)
+        let repeated = try session.inspect(inspectionInput(annexB(parameters + [hevcSlice(nalType: 1)]),
+            generation: generation, accessUnitID: 3, codec: .hevc))
+        XCTAssertEqual(repeated.format.transfer, .hlg)
+        let changed = try session.inspect(inspectionInput(
+            annexB([hevcSPS(colorTransfer: 16), hevcSlice(nalType: 19)]),
+            generation: generation, accessUnitID: 4, codec: .hevc))
+        XCTAssertEqual(changed.format.transfer, .pq)
+    }
+
+    func testHEVCAlternativeTransferStopsAtNewCodedVideoSequenceAndCanBeReplaced() throws {
+        for boundary in UInt8(16)...UInt8(20) {
+            let generation = MediaGeneration(rawValue: 32)
+            var session = VideoAccessUnitInspectionSession(generation: generation, codec: .hevc)
+            let parameters = [hevcVPS(), hevcSPS(colorTransfer: 14), hevcPPS()]
+            _ = try session.inspect(inspectionInput(annexB(parameters
+                + [makeHEVCNAL(type: 39, rbsp: Data([147, 1, 18, 0x80])), hevcSlice(nalType: 19)]),
+                generation: generation, accessUnitID: 1, codec: .hevc))
+            let boundaryProof = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: boundary)]),
+                generation: generation, accessUnitID: 2, codec: .hevc))
+            XCTAssertEqual(boundaryProof.format.transfer, .bt2020)
+            let following = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: 1)]),
+                generation: generation, accessUnitID: 3, codec: .hevc))
+            XCTAssertEqual(following.format.transfer, .bt2020)
+            let replaced = try session.inspect(inspectionInput(annexB([
+                makeHEVCNAL(type: 39, rbsp: Data([147, 1, 16, 0x80])), hevcSlice(nalType: 19)]),
+                generation: generation, accessUnitID: 4, codec: .hevc))
+            XCTAssertEqual(replaced.format.transfer, .pq)
+            let followingReplacement = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: 1)]),
+                generation: generation, accessUnitID: 5, codec: .hevc))
+            XCTAssertEqual(followingReplacement.format.transfer, .pq)
+        }
+    }
+
+    func testHEVCAlternativeTransferContinuesAtCRAAndStopsAfterEOSOrWithoutVUITransfer() throws {
+        for colorDescriptionPresent in [true, false] {
+            let generation = MediaGeneration(rawValue: 33)
+            var session = VideoAccessUnitInspectionSession(generation: generation, codec: .hevc)
+            let parameters = [hevcVPS(), hevcSPS(colorTransfer: 14,
+                colorDescriptionPresent: colorDescriptionPresent), hevcPPS()]
+            _ = try session.inspect(inspectionInput(annexB(parameters
+                + [makeHEVCNAL(type: 39, rbsp: Data([147, 1, 18, 0x80])), hevcSlice(nalType: 19)]),
+                generation: generation, accessUnitID: 1, codec: .hevc))
+            let cra = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: 21)]),
+                generation: generation, accessUnitID: 2, codec: .hevc))
+            XCTAssertEqual(cra.format.transfer, .hlg)
+            _ = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: 1),
+                makeHEVCNAL(type: 36, rbsp: Data([0x80]))]),
+                generation: generation, accessUnitID: 3, codec: .hevc))
+            for (id, type) in [(UInt64(4), UInt8(21)), (UInt64(5), UInt8(1))] {
+                let proof = try session.inspect(inspectionInput(annexB([hevcSlice(nalType: type)]),
+                    generation: generation, accessUnitID: id, codec: .hevc))
+                XCTAssertEqual(proof.format.transfer, colorDescriptionPresent ? .bt2020 : nil)
+            }
+        }
+    }
+
+    func testHEVCAlternativeTransferSEIRejectsMalformedUnknownAndConflictingValues() throws {
+        for messages in [
+            [Data([147, 0, 0x80])],
+            [Data([147, 2, 18, 18, 0x80])],
+            [Data([147, 1, 2, 0x80])],
+            [Data([147, 1, 18, 0x80]), Data([147, 1, 16, 0x80])],
+        ] {
+            let bytes = annexB([hevcVPS(), hevcSPS(colorTransfer: 14), hevcPPS()]
+                + messages.map { makeHEVCNAL(type: 39, rbsp: $0) }
+                + [hevcSlice(nalType: 19)])
+            XCTAssertThrowsError(try inspect(bytes, codec: .hevc))
+        }
+    }
+
+    func testHEVCAlternativeTransferOverridesDemuxCompatibilityEvidenceButRejectsUnrelatedConflict() throws {
+        let bytes = annexB([hevcVPS(), hevcSPS(colorTransfer: 14), hevcPPS(),
+            makeHEVCNAL(type: 39, rbsp: Data([147, 1, 18, 0x80])), hevcSlice(nalType: 19)])
+        for transfer in [DemuxColorTransfer.bt2020, .hlg, .pq] {
+            let expected = VideoTrackDescriptor(streamIndex: 0, codec: .hevc,
+                timeBase: try XCTUnwrap(MediaRational(num: 1, den: 90_000)),
+                width: 3_840, height: 2_160, videoDelay: 0, extradata: Data(),
+                videoMetadata: DemuxVideoMetadata(primaries: .bt2020,
+                    transfer: transfer, matrix: .bt2020Nonconstant))
+            if transfer == .pq {
+                XCTAssertThrowsError(try inspect(bytes, codec: .hevc, expectedFormat: expected))
+            } else {
+                XCTAssertEqual(try inspect(bytes, codec: .hevc, expectedFormat: expected).format.transfer, .hlg)
+            }
+        }
+    }
+
     func testGenerationSessionFreezesInitialCatalogAndReusesItWithoutInBandParameters() throws {
         let generation = MediaGeneration(rawValue: 21)
         var session = VideoAccessUnitInspectionSession(generation: generation, codec: .h264)
@@ -965,7 +1064,8 @@ private func hevcSPS(
     colorPrimaries: UInt8 = 9,
     colorTransfer: UInt8 = 16,
     colorMatrix: UInt8 = 9,
-    chromaLocationType: UInt32? = 0
+    chromaLocationType: UInt32? = 0,
+    colorDescriptionPresent: Bool = true
 ) -> Data {
     var bits = TestBitWriter()
     bits.write(0, count: 4) // sps_video_parameter_set_id
@@ -1022,7 +1122,8 @@ private func hevcSPS(
         colorPrimaries: colorPrimaries,
         colorTransfer: colorTransfer,
         colorMatrix: colorMatrix,
-        chromaLocationType: chromaLocationType
+        chromaLocationType: chromaLocationType,
+        colorDescriptionPresent: colorDescriptionPresent
     )
     bits.write(0, count: 1) // sps_extension_present_flag
     return makeHEVCNAL(type: 33, rbsp: bits.finishRBSP())
@@ -1089,7 +1190,8 @@ private func writeHEVCVUI(
     colorPrimaries: UInt8,
     colorTransfer: UInt8,
     colorMatrix: UInt8,
-    chromaLocationType: UInt32?
+    chromaLocationType: UInt32?,
+    colorDescriptionPresent: Bool = true
 ) {
     bits.write(1, count: 1)
     bits.write(1, count: 8)
@@ -1097,10 +1199,12 @@ private func writeHEVCVUI(
     bits.write(1, count: 1)
     bits.write(5, count: 3)
     bits.write(0, count: 1)
-    bits.write(1, count: 1)
-    bits.write(UInt64(colorPrimaries), count: 8)
-    bits.write(UInt64(colorTransfer), count: 8)
-    bits.write(UInt64(colorMatrix), count: 8)
+    bits.write(colorDescriptionPresent ? 1 : 0, count: 1)
+    if colorDescriptionPresent {
+        bits.write(UInt64(colorPrimaries), count: 8)
+        bits.write(UInt64(colorTransfer), count: 8)
+        bits.write(UInt64(colorMatrix), count: 8)
+    }
     bits.write(chromaLocationType == nil ? 0 : 1, count: 1)
     if let chromaLocationType {
         bits.writeUE(chromaLocationType)

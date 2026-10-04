@@ -13,6 +13,268 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testNativePayloadDigestBorrowsEveryNoncontiguousBlock() throws {
+        let chunks = [Data(repeating: 0x12, count: 65_537),
+                      Data([0x00, 0xFF, 0x43]), Data(repeating: 0xA5, count: 131_073)]
+        let block = try nativeDigestBlock(chunks)
+        XCTAssertFalse(CMBlockBufferIsRangeContiguous(block, atOffset: 0,
+            length: CMBlockBufferGetDataLength(block)))
+        let expected = chunks.reduce(into: Data()) { $0.append($1) }
+        XCTAssertEqual(try nativeSamplePayloadDigest(block), Data(SHA256.hash(data: expected)))
+    }
+
+    func testNativePayloadDigestHandlesEmptyAndContiguousBlocks() throws {
+        for data in [Data(), Data([0xFA]), Data(repeating: 0x35, count: 262_147)] {
+            let block = try nativeDigestBlock(data.isEmpty ? [] : [data])
+            XCTAssertEqual(try nativeSamplePayloadDigest(block), Data(SHA256.hash(data: data)))
+        }
+    }
+
+    func testNativePayloadDigestRechecksMutableBackingAndSlicedReference() throws {
+        let block = try nativeDigestBlock([Data([1, 2, 3]), Data([4, 5, 6, 7])])
+        var reference: CMBlockBuffer?
+        XCTAssertEqual(CMBlockBufferCreateWithBufferReference(allocator: kCFAllocatorDefault,
+            referenceBuffer: block, offsetToData: 1, dataLength: 5, flags: 0,
+            blockBufferOut: &reference), noErr)
+        let slice = try XCTUnwrap(reference)
+        let before = try nativeSamplePayloadDigest(slice)
+        XCTAssertEqual(before, Data(SHA256.hash(data: Data([2, 3, 4, 5, 6]))))
+        XCTAssertEqual(CMBlockBufferFillDataBytes(with: 0x09, blockBuffer: block,
+            offsetIntoDestination: 3, dataLength: 1), noErr)
+        let after = try nativeSamplePayloadDigest(slice)
+        XCTAssertNotEqual(before, after)
+        XCTAssertEqual(after, Data(SHA256.hash(data: Data([2, 3, 9, 5, 6]))))
+    }
+
+    private func nativeDigestBlock(_ chunks: [Data]) throws -> CMBlockBuffer {
+        var created: CMBlockBuffer?
+        XCTAssertEqual(CMBlockBufferCreateEmpty(allocator: kCFAllocatorDefault,
+            capacity: UInt32(chunks.count), flags: 0, blockBufferOut: &created), noErr)
+        let block = try XCTUnwrap(created)
+        var offset = 0
+        for chunk in chunks {
+            XCTAssertEqual(CMBlockBufferAppendMemoryBlock(block, memoryBlock: nil,
+                length: chunk.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+                offsetToData: 0, dataLength: chunk.count, flags: 0), noErr)
+            XCTAssertEqual(chunk.withUnsafeBytes {
+                CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
+                    offsetIntoDestination: offset, dataLength: $0.count)
+            }, noErr)
+            offset += chunk.count
+        }
+        return block
+    }
+
+    func testAsyncCompressedBackpressureRetainsClaimUntilNativeCancellationReturns() async throws {
+        let harness = try Task17AC3Harness(seed: 92_101)
+        let accessUnit = try harness.makeAccessUnit(presentationTimeStamp: .zero)
+        let lease = try XCTUnwrap(accessUnit.directLeaseIdentity)
+        let bundle = try XCTUnwrap(accessUnit.directBundleIdentity)
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 92_101, kind: .ac3,
+            sourceFormatHint: Task17Fixtures.compressedAudioFormat(for: accessUnit),
+            compressedFormatConfiguration: accessUnit.formatConfiguration, factory: factory)
+        try writer.start(at: .zero)
+        let native = try XCTUnwrap(factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "Compressed append waits for receiver")
+        let cancelled = expectation(description: "Receiver observes cancellation")
+        native.observeAsyncAppend(entered: { entered.fulfill() },
+            cancellation: { cancelled.fulfill() }, deferCancellationReturn: true)
+        let ticket = try Task17Fixtures.compressedTicket(accessUnit: accessUnit, writer: writer)
+        let coordinator = harness.coordinator
+        let submission = accessUnit.writerSubmission
+        let append = Task { [writer, submission, coordinator, ticket] in
+            try await writer.appendCompressedAwaitingReadiness(submission,
+                coordinator: coordinator, ticket: ticket)
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(native.appendCount, 0)
+        XCTAssertEqual(harness.coordinator.claimedCompressedWriterSubmissionCount, 1)
+        XCTAssertNil(ticket.committedBoundary)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 1)
+        XCTAssertEqual(harness.coordinator.branchLeaseState(lease),
+                       .transferred(.compressedAccessUnit(bundle)))
+        append.cancel()
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertNil(writer.terminalReceipt)
+        XCTAssertEqual(harness.coordinator.branchLeaseState(lease),
+                       .transferred(.compressedAccessUnit(bundle)))
+        native.completeAsyncCancellation(returnSuccess: true)
+        do { try await append.value; XCTFail("Late native success must not commit a cancelled ticket") }
+        catch is CancellationError {}
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .cancelled)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 0)
+        XCTAssertNil(ticket.committedBoundary)
+        XCTAssertNil(harness.coordinator.branchLeaseState(lease))
+        XCTAssertEqual(accessUnit.confirmWriterTerminal(using: harness.coordinator), 0)
+    }
+
+    func testAsyncAACBatchFinishWaitsForEverySampleThenRejectsUnauthenticatedCallback() async throws {
+        // This inspection adapter can prove append/finish order, but cannot mint the
+        // native callback capsule required for a successful AAC publication terminal.
+        let epoch = try Task17Fixtures.aacEpoch(bufferCount: 2)
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 92_102, kind: .aac,
+            sourceFormatHint: XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
+            factory: factory)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        let writerLane = try XCTUnwrap(Mirror(reflecting: writer).children.first {
+            $0.label == "lane"
+        }?.value as? DispatchQueue)
+        let native = try XCTUnwrap(factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        native.pauseBeforeAsyncAppend(ordinal: 2)
+        let firstEntered = expectation(description: "First batch sample waits for receiver")
+        let secondEntered = expectation(description: "Second batch sample waits for receiver")
+        let entries = Task17LockedCounter()
+        native.observeAsyncAppend(entered: {
+            entries.increment()
+            if entries.value == 1 { firstEntered.fulfill() }
+            else { secondEntered.fulfill() }
+        })
+        let append = Task { try await writer.appendAACEncodedEpochAwaitingReadiness(epoch,
+            coordinator: boundary) }
+        await fulfillment(of: [firstEntered], timeout: 2)
+        let finish = Task { try await writer.finish() }
+        // Observe registration itself, not merely entry into the caller Task. Every
+        // reflected mutable read is synchronized with the writer's existing lane.
+        let registrationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        var finishRegistered = false
+        repeat {
+            finishRegistered = try writerLane.sync {
+                try XCTUnwrap(Mirror(reflecting: writer).children.first {
+                    $0.label == "finishRequested"
+                }?.value as? Bool)
+            }
+            if finishRegistered { break }
+            try await Task.sleep(for: .milliseconds(1))
+        } while ContinuousClock.now < registrationDeadline
+        XCTAssertTrue(finishRegistered, "Finish must be registered before the first append resumes")
+        XCTAssertEqual(native.appendCount, 0)
+        XCTAssertFalse(native.calls.contains(.markFinished))
+        XCTAssertFalse(native.calls.contains(.finish))
+        native.setReadyForMoreMediaData(true)
+        await fulfillment(of: [secondEntered], timeout: 2)
+        XCTAssertEqual(native.appendCount, 1)
+        XCTAssertFalse(native.calls.contains(.markFinished),
+                       "Finishing the first sample must not close an admitted batch")
+        XCTAssertFalse(native.calls.contains(.finish))
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 2)
+        XCTAssertNil(writer.terminalReceipt)
+        native.setReadyForMoreMediaData(true)
+        try await append.value
+        await assertWriterThrowsError(try await finish.value) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .systemFailure,
+                           "Synthetic callbacks must not acquire native AAC publication authority")
+        }
+        let terminal = try XCTUnwrap(writer.terminalReceipt)
+        XCTAssertEqual(terminal.terminalReason, .failed)
+        XCTAssertEqual(terminal.inputCount, 2)
+        XCTAssertEqual(native.appendCount, 2)
+        XCTAssertEqual(native.calls, [.start, .append, .append, .markFinished, .finish, .cancel])
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+    }
+
+    func testRealAACBatchFinishPreservesSuccessfulTerminalAndAllAcceptedInputs() async throws {
+        let epoch = try await Task17Fixtures.realAACEncodedEpoch()
+        XCTAssertGreaterThan(epoch.buffers.count, 1)
+        let collector = Task17ObjectCollector()
+        let writer = try Task17Fixtures.makeWriter(seed: 92_106, kind: .aac,
+            sourceFormatHint: XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
+            collector: collector)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        defer { writer.requestCancellation() }
+        let append = Task { try await writer.appendAACEncodedEpochAwaitingReadiness(epoch,
+            coordinator: boundary) }
+        // Admission is observable without wrapping the native adapter or replacing its
+        // private provenance. Native appends may complete before finish is scheduled;
+        // the separate gated inspection test proves the exact suspended interleaving.
+        let admissionDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while writer.usage.retainedTerminalOwnershipCount == 0,
+              writer.terminalReceipt == nil, ContinuousClock.now < admissionDeadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertGreaterThan(writer.usage.retainedTerminalOwnershipCount, 0)
+        let finish = Task { try await writer.finish() }
+        try await append.value
+        let terminal = try await finish.value
+        XCTAssertEqual(terminal.terminalReason, .finished)
+        XCTAssertEqual(terminal.inputCount, epoch.buffers.count)
+        XCTAssertEqual(terminal.initializationCallbackCount, 1)
+        XCTAssertGreaterThan(terminal.mediaCallbackCount, 0)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+        let media = collector.objects.filter { $0.kind == .media }
+        XCTAssertEqual(media.count, terminal.mediaCallbackCount)
+        for object in media {
+            let evidence = try XCTUnwrap(object.publicationEvidence)
+            XCTAssertEqual(evidence.format.codec, "mp4a.40.2")
+            XCTAssertTrue(evidence.matches(object))
+        }
+    }
+
+    func testAsyncAACBatchBetweenSampleFailureFailsWaitingFinishWithoutClosingNativeInput() async throws {
+        let epoch = try Task17Fixtures.aacEpoch(bufferCount: 2)
+        let factory = Task17FakeSystemWriterFactory(blocksCancel: true)
+        let writer = try Task17Fixtures.makeWriter(seed: 92_104, kind: .aac,
+            sourceFormatHint: XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
+            factory: factory)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        let native = try XCTUnwrap(factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "First admitted AAC sample suspended")
+        native.observeAsyncAppend(entered: { entered.fulfill() })
+        let append = Task { try await writer.appendAACEncodedEpochAwaitingReadiness(epoch,
+            coordinator: boundary) }
+        await fulfillment(of: [entered], timeout: 2)
+        // This is outside the in-flight first sample. The next ticket must reject it,
+        // exercising the batch owner's between-sample failure path rather than native append.
+        XCTAssertEqual(CMSampleBufferSetOutputPresentationTimeStamp(epoch.buffers[1],
+            newValue: CMTime(value: 1_000, timescale: 1)), noErr)
+        let finishEntered = expectation(description: "Finish joins the admitted batch")
+        let finish = Task {
+            finishEntered.fulfill()
+            return try await writer.finish()
+        }
+        await fulfillment(of: [finishEntered], timeout: 2)
+        native.setReadyForMoreMediaData(true)
+        XCTAssertEqual(native.waitUntilCancelEntered(timeout: .now() + 2), .success)
+        XCTAssertFalse(native.calls.contains(.markFinished))
+        XCTAssertFalse(native.calls.contains(.finish))
+        XCTAssertEqual(native.appendCount, 1)
+        XCTAssertNil(writer.terminalReceipt)
+        native.releaseBlockedCancel()
+        await assertWriterThrowsError(try await append.value)
+        await assertWriterThrowsError(try await finish.value)
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .failed)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 1)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+    }
+
+    func testAsyncAACBatchSuffixFailureCannotCommitCumulativeSnapshot() async throws {
+        let epoch = try Task17Fixtures.aacEpoch(bufferCount: 2)
+        let factory = Task17FakeSystemWriterFactory(rejectAppendOrdinal: 2)
+        let writer = try Task17Fixtures.makeWriter(seed: 92_103, kind: .aac,
+            sourceFormatHint: XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
+            factory: factory)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        do {
+            try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
+            XCTFail("A rejected suffix must fail the complete batch")
+        } catch {
+            XCTAssertEqual(error as? SegmentedFMP4WriterFailure, .systemFailure)
+        }
+        XCTAssertEqual(factory.lastWriter?.appendCount, 2)
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .failed)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 1)
+        XCTAssertNil(writer.aacTerminalBinding?.endpointAuthority)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+    }
+
     func testAsyncVideoBackpressureResumesSameTicketExactlyOnce() async throws {
         let fixture = try makeAsyncVideoFixture(seed: 92_001)
         let native = try XCTUnwrap(fixture.factory.lastWriter)
@@ -142,6 +404,36 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(writer.terminalReceipt?.inputCount, 0)
         XCTAssertNil(ticket.committedBoundary)
         XCTAssertEqual(native.appendCount, 1)
+    }
+
+    func testAsyncVideoRejectsPayloadMutationDuringNativeWait() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_008)
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        native.setReadyForMoreMediaData(false)
+        let entered = expectation(description: "Native append is suspended before payload mutation")
+        native.observeAsyncAppend(entered: { entered.fulfill() })
+        let writer = fixture.writer
+        let output = fixture.output
+        let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+        let append = Task { try await writer.appendVideoAwaitingReadiness(output, ticket: ticket) }
+        await fulfillment(of: [entered], timeout: 2)
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(output.sampleBuffer))
+        var byte: UInt8 = 0
+        XCTAssertEqual(CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: 1,
+            destination: &byte), noErr)
+        byte ^= 0xFF
+        XCTAssertEqual(CMBlockBufferReplaceDataBytes(with: &byte, blockBuffer: block,
+            offsetIntoDestination: 0, dataLength: 1), noErr)
+        native.setReadyForMoreMediaData(true)
+        do {
+            try await append.value
+            XCTFail("A payload changed during native wait must not commit its frozen ticket")
+        } catch {
+            XCTAssertEqual(error as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
+        }
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .failed)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 0)
+        XCTAssertNil(ticket.committedBoundary)
     }
 
     func testAsyncNativeThrowPreservesDiagnosticBeforeCancellation() async throws {
@@ -1172,12 +1464,12 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             accessUnit: .aac(sampleRate: 48_000),
             firstEffectiveStart: CMTime(value: 10, timescale: 1))
         try writer.start(at: CMTime(value: 10, timescale: 1))
-        try writer.appendAACEncodedEpoch(
+        try await writer.appendAACEncodedEpochAwaitingReadiness(
             chunk(0, identity: complete.identity), coordinator: boundary)
 
         let foreignIdentity = try await Task17AACEndpointFixtures.realEpoch().identity
         let retainedBeforeRejection = writer.usage.retainedTerminalOwnershipCount
-        XCTAssertThrowsError(try writer.appendAACEncodedEpoch(
+        await assertWriterThrowsError(try await writer.appendAACEncodedEpochAwaitingReadiness(
             chunk(1, identity: foreignIdentity), coordinator: boundary
         )) { error in
             XCTAssertEqual(error as? SegmentedFMP4WriterFailure,
@@ -1188,7 +1480,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertNil(writer.terminalReceipt)
 
         for index in 1..<complete.buffers.count {
-            try writer.appendAACEncodedEpoch(
+            try await writer.appendAACEncodedEpochAwaitingReadiness(
                 chunk(index, identity: complete.identity), coordinator: boundary)
         }
         _ = try await writer.finish()
@@ -1754,7 +2046,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 CMSampleBufferGetFormatDescription(epoch.buffers[0])),
             collector: collector)
         try writer.start(at: CMTime(value: 10, timescale: 1))
-        try writer.appendAACEncodedEpoch(
+        try await writer.appendAACEncodedEpochAwaitingReadiness(
             epoch,
             coordinator: try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer))
         _ = try await writer.finish()
@@ -1817,7 +2109,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                     CMSampleBufferGetFormatDescription(epoch.buffers[0])),
                 collector: collector)
             try writer.start(at: CMTime(value: 10, timescale: 1))
-            try writer.appendAACEncodedEpoch(
+            try await writer.appendAACEncodedEpochAwaitingReadiness(
                 epoch,
                 coordinator: try Task17Fixtures.aacCoordinator(
                     epoch: epoch, writer: writer))
@@ -1928,6 +2220,30 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         )), .fatal(.callbackIdentityMismatch))
         XCTAssertEqual(collector.objects.count, 1)
         XCTAssertEqual(relay.usage.reservedSlots, 0)
+    }
+
+    func testNativeWriterRejectsSynchronousInspectionBeforeAwaitedAdmission() async throws {
+        let sample = try Task17Fixtures.realH264Sample()
+        let boundary = try SegmentBoundaryCoordinator(
+            mode: .audioVideo(epochStart: .zero, videoMode: .passthrough))
+        let writer = try Task17Fixtures.makeWriter(seed: 92_105, kind: .video,
+            sourceFormatHint: sample.format, boundary: boundary)
+        let output = Task17Fixtures.videoOutput(fixture: sample,
+            generation: 92_105, accessUnitID: 92_106, sequenceNumber: 92_107)
+        try writer.start(at: .zero)
+        let inspectionTicket = try boundary.issueVideoAppend(for: output,
+            writerBinding: writer.binding)
+        XCTAssertThrowsError(try writer.appendVideo(output, ticket: inspectionTicket)) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .illegalState)
+        }
+        XCTAssertNil(inspectionTicket.committedBoundary)
+        XCTAssertNil(writer.terminalReceipt)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+        try await writer.appendVideoAwaitingReadiness(output,
+            ticket: boundary.issueVideoAppend(for: output, writerBinding: writer.binding))
+        let terminal = try await writer.finish()
+        XCTAssertEqual(terminal.terminalReason, .finished)
+        XCTAssertEqual(terminal.inputCount, 1)
     }
 
     func testRealVideoWriterProducesRecognizableInitializationAndMediaCallbacks() async throws {
@@ -3941,11 +4257,13 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let samples = (0..<(1_024 * 2)).map {
                 sin(Float(batch * 2_048 + $0) * 0.003125) * 0.25
             }
-            _ = try encoder.pumpSigned(.pcm(samples)) { emission in
+            var emitted: [AACIncrementalEmission] = []
+            _ = try encoder.pumpSigned(.pcm(samples)) { emitted.append($0) }
+            for emission in emitted {
                 do {
-                    let result = try first.appendAACIncremental(emission, coordinator: boundary)
+                    let result = try await first.appendAACIncrementalAwaitingReadiness(emission, coordinator: boundary)
                     XCTAssertEqual(result, .appended)
-                    guard result == .appended else { return }
+                    guard result == .appended else { continue }
                     if acceptedEmissionCount == 0 { firstAcceptedEmission = emission }
                     acceptedEmissionCount += 1
                 }
@@ -3975,7 +4293,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             factory: AVAssetSegmentedFMP4SystemWriterFactory(), continuation: continuation,
             ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 64))
         try next.start(at: CMTime.zero)
-        XCTAssertEqual(try next.appendAACIncremental(
+        try await assertWriterEqual(try await next.appendAACIncrementalAwaitingReadiness(
             originalPending, coordinator: boundary), AACIncrementalAppendResult.appended)
         XCTAssertEqual(AACIncrementalEmissionIdentity(originalPending), originalIdentity)
         XCTAssertThrowsError(try Task17Fixtures.makeWindowWriter(
@@ -4037,9 +4355,9 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             continuation: jump.continuation)
         try jumpWriter.start(at: .zero)
         let skippedPending = try XCTUnwrap(jump.pending.dropFirst().first)
-        XCTAssertThrowsError(try jumpWriter.appendAACIncremental(
+        await assertWriterThrowsError(try await jumpWriter.appendAACIncrementalAwaitingReadiness(
             skippedPending, coordinator: jump.boundary))
-        XCTAssertEqual(try jumpWriter.appendAACIncremental(
+        try await assertWriterEqual(try await jumpWriter.appendAACIncrementalAwaitingReadiness(
             jump.pending[0], coordinator: jump.boundary), .appended)
         _ = jumpWriter.cancel()
         jump.encoder.dispose()
@@ -4082,6 +4400,111 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         }
         XCTAssertTrue(mappingWasRejected,
                       "后继真实首 media mapping 偏移变化必须失败闭合")
+    }
+
+    @MainActor
+    func testPausedPrefixResumesAuthenticatedFinalTailAfterIncrementalFinalization() async throws {
+        try await verifyPausedPrefixFinalization(nanosecondCursor: false)
+    }
+
+    @MainActor
+    func testPausedFinalizedTailPreservesNanosecondCursorWithUnrepresentableDuration() async throws {
+        try await verifyPausedPrefixFinalization(nanosecondCursor: true)
+    }
+
+    @MainActor
+    private func verifyPausedPrefixFinalization(nanosecondCursor: Bool) async throws {
+        try await task22VerifyPrefixFinalizesWhilePaused(nanosecondCursor: nanosecondCursor) { lifecycle in
+            let harness = try await Task22LongRenditionHarness.make(outputLifecycleEpoch: lifecycle)
+            var reservedServer: LoopbackHTTPServer?
+            var reservedSource: LoopbackAVPlayerPreparationEvidenceSource?
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.urlCache = nil
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            let session = URLSession(configuration: configuration)
+            @MainActor func retire() async throws {
+                session.invalidateAndCancel()
+                reservedSource?.retirePreparation()
+                await harness.branch.cancelAndAwait()
+                guard let server = reservedServer else { return }
+                let ticket = server.closeAdmission()
+                let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                while (server.usage.connections != 0 || server.usage.activeResponses != 0
+                        || FrozenPreparationOwner.activeHistoryServer === server),
+                      ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                guard server.usage.connections == 0, server.usage.activeResponses == 0,
+                      FrozenPreparationOwner.activeHistoryServer !== server else {
+                    throw AVPlayerItemCoordinatorFailure.operationInFlight
+                }
+                try server.drain(cleanupTicket: ticket)
+                try server.retire(cleanupTicket: ticket)
+            }
+            do {
+            let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
+                itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in },
+                prepare: { @Sendable token in try await harness.startPublication(loopbackSession: token) })
+            reservedServer = server
+            let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+            reservedSource = source
+            let itemURL = try XCTUnwrap(URL(string: try harness.declaration.playlistURI(participantID: 2),
+                relativeTo: server.baseURL)?.absoluteURL)
+            func serve(_ snapshot: HLSPublishedSnapshot) async throws {
+                let media = try XCTUnwrap(snapshot.media[2])
+                let keys = media.initializationResources + media.resources
+                for url in [itemURL] + (try keys.map {
+                    try XCTUnwrap(URL(string: server.path(for: $0), relativeTo: server.baseURL)?.absoluteURL)
+                }) {
+                    let (body, response) = try await session.data(from: url)
+                    XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+                    XCTAssertFalse(body.isEmpty)
+                }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                while !keys.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }),
+                      ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                guard keys.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }) else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+            }
+            let original = try XCTUnwrap(harness.publisher.visible)
+            let originalMedia = try XCTUnwrap(original.media[2])
+            let originalTerminal = try XCTUnwrap(original.aacTerminalBindings[2])
+            XCTAssertFalse(originalMedia.isFinal)
+            XCTAssertNil(harness.renditionBinding.finalWriterReceipt)
+            XCTAssertNil(harness.renditionBinding.endpointAuthority)
+            try await serve(original)
+            let bundle = try LoopbackAVPlayerPreparationBundle(evidenceSource: source,
+                item: harness.itemIdentity, publicationSequence: original.publicationSequence)
+            return Task22PausedPrefixResumeFixture(request: bundle.request, source: source,
+                prefixHorizon: try XCTUnwrap(originalMedia.effectivePlaybackHorizon), finish: { prefix in
+                    XCTAssertEqual(prefix.publicationSequence, original.publicationSequence)
+                    XCTAssertNil(harness.store.currentFinalPublication(matching: prefix.mapping.binding))
+                    let encoderFinal = try await harness.finishStream(totalPCMInputs: 350)
+                    let writerFinal = try await harness.branch.finishRendition()
+                    XCTAssertEqual(writerFinal.inputCount, encoderFinal.emissionCount)
+                    XCTAssertEqual(writerFinal.inputDigest, encoderFinal.cumulativeDigest)
+                    try harness.finishPublication()
+                    let published = try XCTUnwrap(harness.publisher.visible)
+                    XCTAssertTrue(try XCTUnwrap(published.media[2]).isFinal)
+                    XCTAssertNil(harness.store.currentFinalPublication(matching: writerFinal.binding),
+                        "Committed final metadata cannot replace the unsent terminal HTTP body")
+                    try await serve(published)
+                    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                    while harness.renditionBinding.endpointAuthority == nil,
+                          ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                    let authority = try XCTUnwrap(harness.renditionBinding.endpointAuthority)
+                    let final = try XCTUnwrap(harness.store.currentFinalPublication(matching: writerFinal.binding))
+                    XCTAssertEqual(final.effectivePlaybackHorizon, writerFinal.lastEffectiveEnd)
+                    XCTAssertEqual(try AVPlayerAACEndpointValidator.preflight(authority: authority,
+                        currentFinalPublication: final, store: harness.store, originalPrefix: prefix,
+                        originalTerminalBinding: originalTerminal), authority.receipt)
+                    return final
+                }, retire: { try await retire() })
+            } catch {
+                let first = error
+                do { try await retire() } catch { XCTFail("Prefix setup cleanup failed: \(error)") }
+                throw first
+            }
+        }
     }
 
     func testAACContinuousBranchExceeds384SignedEmissionsAndFinalCoordinatorConsumesAutomaticHTTPSeal()
@@ -4127,6 +4550,16 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             }
         }
         try await serveNewMedia(try XCTUnwrap(harness.publisher.visible))
+        let originalSnapshot = try XCTUnwrap(harness.publisher.visible)
+        let originalMapping = try XCTUnwrap(originalSnapshot.aacTimelineMappings[2])
+        let originalTerminalBinding = try XCTUnwrap(originalSnapshot.aacTerminalBindings[2])
+        let originalKey = try XCTUnwrap(originalSnapshot.media[2]?.resources.last)
+        let originalAdmission = try XCTUnwrap(harness.store.aacPublicationAdmission(for: originalKey))
+        let originalPrefix = try XCTUnwrap(harness.renditionBinding.issuePrefixMapping(
+            publicationSequence: originalSnapshot.publicationSequence,
+            mapping: originalMapping, completedLeaf: originalAdmission.leaf,
+            admission: originalAdmission))
+        XCTAssertNil(harness.store.currentFinalPublication(matching: originalMapping.binding))
         let final = try await harness.finishStream(totalPCMInputs: 6_200) {
             try await serveNewMedia($0)
         }
@@ -4182,6 +4615,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                               relativeTo: server.baseURL)?.absoluteURL)
         })
         let terminalURL = try XCTUnwrap(mediaURLs.last)
+        XCTAssertNil(harness.store.currentFinalPublication(matching: renditionFinal.binding),
+                     "The final horizon cannot substitute for the unsent terminal body")
         let acceptedBeforePreparation = server.acceptedGETSnapshot()
         // 读取足够的历史媒体就可能签发准备就绪边沿，必须先安装监听。
         let completedPublication = expectation(description: "当前窗口的真实 HTTP 准备证据已就绪")
@@ -4239,6 +4674,27 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertTrue(terminalFirst.observePublication(publication))
         XCTAssertFalse(terminalFirst.observePublication(publication),
                        "同一组真实receipt只能取得一次finalization线性化点")
+        let authority = try XCTUnwrap(renditionBinding.endpointAuthority)
+        let currentFinal = try XCTUnwrap(harness.store.currentFinalPublication(
+            matching: authority.receipt.binding))
+        XCTAssertTrue(currentFinal.isAudioOnly)
+        XCTAssertEqual(currentFinal.effectivePlaybackHorizon, authority.receipt.lastEffectiveEnd)
+        let usageBeforePreflight = harness.store.usage
+        for _ in 0..<3 {
+            let resumedReceipt = try AVPlayerAACEndpointValidator.preflight(
+                authority: authority, currentFinalPublication: currentFinal,
+                store: harness.store, originalPrefix: originalPrefix,
+                originalTerminalBinding: originalTerminalBinding)
+            XCTAssertEqual(resumedReceipt, authority.receipt)
+        }
+        XCTAssertEqual(harness.store.usage.resourceCount, usageBeforePreflight.resourceCount)
+        XCTAssertEqual(harness.store.usage.snapshotCount, usageBeforePreflight.snapshotCount)
+        XCTAssertThrowsError(try AVPlayerAACEndpointValidator.preflight(
+            authority: authority, currentFinalPublication: currentFinal,
+            store: harness.store, originalPrefix: originalPrefix,
+            originalTerminalBinding: authority.terminalBinding),
+            "A later physical writer slot cannot replace the original prefix anchor")
+        XCTAssertEqual(originalPrefix.mapping, originalMapping)
         let finalPreparation = try await task22PrepareFinalThroughCoordinator(
             request: preparation.request,
             evidenceSource: evidenceSource,
@@ -4251,7 +4707,10 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             publicationSequence: snapshot.publicationSequence))
         let completed = try XCTUnwrap(
             evidenceSource.retainedCompletedPublicationEvidence())
-        let authority = try XCTUnwrap(renditionBinding.endpointAuthority)
+        XCTAssertEqual(try AVPlayerAACEndpointValidator.preflight(
+            authority: authority, currentFinalPublication: currentFinal,
+            store: harness.store, originalPrefix: originalPrefix,
+            originalTerminalBinding: originalTerminalBinding), authority.receipt)
         let verified = try AVPlayerAACEndpointValidator.preflight(
             authority: authority, completedPublication: completed)
         XCTAssertEqual(verified.lastEffectiveEnd, renditionFinal.lastEffectiveEnd)
@@ -4569,7 +5028,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         }
     }
 
-    func testRemuxWriterAcceptsReorderedPTSWithIncreasingDTSAndRejectsDTSRegression() throws {
+    func testRemuxWriterAcceptsReorderedPTSWithIncreasingDTSAndRejectsDTSRegression() async throws {
         let fixture = try Task17Fixtures.remuxFixture(
             codec: .h264,
             sampleEntry: .avc3,
@@ -4591,7 +5050,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let submission = try fixture.builder.makeSubmission(
                 for: fixture.timed[index], admission: fixture.admissions[index]
             )
-            try writer.appendRemuxVideo(
+            try await writer.appendRemuxVideoAwaitingReadiness(
                 submission,
                 ticket: try fixture.boundary.issueRemuxVideoAppend(
                     for: submission, writerBinding: writer.binding
@@ -4604,7 +5063,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let ticket = try fixture.boundary.issueRemuxVideoAppend(
             for: regressed, writerBinding: writer.binding
         )
-        XCTAssertThrowsError(try writer.appendRemuxVideo(regressed, ticket: ticket)) { error in
+        await assertWriterThrowsError(try await writer.appendRemuxVideoAwaitingReadiness(regressed, ticket: ticket)) { error in
             XCTAssertEqual(error as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
         }
         XCTAssertNil(ticket.committedBoundary,
@@ -4803,7 +5262,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let accepted = try fixture.builder.makeSubmission(
             for: fixture.timed[0], admission: fixture.admissions[0]
         )
-        try first.appendRemuxVideo(
+        try await first.appendRemuxVideoAwaitingReadiness(
             accepted,
             ticket: try fixture.boundary.issueRemuxVideoAppend(
                 for: accepted, writerBinding: first.binding)
@@ -4813,7 +5272,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         )
         let oldAttempt = try pending.claimWriterAttempt(binding: first.binding)
         let oldTicket = try fixture.boundary.issueRemuxVideoAppend(for: oldAttempt)
-        XCTAssertThrowsError(try first.appendRemuxVideo(oldAttempt, ticket: oldTicket)) {
+        await assertWriterThrowsError(try await first.appendRemuxVideoAwaitingReadiness(oldAttempt, ticket: oldTicket)) {
             XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
         }
         XCTAssertNil(oldTicket.committedBoundary)
@@ -4849,9 +5308,9 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertNotEqual(oldAttempt.attemptIdentity, nextAttempt.attemptIdentity)
         try next.start(at: .zero)
         let nextTicket = try fixture.boundary.issueRemuxVideoAppend(for: nextAttempt)
-        XCTAssertNoThrow(try next.appendRemuxVideo(nextAttempt, ticket: nextTicket))
+        await assertWriterNoThrow(try await next.appendRemuxVideoAwaitingReadiness(nextAttempt, ticket: nextTicket))
         let staleTicket = try fixture.boundary.issueRemuxVideoAppend(for: oldAttempt)
-        XCTAssertThrowsError(try next.appendRemuxVideo(oldAttempt, ticket: staleTicket))
+        await assertWriterThrowsError(try await next.appendRemuxVideoAwaitingReadiness(oldAttempt, ticket: staleTicket))
         XCTAssertNil(staleTicket.committedBoundary)
         XCTAssertThrowsError(try pending.claimWriterAttempt(
             binding: next.binding, admission: admission
@@ -4879,7 +5338,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         try first.start(at: .zero)
         let accepted = try fixture.builder.makeSubmission(
             for: fixture.timed[0], admission: fixture.admissions[0])
-        try first.appendRemuxVideo(
+        try await first.appendRemuxVideoAwaitingReadiness(
             accepted,
             ticket: try fixture.boundary.issueRemuxVideoAppend(
                 for: accepted, writerBinding: first.binding))
@@ -4887,7 +5346,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             for: fixture.timed[1], admission: fixture.admissions[1])
         let oldAttempt = try pending.claimWriterAttempt(binding: first.binding)
         let oldTicket = try fixture.boundary.issueRemuxVideoAppend(for: oldAttempt)
-        XCTAssertThrowsError(try first.appendRemuxVideo(oldAttempt, ticket: oldTicket)) {
+        await assertWriterThrowsError(try await first.appendRemuxVideoAwaitingReadiness(oldAttempt, ticket: oldTicket)) {
             XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
         }
         let continuation = try await first.finishWriterWindow()
@@ -5031,14 +5490,14 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let unit = index == 0 ? firstCompressed : try compressed.makeAccessUnit(
                 presentationTimeStamp: CMTime(
                     value: Int64(index * 1_536), timescale: 48_000))
-            try compressedWriter.appendCompressed(
+            try await compressedWriter.appendCompressedAwaitingReadiness(
                 unit.writerSubmission, coordinator: compressed.coordinator,
                 ticket: try compressedBoundary.issueCompressedAudioAppend(
                     for: unit, writerBinding: compressedBinding))
         }
         let rolloverCompressed = try compressed.makeAccessUnit(
             presentationTimeStamp: CMTime(value: 32 * 1_536, timescale: 48_000))
-        XCTAssertThrowsError(try compressedWriter.appendCompressed(
+        await assertWriterThrowsError(try await compressedWriter.appendCompressedAwaitingReadiness(
             rolloverCompressed.writerSubmission, coordinator: compressed.coordinator,
             ticket: try compressedBoundary.issueCompressedAudioAppend(
                 for: rolloverCompressed, writerBinding: compressedBinding))) {
@@ -5122,7 +5581,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             try next.start(at: .zero)
             let before = predecessor.boundary.usage
             let ticket = try predecessor.boundary.issueRemuxVideoAppend(for: attempt)
-            XCTAssertThrowsError(try next.appendRemuxVideo(attempt, ticket: ticket)) {
+            await assertWriterThrowsError(try await next.appendRemuxVideoAwaitingReadiness(attempt, ticket: ticket)) {
                 XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
             }
             XCTAssertNil(ticket.committedBoundary)
@@ -5193,14 +5652,14 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         for index in 0..<32 {
             let value = Int64(index * 1_536)
             let accessUnit = index == 0 ? firstUnit : try unit(at: value)
-            try first.appendCompressed(
+            try await first.appendCompressedAwaitingReadiness(
                 accessUnit.writerSubmission,
                 coordinator: ac3?.coordinator ?? eac3!.coordinator,
                 ticket: try boundary.issueCompressedAudioAppend(
                     for: accessUnit, writerBinding: first.binding))
         }
         let rolloverUnit = try unit(at: 32 * 1_536)
-        XCTAssertThrowsError(try first.appendCompressed(
+        await assertWriterThrowsError(try await first.appendCompressedAwaitingReadiness(
             rolloverUnit.writerSubmission,
             coordinator: ac3?.coordinator ?? eac3!.coordinator,
             ticket: try boundary.issueCompressedAudioAppend(
@@ -5235,7 +5694,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             ?? invalidHarnessEAC3!.coordinator).claimedCompressedWriterSubmissionCount
         let ticket = try boundary.issueCompressedAudioAppend(
             for: invalid, writerBinding: next.binding)
-        XCTAssertThrowsError(try next.appendCompressed(
+        await assertWriterThrowsError(try await next.appendCompressedAwaitingReadiness(
             invalid.writerSubmission,
             coordinator: invalidHarnessAC3?.coordinator ?? invalidHarnessEAC3!.coordinator,
             ticket: ticket)) {
@@ -5333,7 +5792,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let submission = try fixture.builder.makeSubmission(
                 for: fixture.timed[index], admission: fixture.admissions[index])
             do {
-                try writer.appendRemuxVideo(
+                try await writer.appendRemuxVideoAwaitingReadiness(
                     submission,
                     ticket: try fixture.boundary.issueRemuxVideoAppend(
                         for: submission, writerBinding: writer.binding))
@@ -5372,7 +5831,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 for: fixture.timed[0], admission: fixture.admissions[0]
             )
             try writer.start(at: CMTime(value: 10, timescale: 1))
-            try writer.appendRemuxVideo(
+            try await writer.appendRemuxVideoAwaitingReadiness(
                 submission,
                 ticket: try fixture.boundary.issueRemuxVideoAppend(
                     for: submission, writerBinding: writer.binding)
@@ -5417,7 +5876,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 collector: collector,
                 releaseTransfersImmediately: true)
             try writer.start(at: .zero)
-            try writer.appendCompressed(
+            try await writer.appendCompressedAwaitingReadiness(
                 unit.writerSubmission,
                 coordinator: harness?.coordinator ?? eac3Harness!.coordinator,
                 ticket: try boundary.issueCompressedAudioAppend(
@@ -5470,7 +5929,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 for: fixture.timed[inputIndex],
                 admission: fixture.admissions[inputIndex])
             do {
-                try writer.appendRemuxVideo(
+                try await writer.appendRemuxVideoAwaitingReadiness(
                     submission,
                     ticket: try fixture.boundary.issueRemuxVideoAppend(
                         for: submission, writerBinding: writer.binding))
@@ -5497,7 +5956,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 let attempt = try submission.claimWriterAttempt(
                     binding: binding, admission: admission)
                 try writer.start(at: .zero)
-                try writer.appendRemuxVideo(
+                try await writer.appendRemuxVideoAwaitingReadiness(
                     attempt,
                     ticket: try fixture.boundary.issueRemuxVideoAppend(for: attempt))
                 inputIndex += 1
@@ -5509,6 +5968,10 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(windowInputCounts.reduce(0, +), 385)
         XCTAssertTrue(windowInputCounts.allSatisfy { $0 <= 384 })
         XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+    }
+
+    func testCurrentFinalVideoProjectionAuthenticatesLogicalScopeAcrossRealWriterRollover() async throws {
+        try await exerciseRealRemuxAndCompressedAudioPublication(.ac3, verifyFinalVideoContinuation: true)
     }
 
     func testRealRemuxThreeWriterWindowsKeepCanonicalInitAndServeEachWindowOverHTTP()
@@ -5537,7 +6000,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
 
     private func exerciseRealRemuxAndCompressedAudioPublication(
         _ audioKind: SegmentedFMP4TrackKind,
-        videoMode: Task22GenericVideoPublicationHarness.VideoMode = .remux
+        videoMode: Task22GenericVideoPublicationHarness.VideoMode = .remux,
+        verifyFinalVideoContinuation: Bool = false
     ) async throws {
         let harness = try Task22GenericVideoPublicationHarness(
             audioKind: audioKind, videoMode: videoMode)
@@ -5561,6 +6025,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         var canonicalBodies: [UInt64: Data] = [:]
         var servedMedia: Set<HLSResourceKey> = []
         var windowsWithHTTP: [UInt64: Set<UInt64>] = [:]
+        let originalVideo = try XCTUnwrap(harness.observation.snapshot.participantVector.first {
+            $0.participantID == harness.participantID
+        }).binding
+        let originalTicket = harness.publisher.ticket
+        var continuedFinal: HLSCurrentFinalPublication?
         func serve(_ observation: Task22GenericVideoPublicationHarness.Observation) async throws {
             let snapshot = observation.snapshot
             for participantID in [harness.participantID, harness.audioParticipantID] {
@@ -5609,6 +6078,39 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         }
         try await serve(harness.observation)
         try await harness.finish { try await serve($0) }
+        if verifyFinalVideoContinuation {
+            let currentVideo = try XCTUnwrap(harness.observation.snapshot.participantVector.first {
+                $0.participantID == harness.participantID
+            }).binding
+            XCTAssertNotEqual(currentVideo.writerIdentity, originalVideo.writerIdentity)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while harness.store.currentFinalPublication(matching: currentVideo) == nil,
+                  ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+            let exact = try XCTUnwrap(harness.store.currentFinalPublication(matching: currentVideo))
+            XCTAssertNil(harness.store.currentFinalPublication(matching: originalVideo),
+                "The existing exact-physical-binding lookup must remain strict")
+            let continued = try XCTUnwrap(harness.store.currentFinalVideoPublication(continuing: originalVideo))
+            continuedFinal = continued
+            XCTAssertEqual(continued, exact)
+            XCTAssertEqual(continued.binding, currentVideo)
+            XCTAssertTrue(harness.store.validatesCurrentFinalPublication(continued))
+            for mutation in 0..<5 {
+                let wrong = FMP4WriterBinding(
+                    outputLifecycleEpoch: mutation == 0
+                        ? AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 99_910) : originalVideo.outputLifecycleEpoch,
+                    itemGeneration: .init(rawValue: originalVideo.itemGeneration.rawValue + (mutation == 1 ? 1 : 0)),
+                    mediaEpoch: .init(rawValue: originalVideo.mediaEpoch.rawValue + (mutation == 2 ? 1 : 0)),
+                    publicationParticipantID: .init(rawValue: originalVideo.publicationParticipantID.rawValue + (mutation == 3 ? 1 : 0)),
+                    renditionIdentity: .init(rawValue: originalVideo.renditionIdentity.rawValue + (mutation == 4 ? 1 : 0)),
+                    writerIdentity: originalVideo.writerIdentity)
+                XCTAssertNotEqual(wrong, originalVideo)
+                XCTAssertNil(harness.store.currentFinalVideoPublication(continuing: wrong))
+            }
+            let audio = try XCTUnwrap(harness.observation.snapshot.participantVector.first {
+                $0.participantID == harness.audioParticipantID
+            }).binding
+            XCTAssertNil(harness.store.currentFinalVideoPublication(continuing: audio))
+        }
         XCTAssertGreaterThanOrEqual(harness.videoWriterWindowCount, 3)
         XCTAssertGreaterThanOrEqual(harness.audioWriterWindowCount, 3)
         XCTAssertGreaterThanOrEqual(windowsWithHTTP[harness.participantID]?.count ?? 0, 3)
@@ -5628,8 +6130,20 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let retainedKey = try XCTUnwrap(
             harness.observation.snapshot.media[harness.participantID]?.resources.last)
         let retainedResponse = try harness.retainResponseAlias(for: retainedKey)
+        defer { harness.releaseResponseAlias(retainedResponse) }
         XCTAssertEqual(harness.responseBackingBytes, retainedResponse.residentByteCount)
         XCTAssertGreaterThan(harness.responseBackingBytes, 0)
+        if let continuedFinal {
+            XCTAssertThrowsError(try harness.publisher.reconfigure(retiring: [harness.participantID],
+                ticket: originalTicket)) {
+                XCTAssertEqual($0 as? HLSPublicationFailure, .staleTicket)
+            }
+            XCTAssertEqual(harness.store.currentFinalVideoPublication(continuing: originalVideo), continuedFinal,
+                "A stale caller ticket cannot change the committed final authority")
+            _ = try harness.publisher.reconfigure(retiring: [harness.participantID], ticket: harness.publisher.ticket)
+            XCTAssertNil(harness.store.currentFinalVideoPublication(continuing: originalVideo))
+            XCTAssertFalse(harness.store.validatesCurrentFinalPublication(continuedFinal))
+        }
         let cleanupTicket = server.closeAdmission()
         try server.drain(cleanupTicket: cleanupTicket)
         try server.retire(cleanupTicket: cleanupTicket)
@@ -5690,7 +6204,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let unit = pair.0
             let coordinator = pair.1
             do {
-                try writer.appendCompressed(
+                try await writer.appendCompressedAwaitingReadiness(
                     unit.writerSubmission,
                     coordinator: coordinator,
                     ticket: try boundary.issueCompressedAudioAppend(
@@ -5713,7 +6227,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                     writerWindowContinuation: continuation,
                     releaseTransfersImmediately: true)
                 try writer.start(at: .zero)
-                try writer.appendCompressed(
+                try await writer.appendCompressedAwaitingReadiness(
                     unit.writerSubmission,
                     coordinator: coordinator,
                     ticket: try boundary.issueCompressedAudioAppend(
@@ -6065,6 +6579,8 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
         sink.store?.decodeCoverageMap(for: key)
     }
     var responseBackingBytes: Int { sink.store?.usage.responseBackingBytes ?? 0 }
+    var store: SealedMediaStore { sink.store! }
+    var publisher: HLSPublicationCoordinator { sink.publisher! }
     func retainResponseAlias(for key: HLSResourceKey) throws -> HLSMediaResponseLease {
         try XCTUnwrap(try sink.store?.acquireResponse(
             key, token: sink.declaration!.token, now: 0))
@@ -6095,13 +6611,13 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
         for index in 0..<30 {
             let output = index == 0 ? firstOutput : try await encodeSystemVTFrame(at: index)
             if index >= 28 { precedingOutputs.append(output) }
-            try first.appendVideo(
+            try await first.appendVideoAwaitingReadiness(
                 output,
                 ticket: try fixture.boundary.issueVideoAppend(
                     for: output, writerBinding: first.binding))
         }
         let rollover = try await encodeSystemVTFrame(at: 30)
-        XCTAssertThrowsError(try first.appendVideo(
+        await assertWriterThrowsError(try await first.appendVideoAwaitingReadiness(
             rollover,
             ticket: try fixture.boundary.issueVideoAppend(
                 for: rollover, writerBinding: first.binding))) {
@@ -6166,7 +6682,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
         }
         let ticket = try fixture.boundary.issueVideoAppend(
             for: invalid, writerBinding: next.binding)
-        XCTAssertThrowsError(try next.appendVideo(invalid, ticket: ticket)) {
+        await assertWriterThrowsError(try await next.appendVideoAwaitingReadiness(invalid, ticket: ticket)) {
             XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
         }
         XCTAssertNil(ticket.committedBoundary)
@@ -6312,7 +6828,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
         }
     }
 
-    private func appendNext() throws {
+    private func appendNext() async throws {
         let submission: HLSVideoRemuxSubmission
         if let pending { submission = pending }
         else {
@@ -6320,7 +6836,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
                 for: fixture.timed[inputIndex], admission: fixture.admissions[inputIndex])
             pending = submission
         }
-        try writer.appendRemuxVideo(
+        try await writer.appendRemuxVideoAwaitingReadiness(
             submission,
             ticket: try fixture.boundary.issueRemuxVideoAppend(
                 for: submission, writerBinding: writer.binding))
@@ -6334,7 +6850,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
             return
         }
         do {
-            try appendNext()
+            try await appendNext()
         } catch SegmentedFMP4WriterFailure.rolloverRequired {
             let pending = try XCTUnwrap(pending,
                 "rollover 后必须重送抛错前保存的同一 pending core")
@@ -6350,7 +6866,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
                 binding: binding, admission: admission)
             try writer.start(at: .zero)
             videoWriterWindowCount += 1
-            try writer.appendRemuxVideo(
+            try await writer.appendRemuxVideoAwaitingReadiness(
                 attempt,
                 ticket: try fixture.boundary.issueRemuxVideoAppend(for: attempt))
             self.pending = nil
@@ -6364,7 +6880,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
         else { output = try await encodeSystemVTFrame(at: inputIndex) }
         pendingEncoded = output
         do {
-            try writer.appendVideo(
+            try await writer.appendVideoAwaitingReadiness(
                 output,
                 ticket: try fixture.boundary.issueVideoAppend(
                     for: output, writerBinding: writer.binding))
@@ -6376,7 +6892,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
             writer = try makeWriter(binding: binding, continuation: continuation)
             try writer.start(at: .zero)
             videoWriterWindowCount += 1
-            try writer.appendVideo(
+            try await writer.appendVideoAwaitingReadiness(
                 output,
                 ticket: try fixture.boundary.issueVideoAppend(
                     for: output, writerBinding: writer.binding))
@@ -6473,7 +6989,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
             ? firstAudioUnit : makeAudioUnit(audioInputIndex))
         pendingAudio = unit
         do {
-            try audioWriter.appendCompressed(
+            try await audioWriter.appendCompressedAwaitingReadiness(
                 unit.writerSubmission, coordinator: audioCoordinator,
                 ticket: try fixture.boundary.issueCompressedAudioAppend(
                     for: unit, writerBinding: audioWriter.binding))
@@ -6486,7 +7002,7 @@ private final class Task22GenericVideoPublicationHarness: @unchecked Sendable {
                 binding: audioBinding, continuation: continuation)
             try audioWriter.start(at: .zero)
             audioWriterWindowCount += 1
-            try audioWriter.appendCompressed(
+            try await audioWriter.appendCompressedAwaitingReadiness(
                 unit.writerSubmission, coordinator: audioCoordinator,
                 ticket: try fixture.boundary.issueCompressedAudioAppend(
                     for: unit, writerBinding: audioWriter.binding))
@@ -6782,27 +7298,32 @@ private final class Task22LongRenditionHarness: @unchecked Sendable {
     private var pcmInputCount = 0
 
     var publisher: HLSPublicationCoordinator { sink.publisher! }
+    var store: SealedMediaStore { sink.store! }
     var declaration: HLSItemDeclaration { sink.declaration! }
     var itemIdentity: AVPlayerItemInstanceIdentity {
         .init(outputLifecycleEpoch: initialBinding.outputLifecycleEpoch,
               itemGeneration: initialBinding.itemGeneration.rawValue)
     }
 
-    static func make() async throws -> Task22LongRenditionHarness {
+    static func make(outputLifecycleEpoch: OutputLifecycleEpoch? = nil) async throws -> Task22LongRenditionHarness {
         let calibration = try await AACPrimingCalibrator().calibrate(plan:
             AACCalibrationPlan.build([try AACRenditionRequest(
                 layout: RenditionAudioLayout(labels: [.l, .r]),
                 capabilityVersion: "task22-b-385-emissions")]))
         return try Task22LongRenditionHarness(
-            encoder: XCTUnwrap(calibration.encoders.first))
+            encoder: XCTUnwrap(calibration.encoders.first), outputLifecycleEpoch: outputLifecycleEpoch)
     }
 
-    private init(encoder: AACRenditionEncoder) throws {
+    private init(encoder: AACRenditionEncoder, outputLifecycleEpoch: OutputLifecycleEpoch?) throws {
         self.encoder = encoder
         format = try encoder.incrementalFormatDescription()
         boundary = try SegmentBoundaryCoordinator(
             mode: .audioOnly(epochStart: CMTime(value: 10, timescale: 1)))
-        initialBinding = Task19.binding(id: 2, epoch: 1, writer: 32_000, item: 19)
+        let legacy = Task19.binding(id: 2, epoch: 1, writer: 32_000, item: 19)
+        initialBinding = FMP4WriterBinding(outputLifecycleEpoch: outputLifecycleEpoch ?? legacy.outputLifecycleEpoch,
+            itemGeneration: legacy.itemGeneration, mediaEpoch: legacy.mediaEpoch,
+            publicationParticipantID: legacy.publicationParticipantID,
+            renditionIdentity: legacy.renditionIdentity, writerIdentity: legacy.writerIdentity)
         sink = Task22LongPublicationSink(initialBinding: initialBinding)
         try boundary.registerAudioRendition(
             initialBinding.renditionIdentity,
@@ -6857,9 +7378,9 @@ private final class Task22LongRenditionHarness: @unchecked Sendable {
                 try await onPublication(snapshot)
             }
         }
-        var terminal = try branch.pump(.endOfStream)
+        var terminal = try await branch.pumpAwaitingWriter(.endOfStream)
         if terminal.waitingForWriter {
-            let retried = try await branch.retryPendingAcrossWriterWindow()
+            let retried = try await branch.retryPendingAcrossWriterWindowAwaitingWriter()
             terminal = try XCTUnwrap(retried)
         }
         if let snapshot = publisher.visible,
@@ -6876,10 +7397,10 @@ private final class Task22LongRenditionHarness: @unchecked Sendable {
         let samples = (0..<(1_024 * 2)).map {
             sin(Float(batch * 2_048 + $0) * 0.002875) * 0.25
         }
-        var result = try branch.pump(.pcm(samples))
+        var result = try await branch.pumpAwaitingWriter(.pcm(samples))
         XCTAssertFalse(result.waitingForEncoderBudget)
         if result.waitingForWriter {
-            let retried = try await branch.retryPendingAcrossWriterWindow()
+            let retried = try await branch.retryPendingAcrossWriterWindowAwaitingWriter()
             result = try XCTUnwrap(retried)
         }
         XCTAssertFalse(result.waitingForWriter)
@@ -6892,12 +7413,12 @@ private final class Task22LongRenditionHarness: @unchecked Sendable {
         let samples = (0..<(1_024 * 2)).map {
             sin(Float(batch * 2_048 + $0) * 0.002875) * 0.25
         }
-        var result = try branch.pump(.pcm(samples))
+        var result = try await branch.pumpAwaitingWriter(.pcm(samples))
         guard !result.waitingForEncoderBudget else {
             throw AACRenditionFailure.capacityExceeded
         }
         if result.waitingForWriter {
-            let retried = try await branch.retryPendingAcrossWriterWindow()
+            let retried = try await branch.retryPendingAcrossWriterWindowAwaitingWriter()
             result = try XCTUnwrap(retried)
         }
         pcmInputCount += 1
@@ -7187,7 +7708,7 @@ private final class Task17FakeSystemWriterFactory: SegmentedFMP4SystemWriterFact
     }
 }
 
-private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @unchecked Sendable {
+private final class Task17FakeSystemWriter: SegmentedFMP4SynchronousSystemWriting, @unchecked Sendable {
     private let lock = NSLock()
     private let failurePoint: Task17SystemFailurePoint?
     private let defersFinish: Bool
@@ -7219,6 +7740,7 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
     private var defersAsyncCancellationReturn = false
     private var asyncCancellationRequested = false
     private var asyncAppendFailure: (any Error)?
+    private var pausedAsyncAppendOrdinal: Int?
     private var storedResetDecoderAttachments: [Bool] = []
 
     init(
@@ -7324,6 +7846,10 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
         lock.withLock { asyncAppendFailure = error }
     }
 
+    func pauseBeforeAsyncAppend(ordinal: Int) {
+        lock.withLock { pausedAsyncAppendOrdinal = ordinal }
+    }
+
     /// 模拟系统 receiver：只挂起媒体准入，真实 writer 的票据和账本仍由生产代码处理。
     func appendAwaitingReadiness(
         _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
@@ -7332,6 +7858,10 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SystemWriting, @uncheck
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 let action = lock.withLock { () -> (Bool, Bool, (@Sendable () -> Void)?) in
                     precondition(asyncAppendContinuation == nil)
+                    if pausedAsyncAppendOrdinal == storedAppendCount + 1 {
+                        pausedAsyncAppendOrdinal = nil
+                        readyForMoreMediaData = false
+                    }
                     let cancelled = asyncCancellationRequested
                     let complete = (!cancelled && readyForMoreMediaData)
                         || (cancelled && !defersAsyncCancellationReturn)
@@ -7585,7 +8115,7 @@ private enum Task17AACEndpointFixtures {
                 CMSampleBufferGetFormatDescription(copied.buffers[0])),
             collector: collector)
         try writer.start(at: CMTime(value: 10, timescale: 1))
-        try writer.appendAACEncodedEpoch(copied,
+        try await writer.appendAACEncodedEpochAwaitingReadiness(copied,
             coordinator: Task17Fixtures.aacCoordinator(epoch: copied, writer: writer))
         let terminal = try await writer.finish()
         XCTAssertEqual(terminal.terminalReason, .finished)
@@ -8161,8 +8691,10 @@ private enum Task17Fixtures {
             let samples = (0..<(1_024 * 2)).map {
                 sin(Float(batch * 2_048 + $0) * 0.003125) * 0.25
             }
-            _ = try encoder.pumpSigned(.pcm(samples)) { emission in
-                do { _ = try writer.appendAACIncremental(
+            var emitted: [AACIncrementalEmission] = []
+            _ = try encoder.pumpSigned(.pcm(samples)) { emitted.append($0) }
+            for emission in emitted {
+                do { _ = try await writer.appendAACIncrementalAwaitingReadiness(
                     emission, coordinator: boundary) }
                 catch SegmentedFMP4WriterFailure.rolloverRequired {
                     pending.append(emission)
@@ -9144,4 +9676,34 @@ private struct Task17EAC3BitWriter {
     func data(paddedTo byteCount: Int) -> Data {
         Data(bytes + Array(repeating: 0, count: byteCount - bytes.count))
     }
+}
+
+private func assertWriterThrowsError<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath, line: UInt = #line,
+    _ errorHandler: (any Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected writer operation to throw. \(message())", file: file, line: line)
+    } catch { errorHandler(error) }
+}
+
+private func assertWriterNoThrow<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath, line: UInt = #line
+) async {
+    do { _ = try await expression() }
+    catch { XCTFail("Unexpected writer error: \(error). \(message())", file: file, line: line) }
+}
+
+private func assertWriterEqual<T: Equatable>(
+    _ expression: @autoclosure () async throws -> T, _ expected: T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath, line: UInt = #line
+) async throws {
+    let actual = try await expression()
+    XCTAssertEqual(actual, expected, message(), file: file, line: line)
 }

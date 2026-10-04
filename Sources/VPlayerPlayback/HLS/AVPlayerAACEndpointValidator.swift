@@ -91,38 +91,7 @@ enum AVPlayerAACEndpointValidator {
               }) else {
             throw AVPlayerAACEndpointValidationFailure.incompleteHTTPBody
         }
-        guard receipt.sampleRate > 0,
-              receipt.leadingFrames >= 0, receipt.trailingFrames >= 0,
-              receipt.totalDecodedFrames >= receipt.leadingFrames,
-              receipt.totalDecodedFrames - receipt.leadingFrames >= receipt.trailingFrames,
-              receipt.realSampleCount
-                == receipt.totalDecodedFrames - receipt.leadingFrames - receipt.trailingFrames else {
-            throw AVPlayerAACEndpointValidationFailure.invalidTrim
-        }
-        let inputEffectiveBase = try receipt.inputPhysicalBase.adding(
-            ExactMediaTime(value: receipt.leadingFrames,
-                           timescale: receipt.sampleRate))
-        let offset = try receipt.writtenPhysicalBase.subtracting(
-            receipt.inputPhysicalBase)
-        let writtenEffectiveBase = try receipt.inputEffectiveBase.adding(offset)
-        let calculatedEffectiveEnd = try receipt.writtenEffectiveBase.adding(
-            ExactMediaTime(value: receipt.realSampleCount,
-                           timescale: receipt.sampleRate))
-        let calculatedPhysicalEnd = try receipt.writtenPhysicalBase.adding(
-            ExactMediaTime(value: receipt.totalDecodedFrames,
-                           timescale: receipt.sampleRate))
-        let physicalEndFromTrim = try receipt.lastEffectiveEnd.adding(
-            ExactMediaTime(value: receipt.trailingFrames,
-                           timescale: receipt.sampleRate))
-        guard receipt.inputEffectiveBase == inputEffectiveBase,
-              receipt.timelineOffset == offset,
-              receipt.writtenEffectiveBase == writtenEffectiveBase,
-              receipt.lastEffectiveEnd == calculatedEffectiveEnd,
-              receipt.terminalPhysicalEnd == calculatedPhysicalEnd,
-              receipt.terminalPhysicalEnd == physicalEndFromTrim else {
-            throw AVPlayerAACEndpointValidationFailure.effectiveEndMismatch
-        }
-        return receipt
+        return try preflightEffectiveEnd(receipt)
     }
 
     /// 跨物理 writer 的终态只信稳定 rendition owner 汇合的三份私签 receipt。
@@ -131,6 +100,120 @@ enum AVPlayerAACEndpointValidator {
         authority: AACEffectiveEndpointAuthority,
         rendition: AACRenditionTerminalBinding,
         completedPublication: some LoopbackPublicationFacts
+    ) throws -> AACEffectiveEndpointReceipt {
+        let receipt = try preflightRenditionIdentity(authority: authority, rendition: rendition)
+        guard completedPublication.itemGeneration == receipt.binding.itemGeneration.rawValue,
+              let participant = completedPublication.participants.first(where: {
+                  $0.participantID == receipt.binding.publicationParticipantID.rawValue
+                    && $0.renditionIdentity == receipt.binding.renditionIdentity
+                    && $0.mediaType == .audio
+              }),
+              participant.containsInitializationBacking(
+                authority.initialization.backingIdentity),
+              participant.completedMedia.contains(where: {
+                  $0.key == receipt.terminalMedia.key
+                    && $0.backingIdentity == receipt.terminalMedia.backingIdentity
+              }) else {
+            throw AVPlayerAACEndpointValidationFailure.identityMismatch
+        }
+        return try preflightEffectiveEnd(receipt)
+    }
+
+    /// 后续 final 只读当前 store 已提交的 init/terminal 完成事实；不重新消费
+    /// endpoint，也不重写已安装 item 的 timeline。这里只验证 endpoint 元数据，
+    /// shortened interval 仍必须另行验证所有 participant 的完整 decoded coverage。
+    static func preflight(
+        authority: AACEffectiveEndpointAuthority,
+        currentFinalPublication: HLSCurrentFinalPublication,
+        store: SealedMediaStore
+    ) throws -> AACEffectiveEndpointReceipt {
+        guard store.validatesCurrentFinalPublication(currentFinalPublication),
+              let rendition = authority.renditionBinding else {
+            throw AVPlayerAACEndpointValidationFailure.identityMismatch
+        }
+        let receipt = try preflightRenditionIdentity(authority: authority, rendition: rendition)
+        guard let writerFinal = rendition.finalWriterReceipt,
+              writerFinal.terminalBinding === authority.terminalBinding,
+              writerFinal.binding == receipt.binding else {
+            throw AVPlayerAACEndpointValidationFailure.identityMismatch
+        }
+        return try preflightCurrentFinal(authority: authority, receipt: receipt,
+            currentFinalPublication: currentFinalPublication, store: store)
+    }
+
+    /// Recheck the installed finite item's original authority without consuming
+    /// it again. The caller must also match every original participant snapshot
+    /// to the current committed final publication before shortening coverage.
+    static func preflight(
+        authority: AACEffectiveEndpointAuthority,
+        completedPublication: some LoopbackPublicationFacts,
+        currentFinalPublication: HLSCurrentFinalPublication,
+        store: SealedMediaStore
+    ) throws -> AACEffectiveEndpointReceipt {
+        let receipt = try preflight(authority: authority, completedPublication: completedPublication)
+        return try preflightCurrentFinal(authority: authority, receipt: receipt,
+            currentFinalPublication: currentFinalPublication, store: store)
+    }
+
+    private static func preflightCurrentFinal(
+        authority: AACEffectiveEndpointAuthority,
+        receipt: AACEffectiveEndpointReceipt,
+        currentFinalPublication: HLSCurrentFinalPublication,
+        store: SealedMediaStore
+    ) throws -> AACEffectiveEndpointReceipt {
+        let final = currentFinalPublication
+        guard store.validatesCurrentFinalPublication(final),
+              authority.terminalBinding.binding == receipt.binding,
+              final.binding == receipt.binding, final.mediaType == .audio,
+              final.initializationKey == authority.initialization.key,
+              final.initializationBackingIdentity == authority.initialization.backingIdentity,
+              final.initializationDigest == (try FMP4Digest(rawDigest: authority.initialization.sealedDigest)),
+              final.initializationByteCount == authority.initialization.byteCount,
+              final.terminalKey == receipt.terminalMedia.key,
+              final.terminalBackingIdentity == receipt.terminalMedia.backingIdentity,
+              final.terminalDigest == (try FMP4Digest(rawDigest: receipt.terminalMedia.sealedDigest)),
+              final.terminalByteCount == receipt.terminalMedia.byteCount else {
+            throw AVPlayerAACEndpointValidationFailure.identityMismatch
+        }
+        let verified = try preflightEffectiveEnd(receipt)
+        let endComparison = try HLSChecked.compare(verified.lastEffectiveEnd,
+                                                   final.effectivePlaybackHorizon)
+        guard final.isAudioOnly ? endComparison == 0 : endComparison >= 0 else {
+            throw AVPlayerAACEndpointValidationFailure.effectiveEndMismatch
+        }
+        return verified
+    }
+
+    /// 稳定 rendition 只桥接同一 media epoch 内的物理 writer continuation。
+    /// 原 prefix、原 terminal slot 与 offset 必须一起匹配；不存在 source epoch 桥。
+    static func preflight(
+        authority: AACEffectiveEndpointAuthority,
+        currentFinalPublication: HLSCurrentFinalPublication,
+        store: SealedMediaStore,
+        originalPrefix: AACPrefixPlaybackMappingReceipt,
+        originalTerminalBinding: AACWriterTerminalBinding
+    ) throws -> AACEffectiveEndpointReceipt {
+        let original = originalPrefix.mapping
+        let finalBinding = authority.receipt.binding
+        guard let rendition = authority.renditionBinding,
+              originalPrefix.belongs(to: rendition),
+              originalTerminalBinding.acceptsRenditionAnchor(rendition, mapping: original),
+              originalPrefix.publicationSequence <= currentFinalPublication.publicationSequence,
+              original.binding.outputLifecycleEpoch == finalBinding.outputLifecycleEpoch,
+              original.binding.itemGeneration == finalBinding.itemGeneration,
+              original.binding.mediaEpoch == finalBinding.mediaEpoch,
+              original.binding.publicationParticipantID == finalBinding.publicationParticipantID,
+              original.binding.renditionIdentity == finalBinding.renditionIdentity,
+              original.offset == authority.receipt.timelineOffset else {
+            throw AVPlayerAACEndpointValidationFailure.identityMismatch
+        }
+        return try preflight(authority: authority,
+            currentFinalPublication: currentFinalPublication, store: store)
+    }
+
+    private static func preflightRenditionIdentity(
+        authority: AACEffectiveEndpointAuthority,
+        rendition: AACRenditionTerminalBinding
     ) throws -> AACEffectiveEndpointReceipt {
         let receipt = authority.receipt
         guard rendition.owns(authority),
@@ -151,21 +234,14 @@ enum AVPlayerAACEndpointValidator {
               authority.initialization.backingIdentity
                 == receipt.initializationBackingIdentity,
               authority.media.first == receipt.firstMedia,
-              authority.media.last == receipt.terminalMedia,
-              completedPublication.itemGeneration == receipt.binding.itemGeneration.rawValue,
-              let participant = completedPublication.participants.first(where: {
-                  $0.participantID == receipt.binding.publicationParticipantID.rawValue
-                    && $0.renditionIdentity == receipt.binding.renditionIdentity
-                    && $0.mediaType == .audio
-              }),
-              participant.containsInitializationBacking(
-                authority.initialization.backingIdentity),
-              participant.completedMedia.contains(where: {
-                  $0.key == receipt.terminalMedia.key
-                    && $0.backingIdentity == receipt.terminalMedia.backingIdentity
-              }) else {
+              authority.media.last == receipt.terminalMedia else {
             throw AVPlayerAACEndpointValidationFailure.identityMismatch
         }
+        return receipt
+    }
+
+    private static func preflightEffectiveEnd(_ receipt: AACEffectiveEndpointReceipt)
+        throws -> AACEffectiveEndpointReceipt {
         guard receipt.sampleRate > 0,
               receipt.leadingFrames >= 0, receipt.trailingFrames >= 0,
               receipt.totalDecodedFrames >= receipt.leadingFrames,

@@ -11,11 +11,13 @@ import VPlayerCore
 /// EPG state smaller still. Every slot renders even without EPG data so all
 /// tiles in a grid row keep the same height.
 struct ChannelCard: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     let channel: Channel
     let programmes: [Programme]
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
+        TimelineView(.periodic(from: .now, by: prefersReducedResourceUsage ? 120 : 30)) { context in
             let presentation = ChannelProgrammePresentation.resolve(
                 programmes: programmes,
                 at: context.date
@@ -25,8 +27,8 @@ struct ChannelCard: View {
 
                 Text(channel.displayName)
                     .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+                .fixedSize(horizontal: false, vertical: true)
 
                 epgFooter(presentation: presentation)
             }
@@ -39,7 +41,8 @@ struct ChannelCard: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(presentation.current?.title ?? "暂无当前节目")
                 .font(.caption2)
-                .lineLimit(1)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+                .fixedSize(horizontal: false, vertical: true)
 
             ProgressView(value: presentation.progress ?? 0)
                 .accessibilityLabel("当前节目进度")
@@ -47,7 +50,8 @@ struct ChannelCard: View {
 
             Text(nextProgrammeLine(for: presentation.next) ?? " ")
                 .font(.caption2)
-                .lineLimit(1)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .foregroundStyle(.secondary)
     }

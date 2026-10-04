@@ -640,7 +640,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var audioBranch: AudioRenditionBranch?
     private var pendingAudio: [HLSTimedAudioAccessUnit] = []
     private var maxVideoPTS: CMTime?
-    private var sourcePCMIndex: Int64 = 0
+    private var encoderPCMIndex: Int64 = 0
     #if DEBUG
     private var previousRandomAccessDiagnostic: (
         pts: ExactMediaTime,
@@ -653,6 +653,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     init(
         lifecycle: OutputLifecycleEpoch,
         publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
+        initialWindowMinimumSeconds: Int = 3,
         failureSink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void = { _ in }
     ) throws {
         guard publicationDeadlineNanoseconds > 0 else {
@@ -666,7 +667,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             / 1_000_000_000
         publication = try SystemHLSPublicationGraph(
             itemGeneration: lifecycle.outputNonce,
-            publicationDeadlineNanoseconds: publicationDeadlineNanoseconds)
+            publicationDeadlineNanoseconds: publicationDeadlineNanoseconds,
+            initialWindowMinimumSeconds: initialWindowMinimumSeconds)
         let pair = AsyncStream<AdmittedDemuxEvent>.makeStream()
         stream = pair.stream
         streamContinuation = pair.continuation
@@ -724,14 +726,26 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
 
     private func consume(_ event: HLSTimelineEvent) async throws {
         switch event {
-        case .originEstablished:
+        case .originEstablished(let origin):
             setDiagnosticStage("timeline.origin")
-            break
+            if tracks?.video == nil, boundary == nil {
+                try publication.configureAudioOnly()
+                boundary = try SegmentBoundaryCoordinator(mode: .audioOnly(epochStart: origin.effectiveStart.cmTime))
+                mediaEpoch = .init(rawValue: try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch))
+                try installAudioWriterIfReady()
+            }
         case .audioFormat(let configuration):
             setDiagnosticStage("audio.configure")
             try await configureAudio(configuration)
         case .audioSample(let timed):
             setDiagnosticStage("audio.append")
+            if tracks?.video == nil {
+                // Origin comes from a complete audio AU. Never enqueue radio audio
+                // behind a video watermark that cannot exist.
+                try installAudioWriterIfReady()
+                try await appendAudio(timed)
+                return
+            }
             let isAheadOfVideo = maxVideoPTS.map {
                 CMTimeCompare(timed.timing.presentationTimeStamp.cmTime, $0) > 0
             } ?? true
@@ -828,9 +842,14 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             }
             return
         }
+        guard let track = tracks?.audio else { throw AACRenditionFailure.invalidInput }
+        // Audio-only publishes one same-layout AAC rendition. Keep mono/multichannel
+        // fidelity; the A/V compatibility policy remains the existing stereo rendition.
+        let layout = try tracks?.video == nil
+            ? RenditionAudioLayout(native: track.channelLayout).canonical
+            : RenditionAudioLayout(labels: [.l, .r])
         let request = try AACRenditionRequest(
-            layout: RenditionAudioLayout(labels: [.l, .r]),
-            capabilityVersion: "system-hls-task22-v1")
+            layout: layout, capabilityVersion: "system-hls-task22-v1")
         let receipt = try await AACPrimingCalibrator().calibrate(
             plan: AACCalibrationPlan.build([request]))
         guard receipt.encoders.count == 1 else { throw AACRenditionFailure.calibrationMismatch }
@@ -1469,14 +1488,21 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         return admission
     }
 
+    static func makeAudioConverter(for track: AudioTrackDescriptor,
+                                   output: AudioRenditionOutput = .stereo) throws -> AudioRenditionConverter {
+        let inputLayout = try RenditionAudioLayout(native: track.channelLayout)
+        // FFmpeg decoder 与 PCM bridge 保留 native 顺序；仅改标签为 AAC 顺序会错配声道。
+        return try AudioRenditionConverter(
+            inputLabels: inputLayout.labels,
+            inputRate: Int(track.sampleRate), output: output)
+    }
+
     private func installAudioWriterIfReady() throws {
         guard audioBranch == nil, let configuration = audioConfiguration,
               let encoder = audioCalibration?.encoders.first,
               let track = tracks?.audio, let boundary, let mediaEpoch else { return }
-        let inputLayout = try RenditionAudioLayout(native: track.channelLayout)
-        let converter = try AudioRenditionConverter(
-            inputLabels: inputLayout.canonical.labels,
-            inputRate: Int(track.sampleRate), output: .stereo)
+        let converter = try Self.makeAudioConverter(
+            for: track, output: tracks?.video == nil ? .fidelity : .stereo)
         let ownership = HLSAudioCopyOwnership(
             maximumCompressedBytes: 1 * 1_024 * 1_024,
             maximumPCMBytes: 8 * 1_024 * 1_024, capacity: 8)
@@ -1544,15 +1570,24 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
 
     private func appendAudio(_ timed: HLSTimedAudioAccessUnit) async throws {
         guard let bridge = audioBridge, let converter = audioConverter,
-              let branch = audioBranch, let track = tracks?.audio else {
+              let branch = audioBranch else {
             throw AACRenditionFailure.invalidInput
         }
         for decoded in try bridge.push(timed) {
-            let frames = decoded.count / Int(track.channelLayout.channelCount)
-            let converted = try converter.convert(decoded, sourceSampleIndex: sourcePCMIndex)
-            sourcePCMIndex = try checkedAdd(sourcePCMIndex, Int64(frames))
-            if !converted.samples.isEmpty { try await pump(converted, into: branch) }
+            try await appendDecodedAudio(decoded, converter: converter, branch: branch)
         }
+    }
+
+    private func appendDecodedAudio(_ decoded: SystemHLSDecodedPCMBlock,
+                                    converter: AudioRenditionConverter,
+                                    branch: AudioRenditionBranch) async throws {
+        while true {
+            try Task.checkCancellation()
+            guard let silence = try converter.fillGap(before: decoded) else { break }
+            if !silence.samples.isEmpty { try await pump(silence, into: branch) }
+        }
+        let converted = try converter.convert(decoded)
+        if !converted.samples.isEmpty { try await pump(converted, into: branch) }
     }
 
     private func flushPendingAudio(
@@ -1576,11 +1611,33 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         _ block: AudioRenditionPCMBlock,
         into branch: AudioRenditionBranch
     ) async throws {
+        // AAC's integer clock is continuous because the converter materializes real
+        // gaps as silence and removes pre-origin/overlap samples. Verify that contract
+        // before dropping the envelope, then respect the encoder's 32,768-float input cap.
+        guard block.channelCount > 0, block.channelCount <= 8,
+              CMTimeCompare(block.presentationTimeStamp,
+                CMTime(value: try checkedAdd(480_000, encoderPCMIndex), timescale: 48_000)) == 0 else {
+            throw AACRenditionFailure.invalidInput
+        }
+        let maximumSamples = min(16_384, 32_768 / block.channelCount) * block.channelCount
+        if block.samples.count <= maximumSamples {
+            try await pumpSamples(block.samples, into: branch)
+            encoderPCMIndex = try checkedAdd(encoderPCMIndex, Int64(block.frameCount))
+            return
+        }
+        for offset in stride(from: 0, to: block.samples.count, by: maximumSamples) {
+            let end = min(offset + maximumSamples, block.samples.count)
+            try await pumpSamples(Array(block.samples[offset..<end]), into: branch)
+            encoderPCMIndex = try checkedAdd(encoderPCMIndex, Int64((end - offset) / block.channelCount))
+        }
+    }
+
+    private func pumpSamples(_ samples: [Float], into branch: AudioRenditionBranch) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while true {
             do {
                 let result = try await settleAudioPump(
-                    try await branch.pumpAwaitingWriter(.pcm(block.samples)), branch: branch)
+                    try await branch.pumpAwaitingWriter(.pcm(samples)), branch: branch)
                 guard !result.waitingForWriter, !result.waitingForEncoderBudget else {
                     throw AACRenditionFailure.capacityExceeded
                 }
@@ -1668,13 +1725,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
         setDiagnosticStage("naturalEOF.audioDrain")
         guard let bridge = audioBridge, let converter = audioConverter,
-              let branch = audioBranch,
-              let track = tracks?.audio else { throw AACRenditionFailure.invalidInput }
+              let branch = audioBranch else { throw AACRenditionFailure.invalidInput }
         for decoded in try bridge.drainForNaturalEOF() {
-            let frames = decoded.count / Int(track.channelLayout.channelCount)
-            let converted = try converter.convert(decoded, sourceSampleIndex: sourcePCMIndex)
-            sourcePCMIndex = try checkedAdd(sourcePCMIndex, Int64(frames))
-            if !converted.samples.isEmpty { try await pump(converted, into: branch) }
+            try await appendDecodedAudio(decoded, converter: converter, branch: branch)
         }
         let tail = try converter.drain()
         if !tail.samples.isEmpty { try await pump(tail, into: branch) }
@@ -1684,18 +1737,18 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         guard terminal.finalReceipt != nil else { throw AACRenditionFailure.invalidInput }
         setDiagnosticStage("naturalEOF.audioWriter")
         _ = try await branch.finishRendition()
-        if !finishedInterlacedVideo {
+        if !finishedInterlacedVideo, tracks?.video != nil {
             setDiagnosticStage("naturalEOF.video")
             guard let videoWriter else {
                 throw HLSVideoRemuxSubmissionFailure.writerAttemptMismatch
             }
             _ = try await videoWriter.finish()
         }
-        try publication.finishNaturalEnd()
+        let publicationResult = try await publication.finishNaturalEnd()
         setDiagnosticStage("naturalEOF.complete")
         condition.withLock {
             guard state != .failed, state != .retiring, state != .retired else { return }
-            terminalResult = true
+            terminalResult = publicationResult == .endListPublished
             condition.broadcast()
         }
     }

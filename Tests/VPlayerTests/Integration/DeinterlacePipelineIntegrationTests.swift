@@ -135,6 +135,12 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
             0,
             3_600,
         ])
+        XCTAssertEqual(result.admittedSourcePTS90k, [
+            (1 << 33) - 7_200,
+            (1 << 33) - 3_600,
+            1 << 33,
+            (1 << 33) + 3_600,
+        ], "Compressed admission follows the assembler clock while decoder metadata still crosses the raw33-bit wrap")
     }
 
     func testProductionCoordinatorReordersBFramePTSAndCarriesRepeatTiming() throws {
@@ -150,6 +156,7 @@ final class DeinterlacePipelineIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(result.deliveredSourceAccessUnitIDs.prefix(3), [1, 3, 2])
         XCTAssertEqual(result.repeatFieldRoute, .metalYADIF2x)
+        XCTAssertTrue(result.initialInterlacedGOPWasRejected)
         XCTAssertTrue(result.repeatFieldMetadataReachedProcessor)
         XCTAssertEqual(
             result.repeatFieldNormalizedDurations,

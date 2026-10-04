@@ -11,6 +11,815 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class LoopbackHTTPServerTests: XCTestCase {
+    func testCurrentFinalProjectionRequiresCommittedFinalAndExactCompletedBodies() async throws {
+        let fixture = try await Task20HTTPFixture.start(terminalLogicalSequence: 5)
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let binding = try XCTUnwrap(fixture.task19.tracks[2]?.binding)
+        XCTAssertNil(store.currentFinalPublication(matching: binding))
+        XCTAssertEqual(try fixture.task19.publisher.publish(
+            ticket: fixture.task19.publisher.ticket, now: Task19.second,
+            naturalEnd: true), .published)
+        let snapshot = try XCTUnwrap(fixture.task19.publisher.visible?.media[2])
+        let terminal = try XCTUnwrap(snapshot.resources.last)
+        let initialization = try XCTUnwrap(snapshot.initializationResources.first)
+        XCTAssertNil(store.currentFinalPublication(matching: binding),
+            "A committed final playlist alone cannot prove completed media")
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: terminal)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: terminal)?.isComplete == true
+        })
+        XCTAssertNil(store.currentFinalPublication(matching: binding),
+            "The terminal body cannot replace initialization completion")
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: initialization)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.currentFinalPublication(matching: binding) != nil
+        })
+        let final = try XCTUnwrap(store.currentFinalPublication(matching: binding))
+        XCTAssertEqual(final.effectivePlaybackHorizon, snapshot.effectivePlaybackHorizon)
+        XCTAssertEqual(final.effectivePlaybackHorizon,
+                       fixture.task19.publisher.visible?.media[1]?.effectivePlaybackHorizon,
+                       "A/V endpoint metadata preserves the committed common video tail")
+        XCTAssertEqual(final.publicationSequence, snapshot.version)
+        XCTAssertEqual(final.terminalKey, terminal)
+        XCTAssertEqual(final.initializationKey, initialization)
+        XCTAssertTrue(final.initializationKey.authentication.isEmpty)
+        XCTAssertTrue(final.terminalKey.authentication.isEmpty)
+        XCTAssertThrowsError(try store.resourceURI(final.terminalKey),
+                             "Escaping final metadata must not retain routable authentication")
+        XCTAssertEqual(MemoryLayout.size(ofValue: final.initializationDigest), 32)
+        XCTAssertEqual(MemoryLayout.size(ofValue: final.terminalDigest), 32)
+        XCTAssertFalse(final.isAudioOnly)
+        XCTAssertTrue(store.validatesCurrentFinalPublication(final))
+
+        let wrongEpoch = Task19.binding(id: 2, epoch: binding.mediaEpoch.rawValue + 1)
+        XCTAssertNil(store.currentFinalPublication(matching: wrongEpoch))
+        let wrongRendition = FMP4WriterBinding(outputLifecycleEpoch: binding.outputLifecycleEpoch,
+            itemGeneration: binding.itemGeneration, mediaEpoch: binding.mediaEpoch,
+            publicationParticipantID: binding.publicationParticipantID,
+            renditionIdentity: .init(rawValue: 999), writerIdentity: binding.writerIdentity)
+        XCTAssertNil(store.currentFinalPublication(matching: wrongRendition))
+        let other = SealedMediaStore(token: Task19.token, itemGeneration: 19)
+        XCTAssertFalse(other.validatesCurrentFinalPublication(final))
+
+        try await fixture.task19.beginEpoch(binding.mediaEpoch.rawValue + 1)
+        XCTAssertNil(store.currentFinalPublication(matching: binding),
+            "An unbridged successor epoch invalidates the old final projection")
+        XCTAssertFalse(store.validatesCurrentFinalPublication(final))
+    }
+
+    func testCompressedFinalProjectionUsesCommittedCommonTailWithoutAACAuthority() async throws {
+        for codec in [HLSAudioCodec.ac3, .eac3] {
+            let fixture = try await Task21CompressedLifecycleHTTPFixture.start(codec: codec,
+                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 73_120))
+            defer { fixture.shutdown() }
+            do {
+                let publisher = fixture.publication.publisher
+                let binding = try XCTUnwrap(publisher.ticket.participantVector.first?.binding)
+                XCTAssertNil(fixture.publication.store.currentFinalPublication(matching: binding))
+                XCTAssertEqual(try publisher.publish(ticket: publisher.ticket,
+                    now: Task19.second, naturalEnd: true), .published)
+                XCTAssertTrue(try XCTUnwrap(publisher.visible?.media[2]).isFinal)
+                XCTAssertTrue(try XCTUnwrap(publisher.visible).aacTerminalBindings.isEmpty)
+                try await fixture.serveCompletedPublication()
+                XCTAssertTrue(waitUntil(timeout: 2) {
+                    fixture.publication.store.currentFinalPublication(matching: binding) != nil
+                })
+                let final = try XCTUnwrap(fixture.publication.store.currentFinalPublication(matching: binding))
+                XCTAssertTrue(final.isAudioOnly)
+                XCTAssertEqual(final.effectivePlaybackHorizon, Task19.time(6))
+                XCTAssertEqual(final.effectivePlaybackHorizon,
+                               publisher.visible?.media[2]?.effectivePlaybackHorizon)
+            } catch {
+                await fixture.shutdownWriter()
+                throw error
+            }
+            await fixture.shutdownWriter()
+        }
+    }
+
+    func testPausedWindowRequiresItsOwnFrozenInitializationCompletion() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        try fixture.beginPreparationHistory()
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        let media = try XCTUnwrap(playlist.resources.first)
+        XCTAssertEqual(playlist.initializationResources.count, 1)
+        let initialization = try XCTUnwrap(playlist.initializationResources.first)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let requested = try XCTUnwrap(map.samples.first).presentationRange
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: media)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: media)?.isComplete == true
+        })
+        XCTAssertFalse(store.completedEvidenceSnapshot(for: initialization)?.isComplete == true)
+
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        var frozen: PausedWindowCoverageLease? = try .reserve()
+        let slot = try XCTUnwrap(frozen).slot
+        let mediaSlot = try XCTUnwrap(frozen).retainMetadata(in: store, key: media)
+        let initSlot = try XCTUnwrap(frozen).retainMetadata(in: store, key: initialization)
+        try XCTUnwrap(frozen).freezeCompletedResources()
+        XCTAssertTrue(try XCTUnwrap(frozen).containsCompletedResource(mediaSlot))
+        XCTAssertFalse(try XCTUnwrap(frozen).containsCompletedResource(initSlot))
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(owner: XCTUnwrap(frozen),
+            rendition: .init(rawValue: 1), requested: requested),
+            "Completed media cannot certify a merely pinned initialization")
+
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: initialization)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+        })
+        XCTAssertFalse(try XCTUnwrap(frozen).containsCompletedResource(initSlot))
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(owner: XCTUnwrap(frozen),
+            rendition: .init(rawValue: 1), requested: requested),
+            "Later HTTP completion cannot rewrite an already frozen lease")
+        frozen = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+
+        var renewed: PausedWindowCoverageLease? = try .reserve()
+        XCTAssertEqual(try XCTUnwrap(renewed).slot, slot)
+        _ = try XCTUnwrap(renewed).retainMetadata(in: store, key: media)
+        _ = try XCTUnwrap(renewed).retainMetadata(in: store, key: initialization)
+        try XCTUnwrap(renewed).freezeCompletedResources()
+        var dependencies = try store.pausedWindowCoverageReceipt(owner: XCTUnwrap(renewed),
+            rendition: .init(rawValue: 1), requested: requested)?.dependencies
+        XCTAssertNotNil(dependencies)
+        XCTAssertTrue(dependencies?.input(atOrdinal: 0)?.initialization.isComplete == true)
+        XCTAssertTrue(dependencies?.input(atOrdinal: 0)?.media.isComplete == true)
+        renewed = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
+            baseline + PausedWindowCoverageLease.reservationBytes)
+        XCTAssertFalse(store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+        dependencies = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+        XCTAssertTrue(store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+    }
+
+    func testPausedWindowAndStartupCoverageKeepIdenticalDigestsAndGapRejection() async throws {
+        let lifecycle = Task19.binding().outputLifecycleEpoch
+        let fixture = try await FinalReplacementHTTPFixture.start(
+            outputLifecycleEpoch: lifecycle, itemGeneration: 19)
+        defer { fixture.shutdown() }
+        let snapshot = try XCTUnwrap(fixture.publication.publisher.visible)
+        let timeline = try makeRealTimelineEvidence(
+            fixture: fixture, snapshot: snapshot, lifecycle: lifecycle)
+        let store = fixture.publication.store
+        let playlist = try XCTUnwrap(snapshot.media[2])
+        let media = try XCTUnwrap(playlist.resources.last)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let initialization = try XCTUnwrap(playlist.initializationResources.first {
+            store.completedEvidenceSnapshot(for: $0)?.resourceIdentity == map.initializationBackingIdentity
+        })
+        let requested = try XCTUnwrap(map.samples.first).presentationRange
+        let context = Self.makeCoverageContext(rendition: 2, nonce: 72_401,
+            timeline: timeline.authority, selectionCapability: timeline.selection)
+        let original = fixture.evidenceSource.preparationOwner
+        let startup = try XCTUnwrap(store.preparationCoverageReceipt(owner: original,
+            context: context, requested: requested))
+
+        let paused = try PausedWindowCoverageLease.reserve()
+        _ = try paused.retainMetadata(in: store, key: media)
+        _ = try paused.retainMetadata(in: store, key: initialization)
+        try paused.freezeCompletedResources()
+        let renewed = try XCTUnwrap(store.pausedWindowCoverageReceipt(owner: paused,
+            rendition: .init(rawValue: 2), requested: requested))
+        XCTAssertEqual(renewed.itemGeneration, startup.itemGeneration)
+        XCTAssertEqual(renewed.renditionIdentity, startup.renditionIdentity)
+        XCTAssertEqual(renewed.presentationRange, startup.presentationRange)
+        XCTAssertEqual(renewed.canonicalCoverageDigest, startup.canonicalCoverageDigest)
+        XCTAssertEqual(renewed.dependencies, startup.dependencies)
+
+        let end = try XCTUnwrap(map.samples.last).presentationRange.end
+        let gap = try FMP4PresentationRange(start: requested.start,
+            duration: end.adding(Task19.time(1)).subtracting(requested.start))
+        XCTAssertNil(try store.preparationCoverageReceipt(owner: original,
+            context: context, requested: gap))
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(owner: paused,
+            rendition: .init(rawValue: 2), requested: gap))
+        XCTAssertNil(original.coverage(at: 1))
+        XCTAssertNil(paused.coverage(at: 1))
+        XCTAssertEqual(try store.preparationCoverageReceipt(owner: original,
+            context: context, requested: requested)?.canonicalCoverageDigest,
+            startup.canonicalCoverageDigest)
+    }
+
+    func testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        let media = try XCTUnwrap(playlist.resources.first)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let initialization = try XCTUnwrap(playlist.initializationResources.first)
+        let requested = try XCTUnwrap(map.samples.first).presentationRange
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        for _ in 0..<3 {
+            var owner: PausedWindowCoverageLease? = try .reserve()
+            _ = try XCTUnwrap(owner).retainMetadata(in: store, key: media)
+            _ = try XCTUnwrap(owner).retainMetadata(in: store, key: initialization)
+            var workspace: PausedCoverageWorkspace? = try store.reservePausedCoverageWorkspace(
+                owner: XCTUnwrap(owner))
+            let admitted = try XCTUnwrap(workspace)
+            XCTAssertEqual(admitted.mapCount, 1)
+            XCTAssertEqual(admitted.sampleCount, map.samples.count)
+            XCTAssertLessThanOrEqual(admitted.knownAllocationBytes, admitted.reservationBytes)
+            XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: admitted,
+                rendition: .init(rawValue: 1), requested: requested))
+            for key in [media, initialization] {
+                XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                    target: fixture.server.path(for: key)).status, 200)
+            }
+            XCTAssertTrue(waitUntil(timeout: 2) {
+                store.completedEvidenceSnapshot(for: media)?.isComplete == true
+                    && store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+            })
+            try XCTUnwrap(owner).freezeCompletedResources()
+            let receipt = try XCTUnwrap(store.pausedWindowCoverageReceipt(workspace: admitted,
+                rendition: .init(rawValue: 1), requested: requested))
+            // A distinct owner has no cached descriptor, so legacy selection
+            // and union validation run independently rather than taking its cache hit.
+            let legacy = try PausedWindowCoverageLease.reserve()
+            _ = try legacy.retainMetadata(in: store, key: media)
+            _ = try legacy.retainMetadata(in: store, key: initialization)
+            try legacy.freezeCompletedResources()
+            XCTAssertNil(legacy.coverage(at: 0))
+            let legacyReceipt = try XCTUnwrap(store.pausedWindowCoverageReceipt(owner: legacy,
+                rendition: .init(rawValue: 1), requested: requested))
+            XCTAssertEqual(receipt.canonicalCoverageDigest, legacyReceipt.canonicalCoverageDigest)
+            XCTAssertEqual(receipt.dependencies, legacyReceipt.dependencies)
+            owner = nil
+            workspace = nil
+            withExtendedLifetime((admitted, receipt, legacy, legacyReceipt)) {}
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testPausedResumeDecodePinsExcludeUnfetchedNoncontributingVideoHold() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        XCTAssertGreaterThanOrEqual(playlist.resources.count, 2)
+        let priorKey = playlist.resources[0]
+        let nextKey = playlist.resources[1]
+        let prior = try XCTUnwrap(store.decodeCoverageMap(for: priorKey))
+        let next = try XCTUnwrap(store.decodeCoverageMap(for: nextKey))
+        let first = try XCTUnwrap(next.samples.first)
+        let requested = first.presentationRange
+        let priorEnd = try XCTUnwrap(prior.samples.max {
+            CMTimeCompare($0.presentationRange.end.cmTime, $1.presentationRange.end.cmTime) < 0
+        }).presentationRange.end
+        let hold = try XCTUnwrap(PausedDecodeCoverageOrder.videoHold(map: prior))
+        XCTAssertLessThanOrEqual(CMTimeCompare(priorEnd.cmTime, requested.start.cmTime), 0)
+        XCTAssertGreaterThan(CMTimeCompare(try priorEnd.adding(hold).cmTime, requested.start.cmTime), 0)
+        XCTAssertTrue(first.isRandomAccess)
+        XCTAssertEqual(first.nearestRandomAccessOrdinal, first.decodeOrdinal,
+            "The next map must decode independently of the prior map")
+        let initialization = try XCTUnwrap(playlist.initializationResources.first {
+            store.completedEvidenceSnapshot(for: $0)?.resourceIdentity == next.initializationBackingIdentity
+        })
+        for key in [initialization, nextKey] {
+            XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                target: fixture.server.path(for: key)).status, 200)
+        }
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+                && store.completedEvidenceSnapshot(for: nextKey)?.isComplete == true
+        })
+        XCTAssertFalse(store.completedEvidenceSnapshot(for: priorKey)?.isComplete == true)
+        let owner = try PausedWindowCoverageLease.reserve()
+        try store.retainPausedDecodeClosure(key: priorKey, requested: requested, owner: owner)
+        try store.retainPausedDecodeClosure(key: nextKey, requested: requested, owner: owner)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+
+        XCTAssertEqual(workspace.mapCount, 1,
+            "A hold extension cannot admit a map discarded by the exact coverage verifier")
+        XCTAssertTrue(store.pausedCoverageBodiesComplete(owner: owner),
+            "The unfetched prior map must not gate the independently decodable current interval")
+        try owner.freezeCompletedResources()
+        let receipt = try XCTUnwrap(store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: requested))
+        XCTAssertEqual(receipt.dependencies.count, 1)
+        XCTAssertEqual(receipt.dependencies.first?.mediaBackingIdentity, next.resourceIdentity)
+        XCTAssertFalse(receipt.dependencies.contains { $0.mediaBackingIdentity == prior.resourceIdentity })
+    }
+
+    func testPausedCoverageWorkspaceRejectsExpandedPinsAndInvalidCapacities() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        XCTAssertGreaterThanOrEqual(playlist.resources.count, 2)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: playlist.resources[0])
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        _ = try owner.retainMetadata(in: store, key: playlist.resources[1])
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: playlist.resources[0]))
+        XCTAssertThrowsError(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: XCTUnwrap(map.samples.first).presentationRange))
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        for dimensions in [(0, 0), (129, 129), (1, 257), (128, 32_769)] {
+            XCTAssertThrowsError(try PausedCoverageWorkspace.allocationLimits(
+                mapCount: dimensions.0, sampleCount: dimensions.1))
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testPausedDecodeOrderMatchesExistingNestedReorderedAndHeldFragments() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            fixture.server.completedEvidence(for: key)?.isComplete == true
+        })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        XCTAssertTrue(evidence.isComplete)
+        func range(_ start: Int64, _ duration: Int64) throws -> FMP4PresentationRange {
+            try .init(start: .init(value: start, timescale: 100),
+                      duration: .init(value: duration, timescale: 100))
+        }
+        // The latest start has a smaller end than the containing earlier sample.
+        // intersection must preserve lexicographic-last semantics, not max(end).
+        let ranges = try [range(9, 1), range(0, 20), range(8, 2), range(0, 2)]
+        let samples = ranges.enumerated().map { index, range in
+            SealedDecodeSampleEntry(decodeOrdinal: UInt16(index), presentationRange: range,
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
+                isRandomAccess: index == 0, containsInBandConfiguration: false)
+        }
+        let map = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8], samples: samples)
+        let request = try range(0, 30)
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256) { storage in
+            let order = UnsafeMutableBufferPointer(rebasing: storage[..<samples.count])
+            try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+            let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
+            XCTAssertEqual(try PausedDecodeCoverageOrder.intersection(
+                map: map, ordinals: UnsafeBufferPointer(order), requested: ExactMediaInterval(request)),
+                try map.intersection(with: request).map(ExactMediaInterval.init))
+            var cursor = 0
+            var actual: [FMP4PresentationRange] = []
+            while let next = try PausedDecodeCoverageOrder.nextRange(map: map,
+                ordinals: UnsafeBufferPointer(order), cursor: &cursor,
+                requested: ExactMediaInterval(request), eligibility: eligibility) {
+                if let previous = actual.last, CMTimeCompare(next.start.cmTime, previous.end.cmTime) <= 0 {
+                    let end = CMTimeCompare(next.end.cmTime, previous.end.cmTime) > 0
+                        ? next.end : previous.end
+                    actual[actual.count - 1] = try .init(start: previous.start,
+                        duration: end.subtracting(previous.start))
+                } else { actual.append(try .init(start: next.start, duration: next.end.subtracting(next.start))) }
+            }
+            XCTAssertEqual(actual, try map.coveredFragments(by: evidence, intersecting: request))
+        }
+        let nearLimit = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+            samples: [.init(decodeOrdinal: 0,
+                presentationRange: .init(start: Task19.time(Int64.max - 3), duration: Task19.time(1)),
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
+                isRandomAccess: true, containsInBandConfiguration: false)])
+        let nearLimitRequest = nearLimit.samples[0].presentationRange
+        XCTAssertThrowsError(try nearLimit.coveredFragments(by: evidence, intersecting: nearLimitRequest))
+        XCTAssertThrowsError(try pausedFragments(nearLimit, evidence: evidence, requested: nearLimitRequest))
+    }
+
+    func testPausedDecodeIntervalsPreserveNanosecondCursorWithoutDerivedDuration() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) { fixture.server.completedEvidence(for: key)?.isComplete == true })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        let cases: [(Int64, ExactMediaTime)] = [
+            (0, HLSChecked.zero), (10, HLSChecked.zero),
+            (0, ExactMediaTime(value: 1, timescale: 375))
+        ]
+        for (wholeSeconds, offset) in cases {
+            let native = ExactMediaTime(value: wholeSeconds * 1_000_000_000 + 259_475_417,
+                                        timescale: 1_000_000_000)
+            let sample = try FMP4PresentationRange(
+                start: .init(value: wholeSeconds * 375 + 96, timescale: 375),
+                duration: .init(value: 8, timescale: 375))
+            XCTAssertThrowsError(try sample.end.subtracting(native)) {
+                XCTAssertEqual($0 as? HLSTimelineError, .arithmeticOverflow)
+            }
+            if offset != HLSChecked.zero {
+                XCTAssertThrowsError(try native.subtracting(offset)) {
+                    XCTAssertEqual($0 as? HLSTimelineError, .arithmeticOverflow)
+                }
+            }
+            let requested = try ExactMediaInterval(start: native, end: sample.end.adding(offset))
+            let map = try SealedDecodeCoverageMap(mediaType: .audio,
+                sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+                samples: [.init(decodeOrdinal: 0, presentationRange: sample, byteSpan: 8..<16,
+                    nearestRandomAccessOrdinal: 0, isRandomAccess: true, containsInBandConfiguration: false)])
+            try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1) { order in
+                try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+                let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
+                XCTAssertEqual(try PausedDecodeCoverageOrder.intersection(map: map,
+                    ordinals: UnsafeBufferPointer(order), requested: requested,
+                    presentationOffset: offset), requested)
+                XCTAssertTrue(try PausedDecodeCoverageOrder.canContribute(map: map,
+                    requested: requested, presentationOffset: offset))
+                var cursor = 0
+                XCTAssertEqual(try PausedDecodeCoverageOrder.nextRange(map: map,
+                    ordinals: UnsafeBufferPointer(order), cursor: &cursor, requested: requested,
+                    eligibility: eligibility, presentationOffset: offset), requested)
+                XCTAssertNil(try PausedDecodeCoverageOrder.nextRange(map: map,
+                    ordinals: UnsafeBufferPointer(order), cursor: &cursor, requested: requested,
+                    eligibility: eligibility, presentationOffset: offset))
+            }
+        }
+    }
+
+    func testExactComparisonAcceptsValidNanosecondPointsBeyondInt64CrossProduct() throws {
+        let start = ExactMediaTime(value: 10_259_475_417, timescale: 1_000_000_000)
+        let end = try start.adding(ExactMediaTime(value: 3, timescale: 1))
+        XCTAssertEqual(try HLSChecked.compare(start, end), -1)
+        XCTAssertEqual(try HLSChecked.compare(end, start), 1)
+        XCTAssertEqual(try HLSChecked.compare(start, start), 0)
+        let minimum = ExactMediaTime(value: .min, timescale: .max)
+        let maximum = ExactMediaTime(value: .max, timescale: .max - 1)
+        XCTAssertEqual(try HLSChecked.compare(minimum, maximum), -1)
+        XCTAssertEqual(try HLSChecked.compare(maximum, minimum), 1)
+    }
+
+    func testPausedCoverageWorkspaceRejectsReentryWithoutInvalidatingOuterScope() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        let request = try XCTUnwrap(store.decodeCoverageMap(for: media)?.samples.first).presentationRange
+        let charged = PlaybackResourceContextLedger.shared.chargedBytes
+        try workspace.withExclusiveUse {
+            XCTAssertThrowsError(try store.pausedWindowCoverageReceipt(workspace: workspace,
+                rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
+            XCTAssertThrowsError(try workspace.withExclusiveUse { XCTFail("Nested body must not run") })
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+        }
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+    }
+
+    func testPausedCoverageWorkspaceHardCapacityFailureDoesNotAllocateOrLosePins() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        let ledger = PlaybackResourceContextLedger.shared
+        let baseline = ledger.chargedBytes
+        let blocker = try ledger.reserve(allocationIdentity: .stable(UUID()),
+            bytes: PlaybackResourceContextLedger.hardBytes - baseline)
+        XCTAssertThrowsError(try store.reservePausedCoverageWorkspace(owner: owner)) { error in
+            XCTAssertEqual(error as? LoopbackHTTPReservationError, .hardCapacityExceeded)
+        }
+        XCTAssertEqual(ledger.chargedBytes, PlaybackResourceContextLedger.hardBytes)
+        ledger.release(blocker)
+        XCTAssertEqual(ledger.chargedBytes, baseline)
+        XCTAssertFalse(store.preparationLeaseChargeSnapshot(ownerSlot: owner.slot).identities.isEmpty)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        XCTAssertEqual(workspace.mapCount, 1)
+    }
+
+    func testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let playlist = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
+        let media = try XCTUnwrap(playlist.resources.first)
+        let initialization = try XCTUnwrap(playlist.initializationResources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        _ = try owner.retainMetadata(in: store, key: initialization)
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: media)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) { store.completedEvidenceSnapshot(for: media)?.isComplete == true })
+        try owner.freezeCompletedResources()
+        let request = try XCTUnwrap(store.decodeCoverageMap(for: media)?.samples.first).presentationRange
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: initialization)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            store.completedEvidenceSnapshot(for: initialization)?.isComplete == true
+        })
+        XCTAssertNil(try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: ExactMediaInterval(request)))
+        XCTAssertNil(owner.coverage(at: 0))
+    }
+
+    private func pausedFragments(_ map: SealedDecodeCoverageMap,
+                                 evidence: CompletedBodyEvidenceSnapshot,
+                                 requested: FMP4PresentationRange) throws -> [FMP4PresentationRange] {
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: map.samples.count) { order in
+            try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+            let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
+            var cursor = 0
+            var ranges: [FMP4PresentationRange] = []
+            while let next = try PausedDecodeCoverageOrder.nextRange(map: map,
+                ordinals: UnsafeBufferPointer(order), cursor: &cursor,
+                requested: ExactMediaInterval(requested), eligibility: eligibility) {
+                if let previous = ranges.last,
+                   CMTimeCompare(next.start.cmTime, previous.end.cmTime) <= 0 {
+                    let end = CMTimeCompare(next.end.cmTime, previous.end.cmTime) > 0 ? next.end : previous.end
+                    ranges[ranges.count - 1] = try .init(start: previous.start,
+                        duration: end.subtracting(previous.start))
+                } else { ranges.append(try .init(start: next.start, duration: next.end.subtracting(next.start))) }
+            }
+            return ranges
+        }
+    }
+
+    func testPausedDecodeOrderRejectsMissingCommonSampleAndRAPPrefixBytes() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key), headers: ["Range": "bytes=16-23"]).status, 206)
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            fixture.server.completedEvidence(for: key)?.covers(16..<24) == true
+        })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        XCTAssertFalse(evidence.covers(0..<16))
+        func sample(_ ordinal: UInt16, span: Range<Int>, start: Int64) throws -> SealedDecodeSampleEntry {
+            .init(decodeOrdinal: ordinal,
+                presentationRange: try .init(start: Task19.time(start, 100), duration: Task19.time(2, 100)),
+                byteSpan: span, nearestRandomAccessOrdinal: 0, isRandomAccess: ordinal == 0,
+                containsInBandConfiguration: false)
+        }
+        let missingCommon = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+            samples: [sample(0, span: 16..<24, start: 0)])
+        let missingSample = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [16..<24],
+            samples: [sample(0, span: 8..<16, start: 0)])
+        let missingRAP = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [16..<24],
+            samples: [sample(0, span: 8..<16, start: 0), sample(1, span: 16..<24, start: 2)])
+        let request = try FMP4PresentationRange(start: Task19.time(0, 100), duration: Task19.time(4, 100))
+        for map in [missingCommon, missingSample, missingRAP] {
+            XCTAssertEqual(try pausedFragments(map, evidence: evidence, requested: request), [])
+            XCTAssertEqual(try pausedFragments(map, evidence: evidence, requested: request),
+                           try map.coveredFragments(by: evidence, intersecting: request))
+        }
+        // A held frame that ends at the requested start cannot supply coverage.
+        let before = try SealedDecodeCoverageMap(mediaType: .video,
+            sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [16..<24],
+            samples: [sample(0, span: 16..<24, start: 0)])
+        let following = try FMP4PresentationRange(start: Task19.time(2, 100), duration: Task19.time(2, 100))
+        XCTAssertEqual(try pausedFragments(before, evidence: evidence, requested: following), [])
+    }
+
+    func testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap() throws {
+        func range(_ start: Int64, _ duration: Int64) throws -> FMP4PresentationRange {
+            try .init(start: Task19.time(start, 100), duration: Task19.time(duration, 100))
+        }
+        let firstMap = try [range(0, 8), range(20, 4)]
+        let complement = try [range(8, 8), range(16, 8)]
+        let realGap = try [range(9, 7), range(16, 8)]
+        let requested = try range(0, 24)
+        for (other, expected) in [(complement, true), (realGap, false)] {
+            let maps = [firstMap, other]
+            var positions = [0, 0]
+            var current = [maps[0][0], maps[1][0]]
+            try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 2) { heap in
+                var count = 0
+                for index in 0..<2 {
+                    try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                        count: &count, rangeAt: { ExactMediaInterval(current[$0]) })
+                }
+                var cursor = requested.start
+                var gap = false
+                var emitted = 0
+                while count > 0 {
+                    let index = Int(try PausedCoverageTimeHeap.pop(storage: heap,
+                        count: &count, rangeAt: { ExactMediaInterval(current[$0]) }))
+                    let next = current[index]
+                    if CMTimeCompare(next.start.cmTime, cursor.cmTime) > 0 { gap = true }
+                    if !gap, CMTimeCompare(next.end.cmTime, cursor.cmTime) > 0 { cursor = next.end }
+                    emitted += 1
+                    positions[index] += 1
+                    if positions[index] < maps[index].count {
+                        current[index] = maps[index][positions[index]]
+                        try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                            count: &count, rangeAt: { ExactMediaInterval(current[$0]) })
+                    }
+                }
+                XCTAssertEqual(emitted, 4, "Every dependency stream must be drained")
+                XCTAssertEqual(!gap && cursor == requested.end, expected)
+            }
+        }
+    }
+
+    func testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents() async throws {
+        let fixture = try await Task20HTTPFixture.start(audioCount: 3)
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
+        let owner = try PausedWindowCoverageLease.reserve()
+        // All genuine currently published video/audio maps, not an authority-bypassing fixture.
+        for playlist in snapshot.media.values {
+            for key in playlist.initializationResources + playlist.resources {
+                _ = try owner.retainMetadata(in: store, key: key)
+                XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                    target: fixture.server.path(for: key)).status, 200)
+            }
+        }
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            snapshot.media.values.allSatisfy { playlist in
+                (playlist.initializationResources + playlist.resources).allSatisfy {
+                    store.completedEvidenceSnapshot(for: $0)?.isComplete == true
+                }
+            }
+        })
+        let admissionStart = ContinuousClock.now
+        let workspace = try store.reservePausedCoverageWorkspace(owner: owner)
+        let admissionDuration = admissionStart.duration(to: .now)
+        try owner.freezeCompletedResources()
+        let video = try XCTUnwrap(snapshot.media[1])
+        let firstMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(video.resources.first)))
+        let lastMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(video.resources.last)))
+        let audio = try XCTUnwrap(snapshot.media[2])
+        let firstAudioMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(audio.resources.first)))
+        let lastAudioMap = try XCTUnwrap(store.decodeCoverageMap(for: XCTUnwrap(audio.resources.last)))
+        let videoStart = try XCTUnwrap(firstMap.samples.min {
+            CMTimeCompare($0.presentationRange.start.cmTime, $1.presentationRange.start.cmTime) < 0
+        }).presentationRange.start
+        let audioStart = try XCTUnwrap(firstAudioMap.samples.min {
+            CMTimeCompare($0.presentationRange.start.cmTime, $1.presentationRange.start.cmTime) < 0
+        }).presentationRange.start
+        let videoEnd = try XCTUnwrap(lastMap.samples.max {
+            CMTimeCompare($0.presentationRange.end.cmTime, $1.presentationRange.end.cmTime) < 0
+        }).presentationRange.end
+        let audioEnd = try XCTUnwrap(lastAudioMap.samples.max {
+            CMTimeCompare($0.presentationRange.end.cmTime, $1.presentationRange.end.cmTime) < 0
+        }).presentationRange.end
+        let start = CMTimeCompare(videoStart.cmTime, audioStart.cmTime) > 0 ? videoStart : audioStart
+        let end = CMTimeCompare(videoEnd.cmTime, audioEnd.cmTime) < 0 ? videoEnd : audioEnd
+        XCTAssertGreaterThan(CMTimeCompare(end.cmTime, start.cmTime), 0)
+        let requested = try FMP4PresentationRange(start: start, duration: end.subtracting(start))
+        let verificationStart = ContinuousClock.now
+        let videoReceipt = try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 1), requested: requested)
+        let videoVerified = ContinuousClock.now
+        let audioReceipt = try store.pausedWindowCoverageReceipt(workspace: workspace,
+            rendition: .init(rawValue: 2), requested: requested)
+        let audioVerified = ContinuousClock.now
+        XCTAssertNotNil(videoReceipt)
+        XCTAssertNotNil(audioReceipt)
+        XCTAssertEqual(owner.coverage(at: 0)?.rendition, .init(rawValue: 1))
+        XCTAssertEqual(owner.coverage(at: 1)?.rendition, .init(rawValue: 2))
+        let actual = try XCTUnwrap(workspace.actualAllocationBytes)
+        let videoDuration = verificationStart.duration(to: videoVerified)
+        let audioDuration = videoVerified.duration(to: audioVerified)
+        let sequentialDuration = verificationStart.duration(to: audioVerified)
+        var report = "PAUSED_WORKSPACE maps=\(workspace.mapCount) samples=\(workspace.sampleCount) "
+        report += "root=\(actual.root) ordinals=\(actual.ordinals) cursors=\(actual.cursors) heap=\(actual.heap) "
+        report += "context=\(actual.context) application=\(actual.application) reserved=\(workspace.reservationBytes) "
+        report += "serializedAdmission=\(admissionDuration) "
+        report += "videoVerification=\(videoDuration) "
+        report += "audioVerification=\(audioDuration) "
+        report += "sequentialVerification=\(sequentialDuration) "
+        report += "sourceMappingAuthorityProven=false"
+        print(report)
+        let ceiling = try PausedCoverageWorkspace.allocationLimits(mapCount: 128, sampleCount: 32_768)
+        print("PAUSED_WORKSPACE_BOUND maps=128 samples=32768 root=\(ceiling.root) "
+            + "ordinals=\(ceiling.ordinals) cursors=\(ceiling.cursors) heap=\(ceiling.heap) "
+            + "context=\(ceiling.context) application=\(ceiling.application) total=\(ceiling.total) "
+            + "actualAllocation=false actualAdmissionAttempt=false")
+        // This is a report, not a timing success gate or a 128x256 full-store claim.
+    }
+
+    func testPausedDecodeKernelReports128By256ReverseOverlapAndGapWorkloads() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let key = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.path(for: key)).status, 200)
+        XCTAssertTrue(waitUntil(timeout: 2) { fixture.server.completedEvidence(for: key)?.isComplete == true })
+        let evidence = try XCTUnwrap(fixture.server.completedEvidence(for: key))
+        XCTAssertTrue(evidence.isComplete)
+        for scenario in ["reverse", "overlap", "gaps"] {
+            let maps = try (0..<128).map { mapIndex in
+                try SealedDecodeCoverageMap(mediaType: .video,
+                    sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
+                    samples: (0..<256).map { index in
+                        let base = scenario == "overlap" ? 0 : mapIndex * 256
+                        let tick = (base + 255 - index) * (scenario == "gaps" ? 5 : 1)
+                        return SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
+                            presentationRange: try .init(start: Task19.time(Int64(tick), 100),
+                                duration: Task19.time(1, 100)), byteSpan: 8..<16,
+                            nearestRandomAccessOrdinal: 0, isRandomAccess: index == 0,
+                            containsInBandConfiguration: false)
+                    })
+            }
+            let requestedTicks: Int64 = scenario == "overlap" ? 256
+                : scenario == "gaps" ? 163_840 : 32_768
+            let request = try FMP4PresentationRange(start: Task19.time(0, 100),
+                duration: Task19.time(requestedTicks, 100))
+            let storage = UnsafeMutablePointer<UInt8>.allocate(capacity: 32_768)
+            storage.initialize(repeating: 0, count: 32_768)
+            defer { storage.deinitialize(count: 32_768); storage.deallocate() }
+            let begin = ContinuousClock.now
+            for index in maps.indices {
+                try PausedDecodeCoverageOrder.prepare(map: maps[index],
+                    ordinals: .init(start: storage + index * 256, count: 256))
+            }
+            let sorted = ContinuousClock.now
+            let eligibility = try maps.map {
+                try PausedDecodeCoverageOrder.eligibility(map: $0, evidence: evidence)
+            }
+            let eligibilityComputed = ContinuousClock.now
+            var positions = Array(repeating: 0, count: 128)
+            var current = Array<ExactMediaInterval?>(repeating: nil, count: 128)
+            let heapBacking = UnsafeMutablePointer<UInt8>.allocate(capacity: 128)
+            heapBacking.initialize(repeating: 0, count: 128)
+            defer { heapBacking.deinitialize(count: 128); heapBacking.deallocate() }
+            let heap = UnsafeMutableBufferPointer(start: heapBacking, count: 128)
+            var heapCount = 0
+            func advance(_ index: Int) throws {
+                current[index] = try PausedDecodeCoverageOrder.nextRange(map: maps[index],
+                    ordinals: .init(start: storage + index * 256, count: 256), cursor: &positions[index],
+                    requested: ExactMediaInterval(request), eligibility: eligibility[index])
+            }
+            for index in maps.indices {
+                try advance(index)
+                if current[index] != nil {
+                    try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                        count: &heapCount, rangeAt: { current[$0]! })
+                }
+            }
+            XCTAssertEqual(heapCount, 128)
+            var cursor = request.start
+            var gap = false
+            var emitted = 0
+            while heapCount > 0 {
+                let index = Int(try PausedCoverageTimeHeap.pop(storage: heap,
+                    count: &heapCount, rangeAt: { current[$0]! }))
+                let range = try XCTUnwrap(current[index])
+                if CMTimeCompare(range.start.cmTime, cursor.cmTime) > 0 { gap = true }
+                if !gap, CMTimeCompare(range.end.cmTime, cursor.cmTime) > 0 { cursor = range.end }
+                emitted += 1
+                try advance(index)
+                if current[index] != nil {
+                    try PausedCoverageTimeHeap.insert(UInt8(index), storage: heap,
+                        count: &heapCount, rangeAt: { current[$0]! })
+                }
+            }
+            let end = ContinuousClock.now
+            XCTAssertEqual(emitted, 32_768)
+            XCTAssertTrue(positions.allSatisfy { $0 == 256 })
+            XCTAssertEqual(!gap && cursor == request.end, scenario != "gaps")
+            print("PAUSED_KERNEL scenario=\(scenario) maps=128 samples=32768 "
+                + "ordinalBacking=\(malloc_size(storage)) heapBacking=\(malloc_size(heapBacking)) "
+                + "sort=\(begin.duration(to: sorted)) "
+                + "eligibility=\(sorted.duration(to: eligibilityComputed)) "
+                + "heapMergeAndIteration=\(eligibilityComputed.duration(to: end)) "
+                + "syntheticHeapMergeMeasured=true authenticatedStore=false domainHoldMeasured=false "
+                + "admissionProven=false")
+        }
+    }
+
+    func testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow() throws {
+        let samples = try (0..<256).map { index in
+            SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
+                presentationRange: try .init(start: .init(value: Int64(255 - index), timescale: 100),
+                    duration: .init(value: 1, timescale: 100)), byteSpan: 8..<16,
+                nearestRandomAccessOrdinal: 0, isRandomAccess: index == 0,
+                containsInBandConfiguration: false)
+        }
+        let map = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
+            commonByteSpans: [0..<8], samples: samples)
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256) { storage in
+            try PausedDecodeCoverageOrder.prepare(map: map, ordinals: storage)
+            XCTAssertEqual(Array(storage), Array((0...255).reversed()).map(UInt8.init))
+        }
+        let overflow = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
+            commonByteSpans: [0..<8], samples: [.init(decodeOrdinal: 0,
+                presentationRange: .init(start: .init(value: 0, timescale: 1),
+                    duration: .init(value: Int64.max / 2, timescale: 1)),
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
+                isRandomAccess: true, containsInBandConfiguration: false)])
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1) { storage in
+            try PausedDecodeCoverageOrder.prepare(map: overflow, ordinals: storage)
+            XCTAssertThrowsError(try PausedDecodeCoverageOrder.videoHold(map: overflow))
+        }
+    }
+
     func testResourcePathFailurePreservesPublicationErrorTypeAndReason() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
@@ -38,11 +847,11 @@ final class LoopbackHTTPServerTests: XCTestCase {
 
     func testProductionFactoryRejectsRawTokenStoreEvenWhenEveryVisibleTokenMatches() async throws {
         do {
-            _ = try await LoopbackHTTPSessionFactory().start(
+            _ = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
                 itemGeneration: 19, now: { 0 }, logger: { _ in }, responseFailure: { _, _ in }
             ) { capability in
-                let harness = try Task19Harness(token: capability.value)
-                try harness.initial()
+                let harness = try await Task19Harness(token: capability.value)
+                try await harness.initial()
                 var declaration = try Task19.declaration()
                 declaration.token = capability.value
                 return LoopbackPreparedPublication(store: harness.store, declaration: declaration,
@@ -62,13 +871,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 let configuration = LoopbackHTTPTestingConfiguration(
                     capability: capability, entropyFault: fault)
                 do {
-                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).start(
+                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).startPreparingAsynchronously(
                         itemGeneration: 19, now: { 0 }, logger: { _ in },
                         responseFailure: { _, _ in }
                     ) { token in
                         prepared.append(1)
-                        let harness = try Task19Harness(loopbackSession: token)
-                        try harness.initial()
+                        let harness = try await Task19Harness(loopbackSession: token)
+                        try await harness.initial()
                         var declaration = try Task19.declaration()
                         declaration.token = token.value
                         return LoopbackPreparedPublication(store: harness.store,
@@ -86,12 +895,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
             let configuration = LoopbackHTTPTestingConfiguration(
                 capability: capability, cancelAfterStartupProbeAccepted: true)
             do {
-                _ = try await LoopbackHTTPSessionFactory(testing: configuration).start(
+                _ = try await LoopbackHTTPSessionFactory(testing: configuration).startPreparingAsynchronously(
                     itemGeneration: 19, now: { 0 }, logger: { _ in },
                     responseFailure: { _, _ in }
                 ) { token in
-                    let harness = try Task19Harness(loopbackSession: token)
-                    try harness.initial()
+                    let harness = try await Task19Harness(loopbackSession: token)
+                    try await harness.initial()
                     storeBox.value = harness
                     var declaration = try Task19.declaration()
                     declaration.token = token.value
@@ -117,7 +926,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             .declaration.playlistURI(participantID: 1)
         let initialHEAD = try rawRequest(port: fixture.server.port, method: "HEAD", target: playlistPath)
 
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let refreshed = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -135,8 +944,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let oldKey = try XCTUnwrap(initial.media[1]?.resources.first)
         let oldPath = try fixture.task19.store.resourceURI(oldKey,
             declaration: try XCTUnwrap(initial.participantVector.first { $0.participantID == 1 }).declaration)
-        try fixture.task19.beginEpoch(2)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.beginEpoch(2)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second * 2), .published)
         let epochTwo = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -629,6 +1438,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
         let timeline = try makeRealTimelineEvidence(
             fixture: fixture, snapshot: snapshot, authorityParticipantID: 2)
+        let preparationOwner = try fixture.beginPreparationHistory().preparationOwner
         let context = Self.makeCoverageContext(rendition: 1, nonce: 301,
             timeline: timeline.authority, selectionCapability: timeline.selection)
         for key in [oldInit, oldMedia] {
@@ -637,30 +1447,100 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
         let oldReceipt = try XCTUnwrap(fixture.server.coverageReceipt(
             for: context, adding: oldRange))
-        XCTAssertEqual(Mirror(reflecting: oldReceipt).displayStyle, .class,
-                       "coverage receipt 必须是无 memberwise initializer 的 opaque capability")
+        // The immutable value is opaque because construction requires the store's
+        // private issuance authority; reference-type shape is not its trust boundary.
+        XCTAssertEqual(oldReceipt.preparedPlayheadIdentity, context.preparedPlayheadIdentity)
+        XCTAssertEqual(oldReceipt.observedRenditionSetReceiptIdentity,
+                       context.observedRenditionSetReceipt.identity)
+        XCTAssertEqual(oldReceipt.renditionIdentity, context.renditionIdentity)
+        XCTAssertEqual(oldReceipt.itemGeneration, oldMedia.itemGeneration)
+        XCTAssertEqual(oldReceipt.presentationRange, oldRange)
+        XCTAssertTrue(oldReceipt.preparedPlayheadIdentity.audioSelectionCapability
+            === timeline.selection)
+        XCTAssertTrue(oldReceipt.preparedPlayheadIdentity.timelineMappingAuthority
+            === timeline.authority)
+        XCTAssertEqual(oldReceipt.dependencies.count, 1)
+        let dependency = try XCTUnwrap(oldReceipt.dependencies.first)
+        let mediaEvidence = try XCTUnwrap(fixture.server.completedEvidence(for: oldMedia))
+        let initializationEvidence = try XCTUnwrap(fixture.server.completedEvidence(for: oldInit))
+        XCTAssertEqual(dependency.mediaEpoch, oldMedia.mediaEpoch)
+        XCTAssertEqual(dependency.epochProofIdentity, oldMap.epochProofIdentity)
+        XCTAssertEqual(dependency.segmentReceiptIdentity, oldMap.segmentReceiptIdentity)
+        XCTAssertEqual(dependency.mediaBackingIdentity, mediaEvidence.resourceIdentity)
+        XCTAssertEqual(dependency.initializationBackingIdentity, initializationEvidence.resourceIdentity)
+        XCTAssertEqual(dependency.mediaEvidenceIdentity, mediaEvidence.stateIdentity)
+        XCTAssertEqual(dependency.initializationEvidenceIdentity, initializationEvidence.stateIdentity)
+        let copiedReceipt = oldReceipt
+        let originalDigest = oldReceipt.canonicalCoverageDigest
+        XCTAssertEqual(try fixture.server.coverageReceipt(for: context, adding: oldRange), oldReceipt,
+                       "同一真实 completed-body 集合的重复查询必须保留同一签发事实")
 
-        try fixture.task19.beginEpoch(2)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.beginEpoch(2)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let successor = try XCTUnwrap(fixture.task19.publisher.visible?.media[1])
-        let newInit = try XCTUnwrap(successor.initializationResources.last)
         let newMedia = try XCTUnwrap(successor.resources.last)
+        let newMap = try XCTUnwrap(fixture.task19.store.decodeCoverageMap(for: newMedia))
+        // A rolling playlist advertises an unordered set of init resources from
+        // both epochs. Select the one authenticated by this media's decode map.
+        let matchingInitializations = successor.initializationResources.filter {
+            $0.mediaEpoch == newMedia.mediaEpoch
+                && fixture.server.completedEvidence(for: $0)?.resourceIdentity
+                    == newMap.initializationBackingIdentity
+        }
+        XCTAssertEqual(matchingInitializations.count, 1)
+        let newInit = try XCTUnwrap(matchingInitializations.first)
+        XCTAssertEqual(newInit.mediaEpoch, 2)
+        XCTAssertEqual(newMedia.mediaEpoch, 2)
         clock.value = Task19.second * 60
+        fixture.task19.store.sweep(now: clock.value)
+        XCTAssertTrue(preparationOwner.isHistoryActive)
+        XCTAssertEqual(fixture.server.completedEvidence(for: oldMedia), mediaEvidence,
+                       "活动 history 仍钉住原 publication，跨过 horizon 本身不能退休旧 media")
+        XCTAssertEqual(try fixture.server.coverageReceipt(for: context, adding: oldRange), oldReceipt)
+        // Release the live publication history while the original frozen audio
+        // timeline and immutable receipt aliases remain held by this test.
+        fixture.retirePreparationHistory()
+        XCTAssertTrue(preparationOwner.isRetired)
         fixture.task19.store.sweep(now: clock.value)
         XCTAssertNil(fixture.server.completedEvidence(for: oldMedia),
                      "旧 media 跨过 horizon 后必须从 store 信任域退休")
+        XCTAssertNil(try fixture.server.coverageReceipt(for: context, adding: oldRange),
+                     "保留旧 receipt 别名不能重新签发已经退休的 dependency")
         for key in [newInit, newMedia] {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: fixture.server.path(for: key)).status, 200)
         }
-        let newMap = try XCTUnwrap(fixture.task19.store.decodeCoverageMap(for: newMedia))
+        XCTAssertEqual(fixture.server.completedEvidence(for: newInit)?.isComplete, true)
+        XCTAssertEqual(fixture.server.completedEvidence(for: newMedia)?.isComplete, true)
+        XCTAssertEqual(fixture.server.completedEvidence(for: newInit)?.stateIdentity,
+                       newMap.initializationStateIdentity)
+        XCTAssertEqual(fixture.server.completedEvidence(for: newMedia)?.stateIdentity,
+                       newMap.evidenceStateIdentity)
+        let newRange = try XCTUnwrap(newMap.samples.first).presentationRange
+        let successorReceipt = try fixture.server.coverageReceipt(for: context, adding: newRange)
+        XCTAssertNotNil(successorReceipt)
+        if let successorReceipt {
+            XCTAssertEqual(successorReceipt.preparedPlayheadIdentity, context.preparedPlayheadIdentity)
+            XCTAssertEqual(successorReceipt.presentationRange, newRange)
+            XCTAssertEqual(successorReceipt.dependencies.count, 1)
+            let successorDependency = successorReceipt.dependencies.first
+            XCTAssertEqual(successorDependency?.mediaEpoch, newMedia.mediaEpoch)
+            XCTAssertEqual(successorDependency?.epochProofIdentity, newMap.epochProofIdentity)
+            XCTAssertEqual(successorDependency?.segmentReceiptIdentity, newMap.segmentReceiptIdentity)
+            XCTAssertEqual(successorDependency?.mediaBackingIdentity, newMap.resourceIdentity)
+            XCTAssertNotEqual(successorDependency?.mediaEpoch, dependency.mediaEpoch)
+        }
         let newEnd = try XCTUnwrap(newMap.samples.last).presentationRange.end
         let spanning = try FMP4PresentationRange(start: oldRange.start,
             duration: newEnd.subtracting(oldRange.start))
         XCTAssertNil(try fixture.server.coverageReceipt(for: context, adding: spanning),
                      "每次签发必须在 store 域复验全部既有 dependency，不能携带退休旧代")
+        XCTAssertEqual(copiedReceipt, oldReceipt)
+        XCTAssertEqual(copiedReceipt.canonicalCoverageDigest, originalDigest)
+        XCTAssertEqual(Array(copiedReceipt.dependencies), [dependency],
+                       "复制的旧 receipt 必须保留原 proof/backing/evidence，不能被后继 epoch 改写")
     }
 
     func testLifecycleRequiresMatchingTicketDrainAndLoggerMayReenterWithoutDeadlock() async throws {
@@ -684,6 +1564,52 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try fixture.server.retire(cleanupTicket: ticket)
         XCTAssertEqual(fixture.server.lifecyclePhase, .retired)
         XCTAssertFalse(callbacks.values.isEmpty)
+    }
+
+    func testOwnedDrainRejectsForeignTicketAndWaitsForLateRealConnection() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        let other = try await Task20HTTPFixture.start()
+        defer { other.shutdown() }
+        let foreignTicket = other.server.closeAdmission()
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: foreignTicket)) {
+            XCTAssertEqual($0 as? LoopbackHTTPServerError, .invalidConfiguration)
+        }
+        let ticket = fixture.server.closeAdmission()
+        XCTAssertEqual(fixture.server.usage.connections, 0)
+        // Reproduce the original ordering with an actual late socket owner:
+        // the caller has observed zero, but .closed still accepts tracked peers.
+        let late = try ConnectedSocket(port: fixture.server.port)
+        defer { late.reset(); fixture.shutdown() }
+        XCTAssertTrue(waitUntil { fixture.server.usage.connections == 1 })
+        XCTAssertEqual(fixture.server.lifecyclePhase, .closed)
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: foreignTicket)) {
+            XCTAssertEqual($0 as? LoopbackHTTPServerError, .invalidConfiguration)
+        }
+        XCTAssertFalse(try fixture.server.drainIfIdle(cleanupTicket: ticket),
+                       "An actual accepted socket remains owned until its terminal")
+        XCTAssertEqual(fixture.server.lifecyclePhase, .closed)
+        XCTAssertThrowsError(try fixture.server.drain(cleanupTicket: ticket),
+                             "The strict drain API must retain its busy-owner error")
+        late.reset()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(try fixture.server.drainIfIdle(cleanupTicket: ticket)) {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("The released real socket did not reach its owned terminal")
+                throw LoopbackHTTPServerError.invalidConfiguration
+            }
+            await Task.yield()
+        }
+        XCTAssertEqual(fixture.server.lifecyclePhase, .drained)
+        XCTAssertEqual(fixture.server.usage.connections, 0)
+        XCTAssertEqual(fixture.server.usage.activeResponses, 0)
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: ticket),
+                             "A completed drain must not silently accept a second transition")
+        XCTAssertThrowsError(try fixture.server.retire(cleanupTicket: foreignTicket))
+        try fixture.server.retire(cleanupTicket: ticket)
+        XCTAssertEqual(fixture.server.lifecyclePhase, .retired)
+        XCTAssertEqual(fixture.server.usage.distinctBackingBytes, 0)
+        XCTAssertEqual(fixture.server.usage.parserAndStagingBytes, 0)
+        XCTAssertThrowsError(try fixture.server.drainIfIdle(cleanupTicket: ticket))
     }
 
     func testFinalAACParticipantsRequireExactTerminalAndTimelineSetsBeforeServerVisibility()
@@ -790,6 +1716,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
                            .insufficientCoverage)
         }
 
+        closeFixture.evidenceSource.retirePreparation()
+
         let responseFailures = LockedEvidenceFailures()
         let failureLifecycle = AudioServiceLeaseTestHarness.makeLifecycle(
             outputNonce: 51_201)
@@ -856,113 +1784,124 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let fixture = try await FinalReplacementHTTPFixture.start(
             outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(
                 outputNonce: 51_300))
-        let snapshot = try XCTUnwrap(fixture.publication.publisher.visible)
-        let playlist = try XCTUnwrap(snapshot.media[2])
-        let declaration = try XCTUnwrap(snapshot.participantVector.first {
-            $0.participantID == 2
-        }?.declaration)
-        XCTAssertEqual(try rawRequest(port: fixture.server.port,
-            target: declaration.playlistURI(participantID: 2)).status, 200)
-        for key in playlist.initializationResources + playlist.resources {
+        let store = fixture.publication.store
+        do {
+            let snapshot = try XCTUnwrap(fixture.publication.publisher.visible)
+            let playlist = try XCTUnwrap(snapshot.media[2])
+            let declaration = try XCTUnwrap(snapshot.participantVector.first {
+                $0.participantID == 2
+            }?.declaration)
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
-                target: fixture.server.path(for: key)).status, 200)
-        }
-        let mediaKey = try XCTUnwrap(playlist.resources.first)
-        let map = try XCTUnwrap(
-            fixture.publication.store.decodeCoverageMap(for: mediaKey))
-        let requested = try XCTUnwrap(map.samples.first).presentationRange
-        let capability = try XCTUnwrap(fixture.server.completedPublicationCapability(
-            itemURL: fixture.itemURL, itemGeneration: 20,
-            publicationSequence: snapshot.publicationSequence))
-        let publicationEvidence = try XCTUnwrap(
-            fixture.server.consumeCompletedPublicationCapability(capability))
-        let selection = try XCTUnwrap(publicationEvidence.audioSelectionCapability)
-        let item = AVPlayerItemInstanceIdentity(
-            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(
-                outputNonce: 51_300),
-            itemGeneration: 20)
-        let timeline: PlayerItemTimelineMappingAuthority
-        switch try fixture.server.makePlayerItemTimelineMappingAuthority(
-            endpointAuthority: fixture.publication.endpointAuthority,
-            completedPublication: publicationEvidence,
-            itemURL: fixture.itemURL,
-            item: item,
-            publicationSequence: snapshot.publicationSequence,
-            expectedSelection: selection) {
-        case .ready(let value):
-            timeline = value
-        case .waitingForSelection, .invalid:
-            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
-        }
-        let prepared = PreparedPlayheadIdentity(
-            outputLifecycleEpoch: item.outputLifecycleEpoch,
-            itemGeneration: 20,
-            publicationSequence: snapshot.publicationSequence,
-            mediaTime: timeline.effectiveSourceOrigin,
-            playerItemTime: try timeline.playerItemTime(
-                for: timeline.effectiveSourceOrigin),
-            seekNonce: 51_301,
-            renditionSelectionSlotNonce: 51_302,
-            audioSelectionCapability: selection,
-            timelineMappingAuthority: timeline)
-        let observed = ObservedRenditionSetReceipt(
-            preparedPlayheadIdentity: prepared,
-            selectionFenceRevision: 51_303,
-            orderedRenditionIdentities: [.init(rawValue: 2)])
-        let context = LoopbackCoverageContext(
-            preparedPlayheadIdentity: prepared,
-            observedRenditionSetReceipt: observed,
-            renditionIdentity: .init(rawValue: 2))
-        _ = try fixture.server.coverageReceipt(for: context, adding: requested)
-        XCTAssertEqual(fixture.publication.store.coverageContextCount, 1)
-        XCTAssertEqual(
-            fixture.publication.store.coverageApplicationChargeSnapshot.chargedBytes,
-            LoopbackStorageLayout.current.coverageAccumulatorAllocationBytes)
+                target: declaration.playlistURI(participantID: 2)).status, 200)
+            for key in playlist.initializationResources + playlist.resources {
+                XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                    target: fixture.server.path(for: key)).status, 200)
+            }
+            let mediaKey = try XCTUnwrap(playlist.resources.first)
+            let map = try XCTUnwrap(
+                fixture.publication.store.decodeCoverageMap(for: mediaKey))
+            let requested = try XCTUnwrap(map.samples.first).presentationRange
+            let capability = try XCTUnwrap(fixture.server.completedPublicationCapability(
+                itemURL: fixture.itemURL, itemGeneration: 20,
+                publicationSequence: snapshot.publicationSequence))
+            let publicationEvidence = try XCTUnwrap(
+                fixture.server.consumeCompletedPublicationCapability(capability))
+            let selection = try XCTUnwrap(publicationEvidence.audioSelectionCapability)
+            let item = AVPlayerItemInstanceIdentity(
+                outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(
+                    outputNonce: 51_300),
+                itemGeneration: 20)
+            let timeline: PlayerItemTimelineMappingAuthority
+            switch try fixture.server.makePlayerItemTimelineMappingAuthority(
+                endpointAuthority: fixture.publication.endpointAuthority,
+                completedPublication: publicationEvidence,
+                itemURL: fixture.itemURL,
+                item: item,
+                publicationSequence: snapshot.publicationSequence,
+                expectedSelection: selection) {
+            case .ready(let value):
+                timeline = value
+            case .waitingForSelection, .invalid:
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            let prepared = PreparedPlayheadIdentity(
+                outputLifecycleEpoch: item.outputLifecycleEpoch,
+                itemGeneration: 20,
+                publicationSequence: snapshot.publicationSequence,
+                mediaTime: timeline.effectiveSourceOrigin,
+                playerItemTime: try timeline.playerItemTime(
+                    for: timeline.effectiveSourceOrigin),
+                seekNonce: 51_301,
+                renditionSelectionSlotNonce: 51_302,
+                audioSelectionCapability: selection,
+                timelineMappingAuthority: timeline)
+            let observed = ObservedRenditionSetReceipt(
+                preparedPlayheadIdentity: prepared,
+                selectionFenceRevision: 51_303,
+                orderedRenditionIdentities: [.init(rawValue: 2)])
+            let context = LoopbackCoverageContext(
+                preparedPlayheadIdentity: prepared,
+                observedRenditionSetReceipt: observed,
+                renditionIdentity: .init(rawValue: 2))
+            _ = try fixture.server.coverageReceipt(for: context, adding: requested)
+            XCTAssertEqual(fixture.publication.store.coverageContextCount, 1)
+            XCTAssertEqual(
+                fixture.publication.store.coverageApplicationChargeSnapshot.chargedBytes,
+                LoopbackStorageLayout.current.coverageAccumulatorAllocationBytes)
 
-        let ticket = fixture.server.closeAdmission()
-        XCTAssertTrue(waitUntil {
-            fixture.server.usage.connections == 0
-                && fixture.server.usage.activeResponses == 0
-        })
-        try fixture.server.drain(cleanupTicket: ticket)
-        try fixture.server.retire(cleanupTicket: ticket)
+            let ticket = fixture.server.closeAdmission()
+            XCTAssertTrue(waitUntil {
+                fixture.server.usage.connections == 0
+                    && fixture.server.usage.activeResponses == 0
+            })
+            try fixture.server.drain(cleanupTicket: ticket)
+            try fixture.server.retire(cleanupTicket: ticket)
 
-        let usage = fixture.server.usage
-        XCTAssertEqual(usage.connections, 0)
-        XCTAssertEqual(usage.activeResponses, 0)
-        XCTAssertEqual(usage.distinctBackingBytes, 0)
-        XCTAssertEqual(usage.parserAndStagingBytes, 0,
-                       "retire 必须在 server queue 清掉 coverageContext 的 64 KiB 统计")
-        XCTAssertEqual(fixture.publication.store.coverageContextCount, 0)
-        XCTAssertEqual(
-            fixture.publication.store.coverageApplicationChargeSnapshot.chargedBytes, 0)
-        XCTAssertEqual(fixture.publication.store.usage.responseBackingBytes, 0)
-        XCTAssertEqual(fixture.publication.store.usage.residentBytes, 0)
-        XCTAssertEqual(fixture.publication.store.usage.reservedBytes, 0)
+            let usage = fixture.server.usage
+            XCTAssertEqual(usage.connections, 0)
+            XCTAssertEqual(usage.activeResponses, 0)
+            XCTAssertEqual(usage.distinctBackingBytes, 0)
+            XCTAssertEqual(usage.parserAndStagingBytes, 0,
+                           "retire 必须在 server queue 清掉 coverageContext 的 64 KiB 统计")
+            XCTAssertEqual(fixture.publication.store.coverageContextCount, 0)
+            XCTAssertEqual(
+                fixture.publication.store.coverageApplicationChargeSnapshot.chargedBytes, 0)
+            XCTAssertEqual(fixture.publication.store.usage.responseBackingBytes, 0)
+            XCTAssertGreaterThan(store.usage.residentBytes, 0,
+                                 "已签发的 frozen owner 仍持有原 store metadata 租约")
+            fixture.evidenceSource.retirePreparation()
+        }
+        fixture.releasePreparationEvidence()
+        XCTAssertEqual(store.usage.residentBytes, 0)
+        XCTAssertEqual(store.usage.reservedBytes, 0)
         XCTAssertEqual(shared.chargedBytes, baseline)
     }
 
     func testStartupCancellationClosesPreparedStoreAndCloseRejectsNewAccepts() async throws {
-        let entered = DispatchSemaphore(value: 0)
-        let released = DispatchSemaphore(value: 0)
+        let entered = XCTestExpectation(description: "startup preparation entered")
+        let released = Task20StartupPreparationGate()
         let harnessBox = LockedHarness()
         let task = Task {
-            try await LoopbackHTTPSessionFactory().start(itemGeneration: 19, now: { 0 },
+            try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(itemGeneration: 19, now: { 0 },
                 logger: { _ in }, responseFailure: { _, _ in }) { capability in
-                let harness = try Task19Harness(loopbackSession: capability)
-                try harness.initial()
+                let harness = try await Task19Harness(loopbackSession: capability)
+                try await harness.initial()
                 harnessBox.value = harness
-                entered.signal()
-                _ = released.wait(timeout: .now() + 2)
+                entered.fulfill()
+                await released.waitUntilReleased()
+                XCTAssertTrue(Task.isCancelled, "prepare 必须保持挂起直到取消之后的显式 release")
                 var declaration = try Task19.declaration()
                 declaration.token = capability.value
                 return LoopbackPreparedPublication(store: harness.store, declaration: declaration,
                     snapshot: try XCTUnwrap(harness.publisher.visible))
             }
         }
-        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let enteredResult = await XCTWaiter.fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(enteredResult, .completed)
         task.cancel()
-        released.signal()
+        XCTAssertEqual(harnessBox.value?.store.isClosed, false,
+                       "取消请求不能在 prepare gate 释放前提前结算 store")
+        await released.release()
         do {
             _ = try await task.value
             XCTFail("prepare 后取消必须由统一 startup owner 封闭失败")
@@ -1040,9 +1979,9 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
     }
 
-    func testMediaBeforeInitIsRetrofittedAtomicallyAndInitCapIncludesEvidenceAllocation() throws {
-        let track = try Task19Track(id: 1, mediaType: .video)
-        let packet = try track.next()
+    func testMediaBeforeInitIsRetrofittedAtomicallyAndInitCapIncludesEvidenceAllocation() async throws {
+        let track = try await Task19Track(id: 1, mediaType: .video)
+        let packet = try await track.next()
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
         let mediaReservation = try store.reserveMedia(binding: packet.object.binding,
             kind: .media, bodyBytes: packet.object.bytes.count)
@@ -1073,15 +2012,15 @@ final class LoopbackHTTPServerTests: XCTestCase {
         store.cancel(legal)
     }
 
-    func testFormalInitializationBatchRetrofitsEveryPendingMediaInOneTransaction() throws {
+    func testFormalInitializationBatchRetrofitsEveryPendingMediaInOneTransaction() async throws {
         let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
             epochStart: .zero, videoMode: .passthrough))
-        let video = try Task19Track(id: 1, mediaType: .video, boundary: boundary)
-        let audio = try Task19Track(id: 2, mediaType: .audio, boundary: boundary)
+        let video = try await Task19Track(id: 1, mediaType: .video, boundary: boundary)
+        let audio = try await Task19Track(id: 2, mediaType: .audio, boundary: boundary)
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
         var mediaKeys: [HLSResourceKey] = []
         for track in [video, audio] {
-            let packet = try track.next()
+            let packet = try await track.next()
             let reservation = try store.reserveMedia(binding: packet.object.binding,
                 kind: .media, bodyBytes: packet.object.bytes.count)
             mediaKeys.append(try store.admit(packet.object, proof: track.proof,
@@ -1380,7 +2319,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try fixture.server.retire(cleanupTicket: ticket)
     }
 
-    func testReview4BatchRetrofitRechecksEveryObjectAndStoreHardDeltaAtomically() throws {
+    func testReview4BatchRetrofitRechecksEveryObjectAndStoreHardDeltaAtomically() async throws {
         let layout = LoopbackStorageLayout.current
         let evidenceBytes = SealedMediaStoreCapacityProjection.mediaEvidenceBytes
         let maximumMapBytes = 32 * 1_024 - evidenceBytes
@@ -1404,14 +2343,15 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertEqual($0 as? HLSPublicationFailure, .capacityExceeded)
         }
 
-        func measuredRealMapDelta() throws -> Int {
+        func measuredRealMapDelta() async throws -> Int {
             let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
                 epochStart: .zero, videoMode: .passthrough))
             let tracks = [
-                try Task19Track(id: 1, mediaType: .video, boundary: boundary),
-                try Task19Track(id: 2, mediaType: .audio, boundary: boundary),
+                try await Task19Track(id: 1, mediaType: .video, boundary: boundary),
+                try await Task19Track(id: 2, mediaType: .audio, boundary: boundary),
             ]
-            let packets = try tracks.map { try $0.next() }
+            var packets: [Task19Packet] = []
+            for track in tracks { packets.append(try await track.next()) }
             let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
             var mediaKeys: [HLSResourceKey] = []
             for (track, packet) in zip(tracks, packets) {
@@ -1439,15 +2379,16 @@ final class LoopbackHTTPServerTests: XCTestCase {
             store.close()
             return result
         }
-        let realMapDelta = try measuredRealMapDelta()
+        let realMapDelta = try await measuredRealMapDelta()
 
-        func runBatch(remainingAfterRetrofit: Int, shouldSucceed: Bool) throws {
+        func runBatch(remainingAfterRetrofit: Int, shouldSucceed: Bool) async throws {
             let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
                 epochStart: .zero, videoMode: .passthrough))
-            let video = try Task19Track(id: 1, mediaType: .video, boundary: boundary)
-            let audio = try Task19Track(id: 2, mediaType: .audio, boundary: boundary)
+            let video = try await Task19Track(id: 1, mediaType: .video, boundary: boundary)
+            let audio = try await Task19Track(id: 2, mediaType: .audio, boundary: boundary)
             let tracks = [video, audio]
-            let packets = try tracks.map { try $0.next() }
+            var packets: [Task19Packet] = []
+            for track in tracks { packets.append(try await track.next()) }
             let preRetrofitCharge = zip(tracks, packets).reduce(0) {
                 $0 + $1.1.object.bytes.count + evidenceBytes
                     + $1.0.initialization.bytes.count
@@ -1497,8 +2438,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
             store.close()
         }
 
-        try runBatch(remainingAfterRetrofit: -1, shouldSucceed: false)
-        try runBatch(remainingAfterRetrofit: 0, shouldSucceed: true)
+        try await runBatch(remainingAfterRetrofit: -1, shouldSucceed: false)
+        try await runBatch(remainingAfterRetrofit: 0, shouldSucceed: true)
     }
 
     func testReview5ParserUsesOne16KiBResidentAllocationAndAbsoluteTemporaryCaps() throws {
@@ -1559,6 +2500,58 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
     }
 
+    func testDeliverySoftBoundarySnapshotRetainsExactChargeAcrossOriginalOwnerRelease() throws {
+        let soft = HLSDeliveryApplicationChargeLedger.documentedApplicationSoftBytes
+        let parserBytes = LoopbackStorageLayout.current.parserAllocationBytes
+        let stagingBytes = LoopbackStorageLayout.current.stagingAllocationBytes
+        for retainSnapshot in [false, true] {
+            let ledger = HLSDeliveryApplicationChargeLedger()
+            let originalIdentity = UUID()
+            let original = try ledger.reserve(allocationIdentity: originalIdentity, bytes: 64)
+            defer { ledger.release(original) }
+            let boundary = try (retainSnapshot ? ledger.retainCurrentAllocationsForTesting() : nil)
+            defer { boundary?.reservations.forEach(ledger.release) }
+            if let boundary {
+                XCTAssertEqual(boundary.chargedBytes, 64)
+                XCTAssertEqual(boundary.distinctAllocationCount, 1)
+                XCTAssertEqual(boundary.reservations.count, 1)
+                XCTAssertEqual(boundary.reservations.first?.allocationIdentity,
+                               original.allocationIdentity)
+                XCTAssertEqual(ledger.snapshot(ownedBy: boundary.reservations),
+                    HLSDeliveryOwnedChargeSnapshot(reservationCount: 1,
+                        registeredReservationCount: 1, distinctAllocationCount: 1, chargedBytes: 64))
+            }
+            // Both cases use exactly the same filler. The original owner then
+            // retires at the formerly uncontrolled point before parser admission.
+            let filler = try ledger.reserve(allocationIdentity: UUID(),
+                                             bytes: soft - 64 - parserBytes)
+            defer { ledger.release(filler) }
+            XCTAssertEqual(ledger.chargedBytes, soft - parserBytes)
+            ledger.release(original)
+            let parser = try ledger.reserve(allocationIdentity: UUID(), bytes: parserBytes)
+            defer { ledger.release(parser) }
+            XCTAssertEqual(ledger.chargedBytes, retainSnapshot ? soft : soft - 64)
+            if let boundary {
+                XCTAssertThrowsError(try ledger.reserve(allocationIdentity: UUID(), bytes: stagingBytes)) {
+                    XCTAssertEqual($0 as? LoopbackHTTPReservationError, .backpressure)
+                }
+                XCTAssertEqual(ledger.chargedBytes, soft)
+                boundary.reservations.forEach(ledger.release)
+                XCTAssertEqual(ledger.snapshot(ownedBy: boundary.reservations),
+                    HLSDeliveryOwnedChargeSnapshot(reservationCount: 1,
+                        registeredReservationCount: 0, distinctAllocationCount: 0, chargedBytes: 0))
+                XCTAssertEqual(ledger.chargedBytes, soft - 64)
+            }
+            let staging = try ledger.reserve(allocationIdentity: UUID(), bytes: stagingBytes)
+            XCTAssertEqual(ledger.chargedBytes, soft - 64 + stagingBytes,
+                           "Below-soft admission must still allow its documented crossing allocation")
+            ledger.release(staging)
+            ledger.release(parser)
+            ledger.release(filler)
+            XCTAssertEqual(ledger.chargedBytes, 0)
+        }
+    }
+
     func testReview5DeliverySoftAdmissionAggregatesAcrossStoresAndServers() async throws {
         let soft = HLSDeliveryApplicationChargeLedger.documentedApplicationSoftBytes
         let directLedger = HLSDeliveryApplicationChargeLedger()
@@ -1575,10 +2568,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
         directLedger.release(reopened)
 
         let shared = HLSDeliveryApplicationChargeLedger.shared
-        let firstTrack = try Task19Track(id: 1, mediaType: .audio)
-        let secondTrack = try Task19Track(id: 1, mediaType: .audio)
-        let firstPacket = try firstTrack.next()
-        let secondPacket = try secondTrack.next()
+        let firstTrack = try await Task19Track(id: 1, mediaType: .audio)
+        let secondTrack = try await Task19Track(id: 1, mediaType: .audio)
+        let firstPacket = try await firstTrack.next()
+        let secondPacket = try await secondTrack.next()
         let firstCharge = firstPacket.object.bytes.count
             + SealedMediaStoreCapacityProjection.mediaEvidenceBytes
         let storeBaseline = shared.chargedBytes
@@ -1639,17 +2632,34 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let held = try ConnectedSocket(port: firstFixture.server.port)
         defer { held.reset() }
         XCTAssertTrue(waitUntil { firstFixture.server.usage.connections == 1 })
-        let serverBaseline = shared.chargedBytes
+        let boundary = try shared.retainCurrentAllocationsForTesting()
+        defer {
+            boundary.reservations.forEach(shared.release)
+            XCTAssertEqual(shared.snapshot(ownedBy: boundary.reservations).registeredReservationCount, 0)
+        }
+        let retainedBoundary = shared.snapshot(ownedBy: boundary.reservations)
+        XCTAssertTrue(retainedBoundary.allReservationsRegistered)
+        XCTAssertEqual(retainedBoundary.reservationCount, boundary.distinctAllocationCount)
+        XCTAssertEqual(retainedBoundary.distinctAllocationCount, boundary.distinctAllocationCount)
+        XCTAssertEqual(retainedBoundary.chargedBytes + shared.fixedBookkeepingChargeBytes,
+                       boundary.chargedBytes)
+        let serverBaseline = boundary.chargedBytes
+        XCTAssertEqual(shared.chargedBytes, serverBaseline,
+                       "The captured aliases must retain exactly the sampled global charge")
         let parserBytes = LoopbackStorageLayout.current.parserAllocationBytes
         XCTAssertLessThan(serverBaseline + parserBytes, soft)
         let serverFiller = try shared.reserve(allocationIdentity: UUID(),
             bytes: soft - serverBaseline - parserBytes)
         defer { shared.release(serverFiller) }
+        XCTAssertEqual(shared.chargedBytes, soft - parserBytes,
+                       "Leave exactly one parser allocation before the real staging admission")
         let blocked = try rawRequest(port: secondFixture.server.port,
                                      target: secondFixture.server.masterPath)
         XCTAssertEqual(blocked.status, 503,
                        "第二个 server 的新 staging allocation 必须传播为正常 HTTP 背压")
         XCTAssertTrue(waitUntil { secondFixture.server.usage.softBackpressureCount >= 1 })
+        XCTAssertEqual(shared.snapshot(ownedBy: boundary.reservations), retainedBoundary,
+                       "A late original-owner release must not lower the retained boundary")
         shared.release(serverFiller)
         XCTAssertEqual(try rawRequest(port: secondFixture.server.port,
                                       target: secondFixture.server.masterPath).status, 200)
@@ -1733,6 +2743,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
     func testOriginalServerHookAliasKeepsExactOwnerAfterSourceDeinit() async throws {
         let fixture = try await Task21CompressedLifecycleHTTPFixture.start(
             codec: .ac3, outputLifecycleEpoch: Task19.binding().outputLifecycleEpoch)
+        addTeardownBlock { await fixture.shutdownWriter() }
         defer { fixture.shutdown() }
         func copyOriginalHook(_ label: String) throws -> Any {
             let child = try XCTUnwrap(Mirror(reflecting: fixture.server)
@@ -1787,6 +2798,11 @@ final class LoopbackHTTPServerTests: XCTestCase {
             }
         }
         try await fixture.serveInitialSelection()
+        XCTAssertNotNil(fixture.server.frozenCompletedPublication(
+            itemURL: fixture.itemURL, itemGeneration: 19,
+            publicationSequence: fixture.publicationSequence,
+            preparationOwner: first.preparationOwner))
+        XCTAssertTrue(first.preparationOwner.completionIsFrozen)
         allocations.removeAll()
         first.inspectPreparationAllocations(record)
         second.inspectPreparationAllocations(record)
@@ -1799,6 +2815,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let lifecycle = Task19.binding().outputLifecycleEpoch
         let fixture = try await Task21CompressedLifecycleHTTPFixture.start(
             codec: .ac3, outputLifecycleEpoch: lifecycle)
+        addTeardownBlock { await fixture.shutdownWriter() }
         let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
         defer { source.retirePreparation(); fixture.shutdown() }
         let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: lifecycle, itemGeneration: 20)
@@ -1814,10 +2831,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: fixture.server.path(for: key)).status, 200)
         }
-        let initial = try XCTUnwrap(playlist.resources.dropLast().last)
+        let initialKeys = try fixture.threeSecondPrefix()
         let terminal = try XCTUnwrap(playlist.resources.last)
-        XCTAssertEqual(try rawRequest(port: fixture.server.port,
-            target: fixture.server.path(for: initial)).status, 200)
+        XCTAssertFalse(initialKeys.contains(terminal))
+        for key in initialKeys {
+            XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                target: fixture.server.path(for: key)).status, 200)
+        }
         XCTAssertTrue(waitUntil {
             fixture.server.currentAudioSelectionCapability(itemGeneration: 20,
                 publicationSequence: fixture.publicationSequence) != nil
@@ -1829,13 +2849,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertFalse(source.preparationOwner.completionIsFrozen,
                            "尚未 loaded 时不能发布可增长 completed 视图")
             XCTAssertFalse(fixture.server.completedEvidence(for: terminal)?.isComplete ?? false)
-            for key in playlist.resources where key != initial {
+            for key in playlist.resources where !initialKeys.contains(key) {
                 XCTAssertEqual(try self.rawRequest(port: fixture.server.port,
                     target: fixture.server.path(for: key)).status, 200)
             }
         }
         let prepared = try await coordinator.prepareCurrentItem()
-        XCTAssertTrue(reachedSeek, "不足三秒 GET 时必须先推进到合法 seek，而不是等待未来 GET")
+        XCTAssertTrue(reachedSeek, "已完成三秒选择窗口后，未请求的其余 body 不得阻断合法 seek")
         XCTAssertEqual(prepared.item, item)
         XCTAssertTrue(source.preparationOwner.completionIsFrozen)
         XCTAssertFalse(prepared.coverageDependencies.isEmpty)
@@ -1863,12 +2883,14 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let lifecycle = Task19.binding().outputLifecycleEpoch
         let fixture = try await Task21CompressedLifecycleHTTPFixture.start(
             codec: .ac3, outputLifecycleEpoch: lifecycle)
+        addTeardownBlock { await fixture.shutdownWriter() }
         let first = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
         defer { first.retirePreparation(); fixture.shutdown() }
         let playlist = try XCTUnwrap(fixture.publication.publisher.visible?.media[2])
-        let initial = try XCTUnwrap(playlist.resources.dropLast().last)
+        let initialKeys = try fixture.threeSecondPrefix()
+        XCTAssertLessThan(initialKeys.count, playlist.resources.count)
         XCTAssertEqual(try rawRequest(port: fixture.server.port, target: fixture.itemURL.path).status, 200)
-        for key in playlist.initializationResources + [initial] {
+        for key in playlist.initializationResources + initialKeys {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: fixture.server.path(for: key)).status, 200)
         }
@@ -1876,7 +2898,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             itemGeneration: 20, publicationSequence: fixture.publicationSequence,
             preparationOwner: first.preparationOwner))
         let oldKeys = old.participants[0].completedMedia.map(\.key)
-        XCTAssertEqual(oldKeys, [initial])
+        XCTAssertEqual(oldKeys, initialKeys)
         try await fixture.serveCompletedPublication()
         XCTAssertEqual(old.participants[0].completedMedia.map(\.key), oldKeys)
         let second = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
@@ -2088,7 +3110,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             itemGeneration: 19, publicationSequence: initial.publicationSequence,
             preparationOwner: source.preparationOwner))
         XCTAssertFalse(basis.participants.flatMap { $0.completedMedia.map(\.key) }.contains(deferred))
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
             now: Task19.second), .published)
         let rolled = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -2115,15 +3137,15 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
         let identities = arenaIdentities()
         for iteration in 2...20 {
-            try fixture.task19.offerBoth(count: 1)
+            try await fixture.task19.offerBoth(count: 1)
             XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
                 now: Int64(iteration) * Task19.second), .published)
             let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
             let playlist = try XCTUnwrap(snapshot.media[2])
             let declaration = try XCTUnwrap(snapshot.participantVector.first { $0.participantID == 2 })
                 .declaration
-            for path in [fixture.server.masterPath, try declaration.playlistURI(participantID: 2),
-                         try fixture.server.path(for: XCTUnwrap(playlist.resources.last))] {
+            for path in [fixture.server.masterPath, try declaration.playlistURI(participantID: 2)]
+                + (try playlist.resources.map(fixture.server.path(for:))) {
                 XCTAssertEqual(try rawRequest(port: fixture.server.port, target: path).status, 200)
             }
             XCTAssertNotNil(fixture.server.currentAudioSelectionCapability(itemGeneration: 19,
@@ -2142,7 +3164,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         var selections: [LoopbackAudioMediaSelectionCapability] = []
         for iteration in 0..<15 {
             if iteration > 0 {
-                try fixture.task19.offerBoth(count: 1)
+                try await fixture.task19.offerBoth(count: 1)
                 XCTAssertEqual(try fixture.task19.publisher.publish(ticket: fixture.task19.publisher.ticket,
                     now: Int64(iteration) * Task19.second), .published)
             }
@@ -2152,8 +3174,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 .declaration
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: declaration.playlistURI(participantID: 2)).status, 200)
-            XCTAssertEqual(try rawRequest(port: fixture.server.port,
-                target: fixture.server.path(for: XCTUnwrap(playlist.resources.last))).status, 200)
+            for key in playlist.resources {
+                XCTAssertEqual(try rawRequest(port: fixture.server.port,
+                    target: fixture.server.path(for: key)).status, 200)
+            }
             let selection = fixture.server.currentAudioSelectionCapability(itemGeneration: 19,
                 publicationSequence: snapshot.publicationSequence)
             if iteration < 14 { selections.append(try XCTUnwrap(selection)) }
@@ -2209,16 +3233,16 @@ final class LoopbackHTTPServerTests: XCTestCase {
         var selections = [try XCTUnwrap(frozen.audioSelectionCapability)]
         let participantID = selections[0].participantID
         for iteration in 1...13 {
-            try first.task19.offerBoth(count: 1)
+            try await first.task19.offerBoth(count: 1)
             XCTAssertEqual(try first.task19.publisher.publish(ticket: first.task19.publisher.ticket,
                 now: Int64(iteration) * Task19.second), .published)
             let snapshot = try XCTUnwrap(first.task19.publisher.visible)
             let declaration = try XCTUnwrap(snapshot.participantVector.first {
                 $0.participantID == participantID
             }).declaration
-            let media = try XCTUnwrap(snapshot.media[participantID]?.resources.last)
-            for path in [try declaration.playlistURI(participantID: participantID),
-                         try first.server.path(for: media)] {
+            let media = try XCTUnwrap(snapshot.media[participantID]).resources
+            for path in [try declaration.playlistURI(participantID: participantID)]
+                + (try media.map(first.server.path(for:))) {
                 XCTAssertEqual(try rawRequest(port: first.server.port, target: path).status, 200)
             }
             selections.append(try XCTUnwrap(first.server.currentAudioSelectionCapability(
@@ -2304,11 +3328,14 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(participant.completedMedia.first?.backingIdentity,
                        fixture.server.completedEvidence(for: mediaKey)?.resourceIdentity)
 
-        // endpoint authority 还要求同一 frozen playlist 的 terminal media 完整发送；
-        // 第二份 completed publication 投影只增加该真实 socket fact。
-        let terminalKey = try XCTUnwrap(playlist.resources.last)
-        XCTAssertEqual(try rawRequest(port: fixture.server.port,
-            target: fixture.server.path(for: terminalKey)).status, 200)
+        XCTAssertNil(evidence.audioSelectionCapability,
+                     "一个不足三秒的真实 body 不能预支 selection")
+        try fixture.rotatePreparationHistory()
+        try await fixture.serveInitialSelection()
+        XCTAssertEqual(Set(participant.completedMedia.map(\.key)), [mediaKey],
+                       "后继真实 GET 不得使已签发的旧 completed view 增长")
+        XCTAssertNil(evidence.audioSelectionCapability,
+                     "旧 owner 的冻结 nil selection 不得被后继改写")
         let timelineCapability = try XCTUnwrap(
             fixture.server.completedPublicationCapability(
                 itemURL: itemURL, itemGeneration: 19,
@@ -2364,6 +3391,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                     configuration = nil
                 }
                 let fixture = try await Task20HTTPFixture.start(testing: configuration)
+                try fixture.beginPreparationHistory()
                 let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
                 let participantID: UInt64 = 2
                 let playlist = try XCTUnwrap(snapshot.media[participantID])
@@ -2413,6 +3441,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             }
 
             let first = try await Task20HTTPFixture.start()
+            try first.beginPreparationHistory()
             let second = try await Task20HTTPFixture.start()
             defer { first.shutdown(); second.shutdown() }
             let snapshot = try XCTUnwrap(first.task19.publisher.visible)
@@ -2429,6 +3458,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                          try first.server.path(for: XCTUnwrap(playlist.resources.first))] {
                 XCTAssertEqual(try rawRequest(port: first.server.port, target: path).status, 200)
             }
+            try serveParticipant(1, snapshot: snapshot, fixture: first)
             XCTAssertNil(first.server.completedPublicationCapability(
                 itemURL: itemURL, itemGeneration: 19,
                 publicationSequence: snapshot.publicationSequence + 1),
@@ -2446,68 +3476,134 @@ final class LoopbackHTTPServerTests: XCTestCase {
     @MainActor
     func testReview2SuccessfulSendTerminalIngressInvalidatesActiveAuthorityAndEmitsOneReprepare()
         async throws {
-        let fixture = try await Task20HTTPFixture.start()
-        defer { fixture.shutdown() }
-        let first = try XCTUnwrap(fixture.task19.publisher.visible)
-        try serveFullPublication(first, fixture: fixture, includeMaster: true)
-        let events = LockedInts()
-        let harness = try Review2LoopbackCoordinatorHarness(fixture: fixture,
-            snapshot: first, onAuthorityChange: { events.append(1) })
+        let harness = try await Review2LoopbackCoordinatorHarness.makeFinal(enablesReplacement: true)
+        defer { harness.driver.releasePauseCompletion(); harness.shutdownReplacement() }
+        let server = try XCTUnwrap(harness.finalServer)
+        let first = try XCTUnwrap(harness.finalSnapshot)
+        let originalB = try XCTUnwrap(first.media[4])
+        let originalBDeclaration = try XCTUnwrap(first.participantVector.first {
+            $0.participantID == 4
+        }?.declaration)
+        // Advertise B under N without completing any B media. Its later body
+        // terminals must remain attributable to the installed N authority.
+        XCTAssertEqual(try rawRequest(port: server.port,
+            target: originalBDeclaration.playlistURI(participantID: 4)).status, 200)
+        for key in originalB.initializationResources {
+            XCTAssertEqual(try rawRequest(port: server.port,
+                target: server.path(for: key)).status, 200)
+        }
+        XCTAssertEqual(try rawRequest(port: server.port, target: server.masterPath).status, 200)
+        try serveParticipant(1, snapshot: first, server: server)
+        try serveParticipant(2, snapshot: first, server: server)
         try await harness.prepareAndActivate()
         XCTAssertEqual(harness.coordinator.phase, .playing)
         XCTAssertEqual(harness.driver.playCallCount, 1)
+        let originalSelection = try XCTUnwrap(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: first.publicationSequence))
+        XCTAssertEqual(originalSelection.publicationSequence, first.publicationSequence)
+        XCTAssertEqual(originalSelection.renditionIdentity, .init(rawValue: 2))
+        let originalItem = try XCTUnwrap(harness.currentItemIdentity)
 
-        try fixture.task19.offerBoth(count: 1)
-        XCTAssertEqual(try fixture.task19.publisher.publish(
-            ticket: fixture.task19.publisher.ticket, now: Task19.second), .published)
-        let second = try XCTUnwrap(fixture.task19.publisher.visible)
-        let audio = try XCTUnwrap(second.media[2])
-        let declaration = try XCTUnwrap(second.participantVector.first {
-            $0.participantID == 2
-        }?.declaration)
-        XCTAssertEqual(try rawRequest(port: fixture.server.port,
-            target: declaration.playlistURI(participantID: 2)).status, 200)
-        let conflictingKey = try XCTUnwrap(audio.resources.last)
-        let conflictingPath = try fixture.server.path(for: conflictingKey)
-        for _ in 0..<80 {
-            XCTAssertEqual(try rawRequest(port: fixture.server.port,
-                                          target: conflictingPath).status, 200)
+        let second = try harness.advanceFinalPublication()
+        XCTAssertGreaterThan(second.publicationSequence, first.publicationSequence)
+        XCTAssertEqual(try rawRequest(port: server.port, target: server.masterPath).status, 200)
+        try serveParticipant(1, snapshot: second, server: server)
+        try serveParticipant(2, snapshot: second, server: server)
+        XCTAssertTrue(waitUntil { server.usage.activeResponses == 0 })
+        let rolledSelection = try XCTUnwrap(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: second.publicationSequence))
+        XCTAssertEqual(rolledSelection.publicationSequence, second.publicationSequence)
+        XCTAssertEqual(rolledSelection.renditionIdentity, .init(rawValue: 2))
+        XCTAssertFalse(rolledSelection === originalSelection)
+        XCTAssertTrue(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: first.publicationSequence) === originalSelection)
+        // Reading phase drains the production relay. A complete ordinary N+1
+        // rollover must not invalidate the immutable prepared selection from N.
+        XCTAssertEqual(harness.coordinator.phase, .playing)
+        XCTAssertEqual(harness.currentItemIdentity, originalItem)
+        XCTAssertEqual(harness.coordinator.selectedRenditions, [.init(rawValue: 2)])
+        XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 0)
+        XCTAssertFalse(harness.hasRegisteredSuspend)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+
+        let conflictingKey = try XCTUnwrap(originalB.resources.last)
+        let conflictingPath = try server.path(for: conflictingKey)
+        let conflictingURL = try XCTUnwrap(URL(string: conflictingPath,
+            relativeTo: server.baseURL)?.absoluteURL)
+        XCTAssertEqual(server.classifyAccessLogURI(conflictingURL,
+            itemGeneration: 19, publicationSequence: first.publicationSequence,
+            selected: .init(rawValue: 2)), .conflicting,
+            "N 的真实 B resource 必须仍属于 retained advertised authority")
+        XCTAssertFalse(server.completedEvidence(for: conflictingKey)?.isComplete ?? false)
+        harness.driver.holdPauseCompletion = true
+        for key in originalB.resources {
+            XCTAssertEqual(try rawRequest(port: server.port,
+                target: server.path(for: key)).status, 200)
         }
-
-        XCTAssertTrue(waitUntil {
-            harness.coordinator.phase == .stopping && events.values.count == 1
-        }, "真实 success terminal 必须自动撤销旧 readiness/activation")
-        XCTAssertEqual(harness.coordinator.invalidationCount, 1,
-                       "重复语义事实只能合并到固定槽，不能反复撤销")
-        XCTAssertEqual(events.values, [1],
-                       "冲突 publication 只发出一次 stop/reprepare 事件")
+        let conflictSelection = try XCTUnwrap(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: first.publicationSequence))
+        XCTAssertEqual(conflictSelection.publicationSequence, first.publicationSequence)
+        XCTAssertEqual(conflictSelection.renditionIdentity, .init(rawValue: 4))
+        XCTAssertFalse(conflictSelection === originalSelection)
+        XCTAssertTrue(server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: second.publicationSequence) === rolledSelection,
+            "B terminal 必须精确归属 N，不能误写为 N+1 的选择")
+        for _ in 0..<80 {
+            XCTAssertEqual(try rawRequest(port: server.port, target: conflictingPath).status, 200)
+        }
+        let stopped = await waitUntilOnMainActor {
+            harness.coordinator.phase == .stopping && harness.hasRegisteredSuspend
+                && harness.driver.hasHeldPauseCompletion
+        }
+        XCTAssertTrue(stopped, "N 的真实 B success terminal 必须自动撤销原 A readiness/activation")
+        XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.backendRetireCount, 0)
+        XCTAssertEqual(harness.backendReprepareCount, 0)
+        XCTAssertEqual(harness.driver.rate, 0)
         XCTAssertEqual(harness.driver.playCallCount, 1,
-                       "撤销后不得再次产生正 rate 副作用")
+                       "Registry quiescence 完成前不能产生新的正 rate")
+        harness.driver.releasePauseCompletion()
+        let reprepared = await waitUntilOnMainActor(timeout: .seconds(8)) {
+            harness.currentItemGeneration == 20 && harness.coordinator.phase == .authorized
+                && harness.driver.playCallCount == 2
+        }
+        XCTAssertTrue(reprepared, harness.backendErrorDescription)
+        XCTAssertEqual(harness.backendReprepareCount, 1)
+        XCTAssertEqual(harness.backendRetireCount, 1)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.driver.playCallCount, 2)
     }
 
     func testReview2PublicationAuthorityBindsActualServedVersionBeforeFirstGETAndAcrossHorizon()
         async throws {
-        let beforeFirstGET = try await Task20HTTPFixture.start()
-        defer { beforeFirstGET.shutdown() }
-        try beforeFirstGET.task19.offerBoth(count: 1)
-        XCTAssertEqual(try beforeFirstGET.task19.publisher.publish(
-            ticket: beforeFirstGET.task19.publisher.ticket,
-            now: Task19.second), .published)
-        let advanced = try XCTUnwrap(beforeFirstGET.task19.publisher.visible)
-        try serveFullPublication(advanced, fixture: beforeFirstGET, includeMaster: true)
-        let advancedURL = try masterURL(for: beforeFirstGET)
-        let advancedEvidence = try consumePublication(
-            fixture: beforeFirstGET, itemURL: advancedURL, snapshot: advanced)
-        for entry in advanced.participantVector {
-            let served = try XCTUnwrap(advancedEvidence.participants.first {
-                $0.participantID == entry.participantID
-            })
-            let playlist = try XCTUnwrap(advanced.media[entry.participantID])
-            XCTAssertEqual(served.mediaPlaylistSnapshotIdentity, playlist.identity)
-            XCTAssertEqual(served.mediaPlaylistVersion, playlist.version)
+        do {
+            let beforeFirstGET = try await Task20HTTPFixture.start()
+            try beforeFirstGET.beginPreparationHistory()
+            defer { beforeFirstGET.shutdown() }
+            try await beforeFirstGET.task19.offerBoth(count: 1)
+            XCTAssertEqual(try beforeFirstGET.task19.publisher.publish(
+                ticket: beforeFirstGET.task19.publisher.ticket,
+                now: Task19.second), .published)
+            let advanced = try XCTUnwrap(beforeFirstGET.task19.publisher.visible)
+            try serveFullPublication(advanced, fixture: beforeFirstGET, includeMaster: true)
+            let advancedURL = try masterURL(for: beforeFirstGET)
+            let advancedEvidence = try consumePublication(
+                fixture: beforeFirstGET, itemURL: advancedURL, snapshot: advanced)
+            for entry in advanced.participantVector {
+                let served = try XCTUnwrap(advancedEvidence.participants.first {
+                    $0.participantID == entry.participantID
+                })
+                let playlist = try XCTUnwrap(advanced.media[entry.participantID])
+                XCTAssertEqual(served.mediaPlaylistSnapshotIdentity, playlist.identity)
+                XCTAssertEqual(served.mediaPlaylistVersion, playlist.version)
+            }
         }
 
         let duringPlayback = try await Task20HTTPFixture.start()
+        try duringPlayback.beginPreparationHistory()
         defer { duringPlayback.shutdown() }
         let first = try XCTUnwrap(duringPlayback.task19.publisher.visible)
         try serveFullPublication(first, fixture: duringPlayback, includeMaster: true)
@@ -2516,11 +3612,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
             fixture: duringPlayback, itemURL: itemURL, snapshot: first)
         let oldAudioKey = try XCTUnwrap(first.media[2]?.resources.first)
 
-        try duringPlayback.task19.offerBoth(count: 1)
+        try await duringPlayback.task19.offerBoth(count: 1)
         XCTAssertEqual(try duringPlayback.task19.publisher.publish(
             ticket: duringPlayback.task19.publisher.ticket,
             now: Task19.second), .published)
         let second = try XCTUnwrap(duringPlayback.task19.publisher.visible)
+        duringPlayback.retirePreparationHistory()
+        try duringPlayback.beginPreparationHistory()
         try serveFullPublication(second, fixture: duringPlayback, includeMaster: true)
         let secondEvidence = try consumePublication(
             fixture: duringPlayback, itemURL: itemURL, snapshot: second)
@@ -2731,13 +3829,13 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 let configuration = LoopbackHTTPTestingConfiguration(capability: capability,
                     entropyFault: fault, entropyReadTrace: trace)
                 do {
-                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).start(
+                    _ = try await LoopbackHTTPSessionFactory(testing: configuration).startPreparingAsynchronously(
                         itemGeneration: 19, now: { 0 }, logger: { _ in },
                         responseFailure: { _, _ in }
                     ) { token in
                         prepared.append(1)
-                        let harness = try Task19Harness(loopbackSession: token)
-                        try harness.initial()
+                        let harness = try await Task19Harness(loopbackSession: token)
+                        try await harness.initial()
                         var declaration = try Task19.declaration()
                         declaration.token = token.value
                         return LoopbackPreparedPublication(store: harness.store,
@@ -2846,6 +3944,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         authorityParticipantID: UInt64,
         lifecycle: OutputLifecycleEpoch = Task19.binding().outputLifecycleEpoch
     ) throws -> RealTimelineEvidence {
+        try fixture.beginPreparationHistory()
         let participant = try XCTUnwrap(snapshot.participantVector.first {
             $0.participantID == authorityParticipantID
         })
@@ -2900,20 +3999,17 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: fixture.server.path(for: key)).status, 200)
         }
-        let terminalKey = try XCTUnwrap(playlist.resources.last)
-        let terminalMap = try XCTUnwrap(
-            fixture.publication.store.decodeCoverageMap(for: terminalKey)
-        )
-        let terminalEnd = try XCTUnwrap(terminalMap.samples.last).presentationRange.end
+        let mapping = try XCTUnwrap(snapshot.aacTimelineMappings[participantID])
+        let effectiveOffset = try mapping.writtenEffectiveBase.subtracting(mapping.writtenPhysicalBase)
+        let effectiveEnd = try XCTUnwrap(playlist.effectivePlaybackHorizon)
+        let selectionStart = try effectiveEnd.subtracting(.init(value: 3, timescale: 1))
         var selectionKeys: [HLSResourceKey] = []
         for key in playlist.resources.reversed() {
             selectionKeys.append(key)
             let map = try XCTUnwrap(fixture.publication.store.decodeCoverageMap(for: key))
-            let start = try XCTUnwrap(map.samples.first).presentationRange.start
-            if CMTimeCompare(
-                start.cmTime,
-                try terminalEnd.subtracting(.init(value: 3, timescale: 1)).cmTime
-            ) <= 0 {
+            let physicalStart = try XCTUnwrap(map.samples.first).presentationRange.start
+            let start = try physicalStart.adding(effectiveOffset)
+            if CMTimeCompare(start.cmTime, selectionStart.cmTime) <= 0 {
                 break
             }
         }
@@ -2994,6 +4090,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         // classifier 的 route map 与 request 必须都来自同一 frozen server。
         // participant 2/3 保持真实 AAC writer binding，不能改声明冒充 EAC3。
         let fixture = try await Task20HTTPFixture.start(audioCount: 3)
+        let source = try fixture.beginPreparationHistory()
         defer { fixture.shutdown() }
         let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
         try serveFullPublication(snapshot, fixture: fixture, includeMaster: true)
@@ -3013,7 +4110,6 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let aURL = try XCTUnwrap(URL(string: aPath, relativeTo: fixture.server.baseURL)?.absoluteURL)
         let bURL = try XCTUnwrap(URL(string: bPath, relativeTo: fixture.server.baseURL)?.absoluteURL)
 
-        let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
         XCTAssertEqual(source.classifyAccessLogURI(aURL,
             itemURL: request.itemURL, item: request.item,
             publicationSequence: request.publicationSequence, selected: nil),
@@ -3040,34 +4136,32 @@ final class LoopbackHTTPServerTests: XCTestCase {
     @MainActor
     func testReview3ConflictingRenditionTerminalAutomaticallyRunsOneRegistryStopAndReprepare()
         async throws {
-        let fixture = try await Task20HTTPFixture.start(audioCount: 3)
-        defer { fixture.shutdown() }
-        let snapshot = try XCTUnwrap(fixture.task19.publisher.visible)
-        try serveFullPublication(snapshot, fixture: fixture, includeMaster: true)
-        let harness = try Review2LoopbackCoordinatorHarness(fixture: fixture,
-            snapshot: snapshot, audioRenditions: [2, 3], useManualAuthoritySink: false,
-            onAuthorityChange: {})
+        let harness = try await Review2LoopbackCoordinatorHarness.makeFinal(enablesReplacement: true)
+        defer { harness.driver.releasePauseCompletion(); harness.shutdownReplacement() }
+        let server = try XCTUnwrap(harness.finalServer)
+        let snapshot = try XCTUnwrap(harness.finalSnapshot)
+        XCTAssertEqual(try rawRequest(port: server.port, target: server.masterPath).status, 200)
+        try serveParticipant(1, snapshot: snapshot, server: server)
+        try serveParticipant(2, snapshot: snapshot, server: server)
         try await harness.prepareAndActivate()
         XCTAssertEqual(harness.coordinator.phase, .playing)
+        harness.driver.holdPauseCompletion = true
 
-        let b = try XCTUnwrap(snapshot.media[3])
-        let declaration = try XCTUnwrap(snapshot.participantVector.first {
-            $0.participantID == 3
-        }?.declaration)
-        let paths = [try declaration.playlistURI(participantID: 3)]
-            + (try b.initializationResources.map(fixture.server.path(for:)))
-            + (try b.resources.map(fixture.server.path(for:)))
-        for _ in 0..<8 {
-            for path in paths {
-                XCTAssertEqual(try rawRequest(port: fixture.server.port, target: path).status, 200)
-            }
-        }
-        XCTAssertTrue(waitUntil {
+        for _ in 0..<8 { try serveParticipant(4, snapshot: snapshot, server: server) }
+        let stopped = await waitUntilOnMainActor {
             harness.coordinator.phase == .stopping && harness.hasRegisteredSuspend
-        }, "真实 B full-body terminal 必须让已绑定 A 的 slot 失权并自动进入 Registry 单飞 stop")
+        }
+        XCTAssertTrue(stopped, "真实 B body terminal 必须经 Registry 单飞 stop")
         XCTAssertEqual(harness.coordinator.invalidationCount, 1)
         XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
         XCTAssertEqual(harness.driver.playCallCount, 1)
+        harness.driver.releasePauseCompletion()
+        let reprepared = await waitUntilOnMainActor(timeout: .seconds(8)) {
+            harness.currentItemGeneration == 20 && harness.coordinator.phase == .authorized
+        }
+        XCTAssertTrue(reprepared, harness.backendErrorDescription)
+        XCTAssertEqual(harness.backendReprepareCount, 1)
+        XCTAssertEqual(harness.backendRetireCount, 1)
     }
 
     func testReview3PublicationAuthorityCASNeverRegressesAcrossLiveHorizon() async throws {
@@ -3082,12 +4176,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try serveFullPublication(first, fixture: fixture, includeMaster: true)
         let firstAudio = try XCTUnwrap(first.media[2]?.resources.first)
 
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second), .published)
         let second = try XCTUnwrap(fixture.task19.publisher.visible)
         try serveFullPublication(second, fixture: fixture, includeMaster: true)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second * 2), .published)
         let third = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -3113,7 +4207,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             outputLifecycleEpoch: lifecycle)
         defer { fixture.shutdown() }
         let snapshot = fixture.snapshot
-        let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
+        var source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
         let selections = LockedSelectionCapabilities()
         source.installRenditionSelectionEventHandler {
             selections.append($0)
@@ -3145,21 +4239,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let pendingItem = AVPlayerItemInstanceIdentity(
             outputLifecycleEpoch: lifecycle,
             itemGeneration: 19)
-        let incompleteSelectionPublication = try consumePublication(
-            server: fixture.server, itemURL: itemURL, snapshot: snapshot)
-        XCTAssertNil(incompleteSelectionPublication.audioSelectionCapability)
-        switch try fixture.server.makePlayerItemTimelineMappingAuthority(
-            endpointAuthority: nil,
-            completedPublication: incompleteSelectionPublication,
-            itemURL: itemURL,
-            item: pendingItem,
-            publicationSequence: snapshot.publicationSequence,
-            expectedSelection: nil) {
-        case .waitingForSelection:
-            break
-        case .invalid, .ready:
-            XCTFail("真实 media 尚未覆盖 E-3...E 时只能 waiting，不能 invalid 或签发 mapping")
-        }
+        XCTAssertNil(fixture.server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: snapshot.publicationSequence))
+        XCTAssertNil(source.preparationPublicationBasis(
+            itemURL: itemURL, item: pendingItem,
+            publicationSequence: snapshot.publicationSequence),
+            "真实 media 尚未覆盖三秒时 preparation basis 不得冻结 nil selection")
         for key in audioA.resources.dropFirst() {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: try fixture.server.path(for: key)).status, 200)
@@ -3218,6 +4303,14 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(try rawRequest(port: fixture.server.port, target: playlistB).status, 200)
         XCTAssertEqual(selections.values.count, 1,
                        "B playlist terminal 只能证明 playlist，不能抢占 A selection")
+        source.retirePreparation()
+        source = try .make(server: fixture.server)
+        XCTAssertTrue(source.preparationOwner.isHistoryActive)
+        source.installRenditionSelectionEventHandler { selections.append($0) }
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: fixture.server.masterPath).status, 200)
+        try serveParticipant(1, snapshot: snapshot, server: fixture.server)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port, target: playlistB).status, 200)
         for key in audioB.initializationResources + audioB.resources {
             XCTAssertEqual(try rawRequest(port: fixture.server.port,
                 target: try fixture.server.path(for: key)).status, 200)
@@ -3263,16 +4356,121 @@ final class LoopbackHTTPServerTests: XCTestCase {
         try assertInvalid(nil, "server 已存在 selection 时 nil 不能作为通配符")
         try assertInvalid(selectionCapability, "同 server 已被 B 替代的 A capability 已 stale")
 
-        let foreignFixture = try await Task20HTTPFixture.start(audioCount: 1)
+        source.retirePreparation()
+    }
+
+    func testFinalAudioSelectionRejectsCrossServerCapability() async throws {
+        let foreignFixture = try await Task20HTTPFixture.start()
+        try foreignFixture.beginPreparationHistory()
         defer { foreignFixture.shutdown() }
         let foreignSnapshot = try XCTUnwrap(foreignFixture.task19.publisher.visible)
         try serveParticipant(2, snapshot: foreignSnapshot, fixture: foreignFixture)
-        let foreignSelection = try XCTUnwrap(
-            foreignFixture.server.currentAudioSelectionCapability(
-                itemGeneration: 19,
-                publicationSequence: foreignSnapshot.publicationSequence))
-        try assertInvalid(foreignSelection,
-                          "另一 server/session 签出的 capability 不能进入当前 mapping")
+        let foreignSelection = try XCTUnwrap(foreignFixture.server.currentAudioSelectionCapability(
+            itemGeneration: 19, publicationSequence: foreignSnapshot.publicationSequence))
+        foreignFixture.retirePreparationHistory()
+
+        let lifecycle = Task19.binding().outputLifecycleEpoch
+        let fixture = try await FinalReplacementHTTPFixture.start(
+            outputLifecycleEpoch: lifecycle, itemGeneration: 19)
+        defer { fixture.shutdown() }
+        try await fixture.serveInitialSelection()
+        let snapshot = try XCTUnwrap(fixture.publication.publisher.visible)
+        let publication = try consumePublication(
+            server: fixture.server, itemURL: fixture.itemURL, snapshot: snapshot)
+        let selection = try XCTUnwrap(publication.audioSelectionCapability)
+        XCTAssertFalse(selection === foreignSelection)
+        switch try fixture.server.makePlayerItemTimelineMappingAuthority(
+            endpointAuthority: fixture.publication.endpointAuthority,
+            completedPublication: publication, itemURL: fixture.itemURL,
+            item: .init(outputLifecycleEpoch: lifecycle, itemGeneration: 19),
+            publicationSequence: snapshot.publicationSequence,
+            expectedSelection: foreignSelection) {
+        case .invalid: break
+        case .waitingForSelection, .ready:
+            XCTFail("另一 server/session 的真实 capability 不得进入当前 mapping")
+        }
+    }
+
+    func testStartupSelectionRequiresExactOwnerFourSecondCompletedWindow() async throws {
+        let fixture = try await FinalReview2InitialHTTPFixture.start(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 42_105))
+        let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
+        defer { source.retirePreparation(); fixture.shutdown() }
+        let four = ExactMediaTime(value: 4, timescale: 1)
+        let three = ExactMediaTime(value: 3, timescale: 1)
+        try source.configureStartupSelection(duration: four)
+        XCTAssertNoThrow(try source.configureStartupSelection(duration: four))
+        XCTAssertThrowsError(try source.configureStartupSelection(duration: three),
+                             "An owner's explicit contract cannot change even before its first GET")
+        let dormant = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
+        XCTAssertThrowsError(try dormant.configureStartupSelection(duration: four))
+        let snapshot = fixture.snapshot
+        let audio = try XCTUnwrap(snapshot.media[2])
+        let declaration = try XCTUnwrap(snapshot.participantVector.first { $0.participantID == 2 }?.declaration)
+        let mapping = try XCTUnwrap(snapshot.aacTimelineMappings[2])
+        let offset = try mapping.writtenEffectiveBase.subtracting(mapping.writtenPhysicalBase)
+        XCTAssertEqual(try rawRequest(port: fixture.server.port,
+            target: declaration.playlistURI(participantID: 2)).status, 200)
+        for key in audio.initializationResources {
+            XCTAssertEqual(try rawRequest(port: fixture.server.port, target: fixture.server.path(for: key)).status, 200)
+        }
+        var start: ExactMediaTime?
+        var previousEnd: ExactMediaTime?
+        var observedThreeButNotFour = false
+        var selected: LoopbackAudioMediaSelectionCapability?
+        for (index, key) in audio.resources.enumerated() {
+            let map = try XCTUnwrap(fixture.publication.store.decodeCoverageMap(for: key))
+            let first = try XCTUnwrap(map.samples.first).presentationRange.start
+            let last = try XCTUnwrap(map.samples.last).presentationRange.end
+            let effectiveStart = try first.adding(offset)
+            let effectiveEnd = try last.adding(offset)
+            if let previousEnd { XCTAssertEqual(effectiveStart, previousEnd) }
+            if start == nil { start = effectiveStart }
+            previousEnd = effectiveEnd
+            let duration = try effectiveEnd.subtracting(XCTUnwrap(start))
+            XCTAssertEqual(try rawRequest(port: fixture.server.port, target: fixture.server.path(for: key)).status, 200)
+            XCTAssertTrue(waitUntil { fixture.server.usage.activeResponses == 0 })
+            print("AUDIO_SELECTION_RANGE publication=\(snapshot.publicationSequence) key=\(key.logicalSequence) "
+                + "effective=\(effectiveStart)..\(effectiveEnd) horizon=\(String(describing: audio.effectivePlaybackHorizon))")
+            selected = fixture.server.currentAudioSelectionCapability(itemGeneration: 19,
+                publicationSequence: snapshot.publicationSequence)
+            if index == 1 {
+                XCTAssertLessThan(CMTimeCompare(duration.cmTime, three.cmTime), 0,
+                                  "Two real AAC segments must reproduce the insufficient three-second prefix")
+            }
+            if CMTimeCompare(duration.cmTime, four.cmTime) < 0 {
+                XCTAssertNil(selected, "Native readiness or three seconds cannot satisfy this owner's four-second contract")
+                if CMTimeCompare(duration.cmTime, three.cmTime) >= 0 { observedThreeButNotFour = true }
+            } else { break }
+        }
+        XCTAssertTrue(observedThreeButNotFour)
+        let capability = try XCTUnwrap(selected)
+        XCTAssertEqual(capability.selectionWindow.duration, four)
+        XCTAssertEqual(capability.publicationSequence, snapshot.publicationSequence)
+        XCTAssertLessThanOrEqual(CMTimeCompare(capability.selectionWindow.end.cmTime,
+            try XCTUnwrap(audio.effectivePlaybackHorizon).cmTime), 0)
+        let pointer = UnsafeRawPointer(Unmanaged.passUnretained(capability).toOpaque())
+        XCTAssertLessThanOrEqual(malloc_size(pointer), 1_024,
+                                "The exact duration stays inside the unchanged per-selection reservation")
+        XCTAssertThrowsError(try source.configureStartupSelection(duration: three))
+        source.retirePreparation()
+        XCTAssertThrowsError(try source.configureStartupSelection(duration: four))
+    }
+
+    func testStartupSelectionContractDoesNotLeakToSuccessorOwner() async throws {
+        let fixture = try await FinalReview2InitialHTTPFixture.start(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 42_106))
+        defer { fixture.shutdown() }
+        let first = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
+        try first.configureStartupSelection(duration: .init(value: 4, timescale: 1))
+        first.retirePreparation()
+        let successor = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
+        defer { successor.retirePreparation() }
+        XCTAssertTrue(successor.preparationOwner.isHistoryActive)
+        XCTAssertNoThrow(try successor.configureStartupSelection(duration: .init(value: 3, timescale: 1)))
+        XCTAssertThrowsError(try first.configureStartupSelection(duration: .init(value: 3, timescale: 1)))
+        XCTAssertThrowsError(try successor.configureStartupSelection(duration: .init(value: 2, timescale: 1)),
+                             "No setting may weaken the completed selection floor")
     }
 
     func testAudioSelectionUsesFirstCompletedThreeSecondWindowInsteadOfPlaylistLiveEdge()
@@ -3452,60 +4650,146 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 "\(stage)：quiescent replacement fence 仍由 coordinator 持有，retained graph 不得报零")
             XCTAssertEqual(retiredGraph.coordinatorReservationCount, 0,
                 "\(stage)：replacement retirement 后资源根不得重复计入HLS state")
-            XCTAssertEqual(retiredGraph.allocationIdentityCount, 3,
-                "\(stage)：quiescent HLS state只保留stop、receipt与fence")
+            let reserved = AVPlayerItemCoordinator.retainedGraphFutureReservationSnapshot
+            XCTAssertEqual(retiredGraph.applicationChargeableBytes,
+                           reserved.installedMaximumBranchBytes,
+                "\(stage)：quiescent tail 必须保留原 stop 与互斥终态最大分支的完整预留")
+            XCTAssertLessThanOrEqual(retiredGraph.applicationChargeableBytes,
+                                    AVPlayerRetainedGraphCapacityLedger.maximumBytes)
+            XCTAssertEqual(retiredGraph.allocationIdentityCount, 2,
+                "\(stage)：两个原 allocation 是 stop 与 max(capability, receipt+fence)")
         }
+    }
+
+    @MainActor
+    func testFinalAdvertisedAlternativeAccessLogRunsExactlyOneRegistryReplacement()
+        async throws {
+        let harness = try await Review2LoopbackCoordinatorHarness.makeFinal(enablesReplacement: true)
+        defer { harness.driver.releasePauseCompletion(); harness.shutdownReplacement() }
+        let server = try XCTUnwrap(harness.finalServer)
+        let snapshot = try XCTUnwrap(harness.finalSnapshot)
+        XCTAssertEqual(try rawRequest(port: server.port, target: server.masterPath).status, 200)
+        try serveParticipant(1, snapshot: snapshot, server: server)
+        try serveParticipant(2, snapshot: snapshot, server: server)
+        try await harness.prepareAndActivate()
+        XCTAssertEqual(harness.coordinator.phase, .playing)
+        XCTAssertEqual(harness.coordinator.selectedRenditions, [.init(rawValue: 2)])
+        let item = try XCTUnwrap(harness.currentItemIdentity)
+        let aKey = try XCTUnwrap(snapshot.media[2]?.resources.first)
+        let bKey = try XCTUnwrap(snapshot.media[4]?.resources.first)
+        let aURL = try XCTUnwrap(URL(string: server.path(for: aKey),
+            relativeTo: server.baseURL)?.absoluteURL)
+        let bURL = try XCTUnwrap(URL(string: server.path(for: bKey),
+            relativeTo: server.baseURL)?.absoluteURL)
+        let acceptedMediaBeforeLog = server.acceptedGETSnapshot().mediaCount
+        XCTAssertFalse(server.completedEvidence(for: bKey)?.isComplete ?? false)
+
+        harness.coordinator.observeAccessLogURI(aURL, item: item)
+        XCTAssertEqual(harness.coordinator.phase, .playing)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 0)
+        XCTAssertFalse(harness.hasRegisteredSuspend)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+
+        harness.driver.holdPauseCompletion = true
+        harness.coordinator.observeAccessLogURI(bURL, item: item)
+        for _ in 0..<8 {
+            harness.coordinator.observeAccessLogURI(bURL, item: item)
+            harness.coordinator.observeAccessLogURI(aURL, item: item)
+        }
+        let heldAtQuiescence = await waitUntilOnMainActor {
+            harness.coordinator.phase == .stopping
+                && harness.hasRegisteredSuspend
+                && harness.driver.hasHeldPauseCompletion
+        }
+        XCTAssertTrue(heldAtQuiescence,
+                      "真实已广告 B URI 必须经原 coordinator/Registry 到达 direct-state quiescence")
+        XCTAssertEqual(server.acceptedGETSnapshot().mediaCount, acceptedMediaBeforeLog,
+                       "此 replacement 必须仅由 access log 驱动，不能偷偷请求 B body")
+        XCTAssertFalse(server.completedEvidence(for: bKey)?.isComplete ?? false)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.backendRetireCount, 0)
+        XCTAssertEqual(harness.backendReprepareCount, 0)
+        XCTAssertEqual(harness.driver.rate, 0)
+        XCTAssertEqual(harness.driver.playCallCount, 1,
+                       "quiescence 未证实时不能重新产生正 rate")
+
+        harness.driver.releasePauseCompletion()
+        let reprepared = await waitUntilOnMainActor(timeout: .seconds(8)) {
+            harness.currentItemGeneration == 20
+                && harness.coordinator.phase == .authorized
+                && harness.driver.playCallCount == 2
+        }
+        XCTAssertTrue(reprepared, harness.backendErrorDescription)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.backendRetireCount, 1)
+        XCTAssertEqual(harness.backendReprepareCount, 1)
+        XCTAssertEqual(harness.driver.playCallCount, 2,
+                       "后继只能消费 Registry 为新 generation 签发的一次正速授权")
     }
 
     @MainActor
     func testFinalAccessLogUsesServerBoundRouteAuthorityAndRejectsUnknownMalformedLocalPaths()
         async throws {
-        let harness = try await Review2LoopbackCoordinatorHarness.makeFinal()
-        defer { harness.shutdownReplacement() }
-        let server = try XCTUnwrap(harness.finalServer)
-        let snapshot = try XCTUnwrap(harness.finalSnapshot)
-        XCTAssertEqual(try rawRequest(port: server.port,
-            target: server.masterPath).status, 200)
-        try serveParticipant(1, snapshot: snapshot, server: server)
-        try serveParticipant(2, snapshot: snapshot, server: server)
-        let masterURL = try XCTUnwrap(URL(string: server.masterPath,
-            relativeTo: server.baseURL)?.absoluteURL)
-        XCTAssertTrue(waitForCompletedPublication(
-            server: server, itemURL: masterURL,
-            itemGeneration: 19, publicationSequence: snapshot.publicationSequence,
-            selectedRendition: .init(rawValue: 2)))
-        try await harness.prepareAndActivate()
-        XCTAssertEqual(harness.coordinator.selectedRenditions, [.init(rawValue: 2)])
-        let item = try XCTUnwrap(harness.currentItemIdentity)
-        let aKey = try XCTUnwrap(snapshot.media[2]?.resources.first)
-        let bKey = try XCTUnwrap(snapshot.media[4]?.resources.first)
-        let aPath = try server.path(for: aKey)
-        let bPath = try server.path(for: bKey)
-        let makeURL: (String) throws -> URL = {
-            try XCTUnwrap(URL(string: $0, relativeTo: server.baseURL)?.absoluteURL)
-        }
-
-        harness.coordinator.observeAccessLogURI(try makeURL(aPath), item: item)
-        XCTAssertFalse(harness.hasRegisteredSuspend,
-                       "server route map 中真实 A media URI 必须保持当前 publication")
-        for path in [
-            "/v1/\(server.sessionToken)/19/1/audio/unknown/0.m4s?p=999&a=unknown",
-            aPath.replacingOccurrences(of: "\(aKey.logicalSequence).m4s",
-                                       with: "999999.m4s"),
-            "/v1/\(server.sessionToken)/19/1/audio/2/%2e%2e/0.m4s",
-        ] {
-            harness.coordinator.observeAccessLogURI(try makeURL(path), item: item)
-            for _ in 0..<16 { await Task.yield() }
+        for malformedCase in 0..<3 {
+            let harness = try await Review2LoopbackCoordinatorHarness.makeFinal()
+            defer { harness.shutdownReplacement() }
+            let server = try XCTUnwrap(harness.finalServer)
+            let snapshot = try XCTUnwrap(harness.finalSnapshot)
+            XCTAssertEqual(try rawRequest(port: server.port,
+                target: server.masterPath).status, 200)
+            try serveParticipant(1, snapshot: snapshot, server: server)
+            try serveParticipant(2, snapshot: snapshot, server: server)
+            try await harness.prepareAndActivate()
+            XCTAssertEqual(harness.coordinator.selectedRenditions, [.init(rawValue: 2)])
+            let item = try XCTUnwrap(harness.currentItemIdentity)
+            let aKey = try XCTUnwrap(snapshot.media[2]?.resources.first)
+            let aPath = try server.path(for: aKey)
+            let aURL = try XCTUnwrap(URL(string: aPath,
+                relativeTo: server.baseURL)?.absoluteURL)
+            harness.coordinator.observeAccessLogURI(aURL, item: item)
+            for foreign in [
+                "https://127.0.0.1:\(server.port)\(aPath)",
+                "http://127.0.0.1:\(server.port == 65_535 ? 1 : server.port + 1)\(aPath)",
+                "http://localhost:\(server.port)\(aPath)",
+                "http://127.1:\(server.port)\(aPath)",
+            ] {
+                harness.coordinator.observeAccessLogURI(try XCTUnwrap(URL(string: foreign)), item: item)
+                XCTAssertEqual(harness.coordinator.phase, .playing,
+                               "非当前 canonical scheme/host/port 不得借本地 path 失效 item")
+            }
+            XCTAssertFalse(harness.hasRegisteredSuspend)
+            let malformed = [
+                "/v1/\(server.sessionToken)/19/1/audio/unknown/0.m4s?p=999&a=unknown",
+                aPath.replacingOccurrences(of: "\(aKey.logicalSequence).m4s", with: "999999.m4s"),
+                "/v1/\(server.sessionToken)/19/1/audio/2/%2e%2e/0.m4s",
+            ][malformedCase]
+            let invalidURL = try XCTUnwrap(URL(string: malformed,
+                relativeTo: server.baseURL)?.absoluteURL)
+            harness.coordinator.observeAccessLogURI(invalidURL, item: item)
+            XCTAssertEqual(harness.coordinator.phase, .stopping)
+            XCTAssertEqual(harness.driver.rate, 0,
+                           "同一 canonical authority 的未知或畸形 URI 必须同步关闭正速")
+            XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+            XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
             XCTAssertFalse(harness.hasRegisteredSuspend,
-                           "未知、不存在或畸形本地 URI 不得被误认成可选择的 B")
-            XCTAssertEqual(harness.coordinator.phase, .playing)
+                           "transport item failure 不能冒充 rendition replacement")
+            for _ in 0..<8 {
+                harness.coordinator.observeAccessLogURI(invalidURL, item: item)
+                harness.coordinator.observeAccessLogURI(aURL, item: item)
+            }
+            do {
+                _ = try await harness.coordinator.prepareCurrentItem()
+                XCTFail("首次当前 authority fault 必须保持为 itemFailed")
+            } catch {
+                XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .itemFailed)
+            }
+            XCTAssertEqual(harness.coordinator.invalidationCount, 1)
+            XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+            XCTAssertEqual(harness.backendReprepareCount, 0)
         }
-
-        harness.coordinator.observeAccessLogURI(try makeURL(bPath), item: item)
-        XCTAssertTrue(waitUntil {
-            harness.hasRegisteredSuspend && harness.coordinator.phase == .stopping
-        }, "只有 server 冻结 route map 中真实 B media URI 才能触发 conflict/Registry stop")
-        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
     }
 
     func testFinalPublicationMaxCASPublishesOnlyForwardProgressAndSuppressesOldHorizonCallbacks()
@@ -3521,7 +4805,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
             events.values == [Int(first.publicationSequence)]
         }, "首个 publication 必须等真实 send terminal/max-CAS 下游完成")
         let oldMedia = try XCTUnwrap(first.media[2]?.resources.first)
-        try fixture.task19.offerBoth(count: 1)
+        try await fixture.task19.offerBoth(count: 1)
         XCTAssertEqual(try fixture.task19.publisher.publish(
             ticket: fixture.task19.publisher.ticket, now: Task19.second), .published)
         let current = try XCTUnwrap(fixture.task19.publisher.visible)
@@ -3586,15 +4870,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 publicationSequence: publicationSequence
             )?.renditionIdentity == selectedRendition
         }
-        guard selectionReady,
-              let capability = server.completedPublicationCapability(
+        guard selectionReady, waitUntil({ server.usage.activeResponses == 0 }),
+              let basis = server.preparationPublicationBasis(
                 itemURL: itemURL, itemGeneration: itemGeneration,
-                publicationSequence: publicationSequence),
-              let evidence = server.consumeCompletedPublicationCapability(capability) else {
-            return false
-        }
+                publicationSequence: publicationSequence) else { return false }
         return selectedRendition == nil
-            || evidence.audioSelectionCapability?.renditionIdentity == selectedRendition
+            || basis.audioSelectionCapability?.renditionIdentity == selectedRendition
     }
 
     private func consumePublication(fixture: Task20HTTPFixture, itemURL: URL,
@@ -3766,6 +5047,8 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let fixture = try await Task21CompressedLifecycleHTTPFixture.start(
             codec: codec,
             outputLifecycleEpoch: lifecycle)
+        addTeardownBlock { await fixture.shutdownWriter() }
+        try fixture.beginPreparationHistory()
         defer { fixture.shutdown() }
         let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: lifecycle,
                                                 itemGeneration: fixture.itemGeneration)
@@ -3870,6 +5153,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
 private final class Task21CompressedLifecycleHTTPFixture: @unchecked Sendable {
     let publication: Task21CompressedLifecyclePublication
     let server: LoopbackHTTPServer
+    private var evidenceSource: LoopbackAVPlayerPreparationEvidenceSource?
     let itemURL: URL
     let publicationSequence: UInt64
     let itemGeneration: UInt64
@@ -3890,13 +5174,13 @@ private final class Task21CompressedLifecycleHTTPFixture: @unchecked Sendable {
                       outputLifecycleEpoch: OutputLifecycleEpoch) async throws
         -> Task21CompressedLifecycleHTTPFixture {
         let box = Task21CompressedLifecyclePublicationBox()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 20,
             now: { 0 },
             logger: { _ in },
             responseFailure: { _, _ in }
         ) { token in
-            let publication = try Task21CompressedLifecyclePublication(
+            let publication = try await Task21CompressedLifecyclePublication(
                 loopbackSession: token,
                 codec: codec,
                 outputLifecycleEpoch: outputLifecycleEpoch)
@@ -3910,6 +5194,31 @@ private final class Task21CompressedLifecycleHTTPFixture: @unchecked Sendable {
             publication: XCTUnwrap(box.value),
             server: server)
     }
+
+    func beginPreparationHistory() throws {
+        precondition(evidenceSource == nil)
+        let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+        XCTAssertTrue(source.preparationOwner.isHistoryActive)
+        evidenceSource = source
+    }
+
+    func threeSecondPrefix() throws -> [HLSResourceKey] {
+        let playlist = try XCTUnwrap(publication.publisher.visible?.media[2])
+        let firstKey = try XCTUnwrap(playlist.resources.first)
+        let firstMap = try XCTUnwrap(publication.store.decodeCoverageMap(for: firstKey))
+        let start = try XCTUnwrap(firstMap.samples.first).presentationRange.start
+        let requiredEnd = try start.adding(.init(value: 3, timescale: 1))
+        var prefix: [HLSResourceKey] = []
+        for key in playlist.resources {
+            prefix.append(key)
+            let map = try XCTUnwrap(publication.store.decodeCoverageMap(for: key))
+            let end = try XCTUnwrap(map.samples.last).presentationRange.end
+            if CMTimeCompare(end.cmTime, requiredEnd.cmTime) >= 0 { return prefix }
+        }
+        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+    }
+
+    func shutdownWriter() async { await publication.shutdownWriter() }
 
     func serveCompletedPublication() async throws {
         let snapshot = try XCTUnwrap(publication.publisher.visible)
@@ -3929,6 +5238,8 @@ private final class Task21CompressedLifecycleHTTPFixture: @unchecked Sendable {
     }
 
     func shutdown() {
+        evidenceSource?.retirePreparation()
+        evidenceSource = nil
         _ = waitUntil(timeout: 2) {
             server.usage.connections == 0 && server.usage.activeResponses == 0
         }
@@ -3944,10 +5255,12 @@ private final class Task21CompressedLifecyclePublication: @unchecked Sendable {
     let publisher: HLSPublicationCoordinator
     private let track: Task21CompressedLifecycleTrack
 
+    func shutdownWriter() async { await track.shutdown() }
+
     init(loopbackSession: LoopbackSessionToken,
          codec: HLSAudioCodec,
-         outputLifecycleEpoch: OutputLifecycleEpoch) throws {
-        track = try Task21CompressedLifecycleTrack(
+         outputLifecycleEpoch: OutputLifecycleEpoch) async throws {
+        track = try await Task21CompressedLifecycleTrack(
             codec: codec,
             outputLifecycleEpoch: outputLifecycleEpoch)
         store = SealedMediaStore(loopbackSession: loopbackSession,
@@ -4000,6 +5313,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
 
     private let codec: HLSAudioCodec
     private let admission: AudioBranchAdmissionIdentity
+    private let accessUnitSource: AccessUnitSource
     private let collector = Task21CompressedLifecycleCollector()
     private let boundary: SegmentBoundaryCoordinator
     private let writer: SegmentedFMP4Writer
@@ -4008,7 +5322,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
     private var nextSequence: UInt64 = 0
 
     init(codec: HLSAudioCodec,
-         outputLifecycleEpoch: OutputLifecycleEpoch) throws {
+         outputLifecycleEpoch: OutputLifecycleEpoch) async throws {
         self.codec = codec
         let binding = FMP4WriterBinding(
             outputLifecycleEpoch: outputLifecycleEpoch,
@@ -4039,6 +5353,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
         case .aac:
             throw LoopbackHTTPServerError.invalidConfiguration
         }
+        accessUnitSource = try AccessUnitSource(codec: codec, admission: admission)
         relay = SegmentReportRelay(
             binding: binding,
             limits: .audio,
@@ -4046,10 +5361,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
             objectSink: collector.append)
         boundary = try SegmentBoundaryCoordinator(
             mode: .audioOnly(epochStart: .zero))
-        let firstSource = try Self.makeAccessUnit(
-            codec: codec,
-            admission: admission,
-            at: .zero)
+        let firstSource = try accessUnitSource.makeAccessUnit(at: .zero)
         let first = firstSource.accessUnit
         let trackKind: SegmentedFMP4TrackKind = codec == .ac3 ? .ac3 : .eac3
         let accessUnitKind: SegmentAudioAccessUnitKind = codec == .ac3
@@ -4068,40 +5380,53 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
             compressedFormatConfiguration: first.formatConfiguration,
             relay: relay,
             systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
-        try createdWriter.start(at: .zero)
-        try Self.append(first, writer: createdWriter,
-                        boundary: boundary,
-                        coordinator: firstSource.coordinator)
-        var presentationTimeStamp = CMTime(
-            value: Int64(first.sampleCount),
-            timescale: first.sampleRate)
-        for _ in 1..<224 {
-            let nextSource = try Self.makeAccessUnit(
-                codec: codec,
-                admission: admission,
-                at: presentationTimeStamp)
-            let accessUnit = nextSource.accessUnit
-            try Self.append(accessUnit, writer: createdWriter,
+        let resolvedInitialization: SealedMediaObject
+        let resolvedMedia: [SealedMediaObject]
+        let resolvedProof: EpochFormatProof
+        do {
+            try createdWriter.start(at: .zero)
+            try await Self.append(first, writer: createdWriter,
                             boundary: boundary,
-                            coordinator: nextSource.coordinator)
-            presentationTimeStamp = CMTimeAdd(
-                presentationTimeStamp,
-                CMTime(value: Int64(accessUnit.sampleCount),
-                       timescale: accessUnit.sampleRate))
-            if collector.mediaCount >= 6 { break }
+                            coordinator: firstSource.coordinator)
+            var previousBundle = first.writerSubmission.bundleIdentity
+            var presentationTimeStamp = CMTime(
+                value: Int64(first.sampleCount),
+                timescale: first.sampleRate)
+            for _ in 1..<224 {
+                let nextSource = try accessUnitSource.makeAccessUnit(at: presentationTimeStamp)
+                let accessUnit = nextSource.accessUnit
+                XCTAssertTrue(nextSource.coordinator === firstSource.coordinator,
+                              "Every AU in this track must use its original semantic authority")
+                XCTAssertEqual(accessUnit.admissionIdentity, admission)
+                XCTAssertEqual(accessUnit.presentationStart, presentationTimeStamp)
+                XCTAssertNotEqual(accessUnit.writerSubmission.bundleIdentity, previousBundle,
+                                  "Coordinator reuse must still issue a fresh admitted AU identity")
+                previousBundle = accessUnit.writerSubmission.bundleIdentity
+                try await Self.append(accessUnit, writer: createdWriter,
+                                boundary: boundary,
+                                coordinator: nextSource.coordinator)
+                presentationTimeStamp = CMTimeAdd(
+                    presentationTimeStamp,
+                    CMTime(value: Int64(accessUnit.sampleCount),
+                           timescale: accessUnit.sampleRate))
+                if collector.mediaCount >= 6 { break }
+            }
+            guard collector.waitFor(initializationCount: 1, mediaCount: 6,
+                                    timeout: 10) else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            resolvedInitialization = try XCTUnwrap(collector.takeInitialization())
+            resolvedMedia = collector.takeMedia(count: 6)
+            guard resolvedMedia.count == 6 else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            resolvedProof = try FinalFMP4Validator(
+                binding: binding,
+                mediaType: .audio).validateInitialization(resolvedInitialization)
+        } catch {
+            _ = await createdWriter.cancelAwaitingCompletion()
+            throw error
         }
-        guard collector.waitFor(initializationCount: 1, mediaCount: 6,
-                                timeout: 10) else {
-            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
-        }
-        let resolvedInitialization = try XCTUnwrap(collector.takeInitialization())
-        let resolvedMedia = collector.takeMedia(count: 6)
-        guard resolvedMedia.count == 6 else {
-            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
-        }
-        let resolvedProof = try FinalFMP4Validator(
-            binding: binding,
-            mediaType: .audio).validateInitialization(resolvedInitialization)
         writer = createdWriter
         initialization = resolvedInitialization
         media = resolvedMedia
@@ -4110,31 +5435,43 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
                                             firstLogicalSequence: 0)
     }
 
-    private static func makeAccessUnit(
-        codec: HLSAudioCodec,
-        admission: AudioBranchAdmissionIdentity,
-        at presentationTimeStamp: CMTime
-    ) throws
-        -> (accessUnit: CompressedAudioAccessUnit,
-            coordinator: AudioServiceSemanticCoordinator) {
-        let seed = try PlaybackIdentityAllocator.shared.next(in: .nonce)
-        switch codec {
-        case .ac3:
-            let harness = try Task17AC3Harness(seed: seed,
-                                               admission: admission)
-            return (try harness.makeAccessUnit(
-                presentationTimeStamp: presentationTimeStamp),
-                harness.coordinator)
-        case .eac3:
-            let harness = try Task17EAC3Harness(seed: seed,
-                                                admission: admission)
-            return (try harness.makeSixMemberAccessUnit(
-                presentationBase: presentationTimeStamp),
-                harness.coordinator)
-        case .aac:
-            throw LoopbackHTTPServerError.invalidConfiguration
+    // A compressed track owns one semantic input authority for its whole stream.
+    // Recreating the harness per AU retained a new coordinator through every
+    // writer submission, exhausting its bounded registry before six segments.
+    private enum AccessUnitSource {
+        case ac3(Task17AC3Harness)
+        case eac3(Task17EAC3Harness)
+
+        init(codec: HLSAudioCodec, admission: AudioBranchAdmissionIdentity) throws {
+            let seed = try PlaybackIdentityAllocator.shared.next(in: .nonce)
+            switch codec {
+            case .ac3: self = .ac3(try Task17AC3Harness(seed: seed, admission: admission))
+            case .eac3: self = .eac3(try Task17EAC3Harness(seed: seed, admission: admission))
+            case .aac: throw LoopbackHTTPServerError.invalidConfiguration
+            }
+        }
+
+        func makeAccessUnit(at presentationTimeStamp: CMTime) throws
+            -> (accessUnit: CompressedAudioAccessUnit,
+                coordinator: AudioServiceSemanticCoordinator) {
+            switch self {
+            case .ac3(let harness):
+                return (try harness.makeAccessUnit(presentationTimeStamp: presentationTimeStamp),
+                        harness.coordinator)
+            case .eac3(let harness):
+                return (try harness.makeSixMemberAccessUnit(presentationBase: presentationTimeStamp),
+                        harness.coordinator)
+            }
         }
     }
+
+    func shutdown() async {
+        _ = await writer.cancelAwaitingCompletion()
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0,
+                       "native cancellation terminal must release every submitted AU owner")
+    }
+
+    deinit { _ = writer.cancel() }
 
     func next() throws -> Task19Packet {
         guard !media.isEmpty else {
@@ -4151,8 +5488,8 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
         writer: SegmentedFMP4Writer,
         boundary: SegmentBoundaryCoordinator,
         coordinator: AudioServiceSemanticCoordinator
-    ) throws {
-        try writer.appendCompressed(
+    ) async throws {
+        try await writer.appendCompressedAwaitingReadiness(
             accessUnit.writerSubmission,
             coordinator: coordinator,
             ticket: boundary.issueCompressedAudioAppend(
@@ -4278,6 +5615,7 @@ private final class Review2LoopbackCoordinatorHarness {
             || backend.suspendCallCount > 0
     }
     var backendRetireCount: Int { backend.retireCallCount }
+    var backendReprepareCount: Int { backend.reprepareCallCount }
     var backendErrorDescription: String { String(describing: backend.lastError) }
     var retiredGraphReservation: AVPlayerRetainedGraphReservationSnapshot? {
         backend.retiredGraphReservation
@@ -4287,33 +5625,12 @@ private final class Review2LoopbackCoordinatorHarness {
     var finalServer: LoopbackHTTPServer? { finalInitialFixture?.server }
     var finalSnapshot: HLSPublishedSnapshot? { finalInitialFixture?.snapshot }
 
-    init(fixture: Task20HTTPFixture, snapshot: HLSPublishedSnapshot,
-         audioRenditions: [UInt64] = [2],
-         useManualAuthoritySink: Bool = true,
-         onAuthorityChange: @escaping @Sendable () -> Void,
-         enablesReplacement: Bool = false) throws {
-        driver = Review2LoopbackDriver()
-        let evidence = try LoopbackAVPlayerPreparationEvidenceSource.make(server: fixture.server)
-        if useManualAuthoritySink {
-            coordinator = try AVPlayerItemCoordinator(driver: driver, evidenceSource: evidence)
-        } else {
-            coordinator = try AVPlayerItemCoordinator(driver: driver, evidenceSource: evidence)
-        }
-        backend = Review2LoopbackBackend(coordinator: coordinator,
-                                         enablesReplacement: enablesReplacement)
-        graph = try OutputGraphFixture(backendObject: backend)
-        finalInitialFixture = nil
-        let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: graph.lifecycle,
-                                                itemGeneration: 19)
-        backend.configure(identity: graph.lifecycle.backendIdentity, itemGeneration: 19)
-        let itemURL = try XCTUnwrap(URL(string: fixture.server.masterPath,
-            relativeTo: fixture.server.baseURL)?.absoluteURL)
-        try coordinator.install(.init(itemURL: itemURL, item: item,
-            publicationSequence: snapshot.publicationSequence,
-            audioParticipants: audioRenditions.map {
-                .init(renditionIdentity: .init(rawValue: $0), codec: .explicitlyNonAAC)
-            },
-            directAudioOnlyRendition: nil))
+    func advanceFinalPublication() throws -> HLSPublishedSnapshot {
+        let fixture = try XCTUnwrap(finalInitialFixture)
+        XCTAssertEqual(try fixture.publication.publisher.publish(
+            ticket: fixture.publication.publisher.ticket,
+            now: 2_000_000_000, naturalEnd: true), .published)
+        return try XCTUnwrap(fixture.publication.publisher.visible)
     }
 
     private init(driver: Review2LoopbackDriver,
@@ -4366,6 +5683,7 @@ private final class Review2LoopbackCoordinatorHarness {
         XCTAssertTrue(graph.registry.startOutputPrepareOperation(source))
         guard case .succeeded = await graph.registry.joinOutputBackendOperation(source),
               backend.prepared != nil else {
+            print("LOOPBACK_PREPARE_FAILURE error=\(String(describing: backend.lastError)) phase=\(coordinator.phase) history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
             throw backend.lastError ?? AVPlayerItemCoordinatorFailure.staleIdentity
         }
     }
@@ -4401,6 +5719,12 @@ private final class Review2LoopbackCoordinatorHarness {
 
 @MainActor
 private final class Review2LoopbackDriver: AVPlayerDriving {
+    var disconnectedFromSystemAudio = false
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == item else { throw .staleIdentity }
+        disconnectedFromSystemAudio = disconnected
+    }
     var seekAction: (() throws -> Void)?
     var rate: Float = 0
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
@@ -4411,6 +5735,9 @@ private final class Review2LoopbackDriver: AVPlayerDriving {
     private var statusActivation: ActivationEpoch?
     private(set) var playCallCount = 0
     var holdPlayCompletion = false
+    var holdPauseCompletion = false
+    private var pauseCompletion: CheckedContinuation<Void, Never>?
+    var hasHeldPauseCompletion: Bool { pauseCompletion != nil }
     private var playEntered = false
     private var playEntryWaiter: CheckedContinuation<Void, Never>?
     private var playCompletion: CheckedContinuation<Void, Never>?
@@ -4432,7 +5759,7 @@ private final class Review2LoopbackDriver: AVPlayerDriving {
 
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt { .init(item: item, playhead: playhead, requested: requested) }
 
     func preroll(item: AVPlayerItemInstanceIdentity,
@@ -4486,7 +5813,10 @@ private final class Review2LoopbackDriver: AVPlayerDriving {
         }
     }
     func directState(item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState {
-        .init(item: item, rate: rate, timeControlStatus: timeControlStatus)
+        if holdPauseCompletion {
+            await withCheckedContinuation { pauseCompletion = $0 }
+        }
+        return .init(item: item, rate: rate, timeControlStatus: timeControlStatus)
     }
     func replaceCurrentItemWithNil(item: AVPlayerItemInstanceIdentity) {
         if currentItemIdentity == item { currentItemIdentity = nil }
@@ -4521,6 +5851,12 @@ private final class Review2LoopbackDriver: AVPlayerDriving {
         await withCheckedContinuation { playEntryWaiter = $0 }
     }
 
+    func releasePauseCompletion() {
+        holdPauseCompletion = false
+        pauseCompletion?.resume()
+        pauseCompletion = nil
+    }
+
     func releasePlayCompletion() {
         holdPlayCompletion = false
         playCompletion?.resume()
@@ -4544,6 +5880,7 @@ private final class Review2LoopbackBackend: PlaybackBackend,
     private var errorValue: Error?
     private var suspendCallCountValue = 0
     private var retireCallCountValue = 0
+    private var reprepareCallCountValue = 0
     private var retiredGraphReservationValue:
         AVPlayerRetainedGraphReservationSnapshot?
 
@@ -4580,6 +5917,7 @@ private final class Review2LoopbackBackend: PlaybackBackend,
     var lastError: Error? { lock.withLock { errorValue } }
     var suspendCallCount: Int { lock.withLock { suspendCallCountValue } }
     var retireCallCount: Int { lock.withLock { retireCallCountValue } }
+    var reprepareCallCount: Int { lock.withLock { reprepareCallCountValue } }
     var retiredGraphReservation: AVPlayerRetainedGraphReservationSnapshot? {
         lock.withLock { retiredGraphReservationValue }
     }
@@ -4606,6 +5944,7 @@ private final class Review2LoopbackBackend: PlaybackBackend,
     }
 
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        lock.withLock { reprepareCallCountValue += 1 }
         do {
             guard enablesReplacement else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
@@ -4613,8 +5952,8 @@ private final class Review2LoopbackBackend: PlaybackBackend,
             let replacementFixture = try await FinalReplacementHTTPFixture.start(
                 outputLifecycleEpoch: invocation.outputLifecycleEpoch)
             do {
-                try await replacementFixture.serveInitialSelection()
                 let bundle = try replacementFixture.makeBundle(invocation: invocation)
+                try await replacementFixture.serveInitialSelection()
                 try await coordinator.installReplacement(bundle, invocation: invocation)
                 let prepared = try await coordinator.prepareCurrentItem(invocation: invocation)
                 lock.withLock {
@@ -4782,7 +6121,8 @@ private final class LockedSelectionCapabilities: @unchecked Sendable {
 private final class FinalReplacementHTTPFixture: @unchecked Sendable {
     let publication: FinalReplacementPublicationHarness
     let server: LoopbackHTTPServer
-    let evidenceSource: LoopbackAVPlayerPreparationEvidenceSource
+    private var ownedEvidenceSource: LoopbackAVPlayerPreparationEvidenceSource?
+    var evidenceSource: LoopbackAVPlayerPreparationEvidenceSource { ownedEvidenceSource! }
     let itemURL: URL
     let publicationSequence: UInt64
     let itemGeneration: UInt64
@@ -4791,7 +6131,7 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
                  server: LoopbackHTTPServer) throws {
         self.publication = publication
         self.server = server
-        evidenceSource = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+        ownedEvidenceSource = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
         let playlistPath = try publication.declaration.playlistURI(participantID: 2)
         itemURL = try XCTUnwrap(URL(string: playlistPath,
                                     relativeTo: server.baseURL)?.absoluteURL)
@@ -4811,7 +6151,7 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
             itemGeneration: itemGeneration,
             outputLifecycleEpoch: outputLifecycleEpoch)
         let box = FinalReplacementLockedHarness()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: itemGeneration, now: { 0 }, logger: { _ in },
             responseFailure: responseFailure
         ) { token in
@@ -4828,11 +6168,22 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
             publication: XCTUnwrap(box.value), server: server)
     }
 
+    func releasePreparationEvidence() {
+        ownedEvidenceSource?.retirePreparation()
+        ownedEvidenceSource = nil
+    }
+
+    func rotatePreparationHistory() throws {
+        evidenceSource.retirePreparation()
+        ownedEvidenceSource = try .make(server: server)
+        XCTAssertTrue(evidenceSource.preparationOwner.isHistoryActive)
+    }
+
     func serveInitialSelection() async throws {
         let snapshot = try XCTUnwrap(publication.publisher.visible)
         var urls = [itemURL]
         let playlist = try XCTUnwrap(snapshot.media[2])
-        urls += try (playlist.initializationResources + playlist.resources).map {
+        urls += try (playlist.initializationResources + playlist.resources.reversed()).map {
             try XCTUnwrap(URL(string: server.path(for: $0),
                               relativeTo: server.baseURL)?.absoluteURL)
         }
@@ -4846,11 +6197,14 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while ContinuousClock.now < deadline {
-            if let capability = server.completedPublicationCapability(
+            if server.currentAudioSelectionCapability(
+                itemGeneration: itemGeneration,
+                publicationSequence: publicationSequence)?.renditionIdentity == .init(rawValue: 2),
+               let basis = server.preparationPublicationBasis(
                 itemURL: itemURL, itemGeneration: itemGeneration,
-                publicationSequence: publicationSequence),
-               let evidence = server.consumeCompletedPublicationCapability(capability),
-               evidence.audioSelectionCapability?.renditionIdentity == .init(rawValue: 2) {
+                publicationSequence: publicationSequence,
+                preparationOwner: evidenceSource.preparationOwner),
+               basis.audioSelectionCapability?.renditionIdentity == .init(rawValue: 2) {
                 return
             }
             try await Task.sleep(for: .milliseconds(10))
@@ -4879,7 +6233,7 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
         _ = waitUntil(timeout: 2) {
             server.usage.connections == 0 && server.usage.activeResponses == 0
         }
-        evidenceSource.retirePreparation()
+        releasePreparationEvidence()
         let ticket = server.closeAdmission()
         try? server.drain(cleanupTicket: ticket)
         try? server.retire(cleanupTicket: ticket)
@@ -5045,7 +6399,7 @@ private final class FinalReview2InitialHTTPFixture: @unchecked Sendable {
             audio: encoded, additionalAudioSeed: surround,
             additionalAudioParticipantID: 4)
         let box = FinalReview2InitialLockedHarness()
-        let server = try await LoopbackHTTPSessionFactory().start(
+        let server = try await LoopbackHTTPSessionFactory().startPreparingAsynchronously(
             itemGeneration: 19, now: { 0 }, logger: { _ in },
             responseFailure: { _, _ in }
         ) { token in
@@ -5089,10 +6443,43 @@ private final class FinalReview2InitialLockedHarness: @unchecked Sendable {
     }
 }
 
+/// The preparation owner settles only after the test explicitly releases it.
+/// Task cancellation deliberately does not resume this single-waiter gate.
+private actor Task20StartupPreparationGate {
+    private var isReleased = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func waitUntilReleased() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func release() {
+        isReleased = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
 private final class Task20HTTPFixture: @unchecked Sendable {
     let task19: Task19Harness
     let server: LoopbackHTTPServer
     let token: String
+    private var retainedEvidenceSource: LoopbackAVPlayerPreparationEvidenceSource?
+
+    @discardableResult
+    func beginPreparationHistory() throws -> LoopbackAVPlayerPreparationEvidenceSource {
+        if let retainedEvidenceSource { return retainedEvidenceSource }
+        let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+        XCTAssertTrue(source.preparationOwner.isHistoryActive)
+        retainedEvidenceSource = source
+        return source
+    }
+
+    func retirePreparationHistory() {
+        retainedEvidenceSource?.retirePreparation()
+        retainedEvidenceSource = nil
+    }
 
     private init(task19: Task19Harness, server: LoopbackHTTPServer, token: String) {
         self.task19 = task19
@@ -5104,15 +6491,17 @@ private final class Task20HTTPFixture: @unchecked Sendable {
                       logger: @escaping @Sendable (String) -> Void = { _ in },
                       responseFailure: @escaping @Sendable (HLSResourceKey, CompletedMediaEvidenceError) -> Void = { _, _ in },
                       testing: LoopbackHTTPTestingConfiguration? = nil,
-                      audioCount: Int = 1) async throws -> Task20HTTPFixture {
+                      audioCount: Int = 1,
+                      terminalLogicalSequence: UInt64? = nil) async throws -> Task20HTTPFixture {
         let box = LockedHarness()
         let factory = testing.map { LoopbackHTTPSessionFactory(testing: $0) }
             ?? LoopbackHTTPSessionFactory()
-        let server = try await factory.start(itemGeneration: 19, now: now,
+        let server = try await factory.startPreparingAsynchronously(itemGeneration: 19, now: now,
             logger: logger, responseFailure: responseFailure) { token in
-            let harness = try Task19Harness(
-                loopbackSession: token, audioCount: audioCount)
-            try harness.initial()
+            let harness = try await Task19Harness(
+                loopbackSession: token, audioCount: audioCount,
+                terminalLogicalSequence: terminalLogicalSequence)
+            try await harness.initial()
             box.value = harness
             var declaration = try Task19.declaration(audioCount: audioCount)
             declaration.token = token.value
@@ -5124,6 +6513,7 @@ private final class Task20HTTPFixture: @unchecked Sendable {
     }
 
     func shutdown() {
+        retirePreparationHistory()
         _ = waitUntil(timeout: 2) {
             server.usage.connections == 0 && server.usage.activeResponses == 0
         }

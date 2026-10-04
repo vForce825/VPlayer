@@ -104,6 +104,209 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertEqual(StubURLProtocol.requests.count, 1)
     }
 
+    func testAlreadyCancelledLogoConsumerDoesNotStartLoad() async throws {
+        let directory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let loader = CountingImmediateChannelLogoDataLoader(data: Self.onePixelPNG)
+        let cache = ChannelLogoCache(dataLoader: loader, cacheDirectory: directory)
+        let url = URL(string: "https://images.example/pre-cancelled-cache.png")!
+        // This test and the task share MainActor; cancel before yielding to it.
+        let request = Task { await cache.image(for: url) }
+        request.cancel()
+        let image = await request.value
+        let requestCount = await loader.requestCount
+        XCTAssertNil(image)
+        XCTAssertEqual(requestCount, 0)
+        XCTAssertNil(cache.memoryCachedImage(for: url))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
+
+    func testChannelLogoCacheCancellationReachesLastWaiterBeforeLoaderReturns() async throws {
+        let directory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let loader = ControlledChannelLogoDataLoader()
+        let cache = ChannelLogoCache(dataLoader: loader, cacheDirectory: directory)
+        let url = URL(string: "https://images.example/cancel-cache.png")!
+        let request = Task { await cache.image(for: url) }
+        let started = await waitForLogoCondition { await loader.requestCount == 1 }
+        XCTAssertTrue(started)
+
+        request.cancel()
+        let cancelled = await waitForLogoCondition { await loader.cancellationCount == 1 }
+        XCTAssertTrue(cancelled, "Cancelling the last cache consumer must reach the loader")
+        // The fixture deliberately withholds completion even after cancellation.
+        // Releasing it here also lets this regression terminate on the old code.
+        if !cancelled { await loader.releaseAll(data: Self.onePixelPNG) }
+        let image = await request.value
+        XCTAssertNil(image)
+        XCTAssertNil(cache.memoryCachedImage(for: url))
+        await loader.releaseAll(data: Self.onePixelPNG)
+    }
+
+    func testChannelLogoCacheCancellationKeepsOtherSameURLConsumerAlive() async throws {
+        let directory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let loader = ControlledChannelLogoDataLoader()
+        let cache = ChannelLogoCache(dataLoader: loader, cacheDirectory: directory)
+        let url = URL(string: "https://images.example/shared-cache-cancel.png")!
+        let cancelled = Task { await cache.image(for: url) }
+        let started = await waitForLogoCondition { await loader.requestCount == 1 }
+        XCTAssertTrue(started)
+        let surviving = Task { await cache.image(for: url) }
+        let bothAdmitted = await waitForLogoCondition {
+            self.logoCacheWaiterCount(cache, for: url) == 2
+        }
+        XCTAssertTrue(bothAdmitted)
+        cancelled.cancel()
+        let oneRemaining = await waitForLogoCondition {
+            self.logoCacheWaiterCount(cache, for: url) == 1
+        }
+        XCTAssertTrue(oneRemaining)
+        if !oneRemaining { await loader.releaseAll(data: Self.onePixelPNG) }
+        let cancelledImage = await cancelled.value
+        XCTAssertNil(cancelledImage)
+        let cancellationCount = await loader.cancellationCount
+        XCTAssertEqual(cancellationCount, 0)
+
+        await loader.releaseAll(data: Self.onePixelPNG)
+        let survivingImage = await surviving.value
+        let requestCount = await loader.requestCount
+        XCTAssertNotNil(survivingImage)
+        XCTAssertNotNil(cache.memoryCachedImage(for: url))
+        XCTAssertEqual(requestCount, 1, "Same-URL consumers share download and decode work")
+    }
+
+    func testCancelledLogoGenerationCannotCompleteReplacementOrPopulateCache() async throws {
+        let directory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let loader = ControlledChannelLogoDataLoader()
+        let cache = ChannelLogoCache(dataLoader: loader, cacheDirectory: directory)
+        let url = URL(string: "https://images.example/cache-generation.png")!
+        let old = Task { await cache.image(for: url) }
+        let started = await waitForLogoCondition { await loader.requestCount == 1 }
+        XCTAssertTrue(started)
+        // Observe the actual shared task, without exposing test hooks in production.
+        let oldLoad = logoCacheLoadTask(cache, for: url)
+        XCTAssertNotNil(oldLoad)
+        old.cancel()
+        let cancelled = await waitForLogoCondition { await loader.cancellationCount == 1 }
+        guard cancelled, let oldLoad else {
+            await loader.releaseAll(data: Self.onePixelPNG)
+            _ = await old.value
+            XCTFail("Cache must cancel and detach its previous generation")
+            return
+        }
+        let oldImage = await old.value
+        XCTAssertNil(oldImage)
+        let replacement = Task { await cache.image(for: url) }
+        let replacementStarted = await waitForLogoCondition { await loader.requestCount == 2 }
+        guard replacementStarted else {
+            await loader.releaseAll(data: Self.onePixelPNG)
+            _ = await replacement.value
+            XCTFail("A replacement must not join a cancelled generation")
+            return
+        }
+
+        await loader.release(index: 0, data: Self.onePixelPNG)
+        await oldLoad.value
+        XCTAssertNil(cache.memoryCachedImage(for: url))
+        XCTAssertEqual(logoCacheWaiterCount(cache, for: url), 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+
+        let joining = Task { await cache.image(for: url) }
+        let joinedReplacement = await waitForLogoCondition {
+            self.logoCacheWaiterCount(cache, for: url) == 2
+        }
+        XCTAssertTrue(joinedReplacement)
+        await loader.releaseAll(data: Self.onePixelPNG)
+        let replacementImage = await replacement.value
+        let joiningImage = await joining.value
+        let requestCount = await loader.requestCount
+        XCTAssertNotNil(replacementImage)
+        XCTAssertNotNil(joiningImage)
+        XCTAssertEqual(requestCount, 2, "Old completion must not remove the replacement entry")
+    }
+
+    func testLastCacheConsumerCancellationStartsQueuedURLAndRemovesTemporaryFiles() async throws {
+        let directory = temporaryLogoCacheDirectory()
+        let downloads = temporaryLogoDownloadsDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        defer { try? FileManager.default.removeItem(at: downloads) }
+        let cache = ChannelLogoCache(
+            dataLoader: logoDataLoader(downloadsDirectory: downloads), cacheDirectory: directory
+        )
+        let urls = (0..<5).map { URL(string: "https://images.example/cache-slot-\($0).png")! }
+        let gates = (0..<4).map { _ in StubURLProtocol.ChunkDeliveryGate {} }
+        defer { gates.forEach { $0.release() } }
+        for gate in gates {
+            StubURLProtocol.enqueue(.init(
+                chunks: [Self.onePixelPNG], chunkDeliveryGates: [0: gate]
+            ))
+        }
+        StubURLProtocol.enqueue(.init(chunks: [Self.onePixelPNG]))
+        let active = urls.prefix(4).map { url in Task { await cache.image(for: url) } }
+        let fourStarted = await waitForLogoRequestCount(4)
+        XCTAssertTrue(fourStarted)
+        let queued = Task { await cache.image(for: urls[4]) }
+        let queuedAdmitted = await waitForLogoCondition {
+            self.logoCacheWaiterCount(cache, for: urls[4]) == 1
+        }
+        XCTAssertTrue(queuedAdmitted)
+        active[0].cancel()
+        let fifthStarted = await waitForLogoRequestCount(5)
+        XCTAssertTrue(fifthStarted, "A queued logo must start while the old bodies remain gated")
+        // Unblock only on failure, so the pre-fix regression also cleans up.
+        if !fifthStarted { gates.forEach { $0.release() } }
+        let cancelledImage = await active[0].value
+        let queuedImage = await queued.value
+        XCTAssertNil(cancelledImage)
+        XCTAssertNotNil(queuedImage)
+        for task in active.dropFirst() { task.cancel() }
+        gates.forEach { $0.release() }
+        for task in active.dropFirst() { _ = await task.value }
+        let filesRemoved = await waitForLogoDownloadDirectoryToEmpty(downloads)
+        XCTAssertTrue(filesRemoved)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+    }
+
+    private func waitForLogoCondition(
+        _ condition: @MainActor () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if await condition() { return true }
+            await Task.yield()
+        }
+        return false
+    }
+
+    // Reflection is confined to test synchronization: wait for actual admission
+    // and await a deliberately late old completion, rather than sleeping and
+    // assuming task scheduling order. Assertions exercise the public results.
+    private func logoCacheRequest(_ cache: ChannelLogoCache, for url: URL) -> Any? {
+        let requests = Mirror(reflecting: cache).children.first { $0.label == "inFlight" }?.value
+        guard let requests else { return nil }
+        for entry in Mirror(reflecting: requests).children {
+            let pair = Array(Mirror(reflecting: entry.value).children)
+            if pair.count == 2, pair[0].value as? URL == url { return pair[1].value }
+        }
+        return nil
+    }
+
+    private func logoCacheWaiterCount(_ cache: ChannelLogoCache, for url: URL) -> Int {
+        guard let request = logoCacheRequest(cache, for: url),
+              let waiters = Mirror(reflecting: request).children.first(where: {
+                  $0.label == "waiters"
+              })?.value else { return 0 }
+        return Mirror(reflecting: waiters).children.count
+    }
+
+    private func logoCacheLoadTask(_ cache: ChannelLogoCache, for url: URL) -> Task<Void, Never>? {
+        guard let request = logoCacheRequest(cache, for: url) else { return nil }
+        return Mirror(reflecting: request).children.first { $0.label == "task" }?.value
+            as? Task<Void, Never>
+    }
+
     func testChannelLogoCacheRejectsDeclaredLengthAndCancelsBeforeRemainingBody() async throws {
         let cacheDirectory = temporaryLogoCacheDirectory()
         let downloadsDirectory = temporaryLogoDownloadsDirectory()
@@ -143,25 +346,47 @@ final class VPlayerAppStartupTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
         let logoURL = try XCTUnwrap(URL(string: "https://images.example/chunked-too-large.png"))
         let limit = 8 * 1_024 * 1_024
+        let tailAttempted = expectation(description: "withheld tail rechecks cancellation")
+        let tailGate = StubURLProtocol.ChunkDeliveryGate {
+            tailAttempted.fulfill()
+        }
+        defer { tailGate.release() }
         StubURLProtocol.enqueue(.init(
             chunks: [
                 Data(repeating: 0x41, count: limit),
                 Data([0x42]),
                 Data("must-not-be-delivered".utf8),
             ],
-            callbackDelay: 0.02
+            callbackDelay: 0.02,
+            chunkDeliveryGates: [2: tailGate]
         ))
         let cache = ChannelLogoCache(
             dataLoader: logoDataLoader(downloadsDirectory: downloadsDirectory),
             cacheDirectory: cacheDirectory
         )
 
-        let image = await cache.image(for: logoURL)
+        let imageTask = Task { await cache.image(for: logoURL) }
+        // didLoad queues work for the URLSession delegate and stream consumer; a
+        // fixed delay cannot acknowledge that the preceding 8 MiB was processed.
+        // Withhold the tail until the first overflowing chunk stops the protocol.
         await waitForLogoProtocolCancellation()
+        XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 2)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+
+        tailGate.release()
+        await fulfillment(of: [tailAttempted], timeout: 2)
+        let image = await imageTask.value
 
         XCTAssertNil(image)
         XCTAssertEqual(StubURLProtocol.deliveredChunkCount, 2)
-        XCTAssertGreaterThanOrEqual(StubURLProtocol.stopLoadingCount, 1)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: downloadsDirectory.path),
+            []
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path),
+            []
+        )
     }
 
     func testLastLogoDownloadWaiterCancellationReleasesSlotAndTemporaryFile() async throws {
@@ -686,6 +911,20 @@ final class VPlayerAppStartupTests: XCTestCase {
     }
 
     func testInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes() async {
+        await assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
+            prefersReducedResourceUsage: false
+        )
+    }
+
+    func testReducedResourcePreferencePreservesInitialCachedLibraryBeforeBlockedMaintenanceCompletes() async {
+        await assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
+            prefersReducedResourceUsage: true
+        )
+    }
+
+    private func assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
+        prefersReducedResourceUsage: Bool
+    ) async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let profile = SourceProfile(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
@@ -713,22 +952,30 @@ final class VPlayerAppStartupTests: XCTestCase {
         let repository = RepositorySpy(profiles: [profile])
         let maintenance = BlockingStartupMaintenanceProbe()
         let completion = StartupOpeningCompletionProbe()
+        let opened = expectation(description: "Initial library returned before optional maintenance")
+        let foregroundSleeping = prefersReducedResourceUsage
+            ? expectation(description: "Reduced foreground work is deferred") : nil
+        let automaticWork = expectation(description: "Reduced mode must not start automatic refresh")
+        automaticWork.isInverted = true
+        let refresh: AppModel.Refresh = { _, _, _ in automaticWork.fulfill(); return [] }
         let dependencies = VPlayerDependencies(
             libraryStartup: LibraryStartup {
                 try await maintenance.purgeUnreferencedSnapshots()
             },
             foregroundRefreshDriver: ForegroundRefreshDriver(
-                loadProfiles: { [] },
-                refresh: { _, _, _ in [] },
-                reportStatus: { _ in }
+                loadProfiles: { automaticWork.fulfill(); return [profile] },
+                refresh: refresh,
+                sleep: { foregroundSleeping?.fulfill(); try await Task.sleep(for: .seconds(3_600)) },
+                reportStatus: { _ in XCTFail("Automatic foreground refresh must remain deferred") }
             ),
             backgroundRefreshRegistrar: BackgroundRefreshRegistrar(
                 scheduler: StartupBackgroundSchedulerSpy(),
-                loadProfiles: { [] },
-                refresh: { _, _, _ in [] },
+                loadProfiles: { [profile] },
+                refresh: refresh,
                 reportStatus: { _ in }
             ),
             repository: repository,
+            refresh: refresh,
             prepare: {
                 await repository.replaceChannels(
                     profileID: profile.id,
@@ -738,24 +985,36 @@ final class VPlayerAppStartupTests: XCTestCase {
         )
         let model = AppModel(
             repository: repository,
-            refresh: { _, _, _ in [] },
+            refresh: dependencies.refresh,
             now: { now }
         )
 
+        dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(prefersReducedResourceUsage)
+        dependencies.backgroundRefreshRegistrar.setPrefersReducedResourceUsage(prefersReducedResourceUsage)
+        if prefersReducedResourceUsage {
+            dependencies.foregroundRefreshDriver.activate()
+        }
+        defer { dependencies.foregroundRefreshDriver.deactivate() }
         let opening = Task {
-            await dependencies.openInitialLibrary(using: model)
+            let result = await dependencies.openInitialLibrary(using: model)
             await completion.recordCompletion()
+            opened.fulfill()
+            return result
         }
         await maintenance.waitUntilAttempted()
-        for _ in 0..<100 {
-            await Task.yield()
+        await fulfillment(of: [opened], timeout: 2)
+        if let foregroundSleeping {
+            await fulfillment(of: [foregroundSleeping], timeout: 2)
         }
         let completedBeforeCleanupRelease = await completion.isComplete
 
         XCTAssertEqual(model.channels, [channel])
         await maintenance.release()
-        await opening.value
+        let didOpen = await opening.value
+        XCTAssertTrue(didOpen)
+        XCTAssertTrue(dependencies.foregroundRefreshDriver.isInitialLibraryLoadComplete)
         XCTAssertTrue(completedBeforeCleanupRelease)
+        await fulfillment(of: [automaticWork], timeout: 0.05)
     }
 
     func testInitialLibraryPreparationFailureKeepsLibraryClosedUntilRetrySucceeds() async {
@@ -1193,7 +1452,7 @@ private final class StartupBackgroundSchedulerSpy: BackgroundRefreshScheduling {
         cancelledIdentifiers.append(identifier)
     }
 
-    func submit(identifier: String, earliestBeginDate: Date) throws {
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
         _ = identifier
         _ = earliestBeginDate
     }
@@ -1203,5 +1462,55 @@ private final class StartupBackgroundSchedulerSpy: BackgroundRefreshScheduling {
             if !cancelledIdentifiers.isEmpty { return }
             await Task.yield()
         }
+    }
+}
+
+/// Lets cancellation be observed separately from the old request's completion.
+/// In particular, a cancelled load may still deliver bytes after its replacement
+/// starts, matching network/decode work that completes across a cancellation race.
+private actor ControlledChannelLogoDataLoader: ChannelLogoDataLoading {
+    private var identifiers: [UUID] = []
+    private var pending: [UUID: CheckedContinuation<Data?, Never>] = [:]
+    private var cancelled: Set<UUID> = []
+    var requestCount: Int { identifiers.count }
+    var cancellationCount: Int { cancelled.count }
+
+    func data(for url: URL, maximumByteCount: Int) async -> Data? {
+        let identifier = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                identifiers.append(identifier)
+                pending[identifier] = continuation
+            }
+        } onCancel: {
+            Task { await self.recordCancellation(identifier) }
+        }
+    }
+
+    private func recordCancellation(_ identifier: UUID) {
+        cancelled.insert(identifier)
+    }
+
+    func release(index: Int, data: Data?) {
+        guard identifiers.indices.contains(index) else { return }
+        pending.removeValue(forKey: identifiers[index])?.resume(returning: data)
+    }
+
+    func releaseAll(data: Data?) {
+        let continuations = pending.values
+        pending.removeAll()
+        for continuation in continuations { continuation.resume(returning: data) }
+    }
+}
+
+private actor CountingImmediateChannelLogoDataLoader: ChannelLogoDataLoading {
+    let data: Data
+    private(set) var requestCount = 0
+
+    init(data: Data) { self.data = data }
+
+    func data(for url: URL, maximumByteCount: Int) async -> Data? {
+        requestCount += 1
+        return data
     }
 }

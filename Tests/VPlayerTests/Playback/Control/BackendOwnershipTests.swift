@@ -408,6 +408,22 @@ final class BackendOwnershipTestHarness: @unchecked Sendable {
             await Task.yield()
         }
     }
+
+    func waitForAudibleSuccessor(timeout: Duration = .seconds(3)) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            let context = registry.outputResourceContextSnapshot()
+            if currentAudibleOutputs == 1, context?.phase == .installed,
+               context?.owner == nil, context?.prepared == true {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let context = String(describing: registry.outputResourceContextSnapshot())
+        let route = String(describing: registry.outputRouteObservationSnapshot())
+        XCTFail("有界等待后继真实 activation 超时；context=\(context)；route=\(route)")
+        throw NSError(domain: "BackendOwnershipSuccessorTimeout", code: 1)
+    }
 }
 
 final class BackendOwnershipTests: XCTestCase {

@@ -73,6 +73,8 @@ final class HLSRuntimeFailureRelay: @unchecked Sendable {
         let publicationCapture = malloc_good_size(32 +
             MemoryLayout<SystemHLSMediaGraphAuthority?>.stride) + 32
         // 256B 覆盖两处函数 reabstraction；64B 覆盖 bundle/builder 新引用的分配级差。
+        // Coordinator's relay alias is part of its separately measured 12 KiB
+        // resource-context root; this metadata bound does not prove that root's capacity.
         return actual(self) + actual(lock) + metadataOwner.knownAllocationBytes +
             ErrorDiagnosticSnapshot.maximumStorageAllocationBytes +
             bridgeCapture + relayCapture + publicationCapture + 256 + 64
@@ -97,6 +99,12 @@ final class HLSRuntimeFailureRelay: @unchecked Sendable {
     }
 
     func close() { lock.withLock { state = .closed } }
+
+    /// A failed prepare closes delivery before joining producer retirement. Its
+    /// already recorded first diagnostic still belongs to that same attempt.
+    var closedFailureDiagnostic: ErrorDiagnosticSnapshot? {
+        lock.withLock { state == .closed ? firstFailure : nil }
+    }
 }
 
 /// HLS item 的唯一资源图 owner。它不复制 AVPlayer request，也不把 producer 的
@@ -162,6 +170,9 @@ final class HLSOutputItemBundle: @unchecked Sendable {
     }
 
     var itemGeneration: UInt64 { replacement.request.item.itemGeneration }
+    var isAudioOnly: Bool {
+        lock.withLock { replacementStorage?.request.directAudioOnlyRendition != nil }
+    }
     var currentLifecycle: Lifecycle { lock.withLock { lifecycle } }
 
     /// producer 的 source read 只可启动一次。调用方在成功返回后才可把同一 request
@@ -214,6 +225,17 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         return confirmed
     }
 
+    /// The coordinator retains only an alias to this already charged attempt relay.
+    /// No callback capture, extra owner, or alternate failure scope is created.
+    var runtimeFailureRelay: HLSRuntimeFailureRelay? { runtimeFailure }
+
+    /// Call after retireProducerGraph has closed the relay. Reading its fixed
+    /// slot neither arms runtime delivery nor changes the retirement result.
+    func preservingFirstPreparationFailure(_ error: any Error) -> any Error {
+        if let diagnostic = runtimeFailure?.closedFailureDiagnostic { return diagnostic }
+        return error
+    }
+
     /// 只有 backend 完成该 attempt 的最后一个准备 await 后启用；已到首错锁外回放。
     func armRuntimeFailure() { runtimeFailure?.arm() }
 }
@@ -247,17 +269,28 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
     private let resourceContextLedger: PlaybackResourceContextLedger
 
     convenience init(sourceURL: URL,
+                     startupBufferSeconds: TimeInterval = 3,
                      runtimeEventSink: @escaping RuntimeEventSink = { _ in }) throws {
+        // Choose noncapturing factories: no uncharged per-builder closure context.
+        let factory: GraphFactory
+        if AVPlayerStartupBufferPolicy.initialPublicationSeconds(configured: startupBufferSeconds) == 4 {
+            factory = { source, invocation, ledger, failureSink in
+                let authority = try SystemHLSMediaGraphAuthority(
+                    lifecycle: invocation.outputLifecycleEpoch,
+                    initialWindowMinimumSeconds: 4, failureSink: failureSink)
+                return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
+                    graph: SystemHLSDeliveryGraph(authority: authority))
+            }
+        } else {
+            factory = { source, invocation, ledger, failureSink in
+                let authority = try SystemHLSMediaGraphAuthority(
+                    lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
+                return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
+                    graph: SystemHLSDeliveryGraph(authority: authority))
+            }
+        }
         try self.init(sourceURL: sourceURL, applicationLedger: .shared,
-                      runtimeEventSink: runtimeEventSink,
-                      graphFactory: { source, invocation, ledger, failureSink in
-            let authority = try SystemHLSMediaGraphAuthority(
-                lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
-            return HLSMediaGraphAssembler(
-                sourceURL: source,
-                applicationLedger: ledger,
-                graph: SystemHLSDeliveryGraph(authority: authority))
-        })
+                      runtimeEventSink: runtimeEventSink, graphFactory: factory)
     }
 
     init(validating sourceURL: URL) throws {

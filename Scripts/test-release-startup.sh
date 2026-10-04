@@ -24,11 +24,32 @@ collect_process_logs() {
         fi
     done
 }
+print_failed_process_logs() {
+    [[ -n "$prefix" ]] || return 0
+    local stream
+    # 只输出本次 launch 的日志，逐文件限 8KiB；不扫描其他进程或历史启动。
+    for stream in launch stdout stderr; do
+        printf '\n失败启动日志（最多 8192 字节）：%s.%s.log\n' "$prefix" "$stream" >&2
+        if [[ -f "$prefix.$stream.log" ]]; then
+            head -c 8192 "$prefix.$stream.log" >&2 || true
+            printf '\n' >&2
+        else
+            printf '日志尚不可用\n' >&2
+        fi
+    done
+}
 cleanup() {
+    local status=$?
+    if [[ "$status" != 0 ]]; then
+        # 在终止精确 App 进程前保存故障证据，避免 CI 只留下临时目录路径。
+        collect_process_logs || true
+        print_failed_process_logs || true
+    fi
     if [[ "$launched" == 1 ]]; then
         xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
     fi
-    collect_process_logs
+    collect_process_logs || true
+    return "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -64,7 +85,7 @@ bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.p
 sdk="$(xcrun --sdk appletvsimulator --show-sdk-path)"
 probe="$evidence/tvos_allocator_budget_probe.dylib"
 xcrun clang -O2 -Wall -Wextra -Werror -dynamiclib \
-    -target "$(uname -m)-apple-tvos26.0-simulator" -isysroot "$sdk" \
+    -target "$(uname -m)-apple-tvos27.0-simulator" -isysroot "$sdk" \
     "$repository_root/Scripts/Support/tvos_allocator_budget_probe.c" -o "$probe"
 codesign --force --sign - "$probe" > "$evidence/probe-sign.log" 2>&1
 xcrun simctl install "$simulator_udid" "$app" || fail '安装模拟器 App 失败'

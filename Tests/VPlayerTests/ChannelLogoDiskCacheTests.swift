@@ -54,6 +54,21 @@ final class ChannelLogoDiskCacheTests: XCTestCase {
         XCTAssertEqual(actual, expected)
     }
 
+    @MainActor
+    func testCancelledStoreDoesNotWriteDiskEntry() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = try ChannelLogoDiskCache(directory: directory, capacity: 100)
+        let store = Task {
+            await cache.store(Data("cancelled".utf8), forKey: "cancelled", maximumByteCount: 100)
+        }
+        // Cancel before this MainActor task yields and the store enters its actor.
+        store.cancel()
+        await store.value
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
+
     func testStoreRejectsEntryOverPerEntryLimit() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -267,6 +282,50 @@ final class ChannelLogoDiskCacheTests: XCTestCase {
         XCTAssertEqual(startedBeforeRelease, 4)
     }
 
+    func testCancelledQueuedLogoRequestsDoNotAccumulateWhileAllSlotsAreBusy() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let downloader = HoldingChannelLogoDownloader(directory: directory)
+        let loader = LiveChannelLogoDataLoader(downloader: downloader, fileManager: .default)
+        let active = (0..<4).map { index in
+            Task {
+                await loader.data(
+                    for: URL(string: "https://images.example/held-\(index).png")!,
+                    maximumByteCount: 16
+                )
+            }
+        }
+        let started = await waitForDownloads(downloader, count: 4)
+        XCTAssertTrue(started)
+
+        for index in 0..<64 {
+            let queued = Task {
+                await loader.data(
+                    for: URL(string: "https://images.example/abandoned-\(index).png")!,
+                    maximumByteCount: 16
+                )
+            }
+            let deadline = Date().addingTimeInterval(2)
+            var admitted = false
+            while Date() < deadline {
+                if await loader.logoTestRequestCount == 5 { admitted = true; break }
+                await Task.yield()
+            }
+            XCTAssertTrue(admitted)
+            queued.cancel()
+            let data = await queued.value
+            XCTAssertNil(data)
+            if !admitted { break }
+        }
+        let pendingCount = await loader.logoTestPendingKeyCount
+        let startsBeforeRelease = await downloader.startedURLs.count
+        XCTAssertEqual(pendingCount, 0, "Cancelled entries must not build up behind held downloads")
+        XCTAssertEqual(startsBeforeRelease, 4)
+        try await downloader.releaseAll(data: Data("logo".utf8))
+        for task in active { _ = await task.value }
+    }
+
     func testFileLogoLoaderAcceptsExactLimitAndRejectsOneByteOver() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -316,7 +375,8 @@ final class ChannelLogoDiskCacheTests: XCTestCase {
                 downloader: FixedDownloadedResourceChannelLogoDownloader(
                     resource: DownloadedResource(
                         temporaryFileURL: temporaryFileURL,
-                        byteCount: testCase.reportedByteCount
+                        byteCount: testCase.reportedByteCount,
+                        responseURL: URL(string: "https://images.example/\(testCase.name).png")!
                     )
                 ),
                 fileManager: .default
@@ -392,6 +452,7 @@ private final class DirectoryScanCountingFileManager: FileManager {
 
 private actor HoldingChannelLogoDownloader: BoundedHTTPDownloading {
     private struct Pending {
+        let url: URL
         let continuation: CheckedContinuation<DownloadedResource, any Error>
     }
 
@@ -412,12 +473,12 @@ private actor HoldingChannelLogoDownloader: BoundedHTTPDownloading {
             requests.append(url)
             if let releasedData {
                 do {
-                    continuation.resume(returning: try makeResource(data: releasedData))
+                    continuation.resume(returning: try makeResource(data: releasedData, responseURL: url))
                 } catch {
                     continuation.resume(throwing: error)
                 }
             } else {
-                pending.append(Pending(continuation: continuation))
+                pending.append(Pending(url: url, continuation: continuation))
             }
         }
     }
@@ -426,7 +487,7 @@ private actor HoldingChannelLogoDownloader: BoundedHTTPDownloading {
         guard !pending.isEmpty else { return }
         let item = pending.removeFirst()
         do {
-            item.continuation.resume(returning: try makeResource(data: data))
+            item.continuation.resume(returning: try makeResource(data: data, responseURL: item.url))
         } catch {
             item.continuation.resume(throwing: error)
             throw error
@@ -440,11 +501,12 @@ private actor HoldingChannelLogoDownloader: BoundedHTTPDownloading {
         }
     }
 
-    private func makeResource(data: Data) throws -> DownloadedResource {
+    private func makeResource(data: Data, responseURL: URL) throws -> DownloadedResource {
         let fileURL = directory.appendingPathComponent(UUID().uuidString)
         try data.write(to: fileURL)
         return DownloadedResource(
-            temporaryFileURL: fileURL, byteCount: Int64(data.count)
+            temporaryFileURL: fileURL, byteCount: Int64(data.count),
+            responseURL: responseURL
         )
     }
 }
@@ -469,4 +531,18 @@ private struct FixedDownloadedResourceChannelLogoDownloader: BoundedHTTPDownload
 
 private enum UnexpectedChannelLogoDownloaderError: Error {
     case called
+}
+
+// Test-only actor-isolated observations establish admission without scheduling
+// sleeps or production test hooks, and expose retained queue storage directly.
+private extension LiveChannelLogoDataLoader {
+    var logoTestRequestCount: Int { logoTestCollectionCount(named: "remoteRequests") }
+    var logoTestPendingKeyCount: Int { logoTestCollectionCount(named: "pendingRemoteKeys") }
+
+    func logoTestCollectionCount(named name: String) -> Int {
+        guard let value = Mirror(reflecting: self).children.first(where: {
+            $0.label == name
+        })?.value else { return -1 }
+        return Mirror(reflecting: value).children.count
+    }
 }

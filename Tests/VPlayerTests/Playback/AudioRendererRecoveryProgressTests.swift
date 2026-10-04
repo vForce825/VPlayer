@@ -7,6 +7,24 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRendererRecoveryProgressTests: XCTestCase {
+    func testUnavailableConsumptionObservationDoesNotInventStallDeadline() {
+        var monitor = AudioRendererRecoveryProgressMonitor()
+        XCTAssertEqual(monitor.automaticFlush(key: key(), token: token(), hasReplay: true,
+            canObserveConsumption: false), [.replay])
+        XCTAssertFalse(monitor.hasActiveBaseline)
+        XCTAssertEqual(monitor.replacementReady(key: key(), token: token(), hasReplay: true,
+            canObserveConsumption: false), [.replay])
+        XCTAssertFalse(monitor.hasActiveBaseline)
+    }
+
+    func testUnavailableObservationStillEscalatesExplicitRendererFailures() {
+        var monitor = AudioRendererRecoveryProgressMonitor()
+        XCTAssertEqual(monitor.rendererFailed(key: key(), hasReplay: true), [.rebuildCompressed])
+        _ = monitor.replacementReady(key: key(), token: token(), hasReplay: true,
+            canObserveConsumption: false)
+        XCTAssertEqual(monitor.rendererFailed(key: key(), hasReplay: true), [.fallbackPCM])
+    }
+
     func testFirstFlushWithReplaySchedulesOneProgressDeadline() throws {
         var monitor = AudioRendererRecoveryProgressMonitor()
 

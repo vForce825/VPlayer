@@ -116,13 +116,15 @@ struct PlayerChannelInfoAccessibilityPresentation: Equatable {
 /// live playback.  The timeline is intentionally local to this view so EPG
 /// refreshes do not affect playback state or the transport controls.
 struct PlayerChannelInfoOverlay: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
+    @ScaledMetric(relativeTo: .caption2) private var maximumCardWidth: CGFloat = 540
+    @ScaledMetric(relativeTo: .caption2) private var programmeTimeColumnWidth: CGFloat = 148
     let presentation: PlayerChannelPresentation
     let mediaInformation: PlaybackMediaInformation?
 
     private static let compactMinimumCardWidth: CGFloat = 380
     private static let programmeMinimumCardWidth: CGFloat = 480
-    private static let maximumCardWidth: CGFloat = 540
-    private static let programmeTimeColumnWidth: CGFloat = 148
     private static let programmeRowSpacing: CGFloat = 18
     private static let programmeContentMinimumWidth: CGFloat = 240
     private static let programmeContentMaximumWidth: CGFloat = 320
@@ -136,9 +138,9 @@ struct PlayerChannelInfoOverlay: View {
     var body: some View {
         CappedIntrinsicWidthLayout(
             minimumWidth: minimumCardWidth,
-            maximumWidth: Self.maximumCardWidth
+            maximumWidth: min(maximumCardWidth, 900)
         ) {
-            TimelineView(.periodic(from: .now, by: 30)) { context in
+            TimelineView(.periodic(from: .now, by: prefersReducedResourceUsage ? 120 : 30)) { context in
                 let programmePresentation = ChannelProgrammePresentation.resolve(
                     programmes: presentation.programmes,
                     at: context.date
@@ -196,8 +198,8 @@ struct PlayerChannelInfoOverlay: View {
             VStack(alignment: .leading, spacing: 7) {
                 Text(presentation.request.title)
                     .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 technicalInformation
             }
@@ -249,40 +251,70 @@ struct PlayerChannelInfoOverlay: View {
     private func programmeDetails(
         for programmePresentation: ChannelProgrammePresentation
     ) -> some View {
-        Grid(
-            alignment: .leading,
-            horizontalSpacing: Self.programmeRowSpacing,
-            verticalSpacing: 10
-        ) {
-            if let current = programmePresentation.current {
-                programmeRow(current, semanticLabel: "当前节目")
-                GridRow {
-                    Color.clear
-                        .frame(width: Self.programmeTimeColumnWidth, height: 0)
-                        .gridCellUnsizedAxes(.vertical)
-
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: 16) {
+                if let current = programmePresentation.current {
+                    accessibleProgrammeRow(current, label: "当前节目")
                     ProgressView(value: programmePresentation.progress ?? 0)
                         .progressViewStyle(SlimChannelProgressViewStyle())
-                        .frame(maxWidth: .infinity)
                         .accessibilityLabel("当前节目进度")
                         .accessibilityIdentifier("player-channel-progress")
+                } else {
+                    Text("暂无当前节目").font(.subheadline).foregroundStyle(.secondary)
                 }
-            } else {
-                Text("暂无当前节目")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .gridCellColumns(2)
+                if let next = programmePresentation.next {
+                    accessibleProgrammeRow(next, label: "下一节目")
+                }
             }
+        } else {
+            Grid(
+                alignment: .leading,
+                horizontalSpacing: Self.programmeRowSpacing,
+                verticalSpacing: 10
+            ) {
+                if let current = programmePresentation.current {
+                    programmeRow(current, semanticLabel: "当前节目")
+                    GridRow {
+                        Color.clear
+                            .frame(width: programmeTimeColumnWidth, height: 0)
+                            .gridCellUnsizedAxes(.vertical)
 
-            if let next = programmePresentation.next {
-                programmeRow(next, semanticLabel: "下一节目")
-            } else if programmePresentation.current == nil {
-                Text("暂无后续节目")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .gridCellColumns(2)
+                        ProgressView(value: programmePresentation.progress ?? 0)
+                            .progressViewStyle(SlimChannelProgressViewStyle())
+                            .frame(maxWidth: .infinity)
+                            .accessibilityLabel("当前节目进度")
+                            .accessibilityIdentifier("player-channel-progress")
+                    }
+                } else {
+                    Text("暂无当前节目")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .gridCellColumns(2)
+                }
+
+                if let next = programmePresentation.next {
+                    programmeRow(next, semanticLabel: "下一节目")
+                } else if programmePresentation.current == nil {
+                    Text("暂无后续节目")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .gridCellColumns(2)
+                }
             }
         }
+    }
+
+    private func accessibleProgrammeRow(_ programme: Programme, label: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(label) · \(PlayerChannelInfoAccessibilityPresentation.programmeTimeText(label: label, programme: programme))")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(programme.title)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private func programmeRow(
@@ -307,12 +339,13 @@ struct PlayerChannelInfoOverlay: View {
                 .monospacedDigit()
                 .lineLimit(1)
                 .allowsTightening(true)
-                .frame(width: Self.programmeTimeColumnWidth, alignment: .leading)
+                .frame(width: programmeTimeColumnWidth, alignment: .leading)
 
             Text(programme.title)
                 .font(.caption2.weight(isCurrent ? .semibold : .medium))
                 .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
                 .truncationMode(.tail)
                 .frame(
                     minWidth: Self.programmeContentMinimumWidth,

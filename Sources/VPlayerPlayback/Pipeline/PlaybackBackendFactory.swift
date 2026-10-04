@@ -70,12 +70,16 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
                 eventSink: eventSink
             )
         case .hlsAVPlayer:
+            // The production graph selects A/V or same-layout audio-only AAC from
+            // demux track facts, then returns a validated master or direct media item.
+            // Source topology must not be guessed from the URL or a prebuilt selector.
             let builder: SystemHLSOutputItemBundleBuilder
             if let hlsGraphFactory {
                 builder = try SystemHLSOutputItemBundleBuilder(
                     sourceURL: url, runtimeEventSink: eventSink, graphFactory: hlsGraphFactory)
             } else {
-                builder = try SystemHLSOutputItemBundleBuilder(sourceURL: url, runtimeEventSink: eventSink)
+                builder = try SystemHLSOutputItemBundleBuilder(sourceURL: url,
+                    startupBufferSeconds: tuning.videoBufferSeconds, runtimeEventSink: eventSink)
             }
             let driver = try await MainActor.run {
                 try SystemAVPlayerDriver.make(

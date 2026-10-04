@@ -82,7 +82,11 @@ actor LiveChannelLogoDataLoader: ChannelLogoDataLoading {
         if request.waiters.isEmpty {
             remoteRequests.removeValue(forKey: key)
             request.task?.cancel()
-            // 排队项保留在数组中，由启动循环跳过，避免每次取消线性搬移数组。
+            if request.task == nil {
+                // Cancelled queued work must not accumulate while all four
+                // active downloads are slow or stalled.
+                pendingRemoteKeys.removeAll { $0.identifier == request.identifier }
+            }
         } else {
             remoteRequests[key] = request
         }

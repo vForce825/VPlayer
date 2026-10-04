@@ -18,7 +18,13 @@ final class ChannelLogoCache {
     private let imageDecoder: any ChannelLogoImageDecoding
     private let diskCache: ChannelLogoDiskCache?
     private let maximumResponseBytes: Int
-    private var inFlight: [URL: Task<DecodedChannelLogo?, Never>] = [:]
+    private struct LogoRequest {
+        let identifier: UUID
+        var waiters: [UUID: CheckedContinuation<UIImage?, Never>]
+        let task: Task<Void, Never>
+    }
+
+    private var inFlight: [URL: LogoRequest] = [:]
 
     init(
         dataLoader: any ChannelLogoDataLoading = LiveChannelLogoDataLoader(
@@ -53,25 +59,63 @@ final class ChannelLogoCache {
     }
 
     func image(for url: URL) async -> UIImage? {
-        let cacheKey = url as NSURL
-        if let image = memoryCache.object(forKey: cacheKey) {
+        guard !Task.isCancelled else { return nil }
+        if let image = memoryCache.object(forKey: url as NSURL) {
             return image
         }
-        if let task = inFlight[url] {
-            return await task.value?.image
+        let waiter = UUID()
+        let image: UIImage? = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                if var request = inFlight[url] {
+                    request.waiters[waiter] = continuation
+                    inFlight[url] = request
+                } else {
+                    let identifier = UUID()
+                    let task = Task { [weak self] in
+                        guard let self else { return }
+                        let loaded = await self.loadLogo(for: url)
+                        self.completeLogoRequest(for: url, identifier: identifier, loaded: loaded)
+                    }
+                    inFlight[url] = LogoRequest(
+                        identifier: identifier, waiters: [waiter: continuation], task: task
+                    )
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.cancelLogoWaiter(waiter, for: url) }
         }
+        return Task.isCancelled ? nil : image
+    }
 
-        let task = Task { [weak self] () -> DecodedChannelLogo? in
-            guard let self else { return nil }
-            return await self.loadLogo(for: url)
+    private func cancelLogoWaiter(_ waiter: UUID, for url: URL) {
+        guard var request = inFlight[url],
+              let continuation = request.waiters.removeValue(forKey: waiter) else { return }
+        continuation.resume(returning: nil)
+        if request.waiters.isEmpty {
+            // Remove before cancelling so a new visible consumer can start a
+            // fresh generation while the old download acknowledges cancellation.
+            inFlight.removeValue(forKey: url)
+            request.task.cancel()
+        } else {
+            inFlight[url] = request
         }
-        inFlight[url] = task
-        let loaded = await task.value
-        inFlight[url] = nil
+    }
+
+    private func completeLogoRequest(
+        for url: URL, identifier: UUID, loaded: DecodedChannelLogo?
+    ) {
+        guard let request = inFlight[url], request.identifier == identifier else { return }
+        inFlight.removeValue(forKey: url)
         if let loaded {
-            memoryCache.setObject(loaded.image, forKey: cacheKey, cost: loaded.cost)
+            memoryCache.setObject(loaded.image, forKey: url as NSURL, cost: loaded.cost)
         }
-        return loaded?.image
+        for continuation in request.waiters.values {
+            continuation.resume(returning: loaded?.image)
+        }
     }
 
     func memoryCachedImage(for url: URL) -> UIImage? {
@@ -93,23 +137,29 @@ final class ChannelLogoCache {
     }
 
     private func loadLogo(for url: URL) async -> DecodedChannelLogo? {
+        guard !Task.isCancelled else { return nil }
         let diskKey = Self.diskKey(for: url)
         if let diskCache,
            let data = await diskCache.data(
             forKey: diskKey,
             maximumByteCount: maximumResponseBytes
         ) {
+            guard !Task.isCancelled else { return nil }
             if let decoded = await decode(data) {
-                return decoded
+                return Task.isCancelled ? nil : decoded
             }
+            guard !Task.isCancelled else { return nil }
             await diskCache.removeData(forKey: diskKey)
         }
 
-        guard let data = await dataLoader.data(
+        guard !Task.isCancelled,
+              let data = await dataLoader.data(
             for: url,
             maximumByteCount: maximumResponseBytes
         ),
-              let decoded = await decode(data) else {
+              !Task.isCancelled,
+              let decoded = await decode(data),
+              !Task.isCancelled else {
             return nil
         }
         if let diskCache {
@@ -119,7 +169,7 @@ final class ChannelLogoCache {
                 maximumByteCount: maximumResponseBytes
             )
         }
-        return decoded
+        return Task.isCancelled ? nil : decoded
     }
 
     private func decode(_ data: Data) async -> DecodedChannelLogo? {
@@ -424,6 +474,7 @@ struct AppDependencies {
     let refresh: Refresh
     let prepare: Prepare
     let playbackSettings: PlaybackSettingsStore
+    let nowPlaying: PlaybackNowPlayingCoordinator
     let channelBrowsingSettings: ChannelBrowsingSettingsStore
     let playbackEngine: any PlaybackEngine
     let playbackPresentationController: (any PlaybackPresentationControlling)?
@@ -470,8 +521,16 @@ struct AppDependencies {
         self.libraryUnavailableDiagnostic = libraryUnavailableDiagnostic
         self.repository = repository
         self.refresh = refresh
-        self.prepare = prepare
+        if let store = repository as? SwiftDataLibraryStore {
+            self.prepare = {
+                try await libraryChanges.observeCommittedChanges(in: store)
+                try await prepare()
+            }
+        } else {
+            self.prepare = prepare
+        }
         self.playbackSettings = playbackSettings
+        self.nowPlaying = PlaybackNowPlayingCoordinator()
         self.channelBrowsingSettings = channelBrowsingSettings
         let resolvedPlaybackEngine: any PlaybackEngine
         if let playbackEngine {
@@ -900,7 +959,7 @@ private final class InertBackgroundRefreshScheduler: BackgroundRefreshScheduling
         _ = identifier
     }
 
-    func submit(identifier: String, earliestBeginDate: Date) throws {
+    func submit(identifier: String, earliestBeginDate: Date) async throws {
         _ = identifier
         _ = earliestBeginDate
     }

@@ -22,6 +22,14 @@ public final class PlaybackSerialExecutor: @unchecked Sendable {
         }
     }
 
+    /// Reads executor-owned state inline when already isolated, or after prior
+    /// submissions otherwise. Keep the read bounded and side-effect free; do
+    /// not wait for callbacks or acquire locks held by a caller waiting on us.
+    func readIsolated<Value: Sendable>(_ snapshot: @Sendable () -> Value) -> Value {
+        if isIsolated { return snapshot() }
+        return queue.sync { measure(snapshot) }
+    }
+
     func submit(
         after delay: DispatchTimeInterval,
         _ operation: @escaping @Sendable () -> Void
@@ -31,11 +39,13 @@ public final class PlaybackSerialExecutor: @unchecked Sendable {
         }
     }
 
-    private func measure(_ operation: () -> Void) {
+    private func measure<Value>(_ operation: () -> Value) -> Value {
         let start = DispatchTime.now().uptimeNanoseconds
-        operation()
-        let elapsed = DispatchTime.now().uptimeNanoseconds &- start
-        busyLock.withLock { busyNanosecondsTotal &+= elapsed }
+        defer {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+            busyLock.withLock { busyNanosecondsTotal &+= elapsed }
+        }
+        return operation()
     }
 
     /// Wall time spent running work items. Against elapsed time this says whether

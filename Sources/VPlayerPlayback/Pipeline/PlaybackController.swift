@@ -16,7 +16,7 @@ final class DefaultAudioSessionCompletionReceiver: PlaybackAudioSessionCompletio
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit, completion: AudioSessionBlockingCallCompletion) {}
 }
 
-public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving {
+public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving {
     private let registry: ControlTaskRegistry
     private let deadlineScheduler: PlaybackDeadlineScheduler
     private let audioSessionOwner: PlaybackAudioSessionOwner
@@ -29,13 +29,16 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     public let watchdog: HLSPlaybackWatchdog
     
     private var controllerState = PlaybackControllerState()
+    private var userControlRevision: UInt64 = 0
+    private var playAdmissionGeneration: UInt64 = 0
+    private var latestAdmittedSession: PlaybackSessionIdentity?
     private var terminalMetricsProvider: (any PlaybackTerminalMetricsProviding)?
     private var mediaGeneration: MediaGeneration?
     private var currentMediaInformation: PlaybackMediaInformation?
     private var interruptionActive = false
     private var systemPauseRequired = false
     private var resumeVetoRequired = false
-    private var resumeRequestInFlight = false
+    private var resumeRequestInFlight: AudioSessionLifecycleEpoch?
     // 同一session的终态只关闭一次presentation；恢复/切路由只clear，不占用此终态身份。
     private var finishedPresentationSession: PlaybackSessionIdentity?
     private var diagnosticStage = "init" {
@@ -47,6 +50,8 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
     #if DEBUG
+    enum RequestScopedControlCheckpoint: Equatable, Sendable { case pauseIngress, stopAfterWatchdog }
+    private var requestScopedControlCheckpoint: (@Sendable (RequestScopedControlCheckpoint) async -> Void)?
     private var beforePresentationCommitForTesting: (@Sendable () -> Void)?
     private var beforePresentationMountClaimForTesting: (@Sendable () -> Void)?
     #endif
@@ -272,6 +277,12 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
     #if DEBUG
+    func setRequestScopedControlCheckpointForTesting(
+        _ hook: (@Sendable (RequestScopedControlCheckpoint) async -> Void)?
+    ) {
+        requestScopedControlCheckpoint = hook
+    }
+
     func setBeforePresentationCommitForTesting(_ hook: (@Sendable () -> Void)?) {
         beforePresentationCommitForTesting = hook
     }
@@ -293,9 +304,18 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
     public func play(_ request: PlaybackRequest) async {
+        guard !Task.isCancelled else { return }
+        let originalActionEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
+        let (generation, overflow) = playAdmissionGeneration.addingReportingOverflow(1)
+        guard !overflow else { return }
+        playAdmissionGeneration = generation
         diagnosticStage = "play_entry"
         recoveryCoordinator.cancelCurrentRecovery()
-        await watchdog.disarm()
+        // Revoke old arm authority before replacement preparation starts. This
+        // transition has its own generation because independently queued actor
+        // calls must not rely on FIFO delivery for correctness.
+        await watchdog.beginReplacement(generation: generation, retiring: latestAdmittedSession)
+        guard !Task.isCancelled, playAdmissionGeneration == generation else { return }
         // 新播放请求一进入actor就撤销旧UI所有权，不能让前驱资源排空时间延长旧画面寿命。
         if let context = registry.outputResourceContextSnapshot() {
             finishPresentation(for: context.sessionIdentity)
@@ -307,14 +327,19 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         let parentDeadline: CurrentPlaybackOperationDeadlineTicket
         do {
             diagnosticStage = "admitting_request"
-            parentDeadline = try await admitAfterJoiningCleanup(requestID: request.id)
+            parentDeadline = try await admitAfterJoiningCleanup(requestID: request.id, generation: generation,
+                originalActionEpoch: originalActionEpoch)
             guard case .coldStart(let budget) = parentDeadline else { diagnosticStage = "parentDeadline_not_coldStart"; return }
             sessionIdentity = budget.identity.sessionIdentity
+        } catch is CancellationError {
+            return
         } catch {
+            guard playAdmissionGeneration == generation else { return }
             diagnosticStage = "admit_failed"
             publish(.failed(Self.failure(for: .capture(error, stage: "startup.admission"))))
             return
         }
+        guard playAdmissionGeneration == generation else { return }
         invalidateSession()
         let runIdentity = PlaybackRunIdentity(sessionID: sessionIdentity.sessionID, requestID: request.id)
         
@@ -486,10 +511,19 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
 
-    private func admitAfterJoiningCleanup(requestID: UUID) async throws -> CurrentPlaybackOperationDeadlineTicket {
+    private func admitAfterJoiningCleanup(requestID: UUID, generation: UInt64,
+        originalActionEpoch: AudioSessionLifecycleEpoch) async throws -> CurrentPlaybackOperationDeadlineTicket {
         while true {
-            do { return try registry.admitPlaybackRequest(requestID: requestID) }
-            catch ControlTaskRegistry.Failure.cleanupTailPending {
+            // A scoped close may arrive before this request has an installed
+            // controller state. Never admit its canceled startup after cleanup.
+            guard !Task.isCancelled, playAdmissionGeneration == generation else { throw CancellationError() }
+            do {
+                let admission = try registry.admitPlaybackRequest(requestID: requestID, expectedEpoch: originalActionEpoch)
+                if case .coldStart(let budget) = admission {
+                    latestAdmittedSession = budget.identity.sessionIdentity
+                }
+                return admission
+            } catch ControlTaskRegistry.Failure.cleanupTailPending {
                 await registry.joinAutomaticCleanupTailBeforeAdmission()
             }
         }
@@ -643,13 +677,16 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 readinessCycle: controllerState.readinessCycle,
                 initiallyPaused: controllerState.userPaused || systemPauseRequired)
             if !controllerState.userPaused && !systemPauseRequired {
+                let activationControlRevision = userControlRevision
                 guard let activation = try registry.beginOutputActivation(contextNonce: prepared.contextNonce),
                       registry.startOutputActivationOperation(activation) else {
                     diagnosticStage = "startOutputActivation_failed"
                     return
                 }
                 diagnosticStage = "joining_activation"
-                switch await registry.joinOutputBackendOperation(activation) {
+                let outcome = await registry.joinOutputBackendOperation(activation)
+                guard ownsUserControl(runIdentity, revision: activationControlRevision) else { return }
+                switch outcome {
                 case .succeeded:
                     let isHLS = registry.outputResourceContextSnapshot()?.desiredBackendKind == .hlsAVPlayer
                     if rebase.successorClaim == nil || isHLS {
@@ -659,7 +696,10 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                         }
                         publish(.playing(request))
                     }
-                    await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds, hasObservedProgress: true)
+                    await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds,
+                        hasObservedProgress: true, session: sessionIdentity,
+                        controlRevision: activationControlRevision)
+                    guard ownsUserControl(runIdentity, revision: activationControlRevision) else { return }
                     diagnosticStage = isHLS ? "hls_playing" : "activation_succeeded_waiting_for_pipeline"
                 case .failed(let error):
                     diagnosticStage = "activation_failed_\(error)"
@@ -693,7 +733,25 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
     public func setPaused(_ paused: Bool) async {
-        guard let request = controllerState.request else { return }
+        await setPaused(paused, expectedRequestID: nil)
+    }
+
+    public func setPaused(_ paused: Bool, requestID: UUID) async {
+        await setPaused(paused, expectedRequestID: requestID)
+    }
+
+    private func setPaused(_ paused: Bool, expectedRequestID: UUID?) async {
+        #if DEBUG
+        if expectedRequestID != nil { await requestScopedControlCheckpoint?(.pauseIngress) }
+        #endif
+        // FullScreen cancels the originating pause task before every retry.
+        // Actor hops preserve that task's cancellation capability, even though
+        // retry deliberately reuses the same PlaybackRequest UUID. Check it
+        // before adopting the current admittedRun, not only after a suspension.
+        guard !Task.isCancelled,
+              let request = controllerState.request,
+              expectedRequestID.map({ $0 == request.id }) ?? true,
+              let controlRun = admittedRun, controlRun.requestID == request.id else { return }
         switch registry.playbackStateSnapshot() {
         case .failed, .stopped, .idle:
             return
@@ -703,22 +761,37 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         
         guard let context = registry.outputResourceContextSnapshot() else { return }
         let safety = registry.executor.safetyIngress.snapshot
+        let resumeEpoch = AudioSessionLifecycleEpoch(safety)
+        // Safety callbacks fold synchronously before their actor messages arrive.
+        // Admit this action against that current physical state, even if the
+        // controller's reset/ended presentation flags have not caught up yet.
+        let requiresExplicitResume = resumeVetoRequired || safety.interruptionVeto || safety.mediaServicesResumeRequired
+        // An idempotent duplicate does not cancel the earlier physical command.
+        // In particular a duplicate Play rejected by resumeRequestInFlight must
+        // not strand the original resume waiter with an obsolete revision.
+        let duplicatePause = paused && controllerState.userPaused
+        let duplicateResume = !paused && (requiresExplicitResume ? resumeRequestInFlight == resumeEpoch : !controllerState.userPaused)
+        if !duplicatePause && !duplicateResume { userControlRevision &+= 1 }
+        let controlRevision = userControlRevision
         let sessionIdentity = context.sessionIdentity
         guard sessionIdentity.requestID == request.id else { return }
-        if !paused, resumeVetoRequired {
+        if !paused, requiresExplicitResume {
             controllerState.userPaused = false
             publish(.paused(request))
-            guard !interruptionActive, !resumeRequestInFlight,
+            guard safety.interruptionState != .began, resumeRequestInFlight != resumeEpoch,
                   let run = admittedRun, let lease = registry.audioSessionLease(session: sessionIdentity) else { return }
+            resumeRequestInFlight = resumeEpoch
             await registry.joinOwnedTerminalCleanup()
-            guard isCurrent(run) else { return }
+            guard isCurrent(run), ownsUserControl(controlRun, revision: controlRevision),
+                  AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return }
             if let retained = registry.outputResourceContextSnapshot(), let owner = retained.owner,
                owner.reason == .recovery, retained.pendingReset == nil {
                 _ = try? registry.finishRetainedOutputCleanup(owner: owner)
             }
-            resumeRequestInFlight = true
-            if !audioSessionOwner.requestResume(for: lease) { resumeRequestInFlight = false }
-            if context.phase == .pendingLeaseAcquisition, resumeRequestInFlight {
+            if !audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch) {
+                clearResumeRequest(matching: resumeEpoch)
+            }
+            if context.phase == .pendingLeaseAcquisition, resumeRequestInFlight == resumeEpoch {
                 // 此session仍由原acquisition等待者消费真实active completion，不启动第二prepare。
                 resumeVetoRequired = false
                 systemPauseRequired = false
@@ -736,22 +809,34 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         )
         let controlResult = registry.performOutputUserControl(userControl)
         if case .rejected = controlResult { return }
+        if paused { resumeRequestInFlight = nil }
         
         guard controllerState.userPaused != paused else { return }
         controllerState.userPaused = paused
         advanceReadinessCycle()
+        if context.phase == .pendingLeaseAcquisition {
+            // Registry already folded intent and canceled any pending activation.
+            // The original acquisition caller still owns physical settlement and
+            // preparation; there is no backend to suspend or pause owner to create.
+            publish(paused ? .paused(request) : (systemPauseRequired ? .recovering(request) : .preparing(request)))
+            return
+        }
         if context.phase == .pendingSuccessorLease {
             publish(paused ? .paused(request) : .recovering(request))
             guard !paused, let run = admittedRun else { return }
             if context.pendingReset != nil {
                 await continueResetRecovery(identity: run)
-            } else if !interruptionActive, let lease = registry.audioSessionLease(session: sessionIdentity) {
+            } else if safety.interruptionState != .began, let lease = registry.audioSessionLease(session: sessionIdentity) {
+                resumeRequestInFlight = resumeEpoch
                 await registry.joinOwnedTerminalCleanup()
-                guard isCurrent(run) else { return }
+                guard isCurrent(run), ownsUserControl(controlRun, revision: controlRevision),
+                      AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return }
                 if let owner = registry.outputResourceContextSnapshot()?.owner {
                     _ = try? registry.finishRetainedOutputCleanup(owner: owner)
                 }
-                resumeRequestInFlight = audioSessionOwner.requestResume(for: lease)
+                if !audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch) {
+                    clearResumeRequest(matching: resumeEpoch)
+                }
             }
             return
         }
@@ -768,8 +853,10 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 let original = registry.outputResourceContextSnapshot(), let stop = original.suspend,
                 registry.startOutputSuspendOperation(stop.task, owner: owner) else { return }
             guard case .succeeded = await registry.joinOutputBackendOperation(stop.task),
+                  ownsUserControl(controlRun, revision: controlRevision),
                   registry.finishOutputPause(owner: owner) else { return }
-            await watchdog.disarm()
+            await watchdog.disarm(session: sessionIdentity, controlRevision: controlRevision)
+            guard ownsUserControl(controlRun, revision: controlRevision) else { return }
             registry.updatePreparedSampleBufferPause(contextNonce: original.contextNonce,
                 paused: true, readinessCycle: controllerState.readinessCycle)
             publish(.paused(request))
@@ -778,9 +865,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         } else {
             guard let activation = try? registry.beginOutputActivation(contextNonce: context.contextNonce),
                   registry.startOutputActivationOperation(activation) else { return }
-            switch await registry.joinOutputBackendOperation(activation) {
+            let outcome = await registry.joinOutputBackendOperation(activation)
+            guard ownsUserControl(controlRun, revision: controlRevision) else { return }
+            switch outcome {
             case .succeeded:
-                await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds, hasObservedProgress: true)
+                await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds,
+                    hasObservedProgress: true, session: sessionIdentity, controlRevision: controlRevision)
+                guard ownsUserControl(controlRun, revision: controlRevision) else { return }
             case .failed(let error):
                 if let context = registry.outputResourceContextSnapshot() {
                     beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
@@ -790,18 +881,85 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             }
             registry.updatePreparedSampleBufferPause(contextNonce: context.contextNonce,
                 paused: false, readinessCycle: controllerState.readinessCycle)
-            publish(.preparing(request))
+            // HLS activation is its readiness acknowledgement; only SampleBuffer
+            // reports a later ready event after reopening the shared timebase.
+            publish(context.desiredBackendKind == .hlsAVPlayer ? .playing(request) : .preparing(request))
         }
     }
 
-    public func stop() async {
-        recoveryCoordinator.cancelCurrentRecovery()
-        await watchdog.disarm()
+    /// This marker only coalesces controller actions; Registry still owns physical permission.
+    private func clearResumeRequest(matching epoch: AudioSessionLifecycleEpoch) {
+        if resumeRequestInFlight == epoch { resumeRequestInFlight = nil }
+    }
+
+    private func discardObsoleteResumeRequest() {
+        guard let pending = resumeRequestInFlight,
+              pending != AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) else { return }
+        clearResumeRequest(matching: pending)
+    }
+
+    public func stop() async { await stop(expectedRequestID: nil) }
+
+    public func stop(requestID: UUID) async { await stop(expectedRequestID: requestID) }
+
+    private func stop(expectedRequestID: UUID?) async {
+        guard expectedRequestID == nil || !Task.isCancelled else { return }
+        let requestID = controllerState.request?.id
+        guard expectedRequestID == nil || expectedRequestID == requestID else { return }
+        let stoppingRun = admittedRun
+        let stoppingPlayGeneration = playAdmissionGeneration
+        let reservation = registry.cleanupReservationSnapshot()?.ticket
+        // Explicit Stop dismisses an already-settled failure's collector even
+        // when its request and physical cleanup reservation have both retired.
         terminalMetricsProvider = nil
-        guard controllerState.request != nil || registry.cleanupReservationSnapshot() != nil else { return }
+        guard requestID != nil || reservation != nil else { return }
         let presentationSession = registry.outputResourceContextSnapshot()?.sessionIdentity
-        if case .coldStart(let admitted) = registry.playbackRequestAdmissionSnapshot() {
-            _ = registry.cancelPlaybackRequest(admitted.identity.sessionIdentity)
+        let originalCleanupTask: ControlTaskTicket?
+        if let session = presentationSession, let context = registry.outputResourceContextSnapshot(),
+           context.sessionIdentity == session, context.reservation == reservation,
+           let owner = context.owner, owner.reason.releasesLease {
+            originalCleanupTask = registry.outputCleanupOwnerTask(owner)
+        } else { originalCleanupTask = nil }
+        userControlRevision &+= 1
+        let stoppingControlRevision = userControlRevision
+        recoveryCoordinator.cancelCurrentRecovery()
+        if let session = presentationSession {
+            await watchdog.disarm(session: session, controlRevision: stoppingControlRevision)
+        }
+        #if DEBUG
+        if expectedRequestID != nil { await requestScopedControlCheckpoint?(.stopAfterWatchdog) }
+        #endif
+        // The watchdog call is a real actor suspension. Do not read a replacement
+        // request and accidentally adopt it as the target of this earlier Stop.
+        guard expectedRequestID == nil || !Task.isCancelled else { return }
+        guard controllerState.request?.id == requestID, admittedRun == stoppingRun,
+              stoppingRun != nil || registry.cleanupReservationSnapshot()?.ticket == reservation else {
+            // A same-session failure may already have revoked admission. Stop
+            // still owes that original physical join, without adopting a newer
+            // request or publishing state after its control scope became stale.
+            var cleanupTask = originalCleanupTask
+            if cleanupTask == nil, let session = presentationSession, let reservation,
+               let context = registry.outputResourceContextSnapshot(),
+               context.sessionIdentity == session, context.reservation == reservation,
+               let owner = context.owner, owner.reason.releasesLease {
+                cleanupTask = registry.outputCleanupOwnerTask(owner)
+            }
+            if let session = presentationSession, let cleanupTask {
+                await registry.joinOwnedTerminalCleanup(session: session, task: cleanupTask)
+            }
+            // The original failure may have installed its terminal collector
+            // while Stop was suspended. Only that unchanged control/play scope
+            // may dismiss it; a replacement's retained metrics belong to it.
+            if playAdmissionGeneration == stoppingPlayGeneration,
+               userControlRevision == stoppingControlRevision,
+               controllerState.request == nil, admittedRun == nil {
+                terminalMetricsProvider = nil
+            }
+            return
+        }
+        terminalMetricsProvider = nil
+        if let stoppingRun {
+            _ = registry.cancelPlaybackRequest(.init(sessionID: stoppingRun.sessionID, requestID: stoppingRun.requestID))
         }
         invalidateSession()
         clearMediaInformation()
@@ -903,25 +1061,33 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                             break
                         }
                     } else if ticket == reservation.task(for: .monitorStop) {
-                        if registry.claimStart(ticket) {
-                            let monitorLifecycle: UInt64?
-                            if let snap = registry.ownedResourceSnapshot() {
-                                switch snap.payload {
-                                case .monitor(_, let lifecycle):
-                                    monitorLifecycle = lifecycle
-                                case .lease(_, _, let opt, _):
-                                    monitorLifecycle = opt
-                                case .backend(_, _, _, let opt, _):
-                                    monitorLifecycle = opt
-                                }
-                            } else {
-                                monitorLifecycle = nil
+                        let startsMonitorStop = registry.phase(of: ticket) == .queued
+                        if startsMonitorStop, !registry.claimStart(ticket) { break }
+                        guard registry.phase(of: ticket) == .running else { break }
+                        let monitorLifecycle: UInt64?
+                        if let snap = registry.ownedResourceSnapshot() {
+                            switch snap.payload {
+                            case .monitor(_, let lifecycle):
+                                monitorLifecycle = lifecycle
+                            case .lease(_, _, let opt, _):
+                                monitorLifecycle = opt
+                            case .backend(_, _, _, let opt, _):
+                                monitorLifecycle = opt
                             }
-                            guard let monitorLifecycle else { break }
-                            routeService?.unbindSession()
-                            _ = coordinator.completeMonitorStop(ticket, lifecycle: monitorLifecycle)
                         } else {
-                            break
+                            monitorLifecycle = nil
+                        }
+                        guard let monitorLifecycle else { break }
+                        if startsMonitorStop { routeService?.unbindSession() }
+                        // Claim/unbind once; callback and sampler tails may reject the ACK until
+                        // their real exit. Retry only this exact running task after owned progress.
+                        // This wait is one stage, not an outer-loop iteration or a new stop claim.
+                        while true {
+                            guard let current = registry.outputResourceContextSnapshot(),
+                                  current.owner == owner, current.monitorStop == ticket else { return }
+                            if coordinator.completeMonitorStop(ticket, lifecycle: monitorLifecycle) { break }
+                            guard registry.phase(of: ticket) == .running,
+                                  await registry.waitForPlaybackProgress(.cleanup(owner)) else { return }
                         }
                     } else if ticket == reservation.task(for: .audioSession) {
                         _ = audioSessionOwner.invoke(ticket, receiver: defaultReceiver)
@@ -1057,9 +1223,15 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
     }
 
     func resumeActiveOutputFromRouteRecovery() async {
-        guard let request = controllerState.request, !controllerState.userPaused,
+        guard let request = controllerState.request,
               let context = registry.outputResourceContextSnapshot(),
               context.owner == nil, context.phase == .installed, context.prepared else {
+            return
+        }
+        // Route loss may temporarily publish recovering, but restoring a route
+        // must return manual pause to an actionable state without activating it.
+        guard !controllerState.userPaused else {
+            publish(.paused(request))
             return
         }
         registry.updatePreparedSampleBufferPause(contextNonce: context.contextNonce,
@@ -1245,6 +1417,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         let event = envelope.event
         switch event {
         case .interruptionBegan:
+            discardObsoleteResumeRequest()
             guard !interruptionActive else { return }
             interruptionActive = true
             systemPauseRequired = true
@@ -1272,7 +1445,10 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
                 _ = registry.startOwnedInterruptionCleanup(owner: owner, receiver: self)
             }
         case .mediaServicesWereReset:
+            discardObsoleteResumeRequest()
+            interruptionActive = registry.executor.safetyIngress.snapshot.interruptionState == .began
             systemPauseRequired = true
+            resumeVetoRequired = true
             advanceReadinessCycle()
             clearPresentation()
             if !controllerState.userPaused {
@@ -1281,10 +1457,11 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             await continueResetRecovery(identity: identity)
         case let .interruptionEnded(shouldResume):
             interruptionActive = false
-            resumeRequestInFlight = false
-            resumeVetoRequired = !shouldResume
+            discardObsoleteResumeRequest()
+            let requiresUserResume = registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired
+            resumeVetoRequired = !shouldResume || requiresUserResume
             systemPauseRequired = true
-            if !controllerState.userPaused { publish(shouldResume ? .recovering(request) : .paused(request)) }
+            if !controllerState.userPaused { publish(resumeVetoRequired ? .paused(request) : .recovering(request)) }
             if registry.outputResourceContextSnapshot()?.pendingReset != nil {
                 await continueResetRecovery(identity: identity)
                 return
@@ -1297,10 +1474,17 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
             guard shouldResume, !controllerState.userPaused,
                   let lease = registry.audioSessionLease(session: context.sessionIdentity) else { return }
             _ = try? registry.finishRetainedOutputCleanup(owner: owner)
-            resumeRequestInFlight = audioSessionOwner.requestResume(for: lease)
+            let automaticEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
+            if audioSessionOwner.requestAutomaticResume(for: lease) {
+                resumeRequestInFlight = automaticEpoch
+            }
         case .explicitResumeSucceeded, .resetConfigurationSucceeded:
-            resumeRequestInFlight = false
+            if let receipt = envelope.reactivationReceipt {
+                clearResumeRequest(matching: .init(interruption: receipt.interruptionEpoch,
+                    mediaServices: receipt.mediaServicesEpoch))
+            }
             guard systemPauseRequired, !interruptionActive,
+                  !registry.executor.safetyIngress.snapshot.mediaServicesResumeRequired,
                   let run = admittedRun, let context = registry.outputResourceContextSnapshot() else { return }
             resumeVetoRequired = false
             systemPauseRequired = false
@@ -1465,7 +1649,7 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
         interruptionActive = false
         systemPauseRequired = false
         resumeVetoRequired = false
-        resumeRequestInFlight = false
+        resumeRequestInFlight = nil
         if let context = registry.outputResourceContextSnapshot() {
             registry.deactivateOutputEventRelays(session: context.sessionIdentity)
         }
@@ -1476,6 +1660,10 @@ public actor PlaybackController: PlaybackEngine, PlaybackPresentationControlling
               case .coldStart(let admission) = registry.playbackRequestAdmissionSnapshot() else { return false }
         return admission.identity.sessionIdentity == PlaybackSessionIdentity(
             sessionID: identity.sessionID, requestID: identity.requestID)
+    }
+
+    private func ownsUserControl(_ run: PlaybackRunIdentity, revision: UInt64) -> Bool {
+        !Task.isCancelled && userControlRevision == revision && isCurrent(run)
     }
 
     private func advanceReadinessCycle() {

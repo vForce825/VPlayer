@@ -1003,7 +1003,9 @@ private actor FakeRemoteDownloader: RemoteResourceDownloading {
             throw URLError(.resourceUnavailable)
         }
         try payload.write(to: url, options: .atomic)
-        return DownloadedResource(temporaryFileURL: url, byteCount: Int64(payload.count))
+        return DownloadedResource(
+            temporaryFileURL: url, byteCount: Int64(payload.count), responseURL: request.url
+        )
     }
 
     func invocationCount(for resource: RefreshResource) -> Int {

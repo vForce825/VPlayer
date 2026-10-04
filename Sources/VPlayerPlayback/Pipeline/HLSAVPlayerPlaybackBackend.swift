@@ -79,6 +79,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     private let metrics: PlaybackMetrics?
     private let channelID: String?
     private var activationTime: ContinuousClock.Instant?
+    private var logSnapshotCache: AVPlayerLogSnapshotCache?
 
     init(
         identity: PlaybackBackendIdentity,
@@ -143,7 +144,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
         )
     }
 
-    var isAudioOnly: Bool { audioOnlySelector != nil }
+    var isAudioOnly: Bool {
+        audioOnlySelector != nil || lock.withLock {
+            bundle?.isAudioOnly ?? preparingBundle?.isAudioOnly ?? false
+        }
+    }
 
     var presentation: PlaybackPresentation? { presentationContext.map(PlaybackPresentation.avPlayer) }
 
@@ -215,6 +220,15 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             #endif
             // 从这一刻起即使 install 抛错，也不能再用 producer-only 凭据证明
             // AVPlayer 已清理；后续必须走 coordinator 的物理停止路径。
+            let cache = await createdCoordinator.logSnapshotCache
+            lock.withLock {
+                precondition(preparingBundle === next, "preparing bundle owner 不匹配")
+                coordinator = createdCoordinator
+                bundle = next
+                preparingBundle = nil
+                latestReceipt = nil
+                logSnapshotCache = cache
+            }
             playerInstallationAttempted = true
             do {
                 try await MainActor.run {
@@ -226,6 +240,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                     PlaybackDiagnosticTracker.shared.append("hls_c_inst_ok")
                     #endif
                     try createdCoordinator.bindPrepareInvocation(invocation)
+                    try createdCoordinator.bindRuntimeFailureRelay(next.runtimeFailureRelay,
+                        invocation: invocation)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("hls_c_bind_ok")
                     #endif
@@ -239,13 +255,6 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("hls_coordInstalled")
             #endif
-            lock.withLock {
-                precondition(preparingBundle === next, "preparing bundle owner 不匹配")
-                coordinator = createdCoordinator
-                bundle = next
-                preparingBundle = nil
-                latestReceipt = nil
-            }
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("hls_prepCurrentItem")
             #endif
@@ -267,12 +276,14 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             #endif
             let producerRetirementConfirmed = await next.retireProducerGraph()
             lock.withLock {
-                if bundle === next { bundle = nil }
-                if preparingBundle === next { preparingBundle = nil }
+                // After installation begins, only the signed suspend receipt and
+                // physical coordinator cleanup may release these owners.
+                if !playerInstallationAttempted, producerRetirementConfirmed,
+                   preparingBundle === next { preparingBundle = nil }
                 latestReceipt = nil
             }
             throw HLSPrepareAttemptFailure(
-                underlying: error,
+                underlying: next.preservingFirstPreparationFailure(error),
                 producerRetirementConfirmed: producerRetirementConfirmed,
                 playerInstallationAttempted: playerInstallationAttempted)
         }
@@ -330,28 +341,35 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                   invocation.outputLifecycleEpoch.backendIdentity == identity else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
-            try await MainActor.run {
-                try coordinator.installReplacement(
-                    next.replacement,
-                    invocation: invocation
-                )
-            }
             lock.withLock {
                 precondition(preparingBundle === next, "replacement bundle owner 不匹配")
                 bundle = next
                 preparingBundle = nil
                 latestReceipt = nil
             }
+            try await MainActor.run {
+                try coordinator.installReplacement(
+                    next.replacement,
+                    invocation: invocation
+                )
+                try coordinator.bindRuntimeFailureRelay(next.runtimeFailureRelay,
+                    invocation: invocation)
+            }
             _ = try await coordinator.prepareCurrentItem(invocation: invocation)
             next.armRuntimeFailure()
         } catch {
-            _ = await next.retireProducerGraph()
+            let producerRetirementConfirmed = await next.retireProducerGraph()
+            let playerInstallationAttempted = lock.withLock { bundle === next }
             lock.withLock {
-                if bundle === next { bundle = nil }
-                if preparingBundle === next { preparingBundle = nil }
+                if !playerInstallationAttempted, producerRetirementConfirmed,
+                   preparingBundle === next { preparingBundle = nil }
                 latestReceipt = nil
             }
-            throw error
+            prepareFailureRetirementProof.record(
+                lifecycle: invocation.outputLifecycleEpoch,
+                producerRetirementConfirmed: producerRetirementConfirmed,
+                playerInstallationAttempted: playerInstallationAttempted)
+            throw next.preservingFirstPreparationFailure(error)
         }
     }
 
@@ -422,6 +440,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 bundle = nil
                 latestReceipt = nil
                 activationTime = nil
+                logSnapshotCache = nil
             }
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("cap_hls_retire_confirmed_prepare_failure")
@@ -476,7 +495,10 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             if bundle === retiring { bundle = nil }
             if !preservesCoordinator { self.coordinator = nil }
             latestReceipt = nil
-            if !preservesCoordinator { self.activationTime = nil }
+            if !preservesCoordinator {
+                self.activationTime = nil
+                self.logSnapshotCache = nil
+            }
         }
         #if DEBUG
         PlaybackDiagnosticTracker.shared.append("cap_hls_retire_confirmed")
@@ -524,9 +546,18 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             let errorCode = item?.error.map {
                 "\(($0 as NSError).domain):\(($0 as NSError).code)"
             } ?? "none"
-            let itemGeneration = lock.withLock { bundle?.itemGeneration ?? 0 }
+            let logContext = lock.withLock { (bundle?.replacement.request.item, logSnapshotCache) }
+            let itemGeneration = logContext.0?.itemGeneration ?? 0
+            let logSnapshot: AVPlayerLogScalarSnapshot
+            if let item, let identity = logContext.0, let cache = logContext.1 {
+                let objectIdentity = ObjectIdentifier(item)
+                logSnapshot = cache.snapshot(item: identity, objectIdentity: objectIdentity)
+                cache.requestRefresh(item: identity, objectIdentity: objectIdentity)
+            } else {
+                logSnapshot = .empty
+            }
             let summary = String(
-                format: "avplayer:gen=%llu,tc=%@,item=%@,rate=%.3f,buffer=%.3f,empty=%d,keepUp=%d,access=%d,errorLog=%d,error=%@",
+                format: "avplayer:gen=%llu,tc=%@,item=%@,rate=%.3f,buffer=%.3f,empty=%d,keepUp=%d,access=%ld,errorLog=%ld,error=%@",
                 itemGeneration,
                 timeControlStatus,
                 itemStatus,
@@ -534,8 +565,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 bufferedAhead,
                 item?.isPlaybackBufferEmpty == true ? 1 : 0,
                 item?.isPlaybackLikelyToKeepUp == true ? 1 : 0,
-                item?.accessLog()?.events.count ?? 0,
-                item?.errorLog()?.events.count ?? 0,
+                logSnapshot.accessEventCount,
+                logSnapshot.errorEventCount,
                 errorCode
             )
             metrics?.update(scanType: isInterlaced
@@ -550,8 +581,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 audioRoute: .systemCompressed,
                 audioReady: item?.status == .readyToPlay && item?.isPlaybackBufferEmpty != true,
                 readinessOpen: player.timeControlStatus == .playing && player.rate > 0,
-                retainedAudioCount: item?.accessLog()?.events.count ?? 0,
-                retainedVideoCount: item?.errorLog()?.events.count ?? 0,
+                retainedAudioCount: logSnapshot.accessEventCount,
+                retainedVideoCount: logSnapshot.errorEventCount,
                 audioFirstPTS: nil,
                 audioDuration: CMTime(seconds: bufferedAhead, preferredTimescale: 1_000),
                 videoFirstPTS: nil,

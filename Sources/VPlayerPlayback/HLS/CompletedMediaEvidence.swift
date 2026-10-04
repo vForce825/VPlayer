@@ -667,6 +667,237 @@ struct SealedDecodeCoverageMap: Sendable {
 
 }
 
+/// Exact interval endpoints need not have a representable CMTime duration.
+/// Keep both original rational points; clipping/coverage only compares endpoints.
+struct ExactMediaInterval: Sendable, Hashable {
+    let start: ExactMediaTime
+    let end: ExactMediaTime
+
+    init(start: ExactMediaTime, end: ExactMediaTime) throws {
+        guard start.value >= 0, try HLSChecked.compare(start, end) < 0 else {
+            throw FinalFMP4ValidationFailure.invalidPresentationRange
+        }
+        self.start = start
+        self.end = end
+    }
+
+    init(_ range: FMP4PresentationRange) {
+        start = range.start
+        end = range.end
+    }
+}
+
+/// Paused verification orders immutable sample ordinals in caller-owned storage.
+/// It neither constructs Array backing nor changes the startup coverage path.
+struct PausedDecodeCoverageEligibility {
+    private var bits = SIMD4<UInt64>(repeating: 0)
+    var videoHold: ExactMediaTime?
+
+    func contains(_ ordinal: Int) -> Bool {
+        bits[ordinal / 64] & (UInt64(1) << (ordinal % 64)) != 0
+    }
+    mutating func insert(_ ordinal: Int) {
+        bits[ordinal / 64] |= UInt64(1) << (ordinal % 64)
+    }
+}
+
+/// A fixed UInt8 minheap; ranges stay in the caller's already charged records.
+/// The nonescaping projection is never stored and no element backing is created.
+enum PausedCoverageTimeHeap {
+    private static func precedes(_ left: UInt8, _ right: UInt8,
+                                 rangeAt: (Int) -> ExactMediaInterval) throws -> Bool {
+        let lhs = rangeAt(Int(left))
+        let rhs = rangeAt(Int(right))
+        let start = try HLSChecked.compare(lhs.start, rhs.start)
+        if start != 0 { return start < 0 }
+        return try HLSChecked.compare(lhs.end, rhs.end) < 0
+    }
+
+    static func insert(_ index: UInt8, storage: UnsafeMutableBufferPointer<UInt8>,
+                       count: inout Int, rangeAt: (Int) -> ExactMediaInterval) throws {
+        precondition(count < storage.count)
+        var child = count
+        count += 1
+        storage[child] = index
+        while child > 0 {
+            let parent = (child - 1) / 2
+            guard try precedes(storage[child], storage[parent], rangeAt: rangeAt) else { break }
+            storage.swapAt(parent, child)
+            child = parent
+        }
+    }
+
+    static func pop(storage: UnsafeMutableBufferPointer<UInt8>, count: inout Int,
+                    rangeAt: (Int) -> ExactMediaInterval) throws -> UInt8 {
+        precondition(count > 0)
+        let result = storage[0]
+        count -= 1
+        guard count > 0 else { return result }
+        storage[0] = storage[count]
+        var parent = 0
+        while parent * 2 + 1 < count {
+            var child = parent * 2 + 1
+            if child + 1 < count,
+               try precedes(storage[child + 1], storage[child], rangeAt: rangeAt) { child += 1 }
+            guard try precedes(storage[child], storage[parent], rangeAt: rangeAt) else { break }
+            storage.swapAt(parent, child)
+            parent = child
+        }
+        return result
+    }
+}
+
+enum PausedDecodeCoverageOrder {
+    /// O(n log n) heapsort, with constant auxiliary storage. UInt8 encodes
+    /// ordinals 0...255; counts and positions must remain wider than UInt8.
+    static func prepare(map: SealedDecodeCoverageMap,
+                        ordinals: UnsafeMutableBufferPointer<UInt8>) throws {
+        guard ordinals.count == map.samples.count, (1...256).contains(ordinals.count) else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        for index in ordinals.indices { ordinals[index] = UInt8(index) }
+        func precedes(_ left: UInt8, _ right: UInt8) throws -> Bool {
+            let lhs = map.samples[Int(left)].presentationRange
+            let rhs = map.samples[Int(right)].presentationRange
+            let start = try HLSChecked.compare(lhs.start, rhs.start)
+            if start != 0 { return start < 0 }
+            return try HLSChecked.compare(lhs.end, rhs.end) < 0
+        }
+        func sift(_ root: Int, _ end: Int) throws {
+            var parent = root
+            while parent * 2 + 1 < end {
+                var child = parent * 2 + 1
+                if child + 1 < end, try precedes(ordinals[child], ordinals[child + 1]) {
+                    child += 1
+                }
+                guard try precedes(ordinals[parent], ordinals[child]) else { return }
+                ordinals.swapAt(parent, child)
+                parent = child
+            }
+        }
+        if ordinals.count > 1 {
+            for root in stride(from: ordinals.count / 2 - 1, through: 0, by: -1) {
+                try sift(root, ordinals.count)
+            }
+            for end in stride(from: ordinals.count - 1, through: 1, by: -1) {
+                ordinals.swapAt(0, end)
+                try sift(0, end)
+            }
+        }
+    }
+
+    static func intersection(map: SealedDecodeCoverageMap,
+                             ordinals: UnsafeBufferPointer<UInt8>,
+                             requested: ExactMediaInterval,
+                             presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> ExactMediaInterval? {
+        guard ordinals.count == map.samples.count, let first = ordinals.first,
+              let last = ordinals.last else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        let firstStart = try map.samples[Int(first)].presentationRange.start.adding(presentationOffset)
+        let lastEnd = try map.samples[Int(last)].presentationRange.end.adding(presentationOffset)
+        let start = try HLSChecked.compare(firstStart, requested.start) > 0
+            ? firstStart : requested.start
+        // Preserve the existing lexicographic-last end, including nested ranges.
+        let end = try HLSChecked.compare(lastEnd, requested.end) < 0
+            ? lastEnd : requested.end
+        guard try HLSChecked.compare(start, end) < 0 else { return nil }
+        return try .init(start: start, end: end)
+    }
+
+    /// Admission examines metadata only: HTTP eligibility is checked later.
+    /// Match the verifier's lexicographic raw-map bounds and unextended sample
+    /// overlap without allocating ordinals before workspace admission.
+    static func canContribute(map: SealedDecodeCoverageMap,
+                              requested: ExactMediaInterval,
+                              presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> Bool {
+        guard let first = map.samples.first, map.samples.count <= 256 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        func precedes(_ lhs: FMP4PresentationRange, _ rhs: FMP4PresentationRange) throws -> Bool {
+            let start = try HLSChecked.compare(lhs.start, rhs.start)
+            if start != 0 { return start < 0 }
+            return try HLSChecked.compare(lhs.end, rhs.end) < 0
+        }
+        var minimum = first.presentationRange
+        var maximum = first.presentationRange
+        for sample in map.samples.dropFirst() {
+            if try precedes(sample.presentationRange, minimum) { minimum = sample.presentationRange }
+            if try precedes(maximum, sample.presentationRange) { maximum = sample.presentationRange }
+        }
+        let firstStart = try minimum.start.adding(presentationOffset)
+        let lastEnd = try maximum.end.adding(presentationOffset)
+        let start = try HLSChecked.compare(firstStart, requested.start) > 0
+            ? firstStart : requested.start
+        let end = try HLSChecked.compare(lastEnd, requested.end) < 0
+            ? lastEnd : requested.end
+        guard try HLSChecked.compare(start, end) < 0 else { return false }
+        for sample in map.samples {
+            if try HLSChecked.compare(sample.presentationRange.start.adding(presentationOffset), end) < 0,
+               try HLSChecked.compare(start, sample.presentationRange.end.adding(presentationOffset)) < 0 { return true }
+        }
+        return false
+    }
+
+    static func videoHold(map: SealedDecodeCoverageMap) throws -> ExactMediaTime? {
+        guard map.mediaType == .video, let first = map.samples.first else { return nil }
+        var maximum = first.presentationRange.duration
+        for sample in map.samples.dropFirst() {
+            if try HLSChecked.compare(sample.presentationRange.duration, maximum) > 0 {
+                maximum = sample.presentationRange.duration
+            }
+        }
+        let multiplied = maximum.value.multipliedReportingOverflow(by: 3)
+        guard !multiplied.overflow else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        return .init(value: multiplied.partialValue, timescale: maximum.timescale)
+    }
+
+    /// Every required byte span is queried once. A video prefix is complete iff
+    /// no missing decode ordinal is at or after this sample's nearest RAP.
+    static func eligibility(map: SealedDecodeCoverageMap,
+                            evidence: CompletedBodyEvidenceSnapshot) throws
+        -> PausedDecodeCoverageEligibility {
+        var result = PausedDecodeCoverageEligibility()
+        guard map.commonByteSpans.allSatisfy(evidence.covers) else { return result }
+        result.videoHold = try videoHold(map: map)
+        var lastMissing = -1
+        for index in map.samples.indices {
+            let sample = map.samples[index]
+            let complete = evidence.covers(sample.byteSpan)
+            if !complete { lastMissing = index }
+            if map.mediaType == .audio ? complete
+                : Int(sample.nearestRandomAccessOrdinal) > lastMissing {
+                result.insert(index)
+            }
+        }
+        return result
+    }
+
+    /// Emits individual eligible clipped intervals in nondecreasing start order.
+    /// A global heap may merge them without materializing per-map unions.
+    static func nextRange(map: SealedDecodeCoverageMap,
+                          ordinals: UnsafeBufferPointer<UInt8>, cursor: inout Int,
+                          requested: ExactMediaInterval,
+                          eligibility: PausedDecodeCoverageEligibility,
+                          presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> ExactMediaInterval? {
+        while cursor < ordinals.count {
+            let ordinal = Int(ordinals[cursor])
+            cursor += 1
+            guard eligibility.contains(ordinal) else { continue }
+            let physical = map.samples[ordinal].presentationRange
+            let range = try ExactMediaInterval(start: physical.start.adding(presentationOffset),
+                                              end: physical.end.adding(presentationOffset))
+            guard try HLSChecked.compare(range.start, requested.end) < 0,
+                  try HLSChecked.compare(requested.start, range.end) < 0 else { continue }
+            let start = try HLSChecked.compare(range.start, requested.start) < 0
+                ? requested.start : range.start
+            let heldEnd = try eligibility.videoHold.map { try range.end.adding($0) } ?? range.end
+            let end = try HLSChecked.compare(heldEnd, requested.end) > 0 ? requested.end : heldEnd
+            guard try HLSChecked.compare(start, end) < 0 else { continue }
+            return try .init(start: start, end: end)
+        }
+        return nil
+    }
+}
+
 /// 只读遍历已封口 init/fragment；保存最终固定上限的 sample 表，不复制媒体或物化 box 树。
 private enum FMP4DecodeMapParser {
     private struct Box {
@@ -1223,28 +1454,49 @@ struct FrozenCoverageIndices: Sendable {
 
 struct FrozenCoverageStorage: Sendable {
     let rendition: AudioRenditionIdentity
-    let requested: FMP4PresentationRange
+    let requested: ExactMediaInterval
+    let presentationOffset: ExactMediaTime
     let offset: UInt8
     let count: UInt8
+
+    init(rendition: AudioRenditionIdentity, requested: ExactMediaInterval,
+         offset: UInt8, count: UInt8, presentationOffset: ExactMediaTime = HLSChecked.zero) {
+        self.rendition = rendition; self.requested = requested
+        self.presentationOffset = presentationOffset
+        self.offset = offset; self.count = count
+    }
+
+    init(rendition: AudioRenditionIdentity, requested: FMP4PresentationRange,
+         offset: UInt8, count: UInt8, presentationOffset: ExactMediaTime = HLSChecked.zero) {
+        self.init(rendition: rendition, requested: ExactMediaInterval(requested),
+                  offset: offset, count: count, presentationOffset: presentationOffset)
+    }
 }
 
 struct ServedCoverageDependencies: RandomAccessCollection, Sendable, Equatable {
     enum Storage: Sendable {
         case explicit([ServedRenditionCoverageDependency])
         case frozen(owner: FrozenPreparationOwner, coverageIndex: UInt8)
+        case paused(owner: PausedWindowCoverageLease, coverageIndex: UInt8)
     }
     let storage: Storage
-    var startIndex: Int { 0 }
-    var endIndex: Int {
+    private var ownerProjection: (owner: FrozenCompletedCoverageOwner, index: UInt8)? {
         switch storage {
-        case .explicit(let values): return values.count
-        case .frozen(let owner, let index): return Int(owner.coverage(at: index)!.count)
+        case .explicit: return nil
+        case .frozen(let owner, let index): return (.startup(owner), index)
+        case .paused(let owner, let index): return (.paused(owner), index)
         }
     }
+    var startIndex: Int { 0 }
+    var endIndex: Int {
+        if case .explicit(let values) = storage { return values.count }
+        let projection = ownerProjection!
+        return Int(projection.owner.coverage(at: projection.index)!.count)
+    }
     func input(at slot: Int) -> SealedCoverageInput? {
-        guard case .frozen(let owner, _) = storage,
+        guard let (owner, _) = ownerProjection,
               owner.containsCompletedResource(slot),
-              let input = owner.metadataStore?.preparationCoverageInput(slot: slot, ownerSlot: owner.slot),
+              let input = owner.metadataStore?.preparationCoverageInput(slot: slot, owner: owner),
               input.map.epochProofIdentity != nil, input.map.segmentReceiptIdentity != nil,
               input.map.initializationBackingIdentity != nil else {
             return nil
@@ -1274,25 +1526,35 @@ struct ServedCoverageDependencies: RandomAccessCollection, Sendable, Equatable {
     }
     subscript(index: Int) -> ServedRenditionCoverageDependency {
         if case .explicit(let values) = storage { return values[index] }
-        guard case .frozen(let owner, let coverageIndex) = storage else { preconditionFailure() }
+        guard let (owner, coverageIndex) = ownerProjection else { preconditionFailure() }
         return dependency(input(at: Int(owner.coverageResource(at: index, coverage: coverageIndex)))!)
     }
     func input(atOrdinal ordinal: Int) -> SealedCoverageInput? {
-        guard case .frozen(let owner, let coverageIndex) = storage else { return nil }
+        guard let (owner, coverageIndex) = ownerProjection else { return nil }
         return input(at: Int(owner.coverageResource(at: ordinal, coverage: coverageIndex)))
     }
     static func frozen(owner: FrozenPreparationOwner, rendition: AudioRenditionIdentity,
                        requested: FMP4PresentationRange) throws -> Self? {
+        try frozen(owner: .startup(owner), rendition: rendition, requested: requested)
+    }
+    static func frozen(owner: PausedWindowCoverageLease, rendition: AudioRenditionIdentity,
+                       requested: FMP4PresentationRange) throws -> Self? {
+        try frozen(owner: .paused(owner), rendition: rendition, requested: requested)
+    }
+    static func frozen(owner: FrozenCompletedCoverageOwner, rendition: AudioRenditionIdentity,
+                       requested: FMP4PresentationRange) throws -> Self? {
+        guard owner.completionIsFrozen else { return nil }
         var indices = FrozenCoverageIndices()
         for index in UInt8(0)..<2 {
             if let existing = owner.coverage(at: index),
-               existing.rendition == rendition, existing.requested == requested {
-                return .init(storage: .frozen(owner: owner, coverageIndex: index))
+               existing.rendition == rendition, existing.requested == ExactMediaInterval(requested),
+               existing.presentationOffset == HLSChecked.zero {
+                return owner.dependencies(at: index)
             }
         }
         guard owner.coverage(at: 1) == nil else { throw CompletedMediaEvidenceError.capacityExceeded }
         let coverageIndex: UInt8 = owner.coverage(at: 0) == nil ? 0 : 1
-        let view = Self(storage: .frozen(owner: owner, coverageIndex: coverageIndex))
+        let view = owner.dependencies(at: coverageIndex)
         for slot in 0..<300 {
             guard let input = view.input(at: slot), input.media.renditionIdentity == rendition,
                   let intersection = try input.map.intersection(with: requested),
@@ -1394,6 +1656,53 @@ struct ServedRenditionCoverageReceipt: Sendable, Equatable {
             && lhs.canonicalCoverageDigest == rhs.canonicalCoverageDigest
             && lhs.presentationRange == rhs.presentationRange
             && lhs.dependencies == rhs.dependencies
+    }
+}
+
+/// Immutable media verification only. A server must separately bind a paused
+/// window to its original item/timeline and current owned resume scope.
+struct FrozenRenditionCoverageReceipt: Sendable, Equatable {
+    let renditionIdentity: AudioRenditionIdentity
+    let itemGeneration: UInt64
+    let canonicalCoverageDigest: FrozenCanonicalCoverageDigest
+    let presentationRange: FMP4PresentationRange
+    let dependencies: ServedCoverageDependencies
+
+    init(authority: SealedCoverageIssuanceAuthority,
+         renditionIdentity: AudioRenditionIdentity,
+         itemGeneration: UInt64,
+         canonicalCoverageDigest: FrozenCanonicalCoverageDigest,
+         presentationRange: FMP4PresentationRange,
+         dependencies: ServedCoverageDependencies) {
+        self.renditionIdentity = renditionIdentity
+        self.itemGeneration = itemGeneration
+        self.canonicalCoverageDigest = canonicalCoverageDigest
+        self.presentationRange = presentationRange
+        self.dependencies = dependencies
+    }
+}
+
+// Paused coverage preserves exact endpoints without manufacturing a duration.
+struct PausedRenditionCoverageReceipt: Sendable, Equatable {
+    let renditionIdentity: AudioRenditionIdentity
+    let itemGeneration: UInt64
+    let canonicalCoverageDigest: FrozenCanonicalCoverageDigest
+    let presentationRange: ExactMediaInterval
+    let presentationOffset: ExactMediaTime
+    let dependencies: ServedCoverageDependencies
+
+    init(authority: SealedCoverageIssuanceAuthority,
+         renditionIdentity: AudioRenditionIdentity,
+         itemGeneration: UInt64,
+         canonicalCoverageDigest: FrozenCanonicalCoverageDigest,
+         presentationRange: ExactMediaInterval, presentationOffset: ExactMediaTime,
+         dependencies: ServedCoverageDependencies) {
+        self.renditionIdentity = renditionIdentity
+        self.itemGeneration = itemGeneration
+        self.canonicalCoverageDigest = canonicalCoverageDigest
+        self.presentationRange = presentationRange
+        self.presentationOffset = presentationOffset
+        self.dependencies = dependencies
     }
 }
 

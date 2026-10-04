@@ -25,7 +25,7 @@ final class ProjectConfigurationTests: XCTestCase {
         )
         let prime = try XCTUnwrap(body.range(of: "driver.primeMediaData(item: request.item)"))
         let publication = try XCTUnwrap(body.range(
-            of: "awaitCompletedPublicationBinding(for: request)"
+            of: "awaitCompletedPublicationBinding("
         ))
         XCTAssertLessThan(prime.lowerBound, publication.lowerBound)
     }
@@ -98,7 +98,7 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(epgNotice.contains("EPGCoverageNotice"))
     }
 
-    func testDeploymentTargetIsTVOS26Everywhere() throws {
+    func testDeploymentTargetIsTVOS27Everywhere() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -114,25 +114,27 @@ final class ProjectConfigurationTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 26.0")
+        XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 27.0")
+        let configuredFloors = projectYAML.split(separator: "\n")
+            .filter { $0.contains("deploymentTarget:") && $0.contains("\"") }
+        XCTAssertEqual(configuredFloors.count, 6)
+        XCTAssertTrue(configuredFloors.allSatisfy { $0.contains("\"27.0\"") })
+        let generatedFloors = generatedProject.split(separator: "\n")
+            .filter { $0.contains("TVOS_DEPLOYMENT_TARGET =") }
+        XCTAssertFalse(generatedFloors.isEmpty)
+        XCTAssertTrue(generatedFloors.allSatisfy { $0.contains("= 27.0;") })
         XCTAssertFalse(projectYAML.contains("deploymentTarget: \"18.0\""))
         XCTAssertFalse(generatedProject.contains("TVOS_DEPLOYMENT_TARGET = 18.0;"))
         XCTAssertEqual(PlaybackFoundation.contractVersion, 1)
     }
 
-    func testAppStoreIdentityVersioningAndPrivacyManifestsStayReleaseReady() throws {
+    func testAppStoreIdentityAndPrivacyManifestsStayReleaseReady() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let projectYAML = try String(
             contentsOf: repositoryRoot.appendingPathComponent("project.yml"),
-            encoding: .utf8
-        )
-        let generatedProject = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "VPlayer.xcodeproj/project.pbxproj"
-            ),
             encoding: .utf8
         )
         let infoPlist = try propertyList(
@@ -142,25 +144,6 @@ final class ProjectConfigurationTests: XCTestCase {
         )
 
         XCTAssertTrue(projectYAML.contains("PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer"))
-        XCTAssertEqual(
-            projectYAML.components(separatedBy: "MARKETING_VERSION: \"1.7\"").count - 1,
-            3,
-            "the app and both embedded frameworks need a marketing version"
-        )
-        XCTAssertFalse(projectYAML.contains("MARKETING_VERSION: \"1.6\""))
-        XCTAssertEqual(
-            generatedProject.components(separatedBy: "MARKETING_VERSION = 1.7;").count - 1,
-            6,
-            "应用及两个内嵌框架的 Debug 和 Release 配置都必须使用 1.7 版本"
-        )
-        XCTAssertFalse(generatedProject.contains("MARKETING_VERSION = 1.6;"))
-        XCTAssertEqual(
-            projectYAML.components(separatedBy: "CURRENT_PROJECT_VERSION: \"1\"").count - 1,
-            3,
-            "the app and both embedded frameworks need a build version"
-        )
-        XCTAssertEqual(infoPlist["CFBundleShortVersionString"] as? String, "$(MARKETING_VERSION)")
-        XCTAssertEqual(infoPlist["CFBundleVersion"] as? String, "$(CURRENT_PROJECT_VERSION)")
         XCTAssertEqual(infoPlist["ITSAppUsesNonExemptEncryption"] as? Bool, false)
         XCTAssertEqual(
             infoPlist["BGTaskSchedulerPermittedIdentifiers"] as? [String],

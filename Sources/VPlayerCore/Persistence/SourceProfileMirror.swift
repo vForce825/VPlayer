@@ -63,12 +63,58 @@ struct MirroredSourceProfile: Codable, Equatable, Sendable {
     }
 }
 
-/// Every mirrored profile plus the active selection, which is user-entered too:
-/// restoring the playlists but not which one was on would still change what the
-/// viewer sees on the next launch.
+/// An explicit user override cannot be reconstructed from a playlist or guide.
+/// Keep only the IDs; channel names, icons and programme rows remain cache data.
+struct MirroredManualEPGMapping: Codable, Equatable, Sendable {
+    let sourceProfileID: UUID
+    let channelID: String
+    let xmltvChannelID: String
+
+    init(record: ManualEPGMappingRecord) {
+        sourceProfileID = record.sourceProfileID
+        channelID = record.channelID
+        xmltvChannelID = record.xmltvChannelID
+    }
+
+    func makeRecord() -> ManualEPGMappingRecord? {
+        guard !channelID.isEmpty, !xmltvChannelID.isEmpty else { return nil }
+        return ManualEPGMappingRecord(
+            sourceProfileID: sourceProfileID,
+            channelID: channelID,
+            xmltvChannelID: xmltvChannelID
+        )
+    }
+}
+
+/// All non-rebuildable library choices. The optional decoding of manualMappings
+/// preserves recovery from profile-only mirrors written by previous releases.
 struct SourceProfileMirrorSnapshot: Codable, Equatable, Sendable {
     var profiles: [MirroredSourceProfile]
     var activeProfileID: UUID?
+    var manualMappings: [MirroredManualEPGMapping]
+
+    init(
+        profiles: [MirroredSourceProfile],
+        activeProfileID: UUID?,
+        manualMappings: [MirroredManualEPGMapping] = []
+    ) {
+        self.profiles = profiles
+        self.activeProfileID = activeProfileID
+        self.manualMappings = manualMappings
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case profiles, activeProfileID, manualMappings
+    }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        profiles = try values.decode([MirroredSourceProfile].self, forKey: .profiles)
+        activeProfileID = try values.decodeIfPresent(UUID.self, forKey: .activeProfileID)
+        manualMappings = try values.decodeIfPresent(
+            [MirroredManualEPGMapping].self, forKey: .manualMappings
+        ) ?? []
+    }
 
     static let empty = Self(profiles: [], activeProfileID: nil)
 }
@@ -79,14 +125,18 @@ struct SourceProfileMirrorSnapshot: Codable, Equatable, Sendable {
 /// tvOS denies the sandbox `Library/Application Support`, so the store sits in
 /// `Library/Caches`, which tvOS may evict under storage pressure. Channels,
 /// programmes, and snapshots are a mirror of the remote M3U and XMLTV and come
-/// back with the next refresh; the profiles themselves were typed on a remote
-/// control and exist nowhere else. UserDefaults survives that eviction and
-/// allows roughly 500KB on tvOS, against a few hundred bytes per profile.
+/// back with the next refresh; profiles and manual EPG mappings are user choices
+/// that exist nowhere else. UserDefaults survives that eviction and allows
+/// roughly 500KB on tvOS. New recovery data is capped at 256 KiB, leaving room for
+/// other preferences. Oversized legacy data can still be read, but never written
+/// back above the limit. The store exposes incomplete recovery until the user
+/// reduces their configuration and mappings to fit.
 /// Unchecked because `UserDefaults` carries no `Sendable` conformance while
 /// being documented as thread-safe, and the mirror only ever reads and writes
 /// one key through it.
 public struct SourceProfileMirror: @unchecked Sendable {
     public static let storageKey = "library.sourceProfileMirror"
+    static let maximumEncodedByteCount = 256 * 1_024
 
     private let defaults: UserDefaults
 
@@ -108,10 +158,18 @@ public struct SourceProfileMirror: @unchecked Sendable {
         return snapshot
     }
 
-    func save(_ snapshot: SourceProfileMirrorSnapshot) {
+    func encode(_ snapshot: SourceProfileMirrorSnapshot) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(snapshot) else { return }
+        return try encoder.encode(snapshot)
+    }
+
+    /// Final storage boundary: even migration/recovery callers cannot write a
+    /// value beyond the allowance or replace an existing value on overflow.
+    func save(encoded data: Data) throws {
+        guard data.count <= Self.maximumEncodedByteCount else {
+            throw LibraryRepositoryError.recoveryDataTooLarge(limit: Self.maximumEncodedByteCount)
+        }
         defaults.set(data, forKey: Self.storageKey)
     }
 }

@@ -25,6 +25,10 @@ final class CompressedVideoAssembler {
     private var emittedFingerprint: MediaFormatFingerprint?
     private var parserOperationID: AssemblyOperationID?
     private var lastEmittedDTS: CMTime?
+    private var preferredTransfer: DemuxColorTransfer?
+    private var formatPreferredTransfer: DemuxColorTransfer?
+    private var previousSequenceEnded = false
+    private var initialConfigurationTransfer: DemuxColorTransfer?
 
     init(
         trackSet: DemuxTrackSet,
@@ -51,6 +55,8 @@ final class CompressedVideoAssembler {
         parserOperationID = operationID
         parser = try makeParser(for: descriptor, operationID: operationID)
         let snapshot = formatState.snapshot()
+        preferredTransfer = snapshot.videoPreferredTransfer
+        previousSequenceEnded = snapshot.videoSequenceEnded
         if let owner = snapshot.hlsVideoParameterSetOwner {
             hlsParameterSetOwner = owner
             try restoreHLSFormat(from: owner)
@@ -139,7 +145,18 @@ final class CompressedVideoAssembler {
     /// HLS 的 scan 结果在 format/fingerprint/CM block copy 全部结束前仍然活着。
     /// 费用包含 length-prefixed Data、独立参数 Data 与参数数组的实际元素槽位。
     private func receiveScanned(_ frame: FFmpegParsedFrame, scan: AnnexBScanResult) throws {
-        try updateFormatIfNeeded(with: scan.parameterSets)
+        let spsChanged = incomingChangesSPS(scan.parameterSets)
+        if scan.startsCodedVideoSequence || previousSequenceEnded || spsChanged {
+            preferredTransfer = nil
+        }
+        if let transfer = scan.preferredTransfer ?? (spsChanged ? nil : initialConfigurationTransfer) {
+            preferredTransfer = transfer
+        }
+        initialConfigurationTransfer = nil
+        try updateFormatIfNeeded(with: scan.parameterSets,
+            force: preferredTransfer != formatPreferredTransfer)
+        formatState.commitVideoPreferredTransfer(preferredTransfer)
+        formatState.commitVideoSequenceEnded(scan.endsCodedVideoSequence)
         guard let formatDescription else {
             return
         }
@@ -234,6 +251,10 @@ final class CompressedVideoAssembler {
             sourceBacking: sourceBacking,
             sourceByteRange: sourceBacking.wholeRange
         )))
+        previousSequenceEnded = scan.endsCodedVideoSequence
+        if scan.endsCodedVideoSequence {
+            preferredTransfer = nil
+        }
     }
 
     /// H.264/HEVC parser 未必能从 access unit 语法恢复 duration；此时使用 demux 已冻结的
@@ -259,11 +280,21 @@ final class CompressedVideoAssembler {
                 outputCapacity: envelope.lengthPrefixedBytes,
                 parameterSetCapacity: envelope.parameterSetCount
             )
-            try updateFormatIfNeeded(with: scan.parameterSets)
+            try prepareScannedExtradata(scan)
             return
         }
         let scan = try AnnexBScanner.scan(extradata, codec: descriptor.codec)
-        try updateFormatIfNeeded(with: scan.parameterSets)
+        try prepareScannedExtradata(scan)
+    }
+
+    private func prepareScannedExtradata(_ scan: AnnexBScanResult) throws {
+        if let transfer = scan.preferredTransfer {
+            preferredTransfer = transfer
+            initialConfigurationTransfer = transfer
+        }
+        try updateFormatIfNeeded(with: scan.parameterSets,
+            force: preferredTransfer != formatPreferredTransfer)
+        formatState.commitVideoPreferredTransfer(preferredTransfer)
     }
 
     private func scanWorkspaceBytes(
@@ -290,8 +321,10 @@ final class CompressedVideoAssembler {
         parameterSets = inheritedParameterSets
         formatDescription = try VideoFormatDescriptionBuilder.make(
             codec: descriptor.codec,
-            parameterSets: inheritedParameterSets
+            parameterSets: inheritedParameterSets,
+            videoMetadata: try colorMetadata(for: inheritedParameterSets)
         )
+        formatPreferredTransfer = preferredTransfer
     }
 
     private func restoreHLSFormat(from owner: HLSVideoParameterSetRetention) throws {
@@ -300,39 +333,45 @@ final class CompressedVideoAssembler {
         }
         formatDescription = try VideoFormatDescriptionBuilder.make(
             codec: descriptor.codec,
-            parameterSetOwner: owner
+            parameterSetOwner: owner,
+            videoMetadata: try colorMetadata(for: owner)
         )
+        formatPreferredTransfer = preferredTransfer
     }
 
-    private func updateFormatIfNeeded(with incoming: [Data]) throws {
+    private func updateFormatIfNeeded(with incoming: [Data], force: Bool = false) throws {
         if hlsCopyOwnership != nil {
-            try updateHLSFormatIfNeeded(with: incoming)
+            try updateHLSFormatIfNeeded(with: incoming, force: force)
             return
         }
         let candidate = mergedParameterSets(incoming)
-        guard candidate != parameterSets || formatDescription == nil else { return }
+        guard candidate != parameterSets || formatDescription == nil || force else { return }
         guard hasRequiredParameterSets(candidate) else {
             return
         }
         let candidateDescription = try VideoFormatDescriptionBuilder.make(
             codec: descriptor.codec,
-            parameterSets: candidate
+            parameterSets: candidate,
+            videoMetadata: try colorMetadata(for: candidate)
         )
         parameterSets = candidate
         formatDescription = candidateDescription
+        formatPreferredTransfer = preferredTransfer
         formatState.commitVideoParameterSets(candidate)
     }
 
-    private func updateHLSFormatIfNeeded(with incoming: [Data]) throws {
+    private func updateHLSFormatIfNeeded(with incoming: [Data], force: Bool) throws {
         guard let hlsCopyOwnership else { return }
         // 无新参数集时绝不制造 candidate/owner；旧 snapshot 可能正在外部持有，
         // 这条普通帧路径必须直接复用它而不是等待 owner metadata 容量。
-        guard !incoming.isEmpty else { return }
         if let owner = hlsParameterSetOwner,
-           formatDescription != nil,
-           incomingLeavesHLSOwnerUnchanged(incoming, owner: owner) {
+           incoming.isEmpty || incomingLeavesHLSOwnerUnchanged(incoming, owner: owner) {
+            if force || formatDescription == nil {
+                try restoreHLSFormat(from: owner)
+            }
             return
         }
+        guard !incoming.isEmpty else { return }
         let merged = try mergedHLSParameterSetEntries(incoming, ownership: hlsCopyOwnership)
         let candidate = merged.entries
         guard !sameEntries(candidate, hlsParameterSetOwner?.entries ?? []) || formatDescription == nil else {
@@ -342,12 +381,61 @@ final class CompressedVideoAssembler {
         let owner = hlsCopyOwnership.makeParameterSetOwner(entries: candidate, ownerLease: merged.ownerLease)
         let candidateDescription = try VideoFormatDescriptionBuilder.make(
             codec: descriptor.codec,
-            parameterSetOwner: owner
+            parameterSetOwner: owner,
+            videoMetadata: try colorMetadata(for: owner)
         )
         // HLS 不持有与 owner 平行的裸 Data；旧 snapshot 自己延长旧 owner 的 lease。
         hlsParameterSetOwner = owner
         formatDescription = candidateDescription
+        formatPreferredTransfer = preferredTransfer
         formatState.commitHLSVideoParameterSets(owner)
+    }
+
+    private func colorMetadata(for sets: [Data]) throws -> DemuxVideoMetadata {
+        guard let sps = sets.first(where: { parameterSetType($0) == 33 }) else {
+            return DemuxVideoMetadata()
+        }
+        return try colorMetadata(matchingSPS: sps.span)
+    }
+
+    private func colorMetadata(for owner: HLSVideoParameterSetRetention) throws -> DemuxVideoMetadata {
+        guard let sps = owner.entries.first(where: { parameterSetType($0) == 33 }) else {
+            return DemuxVideoMetadata()
+        }
+        return try sps.withBytes { try colorMetadata(matchingSPS: $0) }
+    }
+
+    /// demux 色彩证据只属于原始 SPS，不能覆盖带内切换后的新格式。
+    /// 借用原始 extradata 比较，HLS 路径不制造额外参数集副本。
+    private func colorMetadata(matchingSPS sps: borrowing Span<UInt8>) throws -> DemuxVideoMetadata {
+        guard descriptor.codec == .hevc else {
+            return DemuxVideoMetadata()
+        }
+        var matched = false
+        if !descriptor.extradata.isEmpty {
+            try AnnexBScanner.visitNALUnits(descriptor.extradata.span, codec: .hevc) { view, original in
+                guard view.nalUnitType == 33, original.count == sps.count else { return }
+                for index in 0..<sps.count where original[index] != sps[index] { return }
+                matched = true
+            }
+        }
+        let metadata = matched ? descriptor.videoMetadata : DemuxVideoMetadata()
+        return DemuxVideoMetadata(sampleAspectRatio: metadata.sampleAspectRatio,
+            range: metadata.range, primaries: metadata.primaries,
+            transfer: preferredTransfer ?? metadata.transfer, matrix: metadata.matrix,
+            chromaLocation: metadata.chromaLocation, masteringDisplay: metadata.masteringDisplay,
+            contentLightLevel: metadata.contentLightLevel)
+    }
+
+    private func incomingChangesSPS(_ incoming: [Data]) -> Bool {
+        for sps in incoming where descriptor.codec == .hevc && parameterSetType(sps) == 33 {
+            if let owner = hlsParameterSetOwner {
+                if !owner.entries.contains(where: { parameterSetType($0) == 33 && $0.matches(sps) }) { return true }
+            } else if !parameterSets.contains(where: { parameterSetType($0) == 33 && $0 == sps }) {
+                return true
+            }
+        }
+        return false
     }
 
     private func mergedHLSParameterSetEntries(
@@ -507,27 +595,23 @@ final class CompressedVideoAssembler {
             isInterlaced: frame.interlaced,
             repeatFirstField: frame.repeatPicture,
             topFieldFirst: frame.topFieldFirst,
-            sourcePTS90k: exactNonnegative90k(presentationTimeStamp)
+            sourcePTS90k: roundedNonnegative90k(presentationTimeStamp)
         )
     }
 
-    private func exactNonnegative90k(_ time: CMTime) -> UInt64? {
+    private func roundedNonnegative90k(_ time: CMTime) -> UInt64? {
         guard time.isNumeric, time.epoch == 0, time.value >= 0, time.timescale > 0 else {
             return nil
         }
-        var value = UInt64(time.value)
-        var multiplier: UInt64 = 90_000
-        var denominator = UInt64(time.timescale)
-        let firstGCD = greatestCommonDivisorForAssembly(value, denominator)
-        value /= firstGCD
-        denominator /= firstGCD
-        let secondGCD = greatestCommonDivisorForAssembly(multiplier, denominator)
-        multiplier /= secondGCD
-        denominator /= secondGCD
-        guard denominator == 1 else { return nil }
-        let (result, overflowed) = value.multipliedReportingOverflow(by: multiplier)
-        return overflowed ? nil : result
+        // Container clocks need not divide 90 kHz (60000/1001 fps is common).
+        // Keep every valid PTS, rounded independently with <= half a tick error;
+        // dropping fractional ticks sparsifies the cadence and stretches playback.
+        let transportTime = CMTimeConvertScale(time, timescale: 90_000,
+            method: .roundHalfAwayFromZero)
+        guard transportTime.isNumeric, transportTime.value >= 0 else { return nil }
+        return UInt64(transportTime.value)
     }
+
 }
 
 func exactTicks(_ time: CMTime, timeBase: MediaRational) throws -> Int64? {

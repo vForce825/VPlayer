@@ -113,8 +113,10 @@ enum HLSChecked {
         catch { PlaybackIdentityAllocator.shared.markIdentitySpaceExhausted(); throw error }
     }
     static func compare(_ a: ExactMediaTime, _ b: ExactMediaTime) throws -> Int {
-        let lhs = try multiply(a.value, Int64(b.timescale))
-        let rhs = try multiply(b.value, Int64(a.timescale))
+        // Every Int64 numerator × positive Int32 scale fits in Int128.
+        // A comparison must not reject valid points for an intermediate product.
+        let lhs = Int128(a.value) * Int128(b.timescale)
+        let rhs = Int128(b.value) * Int128(a.timescale)
         return lhs == rhs ? 0 : (lhs < rhs ? -1 : 1)
     }
     static func nanoseconds(_ time: ExactMediaTime) throws -> Int64 {

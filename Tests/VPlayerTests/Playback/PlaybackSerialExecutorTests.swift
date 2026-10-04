@@ -7,6 +7,66 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackSerialExecutorTests: XCTestCase {
+    func testSnapshotReadObservesPriorSubmissionsOnTheExecutor() {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.executor.snapshot")
+        let probe = ExecutorProbe()
+
+        executor.submit { probe.append(1) }
+        executor.submit { probe.append(2) }
+        let snapshot = executor.readIsolated {
+            XCTAssertTrue(executor.isIsolated)
+            return probe.snapshot
+        }
+
+        XCTAssertEqual(snapshot.values, [1, 2])
+        XCTAssertFalse(executor.isIsolated)
+    }
+
+    func testSnapshotReadRunsInlineAndCanNestWithoutReenteringSubmittedWork() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.executor.snapshot.nested")
+        let probe = ExecutorProbe()
+        let result = LockedSnapshotBox<ExecutorProbe.Snapshot>()
+        let finished = expectation(description: "isolated snapshot read returns")
+
+        executor.submit {
+            probe.append(1)
+            executor.submit {
+                probe.append(4)
+                result.store(probe.snapshot)
+                finished.fulfill()
+            }
+            let snapshot = executor.readIsolated {
+                executor.readIsolated {
+                    XCTAssertTrue(executor.isIsolated)
+                    return probe.snapshot
+                }
+            }
+            XCTAssertEqual(snapshot.values, [1])
+            probe.append(2)
+            probe.append(3)
+        }
+
+        wait(for: [finished], timeout: 5)
+        XCTAssertEqual(try XCTUnwrap(result.load()).values, [1, 2, 3, 4])
+    }
+
+    func testSnapshotReadUsesTheExactExecutorWhenLabelsMatch() {
+        let executorA = PlaybackSerialExecutor(label: "org.vplayer.tests.executor.snapshot.equal")
+        let executorB = PlaybackSerialExecutor(label: "org.vplayer.tests.executor.snapshot.equal")
+        let probe = ExecutorProbe()
+
+        executorA.submit { probe.append(1) }
+        let snapshot = executorB.readIsolated {
+            executorA.readIsolated {
+                XCTAssertTrue(executorA.isIsolated)
+                XCTAssertFalse(executorB.isIsolated)
+                return probe.snapshot
+            }
+        }
+
+        XCTAssertEqual(snapshot.values, [1])
+    }
+
     func testExecutesOneThousandOperationsInSubmissionOrder() throws {
         let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.executor.order")
         let probe = ExecutorProbe()

@@ -9,6 +9,124 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class ControlTaskRegistryTests: XCTestCase {
+    func testStopOwnerJoinCancelsHeldActivationTask() async throws {
+        try await checkOwnerJoinCancelsHeldActivation(reason: .stop)
+    }
+
+    func testTerminalOwnerJoinCancelsHeldActivationTask() async throws {
+        try await checkOwnerJoinCancelsHeldActivation(reason: .terminal)
+    }
+
+    func testEndpointReplacementOwnerJoinCancelsHeldActivationTask() async throws {
+        try await checkOwnerJoinCancelsHeldActivation(reason: .recovery)
+    }
+
+    private func checkOwnerJoinCancelsHeldActivation(reason: OutputTransitionReason) async throws {
+        let gate = RegistryHeldActivationCancellationGate()
+        let backend = CurrentPlaybackRateGateBackend(consumeActivation: true, activationGate: gate)
+        let graph = try OutputGraphFixture(backendObject: backend)
+        let registry = graph.registry
+        backend.configure(identity: graph.lifecycle.backendIdentity)
+        let prepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(registry.startOutputPrepareOperation(prepare))
+        guard case .succeeded = await registry.joinOutputBackendOperation(prepare) else {
+            return XCTFail("The real prepare runner must finish before activation")
+        }
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let activation = try XCTUnwrap(registry.beginOutputActivation(contextNonce: context.contextNonce))
+        guard registry.startOutputActivationOperation(activation) else {
+            return XCTFail("The original Registry activation runner must start")
+        }
+        defer { gate.releaseForFailedRED() }
+        let entryDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !gate.started, ContinuousClock.now < entryDeadline { await Task.yield() }
+        guard gate.started else {
+            XCTFail("The original activation must enter its cancellation-aware await")
+            gate.releaseForFailedRED()
+            _ = await registry.joinOutputBackendOperation(activation)
+            return
+        }
+        let originalInterval = registry.outputResourceContextSnapshot()?.interval
+        XCTAssertNotNil(originalInterval)
+        let owner: OutputTransitionOwnerTicket?
+        do {
+            if reason == .recovery {
+                owner = try registry.admitOutputQuiescentEndpointHandoff(session: context.sessionIdentity)?.owner
+            } else {
+                owner = try registry.beginOutputTransition(contextNonce: context.contextNonce,
+                    reason: reason, anchorInstant: registry.clock.nowNanoseconds, teardown: true)
+            }
+        } catch {
+            XCTFail("Owner admission failed: \(error)")
+            gate.releaseForFailedRED()
+            _ = await registry.joinOutputBackendOperation(activation)
+            return
+        }
+        guard let owner else {
+            XCTFail("The stronger transition must retain a real cleanup owner")
+            gate.releaseForFailedRED()
+            _ = await registry.joinOutputBackendOperation(activation)
+            return
+        }
+        XCTAssertEqual(owner.reason, reason)
+        XCTAssertEqual(registry.phase(of: activation), .cancelRequested)
+        let join = Task { await registry.joinOutputBackendOperations(owner: owner) }
+        let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !gate.cancellationObserved, ContinuousClock.now < cancellationDeadline { await Task.yield() }
+        let canceled = gate.cancellationObserved
+        XCTAssertTrue(canceled,
+            "The original owner join must physically cancel its revoked activation Task (\(reason))")
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, owner)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.interval, originalInterval,
+            "Task cancellation does not manufacture output quiescence")
+        XCTAssertEqual(backend.firstPositiveCalls, 0)
+        XCTAssertEqual(backend.physicalRate, 0)
+        // Failed REDs remain finite, but this release occurs only after the
+        // missing-cancellation assertion and cannot count as Task cancellation.
+        if !canceled { gate.releaseForFailedRED() }
+        let joined = await join.value
+        XCTAssertTrue(joined)
+        let result = await registry.joinOutputBackendOperation(activation)
+        guard case .canceled = result else {
+            return XCTFail("The exact original activation must settle canceled, not as a source failure")
+        }
+        XCTAssertEqual(registry.phase(of: activation), .terminal(.canceled))
+        XCTAssertFalse(gate.hasWaiter)
+    }
+
+    func testPauseCancelsExactActivationBeforeJoinAndKeepsWorkGroupReusable() throws {
+        let fixture = try OutputGraphFixture()
+        let registry = fixture.registry
+        let prepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(registry.claimStart(prepare))
+        XCTAssertTrue(registry.completeOutputPrepare(prepare))
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let activation = try XCTUnwrap(registry.beginOutputActivation(contextNonce: context.contextNonce))
+        XCTAssertTrue(registry.claimStart(activation))
+        let interval = try XCTUnwrap(registry.openOutputInterval(activation, itemGeneration: nil))
+
+        let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .pause, at: registry.clock.nowNanoseconds))
+        XCTAssertEqual(registry.phase(of: activation), .cancelRequested,
+            "Pause must revoke its original activation before any caller waits for that runner")
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, owner)
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.interval, interval,
+            "Cancellation cannot impersonate physical output quiescence")
+        let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        let suspension = try claimGraphSuspend(registry, stop)
+        XCTAssertFalse(suspension.complete(in: registry, preparedPreserved: true),
+            "The original activation must actually finish before suspend may settle")
+        XCTAssertTrue(registry.complete(activation))
+        XCTAssertTrue(suspension.complete(in: registry, preparedPreserved: true))
+        XCTAssertTrue(registry.finishOutputPause(owner: owner))
+        XCTAssertEqual(registry.outputResourceContextSnapshot()?.reservation.workGroup,
+            context.reservation.workGroup)
+        let resumed = try XCTUnwrap(registry.beginOutputActivation(contextNonce: context.contextNonce),
+            "Pause must leave the original work group open for a later resume")
+        XCTAssertEqual(resumed.group, activation.group)
+        XCTAssertNotEqual(resumed, activation)
+    }
+
     func test已消费的同一播放授权允许重复倍率副作用但不重复激活() async throws {
         let fixture = try await CurrentPlaybackRateGateFixture.make()
         let invocation = try XCTUnwrap(fixture.backend.lastActivation)
@@ -1492,6 +1610,7 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     SampleBufferQuiescenceIssuerInstalling, @unchecked Sendable {
     private let lock = NSLock()
     private let consumeActivation: Bool
+    private let activationGate: RegistryHeldActivationCancellationGate?
     private var storedIdentity = PlaybackBackendIdentity(
         sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0)
     private var storedActivation: ControlTaskRegistry.BackendPositiveRateInvocation?
@@ -1499,7 +1618,10 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     private var storedRate: Float = 0
     private var storedFirstPositiveCalls = 0
 
-    init(consumeActivation: Bool) { self.consumeActivation = consumeActivation }
+    init(consumeActivation: Bool, activationGate: RegistryHeldActivationCancellationGate? = nil) {
+        self.consumeActivation = consumeActivation
+        self.activationGate = activationGate
+    }
     var identity: PlaybackBackendIdentity { lock.withLock { storedIdentity } }
     var presentation: PlaybackPresentation? { nil }
     var lastActivation: ControlTaskRegistry.BackendPositiveRateInvocation? {
@@ -1512,6 +1634,7 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
     func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
         lock.withLock { storedActivation = invocation }
+        if let activationGate { try await activationGate.wait() }
         if consumeActivation {
             _ = invocation.performPositiveRateSideEffect {
                 lock.withLock { storedRate = 1; storedFirstPositiveCalls += 1 }
@@ -1535,6 +1658,50 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     func retireOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
         lock.withLock { storedRate = 0 }
         return .confirmedLocalOutputStopped
+    }
+}
+
+private final class RegistryHeldActivationCancellationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var cancellationPending = false
+    private var failedREDReleased = false
+    private var startedValue = false
+    private var cancellationObservedValue = false
+
+    var started: Bool { lock.withLock { startedValue } }
+    var cancellationObserved: Bool { lock.withLock { cancellationObservedValue } }
+    var hasWaiter: Bool { lock.withLock { continuation != nil } }
+
+    func wait() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let finishImmediately = lock.withLock {
+                    startedValue = true
+                    guard !cancellationPending, !failedREDReleased else { return true }
+                    self.continuation = continuation
+                    return false
+                }
+                if finishImmediately { continuation.resume(throwing: CancellationError()) }
+            }
+        } onCancel: {
+            let continuation = lock.withLock {
+                cancellationObservedValue = true
+                cancellationPending = true
+                defer { self.continuation = nil }
+                return self.continuation
+            }
+            continuation?.resume(throwing: CancellationError())
+        }
+    }
+
+    func releaseForFailedRED() {
+        let continuation = lock.withLock {
+            failedREDReleased = true
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(throwing: CancellationError())
     }
 }
 

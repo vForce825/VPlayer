@@ -480,7 +480,8 @@ fileprivate struct HEVCSPSRecord: ParameterSetRecord {
 
     func format(
         masteringDisplay: DemuxMasteringDisplayMetadata?,
-        contentLightLevel: DemuxContentLightLevelMetadata?
+        contentLightLevel: DemuxContentLightLevelMetadata?,
+        preferredTransfer: DemuxColorTransfer?
     ) -> VideoAccessUnitFormatSummary {
         VideoAccessUnitFormatSummary(
             codec: .hevc,
@@ -502,7 +503,7 @@ fileprivate struct HEVCSPSRecord: ParameterSetRecord {
             frameRate: vui.frameRate,
             range: vui.range,
             primaries: vui.primaries,
-            transfer: vui.transfer,
+            transfer: preferredTransfer ?? vui.transfer,
             matrix: vui.matrix,
             chromaLocation: vui.chromaLocation,
             masteringDisplay: masteringDisplay,
@@ -549,6 +550,9 @@ fileprivate struct InspectionState {
     var referencedPPSID: UInt32?
     var masteringDisplay: DemuxMasteringDisplayMetadata?
     var contentLightLevel: DemuxContentLightLevelMetadata?
+    var preferredTransfer: DemuxColorTransfer?
+    var startsCodedVideoSequence = false
+    var endsCodedVideoSequence = false
     var containsParameterSets = false
     var vclCount: UInt32 = 0
     var randomAccessCount: UInt32 = 0
@@ -624,6 +628,19 @@ fileprivate struct InspectionState {
         )
     }
 
+    mutating func inheritPreferredTransfer(
+        _ transfer: DemuxColorTransfer?,
+        spsDigest: VideoAccessUnitSHA256?,
+        afterSequenceEnd: Bool
+    ) {
+        // ATC 的持续范围是 CLVS；IDR/BLA 或 EOS 后的 CRA 开始新序列。
+        guard codec == .hevc, preferredTransfer == nil, !startsCodedVideoSequence,
+              !(afterSequenceEnd && randomAccessKind == .hevcCRA),
+              let ppsID = referencedPPSID, let pps = hevcPPS[ppsID],
+              let sps = hevcSPS[pps.spsID], sps.digest == spsDigest else { return }
+        preferredTransfer = transfer
+    }
+
     private mutating func consumeH264(
         type: UInt8,
         bytes: UnsafeRawBufferPointer,
@@ -663,6 +680,7 @@ fileprivate struct InspectionState {
     ) throws {
         switch type {
         case 0...31:
+            if (16...20).contains(type) { startsCodedVideoSequence = true }
             vclCount = try checkedIncrement(vclCount)
             var reader = try RBSPBitReader(ebsp: bytes, headerBytes: 2)
             try recordPrimaryPictureStartSlice(try reader.readFlag())
@@ -677,6 +695,8 @@ fileprivate struct InspectionState {
         case 34:
             let parsed = try parseHEVCPPS(bytes, digest: digest)
             try insertParameterSet(parsed, into: &hevcPPS, kind: .picture)
+        case 36, 37:
+            endsCodedVideoSequence = true
         case 39, 40:
             try parseSEI(bytes, headerBytes: 2)
         default:
@@ -719,6 +739,9 @@ fileprivate struct InspectionState {
                 throw VideoAccessUnitInspectionError.arithmeticOverflow
             }
             switch type {
+            case 147 where codec == .hevc:
+                preferredTransfer = try HEVCAlternativeTransferReader.readTransfer(
+                    payloadSize: size, from: &reader, previous: preferredTransfer)
             case 137:
                 guard size == 24 else {
                     throw VideoAccessUnitInspectionError.invalidHDRMetadata
@@ -811,11 +834,13 @@ fileprivate struct InspectionState {
             let signature = try makeSignature(codec: .hevc, vps: vps, sps: sps, pps: pps)
             let parsedFormat = sps.format(
                 masteringDisplay: masteringDisplay ?? frozenFormat?.masteringDisplay,
-                contentLightLevel: contentLightLevel ?? frozenFormat?.contentLightLevel
+                contentLightLevel: contentLightLevel ?? frozenFormat?.contentLightLevel,
+                preferredTransfer: preferredTransfer
             )
             let format = try mergeAndValidate(
-                inheritingMissingFormatMetadata(parsedFormat, from: frozenFormat),
-                expected: expected
+                inheritingMissingFormatMetadata(parsedFormat, from: frozenFormat, inheritTransfer: false),
+                expected: expected,
+                validateTransfer: preferredTransfer == nil || expected?.videoMetadata.transfer != sps.vui.transfer
             )
             return ResolvedInspection(parameterSets: signature, format: format)
         }
@@ -896,6 +921,9 @@ struct VideoAccessUnitInspectionSession {
     let generation: MediaGeneration
     let codec: VideoCodec
     private var frozenCatalog: FrozenVideoParameterCatalog?
+    private var preferredTransfer: DemuxColorTransfer?
+    private var preferredTransferSPSDigest: VideoAccessUnitSHA256?
+    private var previousSequenceEnded = false
 
     init(generation: MediaGeneration, codec: VideoCodec) {
         self.generation = generation
@@ -913,6 +941,8 @@ struct VideoAccessUnitInspectionSession {
         let currentParameterSetIDs = state.currentParameterSetIDs
         if let frozenCatalog {
             state.supplementMissingParameterSets(from: frozenCatalog)
+            state.inheritPreferredTransfer(preferredTransfer,
+                spsDigest: preferredTransferSPSDigest, afterSequenceEnd: previousSequenceEnded)
             let resolved = try state.resolve(
                 expected: input.expectedFormat,
                 inheriting: frozenCatalog.format
@@ -921,11 +951,13 @@ struct VideoAccessUnitInspectionSession {
                 currentParameterSetIDs,
                 active: resolved.parameterSets
             )
-            return try VideoAccessUnitInspector.makeProof(
+            let proof = try VideoAccessUnitInspector.makeProof(
                 input: input,
                 state: state,
                 resolved: resolved
             )
+            recordPreferredTransfer(state: state, resolved: resolved)
+            return proof
         }
 
         let resolved: ResolvedInspection
@@ -942,17 +974,61 @@ struct VideoAccessUnitInspectionSession {
             active: resolved.parameterSets
         )
         frozenCatalog = state.frozenCatalog(format: resolved.format)
-        return try VideoAccessUnitInspector.makeProof(
+        let proof = try VideoAccessUnitInspector.makeProof(
             input: input,
             state: state,
             resolved: resolved
         )
+        recordPreferredTransfer(state: state, resolved: resolved)
+        return proof
+    }
+
+    private mutating func recordPreferredTransfer(state: InspectionState, resolved: ResolvedInspection) {
+        preferredTransfer = state.endsCodedVideoSequence ? nil : state.preferredTransfer
+        preferredTransferSPSDigest = resolved.parameterSets.spsSHA256
+        previousSequenceEnded = state.endsCodedVideoSequence
     }
 }
 
 // MARK: - 有界 RBSP 读取
 
-private struct RBSPByteReader {
+/// 播放组装与 HLS 检验共用有界读取，直接尊重码流中的 ATC，避免依赖 demux 的兼容曲线。
+enum HEVCAlternativeTransferReader {
+    static func read(_ bytes: borrowing Span<UInt8>) throws -> DemuxColorTransfer? {
+        try bytes.withUnsafeBytes { raw in
+            var reader = try RBSPByteReader(ebsp: raw, headerBytes: 2)
+            var transfer: DemuxColorTransfer?
+            while !(try reader.isAtTrailingBits()) {
+                let type = try reader.readExtendedValue()
+                let size = try reader.readExtendedValue()
+                if type == 147 {
+                    transfer = try readTransfer(payloadSize: size, from: &reader, previous: transfer)
+                } else {
+                    guard let count = Int(exactly: size) else {
+                        throw VideoAccessUnitInspectionError.arithmeticOverflow
+                    }
+                    try reader.skipBytes(count: count)
+                }
+            }
+            return transfer
+        }
+    }
+
+    fileprivate static func readTransfer(payloadSize: UInt32, from reader: inout RBSPByteReader,
+                                        previous: DemuxColorTransfer?) throws -> DemuxColorTransfer {
+        guard payloadSize == 1 else { throw VideoAccessUnitInspectionError.invalidHDRMetadata }
+        let value = UInt16(try reader.readByte())
+        guard let transfer = DemuxColorTransfer(rawValue: value) else {
+            throw VideoAccessUnitInspectionError.unsupportedColorTransfer(value)
+        }
+        guard previous == nil || previous == transfer else {
+            throw VideoAccessUnitInspectionError.invalidHDRMetadata
+        }
+        return transfer
+    }
+}
+
+fileprivate struct RBSPByteReader {
     private let ebsp: UnsafeRawBufferPointer
     private var rawIndex: Int
     private var zeroCount = 0
@@ -2113,7 +2189,8 @@ private func parseMasteringDisplay(
 
 private func inheritingMissingFormatMetadata(
     _ current: VideoAccessUnitFormatSummary,
-    from frozen: VideoAccessUnitFormatSummary?
+    from frozen: VideoAccessUnitFormatSummary?,
+    inheritTransfer: Bool = true
 ) -> VideoAccessUnitFormatSummary {
     guard let frozen else { return current }
     return VideoAccessUnitFormatSummary(
@@ -2136,7 +2213,7 @@ private func inheritingMissingFormatMetadata(
         frameRate: current.frameRate ?? frozen.frameRate,
         range: current.range ?? frozen.range,
         primaries: current.primaries ?? frozen.primaries,
-        transfer: current.transfer ?? frozen.transfer,
+        transfer: current.transfer ?? (inheritTransfer ? frozen.transfer : nil),
         matrix: current.matrix ?? frozen.matrix,
         chromaLocation: current.chromaLocation ?? frozen.chromaLocation,
         masteringDisplay: current.masteringDisplay ?? frozen.masteringDisplay,
@@ -2251,7 +2328,8 @@ private func makeFormatIdentity(
 
 private func mergeAndValidate(
     _ parsed: VideoAccessUnitFormatSummary,
-    expected: VideoTrackDescriptor?
+    expected: VideoTrackDescriptor?,
+    validateTransfer: Bool = true
 ) throws -> VideoAccessUnitFormatSummary {
     guard let expected else { return parsed }
     guard expected.codec == parsed.codec else {
@@ -2278,7 +2356,7 @@ private func mergeAndValidate(
     try validateIfBoth(parsed.sampleAspectRatio, metadata.sampleAspectRatio, field: .sampleAspectRatio)
     try validateIfBoth(parsed.range, metadata.range, field: .range)
     try validateIfBoth(parsed.primaries, metadata.primaries, field: .primaries)
-    try validateIfBoth(parsed.transfer, metadata.transfer, field: .transfer)
+    if validateTransfer { try validateIfBoth(parsed.transfer, metadata.transfer, field: .transfer) }
     try validateIfBoth(parsed.matrix, metadata.matrix, field: .matrix)
     try validateIfBoth(parsed.chromaLocation, metadata.chromaLocation, field: .chromaLocation)
     try validateIfBoth(parsed.masteringDisplay, metadata.masteringDisplay, field: .masteringDisplay)

@@ -21,10 +21,13 @@ public struct RemoteResourceRequest: Sendable {
 public struct DownloadedResource: Sendable {
     public let temporaryFileURL: URL
     public let byteCount: Int64
+    /// Validated retrieval URL after redirects; never the subscription identity.
+    public let responseURL: URL
 
-    public init(temporaryFileURL: URL, byteCount: Int64) {
+    public init(temporaryFileURL: URL, byteCount: Int64, responseURL: URL) {
         self.temporaryFileURL = temporaryFileURL
         self.byteCount = byteCount
+        self.responseURL = responseURL
     }
 }
 

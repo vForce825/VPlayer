@@ -182,6 +182,20 @@ final class AudioSessionBlockingCallLane: Sendable, Equatable {
     }
 
     func execute(_ delivery: AudioSessionCallDelivery) {
+        switch delivery.request.permit.operation {
+        case .activate, .deactivate:
+            // Registry的原permit跨await保留。此Task不属于调用者的取消树，也不提供
+            // 取消handle；只有SDK真实返回才完成原CAS并允许后续deactivate/activate。
+            Task.detached(priority: .userInitiated) { [self] in
+                let result = await invokeNativeLifecycle(delivery.request.permit.operation)
+                delivery.owner.receive(result, delivery: delivery)
+            }
+        default:
+            executeSynchronous(delivery)
+        }
+    }
+
+    private func executeSynchronous(_ delivery: AudioSessionCallDelivery) {
         queue.async { [self] in
             // 完整原票只存一次于投递对象；队列只持该对象与lane引用。
             let result = autoreleasepool {
@@ -209,19 +223,36 @@ final class AudioSessionBlockingCallLane: Sendable, Equatable {
                 try sdk.setSupportsMultichannelContent()
                 return .configuration(.multichannelCapability(true))
             } catch { return .configuration(.multichannelCapability(false)) }
+        case .activate, .deactivate:
+            preconditionFailure("Native lifecycle calls must use the async lane")
+        case .currentRoute:
+            guard let registration else { return .route(.invalid) }
+            return .route(Self.project(sdk.currentRoute(), salt: registration.salt))
+        }
+    }
+
+    private enum NativeCallFailure: Error {
+        case activationReturnedFalse, deactivationReturnedFalse
+    }
+
+    private func invokeNativeLifecycle(_ operation: AudioSessionBlockingCallOperation) async -> AudioSessionBlockingCallResult {
+        switch operation {
         case .activate:
             do {
-                try sdk.activate()
+                guard try await sdk.activate() else {
+                    return .activation(Self.failure(NativeCallFailure.activationReturnedFalse))
+                }
                 return .activation(nil)
             } catch { return .activation(Self.failure(error)) }
         case .deactivate:
             do {
-                try sdk.deactivate()
+                guard try await sdk.deactivate() else {
+                    return .deactivation(.failed(Self.failure(NativeCallFailure.deactivationReturnedFalse)))
+                }
                 return .deactivation(.succeeded)
             } catch { return .deactivation(.failed(Self.failure(error))) }
-        case .currentRoute:
-            guard let registration else { return .route(.invalid) }
-            return .route(Self.project(sdk.currentRoute(), salt: registration.salt))
+        default:
+            preconditionFailure("Only native lifecycle calls may suspend")
         }
     }
 

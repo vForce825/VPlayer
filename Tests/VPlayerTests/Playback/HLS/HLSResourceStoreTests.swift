@@ -7,14 +7,14 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class HLSResourceStoreTests: XCTestCase {
-    func testReviewI3OneShotWaiterPublishesOnlyAfterEverySnapshotLeaseTerminal() throws {
-        let h = try Task19Harness(audioCount: 3)
-        try h.initial()
+    func testReviewI3OneShotWaiterPublishesOnlyAfterEverySnapshotLeaseTerminal() async throws {
+        let h = try await Task19Harness(audioCount: 3)
+        try await h.initial()
         let old = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0)) }
         let duplicate = try XCTUnwrap(h.store.acquireSnapshot(participantID: 1, now: 0))
-        try h.offerBoth(count: 1)
+        try await h.offerBoth(count: 1)
         _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
-        try h.offerBoth(count: 1, now: Task19.second)
+        try await h.offerBoth(count: 1, now: Task19.second)
         let ticket = h.publisher.ticket
         let serializations = h.publisher.serializationCount
         XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: 2 * Task19.second), .waiting)
@@ -33,14 +33,14 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertThrowsError(try h.publisher.publish(ticket: ticket, now: 2 * Task19.second))
     }
 
-    func testReviewI3StaleCancelCloseDeadlineAndReconfigureOnlyDiscardWaiter() throws {
+    func testReviewI3StaleCancelCloseDeadlineAndReconfigureOnlyDiscardWaiter() async throws {
         for terminal in 0..<5 {
-            let h = try Task19Harness(audioCount: 3)
-            try h.initial()
+            let h = try await Task19Harness(audioCount: 3)
+            try await h.initial()
             let old = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0)) }
-            try h.offerBoth(count: 1)
+            try await h.offerBoth(count: 1)
             _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
-            try h.offerBoth(count: 1, now: Task19.second)
+            try await h.offerBoth(count: 1, now: Task19.second)
             let ticket = h.publisher.ticket
             XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: 2 * Task19.second), .waiting)
             switch terminal {
@@ -58,9 +58,9 @@ final class HLSResourceStoreTests: XCTestCase {
         }
     }
 
-    func testReviewI7MasterAndMediaBorrowRaceReleaseCloseAndDoubleTerminalAreSafe() throws {
-        let h = try Task19Harness()
-        try h.initial()
+    func testReviewI7MasterAndMediaBorrowRaceReleaseCloseAndDoubleTerminalAreSafe() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
         let master = try XCTUnwrap(h.store.acquireMasterSnapshot(now: 0))
         let media = try XCTUnwrap(h.store.acquireSnapshot(participantID: 1, now: 0))
         XCTAssertEqual(master.withSnapshot { $0.raw }, h.publisher.visible?.master?.raw)
@@ -79,14 +79,14 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(h.store.usage.snapshotBytes, 0)
     }
 
-    func testReviewI9PublishedURIIdentitiesRemainGoneBeyond192WithFixedState() throws {
-        let h = try Task19Harness()
-        try h.initial()
+    func testReviewI9PublishedURIIdentitiesRemainGoneBeyond192WithFixedState() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
         let old = h.publisher.visible!.media[1]!.resources[0]
         let uri = try h.store.resourceURI(old, declaration: Task19.declaration())
         for index in 1...112 {
-            if index == 40 || index == 80 { try h.beginEpoch(UInt64(index)) }
-            try h.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
+            if index == 40 || index == 80 { try await h.beginEpoch(UInt64(index)) }
+            try await h.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
             _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Int64(index) * Task19.second)
             h.store.sweep(now: Int64(index) * Task19.second)
             XCTAssertLessThanOrEqual(h.store.usage.tombstoneCount, 192)
@@ -132,24 +132,36 @@ final class HLSResourceStoreTests: XCTestCase {
     }
 
     func testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic() throws {
-        for bytes in [560 * 1024 * 1024 - 1, 560 * 1024 * 1024, 560 * 1024 * 1024 + 1,
-                      688 * 1024 * 1024 - 1, 688 * 1024 * 1024, 688 * 1024 * 1024 + 1] {
+        // The application budget includes the media reservation's fixed32KiB
+        // evidence precharge, not just its payload. Keep the exact total-byte edges.
+        let mediaEvidenceBytes = 32 * 1_024
+        XCTAssertFalse(HLSDeliveryApplicationChargeLedger.shared.shouldBackpressure,
+            "Global application backpressure must be inactive for this store-local threshold check")
+        for totalBytes in [560 * 1024 * 1024 - 1, 560 * 1024 * 1024, 560 * 1024 * 1024 + 1,
+                           688 * 1024 * 1024 - 1, 688 * 1024 * 1024, 688 * 1024 * 1024 + 1] {
+            let bytes = totalBytes - mediaEvidenceBytes
             let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
-            if bytes > 688 * 1024 * 1024 {
+            if totalBytes > 688 * 1024 * 1024 {
                 XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: bytes))
                 XCTAssertEqual(store.usage.reservedBytes, 0)
             } else {
                 let reservation = try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: bytes)
                 XCTAssertEqual(store.usage.reservedBytes, bytes)
-                XCTAssertEqual(store.usage.shouldBackpressure, bytes >= 560 * 1024 * 1024)
+                XCTAssertEqual(store.usage.shouldBackpressure, totalBytes >= 560 * 1024 * 1024)
                 store.cancel(reservation)
             }
             XCTAssertEqual(store.usage.resourceCount, 0)
             XCTAssertEqual(store.usage.residentBytes, 0)
         }
-        for bytes in [65_535, 65_536, 65_537] {
+        let initializationEvidenceBytes = 16 * 1_024
+        XCTAssertEqual(LoopbackStorageLayout.current.initEvidenceAllocationBytes,
+                       initializationEvidenceBytes)
+        XCTAssertEqual(LoopbackStorageLayout.current.initMaximumBodyBytes
+                       + initializationEvidenceBytes, 64 * 1_024)
+        for totalBytes in [65_535, 65_536, 65_537] {
+            let bytes = totalBytes - initializationEvidenceBytes
             let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
-            if bytes == 65_537 {
+            if totalBytes == 65_537 {
                 XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .initialization, bodyBytes: bytes))
             } else {
                 let reservation = try store.reserveMedia(binding: Task19.binding(), kind: .initialization, bodyBytes: bytes)
@@ -159,13 +171,20 @@ final class HLSResourceStoreTests: XCTestCase {
             XCTAssertEqual(store.usage.reservedBytes, 0)
         }
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
+        XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media,
+            bodyBytes: 688 * 1_024 * 1_024),
+            "Payload alone at the hard limit must still charge its evidence and reject atomically")
+        XCTAssertEqual(store.usage.reservedBytes, 0)
+        XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .initialization,
+            bodyBytes: 64 * 1_024), "The64KiB initialization cap includes its16KiB evidence")
+        XCTAssertEqual(store.usage.reservedBytes, 0)
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: .max))
         XCTAssertThrowsError(try store.reserveMedia(binding: Task19.binding(), kind: .media, bodyBytes: -1))
     }
 
-    func testStoreAdmissionRechecksProofReceiptBackingAndTransfersOnlyOnSuccess() throws {
-        let track = try Task19Track(id: 1, mediaType: .video)
-        let packet = try track.next()
+    func testStoreAdmissionRechecksProofReceiptBackingAndTransfersOnlyOnSuccess() async throws {
+        let track = try await Task19Track(id: 1, mediaType: .video)
+        let packet = try await track.next()
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
         let reservation = try store.reserveMedia(binding: track.binding, kind: .media, bodyBytes: packet.object.bytes.count)
         XCTAssertThrowsError(try store.admit(Task19.copy(packet.object), proof: track.proof,
@@ -184,9 +203,9 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(store.usage.resourceCount, 1)
     }
 
-    func testFullBackingOneByteViewsAndDistinctIdenticalContentsAreChargedOncePerBacking() throws {
-        let h = try Task19Harness()
-        try h.initial()
+    func testFullBackingOneByteViewsAndDistinctIdenticalContentsAreChargedOncePerBacking() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
         let key = h.publisher.visible!.media[1]!.resources[0]
         let first = try XCTUnwrap(h.store.acquireResponse(key, token: Task19.token, now: 0, range: 0..<1))
         let second = try XCTUnwrap(h.store.acquireResponse(key, token: Task19.token, now: 0, range: 1..<2))
@@ -205,9 +224,9 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(h.store.usage.distinctResponseBackings, 1)
         h.store.release(second, now: 0)
         XCTAssertEqual(h.store.usage.responseBackingBytes, 0)
-        let a = try Task19Track(id: 1, mediaType: .video)
-        let b = try Task19Track(id: 2, mediaType: .video)
-        let pa = try a.next(), pb = try b.next()
+        let a = try await Task19Track(id: 1, mediaType: .video)
+        let b = try await Task19Track(id: 2, mediaType: .video)
+        let pa = try await a.next(), pb = try await b.next()
         XCTAssertEqual(pa.object.bytes, pb.object.bytes)
         XCTAssertNotEqual(pa.object.backing.identity, pb.object.backing.identity)
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
@@ -218,12 +237,12 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(store.usage.residentBytes, pa.object.bytes.count + pb.object.bytes.count)
     }
 
-    func testAvailabilityHorizonBeforeAtAfterAndForgedIdentities() throws {
+    func testAvailabilityHorizonBeforeAtAfterAndForgedIdentities() async throws {
         for instant: Int64 in [7_999_999_999, 8_000_000_000, 8_000_000_001] {
-            let h = try Task19Harness()
-            try h.initial()
+            let h = try await Task19Harness()
+            try await h.initial()
             let key = h.publisher.visible!.media[1]!.resources[0]
-            try h.offerBoth(count: 1)
+            try await h.offerBoth(count: 1)
             _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
             XCTAssertEqual(h.store.lookup(key, token: Task19.token, now: instant), instant < 8_000_000_000 ? .available : .gone)
             var forged = key
@@ -236,11 +255,11 @@ final class HLSResourceStoreTests: XCTestCase {
         }
     }
 
-    func testResponseAcquiredBeforeHorizonSurvivesAndNewAcquireIsGone() throws {
-        let h = try Task19Harness()
-        try h.initial()
+    func testResponseAcquiredBeforeHorizonSurvivesAndNewAcquireIsGone() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
         let key = h.publisher.visible!.media[1]!.resources[0]
-        try h.offerBoth(count: 1)
+        try await h.offerBoth(count: 1)
         _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
         let lease = try XCTUnwrap(h.store.acquireResponse(key, token: Task19.token, now: 7_999_999_999, range: 0..<1))
         h.store.sweep(now: 8_000_000_000)
@@ -250,12 +269,12 @@ final class HLSResourceStoreTests: XCTestCase {
         h.store.release(lease, now: 8_000_000_001)
         XCTAssertEqual(h.store.usage.responseTailCount, 0)
         XCTAssertEqual(h.store.lookup(key, token: Task19.token, now: 8_000_000_001), .gone)
-        let epoch = try Task19Harness()
-        try epoch.initial()
+        let epoch = try await Task19Harness()
+        try await epoch.initial()
         let oldInit = epoch.publisher.visible!.media[1]!.initializationResources[0]
-        try epoch.beginEpoch(2)
+        try await epoch.beginEpoch(2)
         for index in 1...6 {
-            try epoch.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
+            try await epoch.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
             _ = try epoch.publisher.publish(ticket: epoch.publisher.ticket, now: Int64(index) * Task19.second)
         }
         let initLease = try XCTUnwrap(epoch.store.acquireResponse(oldInit, token: Task19.token, now: 13 * Task19.second - 1))
@@ -266,12 +285,12 @@ final class HLSResourceStoreTests: XCTestCase {
         epoch.store.release(initLease, now: 13 * Task19.second)
     }
 
-    func testVisibleUnpublishedHorizonSnapshotAndResponseProtections() throws {
-        let h = try Task19Harness()
-        try h.initial()
+    func testVisibleUnpublishedHorizonSnapshotAndResponseProtections() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
         let snapshot = try XCTUnwrap(h.store.acquireSnapshot(participantID: 1, now: 0))
         let key = try XCTUnwrap(snapshot.snapshot).resources[0]
-        try h.offerBoth(count: 1)
+        try await h.offerBoth(count: 1)
         _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
         h.store.sweep(now: 8 * Task19.second)
         XCTAssertEqual(h.store.lookup(key, token: Task19.token, now: 8 * Task19.second), .available)
@@ -282,14 +301,14 @@ final class HLSResourceStoreTests: XCTestCase {
         h.store.sweep(now: 100 * Task19.second)
         XCTAssertEqual(h.store.lookup(visibleKey, token: Task19.token, now: 100 * Task19.second), .available)
         let before = h.store.usage.resourceCount
-        try h.offerBoth(count: 1, now: 100 * Task19.second)
+        try await h.offerBoth(count: 1, now: 100 * Task19.second)
         h.store.sweep(now: 200 * Task19.second)
         XCTAssertEqual(h.store.usage.resourceCount, before + 2)
     }
 
-    func testDistinctResponseTailSixEightLimitsAndSameBackingDoesNotMultiply() throws {
-        let h = try Task19Harness()
-        try h.initial()
+    func testDistinctResponseTailSixEightLimitsAndSameBackingDoesNotMultiply() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
         var leases: [HLSMediaResponseLease] = []
         for index in 0..<8 {
             let participant: UInt64 = index % 2 == 0 ? 1 : 2
@@ -303,7 +322,7 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(h.store.usage.distinctResponseBackings, 8)
         h.store.release(same, now: 0)
         for index in 1...12 {
-            try h.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
+            try await h.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
             _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Int64(index) * Task19.second)
         }
         h.store.sweep(now: 20 * Task19.second)
@@ -312,10 +331,10 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(h.store.usage.responseTailCount, 0)
     }
 
-    func testAcquireRetireReleaseCloseRacesNeverUnderflowOrResurrect() throws {
+    func testAcquireRetireReleaseCloseRacesNeverUnderflowOrResurrect() async throws {
         for _ in 0..<12 {
-            let h = try Task19Harness()
-            try h.initial()
+            let h = try await Task19Harness()
+            try await h.initial()
             let key = h.publisher.visible!.media[1]!.resources[0]
             let leases = Task19LeaseBox()
             DispatchQueue.concurrentPerform(iterations: 8) { index in
@@ -371,14 +390,14 @@ final class HLSResourceStoreTests: XCTestCase {
         }
     }
 
-    func testWholeSnapshotBatchWaitsForAllFourOldTerminalReleases() throws {
-        let h = try Task19Harness(audioCount: 3)
-        try h.initial()
+    func testWholeSnapshotBatchWaitsForAllFourOldTerminalReleases() async throws {
+        let h = try await Task19Harness(audioCount: 3)
+        try await h.initial()
         let old = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0)) }
-        try h.offerBoth(count: 1)
+        try await h.offerBoth(count: 1)
         _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
         XCTAssertEqual(h.store.usage.snapshotCount, 9)
-        try h.offerBoth(count: 1, now: Task19.second)
+        try await h.offerBoth(count: 1, now: Task19.second)
         let ticket = h.publisher.ticket
         let serialized = h.publisher.serializationCount
         XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: 2 * Task19.second), .waiting)
@@ -392,7 +411,7 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(h.publisher.visible?.publicationSequence, 3)
     }
 
-    func testSnapshotReservationRollbackOnSerializerCASCancelAndDeadline() throws {
+    func testSnapshotReservationRollbackOnSerializerCASCancelAndDeadline() async throws {
         let store = SealedMediaStore(token: Task19.token, itemGeneration: 19)
         for _ in 0..<16 {
             let reservation = try XCTUnwrap(store.reserveSnapshotBatch(mediaCount: 4, includeMaster: true))
@@ -405,12 +424,12 @@ final class HLSResourceStoreTests: XCTestCase {
             XCTAssertEqual(store.usage.reservedSnapshotCount, 0)
             XCTAssertEqual(store.usage.reservedSnapshotBytes, 0)
         }
-        let h = try Task19Harness(audioCount: 3)
-        try h.initial()
+        let h = try await Task19Harness(audioCount: 3)
+        try await h.initial()
         let old = try (1...4).map { try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0)) }
-        try h.offerBoth(count: 1)
+        try await h.offerBoth(count: 1)
         _ = try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second)
-        try h.offerBoth(count: 1, now: Task19.second)
+        try await h.offerBoth(count: 1, now: Task19.second)
         let ticket = h.publisher.ticket
         XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: 2 * Task19.second), .waiting)
         XCTAssertThrowsError(try h.publisher.deadline(ticket: ticket, now: 4 * Task19.second))
@@ -444,4 +463,136 @@ private final class Task19LeaseBox: @unchecked Sendable {
     private var storage: [HLSMediaResponseLease] = []
     var values: [HLSMediaResponseLease] { lock.withLock { storage } }
     func append(_ value: HLSMediaResponseLease) { lock.withLock { storage.append(value) } }
+}
+
+final class PausedWindowCoverageLeaseTests: XCTestCase {
+    func testResumeLeaseSharesTheExistingTwoSlotAdmission() throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        var original: FrozenPreparationOwner? = try .reserve()
+        let originalSlot = try XCTUnwrap(original).slot
+        let withOriginal = PlaybackResourceContextLedger.shared.chargedBytes
+        var resumed: PausedWindowCoverageLease? = try .reserve()
+        XCTAssertNotEqual(try XCTUnwrap(resumed).slot, originalSlot)
+        XCTAssertThrowsError(try PausedWindowCoverageLease.reserve()) {
+            XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        XCTAssertThrowsError(try FrozenPreparationOwner.reserve()) {
+            XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .capacityExceeded)
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
+            withOriginal + PausedWindowCoverageLease.reservationBytes)
+        resumed = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, withOriginal)
+        XCTAssertEqual(try XCTUnwrap(original).slot, originalSlot)
+        original = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testResumeLeaseDerivesItsOwnedAllocationCharge() throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        try withLease { lease in
+            XCTAssertEqual(lease.indexCapacity, 128)
+            XCTAssertGreaterThan(lease.knownAllocationBytes, 128 * MemoryLayout<UInt16>.stride)
+            XCTAssertLessThanOrEqual(lease.knownAllocationBytes,
+                PausedWindowCoverageLease.reservationBytes)
+            let actual = try XCTUnwrap(lease.actualAllocationBytes)
+            let limits = PausedWindowCoverageLease.allocationLimits
+            XCTAssertLessThanOrEqual(actual.root, limits.root)
+            XCTAssertLessThanOrEqual(actual.indices, limits.indices)
+            XCTAssertLessThanOrEqual(actual.context, limits.context)
+            XCTAssertLessThanOrEqual(actual.application, limits.application)
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes,
+                baseline + PausedWindowCoverageLease.reservationBytes)
+            XCTAssertNil(lease.metadataStore)
+            XCTAssertFalse(lease.completionIsFrozen)
+            XCTAssertNil(lease.coverage(at: 0))
+            XCTAssertNil(lease.coverage(at: 1))
+            print("PAUSED_WINDOW_ALLOCATION actual=\(lease.knownAllocationBytes) "
+                + "reserved=\(PausedWindowCoverageLease.reservationBytes) "
+                + "root=\(actual.root) indices=\(actual.indices) "
+                + "contextToken=\(actual.context) applicationToken=\(actual.application) "
+                + "indexCapacity=\(lease.indexCapacity)")
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testRepeatedResumeLeaseRetirementReturnsExactBaseline() throws {
+        let original = try FrozenPreparationOwner.reserve()
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        for _ in 0..<32 {
+            try withLease { lease in
+                XCTAssertNotEqual(lease.slot, original.slot)
+                XCTAssertLessThanOrEqual(lease.knownAllocationBytes,
+                    PausedWindowCoverageLease.reservationBytes)
+            }
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+        }
+        withExtendedLifetime(original) {}
+    }
+
+    func testResumeMetadataPinsCannotChangeTheOriginalOwner() async throws {
+        let harness = try await Task19Harness()
+        try await harness.initial()
+        defer { harness.publisher.close() }
+        let key = try XCTUnwrap(harness.publisher.visible?.media[1]?.resources.first)
+        let original = try FrozenPreparationOwner.reserve()
+        _ = try original.retainMetadata(in: harness.store, key: key)
+        let originalPins = harness.store.preparationLeaseChargeSnapshot(ownerSlot: original.slot)
+        var resumed: PausedWindowCoverageLease? = try .reserve()
+        let resumedSlot = try XCTUnwrap(resumed).slot
+        let metadataSlot = try XCTUnwrap(resumed).retainMetadata(in: harness.store, key: key)
+        XCTAssertFalse(try XCTUnwrap(resumed).containsCompletedResource(metadataSlot))
+        let otherStore = SealedMediaStore(token: Task19.token, itemGeneration: 19)
+        XCTAssertThrowsError(try XCTUnwrap(resumed).retainMetadata(in: otherStore, key: key)) {
+            XCTAssertEqual($0 as? AVPlayerItemCoordinatorFailure, .staleIdentity)
+        }
+        let beforeFreeze = try ServedCoverageDependencies.frozen(
+            owner: XCTUnwrap(resumed), rendition: .init(rawValue: 1),
+            requested: FMP4PresentationRange(start: Task19.time(0), duration: Task19.time(1)))
+        XCTAssertNil(beforeFreeze, "An unfrozen or partly failed attempt cannot issue dependencies")
+        try XCTUnwrap(resumed).freezeCompletedResources()
+        XCTAssertTrue(try XCTUnwrap(resumed).completionIsFrozen)
+        XCTAssertFalse(try XCTUnwrap(resumed).containsCompletedResource(metadataSlot),
+            "Metadata presence cannot manufacture completed HTTP evidence")
+        XCTAssertThrowsError(try XCTUnwrap(resumed).retainMetadata(in: harness.store, key: key))
+        XCTAssertThrowsError(try XCTUnwrap(resumed).freezeCompletedResources())
+        XCTAssertFalse(harness.store.preparationLeaseChargeSnapshot(ownerSlot: resumedSlot).identities.isEmpty)
+        resumed = nil
+        XCTAssertTrue(harness.store.preparationLeaseChargeSnapshot(ownerSlot: resumedSlot).identities.isEmpty)
+        let after = harness.store.preparationLeaseChargeSnapshot(ownerSlot: original.slot)
+        XCTAssertEqual(Set(after.identities), Set(originalPins.identities))
+        XCTAssertEqual(after.charge, originalPins.charge)
+        XCTAssertTrue(after.charge.allReservationsRegistered)
+        withExtendedLifetime(original) {}
+    }
+
+    func testRetainedCoverageOwnerAliasKeepsItsAdmissionAndPins() async throws {
+        let harness = try await Task19Harness()
+        try await harness.initial()
+        defer { harness.publisher.close() }
+        let key = try XCTUnwrap(harness.publisher.visible?.media[1]?.resources.first)
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let slot = try retainCoverageAlias(in: harness.store, key: key)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+        XCTAssertTrue(harness.store.preparationLeaseChargeSnapshot(ownerSlot: slot).identities.isEmpty)
+    }
+
+    @inline(never)
+    private func retainCoverageAlias(in store: SealedMediaStore, key: HLSResourceKey) throws -> UInt8 {
+        var lease: PausedWindowCoverageLease? = try .reserve()
+        _ = try XCTUnwrap(lease).retainMetadata(in: store, key: key)
+        let alias = FrozenCompletedCoverageOwner.paused(try XCTUnwrap(lease))
+        let charged = PlaybackResourceContextLedger.shared.chargedBytes
+        lease = nil
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+        XCTAssertFalse(store.preparationLeaseChargeSnapshot(ownerSlot: alias.slot).identities.isEmpty)
+        withExtendedLifetime(alias) {}
+        return alias.slot
+    }
+
+    @inline(never)
+    private func withLease(_ body: (PausedWindowCoverageLease) throws -> Void) throws {
+        let lease = try PausedWindowCoverageLease.reserve()
+        try body(lease)
+    }
 }

@@ -28,6 +28,20 @@ enum PlaybackInterruptionState: Sendable, Equatable {
     case inactive, began, ended(shouldResume: Bool)
 }
 
+/// Advisory notification scope only; this cannot authorize a physical audio-session call.
+struct AudioSessionLifecycleEpoch: Sendable, Equatable {
+    let interruption: UInt64
+    let mediaServices: UInt64
+    init(interruption: UInt64, mediaServices: UInt64) {
+        self.interruption = interruption
+        self.mediaServices = mediaServices
+    }
+    init(_ snapshot: PlaybackSafetySnapshot) {
+        interruption = snapshot.interruptionEpoch
+        mediaServices = snapshot.mediaServicesEpoch
+    }
+}
+
 enum PlaybackSystemSafetyEvent: Sendable, Equatable {
     case mediaServicesReset
     case interruptionBegan
@@ -164,6 +178,8 @@ struct PlaybackSafetySnapshot: Sendable, Equatable {
     var audioAdmissionFenceRevision: UInt64 = 0
     var interruptionState: PlaybackInterruptionState = .inactive
     var interruptionVeto = false
+    // Reset rebuilds inactive resources, but only accepted user action may restart audio.
+    var mediaServicesResumeRequired = false
     var userPaused = false
     var activationCancellationRequired: Bool { output.activationCancellationRequired }
     var speculativePreparationParked: Bool { output.speculativePreparationParked }
@@ -177,7 +193,7 @@ struct PlaybackSafetySnapshot: Sendable, Equatable {
 }
 
 enum PlaybackControlOperationDescriptor: Sendable, Equatable {
-    case resourceOwnership, cleanupOwnership, drain
+    case resourceOwnership, cleanupOwnership, monitorStopAcknowledgement, drain
     case factoryAdmission, prepareAdmission, selectionAdmission, probeAdmission, activationAdmission, positiveRateAdmission
 }
 

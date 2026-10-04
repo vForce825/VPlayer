@@ -120,7 +120,9 @@ struct CompressedVideoReservoir: RandomAccessCollection {
     typealias Element = CompressedVideoAccessUnit
 
     let limits: CompressedVideoRetentionLimits
-    private var storage: [CompressedVideoAccessUnit] = []
+    // Consumed slots are cleared immediately. Array compaction only reclaims
+    // empty slot metadata; it must never defer release of payload owners.
+    private var storage: [CompressedVideoAccessUnit?] = []
     private var head = 0
 
     var startIndex: Int { 0 }
@@ -131,7 +133,7 @@ struct CompressedVideoReservoir: RandomAccessCollection {
 
     subscript(position: Int) -> CompressedVideoAccessUnit {
         precondition(indices.contains(position))
-        return storage[head + position]
+        return storage[head + position]!
     }
 
     init(limits: CompressedVideoRetentionLimits) {
@@ -166,7 +168,7 @@ struct CompressedVideoReservoir: RandomAccessCollection {
             let suffix = Array(candidate[index...])
             guard fits(suffix) else { continue }
             let droppedCount = index
-            storage = suffix
+            storage = suffix.map { Optional($0) }
             head = 0
             return CompressedVideoReservoirMutation(
                 accepted: true,
@@ -180,6 +182,7 @@ struct CompressedVideoReservoir: RandomAccessCollection {
     mutating func popFirst() -> CompressedVideoAccessUnit? {
         guard !isEmpty else { return nil }
         let value = storage[head]
+        storage[head] = nil
         head += 1
         compactIfNeeded()
         return value
@@ -191,6 +194,9 @@ struct CompressedVideoReservoir: RandomAccessCollection {
 
     mutating func removeFirst(_ count: Int) {
         precondition(count >= 0 && count <= self.count)
+        for index in head..<(head + count) {
+            storage[index] = nil
+        }
         head += count
         compactIfNeeded()
     }
@@ -205,20 +211,42 @@ struct CompressedVideoReservoir: RandomAccessCollection {
     mutating func removeAll(
         where shouldRemove: (CompressedVideoAccessUnit) throws -> Bool
     ) rethrows {
-        storage = try elements.filter { try !shouldRemove($0) }
+        storage = try elements.filter { try !shouldRemove($0) }.map { Optional($0) }
         head = 0
     }
 
     private func fits(_ values: [CompressedVideoAccessUnit]) -> Bool {
         guard values.count <= limits.maximumCount else { return false }
         var bytes = 0
+        var sourceOwners = Set<ObjectIdentifier>()
+        var sampleOwners = Set<ObjectIdentifier>()
+        func includeBytes(_ byteCount: Int) -> Bool {
+            guard byteCount >= 0 else { return false }
+            let (sum, overflow) = bytes.addingReportingOverflow(byteCount)
+            guard !overflow, sum <= limits.maximumOwnedBytes else { return false }
+            bytes = sum
+            return true
+        }
         var earliest: CMTime?
         var latestEnd: CMTime?
         for value in values {
-            let sampleBytes = CMSampleBufferGetTotalSampleSize(value.sampleBuffer)
-            let (sum, overflow) = bytes.addingReportingOverflow(sampleBytes)
-            guard !overflow, sum <= limits.maximumOwnedBytes else { return false }
-            bytes = sum
+            // The assembler keeps original Annex-B evidence and a separately
+            // allocated length-prefixed CM payload. A slice retains the entire
+            // source owner, while replay/copy aliases of that owner count once.
+            if let source = value.sourceBacking,
+               sourceOwners.insert(ObjectIdentifier(source.ownerIdentity)).inserted,
+               !includeBytes(source.byteCount) { return false }
+            if let block = CMSampleBufferGetDataBuffer(value.sampleBuffer) {
+                // CMSampleBufferCreateCopy shares its CMBlockBuffer. Builders
+                // allocate the full block length, which may exceed sample sizes.
+                // Unknown distinct block headers are conservatively separate:
+                // this is a retained-owner budget, not an allocator/RSS census.
+                if sampleOwners.insert(ObjectIdentifier(block)).inserted,
+                   !includeBytes(CMBlockBufferGetDataLength(block)) { return false }
+            } else if sampleOwners.insert(ObjectIdentifier(value.sampleBuffer)).inserted,
+                      !includeBytes(CMSampleBufferGetTotalSampleSize(value.sampleBuffer)) {
+                return false
+            }
 
             let pts = CMSampleBufferGetPresentationTimeStamp(value.sampleBuffer)
             guard pts.isNumeric, CMTimeCompare(pts, .zero) >= 0 else { continue }

@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import signal
+from socketserver import TCPServer
 import stat
 import subprocess
 import sys
@@ -19,14 +20,17 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import unquote_to_bytes, urlsplit
 
 
 class ReadOnlyFixtureRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def __init__(self, *args: object, fixture_root: Path, **kwargs: object) -> None:
+    def __init__(self, *args: object, fixture_root: Path,
+                 timeline_fixture: Path | None = None, **kwargs: object) -> None:
         self.fixture_root = fixture_root
+        self.timeline_fixture = timeline_fixture
         super().__init__(*args, **kwargs)
 
     def do_GET(self) -> None:
@@ -105,6 +109,11 @@ class ReadOnlyFixtureRequestHandler(BaseHTTPRequestHandler):
                 raise FileNotFoundError(decoded)
             raise PermissionError(decoded)
 
+        if components == ["timeline-4k-15m.ts"] and self.timeline_fixture is not None:
+            if self.timeline_fixture.is_symlink() or not self.timeline_fixture.is_file():
+                raise PermissionError(decoded)
+            return self.timeline_fixture
+
         current = self.fixture_root
         for component in components:
             current = current / component
@@ -131,12 +140,24 @@ class FixtureHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind performs reverse DNS via socket.getfqdn before
+        # returning. Fixtures bind a fixed numeric loopback address, so readiness
+        # must not depend on the host's resolver (which can block on macOS).
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
-def create_server(root: Path) -> FixtureHTTPServer:
+
+def create_server(root: Path, timeline_fixture: Path | None = None) -> FixtureHTTPServer:
     resolved = root.resolve(strict=True)
     if not resolved.is_dir():
         raise NotADirectoryError(resolved)
-    handler = partial(ReadOnlyFixtureRequestHandler, fixture_root=resolved)
+    if timeline_fixture is not None:
+        if timeline_fixture.is_symlink() or not timeline_fixture.is_file():
+            raise ValueError("timeline fixture must be a regular non-symlink file")
+        timeline_fixture = timeline_fixture.resolve(strict=True)
+    handler = partial(ReadOnlyFixtureRequestHandler, fixture_root=resolved,
+                      timeline_fixture=timeline_fixture)
     return FixtureHTTPServer(("127.0.0.1", 0), handler)
 
 
@@ -173,8 +194,8 @@ def remove_exact_port_file(path: Path, identity: tuple[int, int], port: int) -> 
         pass
 
 
-def serve(root: Path, port_file: Path) -> int:
-    server = create_server(root)
+def serve(root: Path, port_file: Path, timeline_fixture: Path | None = None) -> int:
+    server = create_server(root, timeline_fixture=timeline_fixture)
     port = int(server.server_address[1])
     port_identity: tuple[int, int] | None = None
     stopping = threading.Event()
@@ -201,8 +222,9 @@ def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description="read-only VPlayer fixture server")
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--port-file", required=True, type=Path)
+    parser.add_argument("--timeline-fixture", type=Path)
     options = parser.parse_args(arguments)
-    return serve(options.root, options.port_file)
+    return serve(options.root, options.port_file, options.timeline_fixture)
 
 
 class FixtureServerContractTests(unittest.TestCase):
@@ -242,6 +264,17 @@ class FixtureServerContractTests(unittest.TestCase):
         connection.close()
         return response.status, headers, body
 
+    def test_numeric_loopback_startup_does_not_depend_on_reverse_dns(self) -> None:
+        # HTTPServer normally calls socket.getfqdn before publishing readiness.
+        # A stalled system resolver must not hold a numeric loopback fixture.
+        with patch("socket.getfqdn", side_effect=AssertionError("unexpected reverse DNS")):
+            server = create_server(self.root)
+        try:
+            self.assertEqual(server.server_name, "127.0.0.1")
+            self.assertEqual(server.server_port, server.server_address[1])
+        finally:
+            server.server_close()
+
     def test_binds_only_loopback_on_an_ephemeral_port(self) -> None:
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
         self.assertGreater(self.server.server_address[1], 0)
@@ -271,6 +304,42 @@ class FixtureServerContractTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIn(self.request("GET", path)[0], (400, 403, 404))
+
+    def test_explicit_timeline_fixture_is_read_only_and_does_not_expose_siblings(self) -> None:
+        timeline = Path(self.temporary.name) / "timeline 4k.ts"
+        timeline.write_bytes(b"synthetic-4k")
+        server = create_server(self.root, timeline_fixture=timeline)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            for method, path, expected in (("GET", "/timeline-4k-15m.ts", 200),
+                                           ("HEAD", "/timeline-4k-15m.ts", 200),
+                                           ("POST", "/timeline-4k-15m.ts", 405),
+                                           ("GET", "/outside.txt", 404),
+                                           ("GET", "/../outside.txt", 403)):
+                connection.request(method, path)
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, expected)
+                if method == "GET" and expected == 200:
+                    self.assertEqual(body, b"synthetic-4k")
+            # Like the committed fixtures, this server does not advertise Range
+            # support. A Range request receives the complete representation (200).
+            connection.request("GET", "/timeline-4k-15m.ts", headers={"Range": "bytes=2-4"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"synthetic-4k")
+            self.assertEqual(response.getheader("Content-Length"), str(len(b"synthetic-4k")))
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_timeline_fixture_mapping_rejects_symlinks(self) -> None:
+        with self.assertRaises(ValueError):
+            create_server(self.root, timeline_fixture=self.root / "escape.ts")
 
     def test_sigterm_stops_server_and_removes_its_exact_port_file(self) -> None:
         port_file = Path(self.temporary.name) / "server.port"
@@ -302,6 +371,7 @@ class FixtureServerContractTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+            process.stderr.close()
 
 
 def run_self_tests() -> int:

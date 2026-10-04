@@ -283,6 +283,82 @@ final class EPGMatcherTests: XCTestCase {
         XCTAssertEqual(cancellationCheckCount, 3)
     }
 
+    func testFuzzyMatchingBoundsNormalizedUTF8WorkWithoutTruncatingExactNames() {
+        let atLimit = String(repeating: "a", count: 128)
+        let beyondLimit = atLimit + "a"
+        XCTAssertTrue(EPGNameNormalizer.isConservativeFuzzyMatch(
+            atLimit, String(repeating: "a", count: 127) + "b"
+        ))
+        XCTAssertFalse(EPGNameNormalizer.isConservativeFuzzyMatch(
+            beyondLimit, atLimit + "b"
+        ))
+        XCTAssertEqual(
+            match(tvgID: nil, tvgName: beyondLimit, names: [("long", [beyondLimit])]),
+            .matched(xmltvChannelID: "long", method: .exactName)
+        )
+        XCTAssertEqual(
+            match(tvgID: nil, tvgName: beyondLimit, names: [("long", [atLimit + "b"])]),
+            .unmatched
+        )
+        // A byte budget also bounds multi-byte normalized names, not just ASCII.
+        XCTAssertFalse(EPGNameNormalizer.isFuzzyMatchEligible(String(repeating: "体", count: 43)))
+        XCTAssertFalse(EPGNameNormalizer.isFuzzyMatchEligible(String(repeating: "a\u{0363}", count: 128)))
+        XCTAssertFalse(EPGNameNormalizer.isFuzzyMatchEligible(String(repeating: "👨‍👩‍👧‍👦", count: 128)))
+    }
+
+    func testLegal32768CharacterNameKeepsManualExactIDAndExactNameMatching() {
+        let name = String(repeating: "a", count: 32_768)
+        // Fail safely on the old implementation before allowing its roughly
+        // 1 GiB eager signature allocation to exhaust the test host.
+        guard !EPGNameNormalizer.isFuzzyMatchEligible(name) else {
+            return XCTFail("Unbounded names must not enter the fuzzy signature index")
+        }
+        let manual = makeChannel(tvgID: "exact", tvgName: nil, path: "manual-long")
+        let exactID = makeChannel(tvgID: "exact", tvgName: nil, path: "id-long")
+        let exactName = makeChannel(tvgID: nil, tvgName: name, path: "name-long")
+        let channels = [manual, exactID, exactName]
+        let epgChannels = [
+            EPGChannel(id: "exact", displayNames: [name], iconURL: nil),
+            EPGChannel(id: "manual", displayNames: [name + "b"], iconURL: nil)
+        ]
+        let results = EPGMatcher.matches(
+            channels: channels, epgChannels: epgChannels,
+            manualMappingsByChannelID: [manual.id: "manual"]
+        )
+        XCTAssertEqual(results[manual.id], .matched(xmltvChannelID: "manual", method: .manual))
+        XCTAssertEqual(results[exactID.id], .matched(xmltvChannelID: "exact", method: .exactID))
+        XCTAssertEqual(results[exactName.id], .matched(xmltvChannelID: "exact", method: .exactName))
+    }
+
+    func testCancellationCanInterruptSignaturesWithinOneEPGName() {
+        var checks = 0
+        XCTAssertThrowsError(try EPGMatcher.matches(
+            channels: [],
+            epgChannels: [EPGChannel(
+                id: "one", displayNames: [String(repeating: "a", count: 128)], iconURL: nil
+            )],
+            manualMappingsByChannelID: [:],
+            cancellationCheck: {
+                checks += 1
+                if checks == 20 { throw CancellationError() }
+            }
+        )) { XCTAssertTrue($0 is CancellationError) }
+        XCTAssertEqual(checks, 20)
+    }
+
+    func testCancellationCanInterruptSignaturesWithinOnePlaylistName() {
+        var checks = 0
+        XCTAssertThrowsError(try EPGMatcher.matches(
+            channels: [makeChannel(tvgID: nil, tvgName: String(repeating: "a", count: 128))],
+            epgChannels: [], manualMappingsByChannelID: [:],
+            cancellationCheck: {
+                checks += 1
+                if checks == 20 { throw CancellationError() }
+            }
+        )) { XCTAssertTrue($0 is CancellationError) }
+        XCTAssertEqual(checks, 20)
+    }
+
     func testNormalizerPrecomposesAndRemovesFormattingCharacters() {
         XCTAssertEqual(EPGNameNormalizer.normalize("五星 体育-HD"), "五星体育hd")
     }

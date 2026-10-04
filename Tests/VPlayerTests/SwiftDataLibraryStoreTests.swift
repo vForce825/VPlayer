@@ -2336,6 +2336,223 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertEqual(restoredChannels, [])
     }
 
+    func testPurgedStoreRestoresManualMappingBeforeChannelsAndGuideAreRedownloaded() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, original) = try makeMirroringStore(defaults: defaults)
+        let profile = try await original.createProfile(input(name: "Home"), now: date(10))
+        let playlistChannel = channel(profileID: profile.id, name: "Live", path: "live")
+        try await original.setManualMapping(
+            profileID: profile.id, channelID: playlistChannel.id, xmltvChannelID: "chosen"
+        )
+        let recoveryData = defaults.data(forKey: SourceProfileMirror.storageKey)
+        let guide = try temporaryXML(singleProgrammeXMLTV(channelID: "chosen", title: "Guide"))
+        try await original.installPlaylist(
+            profileID: profile.id, channels: [playlistChannel], fetchedAt: date(20)
+        )
+        _ = try await original.installEPG(profileID: profile.id, fileURL: guide, fetchedAt: date(20))
+        XCTAssertEqual(defaults.data(forKey: SourceProfileMirror.storageKey), recoveryData,
+                       "Rebuildable channel/programme snapshots must not be mirrored")
+
+        let (_, afterPurge) = try makeMirroringStore(defaults: defaults)
+        _ = try await afterPurge.synchronizeProfileMirror()
+        let beforeRefresh = try await afterPurge.manualMappings(profileID: profile.id)
+        let emptyChannels = try await afterPurge.channels(profileID: profile.id)
+        let emptyGuide = try await afterPurge.epgChannels(profileID: profile.id)
+        XCTAssertEqual(beforeRefresh, [playlistChannel.id: "chosen"])
+        XCTAssertTrue(emptyChannels.isEmpty)
+        XCTAssertTrue(emptyGuide.isEmpty)
+        try await afterPurge.installPlaylist(
+            profileID: profile.id, channels: [playlistChannel], fetchedAt: date(30)
+        )
+        _ = try await afterPurge.installEPG(profileID: profile.id, fileURL: guide, fetchedAt: date(30))
+        let restoredChannels = try await afterPurge.channels(profileID: profile.id)
+        let restoredGuide = try await afterPurge.epgChannels(profileID: profile.id)
+        let mappings = try await afterPurge.manualMappings(profileID: profile.id)
+        XCTAssertEqual(EPGMatcher.matches(
+            channels: restoredChannels, epgChannels: restoredGuide,
+            manualMappingsByChannelID: mappings
+        )[playlistChannel.id], .matched(xmltvChannelID: "chosen", method: .manual))
+    }
+
+    func testMappingMirrorFollowsUpdatesRemovalsAndDeletedSourcesAcrossRepeatedPurges() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, store) = try makeMirroringStore(defaults: defaults)
+        let kept = try await store.createProfile(input(name: "Kept"), now: date(10))
+        let deleted = try await store.createProfile(input(name: "Deleted"), now: date(20))
+        for profile in [kept, deleted] {
+            try await store.setManualMapping(profileID: profile.id, channelID: "keep", xmltvChannelID: "old")
+            try await store.setManualMapping(profileID: profile.id, channelID: "clear", xmltvChannelID: "old")
+        }
+        try await store.setManualMapping(profileID: kept.id, channelID: "keep", xmltvChannelID: "updated")
+        try await store.setManualMapping(profileID: kept.id, channelID: "clear", xmltvChannelID: nil)
+        try await store.deleteProfile(id: deleted.id)
+
+        let (container, restored) = try makeMirroringStore(defaults: defaults)
+        _ = try await restored.synchronizeProfileMirror()
+        let mappings = try await restored.manualMappings(profileID: kept.id)
+        XCTAssertEqual(mappings, ["keep": "updated"])
+        let records = try ModelContext(container).fetch(FetchDescriptor<ManualEPGMappingRecord>())
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.sourceProfileID, kept.id)
+        try await restored.deleteProfile(id: kept.id)
+        let (emptyContainer, empty) = try makeMirroringStore(defaults: defaults)
+        let count = try await empty.synchronizeProfileMirror()
+        XCTAssertEqual(count, 0)
+        XCTAssertTrue(try ModelContext(emptyContainer).fetch(FetchDescriptor<ManualEPGMappingRecord>()).isEmpty)
+    }
+
+    func testRecoveryBudgetRejectsMappingGrowthWithoutLosingPreviousMappingOrSelection() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, store) = try makeMirroringStore(defaults: defaults)
+        let first = try await store.createProfile(input(name: "First"), now: date(10))
+        let second = try await store.createProfile(input(name: "Second"), now: date(20))
+        try await store.setActiveProfile(id: second.id)
+        try await store.setManualMapping(profileID: first.id, channelID: "live", xmltvChannelID: "old")
+        let previousData = try XCTUnwrap(defaults.data(forKey: SourceProfileMirror.storageKey))
+        XCTAssertLessThanOrEqual(previousData.count, 256 * 1_024)
+        do {
+            try await store.setManualMapping(
+                profileID: first.id, channelID: "live", xmltvChannelID: String(repeating: "x", count: 300_000)
+            )
+            XCTFail("An oversized override must fail before either persistence copy changes")
+        } catch {
+            XCTAssertEqual(error as? LibraryRepositoryError, .recoveryDataTooLarge(limit: 256 * 1_024))
+        }
+        let mapping = try await store.manualMapping(profileID: first.id, channelID: "live")
+        let active = try await store.activeProfile()
+        XCTAssertEqual(mapping?.xmltvChannelID, "old")
+        XCTAssertEqual(active?.id, second.id)
+        XCTAssertEqual(defaults.data(forKey: SourceProfileMirror.storageKey), previousData)
+        let (_, afterPurge) = try makeMirroringStore(defaults: defaults)
+        _ = try await afterPurge.synchronizeProfileMirror()
+        let recovered = try await afterPurge.manualMapping(profileID: first.id, channelID: "live")
+        let recoveredSelection = try await afterPurge.activeProfile()
+        XCTAssertEqual(recovered?.xmltvChannelID, "old")
+        XCTAssertEqual(recoveredSelection?.id, second.id)
+    }
+
+    func testManualMappingSaveFailureLeavesRecoveryMirrorUnchanged() async throws {
+        let defaults = try mirrorDefaults()
+        let (container, writer) = try makeMirroringStore(defaults: defaults)
+        let profile = try await writer.createProfile(input(name: "Home"), now: date(10))
+        try await writer.setManualMapping(profileID: profile.id, channelID: "live", xmltvChannelID: "old")
+        let previousData = defaults.data(forKey: SourceProfileMirror.storageKey)
+        let failing = SwiftDataLibraryStore(
+            modelContainer: container, profileMirror: SourceProfileMirror(defaults: defaults)
+        ) { phase in
+            if phase == .manualMapping { throw InjectedSaveError.expected }
+        }
+        for replacement in [String?.some("new"), nil] {
+            do {
+                try await failing.setManualMapping(profileID: profile.id, channelID: "live", xmltvChannelID: replacement)
+                XCTFail("Expected injected save failure")
+            } catch {
+                XCTAssertTrue(error is InjectedSaveError)
+            }
+            let mapping = try await failing.manualMapping(profileID: profile.id, channelID: "live")
+            XCTAssertEqual(mapping?.xmltvChannelID, "old")
+            XCTAssertEqual(defaults.data(forKey: SourceProfileMirror.storageKey), previousData)
+        }
+        let (_, restored) = try makeMirroringStore(defaults: defaults)
+        _ = try await restored.synchronizeProfileMirror()
+        let mapping = try await restored.manualMapping(profileID: profile.id, channelID: "live")
+        XCTAssertEqual(mapping?.xmltvChannelID, "old")
+    }
+
+    func testRecoveryBudgetRollsBackOversizedInitialProfileAndActiveSelection() async throws {
+        let defaults = try mirrorDefaults()
+        let (_, store) = try makeMirroringStore(defaults: defaults)
+        do {
+            _ = try await store.createProfile(input(name: String(repeating: "x", count: 300_000)), now: date(10))
+            XCTFail("An oversized profile must not commit or become active")
+        } catch {
+            XCTAssertEqual(error as? LibraryRepositoryError, .recoveryDataTooLarge(limit: 256 * 1_024))
+        }
+        let profiles = try await store.profiles()
+        let active = try await store.activeProfile()
+        XCTAssertTrue(profiles.isEmpty)
+        XCTAssertNil(active)
+        XCTAssertNil(defaults.data(forKey: SourceProfileMirror.storageKey))
+    }
+
+    func testUnmirroredLegacyMegabyteOfMappingsNeverWritesOversizedDefaultsAndCanShrink() async throws {
+        let defaults = try mirrorDefaults()
+        let (container, legacy) = try makeStore()
+        let profile = try await legacy.createProfile(input(name: "Legacy"), now: date(10))
+        let longID = String(repeating: "x", count: 145_000)
+        for index in 0..<8 {
+            try await legacy.setManualMapping(profileID: profile.id, channelID: "channel-\(index)", xmltvChannelID: longID)
+        }
+        let upgrading = SwiftDataLibraryStore(modelContainer: container, profileMirror: SourceProfileMirror(defaults: defaults))
+        _ = try await upgrading.synchronizeProfileMirror()
+        let status = await upgrading.recoveryStatus()
+        let allMappings = try await upgrading.manualMappings(profileID: profile.id)
+        XCTAssertEqual(status, .capacityExceeded(limit: 256 * 1_024))
+        XCTAssertEqual(allMappings.count, 8)
+        XCTAssertNil(defaults.data(forKey: SourceProfileMirror.storageKey))
+        do {
+            try await upgrading.setManualMapping(profileID: profile.id, channelID: "new", xmltvChannelID: "new")
+            XCTFail("An oversized legacy store must not grow")
+        } catch {
+            XCTAssertEqual(error as? LibraryRepositoryError, .recoveryDataTooLarge(limit: 256 * 1_024))
+        }
+        for index in 0..<6 {
+            try await upgrading.setManualMapping(profileID: profile.id, channelID: "channel-\(index)", xmltvChannelID: nil)
+            XCTAssertNil(defaults.data(forKey: SourceProfileMirror.storageKey))
+        }
+        try await upgrading.setManualMapping(profileID: profile.id, channelID: "channel-6", xmltvChannelID: nil)
+        let recoveredStatus = await upgrading.recoveryStatus()
+        XCTAssertEqual(recoveredStatus, .current)
+        let bounded = try XCTUnwrap(defaults.data(forKey: SourceProfileMirror.storageKey))
+        XCTAssertLessThanOrEqual(bounded.count, 256 * 1_024)
+        let (_, restored) = try makeMirroringStore(defaults: defaults)
+        _ = try await restored.synchronizeProfileMirror()
+        let retained = try await restored.manualMappings(profileID: profile.id)
+        XCTAssertEqual(retained, ["channel-7": longID])
+        try await restored.deleteProfile(id: profile.id)
+        let (_, empty) = try makeMirroringStore(defaults: defaults)
+        let emptyCount = try await empty.synchronizeProfileMirror()
+        XCTAssertEqual(emptyCount, 0)
+    }
+
+    func testOversizedLegacyMigrationKeepsPreviousMirrorAndReportsIncompleteRecovery() async throws {
+        let defaults = try mirrorDefaults()
+        let (container, original) = try makeMirroringStore(defaults: defaults)
+        let profile = try await original.createProfile(input(name: "Legacy"), now: date(10))
+        let previousData = defaults.data(forKey: SourceProfileMirror.storageKey)
+        let legacy = SwiftDataLibraryStore(modelContainer: container)
+        for index in 0..<8 {
+            try await legacy.setManualMapping(
+                profileID: profile.id, channelID: "channel-\(index)",
+                xmltvChannelID: String(repeating: "x", count: 145_000)
+            )
+        }
+        let upgrading = SwiftDataLibraryStore(modelContainer: container, profileMirror: SourceProfileMirror(defaults: defaults))
+        _ = try await upgrading.synchronizeProfileMirror()
+        let status = await upgrading.recoveryStatus()
+        let mappings = try await upgrading.manualMappings(profileID: profile.id)
+        XCTAssertEqual(status, .capacityExceeded(limit: 256 * 1_024))
+        XCTAssertEqual(mappings.count, 8)
+        XCTAssertEqual(defaults.data(forKey: SourceProfileMirror.storageKey), previousData)
+        try await upgrading.deleteProfile(id: profile.id)
+        let clearedStatus = await upgrading.recoveryStatus()
+        XCTAssertEqual(clearedStatus, .current)
+        let (_, empty) = try makeMirroringStore(defaults: defaults)
+        let count = try await empty.synchronizeProfileMirror()
+        XCTAssertEqual(count, 0)
+    }
+
+    func testMirrorWriteBoundaryRejectsOversizedBytesWithoutReplacingPreviousValue() throws {
+        let defaults = try mirrorDefaults()
+        let previous = Data("previous recovery data".utf8)
+        defaults.set(previous, forKey: SourceProfileMirror.storageKey)
+        let mirror = SourceProfileMirror(defaults: defaults)
+        XCTAssertThrowsError(try mirror.save(encoded: Data(repeating: 0, count: 256 * 1_024 + 1))) {
+            XCTAssertEqual($0 as? LibraryRepositoryError, .recoveryDataTooLarge(limit: 256 * 1_024))
+        }
+        XCTAssertEqual(defaults.data(forKey: SourceProfileMirror.storageKey), previous)
+    }
+
     func testIntactStoreKeepsItsProfilesAndIsNotDuplicatedByTheMirror() async throws {
         let defaults = try mirrorDefaults()
         let (container, store) = try makeMirroringStore(defaults: defaults)
@@ -2466,6 +2683,40 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let reopenedProfiles = try await reopened.profiles()
         XCTAssertEqual(reopenedCount, 1)
         XCTAssertEqual(reopenedProfiles.map(\.id), [usableID])
+    }
+
+    func testOversizedProfileOnlyLegacyMirrorRetainsProfilesAndRestoresMissingSelection() async throws {
+        let defaults = try mirrorDefaults()
+        let profileID = UUID()
+        let longName = String(repeating: "x", count: 270_000)
+        let legacy: [String: Any] = [
+            "profiles": [[
+                "id": profileID.uuidString,
+                "name": longName,
+                "m3uURLString": "https://playlist.example/legacy.m3u",
+                "epgURLString": "https://epg.example/legacy.xml",
+                "m3uRefreshIntervalRaw": 21_600,
+                "epgRefreshIntervalRaw": 86_400,
+                "createdAt": 10,
+                "updatedAt": 10
+            ]]
+        ]
+        let originalBytes = try JSONSerialization.data(withJSONObject: legacy)
+        defaults.set(originalBytes, forKey: SourceProfileMirror.storageKey)
+        let (_, restored) = try makeMirroringStore(defaults: defaults)
+        let count = try await restored.synchronizeProfileMirror()
+        let profiles = try await restored.profiles()
+        let active = try await restored.activeProfile()
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(profiles.first?.name, longName)
+        XCTAssertEqual(active?.id, profileID)
+        let status = await restored.recoveryStatus()
+        XCTAssertEqual(status, .capacityExceeded(limit: 256 * 1_024))
+        XCTAssertEqual(defaults.data(forKey: SourceProfileMirror.storageKey), originalBytes)
+        try await restored.deleteProfile(id: profileID)
+        let (_, empty) = try makeMirroringStore(defaults: defaults)
+        let emptyCount = try await empty.synchronizeProfileMirror()
+        XCTAssertEqual(emptyCount, 0)
     }
 
     func testStoreWithoutMirrorDefaultsNeverTouchesTheMirror() async throws {

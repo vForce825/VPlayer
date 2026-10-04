@@ -529,6 +529,20 @@ final class FakePipelineVideoRenderer: PlaybackVideoRendering, @unchecked Sendab
     private(set) var resetCount = 0
     private var automaticallyCompletesResets = true
     private var pendingReset: PendingReset?
+    var naturalEOFAcceptedEndPTS: CMTime? {
+        lock.withLock {
+            frames.map { CMTimeAdd($0.presentationTimeStamp, $0.duration) }
+                .filter(\.isNumeric).max { CMTimeCompare($0, $1) < 0 }
+        }
+    }
+    private var storedNaturalEOFDrainFailure: PlaybackCoreError?
+    var naturalEOFDrainFailure: PlaybackCoreError? { lock.withLock { storedNaturalEOFDrainFailure } }
+    func setNaturalEOFDrainFailure(_ failure: PlaybackCoreError?) {
+        lock.withLock { storedNaturalEOFDrainFailure = failure }
+    }
+    private var naturalEOFDrainReady = true
+    var isDrainedForNaturalEOF: Bool { lock.withLock { naturalEOFDrainReady && pendingReset == nil && storedNaturalEOFDrainFailure == nil } }
+    func setNaturalEOFDrainReady(_ ready: Bool) { lock.withLock { naturalEOFDrainReady = ready } }
 
     func enqueue(_ frame: VideoPresentationFrame) {
         lock.withLock {
@@ -936,6 +950,7 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
         var pushError: PlaybackCoreError?
         var drainError: PlaybackCoreError?
         private(set) var drainCount = 0
+        var drainEvents: [AudioAssemblerEvent] = []
         init(eventSink: @escaping @Sendable (AudioAssemblerEvent) -> Void = { _ in }) {
             self.eventSink = eventSink
         }
@@ -947,6 +962,8 @@ final class FakePlaybackAssemblerBuilder: PlaybackAssemblerBuilding, @unchecked 
         func drain() throws {
             drainCount += 1
             if let drainError { throw drainError }
+            for event in drainEvents { eventSink(event) }
+            drainEvents.removeAll()
         }
     }
 

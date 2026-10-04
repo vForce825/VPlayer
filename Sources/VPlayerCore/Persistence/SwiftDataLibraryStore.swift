@@ -3,6 +3,8 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import Foundation
+import Observation
+import OSLog
 import SwiftData
 
 enum LibraryStoreSavePhase: Equatable, Sendable {
@@ -54,7 +56,7 @@ typealias LibraryStoreSaveContextObserver = @Sendable (
 
 @ModelActor
 public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting,
-    ConditionalRefreshStatusWriting {
+    ConditionalRefreshStatusWriting, LibraryRecoveryStatusProviding {
     private static let readBatchSize = 256
     private var saveFault: LibraryStoreSaveFault?
     private var epgCancellationCheck: @Sendable () throws -> Void = {
@@ -66,9 +68,132 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     /// opt-in so that in-memory fixture and test stores cannot overwrite the
     /// one copy of the real profiles with seeded data.
     private var profileMirror: SourceProfileMirror?
+    private var mirrorRecoveryStatus: LibraryRecoveryStatus = .current
 
-    /// Mirrors profile configuration into `profileMirror` on every change, so
-    /// `synchronizeProfileMirror()` can rebuild the profiles after the system
+    public func recoveryStatus() -> LibraryRecoveryStatus { mirrorRecoveryStatus }
+
+    // ResultsObserver is Observable, not an AsyncSequence. These observers and
+    // every model they expose remain confined to this ModelActor's context.
+    private var observedProfiles: ResultsObserver<SourceProfileRecord, Never>?
+    private var observedState: ResultsObserver<LibraryStateRecord, Never>?
+    private var observedMappings: ResultsObserver<ManualEPGMappingRecord, Never>?
+    private var observationID: UUID?
+    private var observedSnapshot: CommittedLibrarySnapshot?
+    private var committedObservationRevision: UInt64 = 0
+    private var changeContinuations: [UUID: AsyncStream<CommittedLibrarySnapshot>.Continuation] = [:]
+
+    /// Produces committed metadata values only; no staging rows or model objects
+    /// cross isolation. The first value is the caller's comparison baseline.
+    public func committedChanges() throws -> AsyncStream<CommittedLibrarySnapshot> {
+        if observedProfiles == nil {
+            let profiles = try ResultsObserver<SourceProfileRecord, Never>(
+                modelContext: modelContext, isolation: self
+            )
+            let state = try ResultsObserver<LibraryStateRecord, Never>(
+                modelContext: modelContext, isolation: self
+            )
+            let mappings = try ResultsObserver<ManualEPGMappingRecord, Never>(
+                modelContext: modelContext, isolation: self
+            )
+            observedProfiles = profiles
+            observedState = state
+            observedMappings = mappings
+            let id = UUID()
+            observationID = id
+            do {
+                _ = publishCommittedSnapshot(try trackCommittedSnapshot(observationID: id))
+            } catch {
+                observationID = nil
+                observedProfiles = nil
+                observedState = nil
+                observedMappings = nil
+                throw error
+            }
+        }
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<CommittedLibrarySnapshot>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        changeContinuations[id] = continuation
+        continuation.onTermination = { @Sendable [weak self] _ in
+            Task { await self?.removeCommittedChangeConsumer(id) }
+        }
+        if let observedSnapshot { continuation.yield(observedSnapshot) }
+        return stream
+    }
+
+    /// The explicit local-commit fence reads the writer's already-saved context
+    /// synchronously. It does not depend on when native observer callbacks run.
+    public func committedObservationBoundary() throws -> CommittedLibrarySnapshot {
+        publishCommittedSnapshot(try readCommittedSnapshot())
+    }
+
+    private func readCommittedSnapshot() throws -> CommittedLibrarySnapshot {
+        var profiles: [UUID: CommittedLibrarySnapshot.Profile] = [:]
+        var states: [String: CommittedLibrarySnapshot.State] = [:]
+        var mappings: [CommittedLibrarySnapshot.MappingKey: String] = [:]
+        for record in try modelContext.fetch(FetchDescriptor<SourceProfileRecord>()) {
+            profiles[record.id] = .init(record)
+        }
+        for record in try modelContext.fetch(FetchDescriptor<LibraryStateRecord>()) {
+            states[record.key] = .init(activeProfileID: record.activeProfileID)
+        }
+        for record in try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>()) {
+            mappings[.init(profileID: record.sourceProfileID, channelID: record.channelID)] = record.xmltvChannelID
+        }
+        return CommittedLibrarySnapshot(profiles: profiles, states: states, mappings: mappings)
+    }
+
+    private func trackCommittedSnapshot(observationID: UUID) throws -> CommittedLibrarySnapshot {
+        let result = withObservationTracking {
+            // Track native collection changes plus the fetched records' scalar
+            // metadata. Re-fetch on this same context so a delayed native results
+            // collection can never roll an explicit commit fence backwards.
+            _ = observedProfiles?.results
+            _ = observedState?.results
+            _ = observedMappings?.results
+            return Result { try readCommittedSnapshot() }
+        } onChange: { [weak self] in
+            // Observation fires on willSet. The actor hop waits for synchronous
+            // save/rollback to settle and coalesces one import transaction.
+            Task { await self?.committedResultsDidChange(observationID: observationID) }
+        }
+        return try result.get()
+    }
+
+    private func committedResultsDidChange(observationID: UUID) {
+        guard self.observationID == observationID else { return }
+        do {
+            _ = publishCommittedSnapshot(try trackCommittedSnapshot(observationID: observationID))
+        } catch {
+            // Tracking has already rearmed; a later real change retries the read.
+            Logger(subsystem: "com.vforce.vplayer", category: "LibraryObservation")
+                .error("Cannot read committed library observation: \(String(describing: error), privacy: .private)")
+        }
+    }
+
+    @discardableResult
+    private func publishCommittedSnapshot(_ snapshot: CommittedLibrarySnapshot) -> CommittedLibrarySnapshot {
+        if let observedSnapshot, snapshot.change(since: observedSnapshot) == nil { return observedSnapshot }
+        committedObservationRevision &+= 1
+        let next = snapshot.numbered(committedObservationRevision)
+        observedSnapshot = next
+        for continuation in changeContinuations.values { continuation.yield(next) }
+        return next
+    }
+
+    private func removeCommittedChangeConsumer(_ id: UUID) {
+        changeContinuations[id] = nil
+        guard changeContinuations.isEmpty else { return }
+        observationID = nil
+        observedProfiles = nil
+        observedState = nil
+        observedMappings = nil
+        observedSnapshot = nil
+    }
+
+    /// Mirrors source configuration and manual mappings on every user edit, so
+    /// `synchronizeProfileMirror()` can rebuild those choices after the system
     /// deletes the store. Only the production store needs this.
     public init(
         modelContainer: ModelContainer,
@@ -87,6 +212,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         },
         epgStagingCheckpoint: (@Sendable (EPGStagingCheckpoint) -> Void)? = nil,
         saveContextObserver: LibraryStoreSaveContextObserver? = nil,
+        profileMirror: SourceProfileMirror? = nil,
         saveFault: @escaping LibraryStoreSaveFault
     ) {
         let modelContext = ModelContext(modelContainer)
@@ -95,6 +221,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         self.epgCancellationCheck = epgCancellationCheck
         self.epgStagingCheckpoint = epgStagingCheckpoint
         self.saveContextObserver = saveContextObserver
+        self.profileMirror = profileMirror
         self.saveFault = saveFault
     }
 
@@ -116,7 +243,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         let profileID = UUID()
         let m3uURLIdentity = SourceURLIdentity(url: input.m3uURL)
         let epgURLIdentity = SourceURLIdentity(url: input.epgURL)
-        try commitProfileChange(.profileCreate) {
+        try commitRecoveryChange(.profileCreate) {
             let record = SourceProfileRecord(
                 id: profileID,
                 name: input.name,
@@ -145,7 +272,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         let epgURLIdentity = SourceURLIdentity(url: input.epgURL)
         var oldPlaylistSnapshotID: UUID?
         var oldEPGSnapshotID: UUID?
-        try commitProfileChange(.profileUpdate) {
+        try commitRecoveryChange(.profileUpdate) {
             let record = try profileRecord(id: id)
             if record.m3uURLString != m3uURLIdentity.rawValue {
                 oldPlaylistSnapshotID = record.playlistSnapshotID
@@ -181,7 +308,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
 
     public func deleteProfile(id: UUID) throws {
-        try commitProfileChange(.profileDelete) {
+        try commitRecoveryChange(.profileDelete) {
             let record = try profileRecord(id: id)
             if let snapshotID = record.playlistSnapshotID {
                 try deletePlaylistSnapshot(id: snapshotID)
@@ -208,7 +335,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
 
     public func setActiveProfile(id: UUID) throws {
-        try commitProfileChange(.activeProfile) {
+        try commitRecoveryChange(.activeProfile) {
             _ = try profileRecord(id: id)
             let state = try requiredStateRecord()
             state.activeProfileID = id
@@ -237,13 +364,21 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         var restoredIDs: Set<UUID> = []
         // Committing through the profile path rewrites the mirror afterwards,
         // so entries dropped as unrestorable do not linger for the next launch.
-        try commitProfileChange(.profileRestore) {
+        try commitRecoveryChange(.profileRestore, restoring: snapshot) {
             for mirrored in snapshot.profiles {
-                guard let record = mirrored.makeRecord() else { continue }
+                guard let record = mirrored.makeRecord(),
+                      restoredIDs.insert(record.id).inserted else { continue }
                 modelContext.insert(record)
-                restoredIDs.insert(record.id)
             }
             guard !restoredIDs.isEmpty else { return }
+            var restoredChannelIDs: [UUID: Set<String>] = [:]
+            for mirrored in snapshot.manualMappings {
+                guard restoredIDs.contains(mirrored.sourceProfileID),
+                      let record = mirrored.makeRecord(),
+                      restoredChannelIDs[record.sourceProfileID, default: []]
+                        .insert(record.channelID).inserted else { continue }
+                modelContext.insert(record)
+            }
             let state = try requiredStateRecord()
             let mirroredSelection = snapshot.activeProfileID.flatMap {
                 restoredIDs.contains($0) ? $0 : nil
@@ -387,7 +522,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         channelID: String,
         xmltvChannelID: String?
     ) throws {
-        try commit(.manualMapping) {
+        try commitRecoveryChange(.manualMapping) {
             _ = try profileRecord(id: profileID)
             let existing = try mappingRecord(profileID: profileID, channelID: channelID)
             if let xmltvChannelID {
@@ -1012,27 +1147,67 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         try save(.epgStaging, context: context)
     }
 
-    /// A profile mutation, plus the mirror update that keeps the UserDefaults
-    /// copy from lagging the store.
-    private func commitProfileChange(
+    /// Admit user-choice edits against the recovery budget before committing.
+    /// Failed edits leave both SwiftData and the previous mirror untouched.
+    /// Legacy shrink/delete operations can commit while still oversized; their
+    /// incomplete recovery stays visible until the entire snapshot fits.
+    private func commitRecoveryChange(
         _ phase: LibraryStoreSavePhase,
+        restoring snapshot: SourceProfileMirrorSnapshot? = nil,
         changes: () throws -> Void
     ) throws {
-        try commit(phase, changes: changes)
-        // The mutation is already durable at this point. A mirror that cannot
-        // be rebuilt leaves the recovery copy one edit stale, which is a far
-        // smaller loss than failing an edit the user watched succeed.
-        try? updateProfileMirror()
+        guard let profileMirror else {
+            try commit(phase, changes: changes)
+            return
+        }
+        let previous = try snapshot ?? profileMirrorSnapshot()
+        var encoded: Data?
+        try commit(phase) {
+            try changes()
+            let updated = try profileMirror.encode(profileMirrorSnapshot())
+            if snapshot == nil,
+               updated.count > SourceProfileMirror.maximumEncodedByteCount,
+               updated.count > (try profileMirror.encode(previous)).count {
+                throw LibraryRepositoryError.recoveryDataTooLarge(
+                    limit: SourceProfileMirror.maximumEncodedByteCount
+                )
+            }
+            encoded = updated
+        }
+        if let encoded { try saveProfileMirror(encoded: encoded) }
     }
 
     private func updateProfileMirror() throws {
         guard let profileMirror else { return }
+        // Opening an oversized legacy store remains nonfatal. Keep every
+        // database row and the previous mirror; expose the unprotected state.
+        try saveProfileMirror(encoded: profileMirror.encode(profileMirrorSnapshot()))
+    }
+
+    private func saveProfileMirror(encoded: Data) throws {
+        guard let profileMirror else { return }
+        guard encoded.count <= SourceProfileMirror.maximumEncodedByteCount else {
+            mirrorRecoveryStatus = .capacityExceeded(limit: SourceProfileMirror.maximumEncodedByteCount)
+            return
+        }
+        try profileMirror.save(encoded: encoded)
+        mirrorRecoveryStatus = .current
+    }
+
+    private func profileMirrorSnapshot() throws -> SourceProfileMirrorSnapshot {
         let records = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
             .sorted(by: Self.profileOrder)
-        profileMirror.save(SourceProfileMirrorSnapshot(
+        let profileIDs = Set(records.map(\.id))
+        let mappings = try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>())
+            .filter { profileIDs.contains($0.sourceProfileID) }
+            .sorted {
+                ($0.sourceProfileID.uuidString, $0.channelID) < ($1.sourceProfileID.uuidString, $1.channelID)
+            }
+        return SourceProfileMirrorSnapshot(
             profiles: records.map(MirroredSourceProfile.init(record:)),
-            activeProfileID: try stateRecord()?.activeProfileID
-        ))
+            activeProfileID: try stateRecord()?.activeProfileID,
+            manualMappings: mappings.map(MirroredManualEPGMapping.init(record:))
+        )
     }
 
     private func commit(

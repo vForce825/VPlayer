@@ -57,15 +57,22 @@ final class CompressedAudioAssembler {
 
     func push(_ packet: DemuxPacket) throws {
         try ensureFramerIsCurrent()
+        let continuingWithoutPTS = !packet.presentationTimeStamp.isValid &&
+            framer?.canContinueWithoutTimestamp == true
         guard packet.streamIndex == descriptor.streamIndex,
               packet.codec == .audio(descriptor.codec),
               !packet.data.isEmpty,
-              packet.presentationTimeStamp.isNumeric else {
+              packet.presentationTimeStamp.isNumeric || continuingWithoutPTS else {
             throw Self.validationError()
         }
-        let pts = try audioExactTicks(packet.presentationTimeStamp, timeBase: descriptor.timeBase)
+        let pts: Int64
+        if continuingWithoutPTS {
+            pts = Int64.min
+        } else {
+            pts = try audioExactTicks(packet.presentationTimeStamp, timeBase: descriptor.timeBase)
+        }
         let presentationTimeStamp = descriptor.timeBase.cmTime(forFFmpegValue: pts)
-        guard presentationTimeStamp.isNumeric else { throw Self.validationError() }
+        guard presentationTimeStamp.isNumeric || continuingWithoutPTS else { throw Self.validationError() }
         let framedPacket = CompressedAudioFramingPacket(
             data: packet.data,
             presentationTimeStamp: presentationTimeStamp,

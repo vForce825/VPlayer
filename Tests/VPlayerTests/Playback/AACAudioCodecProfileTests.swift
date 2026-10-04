@@ -9,6 +9,34 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AACAudioCodecProfileTests: XCTestCase {
+    func testLCWithExplicitAbsentSBRSyncExtensionRetainsLCFormat() throws {
+        for (rate, bytes): (Int32, [UInt8]) in [
+            (44_100, [0x12, 0x10, 0x56, 0xE5, 0x00]),
+            (48_000, [0x11, 0x90, 0x56, 0xE5, 0x00]),
+        ] {
+            let asc = Data(bytes)
+            let source = makeSource(sampleRate: rate, channels: 2, extradata: asc)
+            let inspected = try AACAudioCodecProfile(source: source).inspect(
+                makeFrame(Data([0x21, 0x22])), source: source)
+            XCTAssertEqual(inspected.systemFormat.profileID, .aacLC)
+            XCTAssertEqual(inspected.systemFormat.sampleRate, rate)
+            XCTAssertEqual(inspected.sampleCount, 1_024)
+            XCTAssertEqual(inspected.decoderExtradata, asc)
+            try assertCoreAudioAcceptsMagicCookie(
+                AudioFormatDescriptionBuilder.make(inspected.systemFormat).description)
+        }
+    }
+
+    func testSyncExtensionRejectsMalformedTruncatedPresentSBRAndExtraTail() {
+        for suffix: [UInt8] in [
+            [0x56], [0x56, 0xE5], [0x56, 0xE5, 0x80],
+            [0x56, 0xE5, 0x01], [0x56, 0xE4, 0x00],
+            [0x56, 0xE5, 0x00, 0x00], [0x00, 0x00, 0x00],
+        ] {
+            XCTAssertThrowsError(try AudioSpecificConfig.parse(Data([0x11, 0x90] + suffix)))
+        }
+    }
+
     func testRawAACAcceptsExactlyOneMiBAndRejectsOneByteMore() throws {
         let source = makeSource(
             sampleRate: 48_000,

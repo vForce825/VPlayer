@@ -250,6 +250,11 @@ public protocol AudioRenderPipelineProtocol: AnyObject {
         generation: MediaGeneration
     ) throws
     func enqueue(_ sample: CompressedAudioSample) throws
+    /// Close input without flushing accepted media. Drain state describes physical
+    /// renderer acceptance, not consumption; the shared clock owns tail completion.
+    func finishInputForNaturalEOF()
+    var isDrainedForNaturalEOF: Bool { get }
+    var naturalEOFAcceptedEndPTS: CMTime? { get }
     func activateContinuityIsland(
         _ islandID: AudioContinuityIslandID,
         generation: MediaGeneration
@@ -281,6 +286,10 @@ protocol AudioRendererCoverageObserving: AnyObject {
 }
 
 public extension AudioRenderPipelineProtocol {
+    func finishInputForNaturalEOF() {}
+    var isDrainedForNaturalEOF: Bool { true }
+    var naturalEOFAcceptedEndPTS: CMTime? { nil }
+
     func stopAwaitingRendererRemoval() async {
         stop()
     }
@@ -325,15 +334,26 @@ enum AudioRendererEvent: Sendable, Equatable {
 
 enum AudioRendererEnqueueResult: Sendable, Equatable {
     case accepted
+    case acceptedWithSuggestedFlush
     case backpressured
+    case cancelled
+
+    var isAccepted: Bool {
+        self == .accepted || self == .acceptedWithSuggestedFlush
+    }
 }
 
 protocol AudioRenderer: AnyObject, Sendable {
     var identity: AudioRendererIdentity { get }
     var mediaKind: AudioRendererMediaKind { get }
+    /// False when the SDK exposes acceptance but no independent consumption signal.
+    var canObserveConsumption: Bool { get }
     var isReadyForMoreMediaData: Bool { get }
     var hasSufficientMediaDataForReliablePlaybackStart: Bool { get }
-    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void)
+    func cancelPendingEnqueue()
+    func finishedEnqueuing()
     func flush()
     // A demand opportunity only. The pipeline must correlate a post-reset
     // acceptance and backpressure edge before treating this as queue consumption.
@@ -341,6 +361,10 @@ protocol AudioRenderer: AnyObject, Sendable {
     func stopRequestingMediaData()
     func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void)
     func stopObserving()
+}
+
+extension AudioRenderer {
+    var canObserveConsumption: Bool { true }
 }
 
 protocol AudioRendererFactory: Sendable {
@@ -361,8 +385,13 @@ protocol AudioRenderSynchronizing: AnyObject, Sendable {
 
 protocol PCMAudioDecoding: AnyObject, Sendable {
     func push(_ sample: CompressedAudioSample) throws -> [CMSampleBuffer]
+    func drainForNaturalEOF() throws -> [CMSampleBuffer]
     func flush()
     func destroy()
+}
+
+extension PCMAudioDecoding {
+    func drainForNaturalEOF() throws -> [CMSampleBuffer] { [] }
 }
 
 protocol PCMAudioDecoderFactory: Sendable {

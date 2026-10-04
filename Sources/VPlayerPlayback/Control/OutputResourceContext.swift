@@ -267,6 +267,11 @@ struct OutputHandoffAdmission: Sendable {
     let startsCleanup: Bool
 }
 
+struct PendingResetResumeIntent: Sendable, Equatable {
+    let epoch: AudioSessionLifecycleEpoch
+    let leaseID: UInt64
+}
+
 enum OutputUserControlKind: Sendable, Equatable { case pause, resume }
 struct OutputUserControlRequest: Sendable, Equatable {
     let kind: OutputUserControlKind
@@ -277,6 +282,9 @@ struct OutputUserControlRequest: Sendable, Equatable {
     let mediaServicesEpoch: UInt64
     let resetPreRouteBinding: ResetPreRouteTicketBinding?
     var explicitResumeLease: PlaybackAudioSessionLease? = nil
+    var userInitiated = true
+    var originalActionEpoch: AudioSessionLifecycleEpoch? = nil
+    var consumePendingResetResume = false
 }
 enum OutputUserControlResult: Sendable, Equatable {
     case rejected, acceptedWaiting
@@ -285,6 +293,7 @@ enum OutputUserControlResult: Sendable, Equatable {
 struct OutputUserControlSafetyUpdate: Sendable, Equatable {
     let userPaused: Bool
     let interruptionVeto: Bool
+    let mediaServicesResumeRequired: Bool
     let freezeGeneration: UInt64
 }
 
@@ -323,7 +332,7 @@ enum PlaybackBudgetControlResult: Sendable, Equatable {
     case playbackOperationRearmed(PlaybackDeadlineRearm<PlaybackOperationDeadlineArmTicket>)
 }
 enum OutputControlRequest: Sendable, Equatable {
-    case playbackAdmission(UUID)
+    case playbackAdmission(UUID, originalActionEpoch: AudioSessionLifecycleEpoch)
     case audioEventRelayLookup
     case audioRelayOverflow(recordNonce: UInt64)
     case audioSessionCall(AudioSessionBlockingCallAction)
@@ -336,7 +345,8 @@ enum OutputControlRequest: Sendable, Equatable {
 }
 enum OutputControlApplication: Sendable, Equatable {
     case playbackAdmissionNeedsCleanupJoin
-    case playbackAdmitted(CurrentPlaybackOperationDeadlineTicket, PlaybackOutputSafetyState, freezeGeneration: UInt64)
+    case playbackAdmitted(CurrentPlaybackOperationDeadlineTicket, PlaybackOutputSafetyState,
+        freezeGeneration: UInt64, clearsMediaServicesResume: Bool)
     case audioEventRelay(PlaybackAudioSessionEventRelay)
     case audioSessionCall(AudioSessionBlockingCallApplication)
     case registrationValidated
@@ -476,6 +486,7 @@ struct OutputResourceContext: Sendable {
     var resetProof: ResetDrainProof?
     // 物理veto期间的resume只保存意图；准确当前proof到达后才能消费。
     var userResumeRequested = false
+    var pendingResetResumeIntent: PendingResetResumeIntent?
     var pendingReset: MediaServicesResetRootIdentity?
     var interruptionDrainRequired = false
     var teardownRequested = false

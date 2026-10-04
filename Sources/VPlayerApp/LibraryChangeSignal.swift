@@ -51,6 +51,89 @@ final class LibraryChangeSignal {
     @ObservationIgnored
     private var refreshCompletionClaimByKey: [RefreshKey: UUID] = [:]
 
+    @ObservationIgnored
+    private var committedObservationTask: Task<Void, Never>?
+
+    @ObservationIgnored
+    private var committedObservationStore: SwiftDataLibraryStore?
+
+    @ObservationIgnored
+    private var committedObservationID: UUID?
+
+    @ObservationIgnored
+    private var lastCommittedSnapshot: CommittedLibrarySnapshot?
+
+    deinit { committedObservationTask?.cancel() }
+
+    /// Subscribe before library preparation so profile restoration and external
+    /// context commits flow through the same generation/coalescing machinery.
+    /// Only immutable snapshots cross from the store's model actor to MainActor.
+    func observeCommittedChanges(in store: SwiftDataLibraryStore) async throws {
+        guard committedObservationStore !== store else { return }
+        let id = UUID()
+        committedObservationID = id
+        let stream = try await store.committedChanges()
+        var iterator = stream.makeAsyncIterator()
+        // Consume the initial value before returning to preparation; a burst of
+        // saved changes cannot overwrite an as-yet unread comparison baseline.
+        guard let baseline = await iterator.next(isolation: MainActor.shared),
+              committedObservationID == id else { return }
+        committedObservationTask?.cancel()
+        committedObservationStore = store
+        lastCommittedSnapshot = baseline
+        // Hand the iterator to its sole remaining consumer after the baseline
+        // read completes. Keep every mutation on MainActor, including next().
+        committedObservationTask = Task { @MainActor [weak self, iterator] in
+            var iterator = iterator
+            while let snapshot = await iterator.next(isolation: MainActor.shared) {
+                guard !Task.isCancelled, self?.committedObservationID == id else { return }
+                self?.consumeCommittedSnapshot(snapshot)
+            }
+        }
+    }
+
+    func consumeCommittedSnapshot(_ snapshot: CommittedLibrarySnapshot) {
+        if let previous = lastCommittedSnapshot {
+            guard snapshot.revision > previous.revision else { return }
+            if let change = snapshot.change(since: previous) { notify(change) }
+        }
+        lastCommittedSnapshot = snapshot
+    }
+
+    /// Must complete while a local refresh claim is still intercepting updates.
+    /// Delayed native deliveries at/before this revision are then harmless;
+    /// genuinely newer external changes continue through normal scoped reloads.
+    @discardableResult
+    func flushCommittedChanges() async -> Bool {
+        guard let committedObservationStore else { return false }
+        return await flushCommittedChanges(in: committedObservationStore)
+    }
+
+    @discardableResult
+    func flushCommittedChanges(in store: SwiftDataLibraryStore) async -> Bool {
+        if let committedObservationStore, committedObservationStore !== store { return false }
+        let observationID = committedObservationID
+        do {
+            let snapshot = try await store.committedObservationBoundary()
+            guard committedObservationID == observationID else { return false }
+            consumeCommittedSnapshot(snapshot)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func notify(_ change: CommittedLibraryChange) {
+        switch change {
+        case .full:
+            notify()
+        case let .refreshes(resourcesByProfile):
+            for (profileID, resources) in resourcesByProfile {
+                for resource in resources { notify(profileID: profileID, resource: resource) }
+            }
+        }
+    }
+
     func notify() {
         generation &+= 1
         latestFullReloadGeneration = generation

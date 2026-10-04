@@ -14,106 +14,270 @@ final class SystemAudioRenderer: AudioRenderer, @unchecked Sendable {
     let mediaKind: AudioRendererMediaKind
     let renderer: AVSampleBufferAudioRenderer
 
-    private let callbackQueue: DispatchQueue
-    private let notificationCenter: NotificationCenter
-    private var statusObservation: NSKeyValueObservation?
-    private var notificationTokens: [NSObjectProtocol] = []
-    private var requesting = false
+    private let stateLock = NSLock()
+    private var receiverOwner: (any AudioReceiverEndpoint)?
+    private var feedTask: Task<Void, Never>?
+    private var controlTask: Task<Void, Never>?
+    private var pendingFlush = false
+    private var pendingObservationRevision: UInt64?
+    private var observingRevision: UInt64?
+    private var pendingRemoval: RemovalRequest?
+
+    private struct RemovalRequest: @unchecked Sendable {
+        let synchronizer: AVSampleBufferRenderSynchronizer
+        let time: CMTime
+    }
+    private enum ControlOperation {
+        case flush(Task<Void, Never>?)
+        case observe(UInt64)
+        case remove(RemovalRequest)
+        case idle((@Sendable () -> Void)?)
+    }
+    private var revision: UInt64 = 0
+    private var detachedResult: Bool?
+    private var removalInFlight = false
+    private var removalWaiters: [@Sendable (Bool) -> Void] = []
+    private var readyHandler: (@Sendable () -> Void)?
+    private var eventHandler: (@Sendable (AudioRendererEvent) -> Void)?
     private let failureLock = NSLock()
     private var firstFailureEvent: AudioRendererEvent?
 
-    init(
-        identity: AudioRendererIdentity,
-        mediaKind: AudioRendererMediaKind,
+    init(identity: AudioRendererIdentity, mediaKind: AudioRendererMediaKind,
         renderer: AVSampleBufferAudioRenderer = AVSampleBufferAudioRenderer(),
-        notificationCenter: NotificationCenter = .default
-    ) {
+        notificationCenter: NotificationCenter = .default,
+        receiverEndpoint: (any AudioReceiverEndpoint)? = nil) {
         self.identity = identity
         self.mediaKind = mediaKind
         self.renderer = renderer
-        self.notificationCenter = notificationCenter
-        callbackQueue = DispatchQueue(
-            label: "org.vplayer.playback.audio.renderer.\(identity.rawValue)",
-            qos: .userInitiated
-        )
+        receiverOwner = receiverEndpoint
+        _ = notificationCenter
     }
 
-    deinit {
-        if requesting {
-            renderer.stopRequestingMediaData()
-        }
-        statusObservation?.invalidate()
-        for token in notificationTokens {
-            notificationCenter.removeObserver(token)
-        }
+    deinit { feedTask?.cancel(); controlTask?.cancel() }
+
+    // Receiver suspension supplies backpressure. This reports the capacity of
+    // our single submission slot, never the deprecated renderer readiness flag.
+    var isReadyForMoreMediaData: Bool {
+        stateLock.withLock { receiverOwner != nil && feedTask == nil && controlTask == nil }
+    }
+    var hasSufficientMediaDataForReliablePlaybackStart: Bool { false }
+    var canObserveConsumption: Bool { false }
+
+    func attach(to synchronizer: AVSampleBufferRenderSynchronizer) {
+        let receiver = synchronizer.sampleBufferReceiver(adding: renderer)
+        let owner = AudioReceiverOwner(receiver: receiver)
+        stateLock.withLock { receiverOwner = owner }
     }
 
-    var isReadyForMoreMediaData: Bool { renderer.isReadyForMoreMediaData }
-
-    var hasSufficientMediaDataForReliablePlaybackStart: Bool {
-        renderer.hasSufficientMediaDataForReliablePlaybackStart
-    }
-
-    func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void) {
         let formatID = CMSampleBufferGetFormatDescription(sampleBuffer)
             .map(CMFormatDescriptionGetMediaSubType) ?? 0
-        let isPCM = formatID == kAudioFormatLinearPCM
-        guard isPCM == (mediaKind == .linearPCM) else {
-            throw PlaybackCoreError.audioRendererFailed("renderer.media-kind")
+        guard (formatID == kAudioFormatLinearPCM) == (mediaKind == .linearPCM) else {
+            completion(.failure(PlaybackCoreError.audioRendererFailed("renderer.media-kind")))
+            return
         }
-        guard isReadyForMoreMediaData else { return .backpressured }
-        renderer.enqueue(sampleBuffer)
-        return .accepted
+        let sample = RendererReceiverSample(buffer: sampleBuffer)
+        let started = stateLock.withLock { () -> Bool in
+            guard let owner = receiverOwner, feedTask == nil, controlTask == nil else { return false }
+            observingRevision = nil
+            let submissionRevision = revision
+            feedTask = Task { [weak self] in
+                let result: Result<AudioReceiverOutcome, any Error>
+                do {
+                    try Task.checkCancellation()
+                    result = .success(try await owner.enqueue(sample))
+                } catch is CancellationError {
+                    result = .success(.init(result: .cancelled, events: []))
+                } catch { result = .failure(error) }
+                if case let .success(outcome) = result,
+                   outcome.events.contains(where: { event in
+                       if case .automaticFlush = event { return true }
+                       return false
+                   }) {
+                    // Only an actual automatic-flush reason requires this
+                    // immediate physical barrier. Configuration-only suggestions
+                    // stay under the pipeline's coalescing/replay policy.
+                    // The accepted sample remains accepted. Keep the sole feed
+                    // slot occupied until the SDK-required flush has settled;
+                    // an acceptance callback may synchronously submit the next sample.
+                    await owner.flush()
+                }
+                guard let self else { return }
+                let state = stateLock.withLock { () -> (Bool, (@Sendable () -> Void)?) in
+                    feedTask = nil
+                    return (revision == submissionRevision, readyHandler)
+                }
+                if state.0 {
+                    switch result {
+                    case let .success(outcome):
+                        completion(.success(outcome.result))
+                        for event in outcome.events { emit(event, revision: submissionRevision) }
+                    case let .failure(error): completion(.failure(error))
+                    }
+                } else { completion(.success(.cancelled)) }
+                state.1?()
+            }
+            return true
+        }
+        if !started { completion(.success(.backpressured)) }
+    }
+
+    func cancelPendingEnqueue() {
+        let pending = stateLock.withLock { () -> Bool in
+            guard let feedTask else { return false }
+            feedTask.cancel()
+            return true
+        }
+        if pending { flush() }
     }
 
     func flush() {
-        renderer.flush()
+        stateLock.withLock {
+            guard let owner = receiverOwner else { return }
+            queueFlushLocked(owner: owner)
+        }
+    }
+
+    private func queueFlushLocked(owner: any AudioReceiverEndpoint) {
+        revision += 1
+        feedTask?.cancel()
+        pendingFlush = true
+        pendingObservationRevision = nil
+        observingRevision = nil
+        startControlWorkerLocked(owner: owner)
+    }
+
+    func finishedEnqueuing() {
+        stateLock.withLock {
+            guard let owner = receiverOwner, feedTask == nil else { return }
+            guard observingRevision != revision, pendingObservationRevision != revision else { return }
+            pendingObservationRevision = revision
+            startControlWorkerLocked(owner: owner)
+        }
+    }
+
+    func remove(from synchronizer: AVSampleBufferRenderSynchronizer, at time: CMTime,
+        completion: @escaping @Sendable (Bool) -> Void) {
+        var superseded: (@Sendable (Bool) -> Void)?
+        let settled = stateLock.withLock { () -> Bool? in
+            if let detachedResult { return detachedResult }
+            if removalInFlight {
+                if removalWaiters.count == 2 { superseded = removalWaiters.removeLast() }
+                removalWaiters.append(completion)
+                return nil
+            }
+            guard let owner = receiverOwner else { return false }
+            removalInFlight = true
+            removalWaiters.append(completion)
+            queueFlushLocked(owner: owner)
+            receiverOwner = nil
+            pendingRemoval = RemovalRequest(synchronizer: synchronizer, time: time)
+            return nil
+        }
+        superseded?(false)
+        if let settled { completion(settled) }
+    }
+
+    private func startControlWorkerLocked(owner: any AudioReceiverEndpoint) {
+        guard controlTask == nil else { return }
+        controlTask = Task { [self, owner] in
+            while true {
+                let operation = stateLock.withLock { () -> ControlOperation in
+                    if pendingFlush {
+                        pendingFlush = false
+                        return .flush(feedTask)
+                    }
+                    if let removal = pendingRemoval {
+                        pendingRemoval = nil
+                        return .remove(removal)
+                    }
+                    if let expected = pendingObservationRevision {
+                        pendingObservationRevision = nil
+                        observingRevision = expected
+                        return .observe(expected)
+                    }
+                    // Choosing no work and reopening admission are one atomic
+                    // transition, so a racing request starts its own worker.
+                    controlTask = nil
+                    return .idle(readyHandler)
+                }
+                switch operation {
+                case let .flush(feed):
+                    await owner.flush()
+                    await feed?.value
+                case let .observe(expected):
+                    await owner.finishedEnqueuing { [weak self] event in
+                        self?.receiveRenderingEvent(event, revision: expected)
+                    }
+                case let .remove(request):
+                    let result = await owner.remove(from: request.synchronizer, at: request.time)
+                    let waiters = stateLock.withLock {
+                        detachedResult = result
+                        removalInFlight = false
+                        let waiters = removalWaiters
+                        removalWaiters.removeAll()
+                        return waiters
+                    }
+                    for waiter in waiters { waiter(result) }
+                case let .idle(ready):
+                    ready?()
+                    return
+                }
+            }
+        }
+    }
+
+    // Bounded diagnostic state: one worker, at most two pending intents and two
+    // removal waiters, independent of the number of reset/idle requests.
+    var controlWorkSnapshot: (workers: Int, pendingIntents: Int, completionWaiters: Int) {
+        stateLock.withLock {
+            (controlTask == nil ? 0 : 1,
+             (pendingFlush ? 1 : 0) + (pendingObservationRevision == nil ? 0 : 1)
+                + (pendingRemoval == nil ? 0 : 1), removalWaiters.count)
+        }
     }
 
     func requestMediaDataWhenReady(_ handler: @escaping @Sendable () -> Void) {
-        guard !requesting else { return }
-        requesting = true
-        renderer.requestMediaDataWhenReady(on: callbackQueue, using: handler)
+        let alreadyReady = stateLock.withLock {
+            readyHandler = handler
+            return receiverOwner != nil && feedTask == nil && controlTask == nil
+        }
+        // A feed/control worker may have reopened its slot after enqueue saw
+        // backpressure but before this registration. Observe readiness under the
+        // same lock as registration so either that worker or this path wakes the
+        // producer. Notify outside the lock; this grants demand, not consumption.
+        if alreadyReady { handler() }
     }
-
-    func stopRequestingMediaData() {
-        guard requesting else { return }
-        requesting = false
-        renderer.stopRequestingMediaData()
-    }
-
+    func stopRequestingMediaData() { stateLock.withLock { readyHandler = nil } }
     func startObserving(_ handler: @escaping @Sendable (AudioRendererEvent) -> Void) {
-        stopObserving()
-        statusObservation = renderer.observe(\.status, options: [.new]) { [weak self] renderer, _ in
-            guard let self, renderer.status == .failed else { return }
-            handler(recordedFailureEvent(renderer.error))
+        stateLock.withLock { eventHandler = handler }
+    }
+    func stopObserving() { stateLock.withLock { eventHandler = nil } }
+    private func receiveRenderingEvent(_ event: AudioRendererEvent, revision expected: UInt64) {
+        let deliveryRevision = stateLock.withLock { () -> UInt64? in
+            guard revision == expected, let owner = receiverOwner else { return nil }
+            if case .automaticFlush = event {
+                // Close admission synchronously with receipt of the native event.
+                // Resumed producers wait for this barrier even before the
+                // playback executor has processed the recovery notice.
+                queueFlushLocked(owner: owner)
+            }
+            return revision
         }
-        let flushed = notificationCenter.addObserver(
-            forName: Notification.Name.AVSampleBufferAudioRendererWasFlushedAutomatically,
-            object: renderer,
-            queue: nil
-        ) { notification in
-            let copiedTime = (notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey]
-                as? NSValue)?.timeValue
-            handler(.automaticFlush(copiedTime))
-        }
-        let configuration = notificationCenter.addObserver(
-            forName: Notification.Name.AVSampleBufferAudioRendererOutputConfigurationDidChange,
-            object: renderer,
-            queue: nil
-        ) { _ in
-            handler(.outputConfigurationChanged)
-        }
-        notificationTokens = [flushed, configuration]
+        if let deliveryRevision { emit(event, revision: deliveryRevision) }
     }
 
-    func stopObserving() {
-        statusObservation?.invalidate()
-        statusObservation = nil
-        for token in notificationTokens {
-            notificationCenter.removeObserver(token)
-        }
-        notificationTokens.removeAll(keepingCapacity: false)
+    private func emit(_ event: AudioRendererEvent, revision expected: UInt64) {
+        let value: AudioRendererEvent
+        if case .failedWithDiagnostic = event {
+            value = failureLock.withLock {
+                if let firstFailureEvent { return firstFailureEvent }
+                firstFailureEvent = event
+                return event
+            }
+        } else { value = event }
+        stateLock.withLock { revision == expected ? eventHandler : nil }?(value)
     }
 
     /// 首错属于真实 renderer 实例；监听重绑不为同一失败实例重建诊断实体。
@@ -182,7 +346,7 @@ final class SystemAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendab
         guard let renderer = renderer as? SystemAudioRenderer else {
             throw PlaybackCoreError.audioRendererFailed("audio.renderer.type-mismatch")
         }
-        synchronizer.addRenderer(renderer.renderer)
+        renderer.attach(to: synchronizer)
     }
 
     func remove(
@@ -194,14 +358,113 @@ final class SystemAudioSynchronizer: AudioRenderSynchronizing, @unchecked Sendab
             completion(false)
             return
         }
-        synchronizer.removeRenderer(
-            renderer.renderer,
-            at: time,
-            completionHandler: completion
-        )
+        renderer.remove(from: synchronizer, at: time, completion: completion)
     }
 
     func setRate(_ rate: Float, time: CMTime) {
         synchronizer.setRate(rate, time: time)
+    }
+}
+
+/// One actor owns the non-Sendable Receiver. The operation task is cancelled and
+/// physically settled before flushing/removal admits a later submission.
+struct AudioReceiverOutcome: Sendable {
+    let result: AudioRendererEnqueueResult
+    let events: [AudioRendererEvent]
+}
+
+/// Injectable ownership boundary: the real Receiver stays actor-confined.
+/// Fakes can suspend physical operations without making the SDK Receiver Sendable.
+protocol AudioReceiverEndpoint: Actor {
+    func enqueue(_ sample: RendererReceiverSample) async throws -> AudioReceiverOutcome
+    func flush() async
+    func finishedEnqueuing(_ eventSink: @escaping @Sendable (AudioRendererEvent) -> Void) async
+    func remove(from synchronizer: AVSampleBufferRenderSynchronizer, at time: CMTime) async -> Bool
+}
+
+private actor AudioReceiverOwner: AudioReceiverEndpoint {
+    private var receiver: AVSampleBufferAudioRenderer.Receiver?
+    private var isEnqueuing = false
+    private var events: Task<Void, Never>?
+    init(receiver: sending AVSampleBufferAudioRenderer.Receiver) { self.receiver = receiver }
+
+    func enqueue(_ sample: RendererReceiverSample) async throws -> AudioReceiverOutcome {
+        await stopEvents()
+        guard !isEnqueuing, receiver != nil else { return .init(result: .cancelled, events: []) }
+        isEnqueuing = true
+        defer { isEnqueuing = false }
+        return try await performEnqueue(sample)
+    }
+
+    private func performEnqueue(_ sample: RendererReceiverSample) async throws -> AudioReceiverOutcome {
+        guard let receiver else { return .init(result: .cancelled, events: []) }
+        try Task.checkCancellation()
+        let ready = try sample.makeReady()
+        do {
+            return try await enqueueReady(ready, into: receiver)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .init(result: .cancelled, events: [SystemAudioRenderer.failureEvent(error)])
+        }
+    }
+
+    private func enqueueReady(_ sample: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>,
+        into receiver: AVSampleBufferAudioRenderer.Receiver) async throws -> AudioReceiverOutcome {
+        switch try await receiver.enqueue(sample) {
+        case .enqueued: return .init(result: .accepted, events: [])
+        case let .enqueuedWithSuggestedFlush(reasons):
+            let notices: [AudioRendererEvent] = reasons.compactMap { reason in
+                switch reason {
+                case .outputConfigurationChanged: .outputConfigurationChanged
+                case let .wasFlushedAutomatically(at: time): .automaticFlush(time)
+                @unknown default: nil
+                }
+            }
+            return .init(result: .acceptedWithSuggestedFlush, events: notices)
+        case .cancelledDueToFlush: return .init(result: .cancelled, events: [])
+        case let .cancelledDueToError(error):
+            return .init(result: .cancelled, events: [SystemAudioRenderer.failureEvent(error)])
+        @unknown default:
+            throw PlaybackCoreError.audioRendererFailed("renderer.unknown-enqueue-result")
+        }
+    }
+
+    func flush() async {
+        await stopEvents()
+        receiver?.flush()
+    }
+
+    func finishedEnqueuing(_ eventSink: @escaping @Sendable (AudioRendererEvent) -> Void) {
+        guard !isEnqueuing, events == nil, let receiver else { return }
+        let sequence = receiver.renderingEventsAfterFinishedEnqueuing
+        events = Task { [eventSink] in
+            for await event in sequence {
+                guard !Task.isCancelled else { break }
+                switch event {
+                case .outputConfigurationChanged: eventSink(.outputConfigurationChanged)
+                case let .wasFlushedAutomatically(at: time): eventSink(.automaticFlush(time))
+                case let .failed(error): eventSink(SystemAudioRenderer.failureEvent(error))
+                @unknown default: break
+                }
+            }
+        }
+    }
+
+    private func stopEvents() async {
+        let previous = events
+        events = nil
+        previous?.cancel()
+        await previous?.value
+    }
+
+    func remove(from synchronizer: AVSampleBufferRenderSynchronizer, at time: CMTime) async -> Bool {
+        await flush()
+        guard let value = receiver else { return false }
+        receiver = nil
+        // Both tasks have physically settled and the actor released its only
+        // stored alias. The compiler cannot express this detached property region.
+        nonisolated(unsafe) let removed = value
+        return await synchronizer.removeReceiver(removed, at: time)
     }
 }

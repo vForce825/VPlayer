@@ -21,6 +21,12 @@ VPLoadedRangeCoverage VPReadLoadedRangeCoverage(AVPlayerItem * _Nonnull item,
 VPLoadedRangeCoverage VPScanLoadedRangeBuffer(const CMTimeRange * _Nullable ranges,
                                               size_t count, CMTimeRange requested);
 
+// Endpoint requests do not require their difference to fit a CMTime timescale.
+VPLoadedRangeCoverage VPReadLoadedIntervalCoverage(AVPlayerItem * _Nonnull item,
+                                                   CMTime start, CMTime end);
+VPLoadedRangeCoverage VPScanLoadedIntervalBuffer(const CMTimeRange * _Nullable ranges,
+                                                 size_t count, CMTime start, CMTime end);
+
 // 公开malloc zone枚举对“原借用地址+完整元素跨度”的同步定位结果。
 // status=0时allocation/bytes是包含整个借用跨度的原allocation；其余状态均为unknown。
 typedef struct {

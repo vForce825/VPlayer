@@ -79,6 +79,37 @@ public final class PlaybackApplicationChargeLedger: @unchecked Sendable {
         }
     }
 
+    #if DEBUG
+    /// A test may retain the exact existing charged boundary while original
+    /// owners retire. These are aliases of original allocation identities:
+    /// no bytes are added and no production admission rule is changed.
+    func retainCurrentAllocationsForTesting() throws -> (
+        reservations: [PlaybackApplicationChargeReservation], chargedBytes: Int,
+        distinctAllocationCount: Int
+    ) {
+        try lock.withLock {
+            let captured = allocations
+            var capturedBytes = fixedBookkeepingChargeBytes
+            for current in captured.values {
+                guard current.references < Int.max else {
+                    throw LoopbackHTTPReservationError.hardCapacityExceeded
+                }
+                capturedBytes = try HLSChecked.add(capturedBytes, current.bytes)
+            }
+            var aliases: [PlaybackApplicationChargeReservation] = []
+            aliases.reserveCapacity(captured.count)
+            for (identity, current) in captured {
+                allocations[identity] = (current.bytes, current.references + 1)
+                let alias = PlaybackApplicationChargeReservation(
+                    allocationIdentity: identity, bytes: current.bytes)
+                reservations[alias.reservationIdentity] = alias
+                aliases.append(alias)
+            }
+            return (aliases, capturedBytes, captured.count)
+        }
+    }
+    #endif
+
     public var maximumChargedBytes: Int {
         lock.withLock { maximum }
     }

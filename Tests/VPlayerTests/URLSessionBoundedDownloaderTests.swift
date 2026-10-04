@@ -56,6 +56,7 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         let result = try await boundedDownloader.download(url: request().url, byteLimit: 10)
 
         XCTAssertEqual(result.byteCount, 10)
+        XCTAssertEqual(result.responseURL, request().url)
         XCTAssertEqual(try Data(contentsOf: result.temporaryFileURL), Data("1234567890".utf8))
         XCTAssertEqual(result.temporaryFileURL.deletingLastPathComponent(), downloadsDirectory)
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.temporaryFileURL.path))
@@ -198,8 +199,54 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         let result = try await downloader.download(url: request().url, byteLimit: 10)
 
         XCTAssertEqual(try Data(contentsOf: result.temporaryFileURL), Data("redirected".utf8))
+        XCTAssertEqual(result.responseURL, redirectedURL)
         XCTAssertEqual(StubURLProtocol.requests.compactMap(\.url), [request().url, redirectedURL])
         try FileManager.default.removeItem(at: result.temporaryFileURL)
+    }
+
+    func testRedirectedPlaylistResolvesRelativeStreamsAndKeepsOriginalSubscription() async throws {
+        let originalURL = URL(string: "https://origin.example/api/list.m3u")!
+        let finalURL = URL(string: "https://cdn.example/package/channels/list.m3u")!
+        let payload = Data("""
+        #EXTM3U
+        #EXTINF:-1,News
+        live/news.ts
+        """.utf8)
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let repository = SwiftDataLibraryStore(modelContainer: container)
+        let input = try SourceProfileInput(
+            name: "Redirected",
+            m3uURLString: originalURL.absoluteString,
+            epgURLString: "https://origin.example/guide.xml",
+            m3uRefreshInterval: .sixHours,
+            epgRefreshInterval: .daily
+        ).validated()
+        let profile = try await repository.createProfile(input, now: Date())
+        let (downloader, _) = makeDownloader()
+        let coordinator = RefreshCoordinator(repository: repository, downloader: downloader)
+        var firstChannelID: String?
+
+        for _ in 0..<2 {
+            StubURLProtocol.enqueue(.init(response: .redirect(location: finalURL)))
+            StubURLProtocol.enqueue(.init(chunks: [payload]))
+            let outcomes = await coordinator.refresh(
+                profileID: profile.id, resources: [.playlist], trigger: .manual
+            )
+            XCTAssertEqual(outcomes.map(\.succeeded), [true])
+            let channels = try await repository.channels(profileID: profile.id)
+            let channel = try XCTUnwrap(channels.first)
+            XCTAssertEqual(channels.count, 1)
+            XCTAssertEqual(channel.streamURL.absoluteString,
+                           "https://cdn.example/package/channels/live/news.ts")
+            if let firstChannelID { XCTAssertEqual(channel.id, firstChannelID) }
+            firstChannelID = channel.id
+            let profiles = try await repository.profiles()
+            XCTAssertEqual(profiles.first?.m3uURL, originalURL)
+            XCTAssertEqual(profiles.first?.m3uStatus.state, .succeeded)
+        }
+        XCTAssertEqual(StubURLProtocol.requests.compactMap(\.url),
+                       [originalURL, finalURL, originalURL, finalURL])
+        await assertDownloadsDirectoryBecomesEmpty()
     }
 
     func testFileCustomAndHostlessRedirectsAreRejectedBeforeWriting() async {

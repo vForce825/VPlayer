@@ -776,6 +776,15 @@ final class AACRenditionEncoder: @unchecked Sendable {
                 } else { try Self.check(status) }
                 if count == 0 {
                     guard state.input.sawEOS, state.input.totalFrames > 0 else { throw AACRenditionFailure.invalidInput }
+                    // No further Fill can occur after natural EOS. Keep enough
+                    // escrow for every pending packet and at most two final
+                    // headers, then retire only unused capacity before querying
+                    // cookie/layout evidence through the normal soft-limit gate.
+                    let finalCharge = try AACIncrementalEmission.allocationCharge(
+                        payloadBytes: state.pending.reduce(0) { $0 + $1.data.count },
+                        packetCount: state.pending.count).addingReportingOverflow(1_024)
+                    guard !finalCharge.overflow else { throw AACRenditionFailure.capacityExceeded }
+                    try reservation.reduceUnclaimed(to: finalCharge.partialValue)
                     let final = Pass(identity: identity, packets: state.pending, cookieBacking: try cookie(at: .finalDrain),
                         format: try actualFormat(), packetLease: state.packetLease, bandwidth: state.bandwidth.evidence)
                     try validateLiveFinal(final)

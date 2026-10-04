@@ -129,6 +129,7 @@ struct SourceProfilesView: View {
 
     private var emptyState: some View {
         VStack(spacing: 16) {
+            recoveryWarning
             Spacer()
             Image(systemName: "play.square.stack")
                 .font(.system(size: 96, weight: .regular))
@@ -153,6 +154,7 @@ struct SourceProfilesView: View {
     private var profileList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 40) {
+                recoveryWarning
                 addButton
                     // The remote only crosses between controls that overlap
                     // along the axis it travels, and this button sits at the
@@ -168,6 +170,17 @@ struct SourceProfilesView: View {
             }
             .padding(.horizontal, 80)
             .padding(.bottom, 60)
+        }
+    }
+
+    @ViewBuilder
+    private var recoveryWarning: some View {
+        if let message = model.recoveryWarningMessage {
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("source.recovery-capacity.warning")
         }
     }
 

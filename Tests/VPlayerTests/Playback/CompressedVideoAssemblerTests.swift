@@ -9,6 +9,304 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class CompressedVideoAssemblerTests: XCTestCase {
+    func testFractional5994FPSParserPTSReachFinalSampleTimingWithoutTimelineStretch() throws {
+        let generation = MediaGeneration(rawValue: 1)
+        let duration = CMTime(value: 1_001, timescale: 60_000)
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: VideoTrackDescriptor(
+            streamIndex: 0, codec: .h264,
+            timeBase: try XCTUnwrap(MediaRational(num: 1, den: 60_000)),
+            width: 64, height: 36, videoDelay: 0, extradata: Data(),
+            frameRate: MediaRational(num: 60_000, den: 1_001)), audio: nil)
+        var units: [CompressedVideoAccessUnit] = []
+        let assembler = try CompressedVideoAssembler(trackSet: tracks,
+            generationProvider: { generation }, eventSink: {
+                if case .accessUnit(let unit) = $0 { units.append(unit) }
+            }, parserFactory: ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+                try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                    bytes: AssemblerTestFixtures.h264AccessUnit(),
+                    pts: Int64(index) * 1_001, dts: Int64(index) * 1_001,
+                    duration: duration, fieldOrder: 1, topFieldFirst: nil, interlaced: false))
+            }, formatState: AssemblyFormatState(trackSet: tracks))
+        for index in 0..<60 {
+            let pts = CMTime(value: Int64(index) * 1_001, timescale: 60_000)
+            try assembler.push(AssemblerTestFixtures.videoPacket(pts: pts, dts: pts, duration: duration))
+        }
+        try assembler.drain()
+        XCTAssertEqual(units.count, 60)
+        XCTAssertTrue(units.allSatisfy { $0.parserMetadata.sourcePTS90k != nil },
+            "Legal fractional transport ticks are timestamps, not missing PTS")
+
+        let pixelBuffer = try VideoTestFactories.nv12()
+        var normalizer = PresentationTimestampNormalizer(generation: generation)
+        let frames = units.map { unit in
+            DecodedVideoFrame(accessUnitID: unit.id, pixelBuffer: pixelBuffer,
+                presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(unit.sampleBuffer),
+                duration: duration, generation: generation, parserMetadata: unit.parserMetadata,
+                formatMetadata: VideoTestFactories.metadata())
+        }
+        let normalized = frames.flatMap { normalizer.push($0, discontinuity: false) } + normalizer.drain()
+        let builder = VideoImageSampleBufferBuilder()
+        XCTAssertEqual(normalized.count, 60)
+        for (index, frame) in normalized.enumerated() {
+            let sample = try builder.make(frame: VideoPresentationFrame(pixelBuffer: pixelBuffer,
+                presentationTimeStamp: frame.presentationTimeStamp, duration: frame.frameDuration,
+                generation: generation, sequenceNumber: UInt64(index),
+                sourceAccessUnitID: frame.frame.accessUnitID, formatMetadata: frame.frame.formatMetadata))
+            let expected = Double(index) * 1_001 / 60_000
+            XCTAssertEqual(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)),
+                expected, accuracy: 0.5 / 90_000 + 1e-12)
+            XCTAssertEqual(CMTimeGetSeconds(CMSampleBufferGetDuration(sample)),
+                1_001.0 / 60_000, accuracy: 1.0 / 90_000 + 1e-12)
+            XCTAssertFalse(frame.timingWasSynthesized)
+        }
+    }
+
+    // 灰色合成帧的 Main 10 参数集；SPS 使用兼容曲线，HLG 由解复用器解析 SEI 得到。
+    private let compatibilityParameterSets = [
+            Data([0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00,
+                  0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x1E, 0x95, 0x98, 0x09]),
+            Data([0x42, 0x01, 0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+                  0x03, 0x00, 0x00, 0x03, 0x00, 0x1E, 0xA0, 0x10, 0x20, 0x49, 0x36, 0x59,
+                  0x59, 0xA4, 0x93, 0x2B, 0xC0, 0x5A, 0x84, 0x87, 0x04, 0x82, 0x00, 0x00,
+                  0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x32, 0x10]),
+            Data([0x44, 0x01, 0xC1, 0x72, 0xB4, 0x22, 0x40]),
+    ]
+
+    func testHEVCAssemblerPreservesEffectiveHLGMetadataFromDemuxForLegacyAndOwnedFormats() throws {
+        let parameterSets = compatibilityParameterSets
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: VideoTrackDescriptor(
+            streamIndex: 0, codec: .hevc,
+            timeBase: try XCTUnwrap(MediaRational(num: 1, den: 90_000)),
+            width: 128, height: 72, videoDelay: 0,
+            extradata: AssemblerTestFixtures.annexBParameterSets(parameterSets),
+            videoMetadata: DemuxVideoMetadata(range: .limited, primaries: .bt2020,
+                transfer: .hlg, matrix: .bt2020Nonconstant)), audio: nil)
+        for owned in [false, true] {
+            var formats: [CMFormatDescription] = []
+            var samples: [CMSampleBuffer] = []
+            let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+                try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                    bytes: AssemblerTestFixtures.annexBParameterSets(parameterSets)
+                        + AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false)))
+            }
+            let state = AssemblyFormatState(trackSet: tracks)
+            let ownership = owned ? HLSVideoCopyOwnership(maximumPayloadBytes: 4_096,
+                applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil
+            var subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                    switch $0 {
+                    case let .format(format, _): formats.append(format)
+                    case let .accessUnit(unit): samples.append(unit.sampleBuffer)
+                    }
+                }, parserFactory: factory, formatState: state, hlsCopyOwnership: ownership)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            // 同一参数集恢复后仍应保持有效传递函数。
+            subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 2) }, eventSink: {
+                    switch $0 {
+                    case let .format(format, _): formats.append(format)
+                    case let .accessUnit(unit): samples.append(unit.sampleBuffer)
+                    }
+                }, parserFactory: factory, formatState: state, hlsCopyOwnership: ownership)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            XCTAssertEqual(formats.count, 2)
+            for format in formats + samples.compactMap(CMSampleBufferGetFormatDescription) {
+                XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                    extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+                    kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+                XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                    extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String,
+                    kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String)
+                XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                    extensionKey: kCMFormatDescriptionExtension_YCbCrMatrix) as? String,
+                    kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String)
+            }
+        }
+    }
+
+    func testHEVCChangedSPSAndRestoreDoNotReuseOldDemuxColorMetadata() throws {
+        let initial = compatibilityParameterSets
+        var changed = initial
+        changed[1][31] = 0x88 // 合成 SPS 的传递函数从 BT.2020 兼容曲线改为 PQ。
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: VideoTrackDescriptor(
+            streamIndex: 0, codec: .hevc,
+            timeBase: try XCTUnwrap(MediaRational(num: 1, den: 90_000)),
+            width: 128, height: 72, videoDelay: 0,
+            extradata: AssemblerTestFixtures.annexBParameterSets(initial),
+            videoMetadata: DemuxVideoMetadata(range: .limited, primaries: .bt2020,
+                transfer: .hlg, matrix: .bt2020Nonconstant)), audio: nil)
+        for owned in [false, true] {
+            var formats: [CMFormatDescription] = []
+            var samples: [CMSampleBuffer] = []
+            let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+                let parameters = handle.pushCount == 1 ? initial : changed
+                try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                    bytes: AssemblerTestFixtures.annexBParameterSets(parameters)
+                        + AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false)))
+            }
+            let state = AssemblyFormatState(trackSet: tracks)
+            let ownership = owned ? HLSVideoCopyOwnership(maximumPayloadBytes: 4_096,
+                applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil
+            let sink: (VideoAssemblerEvent) -> Void = {
+                switch $0 {
+                case let .format(format, _): formats.append(format)
+                case let .accessUnit(unit): samples.append(unit.sampleBuffer)
+                }
+            }
+            var subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: sink,
+                parserFactory: factory, formatState: state, hlsCopyOwnership: ownership)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            let snapshot = state.snapshot()
+            let restoredState = AssemblyFormatState(trackSet: tracks,
+                videoParameterSets: snapshot.videoParameterSets,
+                hlsVideoParameterSetOwner: snapshot.hlsVideoParameterSetOwner,
+                audioSystemFormat: snapshot.audioSystemFormat,
+                videoPreferredTransfer: snapshot.videoPreferredTransfer,
+                videoSequenceEnded: snapshot.videoSequenceEnded)
+            XCTAssertEqual(try restoredState.fingerprint(), try state.fingerprint())
+            subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 2) }, eventSink: sink,
+                parserFactory: ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+                    try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                        bytes: AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false)))
+                }, formatState: restoredState, hlsCopyOwnership: ownership)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            XCTAssertEqual(formats.count, 3)
+            XCTAssertEqual(samples.count, 3)
+            for format in Array(formats.dropFirst())
+                + samples.dropFirst().compactMap(CMSampleBufferGetFormatDescription) {
+                XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                    extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+                    kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+            }
+        }
+    }
+
+    func testHEVCAssemblerReadsATCWhenDemuxOnlyReportsCompatibilityTransferAndRestoresIt() throws {
+        let parameters = compatibilityParameterSets
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: VideoTrackDescriptor(
+            streamIndex: 0, codec: .hevc,
+            timeBase: try XCTUnwrap(MediaRational(num: 1, den: 90_000)),
+            width: 128, height: 72, videoDelay: 0,
+            extradata: AssemblerTestFixtures.annexBParameterSets(parameters),
+            videoMetadata: DemuxVideoMetadata(range: .limited, primaries: .bt2020,
+                transfer: .bt2020, matrix: .bt2020Nonconstant)), audio: nil)
+        for owned in [false, true] {
+            var formats: [(CMFormatDescription, MediaFormatFingerprint)] = []
+            var samples: [CMSampleBuffer] = []
+            let sink: (VideoAssemblerEvent) -> Void = {
+                switch $0 {
+                case let .format(format, fingerprint): formats.append((format, fingerprint))
+                case let .accessUnit(unit): samples.append(unit.sampleBuffer)
+                }
+            }
+            let state = AssemblyFormatState(trackSet: tracks)
+            let ownership = owned ? HLSVideoCopyOwnership(maximumPayloadBytes: 4_096,
+                applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil
+            var subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: sink,
+                parserFactory: ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+                    let sei = index == 0 ? Data([0, 0, 1, 0x4E, 1, 147, 1, 18, 0x80]) : Data()
+                    try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: sei
+                        + AssemblerTestFixtures.annexBParameterSets(parameters)
+                        + AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false,
+                            nal: Data([0x02, 1, 0x80]))))
+                }, formatState: state, hlsCopyOwnership: ownership)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            let snapshot = state.snapshot()
+            let restoredState = AssemblyFormatState(trackSet: tracks,
+                videoParameterSets: snapshot.videoParameterSets,
+                hlsVideoParameterSetOwner: snapshot.hlsVideoParameterSetOwner,
+                audioSystemFormat: snapshot.audioSystemFormat,
+                videoPreferredTransfer: snapshot.videoPreferredTransfer,
+                videoSequenceEnded: snapshot.videoSequenceEnded)
+            XCTAssertEqual(try restoredState.fingerprint(), try state.fingerprint())
+            subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 2) }, eventSink: sink,
+                parserFactory: ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+                    let sei = index == 1 ? Data([0, 0, 1, 0x4E, 1, 147, 1, 16, 0x80]) : Data()
+                    try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: sei
+                        + AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false,
+                            nal: Data([0x02, 1, 0x80]))))
+                }, formatState: restoredState, hlsCopyOwnership: ownership)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            XCTAssertEqual(formats.count, 3)
+            XCTAssertEqual(samples.count, 4)
+            for format in formats.dropLast().map(\.0)
+                + samples.dropLast().compactMap(CMSampleBufferGetFormatDescription) {
+                XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                    extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+                    kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+            }
+            XCTAssertEqual(CMFormatDescriptionGetExtension(try XCTUnwrap(formats.last?.0),
+                extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+                kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+            XCTAssertNotEqual(formats.first?.1, formats.last?.1)
+        }
+    }
+
+    func testHEVCAssemblerUsesATCFromExtradataWithoutRepeatedSEIInFrames() throws {
+        let parameters = compatibilityParameterSets
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: VideoTrackDescriptor(
+            streamIndex: 0, codec: .hevc,
+            timeBase: try XCTUnwrap(MediaRational(num: 1, den: 90_000)),
+            width: 128, height: 72, videoDelay: 0,
+            extradata: AssemblerTestFixtures.annexBParameterSets(parameters)
+                + Data([0, 0, 1, 0x4E, 1, 147, 1, 18, 0x80]),
+            videoMetadata: DemuxVideoMetadata(transfer: .bt2020)), audio: nil)
+        for owned in [false, true] {
+            var format: CMFormatDescription?
+            let subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                    if case let .accessUnit(unit) = $0 { format = CMSampleBufferGetFormatDescription(unit.sampleBuffer) }
+                }, parserFactory: ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+                    try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes:
+                        AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false,
+                            nal: Data([0x26, 1, 0x80]))))
+                }, formatState: AssemblyFormatState(trackSet: tracks),
+                hlsCopyOwnership: owned ? HLSVideoCopyOwnership(maximumPayloadBytes: 4_096,
+                    applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            XCTAssertEqual(CMFormatDescriptionGetExtension(try XCTUnwrap(format),
+                extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+                kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+        }
+    }
+
+    func testHEVCEOSKeepsSharedFormatFingerprintUntilNextVideoFormatIsKnown() throws {
+        let parameters = compatibilityParameterSets
+        let tracks = DemuxTrackSet(selectedProgramID: 1, video: VideoTrackDescriptor(
+            streamIndex: 0, codec: .hevc,
+            timeBase: try XCTUnwrap(MediaRational(num: 1, den: 90_000)),
+            width: 128, height: 72, videoDelay: 0,
+            extradata: AssemblerTestFixtures.annexBParameterSets(parameters),
+            videoMetadata: DemuxVideoMetadata(transfer: .bt2020)), audio: nil)
+        for owned in [false, true] {
+            let state = AssemblyFormatState(trackSet: tracks)
+            let subject = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: { _ in },
+                parserFactory: ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+                    let sei = index == 1 ? Data() : Data([0, 0, 1, 0x4E, 1, 147, 1, 18, 0x80])
+                    let eos = index == 1 ? Data([0, 0, 1, 0x48, 1, 0x80]) : Data()
+                    try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: sei
+                        + AssemblerTestFixtures.hevcAccessUnit(includeParameterSets: false,
+                            nal: Data([index == 2 ? 0x26 : 0x02, 1, 0x80])) + eos))
+                }, formatState: state, hlsCopyOwnership: owned ? HLSVideoCopyOwnership(
+                    maximumPayloadBytes: 4_096, applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            let active = try state.fingerprint()
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            // 音频消费者读取同一状态，EOS 本身不能虚构一次音频格式漂移。
+            XCTAssertEqual(try state.fingerprint(), active)
+            try subject.push(AssemblerTestFixtures.videoPacket(codec: .hevc))
+            XCTAssertEqual(try state.fingerprint(), active)
+        }
+    }
+
     func testMissingParserDurationFallsBackToFrozenTrackFrameRate() throws {
         let expectedFrameRate = try XCTUnwrap(MediaRational(num: 30_000, den: 1_001))
         let tracks = try AssemblerTestFixtures.videoTracks(frameRate: expectedFrameRate)

@@ -18,10 +18,12 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         let observationStartCount: Int
         let observationStopCount: Int
         let readinessCheckCount: Int
+        let maximumEnqueueCallDepth: Int
     }
 
     let identity: AudioRendererIdentity
     let mediaKind: AudioRendererMediaKind
+    let canObserveConsumption: Bool
 
     private let lock = NSLock()
     private var ready = false
@@ -41,8 +43,11 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var observationStopCount = 0
     private var readinessCheckCount = 0
     private var attached = false
+    private var enqueueCallDepth = 0
+    private var maximumEnqueueCallDepth = 0
 
-    init(identity: UInt64, mediaKind: AudioRendererMediaKind) {
+    init(identity: UInt64, mediaKind: AudioRendererMediaKind, canObserveConsumption: Bool = true) {
+        self.canObserveConsumption = canObserveConsumption
         self.identity = AudioRendererIdentity(rawValue: identity)
         self.mediaKind = mediaKind
     }
@@ -75,6 +80,33 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         withLock { enqueueResults = results }
     }
 
+    var holdEnqueueCompletions = false
+    private var heldEnqueues: [@Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void] = []
+    var heldEnqueueCount: Int { withLock { heldEnqueues.count } }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer,
+        completion: @escaping @Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void) {
+        withLock {
+            enqueueCallDepth += 1
+            maximumEnqueueCallDepth = max(maximumEnqueueCallDepth, enqueueCallDepth)
+        }
+        defer { withLock { enqueueCallDepth -= 1 } }
+        if withLock({ holdEnqueueCompletions }) {
+            withLock { heldEnqueues.append(completion) }
+        } else {
+            completion(Result { try enqueue(sampleBuffer) })
+        }
+    }
+
+    func completeEnqueue(_ result: AudioRendererEnqueueResult) {
+        let completion = withLock { heldEnqueues.isEmpty ? nil : heldEnqueues.removeFirst() }
+        completion?(.success(result))
+    }
+
+    func cancelPendingEnqueue() {}
+    private(set) var finishedEnqueuingCount = 0
+    func finishedEnqueuing() { withLock { finishedEnqueuingCount += 1 } }
+
     func enqueue(_ sampleBuffer: CMSampleBuffer) throws -> AudioRendererEnqueueResult {
         let formatID = CMSampleBufferGetFormatDescription(sampleBuffer)
             .map(CMFormatDescriptionGetMediaSubType) ?? 0
@@ -97,7 +129,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
             enqueuedPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             pendingPTS.append(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             enqueuesSinceReadyCallback += 1
-            return .accepted
+            return scriptedResult ?? .accepted
         }
     }
 
@@ -181,7 +213,8 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
                 stopRequestCount: stopRequestCount,
                 observationStartCount: observationStartCount,
                 observationStopCount: observationStopCount,
-                readinessCheckCount: readinessCheckCount
+                readinessCheckCount: readinessCheckCount,
+                maximumEnqueueCallDepth: maximumEnqueueCallDepth
             )
         }
     }
@@ -195,6 +228,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
 }
 
 final class FakeAudioRendererFactory: AudioRendererFactory, @unchecked Sendable {
+    var canObserveConsumption = true
     private let lock = NSLock()
     private var nextIdentity: UInt64 = 1
     private var renderers: [FakeAudioRenderer] = []
@@ -208,7 +242,8 @@ final class FakeAudioRendererFactory: AudioRendererFactory, @unchecked Sendable 
             throw nextCreateErrors.remove(at: index).1
         }
         if let createError { throw createError }
-        let renderer = FakeAudioRenderer(identity: nextIdentity, mediaKind: mediaKind)
+        let renderer = FakeAudioRenderer(identity: nextIdentity, mediaKind: mediaKind,
+            canObserveConsumption: canObserveConsumption)
         nextIdentity += 1
         renderers.append(renderer)
         return renderer
@@ -335,6 +370,8 @@ final class FakePCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
     private var pushedIDs: [UInt64] = []
     private var flushCount = 0
     private var destroyCount = 0
+    private var drainCount = 0
+    private var drainOutputs: [CMSampleBuffer] = []
 
     init(pushBody: @escaping PushBody) {
         self.pushBody = pushBody
@@ -348,6 +385,16 @@ final class FakePCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         if let error { throw error }
         return try pushBody(sample)
     }
+
+    func configureDrainOutputs(_ outputs: [CMSampleBuffer]) { withLock { drainOutputs = outputs } }
+    func drainForNaturalEOF() throws -> [CMSampleBuffer] {
+        withLock {
+            drainCount += 1
+            defer { drainOutputs.removeAll() }
+            return drainOutputs
+        }
+    }
+    var drainCountSnapshot: Int { withLock { drainCount } }
 
     func configurePushError(_ error: PlaybackCoreError?) {
         withLock { pushError = error }

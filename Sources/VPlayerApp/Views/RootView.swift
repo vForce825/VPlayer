@@ -6,6 +6,7 @@ import SwiftUI
 import VPlayerPlayback
 
 struct RootView: View {
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     private enum InitialLibraryState {
         case loading
         case ready
@@ -69,6 +70,10 @@ struct RootView: View {
                 }
             }
         }
+        .onChange(of: prefersReducedResourceUsage, initial: true) { _, preferred in
+            dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(preferred)
+            dependencies.backgroundRefreshRegistrar.setPrefersReducedResourceUsage(preferred)
+        }
         .task(id: initialLibraryAttempt) {
             initialLibraryState = .loading
             let opened = await dependencies.openInitialLibrary(using: model)
@@ -102,7 +107,8 @@ struct RootView: View {
                 metricsProvider: dependencies.playbackMetricsProvider,
                 acceptanceMetricsEnabled: dependencies.exposesAcceptanceMetrics,
                 acceptanceStateEnabled: dependencies.exposesAcceptanceState,
-                settings: dependencies.playbackSettings
+                settings: dependencies.playbackSettings,
+                nowPlaying: dependencies.nowPlaying
             ) {
                 model.dismissPlayback()
             }

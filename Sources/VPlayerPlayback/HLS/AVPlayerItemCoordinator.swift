@@ -33,7 +33,7 @@ struct AVPlayerPrerollReceipt: Sendable, Equatable {
 struct AVPlayerLoadedRangeReceipt: Sendable, Equatable {
     let item: AVPlayerItemInstanceIdentity
     let playhead: PreparedPlayheadIdentity
-    let requested: FMP4PresentationRange
+    let requested: ExactMediaInterval
 }
 
 struct AVPlayerDirectState: Sendable, Equatable {
@@ -43,6 +43,15 @@ struct AVPlayerDirectState: Sendable, Equatable {
 }
 
 enum AVPlayerStartupBufferPolicy {
+    // Selection is a completed HTTP proof, not AVPlayer's ready/preroll status.
+    static func selectionBufferSeconds(configured seconds: TimeInterval) -> TimeInterval {
+        max(3, seconds)
+    }
+
+    static func initialPublicationSeconds(configured seconds: TimeInterval) -> Int {
+        selectionBufferSeconds(configured: seconds) > 3 ? 4 : 3
+    }
+
     static func coverageDuration(seconds: TimeInterval) -> ExactMediaTime {
         ExactMediaTime(
             value: Int64((seconds * 1_000).rounded()),
@@ -57,6 +66,9 @@ enum AVPlayerPreparationFence: String, Sendable, CaseIterable {
 
 @MainActor
 protocol AVPlayerDriving: AnyObject {
+    var disconnectedFromSystemAudio: Bool { get }
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure)
     var rate: Float { get }
     var timeControlStatus: AVPlayer.TimeControlStatus { get }
     var preferredForwardBufferDuration: TimeInterval { get }
@@ -71,7 +83,7 @@ protocol AVPlayerDriving: AnyObject {
               playhead: PreparedPlayheadIdentity) async throws -> AVPlayerSeekReceipt
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt
     func preroll(item: AVPlayerItemInstanceIdentity,
                  playhead: PreparedPlayheadIdentity) async throws -> AVPlayerPrerollReceipt
@@ -93,6 +105,11 @@ protocol AVPlayerDriving: AnyObject {
     func pause(item: AVPlayerItemInstanceIdentity)
     func waitUntilPaused(item: AVPlayerItemInstanceIdentity) async throws
     func directState(item: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) -> AVPlayerDirectState
+    /// Best-effort synchronous metadata read; failure never prevents physical stop.
+    func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime?
+    func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier?
+    func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws
+    func finishPausedResumeCallbacks(item: AVPlayerItemInstanceIdentity)
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item: AVPlayerItemInstanceIdentity) throws
     func installNaturalEndTerminalHandler(
@@ -105,6 +122,8 @@ protocol AVPlayerDriving: AnyObject {
         _ capability: AVPlayerNaturalEndTerminalCapability,
         item: AVPlayerItemInstanceIdentity
     ) -> AVPlayerNaturalEndTerminalResult?
+    func hasPendingNaturalEndVerification(item: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool
     func replaceCurrentItemWithNil(item: AVPlayerItemInstanceIdentity)
     func removeObservers(item: AVPlayerItemInstanceIdentity)
     func preparationFenceReached(_ fence: AVPlayerPreparationFence,
@@ -113,11 +132,19 @@ protocol AVPlayerDriving: AnyObject {
 }
 
 extension AVPlayerDriving {
+    func hasPendingNaturalEndVerification(item: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool { false }
     var activeWaiterCount: Int { 0 }
     var fixedTimerCount: Int { 0 }
     var preferredForwardBufferDuration: TimeInterval { 3 }
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws {}
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws {}
+    func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime? { nil }
+    func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? { nil }
+    func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {
+        throw AVPlayerItemCoordinatorFailure.capacityExceeded
+    }
+    func finishPausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) {}
     func retainInstallationResourceContext(_ reservation: PlaybackResourceContextReservation) {}
 }
 
@@ -280,6 +307,10 @@ private struct AVPlayerPublicationBindingReadiness {
 }
 
 protocol AVPlayerPreparationEvidenceProviding: AnyObject, Sendable {
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws
     func consumeCompletedPublication(itemURL: URL,
                                      item: AVPlayerItemInstanceIdentity,
                                      publicationSequence: UInt64)
@@ -315,6 +346,14 @@ protocol AVPlayerPreparationEvidenceProviding: AnyObject, Sendable {
 }
 
 extension AVPlayerPreparationEvidenceProviding {
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws {
+        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+    }
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws {
+        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+    }
     func awaitCoverageReadiness(contexts: [LoopbackCoverageContext],
                                 requested: FMP4PresentationRange) async throws {}
 }
@@ -396,6 +435,20 @@ enum AccessLogURIClassification: Sendable, Equatable {
     case conflicting
     case invalidLocalResource
     case unrelated
+
+    var isTerminalFault: Bool {
+        self == .invalidLocalResource || self == .conflicting
+    }
+
+    /// Preserve a known transport failure before a rendition conflict, and either
+    /// fault before benign entries, within one bounded pending batch.
+    func coalescing(_ newer: Self) -> Self {
+        if self == .invalidLocalResource || newer == .invalidLocalResource {
+            return .invalidLocalResource
+        }
+        if self == .conflicting || newer == .conflicting { return .conflicting }
+        return newer
+    }
 }
 
 enum AccessLogURIClassifierV1 {
@@ -444,6 +497,7 @@ enum AVPlayerItemCoordinatorFailure: Error, Equatable {
     case loadedRangeMismatch
     case prerollFailed
     case directPauseNotConfirmed
+    case systemAudioConnectionNotConfirmed
     case invalidTimeline
     case operationInFlight
     case capacityExceeded
@@ -515,6 +569,44 @@ struct AVPlayerQuiescenceReceipt: Sendable, Equatable {
 }
 
 final class AVPlayerQuiescenceReceiptIdentity: @unchecked Sendable {}
+
+/// Only the original successful owned stop binds its pre-disconnect cursor.
+/// Copies are immutable metadata: neither a receipt nor a caller-provided time
+/// can construct this association or grant activation/timeline authority.
+struct AVPlayerPausedCursorBinding: Sendable {
+    let stopIdentity: AVPlayerQuiescenceReceiptIdentity
+    let item: AVPlayerItemInstanceIdentity
+    let time: ExactMediaTime
+    let physicalItemIdentity: ObjectIdentifier
+
+    fileprivate init(stopIdentity: AVPlayerQuiescenceReceiptIdentity,
+                     item: AVPlayerItemInstanceIdentity, time: ExactMediaTime,
+                     physicalItemIdentity: ObjectIdentifier) {
+        self.stopIdentity = stopIdentity
+        self.item = item
+        self.time = time
+        self.physicalItemIdentity = physicalItemIdentity
+    }
+}
+
+/// Minted only while the coordinator still owns the successful stopped scope.
+/// The server separately authenticates its timeline, selection and media facts.
+struct AVPlayerPausedResumeScope: Sendable {
+    let cursor: AVPlayerPausedCursorBinding
+    let itemURL: URL
+    let timeline: PlayerItemTimelineMappingAuthority
+    let selection: LoopbackAudioMediaSelectionCapability
+    let selectionRevision: UInt64
+    let lead: ExactMediaTime
+
+    fileprivate init(cursor: AVPlayerPausedCursorBinding, itemURL: URL,
+        timeline: PlayerItemTimelineMappingAuthority,
+        selection: LoopbackAudioMediaSelectionCapability, selectionRevision: UInt64,
+        lead: ExactMediaTime) {
+        self.cursor = cursor; self.itemURL = itemURL; self.timeline = timeline
+        self.selection = selection; self.selectionRevision = selectionRevision; self.lead = lead
+    }
+}
 
 /// 只有 AVPlayer coordinator 在完成 pause KVO 与同 item direct read 后才能构造。
 /// 普通 backend 只拿到最终 opaque attestation，无法用布尔值拼出 Registry 证明。
@@ -887,6 +979,7 @@ struct LoopbackAVPlayerPreparationBundle: Sendable {
 final class AVPlayerItemCoordinator {
     static let boundaryCapacity = 128
     static let renditionCapacity = 8
+    static let resourceContextReservationBytes = 12 * 1_024
     static let dependencyCapacity = 128
 
     nonisolated static var retainedGraphFutureReservationSnapshot:
@@ -903,6 +996,9 @@ final class AVPlayerItemCoordinator {
     }
 
     private let driver: any AVPlayerDriving
+    var logSnapshotCache: AVPlayerLogSnapshotCache? {
+        (driver as? SystemAVPlayerDriver)?.logSnapshotCache
+    }
     private var evidenceSource: any AVPlayerPreparationEvidenceProviding
     private var evidenceSourceIdentity: UInt64
     private let allocator: PlaybackIdentityAllocator
@@ -918,7 +1014,23 @@ final class AVPlayerItemCoordinator {
     private var authorizationArmed = false
     private var activationInFlight = false
     private var stopTask: OutputPlayerStopTask?
-    private var invalidated = false
+    // Retain the exact successful mapping after the backend drops its returned
+    // PreparedAVPlayerItem. The wrapper remains charged to its original frozen
+    // owner; this alias is inside the coordinator's measured allocation.
+    // The owner's weak cache must stay weak to avoid mapping -> owner -> mapping.
+    private var preparedTimelineMapping: PlayerItemTimelineMappingAuthority?
+    // Inline in the existing measured 12 KiB coordinator root; no new owner,
+    // receipt field, callback, wait slot, reservation, or renewable budget.
+    private var pausedCursorBinding: AVPlayerPausedCursorBinding?
+    private var invalidationFailure: AVPlayerItemCoordinatorFailure?
+    // Diagnostic only; ownership remains the original Registry invocation.
+    // Only a later committed physical stop clears an unresolved rollback.
+    private(set) var unresolvedActivationRollbackFailure: AVPlayerItemCoordinatorFailure?
+    private var invalidated: Bool { invalidationFailure != nil }
+    // An alias to the bundle's existing charged relay; it never captures this coordinator.
+    // This pointer is inside the coordinator's measured malloc allocation and its
+    // unchanged resourceContextReservationBytes, not the relay's 2 KiB metadata charge.
+    private var runtimeFailureRelay: HLSRuntimeFailureRelay?
     private var automaticStopRequested = false
     private var preparationTicket: UInt64?
     /// 完整身份在bind时对应不可变request验真，保留业务证据而不再次复制request身份。
@@ -1075,7 +1187,7 @@ final class AVPlayerItemCoordinator {
         // 使用进程共享 nonce 域，不受注入 allocator 来源冲突影响；失败前无 hook 副作用。
         let evidenceSourceIdentity = try PlaybackIdentityAllocator.shared.next(in: .nonce)
         let resourceContextReservation = try PlaybackResourceContextLedger.shared.reserve(
-            allocationIdentity: .stable(UUID()), bytes: 12 * 1_024)
+            allocationIdentity: .stable(UUID()), bytes: Self.resourceContextReservationBytes)
         let eventRelay = AVPlayerCoordinatorEventRelay()
         self.driver = driver
         self.evidenceSource = evidenceSource
@@ -1126,6 +1238,12 @@ final class AVPlayerItemCoordinator {
               request.itemURL.host == "127.0.0.1" else {
             throw AVPlayerItemCoordinatorFailure.invalidTimeline
         }
+        if let source = evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource {
+            try source.configureStartupSelection(
+                duration: AVPlayerStartupBufferPolicy.coverageDuration(seconds:
+                    AVPlayerStartupBufferPolicy.selectionBufferSeconds(
+                        configured: driver.preferredForwardBufferDuration)))
+        }
         let urlAllocationOwner = request.itemURL as NSURL
         // 最多八项，先规范化为本 owner 的精确 backing；不继承调用方可能过量
         // reserveCapacity 的隐藏容量，也不在 lifecycle 内再次复制该数组。
@@ -1151,8 +1269,12 @@ final class AVPlayerItemCoordinator {
         stopTask = nil
         preparationTicket = nil
         lastQuiescenceReceipt = nil
+        pausedCursorBinding = nil
+        preparedTimelineMapping = nil
         publicationReadiness = nil
-        invalidated = false
+        invalidationFailure = nil
+        unresolvedActivationRollbackFailure = nil
+        runtimeFailureRelay = nil
         automaticStopRequested = false
         renditionSelectionSlot = initialSelection.map(RenditionSelectionSlot.bound)
             ?? .unbound
@@ -1173,7 +1295,7 @@ final class AVPlayerItemCoordinator {
                     item: itemIdentity, publicationSequence: sequence, selected: selection?.renditionIdentity)
             }, handler: { [weak self] classification, item in
                 guard let self, self.request?.item == item else { return }
-                if classification == .conflicting { self.invalidateCurrentPublication() }
+                self.consumeAccessLogClassification(classification)
             })
         try driver.installNaturalEndTerminalHandler(item: request.item) { [weak self] capability, item in
             self?.consumeNaturalEndTerminal(capability, item: item)
@@ -1194,6 +1316,17 @@ final class AVPlayerItemCoordinator {
         }
     }
 
+    func bindRuntimeFailureRelay(
+        _ relay: HLSRuntimeFailureRelay?,
+        invocation: ControlTaskRegistry.BackendPrepareInvocation
+    ) throws {
+        try bindPrepareInvocation(invocation)
+        guard runtimeFailureRelay == nil else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
+        runtimeFailureRelay = relay
+    }
+
     func prepareCurrentItem(
         invocation: ControlTaskRegistry.BackendPrepareInvocation
     ) async throws -> PreparedAVPlayerItem {
@@ -1204,17 +1337,20 @@ final class AVPlayerItemCoordinator {
     /// Registry retirement 调用者必须先让旧 item 真实静止并卸载；这里只签下一次
     /// replacement install 的前置 fence，不生成未来 Task22 的 publication/request。
     func retireForReplacement(_ epoch: OutputLifecycleEpoch) async throws {
-        guard invalidated, state.phase == .stopping,
+        guard invalidated, invalidationFailure != .itemFailed, state.phase == .stopping,
               let installedRequest = request,
               installedRequest.item.outputLifecycleEpoch == epoch else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         let item = installedRequest.item
+        guard driver.disconnectedFromSystemAudio else {
+            throw AVPlayerItemCoordinatorFailure.systemAudioConnectionNotConfirmed
+        }
         driver.cancelPendingPrerolls(item: item)
         driver.pause(item: item)
         let direct = try await driver.directState(item: item)
         guard direct.item == item, direct.rate == 0,
-              direct.timeControlStatus == .paused else {
+              direct.timeControlStatus == .paused, driver.disconnectedFromSystemAudio else {
             throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
         }
         driver.replaceCurrentItemWithNil(item: item)
@@ -1223,6 +1359,9 @@ final class AVPlayerItemCoordinator {
         let quiescentReservation = retainedGraphReservation
             .forQuiescentReplacement(request: installedRequest)
         request = nil
+        pausedCursorBinding = nil
+        preparedTimelineMapping = nil
+        runtimeFailureRelay = nil
         authorization = nil
         authorizationArmed = false
         publicationReadiness = nil
@@ -1235,7 +1374,7 @@ final class AVPlayerItemCoordinator {
     /// Registry 的普通停止与 publication replacement 共用同一个 suspend/retire
     /// 接口；backend 必须在卸载前区分两者，避免把仍需复用的 coordinator 一并销毁。
     func requiresReplacementRetirement(_ epoch: OutputLifecycleEpoch) -> Bool {
-        invalidated && state.phase == .stopping
+        invalidated && invalidationFailure != .itemFailed && state.phase == .stopping
             && request?.item.outputLifecycleEpoch == epoch
     }
 
@@ -1277,93 +1416,132 @@ final class AVPlayerItemCoordinator {
 
     func observeAccessLogURI(_ uri: URL, item: AVPlayerItemInstanceIdentity) {
         guard request?.item == item, let request else { return }
-        switch evidenceSource.classifyAccessLogURI(
+        consumeAccessLogClassification(evidenceSource.classifyAccessLogURI(
             uri, itemURL: request.itemURL, item: item,
             publicationSequence: request.publicationSequence,
-            selected: renditionSelectionSlot.rendition) {
-        case .matching, .unrelated, .invalidLocalResource:
+            selected: renditionSelectionSlot.rendition))
+    }
+
+    private func consumeAccessLogClassification(_ classification: AccessLogURIClassification) {
+        switch classification {
+        case .matching, .unrelated:
             return
         case .conflicting:
             invalidateCurrentPublication()
+        case .invalidLocalResource:
+            invalidateCurrentPublication(failure: .itemFailed)
         }
     }
 
     func prepareCurrentItem() async throws -> PreparedAVPlayerItem {
-        guard let request else { throw AVPlayerItemCoordinatorFailure.noCurrentItem }
+        guard var request else { throw AVPlayerItemCoordinatorFailure.noCurrentItem }
+        if let invalidationFailure { throw invalidationFailure }
         let operationTicket = try beginPreparation(request)
         defer {
             if preparationTicket == operationTicket { preparationTicket = nil }
         }
-        PlaybackDiagnosticTracker.shared.append("avprep_wait_ready")
-        guard try await driver.waitUntilReady(item: request.item) == request.item else {
-            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        do {
+            try Task.checkCancellation()
+            // Keep preparation connected and paused: the tvOS 27 simulator
+            // control remained pending when disconnected before HLS readiness.
+            // A reused player may still be disconnected by its prior suspension.
+            // The transition method joins any actual SDK change and is a no-op
+            // only after proving the requested physical state is already settled.
+            guard driver.rate == 0, driver.timeControlStatus != .playing else {
+                throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+            }
+            try await driver.setDisconnectedFromSystemAudio(false, item: request.item)
+            try Task.checkCancellation()
+            guard self.request?.item == request.item,
+                  preparationTicket == operationTicket, !invalidated,
+                  !driver.disconnectedFromSystemAudio else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            PlaybackDiagnosticTracker.shared.append("avprep_wait_ready")
+            guard try await driver.waitUntilReady(item: request.item) == request.item else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            PlaybackDiagnosticTracker.shared.append("avprep_ready")
+            // A server-derived direct audio playlist has no alternative group.
+            // This only omits that platform operation; completed HTTP authority
+            // must still prove the exact sole rendition before preparation succeeds.
+            if request.directAudioOnlyRendition == nil {
+                try await driver.selectAudibleMedia(item: request.item)
+                PlaybackDiagnosticTracker.shared.append("avprep_audio_selected")
+            }
+            try await driver.primeMediaData(item: request.item)
+            PlaybackDiagnosticTracker.shared.append("avprep_media_primed")
+            request = try await awaitCompletedPublicationBinding(for: request,
+                preparationTicket: operationTicket)
+            PlaybackDiagnosticTracker.shared.append("avprep_publication_bound")
+            let selectedBinding = try selectedPreparationTerminalBinding(for: request)
+            PlaybackDiagnosticTracker.shared.append("avprep_selection_bound")
+            let endpointAuthority: AACEffectiveEndpointAuthority?
+            if let rendition = selectedBinding.rendition {
+                // 已存在 final 时立即走正式终点验真；尚未自然结束则只消费 prefix，
+                // prepare 不等待未来 EOS，也不改写已经冻结的 prepared identity。
+                endpointAuthority = rendition.endpointAuthority
+            } else if let terminalBinding = selectedBinding.terminal {
+                endpointAuthority = try await terminalBinding.awaitEndpointAuthority()
+            } else {
+                endpointAuthority = nil
+            }
+            guard self.request?.item == request.item,
+                  preparationTicket == operationTicket, !invalidated else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            PlaybackDiagnosticTracker.shared.append("avprep_timeline_begin")
+            let timeline = try await evidenceSource.consumePlayerItemTimelineMapping(
+                endpointAuthority: endpointAuthority, itemURL: request.itemURL,
+                item: request.item, publicationSequence: request.publicationSequence,
+                selection: renditionSelectionSlot.capability)
+            PlaybackDiagnosticTracker.shared.append("avprep_timeline_ready_\(timeline != nil)")
+            let context = try makePreparationSeekContext(
+                request: request,
+                timeline: timeline,
+                endpointAuthority: endpointAuthority,
+                requiresAAC: selectedBinding.terminal != nil
+                    || selectedBinding.rendition != nil)
+            PlaybackDiagnosticTracker.shared.append("avprep_context_ready")
+            try pass(.seek, request.item, preparationTicket: operationTicket)
+            try validatePreparationSeek(
+                try await driver.seek(to: context.playhead.playerItemTime,
+                    item: request.item, playhead: context.playhead),
+                request: request, context: context)
+            PlaybackDiagnosticTracker.shared.append("avprep_seek_ready")
+            try pass(.loadedTimeRanges, request.item, preparationTicket: operationTicket)
+            try validatePreparationLoaded(
+                try await driver.waitForLoadedTimeRanges(item: request.item,
+                    playhead: context.playhead, covering: ExactMediaInterval(context.playerItemRequested)),
+                request: request, context: context)
+            PlaybackDiagnosticTracker.shared.append("avprep_loaded_ready")
+            try pass(.loadedTimeRanges, request.item, preparationTicket: operationTicket)
+            try await evidenceSource.awaitCoverageReadiness(
+                contexts: preparationCoverageContexts(context),
+                requested: context.requested
+            )
+            let dependencies = try verifyPreparationCoverage(request: request, context: context)
+            PlaybackDiagnosticTracker.shared.append("avprep_coverage_ready")
+            try pass(.coverage, request.item, preparationTicket: operationTicket)
+            try validatePreparationPreroll(
+                try await driver.preroll(item: request.item, playhead: context.playhead),
+                request: request, context: context)
+            PlaybackDiagnosticTracker.shared.append("avprep_preroll_ready")
+            try pass(.preroll, request.item, preparationTicket: operationTicket)
+            try validatePreparationDirect(try await driver.directState(item: request.item),
+                                          item: request.item)
+            try pass(.preparedCAS, request.item, preparationTicket: operationTicket)
+            try pass(.positiveRateAdmission, request.item, preparationTicket: operationTicket)
+            return finishPreparation(request: request, context: context, dependencies: dependencies)
+        } catch {
+            // Cancellation can be the physical wake-up for this current attempt.
+            // Keep its first authenticated fault, without relabeling a successor.
+            if self.request?.item == request.item, preparationTicket == operationTicket {
+                preparedTimelineMapping = nil
+                if let invalidationFailure { throw invalidationFailure }
+            }
+            throw error
         }
-        PlaybackDiagnosticTracker.shared.append("avprep_ready")
-        try await driver.selectAudibleMedia(item: request.item)
-        PlaybackDiagnosticTracker.shared.append("avprep_audio_selected")
-        try await driver.primeMediaData(item: request.item)
-        PlaybackDiagnosticTracker.shared.append("avprep_media_primed")
-        try await awaitCompletedPublicationBinding(for: request)
-        PlaybackDiagnosticTracker.shared.append("avprep_publication_bound")
-        let selectedBinding = try selectedPreparationTerminalBinding(for: request)
-        PlaybackDiagnosticTracker.shared.append("avprep_selection_bound")
-        let endpointAuthority: AACEffectiveEndpointAuthority?
-        if let rendition = selectedBinding.rendition {
-            // 已存在 final 时立即走正式终点验真；尚未自然结束则只消费 prefix，
-            // prepare 不等待未来 EOS，也不改写已经冻结的 prepared identity。
-            endpointAuthority = rendition.endpointAuthority
-        } else if let terminalBinding = selectedBinding.terminal {
-            endpointAuthority = try await terminalBinding.awaitEndpointAuthority()
-        } else {
-            endpointAuthority = nil
-        }
-        guard self.request?.item == request.item,
-              preparationTicket == operationTicket, !invalidated else {
-            throw AVPlayerItemCoordinatorFailure.staleIdentity
-        }
-        PlaybackDiagnosticTracker.shared.append("avprep_timeline_begin")
-        let timeline = try await evidenceSource.consumePlayerItemTimelineMapping(
-            endpointAuthority: endpointAuthority, itemURL: request.itemURL,
-            item: request.item, publicationSequence: request.publicationSequence,
-            selection: renditionSelectionSlot.capability)
-        PlaybackDiagnosticTracker.shared.append("avprep_timeline_ready_\(timeline != nil)")
-        let context = try makePreparationSeekContext(
-            request: request,
-            timeline: timeline,
-            endpointAuthority: endpointAuthority,
-            requiresAAC: selectedBinding.terminal != nil
-                || selectedBinding.rendition != nil)
-        PlaybackDiagnosticTracker.shared.append("avprep_context_ready")
-        try pass(.seek, request.item, preparationTicket: operationTicket)
-        try validatePreparationSeek(
-            try await driver.seek(to: context.playhead.playerItemTime,
-                item: request.item, playhead: context.playhead),
-            request: request, context: context)
-        PlaybackDiagnosticTracker.shared.append("avprep_seek_ready")
-        try pass(.loadedTimeRanges, request.item, preparationTicket: operationTicket)
-        try validatePreparationLoaded(
-            try await driver.waitForLoadedTimeRanges(item: request.item,
-                playhead: context.playhead, covering: context.playerItemRequested),
-            request: request, context: context)
-        PlaybackDiagnosticTracker.shared.append("avprep_loaded_ready")
-        try pass(.loadedTimeRanges, request.item, preparationTicket: operationTicket)
-        try await evidenceSource.awaitCoverageReadiness(
-            contexts: preparationCoverageContexts(context),
-            requested: context.requested
-        )
-        let dependencies = try verifyPreparationCoverage(request: request, context: context)
-        PlaybackDiagnosticTracker.shared.append("avprep_coverage_ready")
-        try pass(.coverage, request.item, preparationTicket: operationTicket)
-        try validatePreparationPreroll(
-            try await driver.preroll(item: request.item, playhead: context.playhead),
-            request: request, context: context)
-        PlaybackDiagnosticTracker.shared.append("avprep_preroll_ready")
-        try pass(.preroll, request.item, preparationTicket: operationTicket)
-        try validatePreparationDirect(try await driver.directState(item: request.item),
-                                      item: request.item)
-        try pass(.preparedCAS, request.item, preparationTicket: operationTicket)
-        try pass(.positiveRateAdmission, request.item, preparationTicket: operationTicket)
-        return finishPreparation(request: request, context: context, dependencies: dependencies)
     }
 
     // 仅同步调用栈内的值，不新增持久字段或heap owner；将规范扫描与临时receipt
@@ -1525,7 +1703,7 @@ final class AVPlayerItemCoordinator {
     private func validatePreparationLoaded(_ loaded: AVPlayerLoadedRangeReceipt,
         request: AVPlayerItemPreparationRequest, context: PreparationSeekContext) throws {
         guard loaded.item == request.item, loaded.playhead == context.playhead,
-              loaded.requested == context.playerItemRequested else {
+              loaded.requested == ExactMediaInterval(context.playerItemRequested) else {
             throw AVPlayerItemCoordinatorFailure.loadedRangeMismatch
         }
     }
@@ -1586,7 +1764,7 @@ final class AVPlayerItemCoordinator {
     private func validatePreparationDirect(_ direct: AVPlayerDirectState,
                                            item: AVPlayerItemInstanceIdentity) throws {
         guard direct.item == item, direct.rate == 0,
-              direct.timeControlStatus != .playing else {
+              direct.timeControlStatus != .playing, !driver.disconnectedFromSystemAudio else {
             throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
         }
     }
@@ -1597,6 +1775,9 @@ final class AVPlayerItemCoordinator {
         let value = PreparedAVPlayerItem(item: request.item, identity: context.playhead,
             selectedRenditions: selectedRenditions, minimumCoverageDuration: context.requested.duration,
             coverageDependencies: dependencies)
+        // No await separates the final current-item fences from this commit.
+        // Ordinary pause keeps this original object and its unchanged origin.
+        preparedTimelineMapping = context.playhead.timelineMappingAuthority
         state.phase = .prepared
         return value
     }
@@ -1610,48 +1791,152 @@ final class AVPlayerItemCoordinator {
               state.phase == .prepared || authorization == invocation || state.phase == .stopping,
               invocationSnapshot.interval.outputLifecycle == item.outputLifecycleEpoch,
               invocationSnapshot.interval.itemGeneration == item.itemGeneration,
-              !invalidated, state.phase != .quiescent else {
-            return .rejected
-        }
+              !invalidated, state.phase != .quiescent else { return .rejected }
         guard let request else { return .rejected }
-        try revalidateCompletedPublication(for: request)
         if authorizationArmed, authorization == invocation {
+            try revalidateCompletedPublication(for: request)
             return .alreadyArmed(invocation.activation)
         }
-        if state.phase == .stopping {
-            // Registry 只能在 finishOutputPause 已退休原 suspend/activation record 后
-            // 签发新的 invocation。此处仅消费旧 coordinator 静止终态：不 prepare、
-            // seek 或重装 item；旧 receipt identity 随即失去 cleanup 签名能力。
+        let resuming = state.phase == .stopping
+        var resumeScope: AVPlayerPausedResumeScope?
+        if resuming {
             guard authorization == nil, !activationInFlight,
-                  lastQuiescenceReceipt != nil, stopTask != nil else {
-                return .rejected
+                  let stopIdentity = lastQuiescenceReceipt,
+                  stopTask?.receiptIdentity === stopIdentity else { return .rejected }
+            // Copy the original owned cursor and all immutable scope before
+            // consuming the predecessor terminal. Never sample after reconnect.
+            if let cursor = pausedCursorBinding, cursor.stopIdentity === stopIdentity,
+               cursor.item == item, driver.disconnectedFromSystemAudio,
+               driver.pausedItemObjectIdentity(item: item) == cursor.physicalItemIdentity,
+               let timeline = preparedTimelineMapping,
+               let selection = renditionSelectionSlot.capability {
+                resumeScope = .init(cursor: cursor, itemURL: request.itemURL,
+                    timeline: timeline, selection: selection,
+                    selectionRevision: state.selectionRevision,
+                    lead: AVPlayerStartupBufferPolicy.coverageDuration(
+                        seconds: driver.preferredForwardBufferDuration))
             }
             authorizationArmed = false
             lastQuiescenceReceipt = nil
+            pausedCursorBinding = nil
             stopTask = nil
             state.phase = .prepared
         }
         authorization = invocation
         authorizationCount = try Self.checkedIncrement(authorizationCount, allocator: allocator)
         state.phase = .authorized
-        try driver.installTimeControlStatusRelay(
-            item: item,
-            activation: invocation.activation
-        ) { [weak self] status, observedItem, activation in
-            self?.observeTimeControlStatus(status, item: observedItem,
-                                           activation: activation)
-        }
         activationInFlight = true
         defer {
+            if resuming { driver.finishPausedResumeCallbacks(item: item) }
             activationInFlight = false
         }
-        try await driver.play(invocation: invocation, item: item)
-        guard self.request?.item == item, authorization == invocation, !invalidated,
-              state.phase != .stopping, state.phase != .quiescent,
-              invocation.revalidateCurrentAuthority() else { return .rejected }
-        try revalidateCompletedPublication(for: request)
+        do {
+            try Task.checkCancellation()
+            guard invocation.revalidateCurrentAuthority() else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            // Registry already owns an opened interval. Adopt its cleanup
+            // responsibility before a fallible publication check, without
+            // consuming positive-rate authority or performing a native effect.
+            try revalidateCompletedPublication(for: request)
+            var resumeCoverage: LoopbackPausedResumeCoverage?
+            if resuming {
+                guard let resumeScope else { throw AVPlayerItemCoordinatorFailure.seekMismatch }
+                resumeCoverage = try evidenceSource.reservePausedResumeCoverage(resumeScope)
+                try driver.reservePausedResumeCallbacks(item: item)
+            }
+            // Both coverage/workspace and every native callback credit precede
+            // observer installation and the first physical reconnect side effect.
+            try driver.installTimeControlStatusRelay(item: item, activation: invocation.activation) {
+                [weak self] status, observedItem, activation in
+                self?.observeTimeControlStatus(status, item: observedItem, activation: activation)
+            }
+            try await driver.setDisconnectedFromSystemAudio(false, item: item)
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            try resumeCoverage?.revalidateScope()
+            if let coverage = resumeCoverage, let scope = resumeScope {
+                let playhead = PreparedPlayheadIdentity(
+                    outputLifecycleEpoch: item.outputLifecycleEpoch, itemGeneration: item.itemGeneration,
+                    publicationSequence: request.publicationSequence,
+                    mediaTime: coverage.requested.start, playerItemTime: scope.cursor.time,
+                    seekNonce: try issueNonce(), renditionSelectionSlotNonce: try issueNonce(),
+                    audioSelectionCapability: scope.selection, timelineMappingAuthority: scope.timeline)
+                let seek = try await driver.seek(to: scope.cursor.time, item: item, playhead: playhead)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                try coverage.revalidateScope()
+                guard seek.item == item, seek.playhead == playhead, seek.actualTime == scope.cursor.time else {
+                    throw AVPlayerItemCoordinatorFailure.seekMismatch
+                }
+                let itemRange = try ExactMediaInterval(start: scope.cursor.time,
+                    end: scope.timeline.playerItemTime(for: coverage.requested.end))
+                let loaded = try await driver.waitForLoadedTimeRanges(item: item,
+                    playhead: playhead, covering: itemRange)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                try coverage.revalidateScope()
+                guard loaded.item == item, loaded.playhead == playhead, loaded.requested == itemRange else {
+                    throw AVPlayerItemCoordinatorFailure.loadedRangeMismatch
+                }
+                try await evidenceSource.awaitPausedResumeCoverage(coverage)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                try evidenceSource.revalidatePausedResumeCoverage(coverage)
+                let preroll = try await driver.preroll(item: item, playhead: playhead)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                try evidenceSource.revalidatePausedResumeCoverage(coverage)
+                guard preroll.item == item, preroll.playhead == playhead, preroll.succeeded else {
+                    throw AVPlayerItemCoordinatorFailure.prerollFailed
+                }
+                let direct = try await driver.directState(item: item)
+                try validateActivation(invocation, request: request, resumeScope: scope)
+                guard direct.item == item, direct.rate == 0, direct.timeControlStatus == .paused,
+                      driver.pausedTime(item: item) == scope.cursor.time,
+                      !driver.disconnectedFromSystemAudio else {
+                    throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+                }
+                try evidenceSource.revalidatePausedResumeCoverage(coverage)
+            }
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            try await driver.play(invocation: invocation, item: item)
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            if let resumeCoverage { try evidenceSource.revalidatePausedResumeCoverage(resumeCoverage) }
+        } catch {
+            let first = AVPlayerFixedPreparationFailure(error)
+            // The original signed runner owns rollback even after cancellation;
+            // stop joins it before beginning the next physical suspension.
+            driver.cancelPendingPrerolls(item: item)
+            driver.pause(item: item)
+            do throws(AVPlayerItemCoordinatorFailure) {
+                try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            } catch {
+                if self.request?.item == item, authorization == invocation {
+                    unresolvedActivationRollbackFailure = error
+                }
+                // No quiescence receipt or disconnected state is manufactured.
+                // The current invocation and protected native rollback remain
+                // owned; the original failure still reaches Registry's owner.
+            }
+            throw first.boundaryError
+        }
         authorizationArmed = true
         return .armed(invocation.activation)
+    }
+
+    private func validateActivation(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
+        request: AVPlayerItemPreparationRequest, resumeScope: AVPlayerPausedResumeScope?) throws {
+        try Task.checkCancellation()
+        guard self.request?.item == request.item, authorization == invocation, !invalidated,
+              state.phase != .stopping, state.phase != .quiescent,
+              invocation.revalidateCurrentAuthority() else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        try revalidateCompletedPublication(for: request)
+        if let scope = resumeScope {
+            guard preparedTimelineMapping === scope.timeline,
+                  renditionSelectionSlot.capability === scope.selection,
+                  state.selectionRevision == scope.selectionRevision,
+                  driver.pausedItemObjectIdentity(item: request.item) == scope.cursor.physicalItemIdentity else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+        }
     }
 
     func observeTimeControlStatus(_ status: AVPlayer.TimeControlStatus,
@@ -1673,6 +1958,13 @@ final class AVPlayerItemCoordinator {
             publishedPlayingCount = next
             state.phase = .playing
         } else if status == .paused, authorizationArmed {
+            // A matching native endpoint notification may already own its
+            // bounded second direct read. Do not revoke that exact activation
+            // merely because its later paused KVO arrives in another batch.
+            // Every other pause still enters the existing replacement path.
+            if driver.hasPendingNaturalEndVerification(item: item, activation: activation) {
+                return
+            }
             // Registry 发起的暂停会先撤销 authorization，再调用 driver.pause；能走到
             // 这里的 paused 因而不是用户暂停。直播上游在 prepare 之后才 EOF 时，
             // AVPlayer 不一定有预先约束的终点能力，但会可靠地从 playing 转为
@@ -1761,6 +2053,14 @@ final class AVPlayerItemCoordinator {
             #endif
             driver.cancelPendingPrerolls(item: item)
             driver.pause(item: item)
+            // Read on this owned synchronous stack before disconnect can reset
+            // AVPlayer time. Keep it local until this exact stop commits.
+            let pausedTime = driver.pausedTime(item: item)
+            let pausedItemObject = driver.pausedItemObjectIdentity(item: item)
+            try await driver.setDisconnectedFromSystemAudio(true, item: item)
+            guard driver.disconnectedFromSystemAudio else {
+                throw AVPlayerItemCoordinatorFailure.systemAudioConnectionNotConfirmed
+            }
             let direct = try await driver.directState(item: item)
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append(
@@ -1768,7 +2068,7 @@ final class AVPlayerItemCoordinator {
             )
             #endif
             guard direct.item == item, direct.rate == 0,
-                  direct.timeControlStatus == .paused else {
+                  direct.timeControlStatus == .paused, driver.disconnectedFromSystemAudio else {
                 throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
             }
             let receipt = AVPlayerQuiescenceReceipt(item: item,
@@ -1779,15 +2079,30 @@ final class AVPlayerItemCoordinator {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
             lastQuiescenceReceipt = receipt.identity
+            unresolvedActivationRollbackFailure = nil
             // Registry 的 replacement retirement 仍需消费同一停止终态；真正卸载
             // 完成前保持 stopping，避免把“已静止”和“已退休”混成一个阶段。
             state.phase = .stopping
             task.complete(.success(receipt))
+            if request?.item == item, stopTask === task,
+               task.receiptIdentity === receipt.identity {
+                // This exact successful stop owns the slot even when its
+                // metadata read failed. Never retain a predecessor's cursor.
+                pausedCursorBinding = nil
+                if !invalidated, driver.currentItemIdentity == item, let pausedTime,
+                   let pausedItemObject,
+                   driver.pausedItemObjectIdentity(item: item) == pausedItemObject {
+                    pausedCursorBinding = .init(stopIdentity: receipt.identity,
+                        item: item, time: pausedTime, physicalItemIdentity: pausedItemObject)
+                }
+            }
             return receipt
         } catch {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("cap_av_stop_err_\(error)")
             #endif
+            // A late predecessor must never erase a successor's association.
+            if request?.item == item, stopTask === task { pausedCursorBinding = nil }
             task.complete(.failure(error))
             throw error
         }
@@ -1803,6 +2118,9 @@ final class AVPlayerItemCoordinator {
         driver.removeObservers(item: receipt.item)
         (evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource)?.retirePreparation()
         request = nil
+        pausedCursorBinding = nil
+        preparedTimelineMapping = nil
+        runtimeFailureRelay = nil
         authorizationArmed = false
         retainedGraphReservation = .empty
         state.phase = .quiescent
@@ -1818,7 +2136,8 @@ final class AVPlayerItemCoordinator {
     }
 
     func accept(_ receipt: AVPlayerQuiescenceReceipt) -> Bool {
-        guard lastQuiescenceReceipt === receipt.identity else { return false }
+        guard lastQuiescenceReceipt === receipt.identity,
+              driver.disconnectedFromSystemAudio else { return false }
         if let close = receipt.closeClaim {
             return receipt.matches(item: receipt.item,
                                    suspendTicket: receipt.suspendTicket,
@@ -1832,10 +2151,28 @@ final class AVPlayerItemCoordinator {
             && receipt.directlyConfirmedRateZero
     }
 
+    /// Revalidate the retained binding by folding pending publication/selection
+    /// authority events first; this can invalidate scope and request owned stop.
+    /// This is not a passive diagnostic getter. It never recaptures time or
+    /// refreshes scope, and retiring a cursor preserves physical cleanup receipts.
+    func capturedPausedCursor(for receipt: AVPlayerQuiescenceReceipt) -> AVPlayerPausedCursorBinding? {
+        consumePendingPublicationAuthorityEvent()
+        consumePendingRenditionSelectionEvent()
+        guard !invalidated, state.phase == .stopping,
+              let binding = pausedCursorBinding,
+              binding.stopIdentity === receipt.identity,
+              binding.item == receipt.item, request?.item == binding.item,
+              driver.currentItemIdentity == binding.item,
+              accept(receipt) else { return nil }
+        return binding
+    }
+
     private func issueNonce() throws -> UInt64 {
         do { return try allocator.next(in: .nonce) }
         catch {
-            invalidated = true
+            if invalidationFailure == nil { invalidationFailure = .identitySpaceExhausted }
+            pausedCursorBinding = nil
+            preparedTimelineMapping = nil
             throw AVPlayerItemCoordinatorFailure.identitySpaceExhausted
         }
     }
@@ -1848,11 +2185,12 @@ final class AVPlayerItemCoordinator {
         if let preparationTicket, self.preparationTicket != preparationTicket {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        if let invalidationFailure { throw invalidationFailure }
         if let request { try revalidateCompletedPublication(for: request) }
-        guard !invalidated else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
     }
 
-    private func bindCompletedPublication(for request: AVPlayerItemPreparationRequest) throws {
+    private func bindCompletedPublication(for request: AVPlayerItemPreparationRequest,
+        adoptingInitialDirectPublication: Bool = false) throws {
         guard publicationReadiness == nil,
               let readiness = publicationBindingReadiness(for: request),
               readiness.itemURL == request.itemURL,
@@ -1890,8 +2228,21 @@ final class AVPlayerItemCoordinator {
                     $0.renditionIdentity == capability.renditionIdentity
                   }) else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
             if let current = renditionSelectionSlot.capability, current !== capability {
-                invalidateCurrentPublication()
-                throw AVPlayerItemCoordinatorFailure.selectionChanged
+                // A sole rendition's first media response can arrive before its init.
+                // An independently complete newer publication may win initial binding,
+                // but no old body/selection evidence is transferred into that version.
+                guard adoptingInitialDirectPublication, state.phase == .preparing,
+                      let original = self.request,
+                      original.directAudioOnlyRendition == capability.renditionIdentity,
+                      request.directAudioOnlyRendition == capability.renditionIdentity,
+                      current.renditionIdentity == capability.renditionIdentity,
+                      current.outputLifecycleEpoch == request.item.outputLifecycleEpoch,
+                      current.itemGeneration == request.item.itemGeneration,
+                      current.publicationSequence == original.publicationSequence,
+                      request.publicationSequence > original.publicationSequence else {
+                    invalidateCurrentPublication()
+                    throw AVPlayerItemCoordinatorFailure.selectionChanged
+                }
             }
             renditionSelectionSlot = .bound(capability)
             _ = participant
@@ -1908,22 +2259,40 @@ final class AVPlayerItemCoordinator {
     /// 真实 loopback 源因此在同一 prepare 事务内做有界等待，不能把这个事件竞态
     /// 误判为永久 coverage 失败。可控 fake 仍保持同步失败语义。
     private func awaitCompletedPublicationBinding(
-        for request: AVPlayerItemPreparationRequest
-    ) async throws {
-        guard publicationReadiness == nil else { return }
-        guard evidenceSource is LoopbackAVPlayerPreparationEvidenceSource else {
+        for request: AVPlayerItemPreparationRequest, preparationTicket operationTicket: UInt64
+    ) async throws -> AVPlayerItemPreparationRequest {
+        guard publicationReadiness == nil else { return request }
+        guard let source = evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource else {
             try bindCompletedPublication(for: request)
-            return
+            return request
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while true {
+            try Task.checkCancellation()
+            guard self.request?.item == request.item,
+                  self.request?.publicationSequence == request.publicationSequence,
+                  driver.currentItemIdentity == request.item,
+                  preparationTicket == operationTicket, state.phase == .preparing else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
             consumePendingPublicationAuthorityEvent()
             consumePendingRenditionSelectionEvent()
+            if let invalidationFailure { throw invalidationFailure }
             do {
                 try bindCompletedPublication(for: request)
-                return
+                return request
             } catch AVPlayerItemCoordinatorFailure.insufficientCoverage {
+                if request.directAudioOnlyRendition != nil,
+                   let served = try source.completedDirectPreparationRequest(replacing: request) {
+                    try Task.checkCancellation()
+                    try bindCompletedPublication(for: served, adoptingInitialDirectPublication: true)
+                    self.request = served
+                    PlaybackDiagnosticTracker.shared.append(
+                        "avprep_adopt_publication_\(request.publicationSequence)_to_\(served.publicationSequence)")
+                    return served
+                }
                 guard ContinuousClock.now < deadline else {
+                    PlaybackDiagnosticTracker.shared.append("avprep_publication_timeout_\(request.publicationSequence)")
                     throw AVPlayerItemCoordinatorFailure.insufficientCoverage
                 }
                 try await Task.sleep(for: .milliseconds(5))
@@ -2019,9 +2388,13 @@ final class AVPlayerItemCoordinator {
         }
     }
 
-    private func invalidateCurrentPublication() {
+    private func invalidateCurrentPublication(
+        failure: AVPlayerItemCoordinatorFailure = .selectionChanged
+    ) {
         guard !invalidated else { return }
-        invalidated = true
+        invalidationFailure = failure
+        pausedCursorBinding = nil
+        preparedTimelineMapping = nil
         renditionSelectionSlot = .invalid
         if let next = try? Self.checkedIncrement(invalidationCount, allocator: allocator) {
             invalidationCount = next
@@ -2030,6 +2403,18 @@ final class AVPlayerItemCoordinator {
         if let next = try? Self.checkedIncrement(stopTaskCount, allocator: allocator) {
             stopTaskCount = next
             automaticStopRequested = true
+        }
+        if failure == .itemFailed {
+            // Transport failure belongs to the current attempt's terminal path,
+            // never publication replacement. Close native admission synchronously
+            // while the existing scoped first-error relay reaches its owned cleanup.
+            if let item = request?.item {
+                driver.cancelPendingPrerolls(item: item)
+                driver.pause(item: item)
+            }
+            automaticStopRequested = runtimeFailureRelay != nil
+            runtimeFailureRelay?.record(PlaybackErrorDiagnostics.snapshot(failure))
+            return
         }
         guard backendPublicationReplacementAuthoritySlot.requestReplacement() else {
             // authority 缺失、过期或已消费属于 lifecycle 不变量破坏。此时不能
@@ -2157,6 +2542,59 @@ struct TimelineMappingRetryState {
     }
 }
 
+/// Coverage views retain their exact metadata owner. The restricted resume owner
+/// exposes no startup publication, timeline or history authority through this view.
+enum FrozenCompletedCoverageOwner: Sendable {
+    case startup(FrozenPreparationOwner)
+    case paused(PausedWindowCoverageLease)
+
+    var slot: UInt8 {
+        switch self { case .startup(let owner): owner.slot; case .paused(let owner): owner.slot }
+    }
+    var metadataStore: SealedMediaStore? {
+        switch self {
+        case .startup(let owner): owner.metadataStore
+        case .paused(let owner): owner.metadataStore
+        }
+    }
+    var completionIsFrozen: Bool {
+        switch self {
+        case .startup(let owner): owner.completionIsFrozen
+        case .paused(let owner): owner.completionIsFrozen
+        }
+    }
+    func containsCompletedResource(_ index: Int) -> Bool {
+        switch self {
+        case .startup(let owner): owner.containsCompletedResource(index)
+        case .paused(let owner): owner.containsCompletedResource(index)
+        }
+    }
+    func coverage(at index: UInt8) -> FrozenCoverageStorage? {
+        switch self {
+        case .startup(let owner): owner.coverage(at: index)
+        case .paused(let owner): owner.coverage(at: index)
+        }
+    }
+    func coverageResource(at ordinal: Int, coverage index: UInt8) -> UInt16 {
+        switch self {
+        case .startup(let owner): owner.coverageResource(at: ordinal, coverage: index)
+        case .paused(let owner): owner.coverageResource(at: ordinal, coverage: index)
+        }
+    }
+    func setCoverage(_ value: FrozenCoverageStorage, indices: FrozenCoverageIndices, at index: UInt8) {
+        switch self {
+        case .startup(let owner): owner.setCoverage(value, indices: indices, at: index)
+        case .paused(let owner): owner.setCoverage(value, indices: indices, at: index)
+        }
+    }
+    func dependencies(at index: UInt8) -> ServedCoverageDependencies {
+        switch self {
+        case .startup(let owner): owner.dependencies(at: index)
+        case .paused(let owner): owner.dependencies(at: index)
+        }
+    }
+}
+
 /// 两个不同准备事务共享进程准入；cleanup不能提前归还外部冻结视图仍持有的槽。
 final class FrozenPreparationOwner: @unchecked Sendable {
     private static let admissionLock = PreparationStorageLock()
@@ -2209,6 +2647,9 @@ final class FrozenPreparationOwner: @unchecked Sendable {
         }
         if index == 0 { precondition(firstCoverage == nil); firstCoverage = value }
         else { precondition(secondCoverage == nil); secondCoverage = value }
+    }
+    func dependencies(at index: UInt8) -> ServedCoverageDependencies {
+        .init(storage: .frozen(owner: self, coverageIndex: index))
     }
     private var completedResources: (UInt64, UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0, 0)
 
@@ -2280,20 +2721,23 @@ final class FrozenPreparationOwner: @unchecked Sendable {
         let reservation = try PlaybackResourceContextLedger.shared.reserve(
             allocationIdentity: .stable(UUID()), bytes: 19 * 1_024)
         do {
-            let owner = try admissionLock.withLock { () throws -> FrozenPreparationOwner in
-                let slot: UInt8
-                if admissionReferences.0 == 0 { slot = 1; admissionReferences.0 = 1 }
-                else if admissionReferences.1 == 0 { slot = 2; admissionReferences.1 = 1 }
-                else { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
-                return FrozenPreparationOwner(slot: slot,
-                    resourceContextReservation: reservation)
-            }
+            let slot = try reserveCoverageAdmissionSlot()
+            let owner = FrozenPreparationOwner(slot: slot,
+                resourceContextReservation: reservation)
             try PlaybackResourceContextLedger.shared.rebind(
                 reservation, to: .object(ObjectIdentifier(owner)))
             return owner
         } catch {
             PlaybackResourceContextLedger.shared.release(reservation)
             throw error
+        }
+    }
+
+    fileprivate static func reserveCoverageAdmissionSlot() throws -> UInt8 {
+        try admissionLock.withLock {
+            if admissionReferences.0 == 0 { admissionReferences.0 = 1; return 1 }
+            if admissionReferences.1 == 0 { admissionReferences.1 = 1; return 2 }
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
         }
     }
 
@@ -2352,6 +2796,154 @@ final class FrozenPreparationOwner: @unchecked Sendable {
         timelineStorage = nil
         Self.releaseAdmission(slot: slot)
         PlaybackResourceContextLedger.shared.release(resourceContextReservation)
+    }
+}
+
+/// Storage-only prerequisite for a separately authenticated paused-window issuer.
+/// It cannot create startup publication/timeline authority or activate history.
+/// Mutations run in the original serialized server/store issuance operation;
+/// returned dependency views keep this exact lease and its pins alive.
+final class PausedWindowCoverageLease: @unchecked Sendable {
+    static let indexCapacity = 128
+    var indexCapacity: Int { Self.indexCapacity }
+    let slot: UInt8
+    private let reservation: PlaybackResourceContextReservation
+    private(set) var metadataStore: SealedMediaStore?
+    private(set) var completionIsFrozen = false
+    private var completedResources: (UInt64, UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0, 0)
+    private var firstCoverage: FrozenCoverageStorage?
+    private var secondCoverage: FrozenCoverageStorage?
+    private let coverageIndices: UnsafeMutablePointer<UInt16>
+
+    /// Only the roots this restricted type actually allocates are included. New
+    /// asynchronous issuer/callback frames require their own measured admission.
+    static var allocationLimits: (root: Int, indices: Int, context: Int, application: Int) {
+        (
+            malloc_good_size(class_getInstanceSize(Self.self)),
+            malloc_good_size(indexCapacity * MemoryLayout<UInt16>.stride),
+            malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self)),
+            malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+        )
+    }
+
+    static var reservationBytes: Int {
+        let limits = allocationLimits
+        guard let total = try? HLSChecked.add(try HLSChecked.add(limits.root, limits.indices),
+            try HLSChecked.add(limits.context, limits.application)) else {
+            preconditionFailure("Fixed paused-window allocation sizes overflow")
+        }
+        return total
+    }
+
+    var actualAllocationBytes: (root: Int, indices: Int, context: Int, application: Int)? {
+        guard let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation)
+            else { return nil }
+        return (
+            malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())),
+            malloc_size(UnsafeRawPointer(coverageIndices)),
+            tokens.context, tokens.application
+        )
+    }
+
+    var knownAllocationBytes: Int {
+        guard let actual = actualAllocationBytes else {
+            preconditionFailure("Paused-window allocation must retain its exact registered tokens")
+        }
+        return actual.root + actual.indices + actual.context + actual.application
+    }
+
+    static func reserve() throws -> PausedWindowCoverageLease {
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: reservationBytes)
+        do {
+            let slot = try FrozenPreparationOwner.reserveCoverageAdmissionSlot()
+            let lease = PausedWindowCoverageLease(slot: slot, reservation: reservation)
+            try PlaybackResourceContextLedger.shared.rebind(
+                reservation, to: .object(ObjectIdentifier(lease)))
+            let limits = allocationLimits
+            guard let actual = lease.actualAllocationBytes,
+                  actual.root <= limits.root, actual.indices <= limits.indices,
+                  actual.context <= limits.context, actual.application <= limits.application else {
+                throw LoopbackHTTPReservationError.hardCapacityExceeded
+            }
+            return lease
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(slot: UInt8, reservation: PlaybackResourceContextReservation) {
+        self.slot = slot
+        self.reservation = reservation
+        coverageIndices = .allocate(capacity: Self.indexCapacity)
+        coverageIndices.initialize(repeating: 0, count: Self.indexCapacity)
+    }
+
+    @discardableResult
+    func retainMetadata(in store: SealedMediaStore, key: HLSResourceKey) throws -> Int {
+        guard !completionIsFrozen, metadataStore == nil || metadataStore === store else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        let index = try store.retainPreparationResource(key, ownerSlot: slot, requiresCompleted: false)
+        metadataStore = store
+        return index
+    }
+
+    func freezeCompletedResources() throws {
+        guard !completionIsFrozen, let store = metadataStore else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        for index in 0..<300 {
+            guard let resource = store.preparationResource(slot: index, ownerSlot: slot),
+                  store.preparationResourceIsComplete(slot: index, ownerSlot: slot) else { continue }
+            let retained = try store.retainPreparationResource(resource.key, ownerSlot: slot)
+            guard retained == index else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+            withUnsafeMutableBytes(of: &completedResources) { bytes in
+                bytes.bindMemory(to: UInt64.self)[index / 64] |= UInt64(1) << (index % 64)
+            }
+        }
+        completionIsFrozen = true
+    }
+
+    func containsCompletedResource(_ index: Int) -> Bool {
+        guard (0..<300).contains(index) else { return false }
+        return withUnsafeBytes(of: completedResources) { bytes in
+            bytes.bindMemory(to: UInt64.self)[index / 64] & (UInt64(1) << (index % 64)) != 0
+        }
+    }
+
+    func coverage(at index: UInt8) -> FrozenCoverageStorage? {
+        precondition(index < 2)
+        return index == 0 ? firstCoverage : secondCoverage
+    }
+
+    func coverageResource(at ordinal: Int, coverage index: UInt8) -> UInt16 {
+        let descriptor = coverage(at: index)!
+        precondition(ordinal >= 0 && ordinal < descriptor.count)
+        return coverageIndices[Int(descriptor.offset) + ordinal]
+    }
+
+    func setCoverage(_ value: FrozenCoverageStorage, indices: FrozenCoverageIndices, at index: UInt8) {
+        precondition(completionIsFrozen && index < 2)
+        precondition(Int(value.offset) + Int(value.count) <= Self.indexCapacity)
+        for ordinal in 0..<Int(value.count) {
+            coverageIndices[Int(value.offset) + ordinal] = indices[ordinal]
+        }
+        if index == 0 { precondition(firstCoverage == nil); firstCoverage = value }
+        else { precondition(secondCoverage == nil); secondCoverage = value }
+    }
+
+    func dependencies(at index: UInt8) -> ServedCoverageDependencies {
+        .init(storage: .paused(owner: self, coverageIndex: index))
+    }
+
+    deinit {
+        metadataStore?.releasePreparationMetadata(ownerSlot: slot)
+        coverageIndices.deinitialize(count: Self.indexCapacity)
+        coverageIndices.deallocate()
+        FrozenPreparationOwner.releaseAdmission(slot: slot)
+        PlaybackResourceContextLedger.shared.release(reservation)
     }
 }
 
@@ -2417,7 +3009,8 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
             else if case .pending = mappingStorage { mappingStorage = .idle }
         }
     }
-    private var timelineTerminalFailed = false
+    private var timelineTerminalFailure: AVPlayerFixedPreparationFailure?
+    private var timelineTerminalFailed: Bool { timelineTerminalFailure != nil }
     private var timelineRetry = TimelineMappingRetryState()
     private var prepareWait: AVPlayerPrepareWaitSlot?
     private var completedMapping: PlayerItemTimelineMappingAuthority? {
@@ -2569,6 +3162,19 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
             item: item, pendingPublication: pendingPublication, source: self)
     }
 
+    func configureStartupSelection(duration: ExactMediaTime) throws {
+        try server.configureStartupSelection(duration: duration, owner: preparationOwner)
+    }
+
+    fileprivate func completedDirectPreparationRequest(
+        replacing original: AVPlayerItemPreparationRequest
+    ) throws -> AVPlayerItemPreparationRequest? {
+        guard preparationOwner.isHistoryActive, !preparationOwner.isRetired else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        return try server.completedDirectPreparationRequest(replacing: original, source: self)
+    }
+
     var audioRequirementCount: Int { server.preparationAudioRequirementCount }
     func belongs(to originalServer: LoopbackHTTPServer) -> Bool { server === originalServer }
     func audioRequirement(at index: Int) -> AVPlayerAudioParticipantRequirement {
@@ -2610,6 +3216,9 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
         -> AccessLogURIClassification {
         guard itemURL.scheme == "http", itemURL.host == server.localHost,
               itemURL.port == Int(server.port) else { return .invalidLocalResource }
+        if let direct = server.classifyDirectPreparationAccessLogURI(uri,
+            itemURL: itemURL, item: item, originalSequence: publicationSequence,
+            selected: selected, owner: preparationOwner) { return direct }
         return server.classifyAccessLogURI(uri,
             itemGeneration: item.itemGeneration,
             publicationSequence: publicationSequence,
@@ -2687,6 +3296,34 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
             itemGeneration: receipt.itemGeneration,
             presentationRange: verified.effectivePresentationRange,
             dependencies: .init(served: receipt.dependencies))
+    }
+
+    private func validatePausedSourceTerminal() throws {
+        if let failure = lock.withLock({ timelineTerminalFailure }) { throw failure.boundaryError }
+    }
+
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope) throws
+        -> LoopbackPausedResumeCoverage {
+        try validatePausedSourceTerminal()
+        return try server.reservePausedResumeCoverage(scope, originalOwner: preparationOwner)
+    }
+
+    func awaitPausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while true {
+            try Task.checkCancellation()
+            try validatePausedSourceTerminal()
+            if try server.freezePausedResumeCoverage(coverage) { return }
+            guard ContinuousClock.now < deadline else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    func revalidatePausedResumeCoverage(_ coverage: LoopbackPausedResumeCoverage) throws {
+        try validatePausedSourceTerminal()
+        try server.revalidatePausedResumeCoverage(coverage)
     }
 
     func awaitCoverageReadiness(
@@ -2927,7 +3564,10 @@ final class LoopbackAVPlayerPreparationEvidenceSource: AVPlayerPreparationEviden
     private func receiveTimelineFailure(_ event: LoopbackTimelineFailureEvent) {
         let delivery = lock.withLock { () -> (PendingTimelineMapping, AVPlayerPrepareWaitSlot)? in
             guard !timelineTerminalFailed else { return nil }
-            timelineTerminalFailed = true
+            switch event {
+            case .publicationTerminated(_, _, _, let failure): timelineTerminalFailure = .completed(failure)
+            case .serverTerminated: timelineTerminalFailure = .coordinator(.insufficientCoverage)
+            }
             guard let pending = pendingTimelineMapping, let gate = prepareWait else { return nil }
             pendingTimelineMapping = nil
             timelineRetry.cancelPending()

@@ -188,7 +188,7 @@ audit_build_record() {
   target="$(jq -er '.target' "$record")"
   case "$slice" in
     device)
-      expected_target="arm64-apple-tvos18.0"
+      expected_target="arm64-apple-tvos27.0"
       expected_sdk="appletvos"
       expected_platform_id="3"
       expected_platform="tvos"
@@ -199,7 +199,7 @@ audit_build_record() {
       require_define "$config" ARCH_AARCH64 1
       ;;
     sim-arm64)
-      expected_target="arm64-apple-tvos18.0-simulator"
+      expected_target="arm64-apple-tvos27.0-simulator"
       expected_sdk="appletvsimulator"
       expected_platform_id="8"
       expected_platform="tvos"
@@ -210,7 +210,7 @@ audit_build_record() {
       require_define "$config" ARCH_AARCH64 1
       ;;
     sim-x86_64)
-      expected_target="x86_64-apple-tvos18.0-simulator"
+      expected_target="x86_64-apple-tvos27.0-simulator"
       expected_sdk="appletvsimulator"
       expected_platform_id="8"
       expected_platform="tvos"
@@ -252,8 +252,8 @@ audit_build_record() {
   grep -Fqx "#define FFMPEG_DATADIR \"$virtual_install_base/$slice/share/ffmpeg\"" "$config" || fail "$slice FFMPEG_DATADIR is not normalized"
   grep -Fqx "#define AVCONV_DATADIR \"$virtual_install_base/$slice/share/ffmpeg\"" "$config" || fail "$slice AVCONV_DATADIR is not normalized"
   load_inventory="$(/usr/bin/otool -l "$prefix/lib/libFFmpeg.a" | awk '/^[[:space:]]*platform / || /^[[:space:]]*minos / {print $1, $2}' | LC_ALL=C sort -u)"
-  expected_load_inventory="$(printf 'minos 18.0\nplatform %s' "$expected_platform_id")"
-  [[ "$load_inventory" == "$expected_load_inventory" ]] || fail "$slice Mach-O platform or minimum OS differs from tvOS 18.0"
+  expected_load_inventory="$(printf 'minos 27.0\nplatform %s' "$expected_platform_id")"
+  [[ "$load_inventory" == "$expected_load_inventory" ]] || fail "$slice Mach-O platform or minimum OS differs from tvOS 27.0"
   if grep -q '^#define CONFIG_POSTPROC ' "$config"; then
     require_define "$config" CONFIG_POSTPROC 0
   fi

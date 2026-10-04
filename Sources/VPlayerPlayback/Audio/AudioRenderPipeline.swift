@@ -240,6 +240,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     private var recoveryFloor: CMTime?
     private var nextReplayRetentionID: UInt64? = 1
     private var pendingPCM: [CMSampleBuffer] = []
+    private var naturalEOFInputFinished = false
+    private var naturalEOFPCMDrained = false
     private var activeContinuityIslandID: AudioContinuityIslandID?
     private var needsDecoderResetBeforeNextCompressedEnqueue = false
     private var pcmPrerollStart: CMTime?
@@ -249,6 +251,25 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     private var acceptedCompressedRunStart: CMTime?
     private var acceptedCompressedRunEnd: CMTime?
     private var consecutiveInvalidPacketCount = 0
+    // The executor retains at most one immutable header across Receiver backpressure.
+    // Identity + queue episode fence every completion, including ignored cancellation.
+    private struct Submission: @unchecked Sendable {
+        let id: UInt64
+        let epoch: UInt64
+        let generation: MediaGeneration
+        let rendererID: AudioRendererIdentity
+        let queueEpisode: UInt64
+        let islandID: AudioContinuityIslandID?
+        let sampleBuffer: CMSampleBuffer
+        let compressed: CompressedAudioSample?
+        let retentionID: UInt64?
+        let resetsDecoder: Bool
+    }
+    private var rendererObservationRevision: UInt64 = 0
+    private var nextSubmissionID: UInt64 = 1
+    private var submission: Submission?
+    private var drivingRenderer = false
+    private var submissionBackpressured = false
     private var rendererAttached = false
     private var rendererPumpState = AudioRendererPumpState()
     private var rendererDemandProgress = AudioRendererDemandProgressState()
@@ -337,6 +358,26 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         )
     }
 
+    func finishInputForNaturalEOF() {
+        guard executor.isIsolated else {
+            executor.submit { [weak self] in self?.finishInputForNaturalEOF() }
+            return
+        }
+        guard !naturalEOFInputFinished, !stopped, !terminal else { return }
+        naturalEOFInputFinished = true
+        driveRenderer()
+    }
+
+    var isDrainedForNaturalEOF: Bool {
+        executor.readIsolated {
+            naturalEOFInputFinished && !stopped && !terminal
+                && pendingRendererSampleCount == 0 && submission == nil
+                && !replacing && (route != .ffmpegPCM || naturalEOFPCMDrained)
+        }
+    }
+
+    var naturalEOFAcceptedEndPTS: CMTime? { acceptedCoverage?.endPTS }
+
     var acceptedCoverage: AudioRendererAcceptedCoverage? {
         withSnapshot { $0.acceptedCoverage }
     }
@@ -417,7 +458,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         guard executor.isIsolated else {
             throw PlaybackCoreError.audioRendererFailed(Self.isolationError)
         }
-        guard configured, !stopped, !terminal else { return }
+        guard configured, !stopped, !terminal, !naturalEOFInputFinished else { return }
         guard sample.generation == generation else { return }
         guard activeContinuityIslandID == sample.continuityIslandID else {
             throw PlaybackCoreError.audioRendererFailed("audio.island.mismatch")
@@ -516,6 +557,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         clearReplay(keepingCapacity: false)
         pendingPCM.removeAll(keepingCapacity: false)
         decoder?.flush()
+        naturalEOFPCMDrained = false
         resetPCMPreroll()
         resetAcceptedCompressedMedia()
         consecutiveInvalidPacketCount = 0
@@ -559,6 +601,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         if let renderer { resetRendererQueue(renderer) }
         pendingPCM.removeAll(keepingCapacity: false)
         decoder?.flush()
+        naturalEOFPCMDrained = false
         resetPCMPreroll()
         consecutiveInvalidPacketCount = 0
         for index in replay.indices {
@@ -614,7 +657,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         guard configured, !stopped else { return }
         resetRendererAcceptedCoverage()
         if let renderer {
-            resetRendererQueue(renderer)
+            resetRendererQueue(renderer, rebindObservation: false)
         } else {
             invalidateRendererRequest(on: nil)
         }
@@ -641,6 +684,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         resetCompressedDiagnosticContextForTimeline(generation: generation)
         consecutiveInvalidPacketCount = 0
         decoder?.flush()
+        naturalEOFPCMDrained = false
 
         if var pendingRemoval {
             pendingRemoval.targetEpoch = newEpoch
@@ -798,6 +842,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         self.generation = generation
         format = configuration.formatDescription
         fingerprint = configuration.fingerprint
+        naturalEOFInputFinished = false
+        naturalEOFPCMDrained = false
         codec = configuration.codec
         decoderExtradata = configuration.decoderExtradata
         clearReplay(keepingCapacity: false)
@@ -875,10 +921,13 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         generation: MediaGeneration
     ) {
         let rendererID = renderer.identity
+        rendererObservationRevision += 1
+        let observationRevision = rendererObservationRevision
         renderer.startObserving { [weak self] event in
             guard let self else { return }
             executor.submit { [weak self] in
-                self?.handle(
+                guard let self, rendererObservationRevision == observationRevision else { return }
+                handle(
                     event: event,
                     epoch: epoch,
                     rendererID: rendererID,
@@ -1351,7 +1400,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
                 progressMonitor.automaticFlush(
                     key: attemptKey,
                     token: token,
-                    hasReplay: !replay.isEmpty
+                    hasReplay: !replay.isEmpty,
+                    canObserveConsumption: renderer?.canObserveConsumption == true
                 )
             } else {
                 progressMonitor.correlatedRecovery(
@@ -1419,6 +1469,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         if route == .ffmpegPCM {
             consecutiveInvalidPacketCount = 0
             decoder?.flush()
+            naturalEOFPCMDrained = false
         }
         driveRenderer()
     }
@@ -1612,7 +1663,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
                 progressMonitor.replacementReady(
                     key: attemptKey,
                     token: token,
-                    hasReplay: !replay.isEmpty
+                    hasReplay: !replay.isEmpty,
+                    canObserveConsumption: renderer?.canObserveConsumption == true
                 ),
                 fallbackReason: .compressedRendererNoProgressAfterRebuild
             )
@@ -1737,6 +1789,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             throw error
         }
         decoder = stagedDecoder
+        naturalEOFPCMDrained = false
         renderer = replacement
         rendererAttached = true
         establishRendererDemandLifetime(for: replacement)
@@ -1750,7 +1803,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     }
 
     private func driveRenderer() {
-        guard configured, !stopped, !terminal else { return }
+        guard configured, !stopped, !terminal, !drivingRenderer else { return }
+        drivingRenderer = true
+        submissionBackpressured = false
+        defer { drivingRenderer = false }
         do {
             try trimReplayHistory()
             guard !replacing, rendererAttached, renderer != nil else {
@@ -1769,6 +1825,12 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             return
         }
         reconcileRendererRequest(hasPendingWork: pendingRendererSampleCount > 0)
+        if pendingRendererSampleCount == 0, submission == nil { renderer?.finishedEnqueuing() }
+        // Enqueue/reconciliation work is complete. Readiness can synchronously
+        // prepare a shared anchor, flush this queue, and request its replay.
+        // Release drain ownership before that callback so the fresh queue can
+        // run; synchronous enqueue completions above still cannot recurse.
+        drivingRenderer = false
         updateReadiness()
     }
 
@@ -1786,10 +1848,10 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
               let renderer,
               renderer.mediaKind == .compressed,
               rendererAttached, !replacing, !terminal else { return }
-        while let index = replay.firstIndex(where: { !$0.sentCompressed }) {
-            // 恢复受阻期间共享时钟仍会前进，ready 回调不能补送已经结束的音频。
-            // 保留重锚所需的历史，只将过期帧标为本轮已处理；prepareAnchor 会重新放行。
-            // 起播尚未重锚时不能使用旧时钟位置裁剪 preroll。
+        while submission == nil, !submissionBackpressured,
+              let index = replay.firstIndex(where: { !$0.sentCompressed }) {
+            // A suspended enqueue must not cause later expired recovery packets
+            // to be submitted using the playhead sampled before that suspension.
             if clockMode == .externallyManaged, sharedTimelineOpened,
                replay[index].discardIfExpiredDuringRecovery,
                let interval = replayInterval(of: replay[index]) {
@@ -1801,36 +1863,12 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
                 }
             }
             let sample = replay[index].sample
-            let needsDecoderReset = needsDecoderResetBeforeNextCompressedEnqueue
-            let sampleBuffer = if needsDecoderReset {
-                try SampleBufferBuilder
-                    .copyingAudioSampleBufferWithResetDecoderBeforeDecoding(sample.sampleBuffer)
-            } else {
-                sample.sampleBuffer
-            }
-            guard try renderer.enqueue(sampleBuffer) == .accepted else {
-                incrementDiagnostic(\.rendererBackpressureCount)
-                recordRendererBackpressure(on: renderer)
-                return
-            }
-            recordRendererAcceptance(on: renderer)
-            recordRendererAcceptedCoverage(sampleBuffer)
-            recordRendererAcceptanceDiagnostic(at: sample.presentationTimeStamp)
-            if needsDecoderReset {
-                needsDecoderResetBeforeNextCompressedEnqueue = false
-            }
-            replay[index].sentCompressed = true
-            replay[index].discardIfExpiredDuringRecovery = false
-            if !replay[index].acceptedCompressed {
-                replay[index].acceptedCompressed = true
-                recordCompressedPreroll(sample)
-                recordAcceptedCompressedMedia(sample)
-            }
-            beginStartupWaitIfNeeded()
-            anchorIfNeeded(at: sample.presentationTimeStamp)
-            if !renderer.isReadyForMoreMediaData {
-                recordRendererBackpressure(on: renderer)
-            }
+            let reset = needsDecoderResetBeforeNextCompressedEnqueue
+            let buffer = try reset
+                ? SampleBufferBuilder.copyingAudioSampleBufferWithResetDecoderBeforeDecoding(sample.sampleBuffer)
+                : sample.sampleBuffer
+            submit(buffer, compressed: sample, retentionID: replay[index].retentionID,
+                resetsDecoder: reset, to: renderer)
         }
     }
 
@@ -1875,30 +1913,111 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
               let renderer,
               renderer.mediaKind == .linearPCM,
               rendererAttached, !replacing, !terminal else { return }
-        while true {
+        while submission == nil, !submissionBackpressured {
             if let sample = pendingPCM.first {
-                guard try renderer.enqueue(sample) == .accepted else {
-                    incrementDiagnostic(\.rendererBackpressureCount)
-                    recordRendererBackpressure(on: renderer)
-                    return
-                }
-                recordRendererAcceptance(on: renderer)
-                recordRendererAcceptedCoverage(sample)
-                recordRendererAcceptanceDiagnostic(
-                    at: CMSampleBufferGetPresentationTimeStamp(sample)
-                )
-                pendingPCM.removeFirst()
-                recordPCMPreroll(sample)
-                anchorIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sample))
-                if !renderer.isReadyForMoreMediaData {
-                    recordRendererBackpressure(on: renderer)
-                }
+                submit(sample, compressed: nil, retentionID: nil,
+                    resetsDecoder: false, to: renderer)
                 continue
             }
-            guard replay.contains(where: { !$0.decoded }) else { return }
-            try decodeAvailable()
+            if replay.contains(where: { !$0.decoded }) {
+                try decodeAvailable()
+                // A decoder can retain every input until its drain call. Do not
+                // wait for another renderer demand when the replay is now empty.
+                if pendingPCM.isEmpty, naturalEOFInputFinished,
+                   !replay.contains(where: { !$0.decoded }) { continue }
+            } else if naturalEOFInputFinished, !naturalEOFPCMDrained, let decoder {
+                let tail = try decoder.drainForNaturalEOF()
+                guard tail.count <= Self.pendingPCMCapacity - pendingPCM.count else {
+                    throw PlaybackCoreError.audioFallbackDecode(FFmpegPCMAudioDecoder.tokenCapacityErrorCode)
+                }
+                for sample in tail {
+                    guard let format = CMSampleBufferGetFormatDescription(sample),
+                          pcmOutputValidator.isValidPCMOutput(format) else {
+                        throw PlaybackCoreError.audioRendererFailed(Self.unsupportedPCMError)
+                    }
+                    pcmOutputFormat = format
+                }
+                naturalEOFPCMDrained = true
+                pendingPCM.append(contentsOf: tail)
+            } else {
+                return
+            }
             guard !pendingPCM.isEmpty else { return }
         }
+    }
+
+    private func submit(_ sample: CMSampleBuffer, compressed: CompressedAudioSample?,
+        retentionID: UInt64?, resetsDecoder: Bool, to renderer: any AudioRenderer) {
+        let ticket = Submission(id: nextSubmissionID, epoch: epoch, generation: generation,
+            rendererID: renderer.identity, queueEpisode: rendererDemandProgress.queueEpisode,
+            islandID: activeContinuityIslandID, sampleBuffer: sample, compressed: compressed,
+            retentionID: retentionID, resetsDecoder: resetsDecoder)
+        nextSubmissionID += 1
+        submission = ticket
+        renderer.enqueue(sample) { [weak self] result in
+            guard let self else { return }
+            if executor.isIsolated {
+                completeSubmission(ticket, result: result)
+            } else {
+                executor.submit { [weak self] in self?.completeSubmission(ticket, result: result) }
+            }
+        }
+    }
+
+    private func completeSubmission(_ ticket: Submission,
+        result: Result<AudioRendererEnqueueResult, any Error>) {
+        guard submission?.id == ticket.id,
+              isCurrent(epoch: ticket.epoch, rendererID: ticket.rendererID,
+                generation: ticket.generation),
+              ticket.queueEpisode == rendererDemandProgress.queueEpisode,
+              ticket.islandID == activeContinuityIslandID,
+              !terminal, !replacing, rendererAttached, let renderer else { return }
+        submission = nil
+        do {
+            let outcome = try result.get()
+            guard outcome.isAccepted else {
+                submissionBackpressured = true
+                if outcome == .backpressured {
+                    incrementDiagnostic(\.rendererBackpressureCount)
+                    recordRendererBackpressure(on: renderer)
+                }
+                reconcileRendererRequest(hasPendingWork: pendingRendererSampleCount > 0)
+                return
+            }
+            recordRendererAcceptance(on: renderer)
+            recordRendererAcceptedCoverage(ticket.sampleBuffer)
+            recordRendererAcceptanceDiagnostic(at: CMSampleBufferGetPresentationTimeStamp(ticket.sampleBuffer))
+            if let sample = ticket.compressed {
+                // Preroll belongs to this physical queue episode. Reaccepted
+                // replay earns it again; lifetime admission diagnostics below
+                // still count each retained compressed entry only once.
+                recordCompressedPreroll(ticket.sampleBuffer)
+                if ticket.resetsDecoder { needsDecoderResetBeforeNextCompressedEnqueue = false }
+                if let index = replay.firstIndex(where: { $0.retentionID == ticket.retentionID }) {
+                    replay[index].sentCompressed = true
+                    replay[index].discardIfExpiredDuringRecovery = false
+                    if !replay[index].acceptedCompressed {
+                        replay[index].acceptedCompressed = true
+                        recordAcceptedCompressedMedia(sample)
+                    }
+                }
+                beginStartupWaitIfNeeded()
+                anchorIfNeeded(at: sample.presentationTimeStamp)
+            } else {
+                if pendingPCM.first === ticket.sampleBuffer { pendingPCM.removeFirst() }
+                recordPCMPreroll(ticket.sampleBuffer)
+                anchorIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(ticket.sampleBuffer))
+            }
+            if !renderer.isReadyForMoreMediaData { recordRendererBackpressure(on: renderer) }
+            if !drivingRenderer { driveRenderer() }
+        } catch {
+            classifyAndEmitDecode(error, stage: "audio.renderer.enqueue")
+        }
+    }
+
+    private func cancelSubmission(on renderer: (any AudioRenderer)?) {
+        submission = nil
+        renderer?.cancelPendingEnqueue()
     }
 
     private func anchorIfNeeded(at time: CMTime) {
@@ -2101,7 +2220,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         if !startupPrerollSatisfied {
             let pcmHasPreroll = route == .ffmpegPCM && hasMinimumPCMPreroll
             let compressedHasPreroll = route == .systemCompressed && hasMinimumCompressedPreroll
-            startupPrerollSatisfied = rendererSufficient || pcmHasPreroll || compressedHasPreroll
+            // A finite input cannot grow to the live-stream preroll target. Start
+            // from its nonempty physically accepted interval, allowing remaining
+            // tail submissions to progress when a short renderer queue is full.
+            let finiteTailReady = naturalEOFInputFinished && acceptedCoverage != nil
+            startupPrerollSatisfied = rendererSufficient || pcmHasPreroll || compressedHasPreroll || finiteTailReady
         }
         if startupPrerollSatisfied {
             freezeStartupWaitIfNeeded()
@@ -2177,9 +2300,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         }
     }
 
-    private func recordCompressedPreroll(_ sample: CompressedAudioSample) {
-        let pts = sample.presentationTimeStamp
-        let duration = sample.duration
+    private func recordCompressedPreroll(_ sampleBuffer: CMSampleBuffer) {
+        let pts = CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer)
+        let duration = CMSampleBufferGetOutputDuration(sampleBuffer)
         let end = CMTimeAdd(pts, duration)
         guard pts.isNumeric,
               duration.isNumeric,
@@ -2317,6 +2440,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         recoveryCoordinator.invalidate()
         automaticFlushProgressOrigin.clear()
         terminal = true
+        cancelSubmission(on: renderer)
         replacing = false
         sharedTimelineOpened = false
         reconcileRendererRequest(hasPendingWork: false)
@@ -2459,6 +2583,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     }
 
     private func resetRendererAcceptedCoverage() {
+        resetCompressedPreroll()
         snapshotLock.withLock { publicSnapshot.acceptedCoverage = nil }
     }
 
@@ -2481,6 +2606,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         epoch: UInt64
     ) {
         resetRendererAcceptedCoverage()
+        cancelSubmission(on: renderer)
         invalidateRendererRequest(on: renderer)
         rendererDemandProgress.queueWasReset(
             rendererID: rendererID,
@@ -2489,18 +2615,24 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         publishRendererPumpObservation()
     }
 
-    private func resetRendererQueue(_ renderer: any AudioRenderer) {
+    private func resetRendererQueue(_ renderer: any AudioRenderer, rebindObservation: Bool = true) {
         resetRendererAcceptedCoverage()
+        cancelSubmission(on: renderer)
         invalidateRendererRequest(on: renderer)
         rendererDemandProgress.queueWasReset(
             rendererID: renderer.identity,
             epoch: epoch
         )
         renderer.flush()
+        if rebindObservation, configured, !stopped, !replacing, pendingRemoval == nil {
+            installCallbacks(on: renderer, epoch: epoch, generation: generation)
+        }
         publishRendererPumpObservation()
     }
 
     private func invalidateRendererDemandLifetime(on renderer: (any AudioRenderer)?) {
+        rendererObservationRevision += 1
+        cancelSubmission(on: renderer)
         resetRendererAcceptedCoverage()
         if case .disarm = rendererPumpState.rendererDidChange() {
             renderer?.stopRequestingMediaData()

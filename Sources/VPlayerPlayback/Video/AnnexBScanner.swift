@@ -8,6 +8,9 @@ struct AnnexBScanResult: Equatable {
     let lengthPrefixedData: Data
     let parameterSets: [Data]
     let randomAccessKind: VideoRandomAccessKind
+    let preferredTransfer: DemuxColorTransfer?
+    let startsCodedVideoSequence: Bool
+    let endsCodedVideoSequence: Bool
 }
 
 public enum VideoRandomAccessKind: UInt8, Sendable, Hashable {
@@ -96,6 +99,14 @@ enum AnnexBScanner {
 
     /// visitor 在 backing 的借用期内同步执行，Span 由编译器禁止逃逸。
     static func visitNALUnits(
+        _ bytes: borrowing Span<UInt8>,
+        codec: VideoCodec,
+        _ visitor: (AnnexBNALUnitView, borrowing Span<UInt8>) throws -> Void
+    ) throws {
+        try enumerate(bytes, baseOffset: 0, codec: codec, visitor)
+    }
+
+    static func visitNALUnits(
         in backing: VideoAccessUnitBacking,
         range: VideoAccessUnitByteRange,
         codec: VideoCodec,
@@ -126,6 +137,9 @@ enum AnnexBScanner {
         if let outputCapacity { output.reserveCapacity(outputCapacity) }
         if let parameterSetCapacity { parameterSets.reserveCapacity(parameterSetCapacity) }
         var randomAccessKind = VideoRandomAccessKind.none
+        var preferredTransfer: DemuxColorTransfer?
+        var startsCodedVideoSequence = false
+        var endsCodedVideoSequence = false
 
         try enumerate(bytes, baseOffset: baseOffset, codec: codec) { view, nal in
             guard let length = UInt32(exactly: nal.count),
@@ -138,6 +152,20 @@ enum AnnexBScanner {
             nal.withUnsafeBytes { output.append(contentsOf: $0) }
             if view.isParameterSet {
                 parameterSets.append(nal.withUnsafeBytes { Data($0) })
+            }
+            if codec == .hevc {
+                switch view.nalUnitType {
+                case 16...20: startsCodedVideoSequence = true
+                case 36, 37: endsCodedVideoSequence = true
+                case 39, 40:
+                    if let transfer = try HEVCAlternativeTransferReader.read(nal) {
+                        guard preferredTransfer == nil || preferredTransfer == transfer else {
+                            throw invalidDataError()
+                        }
+                        preferredTransfer = transfer
+                    }
+                default: break
+                }
             }
             switch view.randomAccessKind {
             case .h264IDR, .hevcIDR:
@@ -152,7 +180,10 @@ enum AnnexBScanner {
         return AnnexBScanResult(
             lengthPrefixedData: output,
             parameterSets: parameterSets,
-            randomAccessKind: randomAccessKind
+            randomAccessKind: randomAccessKind,
+            preferredTransfer: preferredTransfer,
+            startsCodedVideoSequence: startsCodedVideoSequence,
+            endsCodedVideoSequence: endsCodedVideoSequence
         )
     }
 

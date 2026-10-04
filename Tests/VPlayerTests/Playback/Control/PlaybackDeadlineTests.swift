@@ -216,12 +216,14 @@ final class PlaybackDeadlineTests: XCTestCase {
         XCTAssertFalse(registry.completePlaybackMediaProgress(active.receipt), "重复progress不得创建新45秒parent")
     }
 
-    func testFirstProgressThenResetCreatesRunningRecoveryParentInIngressCAS() throws {
+    func testFirstProgressThenResetCreatesParkedRecoveryParentUntilFreshUserAction() throws {
         let active = try ActiveDeadlineFixture()
         XCTAssertTrue(active.fixture.registry.completePlaybackMediaProgress(active.receipt))
         let resetInstant = active.clock.read() + 10
         active.clock.set(resetInstant)
         _ = try capturedResetRoot(active.fixture.registry)
+        XCTAssertNil(active.fixture.registry.outputResourceContextSnapshot()?.parentDeadline?.value.runningSince)
+        try authorizeGraphResetRecoveryClock(active.fixture.registry)
         guard case .outputRecovery(let parent) = active.fixture.registry.outputResourceContextSnapshot()?.parentDeadline else {
             return XCTFail("首progress后的真实reset必须在消费ingress时创建recovery parent")
         }
@@ -268,11 +270,9 @@ final class PlaybackDeadlineTests: XCTestCase {
         ))
         let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
         let close = try XCTUnwrap(registry.outputResourceContextSnapshot()?.closeClaim)
-        XCTAssertTrue(registry.claimStart(suspend.task))
-        XCTAssertTrue(coordinator.completeSuspend(.init(
-            suspendTicket: suspend, closeClaim: close, directlyConfirmedRateZero: true,
-            preparedPreserved: true
-        )))
+        let suspendSuspension = try claimGraphSuspend(registry, suspend)
+        XCTAssertEqual(suspendSuspension.closeClaim, close)
+        XCTAssertTrue(suspendSuspension.complete(in: registry, preparedPreserved: true))
         XCTAssertTrue(registry.finishOutputPause(owner: owner))
         XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .pause)), .acceptedWaiting)
         XCTAssertNil(registry.outputResourceContextSnapshot()?.parentDeadline)
@@ -283,6 +283,151 @@ final class PlaybackDeadlineTests: XCTestCase {
             return XCTFail("typed resume必须在同一CAS补建恢复parent")
         }
         XCTAssertEqual(parent.runningSince, resumeInstant)
+    }
+
+    func testOrdinaryRouteDeadlinePublishesRouteUnavailableAtExactBoundaryAndPreservesFirstFailure() async throws {
+        let earlierFailure = PlaybackFailure(code: "test.earlier", userMessage: "Earlier failure")
+        for firstFailure in [nil, earlierFailure] {
+            let active = try ActiveDeadlineFixture()
+            let registry = active.fixture.registry
+            XCTAssertTrue(registry.completePlaybackMediaProgress(active.receipt))
+            XCTAssertTrue(registry.complete(try XCTUnwrap(active.context.sourceTask)))
+            guard case .open(let open) = registry.outputRouteObservationSnapshot() else {
+                return XCTFail("Fixture must begin with an open route")
+            }
+            registry.executor.safetyIngress.beginRouteObservation(.init(
+                sessionIdentity: open.sessionIdentity, monitorLifecycle: open.monitorLifecycle,
+                notificationRevision: open.routeObservationRevision + 1, reasonBits: 1,
+                topologyChangeHint: false, outputConfigurationChanged: false,
+                observedRoute: nil
+            ))
+            guard case .pending(let pending) = registry.outputRouteObservationSnapshot() else {
+                return XCTFail("Route ingress must own an ordinary deadline")
+            }
+            let deadline = try XCTUnwrap(pending.deadline)
+            let arm = try XCTUnwrap(registry.ordinaryRouteDeadlineArmSnapshot())
+            if let firstFailure { registry.publishState(.failed(firstFailure)) }
+            let scheduler = PlaybackDeadlineScheduler(registry: registry)
+            var receiver: DeadlineNoopTerminalCleanupReceiver? = .init()
+            registry.bindPlaybackRuntime(scheduler: scheduler, receiver: try XCTUnwrap(receiver))
+
+            active.clock.set(deadline.deadlineInstant - 1)
+            registry.executor.sync {}
+            XCTAssertFalse(registry.outputResourceContextSnapshot()?.poisoned == true)
+            if firstFailure == nil {
+                XCTAssertNotEqual(registry.playbackStateSnapshot(),
+                    .failed(PlaybackController.routeUnavailableFailure))
+            }
+
+            active.clock.advance(nanoseconds: 1)
+            registry.executor.sync {}
+            let expected = PlaybackState.failed(firstFailure ?? PlaybackController.routeUnavailableFailure)
+            XCTAssertEqual(registry.playbackStateSnapshot(), expected,
+                "The authoritative route ticket must publish its semantic failure without a second timer")
+            XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
+            XCTAssertEqual(registry.playbackDeadlineScheduleSnapshot(), .init())
+            XCTAssertNil(try registry.rearmOutputOrdinaryRouteDeadline(arm))
+            XCTAssertEqual(registry.playbackStateSnapshot(), expected,
+                "A stale route timer cannot replace the first terminal failure")
+            // This test observes publication, not resource retirement. Remove
+            // the weak no-op receiver before joining its real Task tail so the
+            // still-poisoned fixture cannot enqueue another no-op cleanup.
+            withExtendedLifetime(receiver) {}
+            receiver = nil
+            await registry.joinOwnedTerminalCleanup()
+            withExtendedLifetime((active, scheduler)) {}
+        }
+    }
+
+    func testOnlyAcceptedOrdinaryRouteDeadlinePublishesBeforeRuntimeBinding() throws {
+        let fixture = try AcquiringOutputFixture()
+        _ = try fixture.configureAndActivate()
+        let registry = fixture.registry
+        let token = try XCTUnwrap(registry.outputAcquisitionCommitSnapshot())
+        guard case .committed(let handoff) = try registry.commitAcquisitionRelayAndContext(token) else {
+            return XCTFail("Fixture must establish the ordinary route deadline")
+        }
+        let deadline = try XCTUnwrap(handoff.routeDeadline)
+        let original = try XCTUnwrap(registry.ordinaryRouteDeadlineArmSnapshot())
+        let initialState = registry.playbackStateSnapshot()
+
+        fixture.clock.set(deadline.deadlineInstant - 1)
+        let rearmed = try XCTUnwrap(registry.rearmOutputOrdinaryRouteDeadline(original))
+        XCTAssertEqual(rearmed.remainingNanoseconds, 1)
+        XCTAssertEqual(registry.playbackStateSnapshot(), initialState)
+
+        fixture.clock.set(deadline.deadlineInstant)
+        XCTAssertEqual(registry.executor.performPlaybackBudget(.ordinaryRouteTimer(original)),
+            .budget(.rejected), "An obsolete arm cannot publish a failure, even at the deadline")
+        XCTAssertFalse(registry.outputResourceContextSnapshot()?.poisoned == true)
+        XCTAssertEqual(registry.playbackStateSnapshot(), initialState)
+
+        XCTAssertEqual(registry.executor.performPlaybackBudget(.ordinaryRouteTimer(rearmed.arm)), .terminated)
+        XCTAssertEqual(registry.playbackStateSnapshot(), .failed(PlaybackController.routeUnavailableFailure),
+            "The accepted Authority result must publish before a runtime receiver is bound")
+        XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
+    }
+
+    func testOrdinaryRouteDeadlinePreservesRunningRecoveryOwnerAndFirstFailure() async throws {
+        let earlierFailure = PlaybackFailure(code: "test.earlier", userMessage: "Earlier failure")
+        for firstFailure in [nil, earlierFailure] {
+            let fixture = try AcquiringOutputFixture()
+            _ = try fixture.configureAndActivate()
+            let registry = fixture.registry
+            let token = try XCTUnwrap(registry.outputAcquisitionCommitSnapshot())
+            guard case .committed(let handoff) = try registry.commitAcquisitionRelayAndContext(token) else {
+                return XCTFail("Fixture must establish the ordinary route deadline")
+            }
+            let deadline = try XCTUnwrap(handoff.routeDeadline)
+            let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let owner = try XCTUnwrap(registry.beginOutputTransition(
+                contextNonce: context.contextNonce, reason: .recovery,
+                anchorInstant: fixture.clock.read(), teardown: true))
+            let arm = try XCTUnwrap(registry.ordinaryRouteDeadlineArmSnapshot())
+            if let firstFailure { registry.publishState(.failed(firstFailure)) }
+            let receiver = DeadlineHeldRecoveryCleanupReceiver()
+            guard registry.startOwnedInterruptionCleanup(owner: owner, receiver: receiver) else {
+                return XCTFail("Fixture must start its original recovery cleanup runner")
+            }
+            await receiver.waitForEntry()
+
+            fixture.clock.set(deadline.deadlineInstant)
+            XCTAssertEqual(registry.executor.performPlaybackBudget(.ordinaryRouteTimer(arm)), .terminated)
+            let expired = registry.outputResourceContextSnapshot()
+            XCTAssertEqual(owner.reason, .recovery)
+            XCTAssertEqual(expired?.owner, owner, "A terminal failure cannot replace the running cleanup owner")
+            XCTAssertTrue(expired?.poisoned == true)
+            XCTAssertEqual(expired?.disposition, .releaseAfterTeardown)
+            XCTAssertEqual(registry.playbackStateSnapshot(),
+                .failed(firstFailure ?? PlaybackController.routeUnavailableFailure),
+                "The exact poisoned owner must publish before its recovery runner can finish")
+
+            await receiver.release()
+            await registry.joinOwnedTerminalCleanup()
+            withExtendedLifetime((fixture, receiver)) {}
+        }
+    }
+
+    func testAcquisitionDeadlineKeepsGenericFailureWhenRuntimeBindsAfterExpiry() async throws {
+        let fixture = try AcquiringOutputFixture()
+        let registry = fixture.registry
+        let deadline = try XCTUnwrap(registry.outputResourceContextSnapshot()?.acquisitionDeadline)
+        fixture.clock.set(deadline.deadlineInstant)
+        XCTAssertEqual(registry.executor.performPlaybackBudget(.acquisitionTimer(deadline)), .terminated)
+
+        let scheduler = PlaybackDeadlineScheduler(registry: registry)
+        var receiver: DeadlineNoopTerminalCleanupReceiver? = .init()
+        registry.bindPlaybackRuntime(scheduler: scheduler, receiver: try XCTUnwrap(receiver))
+        if case .failed(let failure) = registry.playbackStateSnapshot() {
+            XCTAssertEqual(failure.code, "playback.control-terminal")
+            XCTAssertEqual(failure.diagnosticCode, "playback.control-terminal.deadline")
+        } else {
+            XCTFail("The expired acquisition must publish its terminal failure")
+        }
+        withExtendedLifetime(receiver) {}
+        receiver = nil
+        await registry.joinOwnedTerminalCleanup()
+        withExtendedLifetime((fixture, scheduler)) {}
     }
 
     func testFirstProgressThenRecoveryTransitionStartsSameSemanticRecoveryImmediately() throws {
@@ -335,7 +480,7 @@ final class PlaybackDeadlineTests: XCTestCase {
     }
 
     func testResetAndPostTimersUseStrictBoundaryAndInvalidateFrozenArm() throws {
-        let reset = try ResetAcquiringOutputFixture()
+        let reset = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let registry = reset.registry
         let initial = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         let resetArm = try XCTUnwrap(initial.deadlineArm)
@@ -403,7 +548,7 @@ final class PlaybackDeadlineTests: XCTestCase {
     }
 
     func testResetTimerBackwardClockFailsClosedInSameCellCall() throws {
-        let fixture = try ResetAcquiringOutputFixture()
+        let fixture = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let state = try XCTUnwrap(fixture.registry.resetPreRouteDeadlineSnapshot())
         let arm = try XCTUnwrap(state.deadlineArm)
         fixture.clock.set(try XCTUnwrap(state.runningSince) - 1)
@@ -451,7 +596,7 @@ final class PlaybackDeadlineTests: XCTestCase {
         XCTAssertEqual(checkedOrdinary.ticketIdentity, ordinary.ticketIdentity)
         XCTAssertNotEqual(checkedOrdinary, ordinary, "ordinary投递必须安装新checked arm")
 
-        let reset = try ResetAcquiringOutputFixture()
+        let reset = try ResetAcquiringOutputFixture(freshUserPlayback: true)
         let resetArm = try XCTUnwrap(reset.registry.resetPreRouteDeadlineSnapshot()?.deadlineArm)
         let resetScheduler = PlaybackDeadlineScheduler(registry: reset.registry)
         resetScheduler.armResetPreRoute(resetArm)
@@ -531,7 +676,7 @@ final class PlaybackDeadlineTests: XCTestCase {
     func testManualClockOriginsStayIdleUntilAdvanceAndDeliverOneExactBoundary() throws {
         for origin: UInt64 in [0, 100] {
             let clock = ManualPlaybackClock(nowNanoseconds: origin)
-            let fixture = try ResetAcquiringOutputFixture(clock: clock)
+            let fixture = try ResetAcquiringOutputFixture(clock: clock, freshUserPlayback: true)
             let registry = fixture.registry
             let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
             let arm = try XCTUnwrap(state.deadlineArm)
@@ -561,7 +706,7 @@ final class PlaybackDeadlineTests: XCTestCase {
 
     func testManualEarlyWakeRearmsSameResetTicketWithoutRenewingAbsoluteBoundary() throws {
         let clock = ManualPlaybackClock(nowNanoseconds: 100)
-        let fixture = try ResetAcquiringOutputFixture(clock: clock)
+        let fixture = try ResetAcquiringOutputFixture(clock: clock, freshUserPlayback: true)
         let registry = fixture.registry
         let state = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         let arm = try XCTUnwrap(state.deadlineArm)
@@ -596,10 +741,8 @@ final class PlaybackDeadlineTests: XCTestCase {
         _ = try XCTUnwrap(fixture.coordinator.begin(
             contextNonce: context.contextNonce, reason: .pause, at: clock.nowNanoseconds))
         let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(old.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(
-            suspendTicket: old, closeClaim: nil, directlyConfirmedRateZero: true,
-            preparedPreserved: true)))
+        let oldSuspension = try claimGraphSuspend(registry, old)
+        XCTAssertTrue(oldSuspension.complete(in: registry, preparedPreserved: true))
 
         clock.advance(nanoseconds: 10)
         _ = try XCTUnwrap(fixture.coordinator.begin(
@@ -634,10 +777,8 @@ final class PlaybackDeadlineTests: XCTestCase {
             contextNonce: context.contextNonce, reason: .pause,
             at: clock.nowNanoseconds, teardown: true))
         let first = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
-        XCTAssertTrue(registry.claimStart(first.task))
-        XCTAssertTrue(fixture.coordinator.completeSuspend(.init(
-            suspendTicket: first, closeClaim: nil, directlyConfirmedRateZero: true,
-            preparedPreserved: true)))
+        let firstSuspension = try claimGraphSuspend(registry, first)
+        XCTAssertTrue(firstSuspension.complete(in: registry, preparedPreserved: true))
         XCTAssertTrue(registry.finishOutputPause(owner: pause))
         let cleanup = try XCTUnwrap(registry.outputResourceContextSnapshot()?.budget)
 
@@ -662,13 +803,19 @@ final class PlaybackDeadlineTests: XCTestCase {
     }
 
     func testResetTerminalPreparationFailureDoesNotPartiallyInstallSettledClock() throws {
-        let origin = UInt64.max - 30_000_000_000
-        let clock = ManualPlaybackClock(nowNanoseconds: origin)
-        let fixture = try ResetAcquiringOutputFixture(clock: clock)
+        // First prove ordinary admission and arming succeeded at a safe origin.
+        // Only terminal cleanup preparation is asked to operate at UInt64.max.
+        let clock = ManualPlaybackClock(nowNanoseconds: 100)
+        let fixture = try ResetAcquiringOutputFixture(clock: clock, freshUserPlayback: true)
         let registry = fixture.registry
         let beforeState = try XCTUnwrap(registry.resetPreRouteDeadlineSnapshot())
         let beforeContext = try XCTUnwrap(registry.outputResourceContextSnapshot())
         let arm = try XCTUnwrap(beforeState.deadlineArm)
+        XCTAssertNil(registry.executor.safetyIngress.snapshot.failure)
+        XCTAssertFalse(beforeContext.poisoned)
+        XCTAssertEqual(registry.rearmOutputResetPreRouteDeadline(arm)?.remainingNanoseconds,
+            beforeState.boundaryEffectiveElapsed - beforeState.accumulatedEffectiveTime)
+        XCTAssertEqual(registry.resetPreRouteDeadlineSnapshot(), beforeState)
 
         clock.set(nowNanoseconds: .max)
         XCTAssertNil(registry.executor.performPlaybackBudget(.resetPreRouteTimer(arm)),
@@ -838,6 +985,39 @@ private struct ActiveDeadlineFixture {
             audioAdmissionFenceRevision: snapshot.audioAdmissionFenceRevision,
             stableRouteCommit: fixture.stable.stable)
     }
+}
+
+private final class DeadlineNoopTerminalCleanupReceiver: PlaybackOwnedCleanupReceiving, Sendable {
+    func performOwnedTerminalCleanup(owner: OutputTransitionOwnerTicket,
+        task: ControlTaskTicket, terminalState: PlaybackState) async {}
+}
+
+private actor DeadlineHeldRecoveryCleanupReceiver: PlaybackOwnedInterruptionCleanupReceiving {
+    private var entered = false
+    private var entryWaiter: CheckedContinuation<Void, Never>?
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func performOwnedInterruptionCleanup(owner: OutputTransitionOwnerTicket, task: ControlTaskTicket) async {
+        await withCheckedContinuation { continuation in
+            releaseWaiter = continuation
+            entered = true
+            entryWaiter?.resume()
+            entryWaiter = nil
+        }
+    }
+
+    func waitForEntry() async {
+        if entered { return }
+        await withCheckedContinuation { entryWaiter = $0 }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+
+    func performOwnedTerminalCleanup(owner: OutputTransitionOwnerTicket,
+        task: ControlTaskTicket, terminalState: PlaybackState) async {}
 }
 
 private extension CurrentPlaybackOperationDeadlineTicket {

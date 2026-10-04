@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 VPlayer contributors
 // SPDX-License-Identifier: GPL-3.0-only
 
+import AVFoundation
+import AudioToolbox
 import XCTest
 import Network
 import VPlayerCore
@@ -504,6 +506,290 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertTrue(retired)
     }
 
+    func testProductionFactoriesStartRealFiveByteLCMP4AtBothRatesAndStop() async throws {
+        for rate in [44_100, 48_000] {
+            let file = try XCTUnwrap(Bundle(for: Self.self).url(
+                forResource: "review-lc-\(rate)-av.mp4", withExtension: nil, subdirectory: "Video"))
+            let server = try Task22BundledHTTPFixtureServer(fileURL: file)
+            defer { server.stop() }
+            for isAirPlay in [false, true] {
+                let factory = AudioReviewProductionBackendFactory()
+                let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+                let sdk = FakeAudioSessionSDK(initialPorts: isAirPlay ? .airPlay : .hdmi)
+                let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+                let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
+                let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+                    routeService: routes, backendFactory: factory)
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "lc-\(rate)",
+                    streamURL: server.sourceURL, title: "Five-byte LC MP4"))
+                let state = await controller.currentStateForTesting
+                XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepared, true,
+                    "\(rate) Hz, AirPlay=\(isAirPlay), real source failed: \(state)")
+                await controller.stop()
+                await registry.joinOwnedTerminalCleanup()
+                XCTAssertNil(registry.outputResourceContextSnapshot())
+            }
+        }
+    }
+
+    func testRealAudioOnlyTSMissingPacketTimestampsReachTimelineWithoutLosingSamples() throws {
+        for name in ["review-audio-only-stereo-8s.ts", "review-audio-only-5point1-8s.ts"] {
+            let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name,
+                withExtension: nil, subdirectory: "Video"))
+            let server = try Task22BundledHTTPFixtureServer(fileURL: file)
+            defer { server.stop() }
+            let demuxer = FFmpegDemuxer()
+            defer { demuxer.cancel() }
+            let recorder = DemuxEventRecorder()
+            try demuxer.start(url: server.sourceURL, sink: recorder.record)
+            let input = recorder.waitForTerminal(timeout: 10)
+            XCTAssertEqual(input.last, .endOfStream)
+            let missing = input.compactMap { event -> DemuxPacket? in
+                guard case .packet(let packet) = event, !packet.presentationTimeStamp.isValid else { return nil }
+                return packet
+            }
+            XCTAssertFalse(missing.isEmpty, "fixture must exercise actual buffered TS AUs without PTS")
+            let timeline = HLSTimelineCoordinator()
+            var audio: [HLSTimedAudioAccessUnit] = []
+            for event in input {
+                for output in try timeline.consume(event) {
+                    if case .audioSample(let sample) = output { audio.append(sample) }
+                }
+            }
+            XCTAssertEqual(audio.count, 376)
+            for (index, sample) in audio.enumerated() {
+                XCTAssertEqual(sample.timing.presentationTimeStamp,
+                    ExactMediaTime(value: 480_000 + Int64(index * 1_024), timescale: 48_000))
+                XCTAssertEqual(sample.source.frameSampleCount, 1_024)
+            }
+        }
+    }
+
+    func testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels() async throws {
+        for (name, channels, minimum) in [("review-audio-only-stereo-8s.ts", 2, 3),
+                                          ("review-audio-only-5point1-8s.ts", 6, 3),
+                                          ("review-audio-only-stereo-5s.ts", 2, 4)] {
+            let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name,
+                withExtension: nil, subdirectory: "Video"))
+            let server = try Task22BundledHTTPFixtureServer(fileURL: file)
+            defer { server.stop() }
+            let authority = try SystemHLSMediaGraphAuthority(
+                lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: UInt64(23_800 + channels)),
+                initialWindowMinimumSeconds: minimum)
+            let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+                applicationLedger: HLSDeliveryApplicationChargeLedger(),
+                graph: SystemHLSDeliveryGraph(authority: authority))
+            do {
+                let replacement = try await assembler.startUntilPlayablePrefix()
+                let selected = try XCTUnwrap(replacement.request.directAudioOnlyRendition)
+                XCTAssertEqual(replacement.request.audioParticipants.count, 1)
+                let participant = try XCTUnwrap(replacement.request.audioParticipants.first)
+                XCTAssertEqual(participant.renditionIdentity, selected)
+                XCTAssertEqual(participant.codec, .aac)
+                XCTAssertNotNil(participant.terminalBinding)
+                XCTAssertNotNil(participant.renditionBinding)
+                XCTAssertTrue(replacement.request.itemURL.path.contains("/audio/"))
+                let finished = await authority.finishAllTracksAtNaturalEOF()
+                XCTAssertTrue(finished, authority.failureDescriptionForDiagnostics ?? "EOF did not finish")
+                let (playlist, response) = try await URLSession.shared.data(from: replacement.request.itemURL)
+                XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+                let text = String(decoding: playlist, as: UTF8.self)
+                XCTAssertTrue(text.contains("#EXT-X-ENDLIST"))
+                XCTAssertEqual((response as? HTTPURLResponse)?.mimeType, "application/vnd.apple.mpegurl")
+                try await assertServedAudioFragmentDecodes(playlist: text,
+                    itemURL: replacement.request.itemURL, channels: channels)
+                // Apple documents HLS inspection via a ready AVPlayerItem, not a
+                // standalone AVURLAsset. Require the real stream to advance too.
+                try await Self.assertNativeAudioPlaylistPlays(replacement.request.itemURL)
+            } catch {
+                print("AUDIO_ONLY_GRAPH_FAILURE channels=\(channels) error=\(error) history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
+                let retired = await assembler.retireAndAwaitReceipt()
+                XCTAssertTrue(retired)
+                throw error
+            }
+            let retired = await assembler.retireAndAwaitReceipt()
+            XCTAssertTrue(retired)
+            XCTAssertEqual(assembler.currentPhase, .retired)
+        }
+    }
+
+    func testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput() async throws {
+        let cases = [("review-audio-only-stereo-8s.ts", PlaybackTuning.videoBufferSecondsChoices),
+                     ("review-audio-only-stereo-5s.ts", [4.0])]
+        for (name, choices) in cases {
+            let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name,
+                withExtension: nil, subdirectory: "Video"))
+            let server = try Task22BundledHTTPFixtureServer(fileURL: file)
+            defer { server.stop() }
+            for seconds in choices {
+                let factory = AudioReviewProductionBackendFactory()
+                let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+                let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
+                let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+                let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
+                let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+                    routeService: routes, backendFactory: factory)
+                await controller.setTuning(.init(videoBufferSeconds: seconds))
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "radio-regression",
+                    streamURL: server.sourceURL, title: "Audio-only fixture"))
+                let state = await controller.currentStateForTesting
+                let context = registry.outputResourceContextSnapshot()
+                XCTAssertEqual(context?.prepared, true,
+                    "production factory failed with buffer=\(seconds): \(state); history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
+                XCTAssertTrue(factory.backend?.isAudioOnly == true)
+                XCTAssertNotNil(factory.backend?.outputItemGeneration)
+                do {
+                    if context?.prepared == true, let backend = factory.backend {
+                        try await Self.assertActivatedAudioBackendAdvances(backend, configuredBuffer: seconds)
+                    }
+                } catch {
+                    await controller.stop()
+                    await registry.joinOwnedTerminalCleanup()
+                    throw error
+                }
+                await controller.stop()
+                await registry.joinOwnedTerminalCleanup()
+                XCTAssertNil(registry.outputResourceContextSnapshot())
+            }
+        }
+    }
+
+    func testAudioOnlyFiniteSourcesBelowSelectedPublicationMinimumRemainUnprepared() async throws {
+        for (name, minimum) in [("review-audio-only-stereo-2point5s.ts", 3),
+                                ("review-audio-only-stereo-3point5s.ts", 4)] {
+            let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name,
+                withExtension: nil, subdirectory: "Video"))
+            let server = try Task22BundledHTTPFixtureServer(fileURL: file)
+            defer { server.stop() }
+            let authority = try SystemHLSMediaGraphAuthority(
+                lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: UInt64(23_820 + minimum)),
+                initialWindowMinimumSeconds: minimum)
+            let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+                applicationLedger: HLSDeliveryApplicationChargeLedger(),
+                graph: SystemHLSDeliveryGraph(authority: authority))
+            do {
+                _ = try await assembler.startUntilPlayablePrefix()
+                XCTFail("A finite source shorter than its authentic publication minimum cannot prepare")
+            } catch {
+                XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .insufficientCoverage,
+                    "Unexpected short-source failure: \(error); \(PlaybackDiagnosticTracker.shared.recentHistory)")
+            }
+            let retired = await assembler.retireAndAwaitReceipt()
+            XCTAssertTrue(retired)
+            XCTAssertEqual(assembler.currentPhase, .retired)
+        }
+    }
+
+    private func assertServedAudioFragmentDecodes(playlist: String, itemURL: URL,
+                                                channels: Int) async throws {
+        let lines = playlist.split(separator: "\n").map(String.init)
+        let map = try XCTUnwrap(lines.first { $0.hasPrefix("#EXT-X-MAP:URI=\"") })
+        let initializationPath = try XCTUnwrap(map.split(separator: "\"").dropFirst().first)
+        let mediaPath = try XCTUnwrap(lines.first { !$0.isEmpty && !$0.hasPrefix("#") })
+        let initializationURL = try XCTUnwrap(URL(string: String(initializationPath), relativeTo: itemURL))
+        let mediaURL = try XCTUnwrap(URL(string: mediaPath, relativeTo: itemURL))
+        let (initialization, initialResponse) = try await URLSession.shared.data(from: initializationURL)
+        let (media, mediaResponse) = try await URLSession.shared.data(from: mediaURL)
+        XCTAssertEqual((initialResponse as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual((mediaResponse as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual((initialResponse as? HTTPURLResponse)?.mimeType, "audio/mp4")
+        XCTAssertEqual((mediaResponse as? HTTPURLResponse)?.mimeType, "audio/iso.segment")
+        XCTAssertFalse(initialization.isEmpty)
+        XCTAssertFalse(media.isEmpty)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try (initialization + media).write(to: file)
+        let asset = AVURLAsset(url: file)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        XCTAssertEqual(tracks.count, 1)
+        let track = try XCTUnwrap(tracks.first)
+        let formats = try await track.load(.formatDescriptions)
+        let format = try XCTUnwrap(formats.first)
+        let description = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format))
+        XCTAssertEqual(description.pointee.mFormatID, kAudioFormatMPEG4AAC)
+        XCTAssertEqual(description.pointee.mChannelsPerFrame, UInt32(channels))
+        XCTAssertEqual(description.pointee.mSampleRate, 48_000)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track,
+            outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+        XCTAssertTrue(reader.canAdd(output), "The real served AAC must admit system LPCM decode")
+        guard reader.canAdd(output) else { throw AVPlayerItemCoordinatorFailure.itemFailed }
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        guard let ready = try await provider.next() else {
+            XCTFail("The real served AAC produced no decoded PCM: \(String(describing: reader.error))")
+            throw AVPlayerItemCoordinatorFailure.itemFailed
+        }
+        let decoded = try makeOwnedReaderFixtureSample(copying: ready)
+        XCTAssertGreaterThan(CMSampleBufferGetNumSamples(decoded), 0)
+        let decodedFormat = try XCTUnwrap(CMSampleBufferGetFormatDescription(decoded))
+        let decodedDescription = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(decodedFormat))
+        XCTAssertEqual(decodedDescription.pointee.mFormatID, kAudioFormatLinearPCM)
+        XCTAssertEqual(decodedDescription.pointee.mChannelsPerFrame,
+                       UInt32(channels), "System AAC decode must preserve the served channel count")
+    }
+
+    @MainActor
+    private static func assertActivatedAudioBackendAdvances(_ backend: HLSAVPlayerPlaybackBackend,
+                                                           configuredBuffer: TimeInterval) async throws {
+        guard case .avPlayer(let context)? = backend.presentation else {
+            XCTFail("The production audio-only backend must expose its actual AVPlayer")
+            throw AVPlayerItemCoordinatorFailure.noCurrentItem
+        }
+        let player = context.player
+        let item = try XCTUnwrap(player.currentItem)
+        XCTAssertEqual(item.preferredForwardBufferDuration, configuredBuffer)
+        XCTAssertEqual(item.status, .readyToPlay)
+        let start = player.currentTime()
+        XCTAssertTrue(start.isNumeric)
+        guard start.isNumeric else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        // Do not call play here: only the production Registry activation can start it.
+        while CMTimeCompare(player.currentTime(), CMTimeAdd(start, CMTime(value: 1, timescale: 4))) < 0,
+              item.status != .failed, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let end = player.currentTime()
+        XCTAssertTrue(end.isNumeric)
+        XCTAssertEqual(item.status, .readyToPlay, String(describing: item.error))
+        guard end.isNumeric else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        XCTAssertGreaterThanOrEqual(CMTimeCompare(end,
+            CMTimeAdd(start, CMTime(value: 1, timescale: 4))), 0,
+            "Registry activation did not advance the real audio item; history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
+    }
+
+    @MainActor
+    private static func assertNativeAudioPlaylistPlays(_ url: URL) async throws {
+        let item = AVPlayerItem(url: url)
+        item.preferredForwardBufferDuration = 3
+        let player = AVPlayer(playerItem: item)
+        defer { player.pause(); player.replaceCurrentItem(with: nil) }
+        let readyDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while item.status == .unknown, ContinuousClock.now < readyDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(item.status, .readyToPlay, String(describing: item.error))
+        guard item.status == .readyToPlay else { throw AVPlayerItemCoordinatorFailure.itemFailed }
+        let start = player.currentTime()
+        XCTAssertTrue(start.isNumeric)
+        guard start.isNumeric else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        player.play()
+        let playbackDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while CMTimeCompare(player.currentTime(), CMTimeAdd(start, CMTime(value: 1, timescale: 4))) < 0,
+              item.status != .failed, ContinuousClock.now < playbackDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let end = player.currentTime()
+        XCTAssertTrue(end.isNumeric)
+        XCTAssertEqual(item.status, .readyToPlay, String(describing: item.error))
+        guard end.isNumeric else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        XCTAssertGreaterThanOrEqual(CMTimeCompare(end,
+            CMTimeAdd(start, CMTime(value: 1, timescale: 4))), 0, String(describing: item.error))
+        XCTAssertFalse(item.loadedTimeRanges.isEmpty)
+        print("AUDIO_ONLY_NATIVE_PLAYBACK ready=\(item.status.rawValue) time=\(player.currentTime())")
+    }
+
     func testProductionProgressiveGraphPublishesSixSecondLoopbackPrefixAndRetires()
         async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
@@ -919,4 +1205,20 @@ private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
     }
 
     func stop() { listener.cancel() }
+}
+
+/// Observes the real factory result; does not replace media, AVPlayer, readiness, or retirement.
+private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
+    private let lock = NSLock()
+    private let factory = SystemPlaybackBackendFactory()
+    private var created: HLSAVPlayerPlaybackBackend?
+    var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { created } }
+    func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
+                     tuning: PlaybackTuning, channelID: String, url: URL,
+                     eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
+        let value = try await factory.makeBackend(kind: kind, identity: identity,
+            tuning: tuning, channelID: channelID, url: url, eventSink: eventSink)
+        lock.withLock { created = value as? HLSAVPlayerPlaybackBackend }
+        return value
+    }
 }

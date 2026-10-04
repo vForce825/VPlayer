@@ -162,6 +162,21 @@ final class PlaybackResourceContextLedger: @unchecked Sendable {
     var chargedBytes: Int { lock.withLock { chargedBytesLocked } }
     var maximumChargedBytes: Int { lock.withLock { maximum } }
     var shouldBackpressure: Bool { chargedBytes >= Self.softBytes }
+    /// Read only the exact registered token allocations. No token or authority
+    /// escapes the ledger lock, and an inactive/foreign reservation has no result.
+    func reservationAllocationBytes(for reservation: PlaybackResourceContextReservation)
+        -> (context: Int, application: Int)? {
+        lock.withLock {
+            guard reservation.ledger === self, reservation.isActive,
+                  let index = index(of: reservation.allocationIdentity),
+                  allocations[index].references > 0,
+                  let application = allocations[index].applicationReservation else { return nil }
+            return (
+                malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(reservation).toOpaque())),
+                malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(application).toOpaque()))
+            )
+        }
+    }
     var bootstrapActualBytes: Int {
         let object = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
         let lockObject = UnsafeRawPointer(Unmanaged.passUnretained(lock).toOpaque())
@@ -596,12 +611,8 @@ final class LoopbackAudioMediaSelectionCapability: @unchecked Sendable, Hashable
     var presentationRange: FMP4PresentationRange {
         metadataStore.preparationResource(slot: Int(metadataSlot), ownerSlot: 0)!.presentationRange!
     }
-    private let selectionEnd: ExactMediaTime
+    let selectionWindow: FMP4PresentationRange
     private let effectiveOffset: ExactMediaTime
-    var selectionWindow: FMP4PresentationRange {
-        let lead = ExactMediaTime(value: 3, timescale: 1)
-        return try! .init(start: selectionEnd.subtracting(lead), duration: lead)
-    }
     var overlap: FMP4PresentationRange {
         let physical = presentationRange
         let effective = try! FMP4PresentationRange(start: physical.start.adding(effectiveOffset),
@@ -622,7 +633,7 @@ final class LoopbackAudioMediaSelectionCapability: @unchecked Sendable, Hashable
                      metadataStore: SealedMediaStore, metadataSlot: UInt16,
                      admissionSlot: UInt8,
                      responseLeaseIdentity: UUID,
-                     selectionEnd: ExactMediaTime,
+                     selectionWindow: FMP4PresentationRange,
                      effectiveOffset: ExactMediaTime,
                      sendTerminalIdentity: UUID,
                      resourceContextReservation: PlaybackResourceContextReservation) {
@@ -630,7 +641,7 @@ final class LoopbackAudioMediaSelectionCapability: @unchecked Sendable, Hashable
         self.metadataSlot = metadataSlot
         self.admissionSlot = admissionSlot
         self.responseLeaseIdentity = responseLeaseIdentity
-        self.selectionEnd = selectionEnd
+        self.selectionWindow = selectionWindow
         self.effectiveOffset = effectiveOffset
         self.sendTerminalIdentity = sendTerminalIdentity
         self.resourceContextReservation = resourceContextReservation
@@ -908,6 +919,59 @@ final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
 struct LoopbackAVPlayerCoverageEvidence {
     let physicalReceipt: ServedRenditionCoverageReceipt
     let effectivePresentationRange: FMP4PresentationRange
+}
+
+/// This exact server-issued transaction owns its independent paused HTTP
+/// freeze and bounded workspace. It cannot issue a startup mapping or selection.
+final class LoopbackPausedResumeCoverage: @unchecked Sendable {
+    fileprivate let server: LoopbackHTTPServer
+    fileprivate let originalOwner: FrozenPreparationOwner
+    let scope: AVPlayerPausedResumeScope
+    let requested: ExactMediaInterval
+    fileprivate let lease: PausedWindowCoverageLease
+    fileprivate let workspace: PausedCoverageWorkspace
+    fileprivate var verified = false
+    private let reservation: PlaybackResourceContextReservation
+
+    fileprivate static func make(server: LoopbackHTTPServer, originalOwner: FrozenPreparationOwner,
+        scope: AVPlayerPausedResumeScope, requested: ExactMediaInterval,
+        lease: PausedWindowCoverageLease, workspace: PausedCoverageWorkspace) throws -> Self {
+        let root = malloc_good_size(class_getInstanceSize(Self.self))
+        let context = malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self))
+        let application = malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: root + context + application)
+        do {
+            let value = Self(server: server, originalOwner: originalOwner, scope: scope,
+                requested: requested, lease: lease, workspace: workspace, reservation: reservation)
+            try PlaybackResourceContextLedger.shared.rebind(reservation,
+                to: .object(ObjectIdentifier(value)))
+            guard malloc_size(Unmanaged.passUnretained(value).toOpaque()) <= root,
+                  let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation),
+                  tokens.context <= context, tokens.application <= application else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            return value
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(server: LoopbackHTTPServer, originalOwner: FrozenPreparationOwner,
+        scope: AVPlayerPausedResumeScope, requested: ExactMediaInterval,
+        lease: PausedWindowCoverageLease, workspace: PausedCoverageWorkspace,
+        reservation: PlaybackResourceContextReservation) {
+        self.server = server; self.originalOwner = originalOwner; self.scope = scope
+        self.requested = requested; self.lease = lease; self.workspace = workspace
+        self.reservation = reservation
+    }
+
+    deinit { PlaybackResourceContextLedger.shared.release(reservation) }
+
+    /// Scope freshness is required even before HTTP coverage has frozen. This
+    /// does not grant the verified-coverage permission used before play.
+    func revalidateScope() throws { try server.revalidatePausedResumeScope(self) }
 }
 
 /// timeline admission 明确区分“selection 尚未被真实 E-3...E response 签出”和
@@ -1728,6 +1792,12 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     private var compactAACCompleted: [HLSResourceKey: SealedMediaBackingIdentity] = [:]
     private var activePreparationOwnerSlot: UInt8 = 0
     private var activePreparationHistoryGeneration: UInt64 = 0
+    // One byte in the existing 16 KiB history reservation. Zero is the legacy
+    // unconfigured three-second contract; an explicit owner contract is immutable.
+    private var preparationSelectionSeconds: UInt8 = 0
+    private var preparationSelectionDuration: ExactMediaTime {
+        .init(value: Int64(preparationSelectionSeconds == 0 ? 3 : preparationSelectionSeconds), timescale: 1)
+    }
     private weak var activePreparationOwner: FrozenPreparationOwner?
     private var preparationHistoryResourceReservation: PlaybackResourceContextReservation?
 
@@ -1783,6 +1853,32 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     }
 #endif
 
+    func configureStartupSelection(duration: ExactMediaTime, owner: FrozenPreparationOwner) throws {
+        try queueSync {
+            let three = ExactMediaTime(value: 3, timescale: 1)
+            let four = ExactMediaTime(value: 4, timescale: 1)
+            guard isAdmissionOpen, activePreparationOwner === owner,
+                  owner.isHistoryActive, !owner.isRetired,
+                  duration == three || duration == four else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            if preparationSelectionSeconds != 0 {
+                guard duration == preparationSelectionDuration else {
+                    throw AVPlayerItemCoordinatorFailure.operationInFlight
+                }
+                return
+            }
+            if duration != three {
+                guard owner.frozenPublication == nil, !owner.completionIsFrozen,
+                      completedPlaylistFacts.isEmpty, completedResourceFacts.isEmpty,
+                      audioSelectionByPublication.count == 0, activeResponses == 0 else {
+                    throw AVPlayerItemCoordinatorFailure.operationInFlight
+                }
+            }
+            preparationSelectionSeconds = duration == four ? 4 : 3
+        }
+    }
+
     func activatePreparationHistory(owner: FrozenPreparationOwner) -> Bool {
         queueSync {
             guard isAdmissionOpen else { return false }
@@ -1819,6 +1915,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             guard activePreparationOwnerSlot == ownerSlot else { return nil }
             activePreparationOwnerSlot = 0
             activePreparationHistoryGeneration = 0
+            preparationSelectionSeconds = 0
             activePreparationOwner = nil
             publicationEventHandler = nil
             completedResourceEventHandler = nil
@@ -2536,6 +2633,106 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             directAudioOnlyRendition: directAudioOnlyRendition)
     }
 
+    /// A direct radio can finish producing before AVPlayer's first GET. Bind only
+    /// an actually completed, same-owner publication; never relabel N+1 bodies as N.
+    /// The first ready version wins. Once metadata is frozen, rolling cannot rebind it.
+    func completedDirectPreparationRequest(
+        replacing original: AVPlayerItemPreparationRequest,
+        source: LoopbackAVPlayerPreparationEvidenceSource
+    ) throws -> AVPlayerItemPreparationRequest? {
+        try queueSync {
+            let owner = source.preparationOwner
+            guard source.belongs(to: self), activePreparationOwner === owner,
+                  owner.isHistoryActive, !owner.isRetired, isAdmissionOpen,
+                  original.item.outputLifecycleEpoch == authorityBinding.outputLifecycleEpoch,
+                  original.item.itemGeneration == declaration.itemGeneration,
+                  let direct = original.directAudioOnlyRendition,
+                  frozenParticipants.count == 1,
+                  let participant = frozenParticipants.first,
+                  participant.mediaType == .audio, participant.renditionIdentity == direct,
+                  original.itemURL == URL(string: participant.playlistPath, relativeTo: baseURL)?.absoluteURL,
+                  original.audioParticipants.count == 1,
+                  let requirement = original.audioParticipants.first,
+                  requirement.renditionIdentity == direct,
+                  requirement.codec == preparationAudioRequirement(at: 0).codec,
+                  requirement.terminalBinding === aacTerminalBindings[participant.participantID],
+                  requirement.renditionBinding === aacRenditionBindings[participant.participantID] else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            // A terminal-only AAC request can reserve the publisher's next CAS,
+            // so its sequence has no published authority yet. It must wait for
+            // that exact version even after EOS, never roll onto another one.
+            // Only the stable rendition-prefix path supports AAC adoption.
+            if requirement.codec == .aac, requirement.renditionBinding == nil { return nil }
+            guard authorityBindings[original.publicationSequence]?.origin === authorityBinding.origin else {
+                throw AVPlayerItemCoordinatorFailure.staleIdentity
+            }
+            guard owner.frozenPublication == nil, !owner.completionIsFrozen else { return nil }
+            if let previous = audioSelectionByPublication[original.publicationSequence],
+               previous.renditionIdentity != direct {
+                throw AVPlayerItemCoordinatorFailure.selectionChanged
+            }
+            // Fixed history has at most nine entries. Do not chase the latest live edge
+            // or restart a deadline when the producer advances again.
+            guard let sequence = authorityBindings.keys.sorted().first(where: { sequence in
+                guard sequence > original.publicationSequence,
+                      let binding = authorityBindings[sequence],
+                      binding.origin === authorityBinding.origin,
+                      let values = participantsByPublication[sequence], values.count == 1,
+                      values.first?.definition === participant.definition,
+                      audioSelectionByPublication[sequence]?.renditionIdentity == direct else { return false }
+                return publicationIsReady(binding)
+            }) else { return nil }
+            guard preparationPublicationBasis(itemURL: original.itemURL,
+                itemGeneration: original.item.itemGeneration, publicationSequence: sequence,
+                preparationOwner: owner) != nil else { return nil }
+            // Preserve the installed URL allocation and exact terminal/rendition aliases.
+            return .init(itemURL: original.itemURL, item: original.item,
+                publicationSequence: sequence, audioRequirements: original.audioParticipants,
+                directAudioOnlyRendition: direct)
+        }
+    }
+
+    /// Access-log callbacks are installed before any GET. For a sole direct audio
+    /// route they follow authenticated served metadata until the owner binds, then
+    /// remain on that immutable publication even as later playlists are served.
+    func classifyDirectPreparationAccessLogURI(
+        _ observed: URL, itemURL: URL, item: AVPlayerItemInstanceIdentity,
+        originalSequence: UInt64, selected: AudioRenditionIdentity?,
+        owner: FrozenPreparationOwner
+    ) -> AccessLogURIClassification? {
+        queueSync {
+            guard frozenParticipants.count == 1, let participant = frozenParticipants.first,
+                  participant.mediaType == .audio,
+                  itemURL == URL(string: participant.playlistPath, relativeTo: baseURL)?.absoluteURL
+            else { return nil }
+            guard isAdmissionOpen, activePreparationOwner === owner,
+                  owner.isHistoryActive, !owner.isRetired,
+                  item.outputLifecycleEpoch == authorityBinding.outputLifecycleEpoch,
+                  item.itemGeneration == declaration.itemGeneration else { return .invalidLocalResource }
+            if let selected, selected != participant.renditionIdentity { return .conflicting }
+            let sequence: UInt64
+            let authenticatedSelection: AudioRenditionIdentity?
+            if let frozen = owner.frozenPublication {
+                guard frozen.itemURL == itemURL,
+                      frozen.authorityBinding.origin === authorityBinding.origin,
+                      let capability = frozen.audioSelectionCapability,
+                      capability.renditionIdentity == participant.renditionIdentity else { return .invalidLocalResource }
+                sequence = frozen.authorityBinding.publicationSequence
+                authenticatedSelection = capability.renditionIdentity
+            } else {
+                authenticatedSelection = selected
+                sequence = completedPlaylistFacts.compactMap { fact -> UInt64? in
+                    guard fact.key == .media(participantID: participant.participantID),
+                          fact.authority.origin === authorityBinding.origin else { return nil }
+                    return fact.authority.publicationSequence
+                }.max() ?? originalSequence
+            }
+            return classifyAccessLogURI(observed, itemGeneration: item.itemGeneration,
+                publicationSequence: sequence, selected: authenticatedSelection)
+        }
+    }
+
     var preparationAudioRequirementCount: Int {
         frozenParticipants.reduce(0) { $0 + ($1.mediaType == .audio ? 1 : 0) }
     }
@@ -2888,15 +3085,18 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                               selected: AudioRenditionIdentity?)
         -> AccessLogURIClassification {
         queueSync {
-            guard observed.host == localHost else { return .unrelated }
-            guard observed.scheme == "http", observed.port == Int(port),
-                  observed.user == nil, observed.password == nil,
+            // This is the canonical advertised listener origin, not general web
+            // origin equivalence. URL.host decodes percent-encoded host spellings;
+            // those spellings, aliases, different schemes and ports are unrelated.
+            guard let components = URLComponents(url: observed, resolvingAgainstBaseURL: false),
+                  observed.scheme == "http", observed.host == localHost,
+                  components.percentEncodedHost == localHost,
+                  observed.port == Int(port) else { return .unrelated }
+            guard observed.user == nil, observed.password == nil,
                   observed.fragment == nil,
                   let binding = authorityBindings[publicationSequence],
                   binding.itemGeneration == itemGeneration,
                   let participants = participantsByPublication[publicationSequence],
-                  let components = URLComponents(url: observed,
-                                                 resolvingAgainstBaseURL: false),
                   components.percentEncodedPath == observed.path,
                   !observed.absoluteString.lowercased().contains("%2e") else {
                 return .invalidLocalResource
@@ -2930,6 +3130,221 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             guard let selected else { return .unrelated }
             return participant.renditionIdentity == selected ? .matching : .conflicting
         }
+    }
+
+    private func validatePausedResumeScope(_ scope: AVPlayerPausedResumeScope,
+        originalOwner: FrozenPreparationOwner) throws
+        -> (participants: FrozenParticipantHistoryTable, requested: ExactMediaInterval) {
+        if let terminal = timelineFailureEvent {
+            switch terminal {
+            case .publicationTerminated(_, _, _, let failure): throw failure
+            case .serverTerminated: throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+        }
+        guard isAdmissionOpen, !originalOwner.isRetired, originalOwner.completionIsFrozen,
+              originalOwner.metadataStore === store,
+              let original = originalOwner.frozenPublication,
+              original.authorityBinding.origin === authorityBinding.origin,
+              original.itemURL == scope.itemURL,
+              original.audioSelectionCapability === scope.selection,
+              scope.timeline.belongs(to: original.authorityBinding, selection: scope.selection),
+              scope.timeline.matches(itemURL: scope.itemURL, item: scope.cursor.item,
+                publicationSequence: original.authorityBinding.publicationSequence,
+                selection: scope.selection),
+              let sequence = authorityBindings.keys.max(),
+              let current = participantsByPublication[sequence],
+              current.count == frozenParticipants.count,
+              current.allSatisfy({ $0.definition === frozenParticipants[$0.participantID]?.definition }),
+              let audio = current[scope.selection.participantID],
+              audio.renditionIdentity == scope.selection.renditionIdentity,
+              audio.writerBinding.outputLifecycleEpoch == scope.cursor.item.outputLifecycleEpoch,
+              audio.writerBinding.itemGeneration.rawValue == scope.cursor.item.itemGeneration else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        if let latest = audioSelectionByPublication[sequence],
+           latest.renditionIdentity != scope.selection.renditionIdentity {
+            throw AVPlayerItemCoordinatorFailure.selectionChanged
+        }
+        if audio.audioCodec == .aac {
+            guard let mapping = audio.aacTimelineMapping,
+                  mapping.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
+                  mapping.writtenEffectiveBase == scope.timeline.writtenEffectiveBase,
+                  mapping.binding == audio.writerBinding else {
+                throw AVPlayerItemCoordinatorFailure.invalidTimeline
+            }
+        }
+        let start = try scope.timeline.sourceTime(for: scope.cursor.time)
+        let ordinaryEnd = try start.adding(scope.lead)
+        var end = ordinaryEnd
+        for participant in current where participant.mediaType == .video
+            || participant.participantID == scope.selection.participantID {
+            if try HLSChecked.compare(participant.effectivePlaybackHorizon, end) < 0 {
+                end = participant.effectivePlaybackHorizon
+            }
+        }
+        if try HLSChecked.compare(end, ordinaryEnd) < 0 {
+            guard audio.audioCodec == .aac, let mapping = audio.aacTimelineMapping else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            let originalEndpoint = originalOwner.timelineStorage?.endpointAuthority
+            let originalPrefix = originalOwner.timelineStorage?.prefixReceipt
+            let endpoint: AACEffectiveEndpointAuthority
+            if let originalEndpoint {
+                guard scope.timeline.matchesEndpoint(originalEndpoint),
+                      originalEndpoint.receipt.binding == audio.writerBinding,
+                      originalEndpoint.receipt.timelineOffset == mapping.offset,
+                      originalEndpoint.receipt.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
+                      originalEndpoint.receipt.writtenEffectiveBase == scope.timeline.writtenEffectiveBase else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                endpoint = originalEndpoint
+            } else {
+                // The original prefix stays the installed mapping. Only its
+                // same rendition's private final seal can authorize a later tail.
+                guard let originalPrefix,
+                      scope.timeline.aacPrefixReceipt === originalPrefix,
+                      originalPrefix.publicationSequence == original.authorityBinding.publicationSequence,
+                      originalPrefix.mapping == mapping,
+                      let currentEndpoint = aacRenditionBindings[audio.participantID]?.endpointAuthority else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                endpoint = currentEndpoint
+            }
+            let completed = LoopbackCompletedPublicationEvidence(preparationOwner: originalOwner)
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == scope.selection.participantID {
+                let finalBinding = participant.participantID == scope.selection.participantID
+                    ? endpoint.receipt.binding : participant.writerBinding
+                let currentFinal = participant.mediaType == .video
+                    ? store.currentFinalVideoPublication(continuing: participant.writerBinding)
+                    : store.currentFinalPublication(matching: finalBinding)
+                guard let originalParticipant = completed.participants.first(where: {
+                    $0.participantID == participant.participantID
+                        && $0.renditionIdentity == participant.renditionIdentity
+                        && $0.mediaType == participant.mediaType
+                }), let final = currentFinal,
+                      store.validatesCurrentFinalPublication(final),
+                      final.matchesSnapshot(identity: participant.playlistIdentity,
+                        publicationSequence: participant.playlistVersion),
+                      final.publicationSequence >= originalParticipant.mediaPlaylistVersion,
+                      final.effectivePlaybackHorizon == participant.effectivePlaybackHorizon else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                if originalEndpoint != nil {
+                    guard final.matchesSnapshot(identity: originalParticipant.mediaPlaylistSnapshotIdentity,
+                        publicationSequence: originalParticipant.mediaPlaylistVersion) else {
+                        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                    }
+                }
+                if participant.participantID == scope.selection.participantID {
+                    if let originalPrefix, originalEndpoint == nil {
+                        guard let originalTerminal = aacTerminalBindings[participant.participantID] else {
+                            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                        }
+                        _ = try AVPlayerAACEndpointValidator.preflight(authority: endpoint,
+                            currentFinalPublication: final, store: store, originalPrefix: originalPrefix,
+                            originalTerminalBinding: originalTerminal)
+                    } else {
+                        _ = try AVPlayerAACEndpointValidator.preflight(authority: endpoint,
+                            completedPublication: completed, currentFinalPublication: final, store: store)
+                    }
+                }
+            }
+        }
+        guard try HLSChecked.compare(start, end) < 0 else {
+            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        return (current, try ExactMediaInterval(start: start, end: end))
+    }
+
+    private func validatePausedResumeCoverageScope(_ value: LoopbackPausedResumeCoverage) throws
+        -> FrozenParticipantHistoryTable {
+        guard value.server === self else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        let validated = try validatePausedResumeScope(value.scope, originalOwner: value.originalOwner)
+        guard validated.requested == value.requested else {
+            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+        }
+        return validated.participants
+    }
+
+    fileprivate func revalidatePausedResumeScope(_ value: LoopbackPausedResumeCoverage) throws {
+        try queueSync { try store.domain.sync {
+            _ = try validatePausedResumeCoverageScope(value)
+        } }
+    }
+
+    func reservePausedResumeCoverage(_ scope: AVPlayerPausedResumeScope,
+                                    originalOwner: FrozenPreparationOwner) throws
+        -> LoopbackPausedResumeCoverage {
+        try queueSync { try store.domain.sync {
+            let (current, requested) = try validatePausedResumeScope(scope, originalOwner: originalOwner)
+            let lease = try PausedWindowCoverageLease.reserve()
+            var participantCount = 0
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == scope.selection.participantID {
+                participantCount += 1
+                guard try HLSChecked.compare(requested.end, participant.effectivePlaybackHorizon) <= 0 else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+                // Shift authenticated media-grid endpoints into the effective
+                // source coordinate; never force a native cursor onto that grid.
+                let offset = participant.mediaType == .audio
+                    ? try scope.timeline.writtenEffectiveBase.subtracting(scope.timeline.writtenPhysicalBase)
+                    : HLSChecked.zero
+                for key in participant.mediaKeys {
+                    try store.retainPausedDecodeClosure(key: key, requested: requested, owner: lease,
+                        presentationOffset: offset)
+                }
+                // A rolling publication can drop earlier resources that remain
+                // valid only through the original item's retained membership.
+                for resource in LoopbackCompletedResourceCollection(owner: originalOwner,
+                    participantID: participant.participantID, mode: 1) {
+                    try store.retainPausedDecodeClosure(key: resource.key,
+                        requested: requested, owner: lease,
+                        presentationOffset: offset)
+                }
+            }
+            guard (1...2).contains(participantCount) else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            let workspace = try store.reservePausedCoverageWorkspace(owner: lease)
+            return try .make(server: self, originalOwner: originalOwner, scope: scope,
+                requested: requested, lease: lease, workspace: workspace)
+        } }
+    }
+
+    func freezePausedResumeCoverage(_ value: LoopbackPausedResumeCoverage) throws -> Bool {
+        try queueSync { try store.domain.sync {
+            let current = try validatePausedResumeCoverageScope(value)
+            if value.verified { return true }
+            guard store.pausedCoverageBodiesComplete(owner: value.lease) else { return false }
+            try value.lease.freezeCompletedResources()
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == value.scope.selection.participantID {
+                let offset = participant.mediaType == .audio
+                    ? try value.scope.timeline.writtenEffectiveBase.subtracting(value.scope.timeline.writtenPhysicalBase)
+                    : HLSChecked.zero
+                guard let receipt = try store.pausedWindowCoverageReceipt(workspace: value.workspace,
+                    rendition: participant.renditionIdentity, requested: value.requested,
+                    presentationOffset: offset),
+                      receipt.itemGeneration == value.scope.cursor.item.itemGeneration,
+                      receipt.presentationRange == value.requested, receipt.presentationOffset == offset,
+                      !receipt.dependencies.isEmpty else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+            }
+            value.verified = true
+            return true
+        } }
+    }
+
+    func revalidatePausedResumeCoverage(_ value: LoopbackPausedResumeCoverage) throws {
+        try queueSync { try store.domain.sync {
+            guard value.server === self, value.verified else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            _ = try validatePausedResumeCoverageScope(value)
+        } }
     }
 
     func verifiedCoverage(using evidence: LoopbackCompletedPublicationEvidence,
@@ -3168,13 +3583,23 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     }
 
     func drain(cleanupTicket: LoopbackHTTPCleanupTicket) throws {
+        guard try drainIfIdle(cleanupTicket: cleanupTicket) else {
+            throw LoopbackHTTPServerError.invalidConfiguration
+        }
+    }
+
+    /// Validate the exact owner and atomically close late connection admission
+    /// only once all currently owned connections and responses have terminated.
+    /// Busy owners are pending work; a wrong ticket or phase is still an error.
+    func drainIfIdle(cleanupTicket: LoopbackHTTPCleanupTicket) throws -> Bool {
         try queueSync {
-            guard case .closed(let expected) = phase, expected === cleanupTicket,
-                  connections.isEmpty, closingConnections.isEmpty,
-                  activeResponses == 0 else {
+            guard case .closed(let expected) = phase, expected === cleanupTicket else {
                 throw LoopbackHTTPServerError.invalidConfiguration
             }
+            guard connections.isEmpty, closingConnections.isEmpty,
+                  activeResponses == 0 else { return false }
             phase = .drained(cleanupTicket)
+            return true
         }
     }
 
@@ -3886,6 +4311,14 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                         + "w\(window != nil ? 1 : 0)_e\(effective != nil ? 1 : 0)_"
                         + "x\(overlaps != nil ? 1 : 0)"
                 )
+                if let effective {
+                    PlaybackDiagnosticTracker.shared.append(
+                        "asel_scope_p\(binding.publicationSequence)_s\(route.key.logicalSequence)_"
+                            + "a\(effective.start.value)/\(effective.start.timescale)_"
+                            + "b\(effective.end.value)/\(effective.end.timescale)_"
+                            + "h\(participant.effectivePlaybackHorizon.value)/\(participant.effectivePlaybackHorizon.timescale)_"
+                            + "lead\(preparationSelectionDuration.value)/\(preparationSelectionDuration.timescale)")
+                }
             }
             #endif
 
@@ -3925,7 +4358,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                     metadataStore: store, metadataSlot: metadataSlot,
                     admissionSlot: admissionSlot,
                     responseLeaseIdentity: lease.terminalBindingIdentity,
-                    selectionEnd: window.end,
+                    selectionWindow: window,
                     effectiveOffset: effectiveOffset,
                     sendTerminalIdentity: sendTerminalIdentity,
                     resourceContextReservation: resourceReservation)
@@ -4039,7 +4472,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         binding: LoopbackPublicationAuthorityBinding,
         intersecting terminalRange: FMP4PresentationRange?
     ) -> FMP4PresentationRange? {
-        let lead = ExactMediaTime(value: 3, timescale: 1)
+        let lead = preparationSelectionDuration
         var selected: FMP4PresentationRange?
         for fact in completedResourceFacts where fact.authority == binding
             && fact.participantID == participant.participantID

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFAudio
 import XCTest
 @testable import VPlayerPlayback
 
@@ -196,9 +197,17 @@ final class PlaybackAudioRouteServiceTests: XCTestCase {
             monitor.start()
         }
         XCTAssertNil(releasedMonitor)
-        XCTAssertEqual(center.installedCount, 2)
-        XCTAssertEqual(center.removedCount, 2,
+        // Three typed lifecycle observers plus synchronous interruption/reset ingress.
+        XCTAssertEqual(center.installedCount, 5)
+        XCTAssertEqual(center.removedCount, 5,
             "runtime析构后NotificationCenter不能永久保留旧monitor的弱引用holder")
+        XCTAssertEqual(center.installedIdentities.count, 5)
+        XCTAssertEqual(center.legacyInstalledIdentities.count, 2)
+        XCTAssertTrue(center.legacyInstalledIdentities.isSubset(of: center.removedIdentities),
+            "The two NSObject-based safety ingress tokens must be removed by exact identity")
+        // Typed ObservationToken values are bridged on removal; their AnyObject
+        // box identities are not the underlying NSObject registration identities.
+        // Their three removals remain covered by the exact total above.
     }
 
     func testUnusedProductionRouteServiceCanBeReleasedBeforeAnySessionIsBound() throws {
@@ -388,17 +397,34 @@ private final class Task9ObserverLifetimeNotificationCenter: NotificationCenter,
     private let observationLock = NSLock()
     private var installed = 0
     private var removed = 0
+    private var installedIDs: Set<ObjectIdentifier> = []
+    private var removedIDs: Set<ObjectIdentifier> = []
+    private var legacyInstalledIDs: Set<ObjectIdentifier> = []
+    var legacyInstalledIdentities: Set<ObjectIdentifier> { observationLock.withLock { legacyInstalledIDs } }
+    var installedIdentities: Set<ObjectIdentifier> { observationLock.withLock { installedIDs } }
+    var removedIdentities: Set<ObjectIdentifier> { observationLock.withLock { removedIDs } }
     var installedCount: Int { observationLock.withLock { installed } }
     var removedCount: Int { observationLock.withLock { removed } }
 
     override func addObserver(forName name: Notification.Name?, object: Any?, queue: OperationQueue?,
         using block: @Sendable @escaping (Notification) -> Void) -> any NSObjectProtocol {
-        observationLock.withLock { installed += 1 }
-        return super.addObserver(forName: name, object: object, queue: queue, using: block)
+        let token = super.addObserver(forName: name, object: object, queue: queue, using: block)
+        observationLock.withLock {
+            installed += 1
+            installedIDs.insert(ObjectIdentifier(token))
+            if name == Notification.Name("AVAudioSessionInterruptionNotification")
+                || name == AVAudioSession.mediaServicesWereResetNotification {
+                legacyInstalledIDs.insert(ObjectIdentifier(token))
+            }
+        }
+        return token
     }
 
     override func removeObserver(_ observer: Any) {
-        observationLock.withLock { removed += 1 }
+        observationLock.withLock {
+            removed += 1
+            removedIDs.insert(ObjectIdentifier(observer as AnyObject))
+        }
         super.removeObserver(observer)
     }
 }

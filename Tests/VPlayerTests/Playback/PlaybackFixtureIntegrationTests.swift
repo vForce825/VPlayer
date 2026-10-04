@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+import AVFAudio
 import CoreMedia
 import CryptoKit
 import Foundation
@@ -44,10 +45,13 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         XCTAssertTrue(reader.canAdd(output))
-        reader.add(output)
-        XCTAssertTrue(reader.startReading())
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
 
-        let sample = try XCTUnwrap(output.copyNextSampleBuffer())
+        let next = try await provider.next()
+        let ready = try XCTUnwrap(next)
+        let sample = try makeOwnedReaderFixtureSample(copying: ready)
         let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
         let stream = try XCTUnwrap(
             CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee
@@ -67,7 +71,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             result,
             width: 1_280,
             height: 720,
-            videoDelay: 1,
+            videoDelay: 2,
             audioCodec: .aac
         )
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
@@ -76,6 +80,28 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
             $0.parserMetadata.topFieldFirst != true
         })
+    }
+
+    @MainActor
+    func testProgressiveAACFixtureTraversesRealAudioReceiverLifecycle() async throws {
+        // Like the other demux fixtures, run with the existing HTTP fixture
+        // runner. Native Receiver failures are never converted into skips.
+        let fixture = try assemble(path: "progressive-h264-aac.ts")
+        let configuration = try XCTUnwrap(fixture.audioConfigurations.first)
+        let firstFrame = try XCTUnwrap(fixture.audioFrames.first)
+        XCTAssertEqual(firstFrame.codec, .aac)
+        var continuity = AudioContinuityBuffer()
+        continuity.reset(to: firstFrame.generation)
+        let samples = try fixture.audioFrames.prefix(3).map { frame in
+            guard case let .admitted(admitted) = try continuity.admit(frame) else {
+                XCTFail("Real AAC fixture must pass canonical continuity admission")
+                throw FixtureIntegrationFailure.invalidAudioContinuity
+            }
+            return try SampleBufferBuilder.makeAudio(frame: admitted,
+                formatDescription: configuration.formatDescription,
+                forceResetDecoderBeforeDecoding: false)
+        }
+        try await NativeAudioReceiverSmoke.assertLifecycle(samples: samples, mediaKind: .compressed)
     }
 
     func testProgressiveAACFixtureDecodesAssemblerFramesThroughRealPCMDecoder() throws {
@@ -136,7 +162,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             result,
             width: 1_920,
             height: 1_080,
-            videoDelay: 1,
+            videoDelay: 2,
             audioCodec: .mp2
         )
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
@@ -195,7 +221,7 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             result,
             width: 1_280,
             height: 720,
-            videoDelay: 0,
+            videoDelay: 2,
             audioCodec: .aac
         )
         XCTAssertTrue(result.videoAccessUnits.allSatisfy {
@@ -206,6 +232,414 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
             direct.demuxPackets,
             "HLS startup packets must be replayed exactly once and in original order"
         )
+    }
+
+    @MainActor
+    func testRawHTTPHLSBecomesReadyWhilePausedAndConnected() async throws {
+        try await assertRawHTTPHLSReadiness(disconnected: false)
+    }
+
+    @MainActor
+    func testRawHTTPHLSDisconnectedPreparationBecomesReadyAfterReconnect() async throws {
+        try await assertRawHTTPHLSReadiness(disconnected: true)
+    }
+
+    @MainActor
+    func testRawHTTPHLSReseekAfterReconnectRestoresExactPausedTarget() async throws {
+        let baseURL = try fixtureBaseURL()
+        guard baseURL.scheme == "http", baseURL.host == "127.0.0.1",
+              baseURL.port != nil, baseURL.user == nil, baseURL.password == nil else {
+            throw FixtureIntegrationFailure.invalidHTTPResponse
+        }
+        let itemURL = try await verifyIndependentHTTPHLSFixture(baseURL: baseURL)
+        let events = NativeHTTPAudioLifecycleFacts()
+        let center = NotificationCenter.default
+        // Observe session ownership changes without fetching or configuring the
+        // shared session. Zero observed messages is a bounded diagnostic fact,
+        // not a claim that the process's preexisting session was inactive.
+        let active = center.addObserver(for: AVAudioSession.DidBecomeActiveMessage.self) { _ in
+            events.recordActivation()
+        }
+        let inactive = center.addObserver(for: AVAudioSession.DidBecomeInactiveMessage.self) { _ in
+            events.recordDeactivation()
+        }
+        defer { center.removeObserver(active); center.removeObserver(inactive) }
+        let player = AVPlayer()
+        player.pause()
+        player.automaticallyWaitsToMinimizeStalling = true
+        let rateObservation = player.observe(\.rate, options: [.initial, .new]) { observed, change in
+            events.recordRate(change.newValue ?? observed.rate)
+        }
+        defer { rateObservation.invalidate() }
+        let item = AVPlayerItem(url: itemURL)
+        item.preferredForwardBufferDuration = 3
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        let probe = NativeHTTPReadinessProgressProbe(player: player, stage: "lifecycle.attach")
+        defer { probe.cancel() }
+        XCTAssertNil(player.currentItem)
+        XCTAssertFalse(player.disconnectedFromSystemAudio)
+        player.replaceCurrentItem(with: item)
+
+        var operationFailure: (any Error)?
+        do {
+            try await requireRawNativeReady(player, item: item, stage: "lifecycle.connected_ready", probe: probe)
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+
+            probe.stage = "lifecycle.seek"
+            let target = CMTime(value: 1, timescale: 2)
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).begin")
+            let seekCompleted = await withCheckedContinuation { continuation in
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) {
+                    continuation.resume(returning: $0)
+                }
+            }
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).callback succeeded=\(seekCompleted)")
+            XCTAssertTrue(seekCompleted)
+            guard seekCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
+
+            // preroll's rate is a loading estimate, not a player.rate mutation.
+            // Its documented precondition is a ready player whose current rate is zero.
+            guard player.status == .readyToPlay, item.status == .readyToPlay, player.rate == 0 else {
+                XCTFail("Preroll requires confirmed native readiness and zero rate")
+                throw FixtureIntegrationFailure.nativeReadinessFailed
+            }
+            probe.stage = "lifecycle.preroll"
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).begin")
+            let prerollCompleted = await withCheckedContinuation { continuation in
+                player.preroll(atRate: 1) { continuation.resume(returning: $0) }
+            }
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).callback succeeded=\(prerollCompleted)")
+            XCTAssertTrue(prerollCompleted)
+            guard prerollCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            let preparedTime = player.currentTime()
+            XCTAssertEqual(CMTimeCompare(preparedTime, target), 0)
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+
+            await changeRawNativeAudioConnection(true, player: player,
+                stage: "lifecycle.disconnect_prepared", probe: probe)
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            XCTAssertTrue(player.disconnectedFromSystemAudio)
+            // Run37021632901 retained readiness but changed physical time by
+            // microseconds. Preserve the owned target and inspect native time;
+            // do not manufacture equality or introduce an epsilon.
+            XCTAssertEqual(item.status, .readyToPlay)
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage,
+                requiresCoverage: false)
+
+            await changeRawNativeAudioConnection(false, player: player,
+                stage: "lifecycle.reconnect_prepared", probe: probe)
+            XCTAssertFalse(player.disconnectedFromSystemAudio)
+            try await requireRawNativeReady(player, item: item, stage: "lifecycle.reconnected_ready", probe: probe)
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            // Reconnect may invalidate native buffering even while readiness
+            // stays true (source a9 raw control). Recovery must reload after the real
+            // reseek; requiring retained coverage here would skip that experiment.
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage,
+                requiresCoverage: false)
+
+            // Only a new physical seek may re-establish the original exact
+            // target after a connection change. This is a raw diagnostic, not
+            // an invented production pause-cursor or coverage authority.
+            probe.stage = "lifecycle.reseek"
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).begin "
+                + "target=\(NativeHTTPReadinessProgressProbe.timeFact(target))")
+            let reseekCompleted = await withCheckedContinuation { continuation in
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) {
+                    continuation.resume(returning: $0)
+                }
+            }
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).callback succeeded=\(reseekCompleted)")
+            XCTAssertTrue(reseekCompleted)
+            guard reseekCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
+            try await requireRawNativeCoverage(player, item: item, start: target,
+                stage: "lifecycle.reloaded", probe: probe)
+            guard player.status == .readyToPlay, item.status == .readyToPlay, player.rate == 0 else {
+                throw FixtureIntegrationFailure.nativeReadinessFailed
+            }
+            probe.stage = "lifecycle.repreroll"
+            let reprerollCompleted = await withCheckedContinuation { continuation in
+                player.preroll(atRate: 1) { continuation.resume(returning: $0) }
+            }
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).callback succeeded=\(reprerollCompleted)")
+            XCTAssertTrue(reprerollCompleted)
+            guard reprerollCompleted else { throw FixtureIntegrationFailure.nativeCallbackFailed }
+            try assertRawNativePaused(player, item: item, events: events, stage: probe.stage)
+            XCTAssertEqual(CMTimeCompare(player.currentTime(), target), 0)
+            try checkRawDiagnosticCoverage(player, item: item, stage: probe.stage)
+        } catch {
+            print("RAW_HTTP_LIFECYCLE stage=\(probe.stage).caught "
+                + "errorType=\(String(reflecting: type(of: error))) "
+                + "fixtureFailure=\(String(describing: error as? FixtureIntegrationFailure)) "
+                + "taskCancelled=\(Task.isCancelled)")
+            operationFailure = error
+        }
+
+        // Complete retirement in the same order on success and error. Every
+        // physical callback above is joined before this path can run; a missing
+        // callback remains subject to the unchanged outer XCTest timeout.
+        probe.stage = "lifecycle.retire_pause"
+        player.pause()
+        player.cancelPendingPrerolls()
+        print("RAW_HTTP_LIFECYCLE stage=\(probe.stage) \(NativeHTTPReadinessProgressProbe.snapshot(player))")
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+        await changeRawNativeAudioConnection(true, player: player,
+            stage: "lifecycle.retire_disconnect", probe: probe)
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertTrue(player.disconnectedFromSystemAudio)
+        XCTAssertEqual(player.rate, 0)
+        player.replaceCurrentItem(with: nil)
+        XCTAssertNil(player.currentItem)
+        // Allow queued typed session messages to be observed before retiring
+        // these test-only observers. This window is not an ownership guarantee.
+        try await Task.sleep(for: .milliseconds(250))
+        print("RAW_HTTP_LIFECYCLE stage=lifecycle.retired "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(events.summary)")
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+        XCTAssertTrue(events.hasNoObservedOwnershipOrRateChange)
+        if let operationFailure {
+            print("RAW_HTTP_LIFECYCLE stage=lifecycle.rethrow "
+                + "errorType=\(String(reflecting: type(of: operationFailure))) "
+                + "fixtureFailure=\(String(describing: operationFailure as? FixtureIntegrationFailure)) "
+                + "taskCancelled=\(Task.isCancelled)")
+            throw operationFailure
+        }
+    }
+
+    @MainActor
+    private func requireRawNativeCoverage(_ player: AVPlayer, item: AVPlayerItem,
+                                          start: CMTime, stage: String,
+                                          probe: NativeHTTPReadinessProgressProbe) async throws {
+        probe.stage = stage
+        let requested = CMTimeRange(start: start, duration: CMTime(value: 1, timescale: 1))
+        let loaded = expectation(description: "\(stage) loads the entire exact diagnostic window")
+        let facts = NativeHTTPCoverageKVOFacts()
+        let observation = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { observed, _ in
+            let code = VPReadLoadedRangeCoverage(observed, requested).code
+            if facts.record(Int(code)) { loaded.fulfill() }
+        }
+        defer { observation.invalidate() }
+        await fulfillment(of: [loaded], timeout: 15)
+        let code = VPReadLoadedRangeCoverage(item, requested).code
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).observed "
+            + "requestedStart=\(NativeHTTPReadinessProgressProbe.timeFact(start)) "
+            + "diagnosticDuration=1/1 code=\(code) \(facts.summary) "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player))")
+        XCTAssertEqual(code, 0)
+        guard player.currentItem === item, code == 0 else {
+            throw FixtureIntegrationFailure.nativeLoadedCoverageFailed
+        }
+    }
+
+    @MainActor
+    private func requireRawNativeReady(_ player: AVPlayer, item: AVPlayerItem,
+                                       stage: String, probe: NativeHTTPReadinessProgressProbe) async throws {
+        probe.stage = stage
+        let terminal = expectation(description: "\(stage) reaches native item readiness")
+        let facts = NativeHTTPReadinessKVOFacts()
+        let observation = item.observe(\.status, options: [.initial, .new]) { observed, change in
+            if facts.record(observed.status, changeStatus: change.newValue) { terminal.fulfill() }
+        }
+        defer { observation.invalidate() }
+        await fulfillment(of: [terminal], timeout: 15)
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).observed "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(facts.summary)")
+        XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.readyToPlay.rawValue)
+        XCTAssertEqual(player.status, .readyToPlay)
+        XCTAssertEqual(item.status, .readyToPlay)
+        XCTAssertNil(item.error)
+        guard player.currentItem === item, player.status == .readyToPlay,
+              item.status == .readyToPlay, item.error == nil else {
+            throw FixtureIntegrationFailure.nativeReadinessFailed
+        }
+    }
+
+    @MainActor
+    private func assertRawNativePaused(_ player: AVPlayer, item: AVPlayerItem,
+                                       events: NativeHTTPAudioLifecycleFacts, stage: String) throws {
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).checkpoint "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(events.summary)")
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+        XCTAssertTrue(events.hasNoObservedOwnershipOrRateChange,
+                      "Unsigned native preparation must not change audio ownership or player rate")
+        guard player.currentItem === item, player.rate == 0,
+              player.timeControlStatus == .paused, events.hasNoObservedOwnershipOrRateChange else {
+            throw FixtureIntegrationFailure.unexpectedNativeAudioLifecycle
+        }
+    }
+
+    @MainActor
+    private func changeRawNativeAudioConnection(_ disconnected: Bool, player: AVPlayer,
+                                                stage: String, probe: NativeHTTPReadinessProgressProbe) async {
+        probe.stage = stage
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).begin requestedDisconnected=\(disconnected)")
+        let callbackTime = await withCheckedContinuation { continuation in
+            player.setDisconnectedFromSystemAudio(disconnected) {
+                continuation.resume(returning: player.currentTime())
+            }
+        }
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).callback "
+            + "callbackTime=\(NativeHTTPReadinessProgressProbe.timeFact(callbackTime)) "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player))")
+    }
+
+    @MainActor
+    private func checkRawDiagnosticCoverage(_ player: AVPlayer, item: AVPlayerItem,
+                                            stage: String, requiresCoverage: Bool = true) throws {
+        let observed = player.currentTime()
+        XCTAssertTrue(observed.isNumeric)
+        XCTAssertEqual(observed.epoch, 0)
+        guard observed.isNumeric, observed.timescale > 0, observed.epoch == 0 else {
+            throw FixtureIntegrationFailure.nativeReadinessFailed
+        }
+        // The independent fixture is only two seconds long. This exact one-
+        // second observation window cannot prove production's three-second
+        // startup lead or authenticated served/decode coverage.
+        let requested = CMTimeRange(start: observed, duration: CMTime(value: 1, timescale: 1))
+        let coverage = VPReadLoadedRangeCoverage(item, requested)
+        print("RAW_HTTP_LIFECYCLE stage=\(stage).coverage "
+            + "observed=\(NativeHTTPReadinessProgressProbe.timeFact(observed)) "
+            + "diagnosticDuration=1/1 code=\(coverage.code) required=\(requiresCoverage)")
+        guard requiresCoverage else { return }
+        XCTAssertEqual(coverage.code, 0, "The complete observed forward window must remain loaded")
+        guard coverage.code == 0 else { throw FixtureIntegrationFailure.nativeLoadedCoverageFailed }
+    }
+
+    @MainActor
+    private func assertRawHTTPHLSReadiness(disconnected: Bool) async throws {
+        // Use the existing fixture-runner convention. The dedicated diagnostic
+        // lane must prove env injection and exactly two executions with no skips.
+        let baseURL = try fixtureBaseURL()
+        guard baseURL.scheme == "http", baseURL.host == "127.0.0.1",
+              baseURL.port != nil, baseURL.user == nil, baseURL.password == nil else {
+            throw FixtureIntegrationFailure.invalidHTTPResponse
+        }
+        let itemURL = try await verifyIndependentHTTPHLSFixture(baseURL: baseURL)
+        let label = disconnected ? "disconnected" : "connected"
+        let player = AVPlayer()
+        player.pause()
+        player.automaticallyWaitsToMinimizeStalling = true
+        XCTAssertNil(player.currentItem)
+        XCTAssertFalse(player.disconnectedFromSystemAudio)
+        let probe = NativeHTTPReadinessProgressProbe(player: player, stage: "\(label).setup")
+        defer {
+            probe.cancel()
+            player.replaceCurrentItem(with: nil)
+            XCTAssertNil(player.currentItem)
+        }
+        var disconnectCompletionCount = 0
+        var reconnectCompletionCount = 0
+        if disconnected {
+            probe.stage = "\(label).disconnect"
+            print("RAW_HTTP_READINESS stage=\(probe.stage).begin")
+            // Complete disconnection before creating/attaching media, so no
+            // connected loading window can make this control falsely pass.
+            // Own this physical transition until AVFoundation completes it.
+            // No timeout race releases the player while its callback is pending;
+            // the unchanged outer XCTest timeout remains authoritative.
+            await withCheckedContinuation { continuation in
+                player.setDisconnectedFromSystemAudio(true) { continuation.resume() }
+            }
+            disconnectCompletionCount = 1
+            print("RAW_HTTP_READINESS stage=\(probe.stage).completed")
+        }
+        XCTAssertNil(player.currentItem)
+        XCTAssertEqual(player.disconnectedFromSystemAudio, disconnected)
+        let item = AVPlayerItem(url: itemURL)
+        item.preferredForwardBufferDuration = 3
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        let terminal = expectation(description: "Raw HTTP HLS \(label) reaches terminal status")
+        let facts = NativeHTTPReadinessKVOFacts()
+        let observation = item.observe(\.status, options: [.initial, .new]) { observed, change in
+            if facts.record(observed.status, changeStatus: change.newValue) { terminal.fulfill() }
+        }
+        defer { observation.invalidate() }
+        player.replaceCurrentItem(with: item)
+        if disconnected {
+            // The original paired run37017106205 showed unknown status after
+            // fifteen seconds. Keep a bounded observation of that simulator
+            // behavior, then prove liveness through an actual reconnect.
+            probe.stage = "disconnected.pending_before_reconnect"
+            try await Task.sleep(for: .seconds(1))
+            print("RAW_HTTP_READINESS stage=\(probe.stage) "
+                + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(facts.summary)")
+            XCTAssertTrue(player.disconnectedFromSystemAudio)
+            XCTAssertEqual(item.status, .unknown)
+            XCTAssertEqual(facts.firstTerminalStatus, -1)
+            XCTAssertEqual(player.rate, 0)
+            await changeRawNativeAudioConnection(false, player: player,
+                stage: "disconnected.reconnect", probe: probe)
+            reconnectCompletionCount = 1
+        }
+        probe.stage = "\(label).ready"
+        print("RAW_HTTP_READINESS stage=\(probe.stage).begin "
+            + "disconnectRequests=\(disconnected ? 1 : 0) disconnectCompletions=\(disconnectCompletionCount) "
+            + "reconnectCompletions=\(reconnectCompletionCount) "
+            + "preferredBuffer=\(item.preferredForwardBufferDuration) "
+            + "pausedNetwork=\(item.canUseNetworkResourcesForLiveStreamingWhilePaused) "
+            + "automaticallyWaits=\(player.automaticallyWaitsToMinimizeStalling)")
+        await fulfillment(of: [terminal], timeout: 15)
+        probe.cancel()
+        print("RAW_HTTP_READINESS stage=\(probe.stage).observed "
+            + "\(NativeHTTPReadinessProgressProbe.snapshot(player)) \(facts.summary)")
+        XCTAssertEqual(disconnectCompletionCount, disconnected ? 1 : 0)
+        XCTAssertEqual(reconnectCompletionCount, disconnected ? 1 : 0)
+        XCTAssertFalse(player.disconnectedFromSystemAudio)
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(facts.firstTerminalStatus, AVPlayerItem.Status.readyToPlay.rawValue)
+        XCTAssertEqual(item.status, .readyToPlay)
+        XCTAssertNil(item.error)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+    }
+
+    @MainActor
+    private func verifyIndependentHTTPHLSFixture(baseURL: URL) async throws -> URL {
+        // These are the separately generated and ffprobe-audited H264/AAC bytes,
+        // not the production HLS writer, publication seed, or loopback server.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 10
+        configuration.timeoutIntervalForResource = 20
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        func fetch(_ path: String) async throws -> Data {
+            var request = URLRequest(url: baseURL.appending(path: path))
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            let (bytes, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  !bytes.isEmpty else { throw FixtureIntegrationFailure.invalidHTTPResponse }
+            return bytes
+        }
+        let entries = try parseChecksumManifest(try await fetch("SHA256SUMS"))
+        for path in ["hls/master.m3u8", "hls/segment0.ts"] {
+            let bytes = try await fetch(path)
+            let expected = try XCTUnwrap(entries[path])
+            let matches = SHA256.hash(data: bytes).hexString == expected
+            XCTAssertTrue(matches, "Independent fixture checksum must match")
+            guard matches else { throw FixtureIntegrationFailure.invalidHTTPResponse }
+            if path.hasSuffix(".m3u8") {
+                let playlist = try XCTUnwrap(String(data: bytes, encoding: .utf8))
+                let segments = playlist.split(separator: "\n")
+                    .filter { !$0.hasPrefix("#") }.map(String.init)
+                XCTAssertTrue(playlist.contains("#EXT-X-ENDLIST\n"))
+                XCTAssertEqual(segments, ["segment0.ts"])
+                guard playlist.contains("#EXT-X-ENDLIST\n"), segments == ["segment0.ts"] else {
+                    throw FixtureIntegrationFailure.invalidHTTPResponse
+                }
+            }
+            print("RAW_HTTP_READINESS fixture=\(path.hasSuffix(".m3u8") ? "playlist" : "segment") "
+                + "bytes=\(bytes.count) checksumMatches=\(matches)")
+        }
+        return baseURL.appending(path: "hls/master.m3u8")
     }
 
     func testCancellingFromInitialHLSTracksDropsEveryRetainedStartupPacket() throws {
@@ -442,6 +876,8 @@ final class PlaybackFixtureIntegrationTests: XCTestCase {
         XCTAssertEqual(video.codec, .h264)
         XCTAssertEqual(video.width, width)
         XCTAssertEqual(video.height, height)
+        // The audited fixture generator fixes bframes=2 for both TS files;
+        // the HLS child is byte-identical to the progressive transport stream.
         XCTAssertEqual(video.videoDelay, videoDelay)
         XCTAssertEqual(audio.codec, audioCodec)
         XCTAssertGreaterThanOrEqual(result.videoAccessUnits.count, 25)
@@ -633,6 +1069,150 @@ private enum FixtureIntegrationFailure: Error {
     case missingTracks
     case invalidHTTPResponse
     case requestTimedOut
+    case invalidAudioContinuity
+    case nativeReadinessFailed
+    case nativeCallbackFailed
+    case nativeLoadedCoverageFailed
+    case unexpectedNativeAudioLifecycle
+}
+
+private final class NativeHTTPAudioLifecycleFacts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activationCount = 0
+    private var deactivationCount = 0
+    private var rateCallbackCount = 0
+    private var nonzeroRateCount = 0
+
+    func recordActivation() { lock.withLock { activationCount += 1 } }
+    func recordDeactivation() { lock.withLock { deactivationCount += 1 } }
+    func recordRate(_ rate: Float) {
+        lock.withLock {
+            rateCallbackCount += 1
+            if rate != 0 { nonzeroRateCount += 1 }
+        }
+    }
+    var hasNoObservedOwnershipOrRateChange: Bool {
+        lock.withLock { activationCount == 0 && deactivationCount == 0 && nonzeroRateCount == 0 }
+    }
+    var summary: String {
+        lock.withLock {
+            "audioActiveEvents=\(activationCount) audioInactiveEvents=\(deactivationCount) "
+                + "rateCallbacks=\(rateCallbackCount) nonzeroRateEvents=\(nonzeroRateCount)"
+        }
+    }
+}
+
+private final class NativeHTTPReadinessKVOFacts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var lastStatus = -1
+    private var lastChangeStatus = -1
+    private var terminalStatus = -1
+
+    func record(_ status: AVPlayerItem.Status, changeStatus: AVPlayerItem.Status?) -> Bool {
+        lock.withLock {
+            count += 1
+            lastStatus = status.rawValue
+            lastChangeStatus = changeStatus?.rawValue ?? -1
+            guard terminalStatus == -1,
+                  status == .readyToPlay || status == .failed else { return false }
+            terminalStatus = lastStatus
+            return true
+        }
+    }
+
+    var firstTerminalStatus: Int { lock.withLock { terminalStatus } }
+    var summary: String {
+        lock.withLock {
+            "kvoCount=\(count) kvoStatus=\(lastStatus) "
+                + "kvoTypedChange=\(lastChangeStatus) kvoTerminal=\(terminalStatus)"
+        }
+    }
+}
+
+private final class NativeHTTPCoverageKVOFacts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var lastCode = -1
+    private var fulfilled = false
+
+    func record(_ code: Int) -> Bool {
+        lock.withLock {
+            count += 1
+            lastCode = code
+            guard code == 0, !fulfilled else { return false }
+            fulfilled = true
+            return true
+        }
+    }
+
+    var summary: String {
+        lock.withLock { "loadedKVOCount=\(count) loadedKVOLastCode=\(lastCode)" }
+    }
+}
+
+@MainActor
+private final class NativeHTTPReadinessProgressProbe {
+    var stage: String
+    private weak var player: AVPlayer?
+    private var task: Task<Void, Never>?
+
+    init(player: AVPlayer, stage: String) {
+        self.player = player
+        self.stage = stage
+        task = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) }
+            catch { return }
+            guard !Task.isCancelled, let self, let player = self.player else { return }
+            print("RAW_HTTP_READINESS_WAIT stage=\(self.stage) \(Self.snapshot(player))")
+        }
+    }
+
+    static func snapshot(_ player: AVPlayer) -> String {
+        let item = player.currentItem
+        let time = player.currentTime()
+        let ranges = item?.loadedTimeRanges ?? []
+        let first = ranges.count <= 128 ? ranges.first?.timeRangeValue : nil
+        let last = ranges.count <= 128 ? ranges.last?.timeRangeValue : nil
+        let timebase = item?.timebase
+        // These are ordered native reads, not an atomic clock snapshot. The
+        // connection helper separately captures time inside the SDK callback.
+        let timebaseTime = timebase.map { timeFact(CMTimebaseGetTime($0)) } ?? "none"
+        let timebaseRate = timebase.map { String(CMTimebaseGetRate($0)) } ?? "none"
+        let effectiveRate = timebase.map { String(CMTimebaseGetEffectiveRate($0)) } ?? "none"
+        return "playerStatus=\(player.status.rawValue) playerError=\(errorFact(player.error as NSError?)) "
+            + "itemStatus=\(item?.status.rawValue ?? -1) itemError=\(errorFact(item?.error as NSError?)) "
+            + "assetPlayableState=\(item.map { playableFact($0.asset) } ?? "no_item") "
+            + "rangeCount=\(ranges.count) "
+            + "firstStart=\(timeFact(first?.start)) firstDuration=\(timeFact(first?.duration)) "
+            + "lastStart=\(timeFact(last?.start)) lastDuration=\(timeFact(last?.duration)) "
+            + "currentTime=\(timeFact(time)) timebaseTime=\(timebaseTime) "
+            + "timebaseRate=\(timebaseRate) effectiveRate=\(effectiveRate) "
+            + "rate=\(player.rate) timeControlStatus=\(player.timeControlStatus.rawValue) "
+            + "disconnected=\(player.disconnectedFromSystemAudio)"
+    }
+
+    static func timeFact(_ time: CMTime?) -> String {
+        guard let time else { return "none" }
+        return "\(time.value)/\(time.timescale):epoch\(time.epoch):flags\(time.flags.rawValue)"
+    }
+
+    private static func playableFact(_ asset: AVAsset) -> String {
+        switch asset.status(of: .isPlayable) {
+        case .notYetLoaded: return "notYetLoaded"
+        case .loading: return "loading"
+        case .loaded(let playable): return "loaded:\(playable)"
+        case .failed(let error): return "failed:\(errorFact(error))"
+        }
+    }
+
+    private static func errorFact(_ error: NSError?) -> String {
+        guard let error else { return "none" }
+        return "\(String(error.domain.prefix(96))):\(error.code)"
+    }
+
+    func cancel() { task?.cancel(); task = nil }
+    deinit { task?.cancel() }
 }
 
 private struct AssembledFixture {

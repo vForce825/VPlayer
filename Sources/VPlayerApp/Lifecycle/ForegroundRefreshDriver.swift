@@ -24,6 +24,12 @@ final class ForegroundRefreshDriver {
     private let reportStatus: ReportStatus
     private var loopTask: Task<Void, Never>?
     private var isActive = false
+    private var prefersReducedResourceUsage = false
+
+    func setPrefersReducedResourceUsage(_ preferred: Bool) {
+        // Keep the existing cadence; don't trigger expensive work on a preference change.
+        prefersReducedResourceUsage = preferred
+    }
     private(set) var isInitialLibraryLoadComplete = false
 
     init(
@@ -69,13 +75,19 @@ final class ForegroundRefreshDriver {
         let now = now
         let sleep = sleep
         let reportStatus = reportStatus
-        loopTask = Task { @MainActor in
+        loopTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do {
+                    guard self != nil else { return }
+                    if self?.prefersReducedResourceUsage == true {
+                        try await sleep()
+                        continue
+                    }
                     let profiles = try await loadProfiles()
                     try Task.checkCancellation()
                     for profile in profiles {
                         try Task.checkCancellation()
+                        guard self?.prefersReducedResourceUsage != true else { break }
                         let resources = planner.dueResources(for: profile, now: now())
                         guard !resources.isEmpty else { continue }
                         _ = await refresh(profile.id, resources, .foreground)

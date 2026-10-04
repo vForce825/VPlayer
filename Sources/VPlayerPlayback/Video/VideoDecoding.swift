@@ -87,7 +87,7 @@ public struct VideoFormatMetadata: Sendable, Equatable {
 
 public final class DecodedVideoFrameRetentionTail: @unchecked Sendable {
     private let onRelease: @Sendable () -> Void
-    /// HLS 专用：decoder 输入与未来 YADIF pair 的同一 conversion reservation。
+    /// HLS 专用：decoder 输入与未来去交错输出 pair 的同一 conversion reservation。
     /// 不附着到 CoreVideo attachment，避免被复制到不相同的 backing。
     let outputBackingTail: VideoOutputBackingRetentionTail?
     public init(

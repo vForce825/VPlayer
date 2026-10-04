@@ -4,6 +4,26 @@
 
 import Foundation
 
+/// Recovery can be incomplete for historical choices created before a budget
+/// existed. This is a warning, not a reason to make the cached library unusable.
+public enum LibraryRecoveryStatus: Equatable, Sendable {
+    case current
+    case capacityExceeded(limit: Int)
+
+    public var warningMessage: String? {
+        switch self {
+        case .current:
+            return nil
+        case let .capacityExceeded(limit):
+            return "源配置和手动 EPG 映射超过恢复存储上限（\(limit / 1_024) KiB）。现有资料仍可使用，但最近的更改尚未备份，系统清理缓存后可能丢失或恢复为旧设置。请删除不再需要的源或手动映射，直到此提示消失。"
+        }
+    }
+}
+
+public protocol LibraryRecoveryStatusProviding: Sendable {
+    func recoveryStatus() async -> LibraryRecoveryStatus
+}
+
 public struct RefreshSourceContext: Hashable, Sendable {
     public let source: SourceURLIdentity
     public let attemptID: UUID
@@ -168,9 +188,12 @@ public enum LibraryRepositoryError: Error, Equatable, Sendable, LocalizedError {
     case corruptPersistedField(field: String)
     case persistedValueDecodingFailed(field: String, diagnostic: ErrorDiagnosticSnapshot)
     case sourceConfigurationChanged
+    case recoveryDataTooLarge(limit: Int)
 
     public var errorDescription: String? {
         switch self {
+        case let .recoveryDataTooLarge(limit):
+            return "源配置和手动 EPG 映射超过恢复存储上限（\(limit / 1_024) KiB）。请先删除不再需要的源或手动映射。"
         case let .corruptPersistedField(field):
             return "持久化字段 \(field) 无效。"
         case let .persistedValueDecodingFailed(field, diagnostic):

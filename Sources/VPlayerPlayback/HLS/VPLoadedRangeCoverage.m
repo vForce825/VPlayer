@@ -34,17 +34,19 @@ static BOOL VPRangeEnd(CMTimeRange range, CMTime *end) {
 }
 
 static VPLoadedRangeCoverage VPScan(const void *context, size_t count,
-                                   VPRangeReader read, CMTimeRange requested) {
+                                   VPRangeReader read, CMTime requestedStart, CMTime requestedEnd) {
     VPLoadedRangeCoverage result = { 1, (uint32_t)(count > UINT32_MAX ? UINT32_MAX : count), kCMTimeInvalid };
     if (count > 128) { result.code = 2; return result; }
-    CMTime requestedEnd;
-    if (!VPRangeEnd(requested, &requestedEnd)) { result.code = 3; return result; }
+    if (!VPValidTime(requestedStart) || !VPValidTime(requestedEnd)
+        || requestedStart.value < 0 || CMTimeCompare(requestedStart, requestedEnd) >= 0) {
+        result.code = 3; return result;
+    }
     // 即使前项已覆盖，也校验其余项，不能隐藏后部非法时间。
     for (size_t i = 0; i < count; ++i) {
         CMTime end;
         if (!VPRangeEnd(read(context, i), &end)) { result.code = 3; return result; }
     }
-    CMTime cursor = requested.start;
+    CMTime cursor = requestedStart;
     for (size_t pass = 0; pass < count; ++pass) {
         CMTime next = cursor;
         for (size_t i = 0; i < count; ++i) {
@@ -71,10 +73,26 @@ static CMTimeRange VPReadBuffer(const void *context, size_t index) {
     return ((const CMTimeRange *)context)[index];
 }
 
+static VPLoadedRangeCoverage VPScanRange(const void *context, size_t count,
+                                        VPRangeReader read, CMTimeRange requested) {
+    VPLoadedRangeCoverage invalid = { count > 128 ? 2 : 3,
+        (uint32_t)(count > UINT32_MAX ? UINT32_MAX : count), kCMTimeInvalid };
+    CMTime end;
+    if (count > 128 || !VPRangeEnd(requested, &end)) return invalid;
+    return VPScan(context, count, read, requested.start, end);
+}
+
 VPLoadedRangeCoverage VPReadLoadedRangeCoverage(AVPlayerItem *item, CMTimeRange requested) {
     @autoreleasepool {
         NSArray<NSValue *> *values = item.loadedTimeRanges;
-        return VPScan((__bridge const void *)values, values.count, VPReadArray, requested);
+        return VPScanRange((__bridge const void *)values, values.count, VPReadArray, requested);
+    }
+}
+
+VPLoadedRangeCoverage VPReadLoadedIntervalCoverage(AVPlayerItem *item, CMTime start, CMTime end) {
+    @autoreleasepool {
+        NSArray<NSValue *> *values = item.loadedTimeRanges;
+        return VPScan((__bridge const void *)values, values.count, VPReadArray, start, end);
     }
 }
 
@@ -84,7 +102,16 @@ VPLoadedRangeCoverage VPScanLoadedRangeBuffer(const CMTimeRange *ranges, size_t 
         VPLoadedRangeCoverage invalid = { 3, (uint32_t)count, kCMTimeInvalid };
         return invalid;
     }
-    return VPScan(ranges, count, VPReadBuffer, requested);
+    return VPScanRange(ranges, count, VPReadBuffer, requested);
+}
+
+VPLoadedRangeCoverage VPScanLoadedIntervalBuffer(const CMTimeRange *ranges, size_t count,
+                                               CMTime start, CMTime end) {
+    if (!ranges && count) {
+        VPLoadedRangeCoverage invalid = { 3, (uint32_t)count, kCMTimeInvalid };
+        return invalid;
+    }
+    return VPScan(ranges, count, VPReadBuffer, start, end);
 }
 
 typedef struct {

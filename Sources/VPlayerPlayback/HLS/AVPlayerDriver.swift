@@ -5,6 +5,7 @@
 import AVFoundation
 import Darwin
 import Foundation
+import ObjectiveC
 import VPlayerCore
 import os
 
@@ -109,26 +110,39 @@ struct AVPlayerDriverAdmission: Sendable {
 
 /// 实际交给SDK的callback持有本租约；执行、取消和driver退休均不提前归还。
 final class AVPlayerSDKCallbackLease: @unchecked Sendable {
-    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll }
+    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio }
     nonisolated(unsafe) private static var occupied: UInt8 = 0
     private let slot: UInt8
     let kind: Kind
     private let admission: AVPlayerDriverAdmission
     private let resourceContextReservation: PlaybackResourceContextReservation
     private let installationResourceContextReservation: PlaybackResourceContextReservation?
+    private let creditPool: AVPlayerSDKCallbackCreditPool?
+    private let creditBorrow: AVPlayerSDKCallbackCreditPool.Borrow?
+
+    fileprivate static func claimSlotLocked(admission: AVPlayerDriverAdmission) throws -> UInt8 {
+        guard let slot = (UInt8(0)..<8).first(where: { occupied & (1 << $0) == 0 }) else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        try SystemAVPlayerDriver.retainAdmissionLocked(admission)
+        occupied |= 1 << slot
+        return slot
+    }
+
+    fileprivate static func releaseSlotLocked(_ slot: UInt8, admission: AVPlayerDriverAdmission) {
+        precondition(occupied & (1 << slot) != 0)
+        occupied &= ~(1 << slot)
+        SystemAVPlayerDriver.releaseAdmissionLocked(admission)
+    }
 
     fileprivate static func reserve(_ kind: Kind, admission: AVPlayerDriverAdmission,
         installationResourceContextReservation: PlaybackResourceContextReservation?) throws
         -> AVPlayerSDKCallbackLease {
         let resourceReservation = try PlaybackResourceContextLedger.shared.reserve(
-            allocationIdentity: .stable(UUID()), bytes: 2 * 1_024)
+            allocationIdentity: .stable(UUID()), bytes: kind == .logFetch ? 4 * 1_024 : 2 * 1_024)
         do {
             let lease = try SystemAVPlayerDriver.creationLock.withLock {
-                guard let slot = (UInt8(0)..<8).first(where: { occupied & (1 << $0) == 0 }) else {
-                    throw AVPlayerItemCoordinatorFailure.capacityExceeded
-                }
-                try SystemAVPlayerDriver.retainAdmissionLocked(admission)
-                occupied |= 1 << slot
+                let slot = try claimSlotLocked(admission: admission)
                 return AVPlayerSDKCallbackLease(slot: slot, kind: kind, admission: admission,
                     resourceContextReservation: resourceReservation,
                     installationResourceContextReservation: installationResourceContextReservation)
@@ -141,26 +155,34 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
             throw error
         }
     }
-    private init(slot: UInt8, kind: Kind, admission: AVPlayerDriverAdmission,
+    fileprivate init(slot: UInt8, kind: Kind, admission: AVPlayerDriverAdmission,
                  resourceContextReservation: PlaybackResourceContextReservation,
-                 installationResourceContextReservation: PlaybackResourceContextReservation?) {
+                 installationResourceContextReservation: PlaybackResourceContextReservation?,
+                 creditPool: AVPlayerSDKCallbackCreditPool? = nil,
+                 creditBorrow: AVPlayerSDKCallbackCreditPool.Borrow? = nil) {
         self.slot = slot; self.kind = kind; self.admission = admission
         self.resourceContextReservation = resourceContextReservation
         self.installationResourceContextReservation = installationResourceContextReservation
+        self.creditPool = creditPool
+        self.creditBorrow = creditBorrow
     }
     func assertRegistered() {
         SystemAVPlayerDriver.creationLock.withLock {
             precondition(Self.occupied & (1 << slot) != 0, "SDK callback 的原物理租约不可提前释放")
             precondition(SystemAVPlayerDriver.isAdmissionActiveLocked(admission))
+            if let creditPool, let creditBorrow { creditPool.assertBorrowedLocked(creditBorrow, slot: slot) }
         }
     }
     deinit {
-        SystemAVPlayerDriver.creationLock.withLock {
-            precondition(Self.occupied & (1 << slot) != 0)
-            Self.occupied &= ~(1 << slot)
-            SystemAVPlayerDriver.releaseAdmissionLocked(admission)
+        if let creditPool, let creditBorrow {
+            creditPool.returnFromPhysicalDeinit(creditBorrow, slot: slot,
+                reservation: resourceContextReservation)
+        } else {
+            SystemAVPlayerDriver.creationLock.withLock {
+                Self.releaseSlotLocked(slot, admission: admission)
+            }
+            PlaybackResourceContextLedger.shared.release(resourceContextReservation)
         }
-        PlaybackResourceContextLedger.shared.release(resourceContextReservation)
     }
 #if DEBUG
     nonisolated(unsafe) private static var diagnostics = false
@@ -185,6 +207,361 @@ final class AVPlayerSDKCallbackLease: @unchecked Sendable {
 #endif
 }
 
+/// Prepaid callback capacity for one original driver/item. This object contains
+/// no task, timer, native callback or proof. One inline continuation can wait
+/// for a physical credit return. Its caller retains it through registered
+/// cleanup; closing it is not quiescence evidence.
+final class AVPlayerSDKCallbackCreditPool: @unchecked Sendable {
+    struct AllocationBreakdown: Sendable {
+        let poolBytes: Int
+        let contextReservationBytes: Int
+        let applicationReservationBytes: Int
+        let totalBytes: Int
+    }
+
+    fileprivate enum Role: UInt8, Sendable { case operation, rollback, observer }
+    fileprivate struct Borrow: Sendable {
+        let role: Role
+        let generation: UInt64
+    }
+    private struct Credit {
+        let slot: UInt8
+        var reservation: PlaybackResourceContextReservation?
+        var generation: UInt64 = 0
+        var borrowed = false
+        static var absent: Self { .init(slot: 8, reservation: nil) }
+    }
+
+    fileprivate let admission: AVPlayerDriverAdmission
+    fileprivate let itemIdentity: AVPlayerItemInstanceIdentity?
+    fileprivate let itemObjectIdentity: ObjectIdentifier?
+    private let resourceContextReservation: PlaybackResourceContextReservation
+    private var installationResourceContextReservation: PlaybackResourceContextReservation?
+    // All mutable fields are protected by the existing driver creation lock.
+    private var operation: Credit
+    private var rollback: Credit
+    private var observer: Credit
+    private var cancelled = false
+    private var closed = false
+    private var rollbackProtected = false
+    private var operationReturnWaiter: (UUID, CheckedContinuation<Void, any Error>)?
+    var hasOperationReturnWaiter: Bool {
+        SystemAVPlayerDriver.creationLock.withLock { operationReturnWaiter != nil }
+    }
+
+    /// A completed SDK operation may still retain its callback. Reuse the one
+    /// prepaid operation credit only after that exact physical alias releases.
+    func waitForOperationReturn() async throws {
+        let identity = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let immediate: Result<Void, any Error>? = SystemAVPlayerDriver.creationLock.withLock {
+                    guard !Task.isCancelled else { return .failure(CancellationError()) }
+                    guard !closed, !cancelled else {
+                        return .failure(AVPlayerItemCoordinatorFailure.staleIdentity)
+                    }
+                    if !operation.borrowed { return .success(()) }
+                    guard operationReturnWaiter == nil else {
+                        return .failure(AVPlayerItemCoordinatorFailure.operationInFlight)
+                    }
+                    operationReturnWaiter = (identity, continuation)
+                    return nil
+                }
+                if let immediate { continuation.resume(with: immediate) }
+            }
+        } onCancel: {
+            let waiter = SystemAVPlayerDriver.creationLock.withLock {
+                () -> CheckedContinuation<Void, any Error>? in
+                guard self.operationReturnWaiter?.0 == identity else { return nil }
+                defer { self.operationReturnWaiter = nil }
+                return self.operationReturnWaiter?.1
+            }
+            waiter?.resume(throwing: CancellationError())
+        }
+    }
+
+    static func allocationBreakdown() throws -> AllocationBreakdown {
+        let pool = malloc_good_size(class_getInstanceSize(Self.self))
+        let context = malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self))
+        let application = malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self))
+        return .init(poolBytes: pool, contextReservationBytes: context,
+            applicationReservationBytes: application,
+            totalBytes: try HLSChecked.add(try HLSChecked.add(pool, context), application))
+    }
+
+    fileprivate static func reserve(admission: AVPlayerDriverAdmission,
+        itemIdentity: AVPlayerItemInstanceIdentity?, itemObjectIdentity: ObjectIdentifier?,
+        includingObserver: Bool,
+        installationResourceContextReservation: PlaybackResourceContextReservation?) throws -> Self {
+        let layout = try allocationBreakdown()
+        let pool = try SystemAVPlayerDriver.creationLock.withLock {
+            guard SystemAVPlayerDriver.isAdmissionActiveLocked(admission) else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            let root = try PlaybackResourceContextLedger.shared.reserve(
+                allocationIdentity: .stable(UUID()), bytes: layout.totalBytes)
+            var operation = Credit.absent
+            var rollback = Credit.absent
+            var observer = Credit.absent
+            var transferred = false
+            defer {
+                if !transferred {
+                    releaseUnusedLocked(&observer, admission: admission)
+                    releaseUnusedLocked(&rollback, admission: admission)
+                    releaseUnusedLocked(&operation, admission: admission)
+                    PlaybackResourceContextLedger.shared.release(root)
+                }
+            }
+            operation = try reserveCreditLocked(admission: admission, layout: layout)
+            rollback = try reserveCreditLocked(admission: admission, layout: layout)
+            if includingObserver { observer = try reserveCreditLocked(admission: admission, layout: layout) }
+            let pool = Self(admission: admission, itemIdentity: itemIdentity,
+                itemObjectIdentity: itemObjectIdentity, root: root,
+                installationResourceContextReservation: installationResourceContextReservation,
+                operation: operation, rollback: rollback, observer: observer)
+            transferred = true
+            return pool
+        }
+        // No caller can borrow before all identities and measured roots validate.
+        try PlaybackResourceContextLedger.shared.rebind(pool.resourceContextReservation,
+            to: .object(ObjectIdentifier(pool)))
+        try pool.registerUnusedCreditIdentities()
+        guard let actual = pool.allocationUsage(), actual.pool <= layout.poolBytes,
+              actual.context <= layout.contextReservationBytes,
+              actual.application <= layout.applicationReservationBytes else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        return pool
+    }
+
+    private static func reserveCreditLocked(admission: AVPlayerDriverAdmission,
+        layout: AllocationBreakdown) throws -> Credit {
+        let reservation = try PlaybackResourceContextLedger.shared.reserve(
+            allocationIdentity: .stable(UUID()), bytes: 2 * 1_024)
+        do {
+            let leaseBytes = malloc_good_size(class_getInstanceSize(AVPlayerSDKCallbackLease.self))
+            let tokenBytes = try HLSChecked.add(layout.contextReservationBytes, layout.applicationReservationBytes)
+            guard try HLSChecked.add(leaseBytes, tokenBytes) <= 2 * 1_024,
+                  let actual = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation),
+                  actual.context <= layout.contextReservationBytes,
+                  actual.application <= layout.applicationReservationBytes else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            let slot = try AVPlayerSDKCallbackLease.claimSlotLocked(admission: admission)
+            return .init(slot: slot, reservation: reservation)
+        } catch {
+            PlaybackResourceContextLedger.shared.release(reservation)
+            throw error
+        }
+    }
+
+    private init(admission: AVPlayerDriverAdmission,
+        itemIdentity: AVPlayerItemInstanceIdentity?, itemObjectIdentity: ObjectIdentifier?,
+        root: PlaybackResourceContextReservation,
+        installationResourceContextReservation: PlaybackResourceContextReservation?,
+        operation: Credit, rollback: Credit, observer: Credit) {
+        self.admission = admission
+        self.itemIdentity = itemIdentity
+        self.itemObjectIdentity = itemObjectIdentity
+        resourceContextReservation = root
+        self.installationResourceContextReservation = installationResourceContextReservation
+        self.operation = operation; self.rollback = rollback; self.observer = observer
+    }
+
+    private func withCredit<Result>(_ role: Role,
+        _ body: (inout Credit) throws -> Result) rethrows -> Result {
+        switch role {
+        case .operation: return try body(&operation)
+        case .rollback: return try body(&rollback)
+        case .observer: return try body(&observer)
+        }
+    }
+
+    private func registerUnusedCreditIdentities() throws {
+        try SystemAVPlayerDriver.creationLock.withLock {
+            try registerUnusedCreditIdentityLocked(.operation)
+            try registerUnusedCreditIdentityLocked(.rollback)
+            try registerUnusedCreditIdentityLocked(.observer)
+        }
+    }
+
+    private func registerUnusedCreditIdentityLocked(_ role: Role) throws {
+        try withCredit(role) { credit in
+            if let reservation = credit.reservation {
+                try PlaybackResourceContextLedger.shared.rebind(reservation,
+                    to: .owned(ObjectIdentifier(self), role.rawValue))
+            }
+        }
+    }
+
+    fileprivate func borrowOperation(_ kind: AVPlayerSDKCallbackLease.Kind) throws -> AVPlayerSDKCallbackLease {
+        switch kind {
+        case .ready, .seek, .loaded, .preroll, .systemAudio: break
+        default: throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        return try borrow(.operation, kind: kind)
+    }
+    fileprivate func borrowObserver() throws -> AVPlayerSDKCallbackLease {
+        try borrow(.observer, kind: .timeControl)
+    }
+    /// This transfers storage only. Returning/dropping this lease never proves
+    /// that a native disconnect ran or that registered cleanup accepted ownership.
+    fileprivate func borrowRollback() throws -> AVPlayerSDKCallbackLease {
+        try borrow(.rollback, kind: .systemAudio)
+    }
+
+    private func borrow(_ role: Role, kind: AVPlayerSDKCallbackLease.Kind) throws
+        -> AVPlayerSDKCallbackLease {
+        let claimed = try SystemAVPlayerDriver.creationLock.withLock {
+            guard SystemAVPlayerDriver.isAdmissionActiveLocked(admission),
+                  role == .rollback || (!cancelled && !closed) else {
+                throw AVPlayerItemCoordinatorFailure.capacityExceeded
+            }
+            let claim = try withCredit(role) { credit in
+                guard !credit.borrowed else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+                guard let reservation = credit.reservation else {
+                    throw AVPlayerItemCoordinatorFailure.capacityExceeded
+                }
+                let next = credit.generation.addingReportingOverflow(1)
+                guard !next.overflow else { throw AVPlayerItemCoordinatorFailure.capacityExceeded }
+                credit.generation = next.partialValue
+                credit.borrowed = true
+                credit.reservation = nil
+                return (credit.slot, reservation, Borrow(role: role, generation: next.partialValue))
+            }
+            rollbackProtected = true
+            if role == .rollback { cancelled = true }
+            return (claim, installationResourceContextReservation)
+        }
+        let (claim, installation) = claimed
+        let lease = AVPlayerSDKCallbackLease(slot: claim.0, kind: kind, admission: admission,
+            resourceContextReservation: claim.1,
+            installationResourceContextReservation: installation,
+            creditPool: self, creditBorrow: claim.2)
+        guard Self.actualBytes(of: lease)
+            <= malloc_good_size(class_getInstanceSize(AVPlayerSDKCallbackLease.self)) else {
+            throw AVPlayerItemCoordinatorFailure.capacityExceeded
+        }
+        try PlaybackResourceContextLedger.shared.rebind(claim.1,
+            to: .object(ObjectIdentifier(lease)))
+        return lease
+    }
+
+    private func takeOperationReturnWaiterLocked() -> CheckedContinuation<Void, any Error>? {
+        defer { operationReturnWaiter = nil }
+        return operationReturnWaiter?.1
+    }
+
+    func cancel() {
+        let waiter = SystemAVPlayerDriver.creationLock.withLock {
+            cancelled = true
+            return takeOperationReturnWaiterLocked()
+        }
+        waiter?.resume(throwing: CancellationError())
+    }
+
+    /// Never-started admission can release everything. Once any borrower was
+    /// admitted, only an original-driver native readback can release rollback.
+    func close() {
+        let waiter = SystemAVPlayerDriver.creationLock.withLock {
+            closed = true; cancelled = true
+            Self.releaseUnusedLocked(&operation, admission: admission)
+            Self.releaseUnusedLocked(&observer, admission: admission)
+            if !rollbackProtected {
+                Self.releaseUnusedLocked(&rollback, admission: admission)
+                installationResourceContextReservation = nil
+            }
+            return takeOperationReturnWaiterLocked()
+        }
+        waiter?.resume(throwing: CancellationError())
+    }
+
+    fileprivate func resolveUnusedRollbackAfterDriverReadback() -> Bool {
+        SystemAVPlayerDriver.creationLock.withLock {
+            guard closed, rollbackProtected, !operation.borrowed, !rollback.borrowed,
+                  rollback.reservation != nil,
+                  SystemAVPlayerDriver.isAdmissionActiveLocked(admission) else { return false }
+            rollbackProtected = false
+            Self.releaseUnusedLocked(&rollback, admission: admission)
+            installationResourceContextReservation = nil
+            return true
+        }
+    }
+
+    fileprivate func assertBorrowedLocked(_ borrow: Borrow, slot: UInt8) {
+        withCredit(borrow.role) { credit in
+            precondition(credit.slot == slot && credit.borrowed
+                && credit.generation == borrow.generation && credit.reservation == nil,
+                "Only the exact outstanding physical callback owns this prepaid credit")
+        }
+    }
+
+    fileprivate func returnFromPhysicalDeinit(_ borrow: Borrow, slot: UInt8,
+        reservation: PlaybackResourceContextReservation) {
+        let waiter = SystemAVPlayerDriver.creationLock.withLock {
+            () -> CheckedContinuation<Void, any Error>? in
+            assertBorrowedLocked(borrow, slot: slot)
+            let keepReserved = !closed || (borrow.role == .rollback && rollbackProtected)
+            withCredit(borrow.role) { credit in
+                credit.borrowed = false
+                if keepReserved {
+                    do {
+                        try PlaybackResourceContextLedger.shared.rebind(reservation,
+                            to: .owned(ObjectIdentifier(self), borrow.role.rawValue))
+                    } catch { preconditionFailure("The original exclusive callback reservation must rebind: \(error)") }
+                    credit.reservation = reservation
+                } else {
+                    AVPlayerSDKCallbackLease.releaseSlotLocked(slot, admission: admission)
+                    PlaybackResourceContextLedger.shared.release(reservation)
+                }
+            }
+            guard borrow.role == .operation else { return nil }
+            defer { operationReturnWaiter = nil }
+            return operationReturnWaiter?.1
+        }
+        waiter?.resume()
+    }
+
+    private static func releaseUnusedLocked(_ credit: inout Credit, admission: AVPlayerDriverAdmission) {
+        guard !credit.borrowed, let reservation = credit.reservation else { return }
+        credit.reservation = nil
+        AVPlayerSDKCallbackLease.releaseSlotLocked(credit.slot, admission: admission)
+        PlaybackResourceContextLedger.shared.release(reservation)
+    }
+
+    deinit {
+        // Every outstanding borrower retains this pool. The registered caller is
+        // responsible for retaining its own pool reference until cleanup resolves.
+        SystemAVPlayerDriver.creationLock.withLock {
+            precondition(!operation.borrowed && !rollback.borrowed && !observer.borrowed)
+            Self.releaseUnusedLocked(&operation, admission: admission)
+            Self.releaseUnusedLocked(&rollback, admission: admission)
+            Self.releaseUnusedLocked(&observer, admission: admission)
+        }
+        PlaybackResourceContextLedger.shared.release(resourceContextReservation)
+    }
+
+    private static func actualBytes(of object: AnyObject) -> Int {
+        malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(object).toOpaque()))
+    }
+    /// Sizes of this exact live registration, including its real application
+    /// token. Estimated allocator classes are never reported as measured bytes.
+    func allocationUsage() -> (pool: Int, context: Int, application: Int)? {
+        guard let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(
+            for: resourceContextReservation) else { return nil }
+        return (Self.actualBytes(of: self), tokens.context, tokens.application)
+    }
+#if DEBUG
+    func inspectAllocations(_ body: (String, UnsafeRawPointer, Int, Int) -> Void) {
+        guard let layout = try? Self.allocationBreakdown() else { return }
+        let pointer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        body("owned/callback credit pool", pointer, malloc_size(pointer), layout.poolBytes)
+        let token = UnsafeRawPointer(Unmanaged.passUnretained(resourceContextReservation).toOpaque())
+        body("owned/callback pool context reservation", token, malloc_size(token), layout.contextReservationBytes)
+    }
+#endif
+}
+
 @MainActor
 final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineReceiving {
 #if DEBUG
@@ -194,12 +571,15 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             body(role, pointer, malloc_size(pointer))
         }
         object("HLS/原 SystemAVPlayerDriver 壳", self)
+        logSnapshotCache.inspectPreparationAllocations(body)
+        object("owned/async AVPlayer log reader", logReader)
         inspectNativePreparationWeakSideTable("driver", self, body)
         Self.creationLock.inspect("owned/单 driver 准入锁", body)
         eventHub.inspectPreparationAllocations(body)
         prepareWait.inspectPreparationAllocations(body)
         if let timeControlObservation { object("owned/公开 timeControl KVO wrapper", timeControlObservation) }
         if let accessLogObserver { object("owned/公开 accessLog notification wrapper", accessLogObserver) }
+        if let errorLogObserver { object("owned/公开 errorLog notification wrapper", errorLogObserver) }
         if let endpointObserver { object("owned/公开 endpoint notification wrapper", endpointObserver) }
     }
 #endif
@@ -225,10 +605,14 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     static func make(
         player: AVPlayer? = nil,
         deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)? = nil,
+        logReader: (any AVPlayerLogReading)? = nil,
         preferredForwardBufferDuration: TimeInterval = 3
     ) throws -> SystemAVPlayerDriver {
+        // Existing core 8 KiB plus a fixed 4 KiB envelope for scalar cache/lock,
+        // notification wake and connection-state bookkeeping. The physical log
+        // reader separately retains a 4 KiB callback lease until SDK completion.
         let resourceReservation = try PlaybackResourceContextLedger.shared.reserve(
-            allocationIdentity: .stable(UUID()), bytes: 8 * 1_024)
+            allocationIdentity: .stable(UUID()), bytes: 12 * 1_024)
         var resourceTransferred = false
         defer {
             if !resourceTransferred {
@@ -252,7 +636,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         let driver = try SystemAVPlayerDriver(player: player ?? AVPlayer(),
             deadlineScheduler: deadlineScheduler, admission: admission,
             preferredForwardBufferDuration: preferredForwardBufferDuration,
-            resourceContextReservation: resourceReservation)
+            resourceContextReservation: resourceReservation,
+            logReader: logReader ?? SystemAVPlayerLogReader())
         transferred = true
         try PlaybackResourceContextLedger.shared.rebind(
             resourceReservation, to: .object(ObjectIdentifier(driver)))
@@ -270,7 +655,13 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private let resourceContextReservation: PlaybackResourceContextReservation
     private var installationResourceContextReservation: PlaybackResourceContextReservation?
     private var timeControlObservation: NSKeyValueObservation?
+    nonisolated let logSnapshotCache: AVPlayerLogSnapshotCache
     private var accessLogObserver: NSObjectProtocol?
+    private var errorLogObserver: NSObjectProtocol?
+    private var logRefreshTask: Task<Void, Never>?
+    private let logReader: any AVPlayerLogReading
+    private var systemAudioTransitionInFlight = false
+    private var pausedResumeCallbackPool: AVPlayerSDKCallbackCreditPool?
     private var endpointObserver: NSObjectProtocol?
     private var endpointStabilityDeadline: UUID?
     private var endpointObservationIdentity: UUID?
@@ -286,20 +677,99 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private init(player: AVPlayer, deadlineScheduler: (any AVPlayerWaitDeadlineScheduling)?,
                  admission: AVPlayerDriverAdmission,
                  preferredForwardBufferDuration: TimeInterval,
-                 resourceContextReservation: PlaybackResourceContextReservation) throws {
+                 resourceContextReservation: PlaybackResourceContextReservation,
+                 logReader: any AVPlayerLogReading) throws {
         self.player = player
         self.deadlineScheduler = deadlineScheduler
         self.preferredForwardBufferDuration = preferredForwardBufferDuration
         self.resourceContextReservation = resourceContextReservation
-        eventHub = try AVPlayerDriverEventHub.make(
+        self.logReader = logReader
+        let hub = try AVPlayerDriverEventHub.make(
             admission: admission, resourceContextReservation: resourceContextReservation)
+        eventHub = hub
+        logSnapshotCache = AVPlayerLogSnapshotCache(lifetimeOwner: hub)
     }
 
     deinit { Self.creationLock.withLock { Self.releaseAdmissionLocked(eventHub.admission) } }
 
     func reserveSDKCallbackLease(_ kind: AVPlayerSDKCallbackLease.Kind) throws -> AVPlayerSDKCallbackLease {
-        try .reserve(kind, admission: eventHub.admission,
+        if let pool = pausedResumeCallbackPool {
+            switch kind {
+            case .seek, .loaded, .preroll: return try borrowSDKOperationCredit(kind, from: pool)
+            case .timeControl: return try borrowSDKObserverCredit(from: pool)
+            default: break
+            }
+        }
+        return try .reserve(kind, admission: eventHub.admission,
             installationResourceContextReservation: installationResourceContextReservation)
+    }
+
+    func reservePausedResumeCallbacks(item identity: AVPlayerItemInstanceIdentity) throws {
+        guard pausedResumeCallbackPool == nil, pausedItemObjectIdentity(item: identity) != nil,
+              disconnectedFromSystemAudio else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        pausedResumeCallbackPool = try reserveSDKCallbackCredits(includingObserver: true)
+    }
+
+    func finishPausedResumeCallbacks(item identity: AVPlayerItemInstanceIdentity) {
+        guard let pool = pausedResumeCallbackPool, pool.itemIdentity == identity else { return }
+        pool.close()
+        // After play, the driver keeps prepaid rollback until the original
+        // physical disconnect. Callback aliases retain their exact pool too.
+        if ownsCurrentCallbackCreditPool(pool), !systemAudioTransitionInFlight,
+           player.disconnectedFromSystemAudio, player.rate == 0, player.timeControlStatus == .paused {
+            _ = releaseUnusedSDKRollbackCreditIfDisconnected(pool)
+            pausedResumeCallbackPool = nil
+        }
+    }
+
+    private func awaitPausedResumeOperationCredit(item identity: AVPlayerItemInstanceIdentity) async throws {
+        guard let pool = pausedResumeCallbackPool else { return }
+        try Task.checkCancellation()
+        try await pool.waitForOperationReturn()
+        try Task.checkCancellation()
+        guard pool === pausedResumeCallbackPool, pool.itemIdentity == identity,
+              ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+    }
+
+    /// Capacity only: no native method is invoked and no activation is authorized.
+    func reserveSDKCallbackCredits(includingObserver: Bool = false) throws -> AVPlayerSDKCallbackCreditPool {
+        guard player.currentItem === item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try .reserve(admission: eventHub.admission,
+            itemIdentity: currentItemIdentity, itemObjectIdentity: item.map(ObjectIdentifier.init),
+            includingObserver: includingObserver,
+            installationResourceContextReservation: installationResourceContextReservation)
+    }
+
+    private func ownsCurrentCallbackCreditPool(_ pool: AVPlayerSDKCallbackCreditPool) -> Bool {
+        pool.admission.generation == eventHub.admission.generation
+            && pool.itemIdentity == currentItemIdentity
+            && pool.itemObjectIdentity == item.map(ObjectIdentifier.init)
+            && pool.itemObjectIdentity == player.currentItem.map(ObjectIdentifier.init)
+    }
+
+    func borrowSDKOperationCredit(_ kind: AVPlayerSDKCallbackLease.Kind,
+        from pool: AVPlayerSDKCallbackCreditPool) throws -> AVPlayerSDKCallbackLease {
+        guard ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try pool.borrowOperation(kind)
+    }
+
+    func borrowSDKObserverCredit(from pool: AVPlayerSDKCallbackCreditPool) throws -> AVPlayerSDKCallbackLease {
+        guard ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try pool.borrowObserver()
+    }
+
+    func borrowSDKRollbackCredit(from pool: AVPlayerSDKCallbackCreditPool) throws -> AVPlayerSDKCallbackLease {
+        guard ownsCurrentCallbackCreditPool(pool) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return try pool.borrowRollback()
+    }
+
+    /// Only the original driver can retire unused rollback capacity. This is a
+    /// direct state check, not a stop receipt or authorization to resume playback.
+    func releaseUnusedSDKRollbackCreditIfDisconnected(_ pool: AVPlayerSDKCallbackCreditPool) -> Bool {
+        guard ownsCurrentCallbackCreditPool(pool),
+              !systemAudioTransitionInFlight, player.disconnectedFromSystemAudio,
+              player.rate == 0, player.timeControlStatus == .paused else { return false }
+        return pool.resolveUnusedRollbackAfterDriverReadback()
     }
 
     func retainInstallationResourceContext(_ reservation: PlaybackResourceContextReservation) {
@@ -307,32 +777,98 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         eventHub.retainInstallationResourceContext(reservation)
     }
 
+    var disconnectedFromSystemAudio: Bool {
+        !systemAudioTransitionInFlight && player.disconnectedFromSystemAudio
+    }
+
+    /// Cancellation cannot complete this physical transition early. The signed
+    /// prepare/activation/stop runner keeps ownership until AVFoundation calls back.
+    func setDisconnectedFromSystemAudio(_ disconnected: Bool,
+        item identity: AVPlayerItemInstanceIdentity) async throws(AVPlayerItemCoordinatorFailure) {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else {
+            throw .staleIdentity
+        }
+        guard !systemAudioTransitionInFlight else { throw .operationInFlight }
+        // A settled matching state needs no new SDK transition or callback
+        // lease. Do not use the public disconnected projection for this check:
+        // it is also false while a physical transition is still in flight.
+        // Callers retain cancellation/authority checks around this operation;
+        // cleanup must still be able to settle audio after cancellation.
+        guard player.disconnectedFromSystemAudio != disconnected else {
+            if disconnected { finishPausedResumeCallbacks(item: identity) }
+            return
+        }
+        let lease: AVPlayerSDKCallbackLease
+        do {
+            if let pool = pausedResumeCallbackPool {
+                lease = try disconnected ? borrowSDKRollbackCredit(from: pool)
+                    : borrowSDKOperationCredit(.systemAudio, from: pool)
+            } else { lease = try reserveSDKCallbackLease(.systemAudio) }
+        }
+        catch {
+#if DEBUG
+            print("NATIVE_ADMISSION system-audio-reserve-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount)")
+#endif
+            throw .capacityExceeded
+        }
+        lease.inspectRegistration()
+        systemAudioTransitionInFlight = true
+        defer { systemAudioTransitionInFlight = false }
+        await withCheckedContinuation { continuation in
+            player.setDisconnectedFromSystemAudio(disconnected) {
+                lease.assertRegistered()
+                continuation.resume()
+            }
+        }
+        guard currentItemIdentity == identity, self.item === item,
+              player.currentItem === item else { throw .staleIdentity }
+        guard player.disconnectedFromSystemAudio == disconnected else {
+            throw .systemAudioConnectionNotConfirmed
+        }
+        if disconnected {
+            systemAudioTransitionInFlight = false
+            finishPausedResumeCallbacks(item: identity)
+        }
+    }
+
     var rate: Float { player.rate }
     var timeControlStatus: AVPlayer.TimeControlStatus { player.timeControlStatus }
     var activeWaiterCount: Int {
-        prepareWait.isActive ? 1 : 0
+        (prepareWait.isActive ? 1 : 0)
+            + (pausedResumeCallbackPool?.hasOperationReturnWaiter == true ? 1 : 0)
     }
     var fixedTimerCount: Int { 0 }
 
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
+        guard !systemAudioTransitionInFlight else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
         cancelAllWaiters()
         installationResourceContextReservation = nil
         eventHub.releaseInstallationResourceContext()
         player.pause()
         player.automaticallyWaitsToMinimizeStalling = true
         let installed = AVPlayerItem(url: url)
-        installed.preferredForwardBufferDuration = preferredForwardBufferDuration
+        installed.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(
+            configured: preferredForwardBufferDuration)
         installed.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         player.replaceCurrentItem(with: installed)
         item = installed
         currentItemIdentity = identity
         eventHub.activate(identity)
+        logSnapshotCache.activate(item: identity, objectIdentity: ObjectIdentifier(installed))
     }
 
     func preparationFenceReached(_ fence: AVPlayerPreparationFence,
                                  item identity: AVPlayerItemInstanceIdentity) {
         precondition(currentItemIdentity == identity,
                      "prepare fence 必须属于当前 System AVPlayer item")
+        if fence == .seek {
+            // Coordinator reaches this only after authenticating the selection.
+            // Keep the configured latency/coverage policy; the larger value merely
+            // bootstraps paused network fetching and never counts as HTTP evidence.
+            item?.preferredForwardBufferDuration = preferredForwardBufferDuration
+        }
     }
 
     func waitUntilReady(item identity: AVPlayerItemInstanceIdentity) async throws
@@ -392,6 +928,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.seek)
         let gate = prepareWait
         let token = try gate.begin(.seek)
@@ -417,7 +954,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func waitForLoadedTimeRanges(item identity: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
-                                 covering requested: FMP4PresentationRange) async throws
+                                 covering requested: ExactMediaInterval) async throws
         -> AVPlayerLoadedRangeReceipt {
         guard currentItemIdentity == identity, let item else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
@@ -426,6 +963,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         if try Self.hasLoadedCoverage(item, requested: requested) {
             return .init(item: identity, playhead: playhead, requested: requested)
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.loaded)
         let gate = prepareWait
         let token = try gate.begin(.loaded)
@@ -498,6 +1036,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.preroll)
         let gate = prepareWait
         let token = try gate.begin(.preroll)
@@ -525,12 +1064,16 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func play(invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
               item identity: AVPlayerItemInstanceIdentity) async throws {
-        guard currentItemIdentity == identity,
+        guard currentItemIdentity == identity, !systemAudioTransitionInFlight,
+              !player.disconnectedFromSystemAudio,
               let snapshot = invocation.currentSnapshot,
               snapshot.interval.outputLifecycle == identity.outputLifecycleEpoch,
               snapshot.interval.itemGeneration == identity.itemGeneration else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        // Classification and this native admission run on MainActor. Inspect the
+        // current pending scalar without holding the hub lock across AVPlayer.
+        if let failure = eventHub.pendingAccessFailure(item: identity) { throw failure }
         guard invocation.performPositiveRateSideEffect({ player.play() }) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
@@ -566,22 +1109,94 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         handler: @escaping @MainActor @Sendable (AccessLogURIClassification, AVPlayerItemInstanceIdentity) -> Void
     ) throws {
         guard currentItemIdentity == identity, let item,
-              accessLogObserver == nil else {
+              accessLogObserver == nil, errorLogObserver == nil else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
-        let callbackLease = try reserveSDKCallbackLease(.accessLog)
-        let hub = eventHub
-        hub.installAccessLog(classify: classify, handler: handler)
-        let callback: @Sendable (Notification) -> Void = { [weak item, weak hub] _ in
-            callbackLease.assertRegistered()
-            guard let value = item?.accessLog()?.events.last?.uri,
-                  let url = URL(string: value) else { return }
-            hub?.receive(url, item: identity)
-        }
-        callbackLease.inspectRegistration()
+        // Reserve both observers before installation so a capacity failure cannot
+        // leave an untracked observer or an unbudgeted callback behind.
+        let accessLease = try reserveSDKCallbackLease(.accessLog)
+        let errorLease = try reserveSDKCallbackLease(.errorLog)
+        accessLease.inspectRegistration()
+        errorLease.inspectRegistration()
+        let cache = logSnapshotCache
+        let objectIdentity = ObjectIdentifier(item)
+        eventHub.installAccessLog(classify: classify, handler: handler)
         accessLogObserver = NotificationCenter.default.addObserver(
-            forName: AVPlayerItem.newAccessLogEntryNotification,
-            object: item, queue: nil, using: callback)
+            forName: AVPlayerItem.newAccessLogEntryNotification, object: item, queue: nil
+        ) { _ in
+            accessLease.assertRegistered()
+            cache.requestRefresh(item: identity, objectIdentity: objectIdentity)
+        }
+        errorLogObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.newErrorLogEntryNotification, object: item, queue: nil
+        ) { _ in
+            errorLease.assertRegistered()
+            cache.requestRefresh(item: identity, objectIdentity: objectIdentity)
+        }
+        // activate() already marked an initial read pending. Installing the wake
+        // now starts it even when no log notification was emitted after observation.
+        cache.installWake { [weak self] in self?.startLogRefresh() }
+    }
+
+    private func startLogRefresh() {
+        guard logRefreshTask == nil else { return }
+        let lease: AVPlayerSDKCallbackLease
+        do { lease = try reserveSDKCallbackLease(.logFetch) }
+        catch { logSnapshotCache.deferRefresh(); return }
+        lease.inspectRegistration()
+        logRefreshTask = Task { [self, lease] in
+            defer { logRefreshTask = nil }
+            while let ticket = logSnapshotCache.beginRefresh() {
+                lease.assertRegistered()
+                guard let item, currentItemIdentity == ticket.scope.item,
+                      ObjectIdentifier(item) == ticket.scope.objectIdentity,
+                      player.currentItem === item else {
+                    logSnapshotCache.complete(ticket, snapshot: .empty)
+                    continue
+                }
+                let accessCount = await readAccessLog(item, ticket: ticket)
+                guard logSnapshotCache.isCurrent(ticket), self.item === item,
+                      player.currentItem === item else {
+                    logSnapshotCache.complete(ticket, snapshot: .empty)
+                    continue
+                }
+                let errorCount = await logReader.readErrorLogCount(item: item)
+                guard self.item === item, player.currentItem === item else {
+                    logSnapshotCache.complete(ticket, snapshot: .empty)
+                    continue
+                }
+                logSnapshotCache.complete(ticket, snapshot: .init(
+                    accessEventCount: accessCount, errorEventCount: errorCount))
+            }
+        }
+    }
+
+    /// Reduce the complete fetched batch into one scalar. The visitor runs after
+    /// the SDK await and validates the original ticket before any classification.
+    /// A benign tail cannot erase a fault. Queue a known fault immediately so it
+    /// fences native admission before delivery and never waits for another SDK read.
+    private func readAccessLog(_ item: AVPlayerItem,
+                               ticket: AVPlayerLogSnapshotCache.Ticket) async -> Int {
+        var reduced: AccessLogURIClassification?
+        var faultEnqueued = false
+        let count = await logReader.readAccessLog(item: item) { [self] rawURI in
+            guard logSnapshotCache.isCurrent(ticket), self.item === item,
+                  player.currentItem === item, let url = URL(string: rawURI),
+                  let classification = eventHub.classify(url, item: ticket.scope.item) else { return }
+            reduced = reduced?.coalescing(classification) ?? classification
+            if classification.isTerminalFault {
+                // The reader visits its complete batch synchronously on MainActor.
+                // One coalesced wake therefore sees the full fault priority.
+                eventHub.receive(classification, item: ticket.scope.item)
+                faultEnqueued = true
+            }
+        }
+        guard logSnapshotCache.isCurrent(ticket), self.item === item,
+              player.currentItem === item else { return 0 }
+        // The queued handler may have consumed the fault while this async call
+        // returned. Never emit that same batch again after its first delivery.
+        if !faultEnqueued, let reduced { eventHub.receive(reduced, item: ticket.scope.item) }
+        return count
     }
 
     func cancelPendingPrerolls(item identity: AVPlayerItemInstanceIdentity) {
@@ -592,6 +1207,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func pause(item identity: AVPlayerItemInstanceIdentity) {
         guard currentItemIdentity == identity else { return }
+        // A retained prepared item can resume under a new activation. Retire the
+        // old activation-specific KVO while its late callbacks keep their own
+        // leases and are rejected by the hub's cleared activation identity.
+        eventHub.cancelTimeControl()
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
         cancelNaturalEndDeadline()
         naturalEndAuthority = nil
         player.pause()
@@ -612,8 +1233,28 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity, let item, player.currentItem === item else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        guard !systemAudioTransitionInFlight else {
+            throw AVPlayerItemCoordinatorFailure.operationInFlight
+        }
         return AVPlayerDirectState(item: identity, rate: player.rate,
                             timeControlStatus: player.timeControlStatus)
+    }
+
+    /// This must be read immediately after the owned pause and before the
+    /// asynchronous audio disconnect. Invalid metadata cannot fail teardown.
+    func pausedTime(item identity: AVPlayerItemInstanceIdentity) -> ExactMediaTime? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              !systemAudioTransitionInFlight,
+              player.rate == 0, player.timeControlStatus == .paused else { return nil }
+        // ExactMediaTime rejects nonnumeric times, nonpositive timescales and
+        // nonzero epochs instead of dropping epoch or converting via seconds.
+        return try? ExactMediaTime(player.currentTime())
+    }
+
+    func pausedItemObjectIdentity(item identity: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              !systemAudioTransitionInFlight else { return nil }
+        return ObjectIdentifier(item)
     }
 
     func constrainPlaybackEnd(to time: ExactMediaTime,
@@ -652,14 +1293,24 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 firstCurrentTime: first,
                 stableCurrentTime: nil)
             guard self.naturalEndAuthority?.revalidateCurrentAuthority() == true else {
+                #if DEBUG
+                PlaybackDiagnosticTracker.shared.append(
+                    "eos_first_read_authority_rejected_present_\(self.naturalEndAuthority != nil)")
+                #endif
                 self.publishNaturalEnd(.failure(.deadlineCapacityExceeded), item: observedIdentity)
                 return
             }
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("eos_first_read_authority_accepted")
+            #endif
             guard self.endpointStabilityDeadline == nil else { return }
             if let scheduler = self.deadlineScheduler {
                 guard let deadline = scheduler.schedule(after: 0.1, handler: { [weak self] in
                     self?.naturalEndDeadlineFired(identity: observationIdentity)
                 }) else {
+                    #if DEBUG
+                    PlaybackDiagnosticTracker.shared.append("eos_manual_deadline_slot_rejected")
+                    #endif
                     self.publishNaturalEnd(.failure(.deadlineCapacityExceeded), item: observedIdentity)
                     return
                 }
@@ -667,6 +1318,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             } else {
                 guard self.naturalEndAuthority?.scheduleNaturalEnd(item: observedIdentity,
                     identity: observationIdentity, receiver: self) == true else {
+                    #if DEBUG
+                    PlaybackDiagnosticTracker.shared.append("eos_registry_deadline_rejected")
+                    #endif
                     self.publishNaturalEnd(.failure(.deadlineCapacityExceeded), item: observedIdentity)
                     return
                 }
@@ -698,6 +1352,25 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     nonisolated func naturalEndDeadlineFired(identity: UUID) {
         DispatchQueue.main.async { [weak self] in self?.completeNaturalEndRead(identity: identity) }
+    }
+
+    func hasPendingNaturalEndVerification(item identity: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              player.rate == 0, player.timeControlStatus == .paused,
+              endpointObservationIdentity != nil, endpointStabilityDeadline != nil,
+              !naturalEndTerminalIssued, naturalEndTerminalResult == nil,
+              let observation = naturalEndObservation, observation.item == identity,
+              observation.stableCurrentTime == nil,
+              observation.constrainedEndpoint == observation.expectedEndpoint,
+              let constraint = try? ExactMediaTime(item.forwardPlaybackEndTime),
+              constraint == observation.expectedEndpoint,
+              naturalEndAuthority?.activation == activation,
+              naturalEndAuthority?.revalidateCurrentAuthority() == true else { return false }
+        // Only the private matching notification installs the first observation
+        // and its original deadline. Completion, cancellation and owned pause
+        // clear that deadline; this query creates no grace period or EOS proof.
+        return true
     }
 
     private func completeNaturalEndRead(identity: UUID) {
@@ -759,7 +1432,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     func replaceCurrentItemWithNil(item identity: AVPlayerItemInstanceIdentity) {
-        guard currentItemIdentity == identity else { return }
+        guard currentItemIdentity == identity, !systemAudioTransitionInFlight else { return }
         cancelAllWaiters()
         player.replaceCurrentItem(with: nil)
         item = nil
@@ -774,11 +1447,14 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     private func cancelAllWaiters() {
+        logSnapshotCache.invalidate()
         prepareWait.cancelCurrent()
         timeControlObservation?.invalidate()
         timeControlObservation = nil
         if let accessLogObserver { NotificationCenter.default.removeObserver(accessLogObserver) }
         accessLogObserver = nil
+        if let errorLogObserver { NotificationCenter.default.removeObserver(errorLogObserver) }
+        errorLogObserver = nil
         eventHub.cancel()
         removeEndpointObserver()
         naturalEndTerminalHandler = nil
@@ -798,9 +1474,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     nonisolated private static func hasLoadedCoverage(_ item: AVPlayerItem,
-        requested: FMP4PresentationRange) throws(AVPlayerItemCoordinatorFailure) -> Bool {
-        let result = VPReadLoadedRangeCoverage(item,
-            CMTimeRange(start: requested.start.cmTime, duration: requested.duration.cmTime))
+        requested: ExactMediaInterval) throws(AVPlayerItemCoordinatorFailure) -> Bool {
+        let result = VPReadLoadedIntervalCoverage(item, requested.start.cmTime, requested.end.cmTime)
         switch result.code {
         case 0: return true
         case 1: return false
@@ -873,7 +1548,14 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
     }
 
     func installTimeControl(activation: ActivationEpoch, handler: @escaping StatusHandler) {
-        lock.withLock { self.activation = activation; statusHandler = handler }
+        lock.withLock {
+            self.activation = activation
+            statusHandler = handler
+            pendingStatus = nil
+        }
+    }
+    func cancelTimeControl() {
+        lock.withLock { activation = nil; statusHandler = nil; pendingStatus = nil }
     }
     func installAccessLog(classify: @escaping @Sendable (URL) -> AccessLogURIClassification,
                           handler: @escaping AccessHandler) {
@@ -895,18 +1577,35 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
         if schedule { deliver() }
     }
 
-    func receive(_ url: URL, item: AVPlayerItemInstanceIdentity) {
+    func classify(_ url: URL, item: AVPlayerItemInstanceIdentity) -> AccessLogURIClassification? {
         let classifier = lock.withLock { self.item == item ? self.classifier : nil }
-        guard let classifier else { return }
         // 不持 hub 锁进入 server/source，避免 queueSync 或 evidence 回调形成锁环。
-        let classification = classifier(url)
+        return classifier?(url)
+    }
+
+    func receive(_ url: URL, item: AVPlayerItemInstanceIdentity) {
+        guard let classification = classify(url, item: item) else { return }
+        receive(classification, item: item)
+    }
+
+    func receive(_ classification: AccessLogURIClassification, item: AVPlayerItemInstanceIdentity) {
         let schedule = lock.withLock {
             guard self.item == item, accessHandler != nil else { return false }
-            // conflict 不能被随后 matching/unrelated 覆盖而丢失撤销语义。
-            if pendingAccess != .conflicting { pendingAccess = classification }
+            pendingAccess = pendingAccess?.coalescing(classification) ?? classification
             return reserveDeliveryLocked()
         }
         if schedule { deliver() }
+    }
+
+    func pendingAccessFailure(item: AVPlayerItemInstanceIdentity) -> AVPlayerItemCoordinatorFailure? {
+        lock.withLock {
+            guard self.item == item else { return nil }
+            switch pendingAccess {
+            case .invalidLocalResource: return .itemFailed
+            case .conflicting: return .selectionChanged
+            case .matching, .unrelated, nil: return nil
+            }
+        }
     }
 
     func receiveEndpoint(item: AVPlayerItemInstanceIdentity, token: UUID) {
@@ -940,10 +1639,23 @@ final class AVPlayerDriverEventHub: @unchecked Sendable {
                     pendingEnd ? endpoint : nil, pendingEnd ? endHandler : nil)
             }
             guard let delivery else { return }
-            // 先交付 conflict，使其撤销对后续 playing/EOS 发布可见。
+            #if DEBUG
+            if delivery.6 != nil || delivery.1 == .paused {
+                PlaybackDiagnosticTracker.shared.append(
+                    "avrelay_batch_output_\(delivery.0.outputLifecycleEpoch.outputNonce)"
+                    + "_item_\(delivery.0.itemGeneration)"
+                    + "_activation_\(delivery.2?.activationNonce ?? 0)"
+                    + "_status_\(delivery.1?.rawValue ?? -1)"
+                    + "_access_\(delivery.4.map { String(describing: $0) } ?? "nil")"
+                    + "_endpoint_\(delivery.6 != nil)")
+            }
+            #endif
+            // Access faults revoke authority first. A matching endpoint then
+            // admits its bounded direct-read verification before a coalesced
+            // paused status asks whether that exact verification is pending.
             if let classification = delivery.4 { delivery.5?(classification, delivery.0) }
-            if let status = delivery.1, let activation = delivery.2 { delivery.3?(status, delivery.0, activation) }
             if let endpoint = delivery.6 { delivery.7?(delivery.0, endpoint) }
+            if let status = delivery.1, let activation = delivery.2 { delivery.3?(status, delivery.0, activation) }
             withExtendedLifetime(resourceTail) {}
         }
     }
@@ -1022,6 +1734,7 @@ final class AVPlayerPrepareWaitSlot: @unchecked Sendable {
     private var terminal: Result<Bool, AVPlayerFixedPreparationFailure>?
 
     var isActive: Bool { lock.withLock { current != nil } }
+    var activePhase: Phase? { lock.withLock { current?.phase } }
 
     func begin(_ phase: Phase) throws -> Token {
         try lock.withLock {

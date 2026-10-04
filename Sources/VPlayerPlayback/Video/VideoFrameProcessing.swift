@@ -4,7 +4,7 @@
 
 import CoreMedia
 
-/// 独立 GPU 输出 backing 的共享尾。它不复用 decoder 输入费用；YADIF、bridge、
+/// 独立 GPU 输出 backing 的共享尾。它不复用 decoder 输入费用；去交错、bridge、
 /// VT 和 writer 的最后一个实际 holder 共同持有同一实例才会触发退费。
 public final class VideoOutputBackingRetentionTail: NSObject, @unchecked Sendable {
     /// 只附着在本输出 backing 上，绝不随 `CVBufferPropagateAttachments` 复制。

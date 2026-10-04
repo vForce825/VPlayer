@@ -216,6 +216,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         let completion: @Sendable (VideoDecoderTransitionOutcome) -> Void
         var nativeDrainCompleted = false
         var yadifDrainRequested = false
+        var yadifDrainCompleted = false
     }
     private struct PendingStopRetirement {
         let token: VideoDecoderTransitionToken
@@ -271,6 +272,9 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
     private var pendingDecoderConfiguration: PendingDecoderConfiguration?
     private var pendingDecoderInvalidation: PendingDecoderInvalidation?
     private var pendingNaturalDrain: PendingNaturalDrain?
+    private var pendingPassthroughCompletions = 0
+    private var pendingPassthroughGeneration: MediaGeneration?
+    private var pendingPassthroughRouteEpoch: UInt64 = 0
     private var pendingStopRetirement: PendingStopRetirement?
     private var decoderTransitionDeadlineRevision: UInt64 = 0
     private var routeEpoch: UInt64 = 0
@@ -832,7 +836,13 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
                 var advanced = pending
                 advanced.nativeDrainCompleted = true
                 pendingNaturalDrain = advanced
-                for normalized in normalizer.drain() { process(normalized) }
+                let tail = normalizer.drain()
+                if !isClassificationResolved, let last = tail.last {
+                    // No later input/probe can establish a startup classification.
+                    // Use the existing bounded-probe fallback before presenting EOF.
+                    resolveAfterProbeBudget(last.frame)
+                }
+                for normalized in tail { process(normalized) }
                 advanceNaturalDrainIfReady()
             }
             return
@@ -1028,16 +1038,27 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         yadif.drain { [weak self] in
             self?.hooks.schedule { [weak self] in
                 guard let self,
-                      let current = self.pendingNaturalDrain,
+                      var current = self.pendingNaturalDrain,
                       current.token == token,
                       current.generation == self.generation,
                       current.yadifDrainRequested,
                       !self.stopped,
                       self.pendingHLSYADIF.isEmpty else { return }
-                self.pendingNaturalDrain = nil
-                current.completion(.completed)
+                current.yadifDrainCompleted = true
+                self.pendingNaturalDrain = current
+                self.completeNaturalDrainIfReady()
             }
         }
+    }
+
+    private func completeNaturalDrainIfReady() {
+        guard let pending = pendingNaturalDrain, pending.nativeDrainCompleted,
+              pending.yadifDrainCompleted,
+              pendingPassthroughCompletions == 0 || pendingPassthroughGeneration != generation
+                || pendingPassthroughRouteEpoch != routeEpoch,
+              !stopped, pending.generation == generation else { return }
+        pendingNaturalDrain = nil
+        pending.completion(.completed)
     }
 
     private func failPendingNaturalDrain() {
@@ -1308,6 +1329,7 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
         let submittedEpoch = routeEpoch
         let submittedAccessUnitID = normalized.frame.accessUnitID
         let submittedPresentationTimeStamp = normalized.presentationTimeStamp
+        let usesPassthrough = route != .metalYADIF2x
         let completion: @Sendable (VideoProcessingResult) -> Void = { [weak self] result in
             guard let self else { return }
             // YADIF 会在 completion 返回后立即调度下一个 ready job，而 production
@@ -1327,6 +1349,11 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             }
             hooks.schedule { [weak self] in
                 guard let self else { return }
+                if usesPassthrough, pendingPassthroughGeneration == submittedGeneration,
+                   pendingPassthroughRouteEpoch == submittedEpoch {
+                    pendingPassthroughCompletions -= 1
+                }
+                defer { completeNaturalDrainIfReady() }
                 var keepYADIFSchedulingPaused = false
                 defer {
                     if atomicEncodingAdmission != nil, !keepYADIFSchedulingPaused {
@@ -1490,6 +1517,12 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             return
         }
 
+        if pendingPassthroughGeneration != submittedGeneration || pendingPassthroughRouteEpoch != submittedEpoch {
+            pendingPassthroughGeneration = submittedGeneration
+            pendingPassthroughRouteEpoch = submittedEpoch
+            pendingPassthroughCompletions = 0
+        }
+        pendingPassthroughCompletions += 1
         passthrough.submit(normalizedFrame(from: normalized), completion: completion)
     }
 

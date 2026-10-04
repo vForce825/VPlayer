@@ -12,6 +12,9 @@ int32_t vp_ffmpeg_audio_converter_create(const uint8_t *input_labels, int32_t in
     const uint8_t *output_labels, int32_t outputs, int32_t input_rate,
     const double *matrix, VPFFAudioConverter **out_converter);
 int32_t vp_ffmpeg_audio_converter_capacity(VPFFAudioConverter *converter, int32_t input_frames);
+// Input Float PCM may have finite codec headroom above full scale. Rematrix/SRC
+// retains that headroom; output is saturated to [-1, 1] for the AAC handoff.
+// Non-finite input/output, invalid layouts and existing allocation caps still fail.
 int32_t vp_ffmpeg_audio_converter_convert(VPFFAudioConverter *converter,
     const float *input, int32_t frames, float *output, int32_t capacity);
 void vp_ffmpeg_audio_converter_destroy(VPFFAudioConverter *converter);

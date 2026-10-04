@@ -10,6 +10,368 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AACPrimingCalibratorTests: XCTestCase {
+    func testLeadingOffsetMatchesIntegerOracleAcrossWindowAndChannelBoundaries() throws {
+        // Exercise start=0/start=1024, a partial/full window and interleaved channels.
+        for frames in [128, 129, 2_047, 2_048, 4_095, 4_096, 16_384] {
+            for channels in [1, 2, 8] {
+                let source = Self.correlationSignal(frames: frames, channels: channels)
+                for offset in [0, 17] {
+                    for gain: Float in [1, 0.75] {
+                        let observed = source.enumerated().map { index, value in
+                            value * gain + (gain == 1 ? 0 : Float(index % 7 - 3) / 4_096)
+                        }
+                        let decoded = [Float](repeating: 0, count: offset * channels)
+                            + observed + [Float](repeating: 0, count: 32 * channels)
+                        let expected = Self.integerLeadingOffset(
+                            source: source, decoded: decoded, channels: channels, maximumOffset: 31)
+                        let actual = try AACPrimingCalibrator.leadingOffset(
+                            source: source, decoded: decoded, channels: channels, maximumOffset: 31)
+                        XCTAssertEqual(actual, expected, "frames=\(frames), channels=\(channels), offset=\(offset), gain=\(gain)")
+                        XCTAssertEqual(actual, offset)
+                    }
+                }
+            }
+        }
+    }
+
+    func testLeadingOffsetPreservesOneUnitScoreDifferenceNearMaximumSum() throws {
+        // A Float dot product loses this one-unit distinction near 2^41. Double
+        // must exactly retain both the winning index and the ambiguous-tie rule.
+        for weakIndex in [0, 2_047] {
+            var source = [Float](repeating: 1, count: 2_048)
+            source[weakIndex] = Float(1) / 32_767
+            var decoded = [Float](repeating: 1, count: 2_049)
+            decoded[weakIndex == 0 ? 0 : 2_048] = Float(32_766) / 32_767
+            let expected = weakIndex == 0 ? 1 : 0
+            XCTAssertEqual(Self.integerLeadingOffset(
+                source: source, decoded: decoded, channels: 1, maximumOffset: 1), expected)
+            XCTAssertEqual(try AACPrimingCalibrator.leadingOffset(
+                source: source, decoded: decoded, channels: 1, maximumOffset: 1), expected)
+            decoded = [Float](repeating: 1, count: 2_049)
+            XCTAssertThrowsError(try AACPrimingCalibrator.leadingOffset(
+                source: source, decoded: decoded, channels: 1, maximumOffset: 1)) {
+                XCTAssertEqual($0 as? AACRenditionFailure, .calibrationMismatch)
+            }
+        }
+    }
+
+    func testLeadingOffsetIncludesMaximumCandidateAndKeepsFirstChannelSemantics() throws {
+        let channels = 8, offset = 8_192
+        let source = Self.correlationSignal(frames: 4_096, channels: channels)
+        var decoded = [Float](repeating: 0, count: offset * channels) + source
+        // Non-reference channels deliberately disagree; the existing proof uses
+        // only the first channel while still validating every input sample.
+        for index in decoded.indices where index % channels != 0 {
+            decoded[index] = index.isMultiple(of: 2) ? 1 : -1
+        }
+        XCTAssertEqual(try AACPrimingCalibrator.leadingOffset(
+            source: source, decoded: decoded, channels: channels, maximumOffset: offset), offset)
+    }
+
+    func testLeadingOffsetRejectsSilenceNegativePeakAndEqualPeaks() throws {
+        let cases: [([Float], [Float], Int)] = [
+            ([Float](repeating: 0, count: 128), [Float](repeating: 0, count: 129), 1),
+            ([Float](repeating: 1, count: 128), [Float](repeating: -1, count: 128), 0),
+            ([Float](repeating: 0.5, count: 128), [Float](repeating: 0.5, count: 136), 8),
+        ]
+        for (source, decoded, maximumOffset) in cases {
+            XCTAssertNil(Self.integerLeadingOffset(
+                source: source, decoded: decoded, channels: 1, maximumOffset: maximumOffset))
+            XCTAssertThrowsError(try AACPrimingCalibrator.leadingOffset(
+                source: source, decoded: decoded, channels: 1, maximumOffset: maximumOffset)) {
+                XCTAssertEqual($0 as? AACRenditionFailure, .calibrationMismatch)
+            }
+        }
+    }
+
+    func testLeadingOffsetRetainsBoundsAndValidatesUnusedChannels() throws {
+        let source = Self.correlationSignal(frames: 128, channels: 2)
+        for value: Float in [.nan, .infinity, -.infinity, 1.01] {
+            var decoded = source
+            decoded[1] = value
+            XCTAssertThrowsError(try AACPrimingCalibrator.leadingOffset(
+                source: source, decoded: decoded, channels: 2, maximumOffset: 0)) {
+                XCTAssertEqual($0 as? AACRenditionFailure, .invalidInput)
+            }
+        }
+        for maximumOffset in [-1, 8_193] {
+            XCTAssertThrowsError(try AACPrimingCalibrator.leadingOffset(
+                source: source, decoded: source, channels: 2, maximumOffset: maximumOffset)) {
+                XCTAssertEqual($0 as? AACRenditionFailure, .invalidInput)
+            }
+        }
+        XCTAssertThrowsError(try AACPrimingCalibrator.leadingOffset(
+            source: source, decoded: Array(source.dropLast(2)), channels: 2, maximumOffset: 0)) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .calibrationMismatch)
+        }
+    }
+
+    private static func correlationSignal(frames: Int, channels: Int) -> [Float] {
+        var state: UInt32 = 0x71a2b3c4
+        return (0..<(frames * channels)).map { _ in
+            state = state &* 1_664_525 &+ 1_013_904_223
+            return Float(Int32(bitPattern: state) >> 17) / 32_768
+        }
+    }
+
+    // Int64 scalar oracle intentionally stays in tests. It matches the old
+    // quantization, window, candidate range and unique-positive-maximum rule.
+    private static func integerLeadingOffset(
+        source: [Float], decoded: [Float], channels: Int, maximumOffset: Int
+    ) -> Int? {
+        let frames = source.count / channels
+        let start = frames >= 4_096 ? 1_024 : 0
+        let width = min(2_048, frames - start)
+        let upper = min(maximumOffset, decoded.count / channels - start - width)
+        guard upper >= 0 else { return nil }
+        let a = (0..<width).map { Int64((Double(source[(start + $0) * channels]) * 32_767).rounded()) }
+        let b = (0..<(decoded.count / channels)).map { Int64((Double(decoded[$0 * channels]) * 32_767).rounded()) }
+        var best = Int64.min, second = Int64.min, offset = 0
+        for candidate in 0...upper {
+            var sum: Int64 = 0
+            for index in 0..<width { sum += a[index] * b[start + candidate + index] }
+            if sum > best { second = best; best = sum; offset = candidate } else { second = max(second, sum) }
+        }
+        return best > 0 && best > second ? offset : nil
+    }
+
+    func testAwaitedReaderValueDistinguishesEOFAndOriginalFailure() async throws {
+        let lane = AACOwnedCallLane()
+        let sample: Int? = try await lane.callAwaiting { 7 }
+        XCTAssertEqual(sample, 7)
+        let eof: Int? = try await lane.callAwaiting { nil }
+        XCTAssertNil(eof)
+        do {
+            let _: Int? = try await lane.callAwaiting {
+                throw NSError(domain: "AAC.NativeReader", code: -73,
+                    userInfo: [NSLocalizedDescriptionKey: "reader failure is not EOF"])
+            }
+            XCTFail("reader failure must not become nil")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "AAC.NativeReader")
+            XCTAssertEqual((error as NSError).code, -73)
+        }
+        XCTAssertNoThrow(try lane.call {})
+    }
+
+    func testAwaitedReaderDiscardsLateSampleAfterCancellation() async throws {
+        let lane = AACOwnedCallLane()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "provider next is suspended")
+        let read = Task {
+            try await lane.callAwaiting { () async throws -> Int? in
+                entered.fulfill()
+                await gate.wait()
+                return 7
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        lane.requestCancel()
+        XCTAssertFalse(lane.finishCancellation { XCTFail("reader still owns its permit") })
+        await gate.open()
+        do {
+            _ = try await read.value
+            XCTFail("a late reader sample cannot enter the decoder after cancellation")
+        } catch {
+            XCTAssertEqual(error as? AACRenditionFailure, .cancelled)
+        }
+        XCTAssertTrue(lane.finishCancellation {})
+    }
+
+    func testOwnedReaderSamplePreservesPacketsAndBothAttachmentModes() throws {
+        let calibrator = AACPrimingCalibrator()
+        let request = try AACPrimingCalibratorTestHarness.request([.c])
+        let plan = try AACCalibrationPlan.build([request])
+        let encoder = try AACRenditionEncoder(
+            identity: .init(plan: plan, ordinal: 0, request: request, nonce: ConverterInstanceNonce()),
+            lane: calibrator.lane, workspace: calibrator.workspace,
+            observer: AACDefaultCalibrationObserver(), presentationTerminal: calibrator.presentationTerminal)
+        defer { encoder.dispose() }
+        let pass = try encoder.encodePass(
+            AACPrimingCalibratorTestHarness.signal(frames: 4_096, channels: 1),
+            cookieStage: .finalizedPass(1))
+        let epoch = try encoder.makeEpoch(pass: pass, realFrames: pass.totalFrames, leading: 0)
+        let original = try XCTUnwrap(epoch.buffers.first)
+        let propagated = "VPlayer.Reader.Propagated" as CFString
+        let privateKey = "VPlayer.Reader.NonPropagated" as CFString
+        CMSetAttachment(original, key: propagated, value: kCFBooleanTrue,
+                        attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        CMSetAttachment(original, key: privateKey, value: kCFBooleanTrue,
+                        attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        let ready = try makeReadyWriterFixtureSample(copying: original)
+        let owned = try AACSystemLoopback.ownedReaderSample(copying: ready)
+        XCTAssertNotEqual(ObjectIdentifier(owned), ObjectIdentifier(original))
+        XCTAssertNotEqual(ObjectIdentifier(owned), ready.withUnsafeSampleBuffer { ObjectIdentifier($0) })
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(owned), CMSampleBufferGetPresentationTimeStamp(original))
+        XCTAssertEqual(CMSampleBufferGetDuration(owned), CMSampleBufferGetDuration(original))
+        XCTAssertEqual(try AACPrimingCalibratorTestHarness.packetIdentity([owned]),
+                       try AACPrimingCalibratorTestHarness.packetIdentity([original]))
+        for (key, mode) in [(propagated, kCMAttachmentMode_ShouldPropagate),
+                            (privateKey, kCMAttachmentMode_ShouldNotPropagate)] {
+            var actualMode = kCMAttachmentMode_ShouldPropagate
+            XCTAssertNotNil(CMGetAttachment(owned, key: key, attachmentModeOut: &actualMode))
+            XCTAssertEqual(actualMode, mode)
+            CMRemoveAttachment(owned, key: key)
+            XCTAssertTrue(ready.withUnsafeSampleBuffer {
+                CMGetAttachment($0, key: key, attachmentModeOut: nil) != nil
+            }, "owned header edits must not mutate the provider header")
+        }
+    }
+
+    func testAwaitedOwnedCallRejectsOverlapAndLateSuccessAfterCancellation() async throws {
+        let lane = AACOwnedCallLane()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "awaited call holds the owned permit")
+        let call = Task {
+            try await lane.callAwaiting {
+                entered.fulfill()
+                await gate.wait()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertThrowsError(try lane.call {}) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        lane.requestCancel()
+        XCTAssertFalse(lane.finishCancellation { XCTFail("cannot clean up an in-flight append") })
+        await gate.open()
+        do {
+            try await call.value
+            XCTFail("late native success must not commit after cancellation")
+        } catch {
+            XCTAssertEqual(error as? AACRenditionFailure, .cancelled)
+        }
+        XCTAssertTrue(lane.finishCancellation {})
+        XCTAssertTrue(lane.isCancellationFinished)
+    }
+
+    func testAwaitedOwnedCallPreservesOriginalErrorAndReleasesPermit() async throws {
+        let lane = AACOwnedCallLane()
+        do {
+            try await lane.callAwaiting {
+                lane.requestCancel()
+                throw NSError(domain: "AAC.NativeAppend", code: -71,
+                    userInfo: [NSLocalizedDescriptionKey: "first native append failure"])
+            }
+            XCTFail("native failure must propagate")
+        } catch {
+            let native = error as NSError
+            XCTAssertEqual(native.domain, "AAC.NativeAppend")
+            XCTAssertEqual(native.code, -71)
+            XCTAssertEqual(native.localizedDescription, "first native append failure")
+        }
+        XCTAssertTrue(lane.finishCancellation {})
+    }
+
+    func testAsyncLoopbackStreamDrainsBoundedBatchBeforeReadingMorePCM() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        let probe = AACCalibrationStreamProbe()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "first append awaits native acceptance")
+        let stream = Task {
+            try await AACSystemLoopback.encodeStreamAwaitingAppend(
+                encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+            ) { buffer in
+                if probe.recordAppend(buffer) == 1 {
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            }
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        let readsAtBackpressure = probe.readCount
+        XCTAssertEqual(readsAtBackpressure, 1, "the first 16384-frame block must emit before the next read")
+        XCTAssertThrowsError(try harness.calibrator.lane.call {}) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        XCTAssertGreaterThan(harness.calibrator.workspace.currentBytes, encoder.retainedEvidenceBytes,
+                             "signed input backing must remain charged until append returns")
+        XCTAssertNil(encoder.terminalFailure)
+        XCTAssertEqual(probe.readCount, readsAtBackpressure)
+        await gate.open()
+        let summary = try await stream.value
+        XCTAssertEqual(summary.realSampleCount, 65_536)
+        XCTAssertEqual(probe.readCount, 5, "four PCM blocks and one EOS read")
+        XCTAssertEqual(probe.appendedFrames, summary.totalDecodedFrames)
+        XCTAssertGreaterThan(probe.appendCount, 32)
+        XCTAssertLessThanOrEqual(summary.maximumRetainedPackets, 64)
+        XCTAssertLessThanOrEqual(harness.calibrator.workspace.peakBytes, 4_194_304)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, encoder.retainedEvidenceBytes)
+        XCTAssertNoThrow(try harness.calibrator.lane.call {})
+    }
+
+    func testAsyncLoopbackCancellationRetainsBatchUntilLateAppendReturns() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        let probe = AACCalibrationStreamProbe()
+        let gate = AACCalibrationAppendGate()
+        let entered = expectation(description: "native append has retained one sample")
+        let stream = Task {
+            try await AACSystemLoopback.encodeStreamAwaitingAppend(
+                encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+            ) { buffer in
+                _ = probe.recordAppend(buffer)
+                entered.fulfill()
+                await gate.wait()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        let retained = harness.calibrator.workspace.currentBytes
+        harness.calibrator.cancel()
+        XCTAssertThrowsError(try harness.calibrator.finishOnOwnedRunner()) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, retained)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertNil(encoder.terminalFailure)
+        await gate.open()
+        do {
+            _ = try await stream.value
+            XCTFail("late append success cannot finish a cancelled stream")
+        } catch {
+            XCTAssertEqual(error as? AACRenditionFailure, .cancelled)
+        }
+        XCTAssertEqual(probe.appendCount, 1)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+        XCTAssertEqual(encoder.terminalFailure, .cancelled)
+        XCTAssertNoThrow(try harness.calibrator.finishOnOwnedRunner())
+    }
+
+    func testAsyncLoopbackStreamAppendFailureSnapshotsFirstErrorAndDisposes() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        encoder.markVisible()
+        let probe = AACCalibrationStreamProbe()
+        do {
+            _ = try await AACSystemLoopback.encodeStreamAwaitingAppend(
+                encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+            ) { _ in
+                throw NSError(domain: "AAC.NativeAppend", code: -72,
+                    userInfo: [NSLocalizedDescriptionKey: "original receiver failure"])
+            }
+            XCTFail("append failure must stop the stream")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "AAC.NativeAppend")
+            XCTAssertEqual((error as NSError).code, -72)
+        }
+        let first = try XCTUnwrap(encoder.terminalFailure)
+        harness.calibrator.presentationTerminal.fail(.cancelled)
+        XCTAssertEqual(encoder.terminalFailure, first)
+        let description = String(reflecting: first)
+        XCTAssertTrue(description.contains("AAC.NativeAppend"), description)
+        XCTAssertTrue(description.contains("-72"), description)
+        XCTAssertTrue(description.contains("original receiver failure"), description)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertEqual(harness.calibrator.presentationTerminal.publicationCount, 1)
+        XCTAssertFalse(encoder.mayPublishTailOrEndList)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+    }
+
     func testForeignStreamFailureRetainsOriginalTerminalReason() async throws {
         let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
         let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
@@ -55,6 +417,43 @@ final class AACPrimingCalibratorTests: XCTestCase {
             else { baseline = measured; XCTAssertGreaterThan(measured, 0) }
         }
     }
+
+    func testCompletedLoopbackRetiresWriterStorageBeforeReturning() async throws {
+        let calibrator = AACPrimingCalibrator()
+        let request = try AACPrimingCalibratorTestHarness.request([.c])
+        let plan = try AACCalibrationPlan.build([request])
+        let encoder = try AACRenditionEncoder(
+            identity: .init(plan: plan, ordinal: 0, request: request, nonce: ConverterInstanceNonce()),
+            lane: calibrator.lane, workspace: calibrator.workspace,
+            observer: AACDefaultCalibrationObserver(), presentationTerminal: calibrator.presentationTerminal)
+        defer { encoder.dispose() }
+        let pass = try encoder.encodePass(
+            AACPrimingCalibratorTestHarness.signal(frames: 4_096, channels: 1),
+            cookieStage: .finalizedPass(1))
+        let epoch = try encoder.makeEpoch(pass: pass, realFrames: pass.totalFrames, leading: 0)
+        let loopbackWorkspace = AACCalibrationWorkspace()
+        let loopbackLane = AACOwnedCallLane()
+        let observer = AACReviewFixture()
+
+        // Exercise completed native-writer retirement directly, without a prior
+        // calibration masking its lifecycle failure in fixture construction.
+        let decoded = try await AACSystemLoopback.decode(epoch: epoch, lane: loopbackLane,
+            workspace: loopbackWorkspace, observer: observer)
+        XCTAssertTrue(decoded.didDrainNaturally)
+        XCTAssertEqual(decoded.rawFrameCount, pass.totalFrames)
+        XCTAssertEqual(decoded.packetIdentity, try AACPrimingCalibratorTestHarness.packetIdentity(epoch.buffers))
+        XCTAssertEqual(observer.initializationEvents, 1)
+        XCTAssertGreaterThan(observer.mediaEvents, 0)
+        let outputBytes = decoded.lease.bytes + decoded.metadataLease.bytes
+            + decoded.rawReaderCookie.lease.bytes + decoded.writerCookieEvidence.backing.lease.bytes
+            + decoded.writerCookieEvidence.metadataLease.bytes
+        XCTAssertEqual(loopbackWorkspace.currentBytes, outputBytes,
+                       "only returned evidence remains; writer/delegate/file storage is physically retired")
+        XCTAssertNoThrow(try loopbackLane.call {})
+        XCTAssertLessThanOrEqual(loopbackWorkspace.peakBytes, 4_194_304)
+        withExtendedLifetime(decoded) {}
+    }
+
     func testIncrementalPumpAlternatesTwoRenditionsWithoutCallbackReentryOrReset() async throws {
         let observer = AACReviewFixture()
         let calibrator = AACPrimingCalibrator(observer: observer)
@@ -592,18 +991,183 @@ final class AACPrimingCalibratorTests: XCTestCase {
         XCTAssertThrowsError(try receipt.encoder(for: receipt.encoders[0].identity))
     }
 
+    func testOccupiedLaneRetainsOneWriterUntilDeferredTerminalCompletes() throws {
+        let lane = AACOwnedCallLane()
+        let workspace = AACCalibrationWorkspace()
+        let record = AACWriterRetirementRecord()
+        var owner: AACWriterRetirementProbe? = AACWriterRetirementProbe(
+            lane: lane, lease: try workspace.acquire(.temporaryFile, bytes: 1_048_576), record: record)
+        let weakOwner = AACWeakWriterRetirementProbe(try XCTUnwrap(owner))
+        try lane.claimWriterOwnership(try XCTUnwrap(owner))
+        XCTAssertThrowsError(try lane.claimWriterOwnership(
+            AACWriterRetirementProbe(lane: lane, lease: nil, record: record))) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        try lane.enter()
+        XCTAssertTrue(lane.finishWriterOwnership(try XCTUnwrap(owner)))
+        XCTAssertFalse(lane.finishWriterOwnership(try XCTUnwrap(owner)), "retirement is admitted once")
+        owner = nil
+        lane.requestCancel()
+        XCTAssertNotNil(weakOwner.value, "the occupied lane owns the deferred physical resources")
+        XCTAssertEqual(workspace.currentBytes, 1_048_576)
+        XCTAssertEqual(record.count, 0)
+        XCTAssertFalse(lane.finishCancellation { XCTFail("writer terminal has not completed") })
+        lane.leave()
+        XCTAssertEqual(record.count, 1)
+        XCTAssertTrue(record.wasExcludedDuringRetirement)
+        XCTAssertEqual(workspace.currentBytes, 0)
+        XCTAssertNil(weakOwner.value)
+        XCTAssertTrue(lane.finishCancellation {})
+    }
+
+    func testIdleLaneRetiresWriterImmediatelyAndAcceptsNextOwnership() throws {
+        let lane = AACOwnedCallLane()
+        let record = AACWriterRetirementRecord()
+        let first = AACWriterRetirementProbe(lane: lane, lease: nil, record: record)
+        try lane.claimWriterOwnership(first)
+        XCTAssertTrue(lane.finishWriterOwnership(first))
+        XCTAssertEqual(record.count, 1)
+        let second = AACWriterRetirementProbe(lane: lane, lease: nil, record: record)
+        try lane.claimWriterOwnership(second)
+        XCTAssertTrue(lane.finishWriterOwnership(second))
+        XCTAssertEqual(record.count, 2)
+        XCTAssertNoThrow(try lane.call {})
+    }
+
+    func testStreamingBusyCleanupRetainsNativeOwnerUntilPermitLeaves() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        var occupied = false
+        defer { if occupied { harness.calibrator.lane.leave() } }
+        do {
+            _ = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 8_192) {
+                try harness.calibrator.lane.enter()
+                occupied = true
+                throw NSError(domain: "AAC.OccupiedCleanup", code: -75)
+            }
+            XCTFail("source failure must propagate")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "AAC.OccupiedCleanup")
+            XCTAssertEqual((error as NSError).code, -75)
+        }
+        guard occupied else { return XCTFail("fixture must own the lane while cleanup is requested") }
+        XCTAssertGreaterThanOrEqual(harness.calibrator.workspace.currentBytes, 1_056_768,
+                                    "writer/delegate/file storage cannot disappear before native terminal")
+        XCTAssertThrowsError(try harness.calibrator.finishOnOwnedRunner()) {
+            XCTAssertEqual($0 as? AACRenditionFailure, .busy)
+        }
+        harness.calibrator.lane.leave()
+        occupied = false
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+        XCTAssertNoThrow(try harness.calibrator.finishOnOwnedRunner())
+        XCTAssertTrue(String(reflecting: encoder.terminalFailure).contains("AAC.OccupiedCleanup"))
+    }
+
+    func testEOSRetiresOnlyUnusedReservationBeforeFinalCookieAllocation() throws {
+        let workspace = AACCalibrationWorkspace()
+        let file = try workspace.acquire(.temporaryFile, bytes: 1_048_576)
+        let metadata = try workspace.acquire(.nonPayload, bytes: 8_192)
+        let source = try workspace.acquire(.sourcePCM, bytes: 262_144)
+        let packets = try workspace.acquire(.aacPackets, bytes: 131_072)
+        let base = workspace.currentBytes
+        let reservation = try workspace.reserveAvailable(.aacPackets,
+            preferredBytes: AACCalibrationWorkspace.aacPacketCapacity, minimumBytes: 16_384)
+        let acceptedEmission = try reservation.claim(bytes: 4_096)
+        XCTAssertTrue(workspace.atSoftLimit)
+        XCTAssertThrowsError(try workspace.acquire(.nonPayload, bytes: 39))
+        let beforeRejectedTrim = workspace.currentBytes
+        XCTAssertThrowsError(try reservation.reduceUnclaimed(to: reservation.unclaimedBytes + 1))
+        XCTAssertEqual(workspace.currentBytes, beforeRejectedTrim)
+
+        try reservation.reduceUnclaimed(to: 8_192)
+        XCTAssertEqual(workspace.currentBytes, base + 4_096 + 8_192,
+                       "retire unused capacity only; accepted emission ownership is still charged")
+        XCTAssertEqual(reservation.unclaimedBytes, 8_192)
+        let finalCookie = try workspace.acquire(.nonPayload, bytes: 39)
+        let finalEmission = try reservation.claim(bytes: 8_192)
+        XCTAssertThrowsError(try reservation.claim(bytes: 1))
+        reservation.releaseUnclaimed()
+        reservation.releaseUnclaimed()
+        XCTAssertEqual(workspace.currentBytes, base + 4_096 + 8_192 + 39)
+        acceptedEmission.release(); finalEmission.release(); finalCookie.release()
+        file.release(); metadata.release(); source.release(); packets.release()
+        XCTAssertEqual(workspace.currentBytes, 0)
+        XCTAssertLessThanOrEqual(workspace.peakBytes, 4_194_304)
+    }
+
+    func testAsyncStreamEOSPreservesFinalEvidenceWhileWriterFileBudgetIsHeld() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.l, .r])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        let file = try harness.calibrator.workspace.acquire(.temporaryFile, bytes: 1_048_576)
+        let metadata = try harness.calibrator.workspace.acquire(.nonPayload, bytes: 8_192)
+        let probe = AACCalibrationStreamProbe()
+        let summary = try await AACSystemLoopback.encodeStreamAwaitingAppend(
+            encoder: encoder, realFrames: 65_536, nextPCM: { probe.nextPCM() }
+        ) { buffer in _ = probe.recordAppend(buffer) }
+        XCTAssertNil(encoder.terminalFailure)
+        XCTAssertEqual(summary.realSampleCount, 65_536)
+        XCTAssertEqual(probe.appendedFrames, summary.totalDecodedFrames)
+        XCTAssertEqual(summary.totalDecodedFrames,
+                       Int64(summary.leadingFrames) + summary.realSampleCount + summary.trailingFrames)
+        XCTAssertLessThanOrEqual(summary.maximumRetainedPackets, 64)
+        XCTAssertGreaterThan(harness.calibrator.workspace.peakBytes, 3_145_728,
+                             "reproduce the high-water condition without relaxing the soft admission bound")
+        XCTAssertLessThanOrEqual(harness.calibrator.workspace.peakBytes, 4_194_304)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes,
+                       encoder.retainedEvidenceBytes + file.bytes + metadata.bytes)
+        file.release(); metadata.release()
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, encoder.retainedEvidenceBytes)
+    }
+
+    func testStreamingFailureSnapshotPrecedesNativeAndTemporaryCleanup() async throws {
+        let harness = try AACPrimingCalibratorTestHarness(labels: [.c])
+        let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
+        let encoder = try XCTUnwrap(receipt.encoders.first)
+        harness.observer.beginStreamDiagnostics(encoder: encoder)
+        do {
+            _ = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 8_192) {
+                throw NSError(domain: "AAC.BeforeFileCleanup", code: -74,
+                    userInfo: [NSLocalizedDescriptionKey: "original source failure"])
+            }
+            XCTFail("source failure must propagate")
+        } catch {
+            harness.observer.recordCaughtStreamFailure(error, encoder: encoder)
+            XCTAssertEqual((error as NSError).domain, "AAC.BeforeFileCleanup")
+            XCTAssertEqual((error as NSError).code, -74)
+        }
+        let record = try XCTUnwrap(harness.observer.disposalRecords.first)
+        XCTAssertEqual(harness.observer.disposalRecords.count, 1)
+        XCTAssertGreaterThan(record.workspaceBytes, 0, "snapshot must precede resource cleanup")
+        let failure = try XCTUnwrap(record.failure)
+        let description = String(reflecting: failure)
+        XCTAssertTrue(description.contains("AAC.BeforeFileCleanup"), description)
+        XCTAssertTrue(description.contains("-74"), description)
+        XCTAssertTrue(description.contains("original source failure"), description)
+        XCTAssertEqual(failure, encoder.terminalFailure)
+        XCTAssertEqual(harness.calibrator.workspace.currentBytes, 0)
+    }
+
     func testStreamingLiveUsesBoundedTailAndIntegerClockBeyondCalibrationCap() async throws {
         let harness = try AACPrimingCalibratorTestHarness(labels: [.l,.r])
         defer { attachEvidence(harness) }
         let receipt = try await harness.calibrator.calibrate(plan: harness.plan)
         let encoder = try XCTUnwrap(receipt.encoders.first)
+        harness.observer.beginStreamDiagnostics(encoder: encoder)
         var batches = 0
-        let decoded = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 102_400, nextPCM: {
-            guard batches < 100 else { return nil }
-            let start = batches * 1_024
-            batches += 1
-            return AACPrimingCalibratorTestHarness.indexedSignal(start: start, frames: 1_024, channels: 2)
-        })
+        let decoded: AACSystemLoopback.StreamEvidence
+        do {
+            decoded = try await AACSystemLoopback.decodeStream(encoder: encoder, realFrames: 102_400, nextPCM: {
+                guard batches < 100 else { return nil }
+                let start = batches * 1_024
+                batches += 1
+                return AACPrimingCalibratorTestHarness.indexedSignal(start: start, frames: 1_024, channels: 2)
+            })
+        } catch {
+            harness.observer.recordCaughtStreamFailure(error, encoder: encoder)
+            throw error
+        }
         let summary = decoded.summary
         XCTAssertEqual(summary.realSampleCount, 102_400)
         XCTAssertEqual(decoded.rawFrameCount, summary.totalDecodedFrames, "raw Q 与 effective N 是两个独立域")
@@ -710,7 +1274,7 @@ final class AACPrimingCalibratorTests: XCTestCase {
 
     func testWorkspaceEverySubledgerAliasSoftHardAndPreallocationCookieLimits() throws {
         let workspace = AACCalibrationWorkspace()
-        let caps: [(AACCalibrationWorkspace.Kind, Int)] = [(.sourcePCM,524_288),(.aacPackets,524_288),(.temporaryFile,1_048_576),(.decodedPCM,1_048_576),(.correlation,524_288),(.nonPayload,524_288)]
+        let caps: [(AACCalibrationWorkspace.Kind, Int)] = [(.sourcePCM,524_288),(.aacPackets,2 * 1_024 * 1_024),(.temporaryFile,1_048_576),(.decodedPCM,1_048_576),(.correlation,524_288),(.nonPayload,524_288)]
         for (kind, cap) in caps {
             let lease = try workspace.acquire(kind, bytes: cap)
             XCTAssertThrowsError(try workspace.acquire(kind, bytes: 1))
@@ -960,11 +1524,62 @@ private final class AACCookieBoundaryFixture: AACCalibrationObserver, @unchecked
     private let lock = NSLock()
     private var records: [String] = []
     private var formats: [String] = []
+    struct DisposalRecord: Sendable {
+        let failure: AACRenditionFailure?
+        let workspaceBytes: Int
+    }
+    private weak var streamingEncoder: AACRenditionEncoder?
+    private var streamPhases: [String] = []
+    private var streamDisposals: [DisposalRecord] = []
+    var disposalRecords: [DisposalRecord] { lock.withLock { streamDisposals } }
     var evidence: [String] { lock.withLock { records } }
     var formatEvidence: [String] { lock.withLock { formats } }
     init(mutation: AACBoundaryMutation) { self.mutation = mutation }
+    func beginStreamDiagnostics(encoder: AACRenditionEncoder) {
+        lock.withLock {
+            streamingEncoder = encoder
+            streamPhases.removeAll(keepingCapacity: true)
+            streamDisposals.removeAll(keepingCapacity: true)
+        }
+    }
+    func loopbackPhase(_ phase: AACLoopbackPhase, lane: AACOwnedCallLane) {
+        lock.withLock {
+            if streamingEncoder != nil, streamPhases.count < 32 {
+                streamPhases.append(String(describing: phase))
+            }
+        }
+    }
+    func writerSegment(initialization: Bool, writerIdentity: ObjectIdentifier) {
+        lock.withLock {
+            if streamingEncoder != nil, streamPhases.count < 32 {
+                streamPhases.append("writer=\(writerIdentity) init=\(initialization)")
+            }
+        }
+    }
+    func willDispose() {
+        guard let encoder = lock.withLock({ streamingEncoder }) else { return }
+        let record = DisposalRecord(failure: encoder.terminalFailure,
+                                    workspaceBytes: encoder.workspace.currentBytes)
+        let phases = lock.withLock { () -> [String] in
+            if streamDisposals.count < 4 { streamDisposals.append(record) }
+            return streamPhases
+        }
+        // terminalFailure was already snapshotted by the encoder, before this
+        // disposal hook and before native writer cancellation / file cleanup.
+        print("AAC_STREAM_PRE_NATIVE_CLEANUP terminal=\(String(reflecting: record.failure)) workspace=\(record.workspaceBytes) phases=\(phases)")
+    }
+    func recordCaughtStreamFailure(_ error: any Error, encoder: AACRenditionEncoder) {
+        let caught = AACRenditionFailure(error)
+        let phases = lock.withLock { streamPhases }
+        // Print bounded primitive snapshots before XCTest tries NSError serialization.
+        // The original error is still rethrown by the test, preserving its assertion.
+        print("AAC_STREAM_CAUGHT snapshot=\(String(reflecting: caught)) terminal=\(String(reflecting: encoder.terminalFailure)) workspace=\(encoder.workspace.currentBytes) peak=\(encoder.workspace.peakBytes) phases=\(phases)")
+    }
     func cookie(_ value: Data, at stage: AACCookieStage) -> Data {
         lock.withLock {
+            if streamingEncoder != nil, streamPhases.count < 32 {
+                streamPhases.append("cookie=\(stage) bytes=\(value.count)")
+            }
             if records.count < 8 { records.append("\(stage):\(value.map { String(format: "%02x", $0) }.joined())") }
         }
         switch (stage, mutation) {
@@ -997,5 +1612,74 @@ private final class AACCookieBoundaryFixture: AACCalibrationObserver, @unchecked
                 formats.append("actual[\(formats.count)]: ASBD=\(format.asbd), leading=\(format.leadingPrimeFrames), trailing=\(format.trailingPrimeFrames), layout=\(format.layoutBacking.data.map { String(format: "%02x", $0) }.joined())")
             }
         }
+    }
+}
+
+private actor AACCalibrationAppendGate {
+    private var opened = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func open() {
+        opened = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private final class AACCalibrationStreamProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private var appends = 0
+    private var frames: Int64 = 0
+    var readCount: Int { lock.withLock { reads } }
+    var appendCount: Int { lock.withLock { appends } }
+    var appendedFrames: Int64 { lock.withLock { frames } }
+    func nextPCM() -> [Float]? {
+        let index = lock.withLock { let index = reads; reads += 1; return index }
+        guard index < 4 else { return nil }
+        return AACPrimingCalibratorTestHarness.indexedSignal(
+            start: index * 16_384, frames: 16_384, channels: 2)
+    }
+    func recordAppend(_ buffer: CMSampleBuffer) -> Int {
+        lock.withLock {
+            appends += 1
+            frames += Int64(CMSampleBufferGetNumSamples(buffer)) * 1_024
+            return appends
+        }
+    }
+}
+
+private final class AACWeakWriterRetirementProbe {
+    weak var value: AACWriterRetirementProbe?
+    init(_ value: AACWriterRetirementProbe) { self.value = value }
+}
+
+private final class AACWriterRetirementRecord: @unchecked Sendable {
+    private let lock = NSLock()
+    private var retirements = 0
+    private var excluded = true
+    var count: Int { lock.withLock { retirements } }
+    var wasExcludedDuringRetirement: Bool { lock.withLock { excluded } }
+    func record(excluded: Bool) {
+        lock.withLock { retirements += 1; self.excluded = self.excluded && excluded }
+    }
+}
+
+private final class AACWriterRetirementProbe: AACOwnedWriterRetiring, @unchecked Sendable {
+    let lane: AACOwnedCallLane
+    let lease: AACCalibrationWorkspace.Lease?
+    let record: AACWriterRetirementRecord
+    init(lane: AACOwnedCallLane, lease: AACCalibrationWorkspace.Lease?, record: AACWriterRetirementRecord) {
+        self.lane = lane; self.lease = lease; self.record = record
+    }
+    func retireWriterResources() {
+        let excluded: Bool
+        do { try lane.call {}; excluded = false }
+        catch { excluded = true }
+        record.record(excluded: excluded)
+        lease?.release()
     }
 }

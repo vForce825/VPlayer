@@ -349,7 +349,9 @@ final class HLSTimelineCoordinator {
                 trackSet: tracks,
                 videoParameterSets: formatSnapshot?.videoParameterSets ?? [],
                 hlsVideoParameterSetOwner: formatSnapshot?.hlsVideoParameterSetOwner,
-                audioSystemFormat: formatSnapshot?.audioSystemFormat
+                audioSystemFormat: formatSnapshot?.audioSystemFormat,
+                videoPreferredTransfer: formatSnapshot?.videoPreferredTransfer,
+                videoSequenceEnded: formatSnapshot?.videoSequenceEnded ?? false
             )
             acceptedFormatSnapshot = formatSnapshot ?? AssemblyFormatSnapshot(
                 videoParameterSets: [],
@@ -707,6 +709,8 @@ final class HLSTimelineCoordinator {
                   state.replayTarget?.blocksVideo != true else {
                 return
             }
+            // EOS 不改变当前格式指纹，但其持续边界必须随已接受 AU 进入重放快照。
+            state.acceptedFormatSnapshot = state.formatState.snapshot()
             let mediaGeneration = MediaGeneration(rawValue: state.generation.rawValue)
             _ = state.scanClassifier.observe(ScanObservation(
                 generation: mediaGeneration,

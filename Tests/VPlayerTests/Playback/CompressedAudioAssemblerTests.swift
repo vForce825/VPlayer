@@ -117,6 +117,26 @@ final class CompressedAudioAssemblerTests: XCTestCase {
         XCTAssertEqual(events.compactMap(\.frame).map(\.payload), [Data([0x21, 0x22])])
     }
 
+    func testFiveByteLCASCStartsSharedAssemblerForBothOutputOwnershipModes() throws {
+        for (rate, prefix): (Int32, [UInt8]) in [(44_100, [0x12, 0x10]), (48_000, [0x11, 0x90])] {
+            for isHLS in [false, true] {
+                let asc = Data(prefix + [0x56, 0xE5, 0x00])
+                let tracks = try AssemblerTestFixtures.audioTracks(sampleRate: rate, extradata: asc)
+                var events: [AudioAssemblerEvent] = []
+                let assembler = try CompressedAudioAssembler(
+                    trackSet: tracks, generationProvider: { .init(rawValue: 1) },
+                    eventSink: { events.append($0) }, formatState: AssemblyFormatState(trackSet: tracks),
+                    hlsCopyOwnership: isHLS ? HLSAudioCopyOwnership(
+                        maximumCompressedBytes: 1_048_576, maximumPCMBytes: 8_388_608, capacity: 8) : nil)
+                try assembler.push(AssemblerTestFixtures.audioPacket(data: Data([0x21, 0x22]), codec: .aac))
+                XCTAssertEqual(events.kinds, ["format", "frame"])
+                XCTAssertEqual(events.compactMap(\.configuration).first?.decoderExtradata, asc)
+                XCTAssertEqual(events.compactMap(\.frame).first?.duration,
+                               CMTime(value: 1_024, timescale: rate))
+            }
+        }
+    }
+
     func testRawAndADTSAACLCRegression() throws {
         let rawPayload = Data([0xDE, 0xAD, 0xBE, 0xEF])
         let rawTracks = try AssemblerTestFixtures.audioTracks(extradata: Data([0x11, 0x90]))
@@ -174,6 +194,122 @@ final class CompressedAudioAssemblerTests: XCTestCase {
             framesPerPacket: 1_024,
             cookie: coreAudioCookie(for: Data([0x11, 0x90]))
         )
+    }
+
+    func testADTSMissingPacketPTSContinuesProvenSampleClockAndPreservesExplicitGap() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let adts = makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false)
+        let events = try assemble(tracks: tracks, packets: [
+            AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: CMTime(value: 126_000, timescale: 90_000), duration: .zero),
+            AssemblerTestFixtures.audioPacket(data: adts + adts, codec: .aac, pts: .invalid, duration: .zero),
+            AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: CMTime(value: 2, timescale: 1), duration: .zero),
+            AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .invalid, duration: .zero),
+        ])
+        XCTAssertTrue(events.decodeBreakReasons.isEmpty)
+        XCTAssertEqual(events.compactMap(\.frame).map(\.presentationTimeStamp), [
+            CMTime(value: 67_200, timescale: 48_000),
+            CMTime(value: 68_224, timescale: 48_000),
+            CMTime(value: 69_248, timescale: 48_000),
+            CMTime(value: 96_000, timescale: 48_000),
+            CMTime(value: 97_024, timescale: 48_000),
+        ])
+    }
+
+    func testADTSMissingPTSCanCompleteAnchoredCarryWithoutInventingANewAnchor() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let adts = makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false)
+        let events = try assemble(tracks: tracks, packets: [
+            AssemblerTestFixtures.audioPacket(data: Data(adts.prefix(5)), codec: .aac,
+                pts: CMTime(value: 1, timescale: 1)),
+            AssemblerTestFixtures.audioPacket(data: Data(adts.dropFirst(5)) + adts,
+                codec: .aac, pts: .invalid),
+        ])
+        XCTAssertTrue(events.decodeBreakReasons.isEmpty)
+        XCTAssertEqual(events.compactMap(\.frame).map(\.presentationTimeStamp), [
+            CMTime(value: 48_000, timescale: 48_000), CMTime(value: 49_024, timescale: 48_000),
+        ])
+    }
+
+    func testADTSTimestampContinuationKeepsFractionalSampleClock() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(sampleRate: 44_100, extradata: Data())
+        var adts = makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false)
+        adts[2] = (adts[2] & 0xC3) | (4 << 2)
+        let events = try assemble(tracks: tracks, packets: [
+            AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .zero),
+            AssemblerTestFixtures.audioPacket(data: adts + adts, codec: .aac, pts: .invalid),
+        ])
+        XCTAssertEqual(events.compactMap(\.frame).map(\.presentationTimeStamp), [
+            .zero, CMTime(value: 1_024, timescale: 44_100), CMTime(value: 2_048, timescale: 44_100),
+        ])
+    }
+
+    func testMissingPTSStillRejectsUnanchoredADTSRawAACAndNonfiniteTimes() throws {
+        for extradata in [Data(), Data([0x11, 0x90])] {
+            let tracks = try AssemblerTestFixtures.audioTracks(extradata: extradata)
+            let payload = extradata.isEmpty
+                ? makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false) : Data([0x21, 0x22])
+            let assembler = try CompressedAudioAssembler(trackSet: tracks,
+                generationProvider: { .init(rawValue: 1) }, eventSink: { _ in },
+                formatState: AssemblyFormatState(trackSet: tracks))
+            XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.audioPacket(
+                data: payload, codec: .aac, pts: .invalid)))
+            try assembler.push(AssemblerTestFixtures.audioPacket(data: payload, codec: .aac, pts: .zero))
+            for invalidTime in [CMTime.indefinite, .positiveInfinity, .negativeInfinity] {
+                XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.audioPacket(
+                    data: payload, codec: .aac, pts: invalidTime)))
+            }
+            if !extradata.isEmpty {
+                XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.audioPacket(
+                    data: payload, codec: .aac, pts: .invalid)))
+            }
+        }
+    }
+
+    func testADTSDecodeBreakAndBindingResetRevokeMissingTimestampContinuation() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let adts = makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false)
+        let binding = AssemblyEpochBinding.standalone()
+        var events: [AudioAssemblerEvent] = []
+        let assembler = try CompressedAudioAssembler(trackSet: tracks,
+            generationProvider: { .init(rawValue: 1) }, eventSink: { events.append($0) },
+            formatState: AssemblyFormatState(trackSet: tracks), binding: binding)
+        try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .zero))
+        try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .invalid, isCorrupt: true))
+        XCTAssertEqual(events.decodeBreakReasons, [.corruptPacket])
+        XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .invalid)))
+        try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: CMTime(value: 2, timescale: 1)))
+        _ = binding.rebind()
+        XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .invalid)))
+    }
+
+    func testRejectedADTSFrameRevokesMissingTimestampContinuation() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let adts = makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false)
+        var wrongRate = adts
+        wrongRate[2] = (wrongRate[2] & 0xC3) | (4 << 2)
+        for rejected in [Data([0, 1]), wrongRate] {
+            var events: [AudioAssemblerEvent] = []
+            let assembler = try CompressedAudioAssembler(trackSet: tracks,
+                generationProvider: { .init(rawValue: 1) }, eventSink: { events.append($0) },
+                formatState: AssemblyFormatState(trackSet: tracks))
+            try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .zero))
+            try assembler.push(AssemblerTestFixtures.audioPacket(data: rejected, codec: .aac, pts: .invalid))
+            XCTAssertEqual(events.decodeBreakReasons.count, 1)
+            XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .invalid)))
+        }
+    }
+
+    func testTimelineDiscontinuityCannotReuseADTSMissingTimestampAnchor() throws {
+        let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data())
+        let adts = makeADTSFrame(payload: Data([0x21, 0x22]), hasCRC: false)
+        for reason in [DemuxDiscontinuityReason.timelineReset, .formatChange] {
+            let timeline = HLSTimelineCoordinator()
+            _ = try timeline.consume(.tracks(tracks))
+            _ = try timeline.consume(.packet(AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .zero)))
+            _ = try timeline.consume(.discontinuity(tracks, reason: reason))
+            XCTAssertThrowsError(try timeline.consume(.packet(
+                AssemblerTestFixtures.audioPacket(data: adts, codec: .aac, pts: .invalid))))
+        }
     }
 
     func testExplicitHEAACV1AndV2Configurations() throws {

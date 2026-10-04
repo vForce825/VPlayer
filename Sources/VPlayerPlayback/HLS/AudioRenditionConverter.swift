@@ -18,12 +18,14 @@ final class AudioRenditionConverter {
     private(set) var nextSourceSampleIndex: Int64 = 0
     private(set) var outputSampleCount: Int64 = 0
     private let inputChannels: Int
+    private let inputRate: Int
     private var native: OpaquePointer?
     private var drained = false
     init(inputLabels: [RenditionChannelLabel], inputRate: Int, output: AudioRenditionOutput) throws {
         let input = try RenditionAudioLayout(labels: inputLabels)
         outputLayout = try output == .stereo ? RenditionAudioLayout(labels: [.l,.r]) : input.canonical
         inputChannels = inputLabels.count
+        self.inputRate = inputRate
         guard inputRate >= 1, inputRate <= 0xFFFFFF else { throw AACRenditionFailure.invalidInput }
         let matrix: [Double]
         if output == .stereo {
@@ -37,9 +39,54 @@ final class AudioRenditionConverter {
         guard status == 0, native != nil else { throw AACRenditionFailure.framework(status) }
     }
     deinit { vp_ffmpeg_audio_converter_destroy(native) }
+    /// Decoder PTS, not decoded-frame arrival order, determines source coverage.
+    /// Quantize once to the nearest source sample (container time bases may be coarser).
+    func convert(_ decoded: SystemHLSDecodedPCMBlock) throws -> AudioRenditionPCMBlock {
+        try convert(decoded.samples, sourceSampleIndex: sourceSampleIndex(for: decoded))
+    }
+
+    /// Materialize only one admitted silence chunk. The graph pumps it before asking
+    /// for another, so an ordinary multi-second gap never becomes one large allocation
+    /// or gets compressed out of the timeline. Its cancellation/publication fences still
+    /// bound how much work can run ahead. Direct array calls retain their per-call cap.
+    func fillGap(before decoded: SystemHLSDecodedPCMBlock) throws -> AudioRenditionPCMBlock? {
+        let index = try sourceSampleIndex(for: decoded)
+        guard index > nextSourceSampleIndex else { return nil }
+        var frames = Int(min(16_384, index - nextSourceSampleIndex))
+        // Low explicit rates can expand one source chunk beyond the native output
+        // cap. Capacity includes the current SRC delay and does not consume input;
+        // find an admissible chunk before allocating or changing either sample clock.
+        var capacity = vp_ffmpeg_audio_converter_capacity(native, Int32(frames))
+        while capacity == -EOVERFLOW, frames > 1 {
+            frames /= 2
+            capacity = vp_ffmpeg_audio_converter_capacity(native, Int32(frames))
+        }
+        guard capacity != -EOVERFLOW else { throw AACRenditionFailure.capacityExceeded }
+        guard capacity > 0 else { throw AACRenditionFailure.framework(capacity) }
+        return try convert([Float](repeating: 0, count: frames * inputChannels),
+                           sourceSampleIndex: nextSourceSampleIndex)
+    }
+
+    private func sourceSampleIndex(for decoded: SystemHLSDecodedPCMBlock) throws -> Int64 {
+        guard !drained, decoded.sampleRate == inputRate, decoded.channelCount == inputChannels,
+              !decoded.samples.isEmpty, decoded.samples.count % inputChannels == 0,
+              decoded.samples.count / inputChannels <= 16_384,
+              decoded.samples.allSatisfy({ $0.isFinite }),
+              decoded.presentationTimeStamp.isNumeric, decoded.presentationTimeStamp.epoch == 0 else {
+            throw AACRenditionFailure.invalidInput
+        }
+        let delta = CMTimeSubtract(decoded.presentationTimeStamp, CMTime(value: 10, timescale: 1))
+        let index = CMTimeConvertScale(delta, timescale: Int32(inputRate), method: .roundHalfAwayFromZero)
+        guard index.isNumeric, index.epoch == 0, index.timescale == Int32(inputRate),
+              !index.value.addingReportingOverflow(Int64(decoded.samples.count / inputChannels)).overflow else {
+            throw AACRenditionFailure.invalidInput
+        }
+        return index.value
+    }
+
     func convert(_ samples: [Float], sourceSampleIndex: Int64) throws -> AudioRenditionPCMBlock {
         guard !drained, samples.count % inputChannels == 0, samples.count / inputChannels <= 16_384,
-              samples.allSatisfy({ $0.isFinite && abs($0) <= 1 }) else { throw AACRenditionFailure.invalidInput }
+              samples.allSatisfy({ $0.isFinite }) else { throw AACRenditionFailure.invalidInput }
         let frames = samples.count / inputChannels
         let (end, overflow) = sourceSampleIndex.addingReportingOverflow(Int64(frames))
         guard !overflow else { throw AACRenditionFailure.invalidInput }

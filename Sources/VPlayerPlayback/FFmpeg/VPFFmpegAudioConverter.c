@@ -85,7 +85,7 @@ int32_t vp_ffmpeg_audio_converter_convert(VPFFAudioConverter *owned,
     if ((frames && !reordered) || !converted) { free(reordered); free(converted); return -ENOMEM; }
     for (int frame = 0; frame < frames; ++frame) for (int ch = 0; ch < owned->inputs; ++ch) {
         float value = input[frame * owned->inputs + ch];
-        if (!isfinite(value) || fabsf(value) > 1) { free(reordered); free(converted); return -EINVAL; }
+        if (!isfinite(value)) { free(reordered); free(converted); return -EINVAL; }
         reordered[frame * owned->inputs + owned->input_order[ch]] = value;
     }
     const uint8_t *in[] = {(const uint8_t *)reordered};
@@ -93,9 +93,11 @@ int32_t vp_ffmpeg_audio_converter_convert(VPFFAudioConverter *owned,
     int result = swr_convert(owned->swr, out, capacity, frames ? in : NULL, frames);
     for (int frame = 0; frame < result; ++frame) for (int ch = 0; ch < owned->outputs; ++ch) {
         double value = converted[frame * owned->outputs + owned->output_order[ch]];
-        // 不允许 limiter 或 clamp；超出可表示的安全幅度时终止该输出。
-        if (!isfinite(value) || fabs(value) > 1.0000000000000002) { result = -ERANGE; break; }
-        output[frame * owned->outputs + ch] = (float)value;
+        // Floating-point codec output and sinc SRC may legally exceed full scale.
+        // Preserve headroom through mixing/SRC, then saturate at the normalized
+        // AAC encoder boundary. Non-finite results still fail closed.
+        if (!isfinite(value)) { result = -ERANGE; break; }
+        output[frame * owned->outputs + ch] = (float)fmax(-1.0, fmin(1.0, value));
     }
     free(reordered); free(converted);
     return result;

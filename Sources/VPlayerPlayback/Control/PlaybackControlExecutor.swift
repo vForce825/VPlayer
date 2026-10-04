@@ -151,7 +151,13 @@ final class PlaybackControlExecutor: @unchecked Sendable {
                 switch safetyIngress.performPlaybackBudget(action) {
                 case .retry: continue
                 case .rejected: return
-                case .performed(let value): result = value; return
+                case .performed(let value):
+                    result = value
+                    // The Cell has unlocked, but this executor still owns the
+                    // accepted result and its resource graph. Publish its cause
+                    // before a later reconciliation can choose a generic failure.
+                    eventDrainRegistry?.publishPlaybackBudgetTerminal(action, application: value)
+                    return
                 }
             }
         }

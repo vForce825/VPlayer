@@ -107,114 +107,125 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(harness.clock.snapshot().rate, 1)
     }
 
-    func testAudioOnlyReadinessUpdatesPreserveSupplyObservationAndAdjustedRate() async throws {
+    func testSteadyLiveAudioSupplyNeverRetimesTheSharedClock() async throws {
+        // 同步器在两个非零速率之间切换会让系统 audio renderer 自动清空已排队音频，
+        // 实机表现为约每 30 秒一次断音。稳态供给即使低于旧补偿目标也只能保持名义速率 1。
         let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
+        let holds = ManualPipelineDelayScheduler()
         let harness = makeHarness(
             useRealCompressedAudio: true,
             audioDiagnosticsNow: virtualTime.now,
-            audioSupplyTimeProvider: virtualTime.now
+            audioSupplyHoldScheduler: holds.schedule
         )
         let generation = try await openRealAudioSupplyTimeline(harness)
+        let baseline = harness.clock.snapshot()
+        var observedRates: Set<Float> = []
+        // 1_500 个 AAC 包约 32 秒，跨过旧策略的 30 秒观察窗口。
         _ = try await feedRealAACSupply(
             harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001
+            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001,
+            onEachFrame: { observedRates.insert(harness.clock.snapshot().rate) }
         )
 
-        let adjustedRate = harness.clock.snapshot().rate
-        XCTAssertLessThan(adjustedRate, 1,
-                          "持续低水位必须形成调速；重复的 ready 状态不能每包清空观察窗口")
-        XCTAssertGreaterThanOrEqual(adjustedRate, 0.998 - 0.000_001)
-        XCTAssertTrue(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
-
-        // 同一就绪周期的刷新必须保留已应用倍率，不得重新应用名义速率 1。
-        for _ in 0..<4 {
-            harness.pipeline.receive(audioReadiness: .available, generation: generation)
-            harness.pipeline.refreshReadiness()
-            _ = await harness.pipeline.debugSnapshot()
-            XCTAssertEqual(harness.clock.snapshot().rate, adjustedRate)
-        }
+        XCTAssertEqual(observedRates, [1], "稳态供给不能把共享时钟调到 1 以外的任何速率")
+        XCTAssertEqual(harness.clock.snapshot().anchors.count, baseline.anchors.count,
+                       "稳态供给不能重新锚定共享时钟")
+        XCTAssertEqual(harness.clock.snapshot().pauses, baseline.pauses,
+                       "供给余量健康时不能暂停共享时钟")
+        XCTAssertEqual(holds.pendingCount, 0)
     }
 
-    func testRevokedAudioSupplyRateCannotRestartFromLateCoverageAndReauthorizationIsFresh() async throws {
+    func testAudioSupplyDeficitBrieflyHoldsTheSameClockWithoutReanchorOrFlush() async throws {
         let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
+        let holds = ManualPipelineDelayScheduler()
         let harness = makeHarness(
             useRealCompressedAudio: true,
             audioDiagnosticsNow: virtualTime.now,
-            audioSupplyTimeProvider: virtualTime.now
+            audioSupplyHoldScheduler: holds.schedule
         )
         let generation = try await openRealAudioSupplyTimeline(harness)
-        let nextFrame = try await feedRealAACSupply(
-            harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001
-        )
-        XCTAssertLessThan(harness.clock.snapshot().rate, 1)
-
-        harness.pipeline.setPlaybackRate(0)
-        _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 0)
-        virtualTime.set(1_100)
-        for frame in nextFrame..<(nextFrame + 48) {
-            harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
-                id: frame + 1, generation: generation,
-                pts: CMTime(value: Int64(frame) * 1_024, timescale: 48_000),
-                duration: CMTime(value: 1_024, timescale: 48_000)
-            )))
-        }
-        harness.pipeline.receive(audioReadiness: .available, generation: generation)
-        harness.pipeline.refreshReadiness()
-        _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 0,
-                       "晚到的连续覆盖及 readiness 刷新不能重新签发播放授权")
-
-        harness.pipeline.setPlaybackRate(1)
-        harness.pipeline.refreshReadiness()
-        _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 1,
-                       "新的播放授权必须丢弃上一轮已经形成的补偿倍率")
-        _ = try await feedRealAACSupply(
-            harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: nextFrame + 48, frameCount: 470,
-            firstObservationTime: 1_101
-        )
-        XCTAssertEqual(harness.clock.snapshot().rate, 1,
-                       "新观察不足十几秒，不能沿用旧的三十秒窗口立即调速")
-    }
-
-    func testNonUnitNominalRateDoesNotReuseOrAccumulateLiveAudioSupplyAdjustment() async throws {
-        let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
-        let harness = makeHarness(
-            useRealCompressedAudio: true,
-            audioDiagnosticsNow: virtualTime.now,
-            audioSupplyTimeProvider: virtualTime.now
-        )
-        let generation = try await openRealAudioSupplyTimeline(harness)
+        let audio = try XCTUnwrap(harness.compressedAudio)
+        let baseline = harness.clock.snapshot()
         var nextFrame = try await feedRealAACSupply(
             harness, generation: generation, virtualTime: virtualTime,
-            firstFrame: 16, frameCount: 1_500, firstObservationTime: 1_001
+            firstFrame: 16, frameCount: 48, firstObservationTime: 1_001
         )
-        XCTAssertLessThan(harness.clock.snapshot().rate, 1)
+        XCTAssertEqual(holds.pendingCount, 0)
 
-        // 本次直播补偿只作用于名义速率 1；其他授权速率保持调用方请求。
-        harness.pipeline.setPlaybackRate(2)
+        // 供给落后于硬件时钟：已接纳音频只领先 10ms，低于输出延迟加安全余量。
+        let deficitLead = CMTime(value: 1, timescale: 100)
+        nextFrame = try await feedRealAACSupply(
+            harness, generation: generation, virtualTime: virtualTime,
+            firstFrame: nextFrame, frameCount: 1, firstObservationTime: 1_002,
+            lead: deficitLead
+        )
+
+        let held = harness.clock.snapshot()
+        XCTAssertEqual(held.rate, 0, "余量不足时必须以普通暂停补足余量")
+        XCTAssertEqual(held.pauses, baseline.pauses + 1)
+        XCTAssertEqual(held.anchors.count, baseline.anchors.count,
+                       "补足余量不能重新锚定，避免 flush 与重播")
+        XCTAssertTrue(audio.pipeline.isReadyForPlayback, "普通暂停不能清空音频队列")
+        XCTAssertNotNil(audio.pipeline.acceptedCoverage)
+        XCTAssertEqual(holds.pendingCount, 1)
+        let delay = try XCTUnwrap(Self.seconds(of: try XCTUnwrap(holds.delays.last)))
+        // 低余量可能在最新一包被接纳前或接纳后被观察到，因此允许一个 AAC 包的差异。
+        let expectedHold = audio.pipeline.anchorLeadTime.seconds + 0.2 - deficitLead.seconds
+        let packetSeconds = CMTime(value: 1_024, timescale: 48_000).seconds
+        XCTAssertGreaterThanOrEqual(delay, expectedHold - 0.002, "暂停时长应把余量补回目标值")
+        XCTAssertLessThanOrEqual(delay, expectedHold + packetSeconds + 0.002)
+
+        // 暂停期间继续到达的音频不能叠加第二次暂停。
+        _ = try await feedRealAACSupply(
+            harness, generation: generation, virtualTime: virtualTime,
+            firstFrame: nextFrame, frameCount: 4, firstObservationTime: 1_003,
+            lead: deficitLead
+        )
+        XCTAssertEqual(holds.pendingCount, 1)
+        XCTAssertEqual(harness.clock.snapshot().pauses, baseline.pauses + 1)
+
+        XCTAssertTrue(holds.fireNext())
         _ = await harness.pipeline.debugSnapshot()
-        XCTAssertEqual(harness.clock.snapshot().rate, 2,
-                       "切换名义速率必须丢弃此前的直播补偿倍率")
+        let resumed = harness.clock.snapshot()
+        XCTAssertEqual(resumed.rate, 1, "暂停结束后以原名义速率继续，系统不会 flush")
+        XCTAssertEqual(resumed.anchors.count, baseline.anchors.count)
+        XCTAssertTrue(audio.pipeline.isReadyForPlayback)
+    }
 
-        // 再推进约 34 秒低水位，跨过完整观察窗口，不能形成新的二倍速补偿。
-        let chunkDuration = 200 * CMTime(value: 1_024, timescale: 48_000).seconds
-        for chunk in 0..<8 {
-            nextFrame = try await feedRealAACSupply(
-                harness, generation: generation, virtualTime: virtualTime,
-                firstFrame: nextFrame, frameCount: 200,
-                firstObservationTime: 1_040 + Double(chunk) * chunkDuration
+    func testExpiredAudioSupplyHoldCannotRestartRevokedOrPausedOutput() async throws {
+        for revokeByPause in [false, true] {
+            let virtualTime = PipelineAudioDiagnosticsClock(value: 1_000)
+            let holds = ManualPipelineDelayScheduler()
+            let harness = makeHarness(
+                useRealCompressedAudio: true,
+                audioDiagnosticsNow: virtualTime.now,
+                audioSupplyHoldScheduler: holds.schedule
             )
-            harness.pipeline.receive(audioReadiness: .available, generation: generation)
-            harness.pipeline.refreshReadiness()
+            let generation = try await openRealAudioSupplyTimeline(harness)
+            let nextFrame = try await feedRealAACSupply(
+                harness, generation: generation, virtualTime: virtualTime,
+                firstFrame: 16, frameCount: 48, firstObservationTime: 1_001
+            )
+            _ = try await feedRealAACSupply(
+                harness, generation: generation, virtualTime: virtualTime,
+                firstFrame: nextFrame, frameCount: 1, firstObservationTime: 1_002,
+                lead: CMTime(value: 1, timescale: 100)
+            )
+            XCTAssertEqual(holds.pendingCount, 1)
+
+            if revokeByPause {
+                harness.pipeline.setPaused(true, readinessCycle: 1)
+            } else {
+                harness.pipeline.setPlaybackRate(0)
+            }
             _ = await harness.pipeline.debugSnapshot()
-            XCTAssertEqual(harness.clock.snapshot().rate, 2,
-                           "超过观察窗口的有效覆盖和 readiness 更新也必须保留名义速率 2")
+            XCTAssertTrue(holds.fireNext())
+            _ = await harness.pipeline.debugSnapshot()
+            XCTAssertEqual(harness.clock.snapshot().rate, 0,
+                           "过期的补余量暂停不能重新签发播放授权 (pause=\(revokeByPause))")
         }
     }
+
 
     func testAuthorizedOutputRateResumesAfterDisplayReanchor() async throws {
         let harness = makeHarness()
@@ -543,6 +554,20 @@ final class PlaybackPipelineTests: XCTestCase {
                     if case .ready = $0 { return true }
                     return false
                 }.count == 1
+        }
+
+        if harness.clock.snapshot().anchors.count != 1 {
+            let state = await harness.pipeline.debugSnapshot()
+            let receiver = replacement.snapshot
+            let coverage = audio.pipeline.acceptedCoverage
+            print("RETRY_PREROLL_FAILURE terminal=\(state.isTerminal) paused=\(state.isPaused) "
+                + "videoRequired=\(state.requiredVideoFrameCount) videoAdmission=\(state.videoAdmissionOpen) "
+                + "pendingDecode=\(state.pendingVideoDecodeCount) outstandingDecode=\(state.outstandingVideoDecodeCount) "
+                + "audioReady=\(audio.pipeline.isReadyForPlayback) "
+                + "audioRouteReady=\(audio.pipeline.isOutputRouteReadyForSharedAnchor) "
+                + "acceptedCount=\(receiver.enqueuedPTS.count) pendingCount=\(receiver.pendingPTS.count) "
+                + "requestCount=\(receiver.requestCount) observationCount=\(receiver.observationStartCount) "
+                + "coveragePresent=\(coverage != nil) anchors=\(harness.clock.snapshot().anchors.count)")
         }
 
         XCTAssertEqual(
@@ -6853,6 +6878,262 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertLessThanOrEqual(resumedSnapshot.deferredPacketCount, PlaybackPipeline.deferredPacketCapacity)
     }
 
+    func testNaturalEOFDrainsParserAndNormalizerTailsBeforeOutputAcceptanceAndClockEnd() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        await withCheckedContinuation { continuation in
+            harness.executor.submit {
+                harness.assemblers.audio.drainEvents = [.frame(PlaybackFakeMedia.audioFrame(
+                    id: 99, generation: generation, pts: CMTime(value: 1, timescale: 4),
+                    duration: CMTime(value: 1, timescale: 4)))]
+                continuation.resume()
+            }
+        }
+        try await openInitialSharedTimeline(harness, generation: generation)
+        harness.pipeline.setPlaybackRate(1)
+        harness.renderer.setNaturalEOFDrainReady(false)
+        harness.demux.emit(.endOfStream)
+        try await eventually {
+            harness.audio.snapshot().samples.contains { $0.id == 99 }
+                && harness.renderer.snapshot().frames.contains { $0.sourceAccessUnitID == 2 }
+        }
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        harness.clock.setTime(CMTime(value: 499, timescale: 1_000))
+        harness.renderer.setNaturalEOFDrainReady(true)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped), "Accepted media still has an audible tail")
+        harness.renderer.setNaturalEOFDrainReady(false)
+        harness.clock.setTime(CMTime(value: 1, timescale: 2))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped), "Clock time cannot replace output acceptance")
+        harness.renderer.setNaturalEOFDrainReady(true)
+        try await eventually { harness.events.snapshot().contains(.stopped) }
+    }
+
+    func testShortFiniteAVOpensWithCompleteTailBelowLiveStartupTargets() async throws {
+        let harness = makeHarness(requiredVideoFrames: 3, useRealCompressedAudio: true)
+        let generation = try await configure(harness)
+        let audio = try XCTUnwrap(harness.compressedAudio)
+        let output = try XCTUnwrap(audio.renderers.snapshot.first)
+        output.configureReadiness(ready: false, sufficient: false)
+        let audioDuration = CMTime(value: 1_024, timescale: 48_000)
+        harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(id: 1,
+            generation: generation, pts: .zero, duration: audioDuration)))
+        harness.pipeline.receive(decoder: harness.frameEvent(try PlaybackFakeMedia.decodedFrame(
+            id: 0, generation: generation, pts: .zero, interlaced: false)))
+        harness.pipeline.setPlaybackRate(1)
+        harness.demux.emit(.endOfStream)
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+        output.configureReadiness(ready: true, sufficient: false)
+        output.fireReady()
+        try await eventually { harness.clock.snapshot().rate == 1 }
+        XCTAssertEqual(harness.renderer.snapshot().frames.count, 1)
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        XCTAssertTrue(audio.pipeline.isDrainedForNaturalEOF)
+        XCTAssertEqual(audio.synchronizer.removalCount, 0, "Accepted tails must play before renderer removal")
+        harness.clock.setTime(CMTime(value: 1, timescale: 25))
+        // Real AudioRenderPipeline awaits physical removal; its fake synchronizer
+        // intentionally holds that acknowledgement until the test supplies it.
+        try await eventually { audio.synchronizer.removalCount == 1 }
+        guard audio.synchronizer.removalCount == 1 else { return }
+        let completingSnapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertTrue(completingSnapshot.isTerminal, "The finite tail reached teardown")
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped), "Natural completion must await removal")
+        audio.synchronizer.completeRemoval(index: 0, didRemove: true)
+        try await eventually { harness.events.snapshot().contains(.stopped) }
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+    }
+
+    func testPausedFiniteVideoOnlyRemainderResumesWithoutReplayingEndedAudio() async throws {
+        for resetOutput in [false, true] {
+            let harness = makeHarness(requiredVideoFrames: 3, useRealCompressedAudio: true)
+            let generation = try await configure(harness)
+            let audio = try XCTUnwrap(harness.compressedAudio)
+            let output = try XCTUnwrap(audio.renderers.snapshot.first)
+            output.configureReadiness(ready: true, sufficient: false)
+            harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(id: 1,
+                generation: generation, pts: .zero, duration: CMTime(value: 1_024, timescale: 48_000))))
+            harness.pipeline.receive(decoder: harness.frameEvent(try PlaybackFakeMedia.decodedFrame(
+                id: 0, generation: generation, pts: .zero, interlaced: false)))
+            harness.pipeline.setPlaybackRate(1)
+            harness.demux.emit(.endOfStream)
+            try await eventually { harness.clock.snapshot().rate == 1 }
+            let pauseTime = CMTime(value: 30, timescale: 1_000)
+            harness.clock.setTime(pauseTime)
+            audio.synchronizer.setCurrentTime(pauseTime)
+            harness.pipeline.setPaused(true, readinessCycle: 1)
+            _ = await harness.pipeline.debugSnapshot()
+            if resetOutput { harness.renderer.flush(to: generation) }
+            let videoFlushes = harness.renderer.snapshot().flushes.count
+            let audioFlushes = output.snapshot.operations.filter { $0 == "flush" }.count
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertEqual(harness.clock.snapshot().rate, 0)
+            XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+            harness.pipeline.setPaused(false, readinessCycle: 2)
+            harness.pipeline.setPlaybackRate(1)
+            try await eventually { harness.clock.snapshot().rate == 1 }
+            XCTAssertGreaterThanOrEqual(CMTimeCompare(harness.clock.currentTime, pauseTime), 0)
+            XCTAssertEqual(harness.renderer.snapshot().flushes.count, videoFlushes + (resetOutput ? 1 : 0))
+            XCTAssertEqual(output.snapshot.operations.filter { $0 == "flush" }.count, audioFlushes)
+            XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+            XCTAssertTrue(audio.pipeline.isDrainedForNaturalEOF)
+            XCTAssertEqual(audio.synchronizer.removalCount, 0, "Resume must preserve the unplayed video tail")
+            harness.clock.setTime(CMTime(value: 40, timescale: 1_000))
+            try await eventually { audio.synchronizer.removalCount == 1 }
+            guard audio.synchronizer.removalCount == 1 else { return }
+            let completingSnapshot = await harness.pipeline.debugSnapshot()
+            XCTAssertTrue(completingSnapshot.isTerminal, "The resumed finite tail reached teardown")
+            XCTAssertFalse(harness.events.snapshot().contains(.stopped), "Natural completion must await removal")
+            audio.synchronizer.completeRemoval(index: 0, didRemove: true)
+            try await eventually { harness.events.snapshot().contains(.stopped) }
+            XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+        }
+    }
+
+    func testPausedFiniteLatencyOnlyRemainderResumesWithoutAnExpiredAudioAnchor() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        harness.audio.setRouteSnapshot(AudioOutputRouteSnapshot(category: .hdmi, reason: .initial,
+            revision: 0, outputLatency: 0.1, ioBufferDuration: 0))
+        harness.pipeline.setPlaybackRate(1)
+        harness.demux.emit(.endOfStream)
+        try await eventually { harness.renderer.snapshot().frames.contains { $0.sourceAccessUnitID == 2 } }
+        harness.clock.setTime(CMTime(value: 300, timescale: 1_000))
+        harness.pipeline.setPaused(true, readinessCycle: 1)
+        _ = await harness.pipeline.debugSnapshot()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+        harness.pipeline.setPaused(false, readinessCycle: 2)
+        harness.pipeline.setPlaybackRate(1)
+        try await eventually { harness.clock.snapshot().rate == 1 }
+        XCTAssertEqual(harness.clock.currentTime, CMTime(value: 300, timescale: 1_000))
+        harness.clock.setTime(CMTime(value: 349, timescale: 1_000))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        harness.clock.setTime(CMTime(value: 350, timescale: 1_000))
+        try await eventually { harness.events.snapshot().contains(.stopped) }
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+    }
+
+    func testEmptyResetCannotEraseMissingEOFTailAcceptanceProof() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        harness.demux.emit(.endOfStream)
+        try await eventually { harness.renderer.snapshot().frames.contains { $0.sourceAccessUnitID == 2 } }
+        // The queue is discarded before the paused clock has played its tail.
+        await withCheckedContinuation { continuation in
+            harness.executor.submit {
+                harness.renderer.flush(to: generation)
+                harness.clock.setTime(CMTime(value: 1, timescale: 4))
+                continuation.resume()
+            }
+        }
+        let failure = PlaybackCoreError.videoRendererFailed("renderer.eof-tail-unaccepted")
+        try await eventually { harness.events.snapshot().contains(.failed(failure)) }
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+    }
+
+    func testRejectedFinalVideoTailFailsInsteadOfPublishingNaturalCompletion() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        let failure = PlaybackCoreError.videoRendererFailed("renderer.enqueue-cancelled")
+        harness.renderer.setNaturalEOFDrainFailure(failure)
+        harness.demux.emit(.endOfStream)
+        try await eventually { harness.events.snapshot().contains(.failed(failure)) }
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+    }
+
+    func testPausedNaturalEOFPreservesTailUntilExplicitResume() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        harness.pipeline.setPaused(true, readinessCycle: 1)
+        _ = await harness.pipeline.debugSnapshot()
+        let flushCount = harness.renderer.snapshot().flushes.count
+        harness.demux.emit(.endOfStream)
+        try await Task.sleep(for: .milliseconds(50))
+        let pausedSnapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertFalse(pausedSnapshot.isTerminal)
+        XCTAssertEqual(harness.renderer.snapshot().flushes.count, flushCount)
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+        harness.pipeline.setPaused(false, readinessCycle: 2)
+        harness.pipeline.setPlaybackRate(1)
+        try await eventually { harness.clock.snapshot().rate == 1 }
+        try await eventually { harness.renderer.snapshot().frames.contains { $0.sourceAccessUnitID == 2 } }
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        harness.clock.setTime(CMTime(value: 1, timescale: 4))
+        try await eventually { harness.events.snapshot().contains(.stopped) }
+    }
+
+    func testResumeAfterFinalVideoFrameStillPlaysRemainingFiniteAudioTail() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        harness.pipeline.setPlaybackRate(1)
+        harness.demux.emit(.endOfStream)
+        try await eventually { harness.renderer.snapshot().frames.contains { $0.sourceAccessUnitID == 2 } }
+        let acceptedVideoEnd = try XCTUnwrap(harness.renderer.naturalEOFAcceptedEndPTS)
+        XCTAssertLessThan(CMTimeCompare(acceptedVideoEnd, CMTime(value: 1, timescale: 5)), 0)
+        harness.clock.setTime(CMTime(value: 1, timescale: 5))
+        harness.pipeline.setPaused(true, readinessCycle: 1)
+        _ = await harness.pipeline.debugSnapshot()
+        harness.pipeline.setPaused(false, readinessCycle: 2)
+        harness.pipeline.setPlaybackRate(1)
+        try await eventually { harness.clock.snapshot().rate == 1 }
+        XCTAssertNil(harness.renderer.naturalEOFAcceptedEndPTS,
+            "The audio-only reanchor clears the already consumed video queue")
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        XCTAssertGreaterThanOrEqual(CMTimeCompare(harness.clock.currentTime, CMTime(value: 1, timescale: 5)), 0)
+        harness.clock.setTime(CMTime(value: 1, timescale: 4))
+        try await eventually { harness.events.snapshot().contains(.stopped) }
+        XCTAssertFalse(harness.events.snapshot().contains { if case .failed = $0 { true } else { false } })
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+    }
+
+    func testExplicitStopCancelsNaturalTailWaitWithoutAdvancingClock() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        harness.demux.emit(.endOfStream)
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped))
+        await harness.pipeline.stop()
+        let stoppedSnapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertTrue(stoppedSnapshot.isTerminal)
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(harness.events.snapshot().filter { $0 == .stopped }.count, 1)
+    }
+
+    func testNaturalEOFWaitsForDelayedPassthroughProcessingCompletion() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        harness.audio.setReady(true)
+        harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(id: 1,
+            generation: generation, pts: .zero, duration: CMTime(value: 1, timescale: 4))))
+        harness.processor.setAutomaticallyCompletes(false)
+        harness.pipeline.receive(decoder: harness.frameEvent(try PlaybackFakeMedia.decodedFrame(
+            id: 0, generation: generation, pts: .zero, interlaced: false)))
+        harness.demux.emit(.endOfStream)
+        try await eventually { !harness.processor.snapshot().metadata.isEmpty }
+        harness.clock.setTime(CMTime(value: 1, timescale: 4))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(harness.events.snapshot().contains(.stopped),
+            "Even a clock beyond the audio tail cannot discard in-flight video processing")
+        // Keep the next anchor inside retained media after observing the blocked drain.
+        harness.clock.setTime(.zero)
+        harness.processor.completePending()
+        try await eventually { !harness.renderer.snapshot().frames.isEmpty }
+        harness.clock.setTime(CMTime(value: 1, timescale: 4))
+        try await eventually { harness.events.snapshot().contains(.stopped) }
+    }
+
     func testEndCancellationAndFailureUseDistinctTerminalPaths() async throws {
         let ended = makeHarness()
         let endedGeneration = try await configure(ended)
@@ -7059,6 +7340,12 @@ final class PlaybackPipelineTests: XCTestCase {
                 generation: current,
                 randomAccess: true
             )))
+            // Generation advancement precedes the queued RAP/configure work.
+            // A decoder callback can only carry this generation's real identity
+            // after that configuration has reached the decoder.
+            try await eventually {
+                harness.decoder.snapshot().containsConfiguration(current)
+            }
             var callbacks = [
                 try PlaybackFakeMedia.decodedFrame(id: 1, generation: oldGeneration, pts: .zero, interlaced: false),
                 try PlaybackFakeMedia.decodedFrame(id: 2, generation: current, pts: .zero, interlaced: false),
@@ -7901,13 +8188,17 @@ final class PlaybackPipelineTests: XCTestCase {
         virtualTime: PipelineAudioDiagnosticsClock,
         firstFrame: UInt64,
         frameCount: UInt64,
-        firstObservationTime: TimeInterval
+        firstObservationTime: TimeInterval,
+        lead: CMTime = CMTime(value: 8, timescale: 100),
+        onEachFrame: () -> Void = {}
     ) async throws -> UInt64 {
         let audio = try XCTUnwrap(harness.compressedAudio)
         let packetDuration = CMTime(value: 1_024, timescale: 48_000)
+        defer { onEachFrame() }
         for frame in firstFrame..<(firstFrame + frameCount) {
+            onEachFrame()
             let end = CMTime(value: Int64(frame + 1) * 1_024, timescale: 48_000)
-            let clockTime = CMTimeSubtract(end, CMTime(value: 8, timescale: 100))
+            let clockTime = CMTimeSubtract(end, lead)
             harness.clock.setTime(clockTime)
             audio.synchronizer.setCurrentTime(clockTime)
             virtualTime.set(firstObservationTime
@@ -7919,6 +8210,17 @@ final class PlaybackPipelineTests: XCTestCase {
             _ = await harness.pipeline.debugSnapshot()
         }
         return firstFrame + frameCount
+    }
+
+    private static func seconds(of interval: DispatchTimeInterval) -> Double? {
+        switch interval {
+        case let .seconds(value): Double(value)
+        case let .milliseconds(value): Double(value) / 1_000
+        case let .microseconds(value): Double(value) / 1_000_000
+        case let .nanoseconds(value): Double(value) / 1_000_000_000
+        case .never: nil
+        @unknown default: nil
+        }
     }
 
     private func configure(
@@ -8097,7 +8399,7 @@ final class PlaybackPipelineTests: XCTestCase {
         useRealCompressedAudio: Bool = false,
         routeMonitor: (any AudioRouteMonitoring)? = nil,
         audioDiagnosticsNow: AudioRenderPipeline.DiagnosticsNow? = nil,
-        audioSupplyTimeProvider: (@Sendable () -> TimeInterval)? = nil,
+        audioSupplyHoldScheduler: PlaybackPipeline.VideoDecodeStallScheduler? = nil,
         automaticallyCompleteDecoderTransitions: Bool = true,
         automaticallyCompleteDecoderSubmissions: Bool = true,
         decoderTransitionEventsInline: Bool = false,
@@ -8188,8 +8490,7 @@ final class PlaybackPipelineTests: XCTestCase {
                 eventForwarder?.send(event)
             },
             metrics: metrics,
-            audioSupplyTimeProvider: audioSupplyTimeProvider
-                ?? { ProcessInfo.processInfo.systemUptime }
+            audioSupplyHoldScheduler: audioSupplyHoldScheduler
         )
         audioRelay?.install(pipeline)
         decoder.setTransitionEventSink(
@@ -8489,15 +8790,20 @@ private struct Harness: @unchecked Sendable {
 private final class ManualPipelineDelayScheduler: @unchecked Sendable {
     private let lock = NSLock()
     private var operations: [@Sendable () -> Void] = []
+    private var requestedDelays: [DispatchTimeInterval] = []
 
     func schedule(
-        after _: DispatchTimeInterval,
+        after delay: DispatchTimeInterval,
         _ operation: @escaping @Sendable () -> Void
     ) {
-        lock.withLock { operations.append(operation) }
+        lock.withLock {
+            requestedDelays.append(delay)
+            operations.append(operation)
+        }
     }
 
     var pendingCount: Int { lock.withLock { operations.count } }
+    var delays: [DispatchTimeInterval] { lock.withLock { requestedDelays } }
 
     func fireNext() -> Bool {
         let operation = lock.withLock { () -> (@Sendable () -> Void)? in
