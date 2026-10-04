@@ -8,6 +8,50 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class AudioRenditionConverterTests: XCTestCase {
+    func testMediaGraphNativePCMImpulsesPreserveEveryStereoChannel() throws {
+        // 输入按 FFmpeg native mask 的置位顺序排列；golden 不从生产 label/matrix 推导。
+        // 必须调用 installAudioWriterIfReady 使用的同一入口，不能人工提供正确标签。
+        let rows: [(mask: UInt64, stereo: [[Float]])] = [
+            (0x4, [[1,1]]),
+            (0x3, [[1,0],[0,1]]),
+            (0x7, [[0.58578646,0],[0,0.58578646],[0.41421357,0.41421357]]),
+            (0x33, [[0.58578646,0],[0,0.58578646],[0.41421357,0],[0,0.41421357]]),
+            (0x603, [[0.58578646,0],[0,0.58578646],[0.41421357,0],[0,0.41421357]]),
+            (0x107, [[0.41421357,0],[0,0.41421357],[0.29289323,0.29289323],[0.29289323,0.29289323]]),
+            (0x37, [[0.41421357,0],[0,0.41421357],[0.29289323,0.29289323],[0.29289323,0],[0,0.29289323]]),
+            (0x607, [[0.41421357,0],[0,0.41421357],[0.29289323,0.29289323],[0.29289323,0],[0,0.29289323]]),
+            (0x3f, [[0.41421357,0],[0,0.41421357],[0.29289323,0.29289323],[0,0],[0.29289323,0],[0,0.29289323]]),
+            (0x60f, [[0.41421357,0],[0,0.41421357],[0.29289323,0.29289323],[0,0],[0.29289323,0],[0,0.29289323]]),
+            (0x137, [[0.32037723,0],[0,0.32037723],[0.22654092,0.22654092],[0.22654092,0],[0,0.22654092],[0.22654092,0.22654092]]),
+            (0x707, [[0.32037723,0],[0,0.32037723],[0.22654092,0.22654092],[0.22654092,0.22654092],[0.22654092,0],[0,0.22654092]]),
+            (0x13f, [[0.32037723,0],[0,0.32037723],[0.22654092,0.22654092],[0,0],[0.22654092,0],[0,0.22654092],[0.22654092,0.22654092]]),
+            (0x70f, [[0.32037723,0],[0,0.32037723],[0.22654092,0.22654092],[0,0],[0.22654092,0.22654092],[0.22654092,0],[0,0.22654092]]),
+            (0x637, [[0.32037723,0],[0,0.32037723],[0.22654092,0.22654092],[0.22654092,0],[0,0.22654092],[0.22654092,0],[0,0.22654092]]),
+            (0x63f, [[0.32037723,0],[0,0.32037723],[0.22654092,0.22654092],[0,0],[0.22654092,0],[0,0.22654092],[0.22654092,0],[0,0.22654092]]),
+        ]
+        for row in rows {
+            let channels = row.stereo.count
+            let track = AudioTrackDescriptor(
+                streamIndex: 0, codec: .aac, timeBase: .init(num: 1, den: 48_000),
+                sampleRate: 48_000,
+                channelLayout: .init(channelCount: Int32(channels), nativeMask: row.mask),
+                extradata: Data())
+            let converter = try SystemHLSMediaGraphAuthority.makeAudioConverter(for: track)
+            XCTAssertEqual(converter.outputLayout.labels, [.l, .r])
+            for channel in 0..<channels {
+                var nativePCM = [Float](repeating: 0, count: channels * 64)
+                nativePCM[channel] = 1
+                let block = try converter.convert(
+                    nativePCM, sourceSampleIndex: converter.nextSourceSampleIndex)
+                XCTAssertEqual(block.frameCount, 64)
+                XCTAssertEqual(Array(block.samples.prefix(2)), row.stereo[channel],
+                    "native mask \(String(row.mask, radix: 16)), PCM channel \(channel)")
+                XCTAssertTrue(block.samples.dropFirst(2).allSatisfy { $0 == 0 })
+            }
+            XCTAssertTrue(try converter.drain().samples.isEmpty)
+        }
+    }
+
     func testExplicitPositive24BitSampleRatesAreNotNarrowedByConverter() throws {
         for rate in [4_000, 384_000] {
             do {

@@ -1469,14 +1469,19 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         return admission
     }
 
+    static func makeAudioConverter(for track: AudioTrackDescriptor) throws -> AudioRenditionConverter {
+        let inputLayout = try RenditionAudioLayout(native: track.channelLayout)
+        // FFmpeg decoder 与 PCM bridge 保留 native 顺序；仅改标签为 AAC 顺序会错配声道。
+        return try AudioRenditionConverter(
+            inputLabels: inputLayout.labels,
+            inputRate: Int(track.sampleRate), output: .stereo)
+    }
+
     private func installAudioWriterIfReady() throws {
         guard audioBranch == nil, let configuration = audioConfiguration,
               let encoder = audioCalibration?.encoders.first,
               let track = tracks?.audio, let boundary, let mediaEpoch else { return }
-        let inputLayout = try RenditionAudioLayout(native: track.channelLayout)
-        let converter = try AudioRenditionConverter(
-            inputLabels: inputLayout.canonical.labels,
-            inputRate: Int(track.sampleRate), output: .stereo)
+        let converter = try Self.makeAudioConverter(for: track)
         let ownership = HLSAudioCopyOwnership(
             maximumCompressedBytes: 1 * 1_024 * 1_024,
             maximumPCMBytes: 8 * 1_024 * 1_024, capacity: 8)
