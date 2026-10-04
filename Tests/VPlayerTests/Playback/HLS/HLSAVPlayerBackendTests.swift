@@ -6,6 +6,7 @@ import AudioToolbox
 import XCTest
 import Network
 import VPlayerCore
+@testable import VPlayer
 @testable import VPlayerPlayback
 
 /// Task22-F 的 production 装配边界。整图 fixture 由 root runner 在模拟器上执行；这里先
@@ -249,6 +250,467 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         server.stop()
         let retired = await assembler.retireAndAwaitReceipt()
         XCTAssertTrue(retired, "测试必须退休真实 writer/server 图")
+    }
+
+    func testLivePublicationCommitUsesTheLoopbackMonotonicTimeDomain() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let server = try Task22LatePublicationFixtureServer(fileURL: file)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_201))
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        let before = SystemHLSLoopbackClock.nowNanoseconds()
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let after = SystemHLSLoopbackClock.nowNanoseconds()
+            let committed = try XCTUnwrap(publication.publisher?.ticket.previousPublishInstant)
+            XCTAssertGreaterThanOrEqual(committed, before,
+                "Production publication must use the same monotonic domain as HTTP residency, not segment ordinals")
+            XCTAssertLessThanOrEqual(committed, after)
+            XCTAssertFalse(server.hasSentSourceEOF)
+        } catch {
+            XCTFail("The real writer must reach its live prefix before the clock assertion: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    func testLiveLongGOPPendingSegmentPublishesWithoutAnotherCallback() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        let server = try Task22LatePublicationFixtureServer(
+            fileURL: file, sendEntireBodyWithoutEOF: true)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_202))
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        // Keep the deliberately incomplete live HTTP body inside its read budget
+        // for the whole publication observation; network timeout is a different test.
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            let initial = try XCTUnwrap(publisher.visible)
+            let video = try XCTUnwrap(publication.declaration?.video?.participantID)
+            XCTAssertEqual(initial.media[video]?.logicalSequences.last, 2)
+            gate.releaseThrough(3)
+            let nextBlocked = await Task.detached { gate.waitUntilBlocked(atLeast: 4) }.value
+            XCTAssertTrue(nextBlocked, "The next callback must be held outside the real publication graph")
+            let deadline = ContinuousClock.now + .seconds(7)
+            while publisher.visible?.media[video]?.logicalSequences.last == 2,
+                  authority.failureDiagnostic == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertNil(authority.failureDiagnostic)
+            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 3,
+                "A sealed pending 5s segment must publish when its real-time gate opens, with no callback or EOF to drive it")
+            XCTAssertFalse(publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertFalse(server.hasSentSourceEOF)
+            XCTAssertFalse(gate.didTimeout)
+        } catch {
+            XCTFail("The real long-GOP writer must reach the live gate assertion: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    func testLiveLongGOPBurstContinuesBeyondSixtyFiveSecondsWithoutEOF() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        let server = try Task22LatePublicationFixtureServer(
+            fileURL: file, sendEntireBodyWithoutEOF: true)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_203))
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        // Keep the deliberately incomplete live HTTP body inside its read budget
+        // for the whole publication observation; network timeout is a different test.
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            let video = try XCTUnwrap(publication.declaration?.video?.participantID)
+            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 2)
+            gate.release()
+            // The body arrives as a burst, but the production graph must bound its
+            // producer and keep publishing on real five-second gates. No test calls
+            // publisher.publish, finishes a writer, or manufactures a receipt.
+            let deadline = ContinuousClock.now + .seconds(75)
+            var lastSequence: UInt64 = 2
+            var maximumPending = 0
+            while lastSequence < 13, authority.failureDiagnostic == nil,
+                  ContinuousClock.now < deadline {
+                let snapshot = try XCTUnwrap(publisher.visible)
+                let current = try XCTUnwrap(snapshot.media[video]?.logicalSequences.last)
+                XCTAssertGreaterThanOrEqual(current, lastSequence)
+                lastSequence = current
+                maximumPending = max(maximumPending, publisher.pendingLogicalSequenceCount)
+                XCTAssertFalse(snapshot.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            XCTAssertNil(authority.failureDiagnostic,
+                "Continuous long-GOP input must not fail at callback 12 with an eight-segment backlog")
+            XCTAssertGreaterThanOrEqual(lastSequence, 13,
+                "A live playlist must cover at least 70 seconds of real media without natural-end drain")
+            XCTAssertLessThanOrEqual(maximumPending, 8,
+                "Fixing the clock must preserve the bounded publication backlog")
+            let coverage = try XCTUnwrap(publisher.visible?.coverage.participants.first {
+                $0.participantID == video
+            })
+            let horizon = try XCTUnwrap(coverage.ranges.last?.end)
+            XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(horizon.cmTime), 70)
+            for range in coverage.ranges {
+                XCTAssertEqual(CMTimeGetSeconds(range.duration.cmTime), 5, accuracy: 0.001,
+                    "This fixture must exercise genuine 5s GOP segments, not one-second callbacks")
+            }
+            XCTAssertFalse(server.hasSentSourceEOF)
+        } catch {
+            XCTFail("The production continuous-live path failed before its progress assertion: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired, "The continuous source must retire without relying on source EOF")
+    }
+
+    func testLiveInjectedClockRetiresTheBackpressuredProducerAndRejectsLateWake() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        let server = try Task22LatePublicationFixtureServer(
+            fileURL: file, sendEntireBodyWithoutEOF: true)
+        let clock = ManualPlaybackClock(90_000_000_000)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_204),
+            publicationClock: clock)
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        var retiredPublisher: HLSPublicationCoordinator?
+        var frozenSequence: UInt64?
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            retiredPublisher = publisher
+            XCTAssertEqual(publisher.ticket.previousPublishInstant, 90_000_000_000)
+            XCTAssertEqual(publication.store?.monotonicNowNanoseconds, 90_000_000_000,
+                "HTTP residency and publication must sample the same injected domain")
+            gate.release()
+            let deadline = ContinuousClock.now + .seconds(10)
+            while !publisher.shouldBackpressureProducer, authority.failureDiagnostic == nil,
+                  ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(publisher.shouldBackpressureProducer,
+                "The real burst-fed worker must reach a bounded common-prefix wait")
+            XCTAssertNil(authority.failureDiagnostic)
+            XCTAssertLessThanOrEqual(publisher.pendingLogicalSequenceCount, 8)
+            frozenSequence = publisher.visible?.publicationSequence
+        } catch {
+            XCTFail("The actual producer did not reach its capacity wait: \(error)")
+        }
+        gate.release()
+        // Retirement must interrupt the producer wait before joining that worker.
+        let retired = await assembler.retireAndAwaitReceipt()
+        server.stop()
+        XCTAssertTrue(retired)
+        clock.advance(nanoseconds: 150_000_000_000)
+        clock.fireDeadlineTimerEarly()
+        await Task.yield()
+        XCTAssertEqual(retiredPublisher?.visible?.publicationSequence, frozenSequence)
+        XCTAssertTrue(retiredPublisher?.isClosed == true)
+        XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+        XCTAssertEqual(publication.store?.capacityWaiterCount, 0)
+    }
+
+    func testLiveInjectedClockSourceSilenceFailsAtTheOriginalPublicationDeadline() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let server = try Task22LatePublicationFixtureServer(fileURL: file)
+        let clock = ManualPlaybackClock(90_000_000_000)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_205),
+            publicationDeadlineNanoseconds: 30_000_000_000,
+            publicationClock: clock)
+        let publication = authority.publicationForTesting
+        let gate = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            let originalTicket = publisher.ticket
+            XCTAssertEqual(originalTicket.absoluteDeadline, 120_000_000_000)
+            clock.set(119_999_999_999)
+            clock.fireDeadlineTimerEarly()
+            await Task.yield()
+            XCTAssertNil(authority.failureDiagnostic)
+            XCTAssertEqual(publisher.ticket, originalTicket)
+            clock.advance(nanoseconds: 1)
+            let deadline = ContinuousClock.now + .seconds(2)
+            while authority.failureDiagnostic == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let failure = try XCTUnwrap(authority.failureDiagnostic,
+                "No new callback is required to enforce the original publication deadline")
+            XCTAssertTrue(failure.summary.contains("deadlineExceeded"), failure.summary)
+            XCTAssertEqual(publisher.visible?.publicationSequence, 1)
+            XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+            XCTAssertFalse(server.hasSentSourceEOF)
+        } catch {
+            XCTFail("The original live deadline was not observed: \(error)")
+        }
+        gate.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    func testSelectedLiveWakeCannotFailACompletedGenuineNaturalEOF() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let server = try Task22LatePublicationFixtureServer(fileURL: file, sendEntireBodyWithoutEOF: true)
+        let clock = ManualPlaybackClock(90_000_000_000)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_206),
+            publicationClock: clock)
+        let publication = authority.publicationForTesting
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        let wake = Task22SelectedLiveWakeGate()
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            for expected in UInt64(1)..<13 {
+                let pending = try await waitForLiveTestCondition { publisher.pendingLogicalSequenceCount > 0 }
+                XCTAssertTrue(pending)
+                clock.advance(nanoseconds: 1_000_000_000)
+                let published = try await waitForLiveTestCondition {
+                    publisher.visible?.publicationSequence == expected + 1
+                }
+                XCTAssertTrue(published)
+            }
+            XCTAssertEqual(publisher.visible?.publicationSequence, 13)
+            XCTAssertEqual(publisher.pendingLogicalSequenceCount, 0,
+                "The genuine 16s source must leave only its unsealed final segment")
+            publication.installLiveWakeObserverForTesting(
+                before: { wake.beforeEntry() }, after: { wake.afterEntry() })
+            wake.arm()
+            // Select a real live timer callback at its original deadline, but hold
+            // it outside graph. The terminal segment's gate is already due.
+            clock.set(UInt64(try XCTUnwrap(publisher.ticket.absoluteDeadline)))
+            let selected = await Task.detached { wake.waitUntilSelected() }.value
+            XCTAssertTrue(selected)
+            server.finishBody() // Real demux EOF, encoder drain and terminal writer authorities.
+            try await assembler.finishAtNaturalEOF()
+            let final = try XCTUnwrap(publisher.visible)
+            XCTAssertTrue(final.media.values.allSatisfy { $0.isFinal && $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertEqual(final.publicationSequence, 14)
+            XCTAssertNil(authority.failureDiagnostic)
+            wake.release()
+            let completed = await Task.detached { wake.waitUntilCompleted() }.value
+            XCTAssertTrue(completed)
+            XCTAssertFalse(wake.didTimeout)
+            XCTAssertNil(authority.failureDiagnostic,
+                "A live closure selected before EOF cannot turn successful ENDLIST into a closed-clock failure")
+            XCTAssertEqual(publisher.visible?.publicationSequence, final.publicationSequence)
+            XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+            XCTAssertEqual(publication.store?.capacityWaiterCount, 0)
+        } catch {
+            XCTFail("Selected-live/real-EOF interleaving did not complete: \(error)")
+        }
+        wake.release()
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    func testProductionCapacityReleasePublishesOnceThroughTheGraphOwnedTimer() async throws {
+        try await checkProductionCapacityWake(.publish)
+    }
+
+    func testProductionCapacitySelectedWakeCannotPublishAfterRetirement() async throws {
+        try await checkProductionCapacityWake(.retire)
+    }
+
+    func testProductionCapacitySelectedWakeCannotReplaceTheFirstGraphFailure() async throws {
+        try await checkProductionCapacityWake(.failure)
+    }
+
+    func testProductionCapacitySelectedWakeStaysRevokedAcrossGenuineEOFHandoff() async throws {
+        try await checkProductionCapacityWake(.naturalEnd)
+    }
+
+    private enum LiveCapacityWakeOutcome { case publish, retire, failure, naturalEnd }
+
+    private func checkProductionCapacityWake(_ outcome: LiveCapacityWakeOutcome) async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let server = try Task22LatePublicationFixtureServer(fileURL: file, sendEntireBodyWithoutEOF: true)
+        let clock = ManualPlaybackClock(90_000_000_000)
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_207),
+            publicationClock: clock)
+        let publication = authority.publicationForTesting
+        let callbacks = Task22LatePublicationReceiveGate()
+        publication.installBeforeReceiveForTesting { callbacks.receive($0) }
+        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        let wake = Task22SelectedLiveWakeGate()
+        var pinned: [HLSPlaylistResponseLease] = []
+        do {
+            _ = try await assembler.startUntilPlayablePrefix()
+            let publisher = try XCTUnwrap(publication.publisher)
+            let store = try XCTUnwrap(publication.store)
+            let lastBeforeCapacity: UInt64 = outcome == .naturalEnd ? 12 : 4
+            callbacks.releaseThrough(lastBeforeCapacity + 2)
+            for expected in UInt64(1)...lastBeforeCapacity {
+                let reached = try await waitForLiveTestCondition {
+                    publisher.visible?.publicationSequence == expected || authority.failureDiagnostic != nil
+                }
+                XCTAssertTrue(reached)
+                XCTAssertNil(authority.failureDiagnostic)
+                XCTAssertEqual(publisher.visible?.publicationSequence, expected)
+                // Four real two-track generations plus the master exhaust the
+                // store's nine-snapshot bound without changing production limits.
+                if expected >= lastBeforeCapacity - 3 {
+                    for participant in try XCTUnwrap(publisher.visible).media.keys.sorted() {
+                        pinned.append(try XCTUnwrap(store.acquireSnapshot(
+                            participantID: participant, now: Int64(clock.nowNanoseconds))))
+                    }
+                }
+                if expected < lastBeforeCapacity { clock.advance(nanoseconds: 1_000_000_000) }
+            }
+            let ready = try await waitForLiveTestCondition { publisher.pendingLogicalSequenceCount > 0 }
+            XCTAssertTrue(ready)
+            clock.advance(nanoseconds: 1_000_000_000)
+            let blocked = try await waitForLiveTestCondition { store.capacityWaiterCount == 1 }
+            XCTAssertTrue(blocked, "The actual production graph must block on a real snapshot reservation")
+            XCTAssertEqual(publisher.visible?.publicationSequence, lastBeforeCapacity)
+            XCTAssertEqual(store.usage.snapshotCount, 9)
+            XCTAssertFalse(server.hasSentSourceEOF)
+            publication.installLiveWakeObserverForTesting(
+                before: { wake.beforeEntry() }, after: { wake.afterEntry() })
+            wake.arm()
+            for lease in pinned {
+                store.release(lease, completedAt: nil, now: Int64(clock.nowNanoseconds))
+            }
+            pinned.removeAll()
+            let selected = await Task.detached { wake.waitUntilSelected() }.value
+            XCTAssertTrue(selected, "Capacity release must select the production signal → timer → graph path")
+            XCTAssertEqual(publisher.visible?.publicationSequence, lastBeforeCapacity,
+                "Capacity release cannot bypass the held graph lifecycle entry with an inline CAS")
+            let releasedAt = Int64(clock.nowNanoseconds)
+            var expectedFinal = lastBeforeCapacity
+            switch outcome {
+            case .publish:
+                expectedFinal += 1
+            case .retire:
+                let retirement = Task { await assembler.retireAndAwaitReceipt() }
+                let closed = try await waitForLiveTestCondition {
+                    (try? publication.withActivePublication { true }) != true
+                }
+                XCTAssertTrue(closed)
+                callbacks.release() // Writer cleanup can now drain held callbacks into the closed graph.
+                let retired = await retirement.value
+                XCTAssertTrue(retired)
+            case .failure:
+                publication.recordFailure(NSError(domain: "Live.Capacity.FirstFailure", code: -207))
+            case .naturalEnd:
+                // Only the already sealed penultimate segment and final writer
+                // tail remain. Demux EOF is genuine; tests never sign terminal receipts.
+                callbacks.release()
+                server.finishBody()
+                var releasedAfterHandoff = false
+                for _ in 0..<4 {
+                    if publisher.visible?.media.values.allSatisfy({ $0.isFinal }) == true { break }
+                    let progressed = try await waitForLiveTestCondition {
+                        (publisher.visible?.publicationSequence ?? 0) > expectedFinal || authority.failureDiagnostic != nil
+                    }
+                    XCTAssertTrue(progressed)
+                    expectedFinal = try XCTUnwrap(publisher.visible?.publicationSequence)
+                    if !releasedAfterHandoff {
+                        // EOF has consumed the due segment under its own scope.
+                        // Release the old selected live delivery before the next
+                        // EOF timer gate, matching the native serial timer contract.
+                        wake.release()
+                        let completed = await Task.detached { wake.waitUntilCompleted() }.value
+                        XCTAssertTrue(completed)
+                        XCTAssertEqual(publisher.visible?.publicationSequence, expectedFinal)
+                        XCTAssertNil(authority.failureDiagnostic)
+                        releasedAfterHandoff = true
+                    }
+                    if publisher.visible?.media.values.allSatisfy({ $0.isFinal }) != true {
+                        clock.advance(nanoseconds: 1_000_000_000)
+                    }
+                }
+                try await assembler.finishAtNaturalEOF()
+                XCTAssertTrue(publisher.visible!.media.values.allSatisfy { $0.isFinal })
+                expectedFinal = try XCTUnwrap(publisher.visible?.publicationSequence)
+            }
+            wake.release()
+            let completed = await Task.detached { wake.waitUntilCompleted() }.value
+            XCTAssertTrue(completed)
+            XCTAssertFalse(wake.didTimeout)
+            XCTAssertEqual(publisher.visible?.publicationSequence, expectedFinal)
+            XCTAssertEqual(store.capacityWaiterCount, 0)
+            if outcome == .publish {
+                XCTAssertEqual(publisher.ticket.previousPublishInstant, releasedAt)
+                XCTAssertFalse(publisher.visible!.media.values.contains { $0.isFinal })
+            } else if outcome == .failure {
+                XCTAssertThrowsError(try publication.waitForVisible(until: Date())) {
+                    XCTAssertTrue(PlaybackErrorDiagnostics.snapshot($0).summary.contains("Live.Capacity.FirstFailure"))
+                }
+                XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+            } else {
+                XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+            }
+            if outcome != .failure { XCTAssertNil(authority.failureDiagnostic) }
+            XCTAssertFalse(callbacks.didTimeout)
+        } catch {
+            XCTFail("Real production capacity interleaving failed: \(error)")
+        }
+        wake.release()
+        callbacks.release()
+        if let store = publication.store {
+            for lease in pinned { store.release(lease, completedAt: nil, now: Int64(clock.nowNanoseconds)) }
+        }
+        server.stop()
+        let retired = await assembler.retireAndAwaitReceipt()
+        XCTAssertTrue(retired)
+    }
+
+    private func waitForLiveTestCondition(_ condition: () -> Bool) async throws -> Bool {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        return condition()
     }
 
     func testNestedTranscodeFailuresKeepOriginalDiagnosticWithoutRewrapping() {
@@ -790,6 +1252,515 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         print("AUDIO_ONLY_NATIVE_PLAYBACK ready=\(item.status.rawValue) time=\(player.currentTime())")
     }
 
+    func testProductionAirPlayPublishesMediaInformationThroughControllerToPresentation() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let factory = AudioReviewProductionBackendFactory()
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let owner = try PlaybackAudioSessionOwner(registry: registry,
+            sdk: FakeAudioSessionSDK(initialPorts: .airPlay))
+        let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: routes, backendFactory: factory)
+        let stream = await controller.playbackMediaInformation()
+        let information = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+        let collector = Task {
+            for await value in stream { information.append(value) }
+        }
+        defer { collector.cancel() }
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "homepod-metadata",
+            streamURL: fixture.source, title: "Progressive HomePod fixture")
+
+        await controller.play(request)
+        do {
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepared, true,
+                "The real HLS startup must remain successful: \(state)")
+            XCTAssertEqual(state, .playing(request))
+            XCTAssertNotNil(factory.backend, "AirPlay must use the real HLS backend")
+            XCTAssertFalse(factory.backend?.isAudioOnly ?? true)
+
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while !information.snapshot.contains(where: { $0 != nil }), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let published = try XCTUnwrap(information.snapshot.compactMap { $0 }.last,
+                "Playing HLS must supply the controller's public media stream instead of leaving the UI detecting")
+            XCTAssertEqual(published.width, 1_280)
+            XCTAssertEqual(published.height, 720)
+            XCTAssertEqual(published.scanMode, .progressive)
+            XCTAssertEqual(published.sourceFrameRate, MediaRational(num: 25, den: 1))
+            XCTAssertEqual(published.outputFrameRate, 25)
+            XCTAssertFalse(published.isSmoothMotionEnhanced)
+            XCTAssertEqual(PlaybackMediaInformationPresentation(information: published).visualText,
+                "1280×720p · 25 fps")
+        } catch {
+            await controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await controller.stop()
+        await registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(registry.outputResourceContextSnapshot())
+    }
+
+    func testProductionHLSMediaInformationReplaysWhilePausedAndRejectsStoppedScope() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "paused-metadata",
+                streamURL: fixture.source, title: "Paused metadata")
+            await controller.play(request)
+            let lifecycle = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let initial = await self.currentMediaInformation(controller)
+            XCTAssertEqual(initial?.width, 1_280, "A subscriber joining after prepare must receive the snapshot")
+
+            // Model a notification that lost the pause-owner race. A successful
+            // retained pause must replay even though it does not activate again.
+            await controller.invalidatePreparedMediaInformation(for: lifecycle)
+            let cleared = await self.currentMediaInformation(controller)
+            XCTAssertNil(cleared)
+            await controller.setPaused(true)
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, .paused(request))
+            let paused = await self.currentMediaInformation(controller)
+            XCTAssertEqual(paused, initial)
+            XCTAssertNotNil(registry.preparedHLSMediaInformation(for: lifecycle))
+
+            await controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            await controller.refreshPreparedMediaInformation(for: lifecycle)
+            let stopped = await self.currentMediaInformation(controller)
+            XCTAssertNil(stopped)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: lifecycle))
+        }
+    }
+
+    func testProductionHLSAdmissibleRetainedPauseReplaysMediaWithoutActivation() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "paused-route-metadata",
+                streamURL: fixture.source, title: "Paused route recovery")
+            await controller.play(request)
+            let lifecycle = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            await controller.setPaused(true)
+            let pausedState = await controller.currentStateForTesting
+            XCTAssertEqual(pausedState, .paused(request))
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepared, true)
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.owner)
+            // Keep the original route authority admissible. This exercises the
+            // retained-pause helper, not physical empty-to-AirPlay restoration.
+            // The physical pause already settled; do not issue a second suspend
+            // against its consumed output interval merely to change UI state.
+            await controller.publishRouteRecovering(request: request)
+            await controller.invalidatePreparedMediaInformation(for: lifecycle)
+            let cleared = await self.currentMediaInformation(controller)
+            XCTAssertNil(cleared)
+            await controller.resumeActiveOutputFromRouteRecovery()
+            let information = await self.currentMediaInformation(controller)
+            XCTAssertEqual(information?.width, 1_280,
+                "Retained route recovery must replay a refresh lost to the pause owner without activating")
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, .paused(request))
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.interval)
+        }
+    }
+
+    func testProductionHLSChannelReplacementRejectsOldRefreshAndClearThenPublishesAudioOnlyNil() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let audioFile = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "review-audio-only-stereo-8s.ts", withExtension: nil, subdirectory: "Video"))
+        let audioServer = try Task22BundledHTTPFixtureServer(fileURL: audioFile)
+        defer { audioServer.stop() }
+        try await withProductionMediaController { controller, registry, factory, _ in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-first",
+                streamURL: fixture.source, title: "First"))
+            let first = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            weak var retiredBackend = try XCTUnwrap(factory.backend)
+            XCTAssertNotNil(retiredBackend?.preparedMediaInformation(for: first))
+
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-second",
+                streamURL: fixture.source, title: "Second"))
+            let secondDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let second = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
+                secondDiagnostic)
+            XCTAssertNotEqual(first, second)
+            let current = await self.currentMediaInformation(controller)
+            XCTAssertEqual(current?.width, 1_280)
+            await controller.refreshPreparedMediaInformation(for: first)
+            await controller.invalidatePreparedMediaInformation(for: first)
+            let afterStaleCallbacks = await self.currentMediaInformation(controller)
+            XCTAssertEqual(afterStaleCallbacks, current,
+                "Equal dimensions do not make the retired graph's callbacks current")
+            XCTAssertNil(retiredBackend?.preparedMediaInformation(for: first))
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: first))
+            retiredBackend = nil
+
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-radio",
+                streamURL: audioServer.sourceURL, title: "Radio"))
+            let audio = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let snapshot = try XCTUnwrap(registry.preparedHLSMediaInformation(for: audio))
+            XCTAssertEqual(snapshot.lifecycle, audio)
+            XCTAssertNil(snapshot.information, "A prepared audio-only nil is distinct from a rejected projection")
+            await controller.refreshPreparedMediaInformation(for: second)
+            await controller.invalidatePreparedMediaInformation(for: second)
+            let audioInformation = await self.currentMediaInformation(controller)
+            XCTAssertNil(audioInformation)
+        }
+    }
+
+    func testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, sdk in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-route",
+                streamURL: fixture.source, title: "Route metadata"))
+            let startupDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
+                startupDiagnostic)
+            let stream = await controller.playbackMediaInformation()
+            let values = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+            let collector = Task { for await value in stream { values.append(value) } }
+            defer { collector.cancel() }
+            sdk.lock.withLock { sdk.initialPorts = .hdmi }
+            await controller.requestRouteHandoff(to: .sampleBuffer)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !(values.snapshot.contains(where: { $0 == nil }) && values.snapshot.last.flatMap({ $0 }) != nil),
+                  ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.desiredBackendKind, .sampleBuffer)
+            XCTAssertTrue(values.snapshot.contains(where: { $0 == nil }), "Route retirement must clear the old facts")
+            let local = try XCTUnwrap(values.snapshot.last.flatMap { $0 })
+            XCTAssertEqual(local.width, 1_280)
+            await controller.refreshPreparedMediaInformation(for: old)
+            await controller.invalidatePreparedMediaInformation(for: old)
+            let afterStaleCallbacks = await self.currentMediaInformation(controller)
+            XCTAssertEqual(afterStaleCallbacks, local)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+        }
+    }
+
+    func testProductionHLSFailedReplacementDoesNotRepublishRetiredMediaInformation() async throws {
+        let first = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        let short = try makeProductionFixture(named: "task22-progressive-h264-aac-0.8s-short.ts")
+        defer { first.server?.stop(); short.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-good",
+                streamURL: first.source, title: "Good"))
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-short",
+                streamURL: short.source, title: "Short"))
+            let state = await controller.currentStateForTesting
+            guard case .failed = state else { return XCTFail("The real short source must fail prepare: \(state)") }
+            await controller.refreshPreparedMediaInformation(for: old)
+            let information = await self.currentMediaInformation(controller)
+            XCTAssertNil(information)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+        }
+    }
+
+    func testProductionHLSPrepareWhilePausedPublishesButCanceledPrepareDoesNot() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        for cancelPreparation in [false, true] {
+            let gate = HLSMediaInformationPrefixGate()
+            let factory = AudioReviewProductionBackendFactory(factory: SystemPlaybackBackendFactory(
+                hlsGraphFactory: { source, invocation, ledger, failureSink in
+                    let authority = try SystemHLSMediaGraphAuthority(
+                        lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
+                    return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
+                        graph: HLSMediaInformationGatedGraph(
+                            graph: SystemHLSDeliveryGraph(authority: authority), gate: gate))
+                }))
+            try await withProductionMediaController(factory: factory) { controller, registry, _, _ in
+                let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "metadata-prepare-race",
+                    streamURL: fixture.source, title: "Prepare race")
+                let play = Task { await controller.play(request) }
+                defer { gate.release(); play.cancel() }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+                while !gate.isWaiting, ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertTrue(gate.isWaiting, "Wait for an actual playable prefix, not a synthetic ready event")
+                XCTAssertFalse(registry.outputResourceContextSnapshot()?.prepared ?? true)
+                if cancelPreparation {
+                    let stop = Task { await controller.stop() }
+                    let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+                    while registry.outputResourceContextSnapshot()?.owner == nil,
+                          ContinuousClock.now < cancellationDeadline {
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    XCTAssertNotNil(registry.outputResourceContextSnapshot()?.owner)
+                    gate.release()
+                    await play.value
+                    await stop.value
+                    let information = await self.currentMediaInformation(controller)
+                    XCTAssertNil(information)
+                } else {
+                    await controller.setPaused(true)
+                    gate.release()
+                    await play.value
+                    let state = await controller.currentStateForTesting
+                    XCTAssertEqual(state, .paused(request))
+                    let information = await self.currentMediaInformation(controller)
+                    XCTAssertEqual(information?.width, 1_280,
+                        "A paused prepare must publish without relying on activation")
+                    XCTAssertNil(registry.outputResourceContextSnapshot()?.interval)
+                }
+            }
+        }
+    }
+
+    func testProductionHLSAutomaticReplacementInvalidatesMediaBeforeRetirement() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, factory, _ in
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-auto-replacement",
+                streamURL: fixture.source, title: "Automatic replacement"))
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let information = await self.currentMediaInformation(controller)
+            XCTAssertEqual(information?.width, 1_280)
+            let backend = try XCTUnwrap(factory.backend)
+            let authority = try XCTUnwrap(backend.backendPublicationReplacementAuthoritySlot.currentAuthority())
+            XCTAssertTrue(authority.requestReplacement(), "Use the actual Registry-signed replacement authority")
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            var observed = await self.currentMediaInformation(controller)
+            while observed != nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+                observed = await self.currentMediaInformation(controller)
+            }
+            XCTAssertNil(observed,
+                "The registered replacement runner must invalidate even if later retirement or handoff fails")
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+            await controller.refreshPreparedMediaInformation(for: old)
+            let afterOldRefresh = await self.currentMediaInformation(controller)
+            XCTAssertNil(afterOldRefresh)
+        }
+    }
+
+    func testRealHLSReplacementSnapshotsAreScopedToProducingOutputLifecycle() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let first = AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_201)
+        let second = OutputLifecycleEpoch(backendIdentity: first.backendIdentity, outputNonce: 22_202)
+        var previous: HLSOutputItemBundle?
+        for lifecycle in [first, second] {
+            let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle)
+            let assembler = HLSMediaGraphAssembler(sourceURL: fixture.source,
+                applicationLedger: HLSDeliveryApplicationChargeLedger(),
+                graph: SystemHLSDeliveryGraph(authority: authority))
+            let bundle = HLSOutputItemBundle(
+                startProducer: { try await assembler.startUntilPlayablePrefix() },
+                retireProducer: { await assembler.retireAndAwaitReceipt() })
+            XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle))
+            do {
+                try await bundle.prepareProducer()
+                let snapshot = try XCTUnwrap(bundle.preparedMediaInformation(for: lifecycle))
+                XCTAssertEqual(snapshot.information?.width, 1_280)
+                XCTAssertEqual(snapshot.information?.sourceFrameRate, MediaRational(num: 25, den: 1))
+                XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle == first ? second : first),
+                    "A new graph can restart demux generation zero but cannot reuse an output lifecycle")
+                XCTAssertNil(previous?.preparedMediaInformation(for: first))
+            } catch {
+                _ = await bundle.retireProducerGraph()
+                throw error
+            }
+            // Production's coordinator retires the preparation history before
+            // the producer graph. Keep the stale bundle alias, not its active
+            // singleton history domain, while the successor creates a prefix.
+            let evidence = try XCTUnwrap(bundle.replacement.evidenceSource as? LoopbackAVPlayerPreparationEvidenceSource)
+            evidence.retirePreparation()
+            let retired = await bundle.retireProducerGraph()
+            XCTAssertTrue(retired)
+            XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle))
+            previous = bundle
+        }
+    }
+
+    private func currentMediaInformation(_ controller: PlaybackController) async -> PlaybackMediaInformation? {
+        var iterator = await controller.playbackMediaInformation().makeAsyncIterator()
+        return await iterator.next() ?? nil
+    }
+
+    private func mediaControllerDiagnostic(_ controller: PlaybackController,
+                                           registry: ControlTaskRegistry) async -> String {
+        let state = await controller.currentStateForTesting
+        return "state=\(state); context=\(String(describing: registry.outputResourceContextSnapshot())); "
+            + "resourceBytes=\(PlaybackResourceContextLedger.shared.chargedBytes); "
+            + "applicationBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes); "
+            + "callbacks=\(AVPlayerSDKCallbackLease.occupiedCount); "
+            + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)"
+    }
+
+    private func withProductionMediaController(
+        factory: AudioReviewProductionBackendFactory = AudioReviewProductionBackendFactory(),
+        _ body: (PlaybackController, ControlTaskRegistry, AudioReviewProductionBackendFactory,
+                 FakeAudioSessionSDK) async throws -> Void
+    ) async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
+        // The SDK route/session is controlled by this fixture. Native AVPlayer
+        // audio notifications from other fixtures must not mutate that fake
+        // session's safety epochs halfway through prepare or replacement.
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress,
+            notificationCenter: NotificationCenter())
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
+        let routes = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: routes, backendFactory: factory)
+        var bodyError: (any Error)?
+        do { try await body(controller, registry, factory, sdk) }
+        catch { bodyError = error }
+        await controller.stop()
+        await registry.joinOwnedTerminalCleanup()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (PlaybackResourceContextLedger.shared.chargedBytes > resourceBaseline
+               || HLSDeliveryApplicationChargeLedger.shared.chargedBytes > applicationBaseline
+               || AVPlayerSDKCallbackLease.occupiedCount > callbackBaseline),
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let diagnostic = await mediaControllerDiagnostic(controller, registry: registry)
+        XCTAssertNil(registry.outputResourceContextSnapshot(), diagnostic)
+        XCTAssertLessThanOrEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline, diagnostic)
+        XCTAssertLessThanOrEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, applicationBaseline, diagnostic)
+        XCTAssertLessThanOrEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline, diagnostic)
+        if let bodyError { throw bodyError }
+    }
+
+    func testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute() throws {
+        let frameCount = 48_000
+        var samples = [Float](repeating: 0.1, count: frameCount * 2)
+        func measure(_ values: [Float]) throws -> SyntheticAACPCMStatistics {
+            let bytes = values.withUnsafeBytes { Data($0) }
+            let sample = try PCMSampleBufferBuilder.make(bytes: bytes, frameCount: frameCount,
+                sampleRate: 48_000, channels: 2, channelOrder: .native,
+                channelLayoutMask: 0x3, presentationTimeStamp: .zero)
+            var statistics = SyntheticAACPCMStatistics()
+            try statistics.consume(sample)
+            return statistics
+        }
+        XCTAssertEqual(try measure(samples).silentShortWindows, 0)
+        // 266 ms is deliberately offset from both 5 ms and 100 ms bucket edges.
+        for index in (12_768 * 2)..<((12_768 + 1_008) * 2) { samples[index] = 0 }
+        let muted = try measure(samples)
+        XCTAssertEqual(muted.silentWindows, 0, "The coarse meter alone misses this mute")
+        XCTAssertGreaterThanOrEqual(muted.silentShortWindows, 3)
+        var padded = [Float](repeating: 0.1, count: frameCount * 2)
+        for index in ((frameCount - 1_008) * 2)..<(frameCount * 2) { padded[index] = 0 }
+        XCTAssertEqual(try measure(padded).silentShortWindows, 0,
+            "Padding at the actual EOF must not be classified as an interior mute")
+    }
+
+    func testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "synthetic-hlg50-ac3-64s.ts", withExtension: nil, subdirectory: "Video"),
+            "Generate the mandatory synthetic fixture with Scripts/generate-homepod-audio-diagnostic-fixture.py before running this regression")
+        let source = try Task22BundledHTTPFixtureServer(fileURL: file)
+        defer { source.stop() }
+        let capture = SyntheticAACContinuityCapture()
+        let authority = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 24_064),
+            publicationDeadlineNanoseconds: 180_000_000_000)
+        authority.publicationForTesting.installBeforeReceiveForTesting { capture.receive($0) }
+        let assembler = HLSMediaGraphAssembler(sourceURL: source.sourceURL,
+            applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            graph: SystemHLSDeliveryGraph(authority: authority))
+        do {
+            let prefix = try await assembler.startUntilPlayablePrefix()
+            XCTAssertEqual(prefix.mediaInformation?.width, 3_840)
+            XCTAssertEqual(prefix.mediaInformation?.height, 2_160)
+            XCTAssertEqual(prefix.mediaInformation?.outputFrameRate, 50)
+            let complete = await authority.finishAllTracksAtNaturalEOF()
+            print("AC3_DIAGNOSTIC graphComplete=\(complete) error=\(authority.failureDescriptionForDiagnostics ?? "none")")
+            try capture.printSummary()
+            XCTAssertTrue(complete, authority.failureDescriptionForDiagnostics ?? "Synthetic graph did not finish")
+            // Copy bytes at the existing read-only callback hook; do not retain a
+            // sealed object, publication lease, or the producer's AAC workspace.
+            let records = try capture.snapshot()
+            let media = records.filter { $0.kind == .media }.sorted { $0.sequence < $1.sequence }
+            let initial = try XCTUnwrap(records.first { $0.kind == .initialization })
+            XCTAssertGreaterThanOrEqual(media.count, 60)
+            XCTAssertGreaterThan(Set(media.map(\.writer)).count, 5,
+                "The regression must cross actual physical AAC writer windows")
+            for (previous, current) in zip(media, media.dropFirst()) {
+                XCTAssertEqual(current.sequence, previous.sequence + 1)
+                let previousEnd = CMTimeAdd(try XCTUnwrap(previous.start), try XCTUnwrap(previous.duration))
+                XCTAssertEqual(CMTimeSubtract(try XCTUnwrap(current.start), previousEnd).seconds,
+                    0, accuracy: 1.0 / 48_000,
+                    "AAC report gap at sequence \(current.sequence), writer \(current.writer)")
+            }
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let output = directory.appendingPathComponent("canonical-aac.mp4")
+            var bytes = initial.bytes
+            for segment in media { bytes.append(segment.bytes) }
+            try bytes.write(to: output)
+            let fragments = try media.map { try SyntheticAACFragmentInspector.inspect($0) }
+            XCTAssertTrue(zip(fragments, fragments.dropFirst()).allSatisfy { pair in pair.1.sequence > pair.0.sequence },
+                "Native mfhd values must increase across physical writers: \(fragments.map(\.sequence))")
+            for (previous, current) in zip(fragments, fragments.dropFirst()) {
+                XCTAssertEqual(current.decodeTime, previous.decodeTime + previous.sampleCount * 1_024,
+                    "Original tfdt/trun must preserve every AAC access unit across writer windows")
+            }
+            // Decode the actual canonical init and all original media bytes. No
+            // sequence-number rewrite, box removal, or timing normalization is allowed.
+            let decoded = try await inspectSyntheticAACPCM(output)
+            print("AC3_ORIGINAL_OUTPUT originalBytes=true physicalHomePodVerified=false decodedFrames=\(decoded.frames) maxGapSamples=\(decoded.maximumGapSamples) " +
+                "silent100msWindows=\(decoded.silentWindows) silent5msInteriorWindows=\(decoded.silentShortWindows) " +
+                "minRMS=\(decoded.minimumRMS) min5msInteriorRMS=\(decoded.minimumShortRMS) " +
+                "interiorBuckets=\(decoded.checkedShortWindows) silenceBucketEnds=\(decoded.silentWindowEndTimes)")
+            XCTAssertGreaterThanOrEqual(decoded.frames, 63 * 48_000)
+            XCTAssertLessThanOrEqual(decoded.frames, 65 * 48_000)
+            XCTAssertLessThanOrEqual(decoded.maximumGapSamples, 1)
+            XCTAssertEqual(decoded.silentWindows, 0,
+                "Continuous source tones must remain audible across segment and writer boundaries")
+            XCTAssertGreaterThanOrEqual(decoded.checkedShortWindows, 12_000)
+            XCTAssertEqual(decoded.silentShortWindows, 0,
+                "Interior 5 ms windows must expose repeated AAC priming mutes even when a 100 ms bucket straddles them")
+            let retired = await assembler.retireAndAwaitReceipt()
+            XCTAssertTrue(retired)
+        } catch {
+            try? capture.printSummary()
+            let retired = await assembler.retireAndAwaitReceipt()
+            XCTAssertTrue(retired, "Diagnostic failure must still retire the real graph")
+            throw error
+        }
+    }
+
+    private func inspectSyntheticAACPCM(_ url: URL) async throws -> SyntheticAACPCMStatistics {
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        print("AC3_READER file=\(url.lastPathComponent) assetDuration=\(duration.seconds)")
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsNonInterleaved: false,
+        ])
+        XCTAssertTrue(reader.canAdd(output))
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        var statistics = SyntheticAACPCMStatistics()
+        while let ready = try await provider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
+            try statistics.consume(sample)
+        }
+        XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
+        return statistics
+    }
+
     func testProductionProgressiveGraphPublishesSixSecondLoopbackPrefixAndRetires()
         async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
@@ -812,6 +1783,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertEqual(replacement.request.itemURL.host, "127.0.0.1")
         XCTAssertNotEqual(replacement.request.itemURL, source)
         XCTAssertEqual(replacement.request.item.outputLifecycleEpoch, lifecycle)
+        XCTAssertEqual(replacement.mediaInformation, PlaybackMediaInformation(
+            width: 1_280, height: 720, scanMode: .progressive,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 25,
+            isSmoothMotionEnhanced: false))
         let reachedNaturalEOF = await authority.finishAllTracksAtNaturalEOF()
         XCTAssertTrue(
             reachedNaturalEOF,
@@ -884,6 +1859,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             return
         }
         XCTAssertNotEqual(replacement.request.itemURL, source)
+        XCTAssertEqual(replacement.mediaInformation, PlaybackMediaInformation(
+            width: 1_920, height: 1_080, scanMode: .interlaced,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 50,
+            isSmoothMotionEnhanced: true))
         let finished = await authority.finishAllTracksAtNaturalEOF()
         XCTAssertTrue(
             finished,
@@ -1023,6 +2002,8 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var released = false
     private var blocked = 0
+    private var highestBlockedSequence: UInt64 = 0
+    private var permittedThrough: UInt64 = 2
     private var timedOut = false
 
     var didTimeout: Bool { condition.withLock { timedOut } }
@@ -1031,11 +2012,12 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
         guard object.kind == .media, object.logicalSequence >= 3 else { return }
         condition.lock()
         defer { condition.unlock() }
-        guard !released else { return }
+        guard !released, object.logicalSequence > permittedThrough else { return }
         blocked += 1
+        highestBlockedSequence = max(highestBlockedSequence, object.logicalSequence)
         condition.broadcast()
         let deadline = Date().addingTimeInterval(15)
-        while !released {
+        while !released, object.logicalSequence > permittedThrough {
             if !condition.wait(until: deadline) {
                 timedOut = true
                 return
@@ -1043,19 +2025,68 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
         }
     }
 
-    func waitUntilBlocked() -> Bool {
+    func waitUntilBlocked(atLeast sequence: UInt64 = 3) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(10)
-        while blocked == 0, !released {
+        while (blocked == 0 || highestBlockedSequence < sequence), !released {
             if !condition.wait(until: deadline) { return false }
         }
-        return blocked > 0
+        return blocked > 0 && highestBlockedSequence >= sequence
+    }
+
+    func releaseThrough(_ sequence: UInt64) {
+        condition.withLock { permittedThrough = max(permittedThrough, sequence); condition.broadcast() }
     }
 
     func release() {
         condition.withLock { released = true; condition.broadcast() }
     }
+}
+
+private final class Task22SelectedLiveWakeGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var armed = false
+    private var selected = false
+    private var released = false
+    private var completed = false
+    private var timedOut = false
+
+    var didTimeout: Bool { condition.withLock { timedOut } }
+    func arm() { condition.withLock { armed = true } }
+
+    func beforeEntry() {
+        condition.lock()
+        defer { condition.unlock() }
+        guard armed, !selected else { return }
+        selected = true
+        condition.broadcast()
+        let deadline = Date().addingTimeInterval(20)
+        while !released {
+            if !condition.wait(until: deadline) { timedOut = true; return }
+        }
+    }
+
+    func afterEntry() {
+        condition.withLock {
+            if selected && released { completed = true; condition.broadcast() }
+        }
+    }
+
+    func waitUntilSelected() -> Bool { wait(forCompletion: false) }
+    func waitUntilCompleted() -> Bool { wait(forCompletion: true) }
+
+    private func wait(forCompletion: Bool) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(10)
+        while !(forCompletion ? completed : selected) {
+            if !condition.wait(until: deadline) { return false }
+        }
+        return true
+    }
+
+    func release() { condition.withLock { released = true; condition.broadcast() } }
 }
 
 /// 只发送固定 TS 的前 3/8（188-byte packet 对齐），声明完整长度但保持响应未结束。
@@ -1066,6 +2097,27 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
         private var active: [NWConnection] = []
         private var stopped = false
         private var sentEOF = false
+        private var finishers: [@Sendable () -> Void] = []
+
+        func registerFinisher(_ finisher: @escaping @Sendable () -> Void) {
+            let finishNow = lock.withLock { () -> Bool in
+                guard !stopped else { return false }
+                if sentEOF { return true }
+                finishers.append(finisher)
+                return false
+            }
+            if finishNow { finisher() }
+        }
+
+        func finishBody() {
+            let pending = lock.withLock { () -> [@Sendable () -> Void] in
+                guard !stopped, !sentEOF else { return [] }
+                sentEOF = true
+                defer { finishers.removeAll() }
+                return finishers
+            }
+            for finish in pending { finish() }
+        }
 
         var hasSentEOF: Bool { lock.withLock { sentEOF } }
 
@@ -1080,6 +2132,7 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
         func stop() {
             let retiring = lock.withLock { () -> [NWConnection] in
                 stopped = true
+                finishers.removeAll()
                 defer { active.removeAll() }
                 return active
             }
@@ -1093,13 +2146,18 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
     let sourceURL: URL
     var hasSentSourceEOF: Bool { connections.hasSentEOF }
 
-    init(fileURL: URL) throws {
+    init(fileURL: URL, sendEntireBodyWithoutEOF: Bool = false) throws {
         let payload = try Data(contentsOf: fileURL)
-        let prefixBytes = (payload.count * 3 / 8) / 188 * 188
+        // Retain one whole TS packet and keep the declared response incomplete.
+        // This tests live publication; no EOF can activate the separate drain.
+        let prefixBytes = sendEntireBodyWithoutEOF
+            ? (payload.count / 188 - 1) * 188
+            : (payload.count * 3 / 8) / 188 * 188
         guard prefixBytes > 0, prefixBytes < payload.count else {
             throw NSError(domain: "Task22LatePublicationFixtureServer", code: 1)
         }
         let prefix = Data(payload.prefix(prefixBytes))
+        let suffix = Data(payload.dropFirst(prefixBytes))
         let declaredBytes = payload.count
         let ownedConnections = Connections()
         connections = ownedConnections
@@ -1126,7 +2184,11 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
                     guard error == nil else { connection.cancel(); return }
                     // 不发 isComplete/EOF；未发送的后缀由测试 cleanup 取消。
                     connection.send(content: prefix, completion: .contentProcessed { error in
-                        if error != nil { connection.cancel() }
+                        guard error == nil else { connection.cancel(); return }
+                        ownedConnections.registerFinisher {
+                            connection.send(content: suffix, isComplete: true,
+                                completion: .contentProcessed { _ in connection.cancel() })
+                        }
                     })
                 })
             }
@@ -1142,6 +2204,7 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
         sourceURL = url
     }
 
+    func finishBody() { connections.finishBody() }
     func stop() { listener.cancel(); connections.stop() }
 }
 
@@ -1210,8 +2273,10 @@ private final class Task22BundledHTTPFixtureServer: @unchecked Sendable {
 /// Observes the real factory result; does not replace media, AVPlayer, readiness, or retirement.
 private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let lock = NSLock()
-    private let factory = SystemPlaybackBackendFactory()
-    private var created: HLSAVPlayerPlaybackBackend?
+    private let factory: SystemPlaybackBackendFactory
+    // Observation must not extend a retired backend's one-native-driver lease.
+    private weak var created: HLSAVPlayerPlaybackBackend?
+    init(factory: SystemPlaybackBackendFactory = SystemPlaybackBackendFactory()) { self.factory = factory }
     var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { created } }
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
                      tuning: PlaybackTuning, channelID: String, url: URL,
@@ -1220,5 +2285,262 @@ private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory,
             tuning: tuning, channelID: channelID, url: url, eventSink: eventSink)
         lock.withLock { created = value as? HLSAVPlayerPlaybackBackend }
         return value
+    }
+}
+
+/// Stops only the handoff of an already-proven real prefix. All source, writer,
+/// server, AVPlayer, and retirement behavior remains production behavior.
+private final class HLSMediaInformationPrefixGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    var isWaiting: Bool { lock.withLock { continuation != nil } }
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resume = lock.withLock {
+                guard !released else { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resume { continuation.resume() }
+        }
+    }
+    func release() {
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume()
+    }
+}
+
+private final class HLSMediaInformationGatedGraph: HLSMediaGraphAssembler.DeliveryGraph, @unchecked Sendable {
+    private let graph: SystemHLSDeliveryGraph
+    private let gate: HLSMediaInformationPrefixGate
+    init(graph: SystemHLSDeliveryGraph, gate: HLSMediaInformationPrefixGate) {
+        self.graph = graph
+        self.gate = gate
+    }
+    var failureDiagnostic: ErrorDiagnosticSnapshot? { graph.failureDiagnostic }
+    func accept(_ event: AdmittedDemuxEvent) { graph.accept(event) }
+    func waitUntilPlayablePrefix() async -> HLSMediaGraphAssembler.HLSMediaGraphPlayablePrefix? {
+        guard let prefix = await graph.waitUntilPlayablePrefix() else { return nil }
+        await gate.wait()
+        return prefix
+    }
+    func finishNaturalEOF() async -> Bool { await graph.finishNaturalEOF() }
+    func retireAndAwaitReceipt() async -> Bool { await graph.retireAndAwaitReceipt() }
+}
+
+/// Test-owned copies of synthetic AAC output. Never intercepts or replaces delivery.
+private final class SyntheticAACContinuityCapture: @unchecked Sendable {
+    struct Record: Sendable {
+        let kind: SealedMediaObjectKind
+        let sequence: UInt64
+        let writer: UInt64
+        let start: CMTime?
+        let duration: CMTime?
+        let bytes: Data
+    }
+    private let lock = NSLock()
+    private var records: [Record] = []
+    private var copiedBytes = 0
+    private var exceededCapacity = false
+
+    func receive(_ object: SealedMediaObject) {
+        guard object.publicationEvidence?.format.codec == "mp4a.40.2" else { return }
+        lock.withLock {
+            guard records.count < 256, object.bytes.count <= 8 * 1_024 * 1_024 - copiedBytes else {
+                exceededCapacity = true
+                return
+            }
+            let copy = object.bytes.withUnsafeBytes { Data($0) }
+            records.append(Record(kind: object.kind, sequence: object.logicalSequence,
+                writer: object.writerIdentity.rawValue, start: object.report.earliestPresentationTimeStamp,
+                duration: object.report.duration, bytes: copy))
+            copiedBytes += copy.count
+        }
+    }
+
+    func snapshot() throws -> [Record] {
+        try lock.withLock {
+            guard !exceededCapacity else { throw AACRenditionFailure.capacityExceeded }
+            return records
+        }
+    }
+
+    func printSummary() throws {
+        let values = try snapshot()
+        let media = values.filter { $0.kind == .media }.sorted { $0.sequence < $1.sequence }
+        print("AC3_DIAGNOSTIC segments=\(media.count) physicalWriters=\(Set(media.map(\.writer)).count) " +
+            "initializations=\(values.filter { $0.kind == .initialization }.count)")
+        for record in media {
+            print("AC3_SEGMENT sequence=\(record.sequence) writer=\(record.writer) " +
+                "start=\(record.start?.seconds ?? -1) duration=\(record.duration?.seconds ?? -1) bytes=\(record.bytes.count)")
+        }
+    }
+}
+
+private struct SyntheticAACPCMStatistics {
+    var frames = 0
+    var maximumGapSamples = 0.0
+    var silentWindows = 0
+    var minimumRMS = Double.infinity
+    var silentShortWindows = 0
+    var minimumShortRMS = Double.infinity
+    private var shortWindowSamples = 0
+    private var shortWindowPower = 0.0
+    private var observedSamples = 0
+    private var pendingShortWindows: [(end: Double, rms: Double)] = []
+    var checkedShortWindows = 0
+    var silentWindowEndTimes: [Double] = []
+    private var previousEnd: CMTime?
+    private var windowSamples = 0
+    private var windowPower = 0.0
+
+    mutating func consume(_ sample: CMSampleBuffer) throws {
+        let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+        let asbd = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format)).pointee
+        XCTAssertEqual(asbd.mSampleRate, 48_000)
+        XCTAssertEqual(asbd.mChannelsPerFrame, 2)
+        XCTAssertEqual(asbd.mBitsPerChannel, 32)
+        XCTAssertNotEqual(asbd.mFormatFlags & kAudioFormatFlagIsFloat, 0)
+        XCTAssertEqual(asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved, 0)
+        let count = CMSampleBufferGetNumSamples(sample)
+        let start = CMSampleBufferGetPresentationTimeStamp(sample)
+        XCTAssertTrue(start.isNumeric)
+        if let previousEnd {
+            maximumGapSamples = max(maximumGapSamples, abs(CMTimeSubtract(start, previousEnd).seconds * 48_000))
+        }
+        previousEnd = CMTimeAdd(start, CMTime(value: Int64(count), timescale: 48_000))
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        let length = CMBlockBufferGetDataLength(block)
+        XCTAssertEqual(length, count * 2 * MemoryLayout<Float>.stride)
+        var data = Data(count: length)
+        let status = data.withUnsafeMutableBytes { bytes in
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length,
+                destination: bytes.baseAddress!)
+        }
+        guard status == noErr else { throw AACRenditionFailure.framework(status) }
+        var nonfiniteSamples = 0
+        data.withUnsafeBytes { bytes in
+            for index in 0..<(length / MemoryLayout<Float>.stride) {
+                let value = bytes.loadUnaligned(fromByteOffset: index * MemoryLayout<Float>.stride, as: Float.self)
+                if !value.isFinite { nonfiniteSamples += 1 }
+                let power = Double(value) * Double(value)
+                windowPower += power
+                windowSamples += 1
+                shortWindowPower += power
+                shortWindowSamples += 1
+                observedSamples += 1
+                if shortWindowSamples == 240 * 2 {
+                    let seconds = Double(observedSamples) / (2 * 48_000)
+                    if seconds >= 0.255 {
+                        let rms = sqrt(shortWindowPower / Double(shortWindowSamples))
+                        pendingShortWindows.append((seconds, rms))
+                        // Hold the actual last 250 ms until EOF. AC3 source padding
+                        // and final AAC padding are not recurring interior mutes.
+                        if pendingShortWindows.count > 50 {
+                            let interior = pendingShortWindows.removeFirst()
+                            checkedShortWindows += 1
+                            minimumShortRMS = min(minimumShortRMS, interior.rms)
+                            if interior.rms < 0.001 {
+                                silentShortWindows += 1
+                                if silentWindowEndTimes.count < 128 { silentWindowEndTimes.append(interior.end) }
+                            }
+                        }
+                    }
+                    shortWindowSamples = 0
+                    shortWindowPower = 0
+                }
+                if windowSamples == 4_800 * 2 {
+                    let rms = sqrt(windowPower / Double(windowSamples))
+                    minimumRMS = min(minimumRMS, rms)
+                    if rms < 0.001 { silentWindows += 1 }
+                    windowSamples = 0
+                    windowPower = 0
+                }
+            }
+        }
+        XCTAssertEqual(nonfiniteSamples, 0)
+        frames += count
+    }
+}
+
+/// Read-only facts from actual Apple fragments; this helper never rewrites bytes.
+private enum SyntheticAACFragmentInspector {
+    struct Facts {
+        let sequence: UInt32
+        let decodeTime: UInt64
+        let sampleCount: UInt64
+    }
+    struct Box {
+        let type: String
+        let start: Int
+        let payload: Int
+        let end: Int
+    }
+
+    static func boxes(_ bytes: Data, from start: Int = 0, through end: Int? = nil) throws -> [Box] {
+        let end = end ?? bytes.count
+        var offset = start
+        var result: [Box] = []
+        while offset < end {
+            guard offset + 8 <= end, result.count < 128 else { throw AACRenditionFailure.invalidInput }
+            let size32 = read32(bytes, offset)
+            let header = size32 == 1 ? 16 : 8
+            guard offset + header <= end else { throw AACRenditionFailure.invalidInput }
+            let size64 = size32 == 1 ? read64(bytes, offset + 8) : UInt64(size32 == 0 ? end - offset : Int(size32))
+            guard let size = Int(exactly: size64), size >= header, size <= end - offset else {
+                throw AACRenditionFailure.invalidInput
+            }
+            let type = String(decoding: bytes[(offset + 4)..<(offset + 8)], as: UTF8.self)
+            result.append(Box(type: type, start: offset, payload: offset + header, end: offset + size))
+            offset += size
+        }
+        return result
+    }
+
+    static func inspect(_ record: SyntheticAACContinuityCapture.Record) throws -> Facts {
+        let top = try boxes(record.bytes)
+        guard top.filter({ $0.type == "moof" }).count == 1,
+              top.filter({ $0.type == "mdat" }).count == 1 else {
+            throw AACRenditionFailure.invalidInput
+        }
+        let moof = try XCTUnwrap(top.first { $0.type == "moof" })
+        let children = try boxes(record.bytes, from: moof.payload, through: moof.end)
+        guard children.filter({ $0.type == "traf" }).count == 1 else {
+            throw AACRenditionFailure.invalidInput
+        }
+        let mfhd = try XCTUnwrap(children.first { $0.type == "mfhd" })
+        let traf = try XCTUnwrap(children.first { $0.type == "traf" })
+        let track = try boxes(record.bytes, from: traf.payload, through: traf.end)
+        let tfdt = try XCTUnwrap(track.first { $0.type == "tfdt" })
+        guard mfhd.payload + 8 <= mfhd.end, tfdt.payload + 8 <= tfdt.end,
+              record.bytes[tfdt.payload] <= 1 else { throw AACRenditionFailure.invalidInput }
+        let decodeTime: UInt64
+        if record.bytes[tfdt.payload] == 1 {
+            guard tfdt.payload + 12 <= tfdt.end else { throw AACRenditionFailure.invalidInput }
+            decodeTime = read64(record.bytes, tfdt.payload + 4)
+        } else { decodeTime = UInt64(read32(record.bytes, tfdt.payload + 4)) }
+        let runs = track.filter { $0.type == "trun" }
+        guard !runs.isEmpty else { throw AACRenditionFailure.invalidInput }
+        var count: UInt64 = 0
+        for run in runs {
+            guard run.payload + 8 <= run.end else { throw AACRenditionFailure.invalidInput }
+            count += UInt64(read32(record.bytes, run.payload + 4))
+        }
+        let sequence = read32(record.bytes, mfhd.payload + 4)
+        print("AC3_FRAGMENT sequence=\(record.sequence) top=\(top.map(\.type).joined(separator: ",")) " +
+            "mfhd=\(sequence) tfdt=\(decodeTime) samples=\(count)")
+        return Facts(sequence: sequence, decodeTime: decodeTime, sampleCount: count)
+    }
+
+    private static func read32(_ bytes: Data, _ offset: Int) -> UInt32 {
+        bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian }
+    }
+    private static func read64(_ bytes: Data, _ offset: Int) -> UInt64 {
+        bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self).bigEndian }
     }
 }

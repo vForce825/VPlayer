@@ -785,6 +785,11 @@ final class SealedMediaStore: @unchecked Sendable {
     private var aacWriterInitializationAliases: [UInt64: AACWriterInitializationAlias] = [:]
     private var writerInitializationAliases: [UInt64: WriterInitializationAlias] = [:]
     private var instant: Int64 = 0
+    private let publicationClock: HLSNaturalEndPublicationClock?
+
+    var monotonicNowNanoseconds: Int64 {
+        publicationClock?.residencyNowNanoseconds ?? SystemHLSLoopbackClock.nowNanoseconds()
+    }
     private var preparationHistorySequences:
         (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) = (0,0,0,0,0,0,0,0,0)
 
@@ -902,7 +907,9 @@ final class SealedMediaStore: @unchecked Sendable {
     }
 
     init(token: String, itemGeneration: UInt64, domain: HLSLinearizationDomain = HLSLinearizationDomain(),
-         capacityLimits: SealedMediaStoreCapacityLimits = .standard) {
+         capacityLimits: SealedMediaStoreCapacityLimits = .standard,
+         publicationClock: HLSNaturalEndPublicationClock? = nil) {
+        self.publicationClock = publicationClock
         self.token = token
         self.itemGeneration = itemGeneration
         self.domain = domain
@@ -912,7 +919,9 @@ final class SealedMediaStore: @unchecked Sendable {
 
     init(loopbackSession: LoopbackSessionToken, itemGeneration: UInt64,
          domain: HLSLinearizationDomain = HLSLinearizationDomain(),
-         capacityLimits: SealedMediaStoreCapacityLimits = .standard) {
+         capacityLimits: SealedMediaStoreCapacityLimits = .standard,
+         publicationClock: HLSNaturalEndPublicationClock? = nil) {
+        self.publicationClock = publicationClock
         token = loopbackSession.value
         self.itemGeneration = itemGeneration
         self.domain = domain
@@ -2316,8 +2325,9 @@ final class SealedMediaStore: @unchecked Sendable {
             waiter.publicationClock?.signal()
             return
         }
-        // EOF 的票使用 publisher logical clock，HTTP release 的 store uptime
-        // 只用于 residency，不能拿它误判 publication deadline。
+        // Both ordinary and EOF tickets use their publisher's injected clock.
+        // A caller-supplied HTTP release timestamp cannot expire another domain's
+        // valid ticket or manufacture publication time.
         let publicationInstant: Int64
         do { publicationInstant = try waiter.publicationClock?.now().logical ?? instant }
         catch {

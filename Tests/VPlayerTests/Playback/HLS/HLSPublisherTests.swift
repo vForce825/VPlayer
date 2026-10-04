@@ -405,6 +405,144 @@ final class HLSPublisherTests: XCTestCase {
         h.publisher.close()
     }
 
+    func testLiveProducerBackpressureWaitsForCompleteCommonPrefixNotLeadingTrack() async throws {
+        let h = try await Task19Harness()
+        defer { h.publisher.close() }
+        try await h.initial()
+        try await h.offer(participant: 1, count: 4)
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 4)
+        XCTAssertFalse(h.publisher.shouldBackpressureProducer,
+            "Video skew must leave room for the matching audio to reach the publisher")
+        XCTAssertEqual(try h.publisher.nextLivePublicationWake(now: 0), 3 * Task19.second,
+            "Missing audio waits on the original deadline, not a spinning due gate")
+        try await h.offer(participant: 2, count: 3)
+        XCTAssertFalse(h.publisher.shouldBackpressureProducer)
+        try await h.offer(participant: 2, count: 1)
+        XCTAssertTrue(h.publisher.shouldBackpressureProducer)
+        XCTAssertEqual(try h.publisher.nextLivePublicationWake(now: 0), Task19.second)
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
+        XCTAssertFalse(h.publisher.shouldBackpressureProducer,
+            "Consuming one common pending segment must release the bounded producer wait")
+    }
+
+    func testLiveGateFollowsVaryingRealSegmentDurationsAcrossOneBurst() async throws {
+        let durations = [1, 3, 2, 4, 2, 1, 3].map { Task19.time(Int64($0)) }
+        let clock = ManualPlaybackClock(90 * UInt64(Task19.second))
+        let timing = try HLSNaturalEndPublicationClock.make(
+            clock: clock, usesAbsoluteMonotonicTime: true)
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 20 * Task19.second,
+            initialWindowMinimumSeconds: 3, publicationClock: timing,
+            plannedSegmentDurations: durations)
+        defer { h.publisher.close(); timing.stopWaiting() }
+        let origin = Int64(clock.nowNanoseconds)
+        try await h.offerBoth(count: 3, now: origin)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences, [0, 1, 2])
+        try await h.offerBoth(count: 4, now: origin)
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 4)
+        var elapsed: Int64 = 0
+        for (offset, seconds) in [4, 2, 1, 3].enumerated() {
+            elapsed += Int64(seconds) * Task19.second
+            XCTAssertEqual(try h.publisher.nextLivePublicationWake(now: Int64(clock.nowNanoseconds)), origin + elapsed)
+            clock.set(UInt64(origin + elapsed - 1))
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: timing.now().logical), .waiting)
+            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(2 + offset))
+            clock.advance(nanoseconds: 1)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: timing.now().logical), .published)
+            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(3 + offset))
+            XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+        }
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 0)
+    }
+
+    func testLiveClockCoalescesCapacitySignalAcrossRearmWithoutInlineReentry() throws {
+        let clock = Task19HeldPublicationClock()
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock, usesAbsoluteMonotonicTime: true)
+        let calls = Task19Counter()
+        timing.installLiveWakeHandler { calls.add() }
+        defer { timing.stopWaiting(); clock.timer.releaseHandler() }
+        timing.consumeSignal()
+        timing.signal() // store capacity changed after graph inspected its state.
+        timing.scheduleLiveWake(until: 500)
+        XCTAssertEqual(clock.timer.deadline, 100,
+            "Installing a later media gate must not discard an already pending capacity wake")
+        XCTAssertEqual(calls.value, 0, "Store-lock signals must never synchronously re-enter graph")
+        let delivery = try XCTUnwrap(clock.timer.captureHandler())
+        delivery()
+        XCTAssertEqual(calls.value, 1)
+        timing.consumeSignal()
+        timing.scheduleLiveWake(until: 500)
+        clock.set(499)
+        delivery()
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertEqual(clock.timer.deadline, 500)
+        clock.set(500)
+        delivery()
+        XCTAssertEqual(calls.value, 2)
+        timing.removeLiveWakeHandler()
+        clock.set(900)
+        delivery()
+        XCTAssertEqual(calls.value, 2, "An old physical delivery cannot revive a retired live handler")
+        XCTAssertNil(clock.timer.deadline)
+    }
+
+    func testLiveClockHandsItsOnlyTimerToNaturalEndAndRejectsLateLiveDelivery() async throws {
+        let clock = Task19HeldPublicationClock()
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let liveCalls = Task19Counter()
+        timing.installLiveWakeHandler { liveCalls.add() }
+        timing.scheduleLiveWake(until: 200)
+        let oldDelivery = try XCTUnwrap(clock.timer.captureHandler())
+        timing.removeLiveWakeHandler()
+        timing.consumeSignal()
+        let task = Task { try await timing.wait(until: 300) }
+        defer { task.cancel(); timing.stopWaiting(); clock.timer.releaseHandler() }
+        await assertNaturalEndEventually { clock.timer.deadline == 300 }
+        clock.set(200)
+        oldDelivery()
+        XCTAssertEqual(liveCalls.value, 0)
+        XCTAssertEqual(clock.timer.deadline, 300)
+        clock.set(300)
+        oldDelivery()
+        try await task.value
+        XCTAssertEqual(liveCalls.value, 0)
+        timing.stopWaiting()
+        oldDelivery()
+        XCTAssertEqual(liveCalls.value, 0)
+        XCTAssertNil(clock.timer.deadline)
+    }
+
+    func testLiveCapacityReleaseUsesPublicationClockInsteadOfHTTPStoreUptime() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(audioCount: 3, publicationClock: timing)
+        defer { h.publisher.close() }
+        try await h.initial()
+        let pinned = try (1...4).map {
+            try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0))
+        }
+        try await h.offerBoth(count: 1)
+        clock.set(100 + UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
+        try await h.offerBoth(count: 1, now: Task19.second)
+        clock.set(100 + 2 * UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 2 * Task19.second), .waiting)
+        XCTAssertEqual(h.store.capacityWaiterCount, 1)
+        // Production HTTP releases use host uptime. A capacity wake must re-read
+        // the injected publication clock rather than expire its still-valid ticket
+        // against an unrelated store timestamp.
+        for lease in pinned {
+            h.store.release(lease, completedAt: nil, now: 4_000_000_000_000)
+        }
+        await assertNaturalEndEventually { h.publisher.visible?.publicationSequence == 3 }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 3,
+            "Ordinary live capacity release must publish a valid pending segment without another callback")
+        XCTAssertEqual(h.publisher.ticket.previousPublishInstant, 2 * Task19.second)
+        XCTAssertEqual(h.store.capacityWaiterCount, 0)
+        XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+    }
+
     func testNaturalEndCapacityWakeUsesOneSlotAndCommitAnchorIncludesOrdinaryWake() async throws {
         let clock = ManualPlaybackClock(100)
         let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
@@ -1956,6 +2094,7 @@ final class Task19Harness: @unchecked Sendable {
          initialWindowMinimumSeconds: Int = 6,
          terminalLogicalSequence: UInt64? = nil,
          publicationClock: HLSNaturalEndPublicationClock? = nil,
+         plannedSegmentDurations: [ExactMediaTime]? = nil,
          initialFormatVariants: [UInt64: Task19.FormatVariant] = [:]) async throws {
         let sessionToken = loopbackSession?.value ?? token
         store = loopbackSession.map { SealedMediaStore(loopbackSession: $0, itemGeneration: 19) }
@@ -1966,14 +2105,26 @@ final class Task19Harness: @unchecked Sendable {
             : [Task19.time(49_152, 48_000)] + Array(repeating: Task19.time(48_128, 48_000), count: 5) + [Task19.time(47_104, 48_000)]
         let specialVideo: [ExactMediaTime]? = audioBoundaryOffsets == nil ? nil
             : [Task19.time(48_256, 48_000)] + Array(repeating: Task19.time(48_128, 48_000), count: 5) + [Task19.time(1)]
+        var plannedAudioDurations: [ExactMediaTime]?
+        if let plannedSegmentDurations {
+            var mediaEnd = Task19.time(0)
+            var physicalEnd: Int64 = 0
+            plannedAudioDurations = try plannedSegmentDurations.map { duration in
+                mediaEnd = try mediaEnd.adding(duration)
+                let target = CMTimeConvertScale(mediaEnd.cmTime, timescale: 48_000, method: .default).value
+                let nextEnd = ((target + 1_023) / 1_024) * 1_024
+                defer { physicalEnd = nextEnd }
+                return Task19.time(nextEnd - physicalEnd, 48_000)
+            }
+        }
         if !audioOnly { tracks[1] = try await Task19Track(id: 1, mediaType: .video, duration: videoDuration,
-            boundary: boundary, plannedDurations: specialVideo,
+            boundary: boundary, plannedDurations: plannedSegmentDurations ?? specialVideo,
             terminalLogicalSequence: terminalLogicalSequence,
             formatVariant: initialFormatVariants[1] ?? .baseline) }
         for index in 0..<audioCount { tracks[UInt64(index + 2)] = try await Task19Track(id: UInt64(index + 2), mediaType: .audio,
             duration: audioDuration, start: audioStart, item: audioOnly ? UInt64(20 + index) : 19,
             boundary: boundary, channels: [2, 6, 8][index], offsets: audioBoundaryOffsets,
-            plannedDurations: specialAudio, terminalLogicalSequence: terminalLogicalSequence) }
+            plannedDurations: plannedAudioDurations ?? specialAudio, terminalLogicalSequence: terminalLogicalSequence) }
         var declaration = try Task19.declaration(audioOnly: audioOnly, audioCount: audioCount)
         declaration.token = sessionToken
         if let track = tracks[1] {

@@ -928,6 +928,15 @@ private final class AVPlayerRetiredReplacementFence: @unchecked Sendable {
 struct AVPlayerItemReplacementBundle: Sendable {
     let request: AVPlayerItemPreparationRequest
     let evidenceSource: any AVPlayerPreparationEvidenceProviding
+    let mediaInformation: PlaybackMediaInformation?
+
+    init(request: AVPlayerItemPreparationRequest,
+         evidenceSource: any AVPlayerPreparationEvidenceProviding,
+         mediaInformation: PlaybackMediaInformation? = nil) {
+        self.request = request
+        self.evidenceSource = evidenceSource
+        self.mediaInformation = mediaInformation
+    }
 }
 
 /// request 与 evidence source 由同一 server 一次生成；调用方无法把一台 server 的

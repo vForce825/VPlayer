@@ -211,13 +211,17 @@ struct SegmentedFMP4SystemConfiguration: @unchecked Sendable {
     let sourceFormatHintIdentity: ObjectIdentifier?
     let inputCount: Int
     let callbackContext: SegmentedFMP4CallbackContext?
+    let initialMovieFragmentSequenceNumber: Int
+    let producesCombinableFragments = true
     init(contentTypeIdentifier: String, outputFileTypeProfile: String, preferredOutputSegmentInterval: CMTime,
          mediaType: AVMediaType, outputSettingsAreNil: Bool, sourceFormatHintIdentity: ObjectIdentifier?, inputCount: Int,
-         callbackContext: SegmentedFMP4CallbackContext? = nil) {
+         callbackContext: SegmentedFMP4CallbackContext? = nil,
+         initialMovieFragmentSequenceNumber: Int = 1) {
         self.contentTypeIdentifier = contentTypeIdentifier; self.outputFileTypeProfile = outputFileTypeProfile
         self.preferredOutputSegmentInterval = preferredOutputSegmentInterval; self.mediaType = mediaType
         self.outputSettingsAreNil = outputSettingsAreNil; self.sourceFormatHintIdentity = sourceFormatHintIdentity
         self.inputCount = inputCount; self.callbackContext = callbackContext
+        self.initialMovieFragmentSequenceNumber = initialMovieFragmentSequenceNumber
     }
 }
 
@@ -538,12 +542,18 @@ private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting
               CMTIME_IS_INDEFINITE(configuration.preferredOutputSegmentInterval),
               configuration.outputSettingsAreNil,
               configuration.sourceFormatHintIdentity == ObjectIdentifier(sourceFormatHint),
-              configuration.inputCount == 1 else {
+              configuration.inputCount == 1,
+              configuration.initialMovieFragmentSequenceNumber > 0,
+              UInt32(exactly: configuration.initialMovieFragmentSequenceNumber) != nil else {
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
         }
         let writer = AVAssetWriter(contentType: .mpeg4Movie)
         writer.outputFileTypeProfile = .mpeg4AppleHLS
         writer.preferredOutputSegmentInterval = .indefinite
+        // Physical windows form one uniform fragment stream. Configure the native
+        // writer before start; callback bytes and codec/timing metadata stay untouched.
+        writer.initialMovieFragmentSequenceNumber = configuration.initialMovieFragmentSequenceNumber
+        writer.producesCombinableFragments = configuration.producesCombinableFragments
         let segmentDelegate = AVAssetSegmentDelegate(
             callbackSink: callbackSink,
             mediaType: configuration.mediaType,
@@ -684,14 +694,17 @@ final class WriterWindowContinuation: @unchecked Sendable {
     let trackKind: SegmentedFMP4TrackKind
     let frozenFormat: SegmentedFMP4FrozenFormat
     let cadence: WriterWindowCadence?
+    fileprivate let nextMovieFragmentSequenceNumber: Int
     private var state: State = .issued
 
     fileprivate init(
         predecessorTerminal: SegmentedFMP4WriterTerminalReceipt,
         trackKind: SegmentedFMP4TrackKind,
         frozenFormat: SegmentedFMP4FrozenFormat,
-        cadence: WriterWindowCadence?
+        cadence: WriterWindowCadence?,
+        nextMovieFragmentSequenceNumber: Int
     ) {
+        self.nextMovieFragmentSequenceNumber = nextMovieFragmentSequenceNumber
         self.predecessorTerminal = predecessorTerminal
         self.trackKind = trackKind
         self.frozenFormat = frozenFormat
@@ -1394,13 +1407,16 @@ final class AACWriterWindowContinuation: @unchecked Sendable {
     fileprivate let accounting: AACIncrementalStreamAccounting
     fileprivate let context: AACLiveEncodingContext
     fileprivate let renditionBinding: AACRenditionTerminalBinding
+    fileprivate let nextMovieFragmentSequenceNumber: Int
     private var state: State = .issued
     var nextPhysicalStart: ExactMediaTime? { accounting.nextPhysicalStart }
 
     fileprivate init(receipt: AACWriterWindowTerminalReceipt,
                      accounting: AACIncrementalStreamAccounting,
                      context: AACLiveEncodingContext,
-                     renditionBinding: AACRenditionTerminalBinding) {
+                     renditionBinding: AACRenditionTerminalBinding,
+                     nextMovieFragmentSequenceNumber: Int) {
+        self.nextMovieFragmentSequenceNumber = nextMovieFragmentSequenceNumber
         self.receipt = receipt
         self.accounting = accounting
         self.context = context
@@ -2178,6 +2194,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private var inputCount = 0
     private var initializationCallbackCount = 0
     private var mediaCallbackCount = 0
+    private let initialMovieFragmentSequenceNumber: Int
     private var lastLogicalSequence: UInt64?
     private var callbackEvidenceCount = 0
     private var callbackEvidenceDigest = Data(SHA256.hash(data: Data()))
@@ -2289,6 +2306,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         } else {
             writerWindowAdmission = nil
         }
+        initialMovieFragmentSequenceNumber = aacContinuation?.nextMovieFragmentSequenceNumber
+            ?? writerWindowContinuation?.nextMovieFragmentSequenceNumber ?? 1
         aacTerminalBinding = trackKind == .aac
             ? AACWriterTerminalBinding(binding: binding) : nil
         callbackContext = SegmentedFMP4CallbackContext(binding: binding, session: boundarySession,
@@ -2319,7 +2338,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             outputSettingsAreNil: true,
             sourceFormatHintIdentity: ObjectIdentifier(sourceFormatHint),
             inputCount: 1,
-            callbackContext: callbackContext
+            callbackContext: callbackContext,
+            initialMovieFragmentSequenceNumber: initialMovieFragmentSequenceNumber
         )
         systemWriter = try systemFactory.makeWriter(
             configuration: configuration,
@@ -3187,6 +3207,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
               relay.canReserve(projectedByteCount: currentSegmentProjectedBytes) else {
             throw SegmentedFMP4WriterFailure.illegalState
         }
+        _ = try nextMovieFragmentSequenceNumberIsolated()
         let ticket = try relay.reserve(kind: .media,
             logicalSequence: lastLogicalSequence ?? 0,
             projectedByteCount: currentSegmentProjectedBytes)
@@ -3264,10 +3285,12 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 firstMedia: firstAACMediaEvidence,
                 terminalMedia: terminalAACMediaEvidence,
                 mapping: mapping)
+            let nextFragment = try nextMovieFragmentSequenceNumberIsolated()
             windowContinuationIssued = true
             return AACWriterWindowContinuation(
                 receipt: receipt, accounting: accounting, context: context,
-                renditionBinding: renditionBinding)
+                renditionBinding: renditionBinding,
+                nextMovieFragmentSequenceNumber: nextFragment)
         }
     }
 
@@ -3305,12 +3328,14 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             } else {
                 cadence = nil
             }
+            let nextFragment = try nextMovieFragmentSequenceNumberIsolated()
             windowContinuationIssued = true
             return WriterWindowContinuation(
                 predecessorTerminal: terminal,
                 trackKind: trackKind,
                 frozenFormat: frozenFormat,
-                cadence: cadence)
+                cadence: cadence,
+                nextMovieFragmentSequenceNumber: nextFragment)
         }
     }
 
@@ -4083,6 +4108,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         var flushTicket: SegmentCallbackTicket?
         if ticket.requiresFlushBeforeAppend, currentSegmentInputCount > 0 {
+            // The existing segment and the newly opened segment both need a
+            // representable mfhd sequence; never let AVAssetWriter wrap to zero.
+            _ = try nextMovieFragmentSequenceNumberIsolated(additionalFragments: 1)
             guard mediaPendingCallbackCount < Self.pendingCallbackCapacity else {
                 throw SegmentedFMP4WriterFailure.illegalState
             }
@@ -4465,6 +4493,21 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 cleanupGroup.leave()
             }
         }
+    }
+
+    /// Apple HLS separable callbacks each contain one movie fragment. Advance by
+    /// emitted media callbacks, excluding initialization and unrelated writer IDs.
+    /// Pending callbacks are included only while checking live-writer capacity;
+    /// terminal-and-drained continuations have none.
+    private func nextMovieFragmentSequenceNumberIsolated(additionalFragments: Int = 0) throws -> Int {
+        let completedAndPending = mediaCallbackCount.addingReportingOverflow(mediaPendingCallbackCount)
+        let count = completedAndPending.partialValue.addingReportingOverflow(additionalFragments)
+        let next = initialMovieFragmentSequenceNumber.addingReportingOverflow(count.partialValue)
+        guard !completedAndPending.overflow, !count.overflow, !next.overflow,
+              next.partialValue > 0, UInt32(exactly: next.partialValue) != nil else {
+            throw SegmentedFMP4WriterFailure.arithmeticOverflow
+        }
+        return next.partialValue
     }
 
     private var mediaPendingCallbackCount: Int {

@@ -3246,7 +3246,11 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 XCTAssertEqual(try rawRequest(port: first.server.port, target: path).status, 200)
             }
             selections.append(try XCTUnwrap(first.server.currentAudioSelectionCapability(
-                itemGeneration: 19, publicationSequence: snapshot.publicationSequence)))
+                itemGeneration: 19, publicationSequence: snapshot.publicationSequence),
+                "selection iteration=\(iteration) retained=\(selections.count) "
+                    + "sequence=\(snapshot.publicationSequence) facts=\(first.server.preparationHistoryFactCounts) "
+                    + "gets=\(first.server.acceptedGETSnapshot()) aac=\(first.server.aacHTTPMembershipSnapshots) "
+                    + "resources=\(PlaybackResourceContextLedger.shared.chargedBytes)"))
         }
         XCTAssertEqual(Set(selections.map(ObjectIdentifier.init)).count, 14)
         XCTAssertEqual(frozen.participants.flatMap { $0.completedMedia.map(\.key) }, original)
@@ -6209,6 +6213,25 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+        let selection = server.currentAudioSelectionCapability(
+            itemGeneration: itemGeneration, publicationSequence: publicationSequence)
+        let basis = server.preparationPublicationBasis(
+            itemURL: itemURL, itemGeneration: itemGeneration,
+            publicationSequence: publicationSequence, preparationOwner: evidenceSource.preparationOwner)
+        let owner = evidenceSource.preparationOwner
+        let bodies = (playlist.initializationResources + playlist.resources).prefix(16).map { key in
+            let evidence = server.completedEvidence(for: key)
+            return "\(key):complete=\(evidence?.isComplete ?? false),responses=\(evidence?.uniqueResponseCount ?? 0)"
+        }
+        print("REPLACEMENT_SELECTION_FAILURE generation=\(itemGeneration) sequence=\(publicationSequence) "
+            + "visible=\(String(describing: publication.publisher.visible?.publicationSequence)) "
+            + "selection=\(String(describing: selection?.renditionIdentity)) "
+            + "basis=\(basis != nil) basisSelection=\(String(describing: basis?.audioSelectionCapability?.renditionIdentity)) "
+            + "historyActive=\(owner.isHistoryActive) retired=\(owner.isRetired) frozen=\(owner.completionIsFrozen) "
+            + "activeServer=\(FrozenPreparationOwner.activeHistoryServer === server) "
+            + "phase=\(server.lifecyclePhase) facts=\(server.preparationHistoryFactCounts) "
+            + "gets=\(server.acceptedGETSnapshot()) aac=\(server.aacHTTPMembershipSnapshots) "
+            + "resources=\(PlaybackResourceContextLedger.shared.chargedBytes) bodies=\(bodies)")
         throw AVPlayerItemCoordinatorFailure.insufficientCoverage
     }
 

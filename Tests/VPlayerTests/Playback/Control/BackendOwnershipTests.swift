@@ -517,6 +517,10 @@ final class BackendOwnershipTests: XCTestCase {
         XCTAssertEqual(harness.maximumPotentiallyAudibleOutputs, 1)
         let state = await harness.controller.currentStateForTesting
         guard case .paused = state else {
+            print("PAUSED_HANDOFF_FAILURE context=\(String(describing: harness.registry.outputResourceContextSnapshot())); "
+                + "route=\(String(describing: harness.registry.outputRouteObservationSnapshot())); "
+                + "safety=\(harness.registry.executor.safetyIngress.snapshot); "
+                + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
             XCTFail("Expected state to be paused, got \(state)")
             return
         }
