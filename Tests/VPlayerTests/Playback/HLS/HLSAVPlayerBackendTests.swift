@@ -935,6 +935,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 "Equal dimensions do not make the retired graph's callbacks current")
             XCTAssertNil(retiredBackend?.preparedMediaInformation(for: first))
             XCTAssertNil(registry.preparedHLSMediaInformation(for: first))
+            retiredBackend = nil
 
             await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-radio",
                 streamURL: audioServer.sourceURL, title: "Radio"))
