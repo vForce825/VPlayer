@@ -32,7 +32,8 @@ final class AudioRenditionConverterTests: XCTestCase {
         for row in rows {
             let channels = row.stereo.count
             let track = AudioTrackDescriptor(
-                streamIndex: 0, codec: .aac, timeBase: .init(num: 1, den: 48_000),
+                streamIndex: 0, codec: .aac,
+                timeBase: try XCTUnwrap(MediaRational(num: 1, den: 48_000)),
                 sampleRate: 48_000,
                 channelLayout: .init(channelCount: Int32(channels), nativeMask: row.mask),
                 extradata: Data())
