@@ -22,6 +22,21 @@ class WorkflowContracts(unittest.TestCase):
         selected=controls.split('func testNativeObservationControlsRejectFiveFaults()',1)[1]
         self.assertIn('try await checkSourceServerFirstRequest()',selected)
 
+    def test_canonical_native_decode_control_precedes_five_fault_controls(self):
+        native=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceNativeControlTests.swift').read_text()
+        selected=native.split('func testNativeObservationControlsRejectFiveFaults()',1)[1]
+        self.assertIn('try await checkCanonicalVideoDecode()',selected)
+        self.assertLess(selected.index('checkCanonicalVideoDecode()'),selected.index('positive:'))
+        self.assertIn('if entry == canonical { throw error }',native)
+        self.assertIn('guard count > 0, count == timed.count',native)
+        self.assertNotIn('XCTAssertEqual(count, timed.count',native)
+        self.assertNotIn('XCTUnwrap(capture.finish().first)',native)
+        self.assertNotIn('XCTUnwrap(tracks.first)',native)
+        self.assertNotIn('XCTAssertEqual(captured.inits',native)
+        generator=(ROOT/'Scripts/generate-hls-acceptance-fixture.py').read_text()
+        for fixture in ['control-avc.h264','control-hevc.h265']:
+            self.assertIn(fixture,native);self.assertIn(fixture,generator)
+
     def test_xcode_version_checks_drain_output_and_preserve_producer_failure(self):
         paths=list((ROOT/'.github/workflows').glob('*.yml'))
         paths.append(ROOT/'Scripts/run-persistent-hls-acceptance.sh')

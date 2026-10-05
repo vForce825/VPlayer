@@ -1167,7 +1167,10 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 generation: timed.source.generation, codec: track.codec)
             videoEligibility = try VideoRemuxEligibility(
                 generation: timed.source.generation, track: track,
-                sampleEntry: track.codec == .h264 ? .avc3 : .hev1)
+                // Canonical native codec identifiers match the declared avc1/hvc1
+                // packaging. Every AU is inspected before only matching configuration
+                // NALs are stripped; VCL, SEI and all other NAL bytes stay unchanged.
+                sampleEntry: track.codec == .h264 ? .avc1 : .hvc1)
         }
         let sourcePTS = try ExactMediaTime(
             CMSampleBufferGetPresentationTimeStamp(timed.source.sampleBuffer))

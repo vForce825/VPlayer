@@ -5,6 +5,7 @@
 import AudioToolbox
 import AVFoundation
 import CoreMedia
+import CryptoKit
 import Foundation
 import Network
 import VPlayerCore
@@ -305,6 +306,7 @@ final class AcceptanceCapture: @unchecked Sendable {
         var writers: Set<UInt64> = []
         var inits = 0
         var fragments = 0
+        var initializationFormat: [String: Any] = [:]
         var defaultDuration: UInt32 = 0
         var latestMediaTimescale: UInt32?
         var lastInitializationBeforeFragment = 0
@@ -346,6 +348,14 @@ final class AcceptanceCapture: @unchecked Sendable {
                     // Diagnostic only: an unavailable timescale cannot change admission.
                     track.latestMediaTimescale = try? AcceptanceMP4.mediaTimescale(bytes)
                     if track.inits == 1 {
+                        if kind == "video" {
+                            do { track.initializationFormat = try AcceptanceMP4.videoConfiguration(bytes) }
+                            catch { track.initializationFormat = ["diagnostic_error":ErrorDiagnosticSnapshot(error).summary] }
+                        }
+                        if let format = object.publicationEvidence?.format {
+                            track.initializationFormat["writer_source_subtype"] = AcceptanceReport.fourCC(format.sampleEntry)
+                            track.initializationFormat["writer_declared_codec"] = format.codec
+                        }
                         track.defaultDuration = try AcceptanceMP4.defaultDuration(bytes)
                         try track.handle.write(contentsOf: bytes)
                     }
@@ -367,7 +377,7 @@ final class AcceptanceCapture: @unchecked Sendable {
              "error":failure.map { ErrorDiagnosticSnapshot($0).summary } ?? "none",
              "tracks":tracks.values.sorted { $0.kind < $1.kind }.map { track -> [String: Any] in
                  ["kind":track.kind,"inits":track.inits,"fragments":track.fragments,
-                  "writer_count":track.writers.count,
+                  "writer_count":track.writers.count,"initialization_format":track.initializationFormat,
                   "last_init_before_fragment":track.lastInitializationBeforeFragment,
                   "raw":track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale),
                   "last_report_start":track.lastReportStart.map { AcceptanceReport.time($0) as Any } ?? NSNull(),
@@ -427,6 +437,32 @@ enum AcceptanceMP4 {
         guard trex.payload + 24 <= trex.end else { throw AcceptanceError.invalid("short trex") }
         return u32(bytes, trex.payload + 12)
     }
+    static func videoConfiguration(_ bytes: Data) throws -> [String: Any] {
+        let moov = try one("moov", boxes(bytes))
+        let trak = try one("trak", boxes(bytes, moov.payload, moov.end))
+        let mdia = try one("mdia", boxes(bytes, trak.payload, trak.end))
+        let minf = try one("minf", boxes(bytes, mdia.payload, mdia.end))
+        let stbl = try one("stbl", boxes(bytes, minf.payload, minf.end))
+        let stsd = try one("stsd", boxes(bytes, stbl.payload, stbl.end))
+        guard stsd.payload + 8 <= stsd.end, u32(bytes, stsd.payload + 4) == 1 else {
+            throw AcceptanceError.invalid("video diagnostic stsd entry count")
+        }
+        let entries = try boxes(bytes, stsd.payload + 8, stsd.end)
+        guard entries.count == 1, let entry = entries.first, entry.payload + 78 <= entry.end else {
+            throw AcceptanceError.invalid("video diagnostic sample entry")
+        }
+        var result: [String: Any] = ["sample_entry":entry.type]
+        for box in try boxes(bytes, entry.payload + 78, entry.end) where ["avcC", "hvcC"].contains(box.type) {
+            guard box.end - box.payload <= 65_536 else {
+                result[box.type] = ["bytes":box.end - box.payload,"diagnostic_omitted":true]
+                continue
+            }
+            let payload = bytes.subdata(in: box.payload..<box.end)
+            result[box.type] = AcceptanceReport.configuration(payload)
+        }
+        return result
+    }
+
     static func mediaTimescale(_ bytes: Data) throws -> UInt32 {
         let moov = try one("moov", boxes(bytes))
         let trak = try one("trak", boxes(bytes, moov.payload, moov.end))
@@ -610,6 +646,38 @@ final class AcceptanceObservedGraph: HLSMediaGraphAssembler.DeliveryGraph, @unch
 
 /// Native negative controls and long observations share these reporting functions.
 enum AcceptanceReport {
+    static func fourCC(_ value: FourCharCode) -> String {
+        String(bytes: [UInt8(truncatingIfNeeded: value >> 24),UInt8(truncatingIfNeeded: value >> 16),
+            UInt8(truncatingIfNeeded: value >> 8),UInt8(truncatingIfNeeded: value)], encoding: .ascii)
+            ?? String(format: "%08x", value)
+    }
+    static func configuration(_ data: Data) -> [String: Any] {
+        var result: [String: Any] = ["bytes":data.count,
+            "prefix_base64":data.prefix(64).base64EncodedString()]
+        if data.count <= 65_536 { result["sha256"] = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+        return result
+    }
+    static func format(_ format: CMFormatDescription) -> [String: Any] {
+        let type = CMFormatDescriptionGetMediaType(format)
+        var result: [String: Any] = ["media_type":fourCC(type),"subtype":fourCC(CMFormatDescriptionGetMediaSubType(format))]
+        if type == kCMMediaType_Video {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+            result["width"] = dimensions.width; result["height"] = dimensions.height
+            let atoms = CMFormatDescriptionGetExtension(format,
+                extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any]
+            for name in ["avcC", "hvcC"] {
+                if let data = atoms?[name] as? Data { result[name] = configuration(data) }
+            }
+        }
+        return result
+    }
+    static func failureTiming(elapsed: Double, stopped: Double?, playbackStart: Double?, lastProgress: Double?) -> [String: Any] {
+        let observation = stopped ?? elapsed
+        return ["source_observation_seconds":finite(observation),"source_clock_elapsed_seconds":finite(elapsed),
+            "post_stop_seconds":finite(stopped.map { elapsed - $0 }),
+            "playback_wall_seconds":finite(playbackStart.map { observation - $0 }),
+            "last_clock_progress_age_seconds":finite(lastProgress.map { observation - $0 })]
+    }
     /// Failure diagnostics must survive indefinite/invalid native times.
     static func finite(_ value: Double?) -> Any {
         guard let value, value.isFinite else { return NSNull() }

@@ -70,6 +70,19 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertFalse(store.validatesCurrentFinalPublication(final))
     }
 
+    func testCompressedLifecycleFixtureRejectsBothAACFlavors() async throws {
+        for codec in [HLSAudioCodec.aac, .sourceAAC] {
+            do {
+                let track = try await Task21CompressedLifecycleTrack(codec: codec,
+                    outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 73_121))
+                await track.shutdown()
+                XCTFail("The Dolby lifecycle fixture must reject \(codec)")
+            } catch {
+                XCTAssertEqual(error as? LoopbackHTTPServerError, .invalidConfiguration)
+            }
+        }
+    }
+
     func testCompressedFinalProjectionUsesCommittedCommonTailWithoutAACAuthority() async throws {
         for codec in [HLSAudioCodec.ac3, .eac3] {
             let fixture = try await Task21CompressedLifecycleHTTPFixture.start(codec: codec,
@@ -5459,7 +5472,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
                 owner,
                 branchGeneration: admissionSeed,
                 admissionFenceRevision: admissionSeed + 1)
-        case .aac:
+        case .aac, .sourceAAC:
             throw LoopbackHTTPServerError.invalidConfiguration
         }
         accessUnitSource = try AccessUnitSource(codec: codec, admission: admission)
@@ -5556,7 +5569,7 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
             switch codec {
             case .ac3: self = .ac3(try Task17AC3Harness(seed: seed, admission: admission))
             case .eac3: self = .eac3(try Task17EAC3Harness(seed: seed, admission: admission))
-            case .aac: throw LoopbackHTTPServerError.invalidConfiguration
+            case .aac, .sourceAAC: throw LoopbackHTTPServerError.invalidConfiguration
             }
         }
 

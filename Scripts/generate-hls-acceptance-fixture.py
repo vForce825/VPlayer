@@ -46,6 +46,17 @@ def validate_video_packets(packets):
         observed_video_span_seconds=times[-1]-times[0]+.04)
 
 
+def validate_control_probe(probe,codec):
+    streams=probe.get('streams',[])
+    expected_profiles={'h264':{'Constrained Baseline','Baseline','Main','High'},'hevc':{'Main'}}
+    if len(streams)!=1:raise ValueError('one actual control video stream required')
+    stream=streams[0]
+    if (stream.get('codec_name'),stream.get('width'),stream.get('height'),stream.get('has_b_frames'),stream.get('nb_read_frames')) != (codec,1280,720,0,'1'):
+        raise ValueError('native control must be exactly one1280x720 frame without reordering')
+    if stream.get('profile') not in expected_profiles[codec]:raise ValueError('native control profile outside declared ordinary codec envelope')
+    return stream
+
+
 def generate():
     deadline=time.monotonic()+300
     def run(*args):
@@ -61,10 +72,23 @@ def generate():
         run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-f','lavfi','-i',
             'testsrc2=s=1280x720:r=25:d=5','-c:v','libx264','-threads','2','-preset','ultrafast',
             '-pix_fmt','yuv420p','-g','125','-keyint_min','125','-sc_threshold','0','-an',video)
+        # One genuine IDR AU from the same encoder feeds a short paired native
+        # avc3/avc1 control. Repeating this independent IDR is valid short media.
+        run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-i',video,
+            '-frames:v','1','-c:v','copy','-bsf:v','h264_mp4toannexb','-f','h264',str(output/'control-avc.h264'))
+        run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-f','lavfi','-i',
+            'testsrc2=s=1280x720:r=25:d=0.04','-frames:v','1','-c:v','libx265','-preset','ultrafast',
+            '-pix_fmt','yuv420p','-profile:v','main','-x265-params','pools=none:frame-threads=1:bframes=0:repeat-headers=1:open-gop=0',
+            '-f','hevc',str(output/'control-hevc.h265'))
         run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-stream_loop','71','-i',video,
             '-f','lavfi','-i','aevalsrc=0.12*sin(2*PI*997*t)|0.12*sin(2*PI*1511*t):s=48000:d=360:c=stereo',
             '-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','ac3','-b:a','192k',
             '-t','360','-map_metadata','-1','-muxdelay','0','-muxrate','37000000','-f','mpegts',str(output/'persistent-360s.ts'))
+    control_observations={}
+    for codec,name in [('h264','control-avc.h264'),('hevc','control-hevc.h265')]:
+        observed=json.loads(run(FFPROBE,'-v','error','-count_frames','-show_entries',
+            'stream=codec_name,profile,width,height,has_b_frames,nb_read_frames','-of','json',str(output/name)))
+        control_observations[name]=validate_control_probe(observed,codec)
     probe=json.loads(run(FFPROBE,'-v','error','-show_streams','-show_format','-of','json',str(output/'persistent-360s.ts')))
     assert float(probe['format']['duration']) >= 359
     video_stream=next(stream for stream in probe['streams'] if stream['codec_type']=='video')
@@ -80,7 +104,10 @@ def generate():
         'comparison_reason':'same five-second source is admitted by unchanged old-writer256-record maps; candidate six-second coverage is separate',
         'maximum_playback_wall_seconds':300,'ts_muxrate_bps':37000000,
         'paced_transport_bps':38000000,'transport_description':'CBR null-packet padded synthetic TS; not complex 38 Mbps video',
-        'fixture_sha256':file_hash(output/'persistent-360s.ts', deadline)}
+        'fixture_sha256':file_hash(output/'persistent-360s.ts', deadline),
+        'control_avc_sha256':file_hash(output/'control-avc.h264', deadline),
+        'control_hevc_sha256':file_hash(output/'control-hevc.h265', deadline),
+        'native_control_observations':control_observations}
     (output/'provenance.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print(json.dumps(manifest))
 

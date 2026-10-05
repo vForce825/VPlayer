@@ -15,6 +15,15 @@ class AcceptanceFixtureTests(unittest.TestCase):
     def packets(gop=125):
         return [dict(pts_time=str(index/25),flags='K_' if index%gop==0 else '__') for index in range(9000)]
 
+    def test_native_control_fixtures_are_real_single_frame_canonical_codec_inputs(self):
+        self.assertTrue(hasattr(MODULE,'validate_control_probe'))
+        valid=dict(codec_name='h264',width=1280,height=720,has_b_frames=0,nb_read_frames='1',profile='Constrained Baseline')
+        MODULE.validate_control_probe({'streams':[valid]},'h264')
+        MODULE.validate_control_probe({'streams':[{**valid,'codec_name':'hevc','profile':'Main'}]},'hevc')
+        for changed in [{'codec_name':'hevc'},{'nb_read_frames':'0'},{'width':16},{'has_b_frames':1}]:
+            with self.assertRaises(ValueError):MODULE.validate_control_probe({'streams':[{**valid,**changed}]},'h264')
+        with self.assertRaises(ValueError):MODULE.validate_control_probe({'streams':[{**valid,'codec_name':'hevc','profile':'Main Intra'}]},'hevc')
+
     def test_observed_five_second_gop_covers_the_360_second_source(self):
         self.assertTrue(hasattr(MODULE,'validate_video_packets'),'actual GOP observations are required')
         facts=MODULE.validate_video_packets(self.packets())

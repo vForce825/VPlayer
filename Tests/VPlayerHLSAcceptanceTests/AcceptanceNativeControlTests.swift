@@ -5,6 +5,7 @@
 import AudioToolbox
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import Foundation
 import Network
 import XCTest
@@ -15,7 +16,141 @@ import XCTest
 /// Short controls run on the candidate before either capped observation. These
 /// exercise native components, not a second playback or resource-stability run.
 final class AcceptanceNativeControlTests: XCTestCase {
+    /// Same real IDR bytes and production admission/writer path, paired packaging.
+    /// Canonical production output must decode; legacy outcome is diagnostic.
+    private func checkCanonicalVideoDecode() async throws {
+        let cases: [(VideoCodec, String, HLSVideoSampleEntry, HLSVideoSampleEntry)] = [
+            (.h264, "control-avc.h264", .avc3, .avc1), (.hevc, "control-hevc.h265", .hev1, .hvc1)]
+        for (codecIndex, testCase) in cases.enumerated() {
+            let (codec, name, legacy, canonical) = testCase
+            let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name,
+                withExtension: nil, subdirectory: "HLSAcceptance"))
+            let bytes = try Data(contentsOf: url)
+            guard !bytes.isEmpty, bytes.count <= 1_048_576 else { throw AcceptanceError.invalid("video control AU bound") }
+            let scan = try AnnexBScanner.scan(bytes, codec: codec)
+            XCTAssertEqual(scan.randomAccessKind, codec == .h264 ? .h264IDR : .hevcIDR)
+            let track = VideoTrackDescriptor(streamIndex: 0, codec: codec,
+                timeBase: MediaRational(num: 1, den: 25)!, width: 1280, height: 720,
+                videoDelay: 0, extradata: scan.parameterSets.reduce(into: Data()) {
+                    $0.append(contentsOf: [0, 0, 0, 1]); $0.append($1)
+                }, frameRate: MediaRational(num: 25, den: 1), fieldOrder: .progressive)
+            for (entryIndex, entry) in [legacy, canonical].enumerated() {
+                do {
+                    let frames = try await decodeRemuxControl(bytes: bytes, track: track, entry: entry,
+                        writerBinding: binding(UInt64(60 + codecIndex * 2 + entryIndex)))
+                    if entry == canonical { XCTAssertGreaterThan(frames, 0) }
+                    print("HLS_ACCEPTANCE_REMUX_CONTROL=entry:\(entry),decoded_frames:\(frames)")
+                } catch {
+                    print("HLS_ACCEPTANCE_REMUX_CONTROL=entry:\(entry),error:\(ErrorDiagnosticSnapshot(error).summary)")
+                    if entry == canonical { throw error }
+                }
+            }
+        }
+    }
+
+    private func decodeRemuxControl(bytes: Data, track: VideoTrackDescriptor,
+        entry: HLSVideoSampleEntry, writerBinding: FMP4WriterBinding) async throws -> Int {
+        let timeline = HLSTimelineCoordinator()
+        _ = try timeline.consume(.tracks(DemuxTrackSet(selectedProgramID: 1, video: track, audio: nil)))
+        var timed: [HLSTimedVideoAccessUnit] = []
+        for index in 0..<12 {
+            let events = try timeline.consume(.packet(DemuxPacket(streamIndex: 0, codec: .video(track.codec),
+                data: bytes, presentationTimeStamp: CMTime(value: Int64(index), timescale: 25),
+                decodeTimeStamp: CMTime(value: Int64(index), timescale: 25),
+                duration: CMTime(value: 1, timescale: 25), isKey: true, isCorrupt: false)))
+            timed.append(contentsOf: events.compactMap { if case .videoSample(let value) = $0 { value } else { nil } })
+        }
+        timed.append(contentsOf: try timeline.consume(.endOfStream).compactMap {
+            if case .videoSample(let value) = $0 { value } else { nil }
+        })
+        let first = try XCTUnwrap(timed.first, "Real parser/timeline must emit the short video control")
+        var inspection = VideoAccessUnitInspectionSession(generation: first.source.generation, codec: track.codec)
+        let eligibility = try VideoRemuxEligibility(generation: first.source.generation, track: track, sampleEntry: entry)
+        let admissions = try timed.map { unit -> VideoRemuxAdmissionProof in
+            let proof = try inspection.inspect(.init(backing: XCTUnwrap(unit.source.sourceBacking),
+                byteRange: XCTUnwrap(unit.source.sourceByteRange), sourceSHA256: XCTUnwrap(unit.source.sourceSHA256),
+                codec: track.codec, scanClassification: unit.source.scanClassification,
+                presentationTimeStamp: ExactMediaTime(CMSampleBufferGetPresentationTimeStamp(unit.source.sampleBuffer)),
+                decodeTimeStamp: ExactMediaTime(CMSampleBufferGetDecodeTimeStamp(unit.source.sampleBuffer)),
+                duration: ExactMediaTime(CMSampleBufferGetDuration(unit.source.sampleBuffer)), expectedFormat: track))
+            return try XCTUnwrap(eligibility.evaluate(proof).proof)
+        }
+        let builder = try HLSVideoRemuxSubmissionBuilder(reference: first,
+            admission: admissions[0], writerBinding: writerBinding)
+        XCTAssertEqual(CMFormatDescriptionGetMediaSubType(builder.formatDescription), entry.fourCharacterCode)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let capture = AcceptanceCapture(directory: directory)
+        let holder = AcceptanceControlRelayHolder()
+        let relay = SegmentReportRelay(binding: writerBinding, limits: .video, capacity: 4) { object in
+            capture.receive(object)
+            _ = holder.relay?.releaseForControl(object)
+        }
+        holder.relay = relay
+        let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(
+            epochStart: first.timing.presentationTimeStamp.cmTime, videoMode: .passthrough))
+        let writer = try SegmentedFMP4Writer(binding: writerBinding, trackKind: .video,
+            sourceFormatHint: builder.formatDescription, boundarySession: boundary.session,
+            compressedFormatConfiguration: nil, relay: relay,
+            systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
+        do {
+            try writer.start(at: first.timing.presentationTimeStamp.cmTime)
+            for (index, unit) in timed.enumerated() {
+                let submission = try builder.makeSubmission(for: unit, admission: admissions[index])
+                XCTAssertEqual(submission.outputContainsParameterSets, entry == .avc3 || entry == .hev1)
+                var expected = Data()
+                try AnnexBScanner.visitNALUnits(in: XCTUnwrap(unit.source.sourceBacking),
+                    range: XCTUnwrap(unit.source.sourceByteRange), codec: track.codec) { _, bytes in
+                    let nal = bytes.withUnsafeBytes { Data($0) }
+                    let type = track.codec == .h264 ? nal[0] & 0x1F : (nal[0] >> 1) & 0x3F
+                    let parameter = track.codec == .h264 ? [UInt8(7), 8].contains(type) : [UInt8(32), 33, 34].contains(type)
+                    if parameter && (entry == .avc1 || entry == .hvc1) { return }
+                    var length = UInt32(nal.count).bigEndian
+                    withUnsafeBytes(of: &length) { expected.append(contentsOf: $0) }
+                    expected.append(nal)
+                }
+                XCTAssertEqual(submission.outputSHA256, VideoAccessUnitSHA256(bytes: expected.span),
+                    "Only configuration NALs may change; all other bytes and order must survive")
+                try await writer.appendRemuxVideoAwaitingReadiness(submission,
+                    ticket: boundary.issueRemuxVideoAppend(for: submission, writerBinding: writerBinding))
+            }
+            _ = try await writer.finish()
+        } catch { _ = await writer.cancelAwaitingCompletion(); throw error }
+        _ = await writer.cancelAwaitingCompletion()
+        guard let captured = try capture.finish().first, captured.inits == 1 else {
+            throw AcceptanceError.invalid("short native writer did not emit one initialization")
+        }
+        let asset = AVURLAsset(url: captured.url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first else { throw AcceptanceError.invalid("short native output has no video track") }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+        guard reader.canAdd(output) else { throw AcceptanceError.invalid("short video reader cannot add output") }
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        var count = 0
+        while let ready = try await provider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
+            guard CMSampleBufferGetImageBuffer(sample) != nil else { throw AcceptanceError.invalid("video control was not decoded") }
+            count += CMSampleBufferGetNumSamples(sample)
+        }
+        guard reader.status == .completed else { throw reader.error ?? AcceptanceError.invalid("short video decode incomplete") }
+        guard count > 0, count == timed.count else {
+            throw AcceptanceError.invalid("short video decode incomplete: \(count)/\(timed.count) frames")
+        }
+        return count
+    }
+
     private func checkFailureDiagnosticSerialization() throws {
+        let stopped = AcceptanceReport.failureTiming(elapsed: 314.4, stopped: 299.5, playbackStart: 35.1, lastProgress: 299.48)
+        XCTAssertEqual(stopped["source_observation_seconds"] as? Double, 299.5)
+        XCTAssertEqual(try XCTUnwrap(stopped["playback_wall_seconds"] as? Double), 264.4, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(stopped["post_stop_seconds"] as? Double), 14.9, accuracy: 0.001)
+        let overrun = AcceptanceReport.failureTiming(elapsed: 301, stopped: nil, playbackStart: nil, lastProgress: nil)
+        XCTAssertEqual(overrun["source_observation_seconds"] as? Double, 301, "Do not mask an actual missing stop")
         for value in [Double?.none, .some(.nan), .some(.infinity), .some(-.infinity)] {
             XCTAssertTrue(AcceptanceReport.finite(value) is NSNull)
         }
@@ -139,6 +274,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
     }
 
     func testNativeObservationControlsRejectFiveFaults() async throws {
+        try await checkCanonicalVideoDecode()
         try checkFailureDiagnosticSerialization()
         checkFirstFailureCapture()
         try checkListenerReadiness()
@@ -276,6 +412,10 @@ final class AcceptanceNativeControlTests: XCTestCase {
             box("trun", word(0) + word(1))
         return box("moof", header + box("traf", track)) + box("mdat", Data([1, 2, 3, 4]))
     }
+}
+
+private final class AcceptanceControlRelayHolder: @unchecked Sendable {
+    weak var relay: SegmentReportRelay?
 }
 
 private struct WithheldInitializationFactory: SegmentedFMP4SystemWriterFactory {

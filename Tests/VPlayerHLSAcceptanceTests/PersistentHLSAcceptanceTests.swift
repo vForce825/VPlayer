@@ -16,6 +16,7 @@ import XCTest
 /// Dedicated target only. Portable checks never substitute for these observations.
 @MainActor
 final class PersistentHLSAcceptanceTests: XCTestCase {
+    private var decodeDiagnostics: [String: Any] = [:]
     func testFiveMinuteOriginalNativePlaybackAndRetirement() async throws {
         let wholeTestStart = AcceptanceClock.now
         let environment = ProcessInfo.processInfo.environment
@@ -101,6 +102,8 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         }
         defer { sampler.cancel(); watchdog.stop() }
         var report: [String: Any] = [:]
+        var stopObservation: [String: Any] = [:]
+        var renditions: [[String: Any]] = []
         var stage = "await_playable_prefix"
         var playbackBeganAt: Double?
         var firstMediaTime: Double?
@@ -147,6 +150,11 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             XCTAssertLessThanOrEqual(measured, 300, "Actual native source/player observation exceeded the cap")
             let media = player.currentTime().seconds - mediaStart
             let cpuSeconds = try processCPUSeconds() - cpuStart
+            stopObservation = ["fully_validated":false,"wall_seconds":measured,
+                "playback_wall_seconds":start + measured - playbackStart,"prebuffer_seconds":playbackStart - start,
+                "media_seconds":AcceptanceReport.finite(media),"sample_count":samples.count,
+                "sampled_peak_footprint_bytes":samples.compactMap { $0["footprint_bytes"] as? UInt64 }.max() ?? 0,
+                "ledger_before":ledgerBefore]
             let transport = server.transportSnapshot
             // Request telemetry only after the common source/player deadline.
             // SDK27: fetchAccessLog(completionHandler:) delivers a sending log;
@@ -168,6 +176,12 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             }
             let tracks = try capture.finish()
             let cleanupSeconds = AcceptanceClock.now - cleanupStart
+            stopObservation["cleanup_joined"] = retired
+            stopObservation["cleanup_seconds"] = cleanupSeconds
+            stopObservation["ledger_after"] = ledgers()
+            #if !HLS_ACCEPTANCE_BASELINE
+            stopObservation.merge(AcceptanceReport.retirement(probe.snapshot)) { _, new in new }
+            #endif
             // Retirement is physically joined before any remaining telemetry wait
             // or timeout failure. This wait is outside playback and cleanup time.
             let accessWaitStart = AcceptanceClock.now
@@ -178,7 +192,6 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             let accessWaitSeconds = AcceptanceClock.now - accessWaitStart
             stage = "offline_decode"
             let decodeStart = AcceptanceClock.now
-            var renditions: [[String: Any]] = []
             for track in tracks { renditions.append(try await decode(track)) }
             let decodeSeconds = AcceptanceClock.now - decodeStart
             report = ["schema":1,"role":role,"native_evidence":true,"head":head,"tree":tree,
@@ -212,9 +225,8 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         } catch {
             // Capture before cleanup cancels writers/demux and overwrites stages.
             // This diagnostic is not an acceptance report or a baseline measurement.
-            let failure: [String: Any] = ["role":role,"stage":stage,
+            var failure: [String: Any] = ["role":role,"stage":stage,
                 "error":ErrorDiagnosticSnapshot(error).summary,
-                "source_observation_seconds":AcceptanceClock.now - start,
                 "whole_test_seconds":AcceptanceClock.now - wholeTestStart,
                 "task_cancelled":Task.isCancelled,"watchdog_stopped":watchdog.hasStopped,
                 "assembler_phase":String(describing: assembler.currentPhase),
@@ -224,12 +236,14 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "last_demux_control":graph.lastControlDiagnostic,
                 "transport":server.failureDiagnostics,"capture":capture.failureDiagnostics,
                 "player":failurePlayerState(player),
-                "playback_wall_seconds":AcceptanceReport.finite(playbackBeganAt.map { AcceptanceClock.now - $0 }),
                 "prebuffer_seconds":AcceptanceReport.finite(playbackBeganAt.map { $0 - start }),
                 "first_media_seconds":AcceptanceReport.finite(firstMediaTime),
                 "last_advancing_media_seconds":AcceptanceReport.finite(playbackBeganAt == nil ? nil : lastTime),
-                "last_clock_progress_age_seconds":AcceptanceReport.finite(playbackBeganAt == nil ? nil : AcceptanceClock.now - lastProgress),
+                "stop_observation":stopObservation,"completed_decode_results":renditions,"decode":decodeDiagnostics,
                 "history":acceptanceDiagnosticHistoryTail(PlaybackDiagnosticTracker.shared.recentHistory)]
+            failure.merge(AcceptanceReport.failureTiming(elapsed: AcceptanceClock.now - start,
+                stopped: watchdog.measuredSeconds, playbackStart: playbackBeganAt.map { $0 - start },
+                lastProgress: playbackBeganAt == nil ? nil : lastProgress - start)) { _, new in new }
             if let bytes = try? JSONSerialization.data(withJSONObject: failure, options: [.sortedKeys]) {
                 print("HLS_ACCEPTANCE_FAILURE=" + String(decoding: bytes, as: UTF8.self))
             }
@@ -323,10 +337,17 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
     }
     #endif
     private func decode(_ track: AcceptanceCapture.Track) async throws -> [String: Any] {
+        decodeDiagnostics = ["kind":track.kind,"stage":"load_tracks","initialization_format":track.initializationFormat]
         let asset = AVURLAsset(url: track.url)
         let type: AVMediaType = track.kind == "audio" ? .audio : .video
         let loaded = try await asset.loadTracks(withMediaType: type)
         let source = try XCTUnwrap(loaded.first)
+        decodeDiagnostics["stage"] = "load_formats"
+        let formats = try await source.load(.formatDescriptions)
+        decodeDiagnostics["reader_formats"] = formats.prefix(4).map { AcceptanceReport.format($0) }
+        if let bytes = try? JSONSerialization.data(withJSONObject: decodeDiagnostics, options: [.sortedKeys]) {
+            print("HLS_ACCEPTANCE_DECODE_FORMAT=" + String(decoding: bytes, as: UTF8.self))
+        }
         let reader = try AVAssetReader(asset: asset)
         let settings: [String: Any] = track.kind == "audio" ? [
             AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMIsFloatKey:true,
@@ -335,10 +356,17 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let output = AVAssetReaderTrackOutput(track: source, outputSettings: settings)
         XCTAssertTrue(reader.canAdd(output))
         let provider = reader.outputProvider(for: output)
-        try reader.start()
-        defer { if reader.status == .reading { reader.cancelReading() } }
-        var audio = AcceptancePCMStatistics()
         var frames = 0
+        defer {
+            decodeDiagnostics["reader_status"] = reader.status.rawValue
+            decodeDiagnostics["decoded_frames"] = frames
+            decodeDiagnostics["reader_error"] = reader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
+            if reader.status == .reading { reader.cancelReading() }
+        }
+        decodeDiagnostics["stage"] = "reader_start"
+        try reader.start()
+        decodeDiagnostics["stage"] = "reader_output"
+        var audio = AcceptancePCMStatistics()
         var first: CMTime?
         var previousEnd: CMTime?
         var gap = 0.0
