@@ -6,6 +6,7 @@ import Foundation
 import CryptoKit
 import Darwin
 import ObjectiveC
+import Synchronization
 
 enum CompletedMediaEvidenceError: Error, Equatable {
     case identityMismatch
@@ -278,13 +279,13 @@ struct FMP4InitializationCompatibilityFacts: Sendable, Equatable {
 /// One charge follows the immutable backing through all map/collection aliases.
 /// Store adoption is recorded once; it never detaches or releases this owner.
 fileprivate final class SealedDecodeMapPrepayment: @unchecked Sendable {
-    private let lock = NSLock()
+    // The claim state and its synchronization storage are inline in this owner;
+    // no separate Foundation lock allocation can exceed the prepaid estimate.
+    private let claimed = Mutex(false)
     private let owned: PlaybackApplicationChargeReservation
-    private var claimed = false
     let bytes: Int
     static var allocationBytes: Int {
         Int(malloc_good_size(class_getInstanceSize(Self.self)))
-            + Int(malloc_good_size(class_getInstanceSize(NSLock.self)))
     }
     private init(bytes: Int, reservation: PlaybackApplicationChargeReservation) {
         self.bytes = bytes
@@ -300,19 +301,17 @@ fileprivate final class SealedDecodeMapPrepayment: @unchecked Sendable {
             throw HLSPublicationFailure.capacityExceeded
         }
         let value = SealedDecodeMapPrepayment(bytes: bytes, reservation: reservation)
-        let ownerBytes = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value).toOpaque()))
-        let lockBytes = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value.lock).toOpaque()))
-        let actual = ownerBytes + lockBytes
+        let actual = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value).toOpaque()))
         guard actual <= allocationBytes else {
             #if DEBUG
-            print("DECODE_MAP_ADMISSION stage=prepayment-owner ownerActualBytes=\(ownerBytes) lockActualBytes=\(lockBytes) ownerReservedBytes=\(malloc_good_size(class_getInstanceSize(Self.self))) lockReservedBytes=\(malloc_good_size(class_getInstanceSize(NSLock.self))) actualBytes=\(actual) reservedBytes=\(allocationBytes)")
+            print("DECODE_MAP_ADMISSION stage=prepayment-owner actualBytes=\(actual) reservedBytes=\(allocationBytes)")
             #endif
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         return value
     }
     func claim() throws -> PlaybackApplicationChargeReservation {
-        try lock.withLock {
+        try claimed.withLock { claimed in
             guard !claimed else { throw CompletedMediaEvidenceError.identityMismatch }
             claimed = true
             return owned

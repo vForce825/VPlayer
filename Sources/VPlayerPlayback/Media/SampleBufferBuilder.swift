@@ -964,9 +964,10 @@ enum SampleBufferBuilder {
                 target[index].addEntries(from: source[index] as! [AnyHashable: Any])
             }
         }
-        let status = CMSampleBufferSetOutputPresentationTimeStamp(result,
-            newValue: CMSampleBufferGetOutputPresentationTimeStamp(sample))
-        guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
+        // The copied attachments preserve any explicit output-PTS override.
+        // Setting the getter's calculated value would create a new override
+        // attachment on an otherwise unchanged sample, breaking metadata identity
+        // and preventing future trim changes from recalculating its output PTS.
         return result
     }
 

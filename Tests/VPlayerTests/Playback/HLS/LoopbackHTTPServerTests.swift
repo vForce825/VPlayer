@@ -1154,6 +1154,12 @@ final class LoopbackHTTPServerTests: XCTestCase {
             let key = try XCTUnwrap(harness!.publisher.visible?.media[1]?.resources.first)
             var retainedMap = store.decodeCoverageMap(for: key)
             let paid = try XCTUnwrap(retainedMap?.applicationChargeableBytes)
+            XCTAssertEqual(paid, try LoopbackStorageLayout.current.decodeMapAllocation(
+                sampleCount: 1, commonSpanCount: 48),
+                "The ordinary sealed fixture prepays its full bounded map, including the inline owner")
+            XCTAssertThrowsError(try XCTUnwrap(retainedMap).claimPrepaidAllocationForStore()) {
+                XCTAssertEqual($0 as? CompletedMediaEvidenceError, .identityMismatch)
+            }
             var samples = retainedMap?.samples
             var spans = retainedMap?.commonByteSpans
             if closeImmediately { store.close() }
@@ -1169,6 +1175,11 @@ final class LoopbackHTTPServerTests: XCTestCase {
             while HLSDeliveryApplicationChargeLedger.shared.chargedBytes != baseline + paid,
                   ContinuousClock.now < deadline { await Task.yield() }
             XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline + paid)
+            XCTAssertThrowsError(try XCTUnwrap(retainedMap).claimPrepaidAllocationForStore()) {
+                XCTAssertEqual($0 as? CompletedMediaEvidenceError, .identityMismatch)
+            }
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline + paid,
+                "Store retirement must not reset the claim or release a retained owner's charge")
             XCTAssertFalse(try XCTUnwrap(retainedMap?.samples.isEmpty))
             retainedMap = nil
             XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline + paid,

@@ -9,6 +9,91 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SampleBufferBuilderTests: XCTestCase {
+    func testWriterInputPreservesCalculatedOutputTimestampWithoutAddingAttachments() throws {
+        for packetized in [false, true] {
+            let source = try makeWriterInputSource(packetized: packetized)
+            XCTAssertEqual(writerAttachments(source, mode: kCMAttachmentMode_ShouldPropagate)?.count ?? 0, 0)
+            let wrapped = try SampleBufferBuilder.makeWriterInputSample(source, lifetime: WriterInputLifetime())
+            try assertWriterInputMatches(wrapped, source, packetized: packetized)
+
+            // A calculated timestamp must remain calculated after wrapping. An
+            // explicit override with the same current value would freeze it here.
+            let trim = CMTime(value: 128, timescale: 48_000)
+            for sample in [source, wrapped] {
+                CMSetAttachment(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                    value: try XCTUnwrap(CMTimeCopyAsDictionary(trim, allocator: kCFAllocatorDefault)),
+                    attachmentMode: kCMAttachmentMode_ShouldPropagate)
+            }
+            assertExactTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped),
+                CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(source), trim))
+            try assertWriterInputMatches(wrapped, source, packetized: packetized)
+        }
+    }
+
+    func testWriterInputPreservesTrimmedCalculatedOutputTimestampAndAttachmentModes() throws {
+        for packetized in [false, true] {
+            for reversed in [false, true] {
+                let source = try makeWriterInputSource(packetized: packetized)
+                let startTrim = CMTime(value: 128, timescale: 48_000)
+                let endTrim = CMTime(value: 64, timescale: 48_000)
+                for (key, trim) in [(kCMSampleBufferAttachmentKey_TrimDurationAtStart, startTrim),
+                                    (kCMSampleBufferAttachmentKey_TrimDurationAtEnd, endTrim)] {
+                    CMSetAttachment(source, key: key,
+                        value: try XCTUnwrap(CMTimeCopyAsDictionary(trim, allocator: kCFAllocatorDefault)),
+                        attachmentMode: kCMAttachmentMode_ShouldPropagate)
+                }
+                if reversed {
+                    CMSetAttachment(source, key: kCMSampleBufferAttachmentKey_Reverse,
+                        value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
+                }
+                CMSetAttachment(source, key: "VPlayer.WriterInput.Private" as CFString,
+                    value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+                let attachments = try XCTUnwrap(CMSampleBufferGetSampleAttachmentsArray(source,
+                    createIfNecessary: true))
+                let dictionary = Unmanaged<CFMutableDictionary>.fromOpaque(
+                    try XCTUnwrap(CFArrayGetValueAtIndex(attachments, 0))).takeUnretainedValue()
+                CFDictionarySetValue(dictionary,
+                    Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+
+                let wrapped = try SampleBufferBuilder.makeWriterInputSample(source, lifetime: WriterInputLifetime())
+                let pts = CMSampleBufferGetPresentationTimeStamp(source)
+                let expected = reversed
+                    ? CMTimeSubtract(CMTimeAdd(pts, CMSampleBufferGetDuration(source)), endTrim)
+                    : CMTimeAdd(pts, startTrim)
+                assertExactTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped), expected)
+                try assertWriterInputMatches(wrapped, source, packetized: packetized)
+            }
+        }
+    }
+
+    func testWriterInputPreservesExplicitOutputTimestampEvenWhenItEqualsCalculatedValue() throws {
+        for packetized in [false, true] {
+            for shifted in [false, true] {
+                let source = try makeWriterInputSource(packetized: packetized)
+                let calculated = CMSampleBufferGetOutputPresentationTimeStamp(source)
+                let explicit = shifted ? CMTime(value: 91, timescale: 7) : calculated
+                let before = writerAttachments(source, mode: kCMAttachmentMode_ShouldPropagate)
+                XCTAssertEqual(CMSampleBufferSetOutputPresentationTimeStamp(source, newValue: explicit), noErr)
+                XCTAssertFalse(writerAttachments(source, mode: kCMAttachmentMode_ShouldPropagate) == before,
+                    "The explicit override is metadata even when its numeric timestamp is unchanged")
+
+                let wrapped = try SampleBufferBuilder.makeWriterInputSample(source, lifetime: WriterInputLifetime())
+                assertExactTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped), explicit)
+                try assertWriterInputMatches(wrapped, source, packetized: packetized)
+
+                for sample in [source, wrapped] {
+                    CMSetAttachment(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                        value: try XCTUnwrap(CMTimeCopyAsDictionary(
+                            CMTime(value: 128, timescale: 48_000), allocator: kCFAllocatorDefault)),
+                        attachmentMode: kCMAttachmentMode_ShouldPropagate)
+                }
+                assertExactTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped), explicit)
+                try assertWriterInputMatches(wrapped, source, packetized: packetized)
+            }
+        }
+    }
+
     func testHLSOwnedBlockChargesBeforeCopyAndRetainsChargeWhileInputOverlaps() throws {
         let ledger = HLSDeliveryApplicationChargeLedger()
         let inputAdmission = HLSDataPlaneAdmission(
@@ -471,6 +556,82 @@ final class SampleBufferBuilderTests: XCTestCase {
             throw PlaybackCoreError.unsupportedAudioCodec
         }
         return try AudioFormatDescriptionBuilder.make(format).description
+    }
+
+    private func makeWriterInputSource(packetized: Bool) throws -> CMSampleBuffer {
+        let audio = try SampleBufferBuilder.makeAudio(frame: makeAdmittedFrame(),
+            formatDescription: makeFormat(codec: .aac), forceResetDecoderBeforeDecoding: false)
+        if packetized { return audio }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1_024, timescale: 48_000),
+            presentationTimeStamp: CMTime(value: 48_000, timescale: 48_000),
+            decodeTimeStamp: CMTime(value: 47_000, timescale: 48_000))
+        var size = CMSampleBufferGetTotalSampleSize(audio)
+        var result: CMSampleBuffer?
+        XCTAssertEqual(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault,
+            dataBuffer: try XCTUnwrap(CMSampleBufferGetDataBuffer(audio)), formatDescription: nil,
+            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &result), noErr)
+        return try XCTUnwrap(result)
+    }
+
+    private func writerAttachments(_ sample: CMSampleBuffer, mode: CMAttachmentMode) -> NSDictionary? {
+        CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault, target: sample,
+            attachmentMode: mode).map { $0 as NSDictionary }
+    }
+
+    private func assertExactTime(_ actual: CMTime, _ expected: CMTime,
+                                 file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(actual.value, expected.value, file: file, line: line)
+        XCTAssertEqual(actual.timescale, expected.timescale, file: file, line: line)
+        XCTAssertEqual(actual.flags, expected.flags, file: file, line: line)
+        XCTAssertEqual(actual.epoch, expected.epoch, file: file, line: line)
+    }
+
+    private func assertWriterInputMatches(_ actual: CMSampleBuffer, _ expected: CMSampleBuffer,
+                                          packetized: Bool, file: StaticString = #filePath,
+                                          line: UInt = #line) throws {
+        XCTAssertNotEqual(ObjectIdentifier(actual), ObjectIdentifier(expected), file: file, line: line)
+        XCTAssertEqual(CMSampleBufferGetFormatDescription(actual).map(ObjectIdentifier.init),
+            CMSampleBufferGetFormatDescription(expected).map(ObjectIdentifier.init), file: file, line: line)
+        XCTAssertEqual(CMSampleBufferGetNumSamples(actual), CMSampleBufferGetNumSamples(expected),
+            file: file, line: line)
+        for (actualTime, expectedTime) in [
+            (CMSampleBufferGetDuration(actual), CMSampleBufferGetDuration(expected)),
+            (CMSampleBufferGetPresentationTimeStamp(actual), CMSampleBufferGetPresentationTimeStamp(expected)),
+            (CMSampleBufferGetDecodeTimeStamp(actual), CMSampleBufferGetDecodeTimeStamp(expected)),
+            (CMSampleBufferGetOutputPresentationTimeStamp(actual), CMSampleBufferGetOutputPresentationTimeStamp(expected)),
+            (CMSampleBufferGetOutputDecodeTimeStamp(actual), CMSampleBufferGetOutputDecodeTimeStamp(expected)),
+            (CMSampleBufferGetOutputDuration(actual), CMSampleBufferGetOutputDuration(expected))
+        ] {
+            assertExactTime(actualTime, expectedTime, file: file, line: line)
+        }
+        var actualTiming = CMSampleTimingInfo(), expectedTiming = CMSampleTimingInfo()
+        XCTAssertEqual(CMSampleBufferGetSampleTimingInfo(actual, at: 0, timingInfoOut: &actualTiming),
+            noErr, file: file, line: line)
+        XCTAssertEqual(CMSampleBufferGetSampleTimingInfo(expected, at: 0, timingInfoOut: &expectedTiming),
+            noErr, file: file, line: line)
+        assertExactTime(actualTiming.duration, expectedTiming.duration, file: file, line: line)
+        assertExactTime(actualTiming.presentationTimeStamp, expectedTiming.presentationTimeStamp, file: file, line: line)
+        assertExactTime(actualTiming.decodeTimeStamp, expectedTiming.decodeTimeStamp, file: file, line: line)
+        XCTAssertEqual(CMSampleBufferGetSampleSize(actual, at: 0), CMSampleBufferGetSampleSize(expected, at: 0),
+            file: file, line: line)
+        for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+            XCTAssertTrue(writerAttachments(actual, mode: mode) == writerAttachments(expected, mode: mode),
+                "attachmentMode=\(mode)", file: file, line: line)
+        }
+        XCTAssertTrue(CMSampleBufferGetSampleAttachmentsArray(actual, createIfNecessary: false).map { $0 as NSArray }
+            == CMSampleBufferGetSampleAttachmentsArray(expected, createIfNecessary: false).map { $0 as NSArray },
+            file: file, line: line)
+        XCTAssertEqual(try copiedBlockData(XCTUnwrap(CMSampleBufferGetDataBuffer(actual))),
+            try copiedBlockData(XCTUnwrap(CMSampleBufferGetDataBuffer(expected))), file: file, line: line)
+        if packetized {
+            let actualPacket = try packetDescription(from: actual)
+            let expectedPacket = try packetDescription(from: expected)
+            XCTAssertEqual(actualPacket.mStartOffset, expectedPacket.mStartOffset, file: file, line: line)
+            XCTAssertEqual(actualPacket.mVariableFramesInPacket, expectedPacket.mVariableFramesInPacket,
+                file: file, line: line)
+            XCTAssertEqual(actualPacket.mDataByteSize, expectedPacket.mDataByteSize, file: file, line: line)
+        }
     }
 
     private func assertBooleanAttachment(
