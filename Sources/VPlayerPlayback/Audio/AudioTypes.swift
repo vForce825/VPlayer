@@ -12,6 +12,9 @@ public struct CompressedAudioFrame: Sendable {
     public let presentationTimeStamp: CMTime
     public let duration: CMTime
     public let frameSampleCount: Int32
+    let sourceProof: CompressedAudioSourceProof?
+    // Paid data ownership alone confers no compressed-writer authority.
+    private let payloadOwnership: HLSAudioCopyTail?
 
     public init(
         id: UInt64,
@@ -29,6 +32,26 @@ public struct CompressedAudioFrame: Sendable {
         self.presentationTimeStamp = presentationTimeStamp
         self.duration = duration
         self.frameSampleCount = frameSampleCount
+        sourceProof = nil
+        payloadOwnership = nil
+    }
+
+    init(id: UInt64, payload: Data, codec: AudioCodec, generation: MediaGeneration,
+         presentationTimeStamp: CMTime, duration: CMTime, frameSampleCount: Int32,
+         sourceProof: CompressedAudioSourceProof) {
+        self.id = id; self.payload = payload; self.codec = codec; self.generation = generation
+        self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
+        self.frameSampleCount = frameSampleCount; self.sourceProof = sourceProof
+        payloadOwnership = nil
+    }
+
+    init(id: UInt64, payload: Data, codec: AudioCodec, generation: MediaGeneration,
+         presentationTimeStamp: CMTime, duration: CMTime, frameSampleCount: Int32,
+         payloadOwnership: HLSAudioCopyTail?) {
+        self.id = id; self.payload = payload; self.codec = codec; self.generation = generation
+        self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
+        self.frameSampleCount = frameSampleCount; sourceProof = nil
+        self.payloadOwnership = payloadOwnership
     }
 }
 

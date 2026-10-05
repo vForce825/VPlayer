@@ -3,7 +3,109 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import CoreMedia
+import CryptoKit
 import Foundation
+
+/// A bounded source lifetime, issued only by the paid assembler below. EOF is
+/// independent of writer-window completion; cancellation cannot manufacture EOF.
+final class CompressedAudioSourceStream: @unchecked Sendable {
+    let identity = UUID()
+    private let lock = NSLock()
+    private let ownership: HLSAudioCopyTail
+    private var valid = true
+    private var drained = false
+    private var lastFrameID: UInt64?
+    private var rendition: UUID?
+
+    fileprivate static func make(_ copies: HLSAudioCopyOwnership) throws -> CompressedAudioSourceStream {
+        guard let lease = copies.compressedInput.acquire(bytes: 2_048) else {
+            throw CompressedAudioAssembler.validationError()
+        }
+        return CompressedAudioSourceStream(ownership: HLSAudioCopyTail(lease))
+    }
+    private init(ownership: HLSAudioCopyTail) { self.ownership = ownership }
+    fileprivate func issued(_ id: UInt64) throws {
+        try lock.withLock {
+            guard valid, !drained, lastFrameID.map({ id > $0 }) ?? true else {
+                throw CompressedAudioAssembler.validationError()
+            }
+            lastFrameID = id
+        }
+    }
+    fileprivate func finish() { lock.withLock { if valid { drained = true } } }
+    fileprivate func abandonUnlessDrained() { lock.withLock { if !drained { valid = false } } }
+    func invalidate() { lock.withLock { valid = false } }
+    var isCurrent: Bool { lock.withLock { valid } }
+    func isDrained(throughFrameID id: UInt64) -> Bool {
+        lock.withLock { valid && drained && lastFrameID == id }
+    }
+    /// One stable rendition authority, shared by all physical writer windows.
+    func bindRendition(_ identity: UUID) -> Bool {
+        lock.withLock {
+            guard valid, rendition == nil else { return false }
+            rendition = identity
+            return true
+        }
+    }
+    func acceptsRendition(_ identity: UUID) -> Bool {
+        lock.withLock { valid && rendition == identity }
+    }
+}
+
+/// Immutable evidence from real framing/profile inspection. There is deliberately
+/// no externally accessible initializer taking arbitrary Data as a source proof.
+final class CompressedAudioSourceProof: @unchecked Sendable {
+    let identity = UUID()
+    let id: UInt64
+    let stream: CompressedAudioSourceStream
+    let generation: MediaGeneration
+    let presentationTimeStamp: CMTime
+    let duration: CMTime
+    let sourceLayout: AudioChannelLayout
+    let decoderConfiguration: Data
+    let format: SystemCompressedAudioFormat
+    let formatDescription: CMAudioFormatDescription
+    let payloadSHA256: Data
+    let payloadByteCount: Int
+    private let payloadTail: HLSAudioCopyTail
+    private let metadataTail: HLSAudioCopyTail
+    private let copyOwnership: HLSAudioCopyOwnership
+    private let claimLock = NSLock()
+    private var claimed = false
+
+    fileprivate init(id: UInt64, stream: CompressedAudioSourceStream,
+                     descriptor: AudioTrackDescriptor, generation: MediaGeneration,
+                     presentationTimeStamp: CMTime, duration: CMTime,
+                     inspected: InspectedCompressedAudioFrame,
+                     formatDescription: CMAudioFormatDescription,
+                     copyOwnership: HLSAudioCopyOwnership,
+                     payloadTail: HLSAudioCopyTail, metadataTail: HLSAudioCopyTail) {
+        self.id = id; self.stream = stream; self.generation = generation
+        self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
+        sourceLayout = descriptor.channelLayout; decoderConfiguration = inspected.decoderExtradata
+        format = inspected.systemFormat; self.formatDescription = formatDescription
+        payloadSHA256 = Data(SHA256.hash(data: inspected.payload))
+        payloadByteCount = inspected.payload.count
+        self.copyOwnership = copyOwnership; self.payloadTail = payloadTail; self.metadataTail = metadataTail
+    }
+    func validates(_ frame: CompressedAudioFrame) -> Bool {
+        frame.sourceProof === self && stream.isCurrent && frame.id == id
+            && frame.codec == .aac && frame.generation == generation
+            && frame.frameSampleCount == 1_024 && frame.payload.count == payloadByteCount
+            && CMTimeCompare(frame.presentationTimeStamp, presentationTimeStamp) == 0
+            && CMTimeCompare(frame.duration, duration) == 0
+            && Data(SHA256.hash(data: frame.payload)) == payloadSHA256
+    }
+    /// Called only after actual writer capacity has been paid. Rejection cannot
+    /// reset a consumed source AU or let it enter a second native writer.
+    func claim(for rendition: UUID) -> Bool {
+        claimLock.withLock {
+            guard !claimed, stream.acceptsRendition(rendition) else { return false }
+            claimed = true
+            return true
+        }
+    }
+}
 
 final class CompressedAudioAssembler {
     static let invalidInputErrorCode: Int32 = -1_448_208_897
@@ -17,6 +119,7 @@ final class CompressedAudioAssembler {
     private let descriptor: AudioTrackDescriptor
     private let profile: any CompressedAudioCodecProfile
     private let hlsCopyOwnership: HLSAudioCopyOwnership?
+    let sourceStream: CompressedAudioSourceStream?
     private var framer: (any CompressedAudioFramingStrategy)?
     private var nextID: UInt64?
     private var systemFormat: SystemCompressedAudioFormat?
@@ -47,11 +150,13 @@ final class CompressedAudioAssembler {
         self.formatState = formatState
         self.binding = binding
         self.hlsCopyOwnership = hlsCopyOwnership
+        sourceStream = try hlsCopyOwnership.map(CompressedAudioSourceStream.make)
         nextID = startingID
         try configureProfileAndFramer()
     }
 
     deinit {
+        sourceStream?.abandonUnlessDrained()
         framer?.destroy()
     }
 
@@ -97,6 +202,7 @@ final class CompressedAudioAssembler {
         try ensureFramerIsCurrent()
         do {
             try framer?.drain()
+            sourceStream?.finish()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
             throw error
@@ -155,6 +261,7 @@ final class CompressedAudioAssembler {
     private func ensureFramerIsCurrent() throws {
         let operationID = try currentOperationID()
         guard framerOperationID != operationID else { return }
+        sourceStream?.invalidate()
         framer?.destroy()
         framer = nil
         framerOperationID = operationID
@@ -162,6 +269,13 @@ final class CompressedAudioAssembler {
     }
 
     private func receive(_ framed: FramedCompressedAudioFrame) throws {
+        // ADTS removal allocates a distinct payload backing; reserve before inspection.
+        let payloadLease = profile.framing == .adts
+            ? hlsCopyOwnership?.compressedInput.acquire(bytes: framed.payload.count) : nil
+        guard profile.framing != .adts || hlsCopyOwnership == nil || payloadLease != nil else {
+            throw AudioUnitRejection(reason: .invalidFrame)
+        }
+        let payloadTail = payloadLease.map(HLSAudioCopyTail.init)
         let inspected: InspectedCompressedAudioFrame
         do {
             inspected = try profile.inspect(framed, source: descriptor)
@@ -193,15 +307,29 @@ final class CompressedAudioAssembler {
             guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0 else {
                 throw Self.validationError()
             }
-            eventSink(.frame(CompressedAudioFrame(
-                id: id,
-                payload: inspected.payload,
-                codec: descriptor.codec,
-                generation: generation,
-                presentationTimeStamp: framed.presentationTimeStamp,
-                duration: duration,
-                frameSampleCount: inspected.sampleCount
-            )))
+            if inspected.systemFormat.profileID == .aacLC, inspected.sampleCount == 1_024,
+               let hlsCopyOwnership, let sourceStream {
+                guard let ownedPayload = payloadTail ?? framed.hlsCopyTail,
+                      let proofLease = hlsCopyOwnership.compressedInput.acquire(bytes: 2_048) else {
+                    throw Self.validationError()
+                }
+                let metadataTail = HLSAudioCopyTail(proofLease)
+                try sourceStream.issued(id)
+                let proof = CompressedAudioSourceProof(id: id, stream: sourceStream, descriptor: descriptor,
+                    generation: generation, presentationTimeStamp: framed.presentationTimeStamp,
+                    duration: duration, inspected: inspected, formatDescription: formatDescription,
+                    copyOwnership: hlsCopyOwnership, payloadTail: ownedPayload, metadataTail: metadataTail)
+                eventSink(.frame(CompressedAudioFrame(id: id, payload: inspected.payload,
+                    codec: descriptor.codec, generation: generation,
+                    presentationTimeStamp: framed.presentationTimeStamp, duration: duration,
+                    frameSampleCount: inspected.sampleCount, sourceProof: proof)))
+            } else {
+                eventSink(.frame(CompressedAudioFrame(id: id, payload: inspected.payload,
+                    codec: descriptor.codec, generation: generation,
+                    presentationTimeStamp: framed.presentationTimeStamp, duration: duration,
+                    frameSampleCount: inspected.sampleCount,
+                    payloadOwnership: payloadTail ?? framed.hlsCopyTail)))
+            }
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
             throw error
@@ -220,6 +348,7 @@ final class CompressedAudioAssembler {
     }
 
     private func rejectCurrentUnit(reason: AudioDecodeBreakReason) throws {
+        sourceStream?.invalidate()
         framer?.destroy()
         framer = nil
         let operationID = try currentOperationID()

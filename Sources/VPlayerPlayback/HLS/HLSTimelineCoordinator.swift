@@ -207,11 +207,65 @@ enum HLSAudioBoundaryDecision: Sendable, Hashable {
     case trimLeading(ExactMediaTime)
 }
 
+/// The constructor is confined to the actual timeline emission lane. The paid
+/// source metadata reservation includes this bounded per-AU mapping object.
+private final class HLSTimedAudioMapping: @unchecked Sendable {
+    let identity = UUID()
+    let issuer: UUID
+    let sourceProof: CompressedAudioSourceProof
+    let generation: HLSTimelineGeneration
+    let timing: NormalizedSampleTiming
+    let boundaryDecision: HLSAudioBoundaryDecision
+    let origin: MediaOriginReceipt
+
+    init(sourceProof: CompressedAudioSourceProof, generation: HLSTimelineGeneration,
+         timing: NormalizedSampleTiming, boundaryDecision: HLSAudioBoundaryDecision,
+         origin: MediaOriginReceipt, issuer: UUID) {
+        self.sourceProof = sourceProof; self.generation = generation; self.timing = timing
+        self.boundaryDecision = boundaryDecision; self.origin = origin; self.issuer = issuer
+    }
+}
+
 struct HLSTimedAudioAccessUnit: Sendable {
     let source: CompressedAudioFrame
     let generation: HLSTimelineGeneration
     let timing: NormalizedSampleTiming
     let boundaryDecision: HLSAudioBoundaryDecision
+    private let mapping: HLSTimedAudioMapping?
+
+    /// Compatibility callers may carry timing but cannot mint compressed-source authority.
+    init(source: CompressedAudioFrame, generation: HLSTimelineGeneration,
+         timing: NormalizedSampleTiming, boundaryDecision: HLSAudioBoundaryDecision) {
+        self.source = source; self.generation = generation; self.timing = timing
+        self.boundaryDecision = boundaryDecision; mapping = nil
+    }
+    fileprivate init(source: CompressedAudioFrame, generation: HLSTimelineGeneration,
+                     timing: NormalizedSampleTiming, boundaryDecision: HLSAudioBoundaryDecision,
+                     origin: MediaOriginReceipt, issuer: UUID) {
+        self.source = source; self.generation = generation; self.timing = timing
+        self.boundaryDecision = boundaryDecision
+        mapping = source.sourceProof.map { HLSTimedAudioMapping(sourceProof: $0,
+            generation: generation, timing: timing, boundaryDecision: boundaryDecision,
+            origin: origin, issuer: issuer) }
+    }
+    var sourceMappingIdentity: UUID? { mapping?.identity }
+    var sourceTimelineIdentity: UUID? { mapping?.issuer }
+    var sourceOriginReceipt: MediaOriginReceipt? { mapping?.origin }
+
+    func validatesSourceMapping() -> Bool {
+        guard let mapping, mapping.sourceProof === source.sourceProof,
+              mapping.sourceProof.validates(source), mapping.generation == generation,
+              mapping.timing == timing, mapping.boundaryDecision == boundaryDecision,
+              boundaryDecision == .unchanged, mapping.origin.generation == generation,
+              source.generation.rawValue == generation.rawValue,
+              let rawStart = try? ExactMediaTime(source.presentationTimeStamp),
+              let rawDuration = try? ExactMediaTime(source.duration), rawDuration.value > 0,
+              let delta = try? rawStart.subtracting(mapping.origin.sourceTime), delta.value >= 0,
+              let mappedStart = try? mapping.origin.effectiveStart.adding(delta),
+              mappedStart == timing.presentationTimeStamp,
+              timing.duration == rawDuration, timing.decodeTimeStamp == nil else { return false }
+        return true
+    }
 }
 
 enum HLSGenerationEndReason: Sendable, Equatable {
@@ -376,6 +430,9 @@ final class HLSTimelineCoordinator {
     private static let maximumPendingAudioBytes = 4 * 1_024 * 1_024
     private let parserFactory: any FFmpegParserFactory
     private let hlsVideoCopyOwnership: HLSVideoCopyOwnership?
+    private let hlsAudioCopyOwnership: HLSAudioCopyOwnership?
+    private let audioMappingIssuer = UUID()
+    private var sourceAudioStream: CompressedAudioSourceStream?
     private let compressedAudioOutputPlanBinding: CompressedAudioOutputPlanBinding?
     private let sharedControlExecutor: PlaybackControlExecutor?
     /// 独立身份避免在初始化期间把 timeline 自身暴露给跨 coordinator 的 claim。
@@ -391,10 +448,12 @@ final class HLSTimelineCoordinator {
     init(
         parserFactory: any FFmpegParserFactory = LiveFFmpegParserFactory(),
         compressedAudioOutputPlanBinding: CompressedAudioOutputPlanBinding? = nil,
-        hlsVideoCopyOwnership: HLSVideoCopyOwnership? = nil
+        hlsVideoCopyOwnership: HLSVideoCopyOwnership? = nil,
+        hlsAudioCopyOwnership: HLSAudioCopyOwnership? = nil
     ) {
         self.parserFactory = parserFactory
         self.hlsVideoCopyOwnership = hlsVideoCopyOwnership
+        self.hlsAudioCopyOwnership = hlsAudioCopyOwnership
         self.compressedAudioOutputPlanBinding = compressedAudioOutputPlanBinding
         sharedControlExecutor = compressedAudioOutputPlanBinding?.sharedControlExecutor
         if let compressedAudioOutputPlanBinding {
@@ -403,6 +462,24 @@ final class HLSTimelineCoordinator {
                     compressedAudioOutputPlanBinding.claimTimeline(compressedAudioPlanIssuer)
                 }
         }
+    }
+
+    deinit { sourceAudioStream?.invalidate() }
+
+    /// Joins graph retirement without releasing any independently retained AU tail.
+    func retireCompressedGeneration() {
+        if let sharedControlExecutor {
+            sharedControlExecutor.sync { retireCompressedGenerationIsolated() }
+        } else { retireCompressedGenerationIsolated() }
+    }
+    private func retireCompressedGenerationIsolated() {
+        sourceAudioStream?.invalidate()
+        sourceAudioStream = nil
+        state?.binding.invalidate()
+        state = nil
+        emissions.removeAll(keepingCapacity: false)
+        callbackFailure = nil
+        terminalDelivered = true
     }
 
     /// 不接收 raw origin、interval、codec 或 admission；全部从当前状态与既有 binding 读取。
@@ -493,7 +570,10 @@ final class HLSTimelineCoordinator {
     private func consumeIsolated(_ event: DemuxEvent) throws -> [HLSTimelineEvent] {
         if terminalDelivered {
             switch event {
-            case .endOfStream, .cancelled, .failure:
+            case .cancelled, .failure:
+                retireCompressedGenerationIsolated()
+                return []
+            case .endOfStream:
                 return []
             case .tracks, .packet, .discontinuity:
                 break
@@ -611,8 +691,10 @@ final class HLSTimelineCoordinator {
                 },
                 parserFactory: parserFactory,
                 formatState: installed.formatState,
-                binding: installed.binding
+                binding: installed.binding,
+                hlsCopyOwnership: hlsAudioCopyOwnership
             )
+            sourceAudioStream = installed.audioAssembler?.sourceStream
         }
         if tracks.video != nil {
             installed.videoAssembler = try CompressedVideoAssembler(
@@ -940,7 +1022,9 @@ final class HLSTimelineCoordinator {
             source: frame,
             generation: state.generation,
             timing: timing,
-            boundaryDecision: decision
+            boundaryDecision: decision,
+            origin: origin,
+            issuer: audioMappingIssuer
         )))
     }
 
@@ -958,6 +1042,7 @@ final class HLSTimelineCoordinator {
         try state.audioAssembler?.drain()
         try state.videoAssembler?.drain()
         try throwCallbackFailure()
+        if reason != .endOfStream { sourceAudioStream?.invalidate() }
         state.binding.invalidate()
         emissions.append(.generationEnded(state.generation, reason: reason))
         self.state = nil
@@ -965,6 +1050,7 @@ final class HLSTimelineCoordinator {
 
     private func endGenerationWithoutDrain(_ reason: HLSGenerationEndReason) {
         guard let state else { return }
+        if reason != .endOfStream { sourceAudioStream?.invalidate() }
         state.binding.invalidate()
         emissions.append(.generationEnded(state.generation, reason: reason))
         self.state = nil
@@ -979,6 +1065,7 @@ final class HLSTimelineCoordinator {
     private func throwCallbackFailure() throws {
         guard let failure = callbackFailure else { return }
         callbackFailure = nil
+        sourceAudioStream?.invalidate()
         state?.binding.invalidate()
         state = nil
         terminalDelivered = true

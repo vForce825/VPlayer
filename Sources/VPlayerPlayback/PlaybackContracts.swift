@@ -8,19 +8,26 @@ import VPlayerCore
 
 public enum PlaybackFoundation { public static let contractVersion = 1 }
 
-public struct PlaybackRequest: Identifiable, Equatable, Sendable {
+public struct PlaybackRequest: Identifiable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public let id: UUID
     public let sourceProfileID: UUID
     public let channelID: String
     public let streamURL: URL
     public let title: String
+    private let contextResult: Result<PlaybackSourceContext, HLSSourceError>
+    public var sourceContext: PlaybackSourceContext { get throws { try contextResult.get() } }
+    public var description: String { "PlaybackRequest(id=\(id), transport=redacted)" }
+    public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: ["id": id, "transport": "redacted"] as [String: Any]) }
 
-    public init(sourceProfileID: UUID, channelID: String, streamURL: URL, title: String) {
+    public init(sourceProfileID: UUID, channelID: String, streamURL: URL, title: String, attributes: [String: String] = [:], explicitExpiry: Date? = nil) {
         self.id = UUID()
         self.sourceProfileID = sourceProfileID
         self.channelID = channelID
         self.streamURL = streamURL
         self.title = title
+        do { contextResult = .success(try PlaybackSourceContext(requestID: id, sourceProfileID: sourceProfileID, channelID: channelID, entryURL: streamURL, attributes: attributes, explicitExpiry: explicitExpiry)) }
+        catch { contextResult = .failure((error as? HLSSourceError) ?? .invalidHeader) }
     }
 
     public init(channel: Channel) {
@@ -28,7 +35,8 @@ public struct PlaybackRequest: Identifiable, Equatable, Sendable {
             sourceProfileID: channel.sourceProfileID,
             channelID: channel.id,
             streamURL: channel.streamURL,
-            title: channel.displayName
+            title: channel.displayName,
+            attributes: channel.attributes
         )
     }
 }
