@@ -68,6 +68,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let server = try AcceptanceHTTPServer(fileURL: file)
         defer { server.stop() }
         let capture = AcceptanceCapture(directory: directory)
+        defer { capture.close() }
         let firstFailure = AcceptanceFailureCapture()
         let ledgerBefore = ledgers()
         let identity = PlaybackSessionIdentity(sessionID: 30_000,
@@ -466,6 +467,9 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         }
         let provider = reader.outputProvider(for: output)
         let originalProvider = originalReader.outputProvider(for: originalOutput)
+        let rawReader = try AcceptanceRawVideoReader(url: XCTUnwrap(track.rawSamplesURL),
+            timescale: XCTUnwrap(track.latestMediaTimescale))
+        defer { rawReader.close() }
         var timing = AcceptanceVideoTiming()
         var decodedCursor = AcceptanceVideoReaderCursor(kind: .decoded)
         var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
@@ -478,7 +482,8 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             decodeDiagnostics["sample_timing"] = timing.diagnostics
             decodeDiagnostics["decoded_cursor"] = decodedCursor.diagnostics
             decodeDiagnostics["original_cursor"] = originalCursor.diagnostics
-            decodeDiagnostics["raw"] = track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale, mapping: mapping)
+            decodeDiagnostics["raw"] = track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale,
+                mapping: mapping, byteTiming: rawReader.timing)
             decodeDiagnostics["reader_error"] = reader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
             if reader.status == .reading { reader.cancelReading() }
             if originalReader.status == .reading { originalReader.cancelReading() }
@@ -494,8 +499,10 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             var paired = false
             while let original = try await originalProvider.next() {
                 guard try originalCursor.consumesMedia(original) else { continue }
+                let originalSample = try makeOwnedReaderFixtureSample(copying: original)
+                try rawReader.observe(original: originalSample)
                 try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
-                    original: makeOwnedReaderFixtureSample(copying: original))
+                    original: originalSample)
                 paired = true
                 break
             }
@@ -508,19 +515,21 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 throw AcceptanceError.invalid("original video sample has no decoded image")
             }
         }
+        try rawReader.finish()
         guard reader.status == .completed, originalReader.status == .completed,
               let seconds = timing.decodedSeconds else {
             throw AcceptanceError.invalid("paired video read incomplete")
         }
         try track.continuity.requireVideoCoverage(timing, timescale: track.latestMediaTimescale,
-            mapping: XCTUnwrap(mapping))
+            mapping: XCTUnwrap(mapping), byteTiming: rawReader.timing)
         var result: [String: Any] = ["kind":"video","writer_count":track.writers.count,
             "init_count":track.inits,"fragments":track.fragments,"decoded_frames":timing.frames,
             "decoded_seconds":seconds,"maximum_gap_seconds":timing.maximumGapSeconds,
             "missing_decoded_durations":timing.missingDecodedDurations,
             "decoded_cursor":decodedCursor.diagnostics,"original_cursor":originalCursor.diagnostics,
-            "raw":track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale, mapping: mapping),
-            "timing_evidence":"original compressed duration matched to every decoded PTS and native-mapped raw fragment endpoints"]
+            "raw":track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale,
+                mapping: mapping, byteTiming: rawReader.timing),
+            "timing_evidence":"every raw sample byte identity and duration matched to original reader ordinal, with exact translation and decoded PTS"]
         result.merge(AcceptanceReport.fragment(track.continuity)) { _, new in new }
         return result
     }

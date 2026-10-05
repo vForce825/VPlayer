@@ -308,6 +308,10 @@ final class AcceptanceCapture: @unchecked Sendable {
         var fragments = 0
         var initializationFormat: [String: Any] = [:]
         var defaultDuration: UInt32 = 0
+        var sampleDefaults: AcceptanceMP4.SampleDefaults?
+        var rawSamplesURL: URL?
+        var rawSamplesHandle: FileHandle?
+        var rawSampleCount = 0
         var latestMediaTimescale: UInt32?
         var lastInitializationBeforeFragment = 0
         var lastReportStart: CMTime?
@@ -316,14 +320,21 @@ final class AcceptanceCapture: @unchecked Sendable {
     }
     private let lock = NSLock()
     private let directory: URL
+    private let rawSampleRecordLimit: Int
     private var tracks: [String: Track] = [:]
     private var failure: (any Error)?
     private var copiedBytes = 0
+    private var closed = false
 
-    init(directory: URL) { self.directory = directory }
+    init(directory: URL, rawSampleRecordLimit: Int = AcceptanceRawVideoSample.maximumRecords) {
+        self.directory = directory
+        // Controls may lower the limit, never raise the fixed physical bound.
+        self.rawSampleRecordLimit = min(rawSampleRecordLimit, AcceptanceRawVideoSample.maximumRecords)
+    }
 
     func receive(_ object: SealedMediaObject) {
         lock.withLock {
+            guard !closed, failure == nil else { return }
             do {
                 let codec = object.publicationEvidence?.format.codec ?? ""
                 let kind = object.report.mediaType == .audio || codec == "mp4a.40.2" ? "audio" : "video"
@@ -333,7 +344,16 @@ final class AcceptanceCapture: @unchecked Sendable {
                     guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
                         throw AcceptanceError.invalid("cannot create original capture")
                     }
-                    tracks[kind] = Track(kind: kind, url: url, handle: try FileHandle(forWritingTo: url))
+                    var created = Track(kind: kind, url: url, handle: try FileHandle(forWritingTo: url))
+                    if kind == "video" {
+                        let samplesURL = directory.appendingPathComponent("original-video-samples.bin")
+                        guard FileManager.default.createFile(atPath: samplesURL.path, contents: nil) else {
+                            throw AcceptanceError.invalid("cannot create raw sample evidence")
+                        }
+                        created.rawSamplesURL = samplesURL
+                        created.rawSamplesHandle = try FileHandle(forWritingTo: samplesURL)
+                    }
+                    tracks[kind] = created
                 }
                 var track = tracks[kind]!
                 track.writers.insert(object.writerIdentity.rawValue)
@@ -359,17 +379,36 @@ final class AcceptanceCapture: @unchecked Sendable {
                             track.initializationFormat["writer_declared_codec"] = format.codec
                         }
                         track.defaultDuration = try AcceptanceMP4.defaultDuration(bytes)
+                        if kind == "video" { track.sampleDefaults = try AcceptanceMP4.sampleDefaults(bytes) }
                         try track.handle.write(contentsOf: bytes)
                     }
                 } else {
-                    try track.continuity.observe(bytes, defaultDuration: track.defaultDuration)
+                    if let handle = track.rawSamplesHandle {
+                        let defaults = try XCTUnwrap(track.sampleDefaults)
+                        let recordLimit = rawSampleRecordLimit
+                        var count = track.rawSampleCount
+                        try track.continuity.observe(bytes, defaultDuration: track.defaultDuration,
+                            sampleDefaults: defaults) { sample in
+                            guard count < recordLimit else {
+                                throw AcceptanceError.invalid("raw sample evidence capacity")
+                            }
+                            try handle.write(contentsOf: sample.encoded())
+                            count += 1
+                        }
+                        track.rawSampleCount = count
+                    } else { try track.continuity.observe(bytes, defaultDuration: track.defaultDuration) }
                     track.fragments += 1
                     track.lastReportStart = object.report.earliestPresentationTimeStamp
                     track.lastReportDuration = object.report.duration
                     try track.handle.write(contentsOf: bytes)
                 }
                 tracks[kind] = track
-            } catch { failure = error }
+            } catch {
+                if failure == nil { failure = error }
+                // A fragment may already have appended records before failing.
+                // Revoke further physical writes instead of retrying stale counts.
+                closeLocked()
+            }
         }
     }
 
@@ -380,6 +419,7 @@ final class AcceptanceCapture: @unchecked Sendable {
              "tracks":tracks.values.sorted { $0.kind < $1.kind }.map { track -> [String: Any] in
                  ["kind":track.kind,"inits":track.inits,"fragments":track.fragments,
                   "writer_count":track.writers.count,"initialization_format":track.initializationFormat,
+                  "raw_sample_records":track.rawSampleCount,
                   "last_init_before_fragment":track.lastInitializationBeforeFragment,
                   "raw":track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale),
                   "last_report_start":track.lastReportStart.map { AcceptanceReport.time($0) as Any } ?? NSNull(),
@@ -390,16 +430,27 @@ final class AcceptanceCapture: @unchecked Sendable {
 
     func finish() throws -> [Track] {
         try lock.withLock {
+            defer { closeLocked() }
             if let failure { throw failure }
-            for track in tracks.values { try track.handle.synchronize(); try track.handle.close() }
+            for track in tracks.values {
+                try track.handle.synchronize()
+                try track.rawSamplesHandle?.synchronize()
+            }
             return tracks.values.sorted { $0.kind < $1.kind }
         }
+    }
+    func close() { lock.withLock { closeLocked() } }
+    private func closeLocked() {
+        guard !closed else { return }
+        closed = true
+        for track in tracks.values { try? track.handle.close(); try? track.rawSamplesHandle?.close() }
     }
 }
 
 /// Strict read-only MP4 facts, including tfhd/trex duration defaults.
 enum AcceptanceMP4 {
-    struct Box { let type: String; let payload: Int; let end: Int }
+    struct Box { let type: String; let start: Int; let payload: Int; let end: Int }
+    struct SampleDefaults { let trackID: UInt32; let duration: UInt32; let size: UInt32 }
     struct Fragment {
         let sequence: UInt32; let time: UInt64; let duration: UInt64; let sampleCount: Int
         let presentationMatchesDecode: Bool
@@ -425,7 +476,7 @@ enum AcceptanceMP4 {
                 throw AcceptanceError.invalid("MP4 box size")
             }
             result.append(.init(type: String(decoding: bytes[(position+4)..<(position+8)], as: UTF8.self),
-                payload: position + header, end: position + size))
+                start: position, payload: position + header, end: position + size))
             position += size
         }
         return result
@@ -436,11 +487,15 @@ enum AcceptanceMP4 {
         return values[0]
     }
     static func defaultDuration(_ bytes: Data) throws -> UInt32 {
+        try sampleDefaults(bytes).duration
+    }
+    static func sampleDefaults(_ bytes: Data) throws -> SampleDefaults {
         let moov = try one("moov", boxes(bytes))
         let mvex = try one("mvex", boxes(bytes, moov.payload, moov.end))
         let trex = try one("trex", boxes(bytes, mvex.payload, mvex.end))
         guard trex.payload + 24 <= trex.end else { throw AcceptanceError.invalid("short trex") }
-        return u32(bytes, trex.payload + 12)
+        return SampleDefaults(trackID: u32(bytes, trex.payload + 4),
+            duration: u32(bytes, trex.payload + 12), size: u32(bytes, trex.payload + 16))
     }
     static func videoConfiguration(_ bytes: Data) throws -> [String: Any] {
         let moov = try one("moov", boxes(bytes))
@@ -526,9 +581,10 @@ enum AcceptanceMP4 {
         return result
     }
 
-    static func fragment(_ bytes: Data, defaultDuration: UInt32) throws -> Fragment {
+    static func fragment(_ bytes: Data, defaultDuration: UInt32, sampleDefaults: SampleDefaults? = nil,
+        onSample: ((AcceptanceRawVideoSample) throws -> Void)? = nil) throws -> Fragment {
         let top = try boxes(bytes)
-        _ = try one("mdat", top)
+        let mdat = try one("mdat", top)
         let moof = try one("moof", top)
         let children = try boxes(bytes, moof.payload, moof.end)
         let mfhd = try one("mfhd", children)
@@ -541,14 +597,27 @@ enum AcceptanceMP4 {
             throw AcceptanceError.invalid("short fragment headers")
         }
         var durationDefault = defaultDuration
+        var sizeDefault = sampleDefaults?.size ?? 0
         let flags = u32(bytes, tfhd.payload) & 0x00ff_ffff
+        if onSample != nil {
+            guard let sampleDefaults, sampleDefaults.trackID == u32(bytes, tfhd.payload + 4), flags & 1 == 0 else {
+                throw AcceptanceError.invalid("raw sample track/relative addressing unavailable")
+            }
+        }
         var position = tfhd.payload + 8
         if flags & 1 != 0 { position += 8 }
         if flags & 2 != 0 { position += 4 }
         if flags & 8 != 0 {
             guard position + 4 <= tfhd.end else { throw AcceptanceError.invalid("short tfhd duration") }
             durationDefault = u32(bytes, position)
+            position += 4
         }
+        if flags & 0x10 != 0 {
+            guard position + 4 <= tfhd.end else { throw AcceptanceError.invalid("short tfhd sample size") }
+            sizeDefault = u32(bytes, position); position += 4
+        }
+        if flags & 0x20 != 0 { position += 4 }
+        guard position <= tfhd.end else { throw AcceptanceError.invalid("short tfhd defaults") }
         let time: UInt64
         if bytes[tfdt.payload] == 1 {
             guard tfdt.payload + 12 <= tfdt.end else { throw AcceptanceError.invalid("short tfdt") }
@@ -557,6 +626,7 @@ enum AcceptanceMP4 {
         var duration: UInt64 = 0
         var sampleCount = 0
         var presentationMatchesDecode = true
+        var dataPosition: Int?
         let runs = track.filter { $0.type == "trun" }
         guard !runs.isEmpty else { throw AcceptanceError.invalid("missing trun") }
         for run in runs {
@@ -568,7 +638,13 @@ enum AcceptanceMP4 {
             guard !total.overflow else { throw AcceptanceError.invalid("native sample count overflow") }
             sampleCount = total.partialValue
             var position = run.payload + 8
-            if flags & 1 != 0 { position += 4 }
+            if flags & 1 != 0 {
+                guard position + 4 <= run.end else { throw AcceptanceError.invalid("short trun data offset") }
+                // One traf and no absolute base: ISO BMFF defines the base as
+                // this moof, including when default-base-is-moof is implicit.
+                dataPosition = moof.start + Int(Int32(bitPattern: u32(bytes, position)))
+                position += 4
+            }
             if flags & 4 != 0 { position += 4 }
             for _ in 0..<count {
                 let size = (flags & 0x100 != 0 ? 4 : 0) + (flags & 0x200 != 0 ? 4 : 0) +
@@ -578,12 +654,31 @@ enum AcceptanceMP4 {
                 guard value > 0 else { throw AcceptanceError.invalid("missing native sample duration") }
                 let sum = duration.addingReportingOverflow(UInt64(value))
                 guard !sum.overflow else { throw AcceptanceError.invalid("native duration overflow") }
-                duration = sum.partialValue
                 if flags & 0x800 != 0 {
                     // The acceptance fixture has no reordered frames. A nonzero
                     // composition offset makes tfdt unsuitable as a raw PTS.
                     presentationMatchesDecode = presentationMatchesDecode && u32(bytes, position + size - 4) == 0
                 }
+                if let onSample {
+                    let sampleSizeOffset = position + (flags & 0x100 != 0 ? 4 : 0)
+                    let sampleSize = flags & 0x200 != 0 ? u32(bytes, sampleSizeOffset) : sizeDefault
+                    guard presentationMatchesDecode, sampleSize > 0, let dataStart = dataPosition,
+                          dataStart >= mdat.payload, dataStart <= mdat.end,
+                          Int(sampleSize) <= mdat.end - dataStart else {
+                        throw AcceptanceError.invalid("raw sample payload range or composition time unavailable")
+                    }
+                    let timestamp = time.addingReportingOverflow(duration)
+                    guard !timestamp.overflow else { throw AcceptanceError.invalid("raw sample timestamp overflow") }
+                    let dataEnd = dataStart + Int(sampleSize)
+                    var hasher = SHA256()
+                    bytes.withUnsafeBytes { buffer in
+                        hasher.update(bufferPointer: UnsafeRawBufferPointer(rebasing: buffer[dataStart..<dataEnd]))
+                    }
+                    try onSample(AcceptanceRawVideoSample(time: timestamp.partialValue, duration: value,
+                        size: sampleSize, digest: Data(hasher.finalize())))
+                    dataPosition = dataEnd
+                }
+                duration = sum.partialValue
                 position += size
             }
         }
@@ -594,7 +689,157 @@ enum AcceptanceMP4 {
     }
 }
 
-/// Native metadata from the untouched captured asset, not the first decoded PTS.
+/// Fixed-size disk evidence emitted in raw trun/decode order. The same 65,536
+/// sample ceiling used by the parser bounds the entire finite acceptance sidecar
+/// to 3 MiB; no sample payload or growing evidence array is retained.
+struct AcceptanceRawVideoSample {
+    static let recordBytes = 48
+    static let maximumRecords = 65_536
+    let time: UInt64
+    let duration: UInt32
+    let size: UInt32
+    let digest: Data
+    init(time: UInt64, duration: UInt32, size: UInt32, digest: Data) {
+        self.time = time; self.duration = duration; self.size = size; self.digest = digest
+    }
+    init(encoded: Data) throws {
+        guard encoded.count == Self.recordBytes else { throw AcceptanceError.invalid("incomplete raw sample evidence") }
+        time = AcceptanceMP4.u64(encoded, 0)
+        duration = AcceptanceMP4.u32(encoded, 8)
+        size = AcceptanceMP4.u32(encoded, 12)
+        digest = encoded.subdata(in: 16..<48)
+    }
+    func encoded() throws -> Data {
+        guard digest.count == 32, duration > 0, size > 0 else { throw AcceptanceError.invalid("invalid raw sample evidence") }
+        var result = Data(capacity: Self.recordBytes)
+        var time = self.time.bigEndian; var duration = self.duration.bigEndian; var size = self.size.bigEndian
+        withUnsafeBytes(of: &time) { result.append(contentsOf: $0) }
+        withUnsafeBytes(of: &duration) { result.append(contentsOf: $0) }
+        withUnsafeBytes(of: &size) { result.append(contentsOf: $0) }
+        result.append(digest)
+        return result
+    }
+}
+
+/// Every compressed reader sample is associated with the next raw sample ordinal
+/// by exact size and SHA-256 before any timestamp translation is derived or used.
+/// Duplicate payloads cannot select another ordinal. Every duration and translated
+/// timestamp must match, so a first-frame-only offset never establishes coverage.
+struct AcceptanceVideoByteTiming {
+    struct ReaderSample {
+        var size: Int
+        var digest: Data
+        var pts: CMTime
+        var duration: CMTime
+    }
+    let timescale: Int32
+    private(set) var frames = 0
+    private var translation: ExactMediaTime?
+    private var firstRaw: ExactMediaTime?
+    private var rawEnd: ExactMediaTime?
+    private var readerEnd: ExactMediaTime?
+    private var latest: [String: Any] = [:]
+    init(timescale: Int32) { self.timescale = timescale }
+    mutating func observe(raw: AcceptanceRawVideoSample, reader: ReaderSample) throws {
+        latest = ["ordinal":frames,"raw_ticks":raw.time,"raw_duration_ticks":raw.duration,
+            "raw_size":raw.size,"reader_size":reader.size,"reader_pts":AcceptanceReport.time(reader.pts),
+            "reader_duration":AcceptanceReport.time(reader.duration),
+            "raw_sha256":raw.digest.map { String(format: "%02x", $0) }.joined(),
+            "reader_sha256":reader.digest.map { String(format: "%02x", $0) }.joined()]
+        guard timescale > 0, frames < AcceptanceRawVideoSample.maximumRecords,
+              raw.digest.count == 32, raw.digest == reader.digest, raw.size > 0,
+              Int(raw.size) == reader.size, raw.duration > 0, let ticks = Int64(exactly: raw.time) else {
+            throw AcceptanceError.invalid("compressed reader does not match the next raw sample payload")
+        }
+        let rawPTS = ExactMediaTime(value: ticks, timescale: timescale)
+        let rawDuration = ExactMediaTime(value: Int64(raw.duration), timescale: timescale)
+        let readerPTS = try ExactMediaTime(reader.pts)
+        let readerDuration = try ExactMediaTime(reader.duration)
+        guard rawDuration == readerDuration else { throw AcceptanceError.invalid("raw/reader sample duration mismatch") }
+        let candidate = try readerPTS.subtracting(rawPTS)
+        if let translation {
+            guard translation == candidate else { throw AcceptanceError.invalid("raw/reader timestamp translation changed") }
+        }
+        if let rawEnd, let readerEnd {
+            guard rawEnd == rawPTS, readerEnd == readerPTS else {
+                throw AcceptanceError.invalid("raw/reader sample ordinal has a gap or overlap")
+            }
+        }
+        let nextRawEnd = try rawPTS.adding(rawDuration)
+        let nextReaderEnd = try readerPTS.adding(readerDuration)
+        if firstRaw == nil { firstRaw = rawPTS }
+        translation = candidate; rawEnd = nextRawEnd; readerEnd = nextReaderEnd
+        frames += 1
+    }
+    func presentationTime(forRawTime time: CMTime) throws -> CMTime {
+        let raw = try ExactMediaTime(time)
+        guard frames > 0, let translation, let firstRaw, let rawEnd,
+              CMTimeCompare(raw.cmTime, firstRaw.cmTime) >= 0,
+              CMTimeCompare(raw.cmTime, rawEnd.cmTime) <= 0 else {
+            throw AcceptanceError.invalid("raw endpoint lacks complete byte-verified sample coverage")
+        }
+        return try raw.adding(translation).cmTime
+    }
+    var diagnostics: [String: Any] {
+        ["authority":"every raw trun/mdat sample matched by ordinal, size, SHA-256 and exact duration",
+         "verified_samples":frames,"record_limit":AcceptanceRawVideoSample.maximumRecords,
+         "translation":translation.map { AcceptanceReport.time($0.cmTime) as Any } ?? NSNull(),
+         "latest":latest]
+    }
+}
+
+final class AcceptanceRawVideoReader {
+    private let handle: FileHandle
+    private(set) var timing: AcceptanceVideoByteTiming
+    init(url: URL, timescale: UInt32) throws {
+        guard let scale = Int32(exactly: timescale), scale > 0 else {
+            throw AcceptanceError.invalid("raw video evidence timescale unavailable")
+        }
+        handle = try FileHandle(forReadingFrom: url)
+        timing = AcceptanceVideoByteTiming(timescale: scale)
+    }
+    deinit { try? handle.close() }
+    func close() { try? handle.close() }
+    func observe(reader: AcceptanceVideoByteTiming.ReaderSample) throws {
+        guard let bytes = try handle.read(upToCount: AcceptanceRawVideoSample.recordBytes), !bytes.isEmpty else {
+            throw AcceptanceError.invalid("compressed reader sample has no raw sample ordinal")
+        }
+        try timing.observe(raw: AcceptanceRawVideoSample(encoded: bytes), reader: reader)
+    }
+    func observe(original: CMSampleBuffer) throws {
+        let size = CMSampleBufferGetTotalSampleSize(original)
+        guard CMSampleBufferGetNumSamples(original) == 1, size > 0,
+              let block = CMSampleBufferGetDataBuffer(original), CMBlockBufferGetDataLength(block) >= size else {
+            throw AcceptanceError.invalid("compressed reader payload unavailable")
+        }
+        let digest = try withExtendedLifetime(block) {
+            var hasher = SHA256()
+            var offset = 0
+            while offset < size {
+                var length = 0; var total = 0; var pointer: UnsafeMutablePointer<CChar>?
+                let status = CMBlockBufferGetDataPointer(block, atOffset: offset,
+                    lengthAtOffsetOut: &length, totalLengthOut: &total, dataPointerOut: &pointer)
+                guard status == noErr, let pointer, total >= size, length > 0, length <= total - offset else {
+                    throw AcceptanceError.invalid("compressed reader payload borrow failed")
+                }
+                let count = min(length, size - offset)
+                hasher.update(bufferPointer: UnsafeRawBufferPointer(start: pointer, count: count))
+                offset += count
+            }
+            return Data(hasher.finalize())
+        }
+        try observe(reader: .init(size: size, digest: digest,
+            pts: CMSampleBufferGetPresentationTimeStamp(original), duration: CMSampleBufferGetDuration(original)))
+    }
+    func finish() throws {
+        defer { close() }
+        guard timing.frames > 0, try handle.read(upToCount: 1)?.isEmpty != false else {
+            throw AcceptanceError.invalid("raw sample evidence has unread records")
+        }
+    }
+}
+
+/// Native metadata describes the normalized track timeline, not the raw tfdt origin.
 /// https://developer.apple.com/documentation/avfoundation/avpartialasyncproperty/segments
 /// https://developer.apple.com/documentation/coremedia/cmtimemapping/source
 /// Only a single nonempty unit-rate mapping is supported. All retained state is scalar.
@@ -639,8 +884,16 @@ struct AcceptanceVideoTimelineMapping {
         }
         return try targetStart.adding(mediaTime.subtracting(sourceStart)).cmTime
     }
+    func requirePresentationCoverage(first: CMTime, end: CMTime) throws {
+        guard let segment else { throw AcceptanceError.invalid("missing native track mapping") }
+        let sourceEnd = try ExactMediaTime(segment.source.start).adding(ExactMediaTime(segment.source.duration)).cmTime
+        guard CMTimeCompare(first, try presentationTime(forMediaTime: segment.source.start)) == 0,
+              CMTimeCompare(end, try presentationTime(forMediaTime: sourceEnd)) == 0 else {
+            throw AcceptanceError.invalid("reader does not cover the native track timeline")
+        }
+    }
     var diagnostics: [String: Any] {
-        var result: [String: Any] = ["authority":"AVAssetTrack.segments of original captured bytes",
+        var result: [String: Any] = ["authority":"AVAssetTrack.segments normalized track metadata, not raw tfdt origin",
             "segment_count":segmentCount]
         if let segment {
             result["is_empty"] = segment.isEmpty
@@ -663,8 +916,10 @@ struct AcceptanceFragmentContinuity {
     private(set) var rawSequenceContinuous = true
     private(set) var rawTimeContinuous = true
     private(set) var rawPresentationMatchesDecode = true
-    mutating func observe(_ bytes: Data, defaultDuration: UInt32) throws {
-        let facts = try AcceptanceMP4.fragment(bytes, defaultDuration: defaultDuration)
+    mutating func observe(_ bytes: Data, defaultDuration: UInt32, sampleDefaults: AcceptanceMP4.SampleDefaults? = nil,
+        onSample: ((AcceptanceRawVideoSample) throws -> Void)? = nil) throws {
+        let facts = try AcceptanceMP4.fragment(bytes, defaultDuration: defaultDuration,
+            sampleDefaults: sampleDefaults, onSample: onSample)
         rawPresentationMatchesDecode = rawPresentationMatchesDecode && facts.presentationMatchesDecode
         if let previous = lastSequence {
             rawSequenceContinuous = rawSequenceContinuous && UInt64(facts.sequence) == UInt64(previous) + 1
@@ -683,22 +938,25 @@ struct AcceptanceFragmentContinuity {
     }
 
     func requireVideoCoverage(_ timing: AcceptanceVideoTiming, timescale: UInt32?,
-        mapping: AcceptanceVideoTimelineMapping) throws {
+        mapping: AcceptanceVideoTimelineMapping, byteTiming: AcceptanceVideoByteTiming) throws {
         guard rawSequenceContinuous, rawTimeContinuous, rawPresentationMatchesDecode, totalSamples > 0,
-              timing.frames == totalSamples, let first = firstDecodeTime, let end = nextDecodeTime,
+              timing.frames == totalSamples, byteTiming.frames == totalSamples,
+              let first = firstDecodeTime, let end = nextDecodeTime,
               let startTicks = Int64(exactly: first), let endTicks = Int64(exactly: end),
               let timescale, let scale = Int32(exactly: timescale), scale > 0,
               let firstPTS = timing.firstPTS, let lastEnd = timing.lastEnd else {
             throw AcceptanceError.invalid("decoded video does not cover every raw fragment sample and endpoint")
         }
-        let mappedFirst = try mapping.presentationTime(forMediaTime: CMTime(value: startTicks, timescale: scale))
-        let mappedEnd = try mapping.presentationTime(forMediaTime: CMTime(value: endTicks, timescale: scale))
+        let mappedFirst = try byteTiming.presentationTime(forRawTime: CMTime(value: startTicks, timescale: scale))
+        let mappedEnd = try byteTiming.presentationTime(forRawTime: CMTime(value: endTicks, timescale: scale))
         guard CMTimeCompare(firstPTS, mappedFirst) == 0, CMTimeCompare(lastEnd, mappedEnd) == 0 else {
             throw AcceptanceError.invalid("decoded video does not cover the mapped raw fragment endpoints")
         }
+        try mapping.requirePresentationCoverage(first: firstPTS, end: lastEnd)
     }
 
-    func failureDiagnostics(timescale: UInt32?, mapping: AcceptanceVideoTimelineMapping? = nil) -> [String: Any] {
+    func failureDiagnostics(timescale: UInt32?, mapping: AcceptanceVideoTimelineMapping? = nil,
+        byteTiming: AcceptanceVideoByteTiming? = nil) -> [String: Any] {
         let scale = timescale.flatMap { $0 > 0 ? Double($0) : nil }
         let endSeconds = scale.flatMap { scale in nextDecodeTime.map { Double($0) / scale } }
         var result: [String: Any] = ["raw_mfhd_continuous":rawSequenceContinuous,"raw_tfdt_continuous":rawTimeContinuous,
@@ -713,10 +971,13 @@ struct AcceptanceFragmentContinuity {
                 "last_raw_end_seconds":AcceptanceReport.finite(endSeconds)]
         if let mapping {
             result["timeline_mapping"] = mapping.diagnostics
+        }
+        if let byteTiming {
+            result["byte_timing"] = byteTiming.diagnostics
             if let timescale, let scale = Int32(exactly: timescale), scale > 0 {
                 for (key, value) in [("mapped_first_raw_pts", firstDecodeTime), ("mapped_last_raw_end", nextDecodeTime)] {
                     if let value, let ticks = Int64(exactly: value),
-                       let mapped = try? mapping.presentationTime(forMediaTime: CMTime(value: ticks, timescale: scale)) {
+                       let mapped = try? byteTiming.presentationTime(forRawTime: CMTime(value: ticks, timescale: scale)) {
                         result[key] = AcceptanceReport.time(mapped)
                     }
                 }

@@ -276,6 +276,26 @@ class AcceptanceReaderSourceContract(unittest.TestCase):
             self.assertIn('mapping: XCTUnwrap(mapping)',reader)
             self.assertIn('failureDiagnostics(timescale:',reader)
 
+    def test_raw_reader_translation_is_bound_to_every_sample_ordinal_and_payload(self):
+        source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        self.assertIn('struct AcceptanceVideoByteTiming',source)
+        proof=source.split('struct AcceptanceVideoByteTiming',1)[1].split('struct AcceptanceVideoTimelineMapping',1)[0]
+        for condition in ['raw.digest == reader.digest','Int(raw.size) == reader.size',
+                          'rawDuration == readerDuration','translation == candidate']:
+            self.assertIn(condition,proof)
+        for name in ['AcceptanceNativeControlTests.swift','PersistentHLSAcceptanceTests.swift']:
+            reader=(ROOT/'Tests/VPlayerHLSAcceptanceTests'/name).read_text()
+            self.assertIn('rawReader.observe(original: originalSample)',reader)
+            self.assertIn('rawReader.finish()',reader)
+            self.assertIn('byteTiming: rawReader.timing',reader)
+
+    def test_capture_failure_revokes_later_physical_admission(self):
+        source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        receive=source.split('func receive(_ object: SealedMediaObject)',1)[1].split('var failureDiagnostics',1)[0]
+        self.assertIn('guard !closed, failure == nil else { return }',receive)
+        self.assertIn('if failure == nil { failure = error }',receive)
+        self.assertIn('closeLocked()',receive)
+
 class AcceptanceSamplerSourceContract(unittest.TestCase):
     """Portable capture/order guard; Apple compilation and ARC remain native checks."""
     def setUp(self):

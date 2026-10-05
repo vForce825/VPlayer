@@ -6,6 +6,7 @@ import AudioToolbox
 import AVFoundation
 import CoreMedia
 import CoreVideo
+import CryptoKit
 import Foundation
 import Network
 import XCTest
@@ -82,6 +83,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let capture = AcceptanceCapture(directory: directory)
+        defer { capture.close() }
         let holder = AcceptanceControlRelayHolder()
         let relay = SegmentReportRelay(binding: writerBinding, limits: .video, capacity: 4) { object in
             capture.receive(object)
@@ -134,6 +136,9 @@ final class AcceptanceNativeControlTests: XCTestCase {
         }
         let provider = reader.outputProvider(for: output)
         let originalProvider = originalReader.outputProvider(for: originalOutput)
+        let rawReader = try AcceptanceRawVideoReader(url: XCTUnwrap(captured.rawSamplesURL),
+            timescale: XCTUnwrap(captured.latestMediaTimescale))
+        defer { rawReader.close() }
         var timing = AcceptanceVideoTiming()
         var decodedCursor = AcceptanceVideoReaderCursor(kind: .decoded)
         var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
@@ -146,7 +151,8 @@ final class AcceptanceNativeControlTests: XCTestCase {
             observation["decoded_cursor"] = decodedCursor.diagnostics
             observation["original_cursor"] = originalCursor.diagnostics
             observation["initialization_format"] = captured.initializationFormat
-            observation["raw"] = captured.continuity.failureDiagnostics(timescale: captured.latestMediaTimescale, mapping: mapping)
+            observation["raw"] = captured.continuity.failureDiagnostics(timescale: captured.latestMediaTimescale,
+                mapping: mapping, byteTiming: rawReader.timing)
             if let evidence = try? JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys]) {
                 print("HLS_ACCEPTANCE_REMUX_TIMING=" + String(decoding: evidence, as: UTF8.self))
             }
@@ -161,8 +167,10 @@ final class AcceptanceNativeControlTests: XCTestCase {
             var paired = false
             while let original = try await originalProvider.next() {
                 guard try originalCursor.consumesMedia(original) else { continue }
+                let originalSample = try makeOwnedReaderFixtureSample(copying: original)
+                try rawReader.observe(original: originalSample)
                 try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
-                    original: makeOwnedReaderFixtureSample(copying: original))
+                    original: originalSample)
                 paired = true
                 break
             }
@@ -175,12 +183,13 @@ final class AcceptanceNativeControlTests: XCTestCase {
                 throw AcceptanceError.invalid("short original video has no decoded image")
             }
         }
+        try rawReader.finish()
         guard reader.status == .completed, originalReader.status == .completed,
               timing.frames > 0, timing.frames == timed.count else {
             throw AcceptanceError.invalid("short paired video decode incomplete")
         }
         try captured.continuity.requireVideoCoverage(timing, timescale: captured.latestMediaTimescale,
-            mapping: XCTUnwrap(mapping))
+            mapping: XCTUnwrap(mapping), byteTiming: rawReader.timing)
         return timing.frames
     }
 
@@ -281,9 +290,107 @@ final class AcceptanceNativeControlTests: XCTestCase {
             originalPTS: .zero, originalDuration: bad.duration, decodedCount: 1, originalCount: 1))
     }
 
+    private func checkRawVideoByteEvidence() throws {
+        func word(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+        func box(_ name: String, _ payload: Data) -> Data { word(UInt32(payload.count + 8)) + Data(name.utf8) + payload }
+        func fragment(_ dataOffset: UInt32, count: UInt32 = 2, sequence: UInt32 = 1, time: UInt32 = 1_000) -> Data {
+            var run = word(0x301) + word(count) + word(dataOffset)
+            for _ in 0..<count { run.append(word(4) + word(4)) }
+            let track = box("tfhd", word(0x020000) + word(1)) + box("tfdt", word(0) + word(time)) + box("trun", run)
+            return box("moof", box("mfhd", word(0) + word(sequence)) + box("traf", track))
+        }
+        let payload = Data([1, 2, 3, 4, 1, 2, 3, 4])
+        let rawFragment = fragment(UInt32(fragment(0).count + 8)) + box("mdat", payload)
+        var samples: [AcceptanceRawVideoSample] = []
+        _ = try AcceptanceMP4.fragment(rawFragment, defaultDuration: 0,
+            sampleDefaults: .init(trackID: 1, duration: 0, size: 0)) { samples.append($0) }
+        XCTAssertEqual(samples.count, 2)
+        XCTAssertEqual(samples.map(\.time), [1_000, 1_004])
+        XCTAssertEqual(samples.map(\.size), [4, 4])
+        XCTAssertEqual(samples.map(\.duration), [4, 4])
+        let digest = Data(SHA256.hash(data: Data([1, 2, 3, 4])))
+        XCTAssertEqual(samples.map(\.digest), [digest, digest])
+        XCTAssertEqual(AcceptanceRawVideoSample.recordBytes * AcceptanceRawVideoSample.maximumRecords, 3 * 1_024 * 1_024)
+        let first = AcceptanceRawVideoSample(time: 1_000, duration: 4, size: 4, digest: digest)
+        let second = AcceptanceRawVideoSample(time: 1_004, duration: 4, size: 4, digest: digest)
+        XCTAssertEqual(try AcceptanceRawVideoSample(encoded: first.encoded()).time, 1_000)
+        var proof = AcceptanceVideoByteTiming(timescale: 100)
+        let reader = AcceptanceVideoByteTiming.ReaderSample(size: 4, digest: digest,
+            pts: .zero, duration: CMTime(value: 4, timescale: 100))
+        try proof.observe(raw: first, reader: reader)
+        var next = reader; next.pts = CMTime(value: 4, timescale: 100)
+        try proof.observe(raw: second, reader: next)
+        XCTAssertEqual(proof.frames, 2, "Duplicate payloads are verified by ordinal, not looked up by hash")
+        XCTAssertEqual(CMTimeCompare(try proof.presentationTime(forRawTime: CMTime(value: 1_008, timescale: 100)),
+            CMTime(value: 8, timescale: 100)), 0)
+        for fault in [0, 1, 2, 3] {
+            var value = AcceptanceVideoByteTiming(timescale: 100)
+            try value.observe(raw: first, reader: reader)
+            var wrong = next
+            if fault == 0 { wrong.digest = Data(SHA256.hash(data: Data([4, 3, 2, 1]))) }
+            if fault == 1 { wrong.pts = .zero }
+            if fault == 2 { wrong.duration = CMTime(value: 5, timescale: 100) }
+            if fault == 3 { wrong.size = 3 }
+            XCTAssertThrowsError(try value.observe(raw: second, reader: wrong))
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("samples")
+        try (first.encoded() + second.encoded()).write(to: url)
+        let complete = try AcceptanceRawVideoReader(url: url, timescale: 100)
+        defer { complete.close() }
+        try complete.observe(reader: reader); try complete.observe(reader: next)
+        XCTAssertNoThrow(try complete.finish())
+        let missing = try AcceptanceRawVideoReader(url: url, timescale: 100)
+        defer { missing.close() }
+        try missing.observe(reader: reader)
+        XCTAssertThrowsError(try missing.finish(), "An unread raw sample cannot disappear")
+        let extra = try AcceptanceRawVideoReader(url: url, timescale: 100)
+        defer { extra.close() }
+        try extra.observe(reader: reader); try extra.observe(reader: next)
+        XCTAssertThrowsError(try extra.observe(reader: next), "An extra reader sample has no raw ordinal")
+        let interruptedURL = directory.appendingPathComponent("interrupted-samples")
+        try first.encoded().dropLast().write(to: interruptedURL)
+        let interrupted = try AcceptanceRawVideoReader(url: interruptedURL, timescale: 100)
+        defer { interrupted.close() }
+        XCTAssertThrowsError(try interrupted.observe(reader: reader), "An interrupted fixed-size record must fail")
+
+        // A one-record control limit produces a partial-fragment failure with
+        // two ordinary samples; no large or stress input is needed.
+        let capture = AcceptanceCapture(directory: directory, rawSampleRecordLimit: 1)
+        defer { capture.close() }
+        let writerBinding = binding(75)
+        func object(_ bytes: Data, kind: SealedMediaObjectKind, sequence: UInt64) -> SealedMediaObject {
+            SealedMediaObject(binding: writerBinding, writerIdentity: writerBinding.writerIdentity,
+                callbackTicket: .init(rawValue: sequence), logicalSequence: sequence, kind: kind,
+                sourceBytes: bytes as NSData,
+                report: SegmentReportReference(evidence: .init(systemReport: nil, earliestPresentationTimeStamp: .zero)),
+                publicationLease: nil)
+        }
+        let trex = box("trex", word(0) + word(1) + word(1) + word(4) + word(4) + word(0))
+        capture.receive(object(box("moov", box("mvex", trex)), kind: .initialization, sequence: 0))
+        capture.receive(object(rawFragment, kind: .media, sequence: 1))
+        let firstFailure = try XCTUnwrap(capture.failureDiagnostics["error"] as? String)
+        XCTAssertTrue(firstFailure.contains("raw sample evidence capacity"))
+        let sidecar = directory.appendingPathComponent("original-video-samples.bin")
+        XCTAssertEqual(try Data(contentsOf: sidecar).count, AcceptanceRawVideoSample.recordBytes)
+        let oneSample = fragment(UInt32(fragment(0, count: 1).count + 8), count: 1, sequence: 2, time: 1_008) +
+            box("mdat", Data([1, 2, 3, 4]))
+        capture.receive(object(oneSample, kind: .media, sequence: 2))
+        XCTAssertEqual(try Data(contentsOf: sidecar).count, AcceptanceRawVideoSample.recordBytes,
+            "A failed fragment permanently revokes later physical evidence admission")
+        XCTAssertEqual(capture.failureDiagnostics["error"] as? String, firstFailure)
+        XCTAssertThrowsError(try capture.finish())
+    }
+
     private func checkVideoTimelineMapping() throws {
         let mediaStart = CMTime(value: 10, timescale: 1)
         let second = CMTime(value: 1, timescale: 1)
+        let digest = Data(SHA256.hash(data: Data([1, 2, 3, 4])))
+        var byteTiming = AcceptanceVideoByteTiming(timescale: 48_000)
+        try byteTiming.observe(raw: .init(time: 480_000, duration: 48_000, size: 4, digest: digest),
+            reader: .init(size: 4, digest: digest, pts: .zero, duration: second))
         let source = CMTimeRange(start: mediaStart, duration: second)
         let target = CMTimeRange(start: .zero, duration: second)
         let mapping = AcceptanceVideoTimelineMapping(segmentCount: 1,
@@ -322,38 +429,46 @@ final class AcceptanceNativeControlTests: XCTestCase {
         var complete = AcceptanceVideoTiming()
         try complete.observe(decodedPTS: .zero, decodedDuration: .invalid, originalPTS: .zero,
             originalDuration: second, decodedCount: 1, originalCount: 1)
-        XCTAssertNoThrow(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping))
+        XCTAssertNoThrow(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping, byteTiming: byteTiming))
+        let normalized = AcceptanceVideoTimelineMapping(segmentCount: 1,
+            segment: .init(source: target, target: target, isEmpty: false))
+        XCTAssertNoThrow(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: normalized, byteTiming: byteTiming),
+            "Native identity metadata does not expose the byte-proven raw fragment origin")
         let identity = AcceptanceVideoTimelineMapping(segmentCount: 1,
             segment: .init(source: source, target: source, isEmpty: false))
-        XCTAssertThrowsError(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: identity),
+        XCTAssertThrowsError(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: identity, byteTiming: byteTiming),
             "Equal spans cannot excuse a wrong container-derived translation")
         var short = AcceptanceVideoTiming()
         try short.observe(decodedPTS: .zero, decodedDuration: .invalid, originalPTS: .zero,
             originalDuration: CMTime(value: 1, timescale: 2), decodedCount: 1, originalCount: 1)
-        XCTAssertThrowsError(try raw.requireVideoCoverage(short, timescale: 48_000, mapping: mapping))
+        XCTAssertThrowsError(try raw.requireVideoCoverage(short, timescale: 48_000, mapping: mapping, byteTiming: byteTiming))
         var extra = AcceptanceVideoTiming()
         for pts in [CMTime.zero, CMTime(value: 1, timescale: 2)] {
             try extra.observe(decodedPTS: pts, decodedDuration: .invalid, originalPTS: pts,
                 originalDuration: CMTime(value: 1, timescale: 2), decodedCount: 1, originalCount: 1)
         }
-        XCTAssertThrowsError(try raw.requireVideoCoverage(extra, timescale: 48_000, mapping: mapping),
+        XCTAssertThrowsError(try raw.requireVideoCoverage(extra, timescale: 48_000, mapping: mapping, byteTiming: byteTiming),
             "Translation never overrides raw sample counts")
         for offset in [Int32(-1), 1] {
             var reordered = AcceptanceFragmentContinuity()
             try reordered.observe(fragment(sequence: 1, time: 480_000, compositionOffset: offset), defaultDuration: 48_000)
-            XCTAssertThrowsError(try reordered.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping),
+            XCTAssertThrowsError(try reordered.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping, byteTiming: byteTiming),
                 "Raw decode time is not a presentation coordinate when composition offsets are nonzero")
         }
         var zeroOffset = AcceptanceFragmentContinuity()
         try zeroOffset.observe(fragment(sequence: 1, time: 480_000, compositionOffset: 0), defaultDuration: 48_000)
-        XCTAssertNoThrow(try zeroOffset.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping))
-        let diagnostics = raw.failureDiagnostics(timescale: 48_000, mapping: mapping)
+        XCTAssertNoThrow(try zeroOffset.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping, byteTiming: byteTiming))
+        let diagnostics = raw.failureDiagnostics(timescale: 48_000, mapping: mapping, byteTiming: byteTiming)
         XCTAssertTrue(JSONSerialization.isValidJSONObject(diagnostics))
         XCTAssertNotNil(diagnostics["mapped_first_raw_pts"])
     }
 
     private func checkVideoTimingEvidence() throws {
         let start = CMTime(value: 10, timescale: 1)
+        let digest = Data(SHA256.hash(data: Data([1, 2, 3, 4])))
+        var byteTiming = AcceptanceVideoByteTiming(timescale: 48_000)
+        try byteTiming.observe(raw: .init(time: 480_000, duration: 48_000, size: 4, digest: digest),
+            reader: .init(size: 4, digest: digest, pts: start, duration: CMTime(value: 1, timescale: 1)))
         let range = CMTimeRange(start: start, duration: CMTime(value: 1, timescale: 1))
         let identity = AcceptanceVideoTimelineMapping(segmentCount: 1,
             segment: .init(source: range, target: range, isEmpty: false))
@@ -393,26 +508,26 @@ final class AcceptanceNativeControlTests: XCTestCase {
         var complete = AcceptanceVideoTiming()
         try complete.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
             originalDuration: CMTime(value: 1, timescale: 1), decodedCount: 1, originalCount: 1)
-        XCTAssertNoThrow(try original.requireVideoCoverage(complete, timescale: 48_000, mapping: identity))
+        XCTAssertNoThrow(try original.requireVideoCoverage(complete, timescale: 48_000, mapping: identity, byteTiming: byteTiming))
         var extraFrame = AcceptanceVideoTiming()
         for pts in [start, CMTimeAdd(start, CMTime(value: 1, timescale: 2))] {
             try extraFrame.observe(decodedPTS: pts, decodedDuration: .invalid,
                 originalPTS: pts, originalDuration: CMTime(value: 1, timescale: 2),
                 decodedCount: 1, originalCount: 1)
         }
-        XCTAssertThrowsError(try original.requireVideoCoverage(extraFrame, timescale: 48_000, mapping: identity),
+        XCTAssertThrowsError(try original.requireVideoCoverage(extraFrame, timescale: 48_000, mapping: identity, byteTiming: byteTiming),
             "Matching first/end timestamps cannot hide an extra decoded sample")
         var twoRawSamples = AcceptanceFragmentContinuity()
         try twoRawSamples.observe(fragment(sequence: 1, time: 480_000), defaultDuration: 24_000)
         try twoRawSamples.observe(fragment(sequence: 2, time: 504_000), defaultDuration: 24_000)
-        XCTAssertThrowsError(try twoRawSamples.requireVideoCoverage(complete, timescale: 48_000, mapping: identity),
+        XCTAssertThrowsError(try twoRawSamples.requireVideoCoverage(complete, timescale: 48_000, mapping: identity, byteTiming: byteTiming),
             "Matching first/end timestamps cannot hide a missing decoded sample")
-        XCTAssertThrowsError(try original.requireVideoCoverage(timing, timescale: 48_000, mapping: identity),
+        XCTAssertThrowsError(try original.requireVideoCoverage(timing, timescale: 48_000, mapping: identity, byteTiming: byteTiming),
             "Equal decoded and raw frame counts plus exact raw endpoints are mandatory")
         var shortEnd = AcceptanceVideoTiming()
         try shortEnd.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
             originalDuration: duration, decodedCount: 1, originalCount: 1)
-        XCTAssertThrowsError(try original.requireVideoCoverage(shortEnd, timescale: 48_000, mapping: identity),
+        XCTAssertThrowsError(try original.requireVideoCoverage(shortEnd, timescale: 48_000, mapping: identity, byteTiming: byteTiming),
             "The last frame endpoint cannot be inferred from nominal FPS")
         var batched = AcceptanceVideoTiming()
         XCTAssertThrowsError(try batched.observe(decodedPTS: start, decodedDuration: .invalid,
@@ -569,6 +684,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
 
     func testNativeObservationControlsRejectFiveFaults() async throws {
         try checkVideoReaderMarkerEvidence()
+        try checkRawVideoByteEvidence()
         try checkVideoTimelineMapping()
         try checkVideoTimingEvidence()
         try await checkCanonicalVideoDecode()
