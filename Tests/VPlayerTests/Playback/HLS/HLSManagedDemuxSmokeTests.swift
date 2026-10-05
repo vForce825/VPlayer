@@ -78,6 +78,8 @@ final class HLSManagedDemuxSmokeTests: XCTestCase {
             "ordinary-init-prefix=\(sample.header.prefix(4_096).base64EncodedString()) " +
             "ordinary-media-prefix=\(sample.media.prefix(2_048).base64EncodedString())")
         guard admission == 0 else { throw HLSSourceError.unsupportedMedia }
+        XCTAssertEqual(container, 2, "Original native writer output must be admitted as fragmented MP4")
+        XCTAssertEqual(usable, combined.count, "Source admission must retain the complete initialization and media")
         try await runManagedMedia(header: sample.header, media: sample.media, duration: sample.duration, expectedSuffix: "mp4")
     }
 

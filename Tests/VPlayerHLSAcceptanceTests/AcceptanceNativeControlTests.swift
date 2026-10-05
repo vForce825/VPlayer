@@ -137,6 +137,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
         var timing = AcceptanceVideoTiming()
         var decodedCursor = AcceptanceVideoReaderCursor(kind: .decoded)
         var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
+        var mapping: AcceptanceVideoTimelineMapping?
         defer {
             var observation = timing.diagnostics
             observation["entry"] = String(describing: entry)
@@ -144,12 +145,15 @@ final class AcceptanceNativeControlTests: XCTestCase {
             observation["original_reader_status"] = originalReader.status.rawValue
             observation["decoded_cursor"] = decodedCursor.diagnostics
             observation["original_cursor"] = originalCursor.diagnostics
+            observation["initialization_format"] = captured.initializationFormat
+            observation["raw"] = captured.continuity.failureDiagnostics(timescale: captured.latestMediaTimescale, mapping: mapping)
             if let evidence = try? JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys]) {
                 print("HLS_ACCEPTANCE_REMUX_TIMING=" + String(decoding: evidence, as: UTF8.self))
             }
             if reader.status == .reading { reader.cancelReading() }
             if originalReader.status == .reading { originalReader.cancelReading() }
         }
+        mapping = AcceptanceVideoTimelineMapping(segments: try await track.load(.segments))
         try originalReader.start()
         try reader.start()
         while let ready = try await provider.next() {
@@ -175,7 +179,8 @@ final class AcceptanceNativeControlTests: XCTestCase {
               timing.frames > 0, timing.frames == timed.count else {
             throw AcceptanceError.invalid("short paired video decode incomplete")
         }
-        try captured.continuity.requireVideoCoverage(timing, timescale: captured.latestMediaTimescale)
+        try captured.continuity.requireVideoCoverage(timing, timescale: captured.latestMediaTimescale,
+            mapping: XCTUnwrap(mapping))
         return timing.frames
     }
 
@@ -276,8 +281,82 @@ final class AcceptanceNativeControlTests: XCTestCase {
             originalPTS: .zero, originalDuration: bad.duration, decodedCount: 1, originalCount: 1))
     }
 
+    private func checkVideoTimelineMapping() throws {
+        let mediaStart = CMTime(value: 10, timescale: 1)
+        let second = CMTime(value: 1, timescale: 1)
+        let source = CMTimeRange(start: mediaStart, duration: second)
+        let target = CMTimeRange(start: .zero, duration: second)
+        let mapping = AcceptanceVideoTimelineMapping(segmentCount: 1,
+            segment: .init(source: source, target: target, isEmpty: false))
+        XCTAssertEqual(CMTimeCompare(try mapping.presentationTime(forMediaTime: mediaStart), .zero), 0)
+        XCTAssertEqual(CMTimeCompare(try mapping.presentationTime(forMediaTime: CMTime(value: 11, timescale: 1)), second), 0)
+        XCTAssertThrowsError(try mapping.presentationTime(forMediaTime: CMTime(value: 9, timescale: 1)))
+        XCTAssertThrowsError(try mapping.presentationTime(forMediaTime: CMTime(value: 12, timescale: 1)))
+        let shifted = AcceptanceVideoTimelineMapping(segmentCount: 1, segment: .init(
+            source: CMTimeRange(start: CMTime(value: 41, timescale: 3), duration: second),
+            target: CMTimeRange(start: CMTime(value: 7, timescale: 5), duration: second), isEmpty: false))
+        XCTAssertEqual(CMTimeCompare(try shifted.presentationTime(forMediaTime: CMTime(value: 44, timescale: 3)),
+            CMTime(value: 12, timescale: 5)), 0, "Translation comes from container metadata, never a hardcoded ten seconds")
+        for count in [0, 2] {
+            let unsupported = AcceptanceVideoTimelineMapping(segmentCount: count,
+                segment: .init(source: source, target: target, isEmpty: false))
+            XCTAssertThrowsError(try unsupported.presentationTime(forMediaTime: mediaStart))
+        }
+        let empty = AcceptanceVideoTimelineMapping(segmentCount: 1,
+            segment: .init(source: source, target: target, isEmpty: true))
+        XCTAssertThrowsError(try empty.presentationTime(forMediaTime: mediaStart))
+        let absent = AcceptanceVideoTimelineMapping(segmentCount: 1, segment: nil)
+        XCTAssertThrowsError(try absent.presentationTime(forMediaTime: mediaStart))
+        for duration in [CMTime.invalid, .zero, .indefinite, CMTime(value: -1, timescale: 1),
+                         CMTime(value: 2, timescale: 1)] {
+            let unsupported = AcceptanceVideoTimelineMapping(segmentCount: 1, segment: .init(
+                source: source, target: CMTimeRange(start: .zero, duration: duration), isEmpty: false))
+            XCTAssertThrowsError(try unsupported.presentationTime(forMediaTime: mediaStart))
+        }
+        let invalidSource = AcceptanceVideoTimelineMapping(segmentCount: 1, segment: .init(
+            source: CMTimeRange(start: .invalid, duration: second), target: target, isEmpty: false))
+        XCTAssertThrowsError(try invalidSource.presentationTime(forMediaTime: mediaStart))
+
+        var raw = AcceptanceFragmentContinuity()
+        try raw.observe(fragment(sequence: 1, time: 480_000), defaultDuration: 48_000)
+        var complete = AcceptanceVideoTiming()
+        try complete.observe(decodedPTS: .zero, decodedDuration: .invalid, originalPTS: .zero,
+            originalDuration: second, decodedCount: 1, originalCount: 1)
+        XCTAssertNoThrow(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping))
+        let identity = AcceptanceVideoTimelineMapping(segmentCount: 1,
+            segment: .init(source: source, target: source, isEmpty: false))
+        XCTAssertThrowsError(try raw.requireVideoCoverage(complete, timescale: 48_000, mapping: identity),
+            "Equal spans cannot excuse a wrong container-derived translation")
+        var short = AcceptanceVideoTiming()
+        try short.observe(decodedPTS: .zero, decodedDuration: .invalid, originalPTS: .zero,
+            originalDuration: CMTime(value: 1, timescale: 2), decodedCount: 1, originalCount: 1)
+        XCTAssertThrowsError(try raw.requireVideoCoverage(short, timescale: 48_000, mapping: mapping))
+        var extra = AcceptanceVideoTiming()
+        for pts in [CMTime.zero, CMTime(value: 1, timescale: 2)] {
+            try extra.observe(decodedPTS: pts, decodedDuration: .invalid, originalPTS: pts,
+                originalDuration: CMTime(value: 1, timescale: 2), decodedCount: 1, originalCount: 1)
+        }
+        XCTAssertThrowsError(try raw.requireVideoCoverage(extra, timescale: 48_000, mapping: mapping),
+            "Translation never overrides raw sample counts")
+        for offset in [Int32(-1), 1] {
+            var reordered = AcceptanceFragmentContinuity()
+            try reordered.observe(fragment(sequence: 1, time: 480_000, compositionOffset: offset), defaultDuration: 48_000)
+            XCTAssertThrowsError(try reordered.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping),
+                "Raw decode time is not a presentation coordinate when composition offsets are nonzero")
+        }
+        var zeroOffset = AcceptanceFragmentContinuity()
+        try zeroOffset.observe(fragment(sequence: 1, time: 480_000, compositionOffset: 0), defaultDuration: 48_000)
+        XCTAssertNoThrow(try zeroOffset.requireVideoCoverage(complete, timescale: 48_000, mapping: mapping))
+        let diagnostics = raw.failureDiagnostics(timescale: 48_000, mapping: mapping)
+        XCTAssertTrue(JSONSerialization.isValidJSONObject(diagnostics))
+        XCTAssertNotNil(diagnostics["mapped_first_raw_pts"])
+    }
+
     private func checkVideoTimingEvidence() throws {
         let start = CMTime(value: 10, timescale: 1)
+        let range = CMTimeRange(start: start, duration: CMTime(value: 1, timescale: 1))
+        let identity = AcceptanceVideoTimelineMapping(segmentCount: 1,
+            segment: .init(source: range, target: range, isEmpty: false))
         let duration = CMTime(value: 1, timescale: 25)
         var timing = AcceptanceVideoTiming()
         try timing.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
@@ -314,26 +393,26 @@ final class AcceptanceNativeControlTests: XCTestCase {
         var complete = AcceptanceVideoTiming()
         try complete.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
             originalDuration: CMTime(value: 1, timescale: 1), decodedCount: 1, originalCount: 1)
-        XCTAssertNoThrow(try original.requireVideoCoverage(complete, timescale: 48_000))
+        XCTAssertNoThrow(try original.requireVideoCoverage(complete, timescale: 48_000, mapping: identity))
         var extraFrame = AcceptanceVideoTiming()
         for pts in [start, CMTimeAdd(start, CMTime(value: 1, timescale: 2))] {
             try extraFrame.observe(decodedPTS: pts, decodedDuration: .invalid,
                 originalPTS: pts, originalDuration: CMTime(value: 1, timescale: 2),
                 decodedCount: 1, originalCount: 1)
         }
-        XCTAssertThrowsError(try original.requireVideoCoverage(extraFrame, timescale: 48_000),
+        XCTAssertThrowsError(try original.requireVideoCoverage(extraFrame, timescale: 48_000, mapping: identity),
             "Matching first/end timestamps cannot hide an extra decoded sample")
         var twoRawSamples = AcceptanceFragmentContinuity()
         try twoRawSamples.observe(fragment(sequence: 1, time: 480_000), defaultDuration: 24_000)
         try twoRawSamples.observe(fragment(sequence: 2, time: 504_000), defaultDuration: 24_000)
-        XCTAssertThrowsError(try twoRawSamples.requireVideoCoverage(complete, timescale: 48_000),
+        XCTAssertThrowsError(try twoRawSamples.requireVideoCoverage(complete, timescale: 48_000, mapping: identity),
             "Matching first/end timestamps cannot hide a missing decoded sample")
-        XCTAssertThrowsError(try original.requireVideoCoverage(timing, timescale: 48_000),
+        XCTAssertThrowsError(try original.requireVideoCoverage(timing, timescale: 48_000, mapping: identity),
             "Equal decoded and raw frame counts plus exact raw endpoints are mandatory")
         var shortEnd = AcceptanceVideoTiming()
         try shortEnd.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
             originalDuration: duration, decodedCount: 1, originalCount: 1)
-        XCTAssertThrowsError(try original.requireVideoCoverage(shortEnd, timescale: 48_000),
+        XCTAssertThrowsError(try original.requireVideoCoverage(shortEnd, timescale: 48_000, mapping: identity),
             "The last frame endpoint cannot be inferred from nominal FPS")
         var batched = AcceptanceVideoTiming()
         XCTAssertThrowsError(try batched.observe(decodedPTS: start, decodedDuration: .invalid,
@@ -370,6 +449,25 @@ final class AcceptanceNativeControlTests: XCTestCase {
                 word(48_000) + Data(repeating: 0, count: version == 0 ? 8 : 12)
             let initialization = box("moov", box("trak", box("mdia", box("mdhd", mdhd))))
             XCTAssertEqual(try AcceptanceMP4.mediaTimescale(initialization), 48_000)
+        }
+        func wide(_ value: UInt64) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+        let movieHeader = box("mvhd", word(0) + word(0) + word(0) + word(600) + word(0))
+        let mediaHeader = box("mdhd", word(0) + word(0) + word(0) + word(48_000) + word(0))
+        let media = box("mdia", mediaHeader)
+        let noEdit = box("moov", movieHeader + box("trak", media))
+        XCTAssertEqual(try AcceptanceMP4.videoTimelineMetadata(noEdit)["edit_container_count"] as? Int, 0)
+        for version in [UInt8(0), 1] {
+            let values = version == 0 ? word(600) + word(480_000) : wide(600) + wide(480_000)
+            let editList = box("elst", Data([version, 0, 0, 0]) + word(1) + values + word(0x0001_0000))
+            let initialization = box("moov", movieHeader + box("trak", media + box("edts", editList)))
+            let observed = try AcceptanceMP4.videoTimelineMetadata(initialization)
+            XCTAssertEqual(observed["movie_timescale"] as? UInt32, 600)
+            XCTAssertEqual(observed["media_timescale"] as? UInt32, 48_000)
+            let entries = try XCTUnwrap(observed["edits"] as? [[String: Any]])
+            XCTAssertEqual(entries.count, 1)
+            XCTAssertEqual(entries[0]["media_time_ticks"] as? Int64, 480_000)
+            XCTAssertEqual(entries[0]["duration_movie_ticks"] as? UInt64, 600)
+            XCTAssertEqual(entries[0]["rate_16_16_bits"] as? UInt32, 0x0001_0000)
         }
         XCTAssertThrowsError(try AcceptanceMP4.mediaTimescale(box("moov", Data())))
 
@@ -471,6 +569,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
 
     func testNativeObservationControlsRejectFiveFaults() async throws {
         try checkVideoReaderMarkerEvidence()
+        try checkVideoTimelineMapping()
         try checkVideoTimingEvidence()
         try await checkCanonicalVideoDecode()
         try checkFailureDiagnosticSerialization()
@@ -600,14 +699,15 @@ final class AcceptanceNativeControlTests: XCTestCase {
         XCTAssertEqual(status, noErr)
         return try XCTUnwrap(format)
     }
-    private func fragment(sequence: UInt32, time: UInt32) -> Data {
+    private func fragment(sequence: UInt32, time: UInt32, compositionOffset: Int32? = nil) -> Data {
         func word(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
         func box(_ name: String, _ payload: Data) -> Data {
             word(UInt32(payload.count + 8)) + Data(name.utf8) + payload
         }
         let header = box("mfhd", word(0) + word(sequence))
-        let track = box("tfhd", word(0) + word(1)) + box("tfdt", word(0) + word(time)) +
-            box("trun", word(0) + word(1))
+        let run = word(compositionOffset == nil ? 0 : 0x800) + word(1) +
+            (compositionOffset.map { word(UInt32(bitPattern: $0)) } ?? Data())
+        let track = box("tfhd", word(0) + word(1)) + box("tfdt", word(0) + word(time)) + box("trun", run)
         return box("moof", header + box("traf", track)) + box("mdat", Data([1, 2, 3, 4]))
     }
 }

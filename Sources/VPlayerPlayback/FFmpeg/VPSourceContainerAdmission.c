@@ -182,6 +182,11 @@ static int box(Admission *a, uint32_t t, const uint8_t *p, size_t n, unsigned de
     case TAG('p','a','s','p'): return n==8?0:-EINVAL;
     case TAG('c','l','a','p'): return n==32?0:-EINVAL;
     case TAG('f','i','e','l'): return n==2?0:-EINVAL;
+    case TAG('c','h','r','m'):
+        /* CoreMedia's two-byte chroma-location sample-description extension.
+         * The pinned MOV reader skips it; it supplies no format/scan facts. */
+        return n==2 && (parent==TAG('a','v','c','1') || parent==TAG('a','v','c','3') ||
+            parent==TAG('h','v','c','1') || parent==TAG('h','e','v','1')) ? 0:-EINVAL;
     case TAG('b','t','r','t'): return n==12?0:-EINVAL;
     case TAG('f','r','m','a'): return parent==TAG('w','a','v','e') && n==4 && (be32(p)==TAG('a','c','-','3') || be32(p)==TAG('e','c','-','3') || be32(p)==TAG('m','p','4','a') || be32(p)==TAG('.','m','p','3'))?0:-EINVAL;
     case 0: return parent==TAG('w','a','v','e') && n==0?0:-EINVAL;

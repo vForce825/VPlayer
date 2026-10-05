@@ -8,6 +8,48 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class DolbyAudioSourceProducerTests: XCTestCase {
+    func testInterleavedTransportClockProofsStayCurrentAfterOutputRetirement() throws {
+        for codec: AudioCodec in [.ac3, .eac3] {
+            let source = AudioTrackDescriptor(streamIndex: 1, codec: codec,
+                timeBase: MediaRational(num: 1, den: 90_000)!, sampleRate: 48_000,
+                channelLayout: .init(channelCount: 6, nativeMask: 0x60F), extradata: Data(),
+                metadata: .init(role: .main, service: .independentMain, dispositions: [.default]))
+            let harness = try DolbyProducerTestHarness(sourceDescriptor: source)
+            defer { harness.producer.cancel() }
+            let bytes: Data
+            let samples: Int32
+            if codec == .ac3 {
+                bytes = AssemblerTestFixtures.syntheticAC3Frame(acmod: 7, lfeon: true)
+                samples = 1_536
+            } else {
+                let fixture = try FixtureLoader.data("eac3-main-6x1block-5.1.eac3")
+                let size = 2 * (((Int(fixture[2]) & 7) << 8 | Int(fixture[3])) + 1)
+                bytes = Data(fixture.prefix(size))
+                samples = try EAC3FrameInspector.inspect(bytes).sampleCount
+            }
+            let profile = try AudioCodecProfileRegistry.profile(for: source)
+            for index in 0..<16 {
+                let tail = HLSAudioCopyTail(try XCTUnwrap(harness.copies.compressedInput.acquire(bytes: bytes.count)))
+                let pts = source.timeBase.cmTime(forFFmpegValue: Int64(index) * Int64(samples) * 90_000 / 48_000)
+                let framed = FramedCompressedAudioFrame(payload: bytes, presentationTimeStamp: pts,
+                    parserSampleCount: samples, parserSampleRate: 48_000, parserChannelLayout: source.channelLayout,
+                    containerMarkedCorrupt: false, hlsCopyTail: tail)
+                let proof = try harness.producer.makeProof(id: UInt64(index + 1), generation: .init(rawValue: 1),
+                    framed: framed, inspected: profile.inspect(framed, source: source))
+                if index == 0 { try harness.producer.beginOutput() }
+                let admitted = try harness.producer.admitForOutput(proof)
+                XCTAssertEqual(admitted.identity.proofIdentity.codecFacts, proof.codecFacts)
+                XCTAssertTrue(harness.producer.coordinator.retireAdmittedProof(admitted))
+                proof.forgetRetiredAdmission()
+                XCTAssertTrue(harness.producer.isCurrent)
+                XCTAssertNotNil(harness.producer.outputPlanBinding)
+                XCTAssertEqual(harness.producer.coordinator.audioServiceRegistryUsage.admittedProofs, 0)
+            }
+            try harness.producer.finishSourceInput()
+            XCTAssertNoThrow(try harness.producer.requireSourceDrained(throughFrameID: 16))
+        }
+    }
+
     func testStartupFramesDoNotFillServiceRegistryBeforeOutputConsumesThem() throws {
         let harness = try DolbyProducerTestHarness()
         var proofs: [DolbyAudioFrameProof] = []
@@ -133,8 +175,8 @@ final class DolbyProducerTestHarness {
     let producer: DolbyAudioSourceProducer
     private var timeline: HLSTimelineCoordinator?
 
-    init() throws {
-        source = AudioTrackDescriptor(streamIndex: 1, codec: .eac3,
+    init(sourceDescriptor: AudioTrackDescriptor? = nil) throws {
+        source = sourceDescriptor ?? AudioTrackDescriptor(streamIndex: 1, codec: .eac3,
             timeBase: MediaRational(num: 1, den: 48_000)!, sampleRate: 48_000,
             channelLayout: .init(channelCount: 2, nativeMask: 3), extradata: Data(),
             metadata: .init(role: .main, service: .independentMain, dispositions: [.default]))

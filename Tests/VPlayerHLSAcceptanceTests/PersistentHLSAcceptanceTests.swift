@@ -469,6 +469,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         var timing = AcceptanceVideoTiming()
         var decodedCursor = AcceptanceVideoReaderCursor(kind: .decoded)
         var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
+        var mapping: AcceptanceVideoTimelineMapping?
         defer {
             decodeDiagnostics["reader_status"] = reader.status.rawValue
             decodeDiagnostics["original_reader_status"] = originalReader.status.rawValue
@@ -477,10 +478,13 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             decodeDiagnostics["sample_timing"] = timing.diagnostics
             decodeDiagnostics["decoded_cursor"] = decodedCursor.diagnostics
             decodeDiagnostics["original_cursor"] = originalCursor.diagnostics
+            decodeDiagnostics["raw"] = track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale, mapping: mapping)
             decodeDiagnostics["reader_error"] = reader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
             if reader.status == .reading { reader.cancelReading() }
             if originalReader.status == .reading { originalReader.cancelReading() }
         }
+        decodeDiagnostics["stage"] = "video_timeline_mapping"
+        mapping = AcceptanceVideoTimelineMapping(segments: try await source.load(.segments))
         decodeDiagnostics["stage"] = "paired_video_reader_start"
         try originalReader.start()
         try reader.start()
@@ -508,13 +512,15 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
               let seconds = timing.decodedSeconds else {
             throw AcceptanceError.invalid("paired video read incomplete")
         }
-        try track.continuity.requireVideoCoverage(timing, timescale: track.latestMediaTimescale)
+        try track.continuity.requireVideoCoverage(timing, timescale: track.latestMediaTimescale,
+            mapping: XCTUnwrap(mapping))
         var result: [String: Any] = ["kind":"video","writer_count":track.writers.count,
             "init_count":track.inits,"fragments":track.fragments,"decoded_frames":timing.frames,
             "decoded_seconds":seconds,"maximum_gap_seconds":timing.maximumGapSeconds,
             "missing_decoded_durations":timing.missingDecodedDurations,
             "decoded_cursor":decodedCursor.diagnostics,"original_cursor":originalCursor.diagnostics,
-            "timing_evidence":"original compressed duration matched to every decoded PTS and raw fragment endpoint"]
+            "raw":track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale, mapping: mapping),
+            "timing_evidence":"original compressed duration matched to every decoded PTS and native-mapped raw fragment endpoints"]
         result.merge(AcceptanceReport.fragment(track.continuity)) { _, new in new }
         return result
     }

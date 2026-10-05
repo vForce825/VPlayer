@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+import CoreMedia
 import Foundation
 import XCTest
 @testable import VPlayerPlayback
@@ -29,9 +30,13 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         attributes: managed ? ["Authorization": "ordinary fixture"] : [:])
                     await controller.play(request)
                     try await until(registry: registry) {
-                        guard registry.outputResourceContextSnapshot()?.prepared == true,
+                        guard case .playing = registry.playbackStateSnapshot(),
+                              registry.outputResourceContextSnapshot()?.prepared == true,
                               registry.outputResourceContextSnapshot()?.interval != nil,
-                              let backend = factory.backend, let player = backend.presentation?.avPlayerForNativeSmoke else { return false }
+                              let backend = factory.backend, let player = backend.presentation?.avPlayerForNativeSmoke,
+                              let coordinator = backend.nativeCoordinatorForTesting, coordinator.isPrepared,
+                              let activation = coordinator.currentActivation,
+                              activation == registry.outputResourceContextSnapshot()?.activation else { return false }
                         return player.currentItem?.status == .readyToPlay && player.rate > 0
                     }
                     let backend = try XCTUnwrap(factory.backend)
@@ -42,7 +47,10 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     let started = player.currentTime().seconds
                     guard started.isFinite else { throw HLSSourceError.incompleteEvidence }
                     let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                    factory.trace.record("prepared-checkpoint prepared=\(coordinator.isPrepared) " +
+                        "activation=\(String(describing: coordinator.currentActivation))")
                     XCTAssertTrue(coordinator.isPrepared)
+                    XCTAssertEqual(coordinator.currentActivation, registry.outputResourceContextSnapshot()?.activation)
                     let source = coordinator.owned
                     XCTAssertTrue(source.facts.complete)
                     XCTAssertEqual(source.facts.media.first?.video?.frameRate, MediaRational(num: 30, den: 1))
@@ -52,6 +60,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     XCTAssertEqual(selected.audio?.codec, .aac)
                     try await until(registry: registry) { player.currentItem === physical && player.currentTime().seconds > started + 0.25 }
                     guard player.currentItem === physical, player.currentTime().seconds > started + 0.25,
+                          coordinator.isPrepared, coordinator.currentActivation != nil,
+                          coordinator.currentActivation == registry.outputResourceContextSnapshot()?.activation,
                           backend.generatedBundleCallsForTesting == 0,
                           backend.routedTransportForTesting == (managed ? .proxy : .native),
                           selected.video != nil, selected.audio?.codec == .aac, selected.audio?.channelCount == 2,
@@ -86,11 +96,15 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
-        let factory = NativeSmokeFactory()
+        let trace = NativeSmokeTrace()
+        let factory = NativeSmokeFactory(trace: trace)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
         var failure: (any Error)?
-        do { try await body(controller, registry, factory) } catch { failure = error }
+        do { try await body(controller, registry, factory) } catch {
+            print("NATIVE_HLS_SMOKE_TRACE error=\(error)\n\(trace.summary)")
+            failure = error
+        }
         await controller.stop(); await registry.joinOwnedTerminalCleanup()
         XCTAssertNil(registry.outputResourceContextSnapshot())
         if let failure { throw failure }
@@ -107,19 +121,28 @@ private extension PlaybackPresentation {
 private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let lock = NSLock()
     private weak var result: HLSAVPlayerPlaybackBackend?
+    let trace: NativeSmokeTrace
     var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { result } }
     // Explicit test envelope permits the public committed 320×180/30 fixture on a
     // simulator. It supplies no source facts and changes no production policy.
-    private let factory = SystemPlaybackBackendFactory(sourceDependencies: { context in
-        var dependencies = HLSNativeSourceDependencies(context: context)
-        dependencies.capabilities = { _, _ in
-            .init(videoFormats: [.init(codec: .h264, profiles: [66, 77, 100], maximumLevel: 52,
-                maximumWidth: 1_920, maximumHeight: 1_080, maximumFrameRate: MediaRational(num: 60, den: 1)!,
-                bitDepths: [8], chromaFormats: [1], tiers: [.main], videoRanges: [.sdr])], nativeAudioCodecs: [.aac],
-                supportsWebVTT: true, supportsGenerated: false, supportsInBandClosedCaptions: true)
-        }
-        return dependencies
-    })
+    private let factory: SystemPlaybackBackendFactory
+    init(trace: NativeSmokeTrace) {
+        self.trace = trace
+        factory = SystemPlaybackBackendFactory(sourceDependencies: { context in
+            var dependencies = HLSNativeSourceDependencies(context: context)
+            dependencies.makeInspector = { driver in
+                guard let system = driver as? SystemAVPlayerDriver else { throw HLSSourceError.incompleteEvidence }
+                return NativeSmokeTracingInspector(driver: system, trace: trace)
+            }
+            dependencies.capabilities = { _, _ in
+                .init(videoFormats: [.init(codec: .h264, profiles: [66, 77, 100], maximumLevel: 52,
+                    maximumWidth: 1_920, maximumHeight: 1_080, maximumFrameRate: MediaRational(num: 60, den: 1)!,
+                    bitDepths: [8], chromaFormats: [1], tiers: [.main], videoRanges: [.sdr])], nativeAudioCodecs: [.aac],
+                    supportsWebVTT: true, supportsGenerated: false, supportsInBandClosedCaptions: true)
+            }
+            return dependencies
+        })
+    }
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
         channelID: String, url: URL, eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
         throw HLSSourceError.unboundOwner
@@ -131,5 +154,50 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
             url: url, sourceContext: sourceContext, eventSink: eventSink)
         lock.withLock { result = value as? HLSAVPlayerPlaybackBackend }
         return value
+    }
+}
+
+/// A bounded test trace only. The forwarding inspector performs the unchanged
+/// production inspection, without additional asynchronous reads or minted facts.
+private final class NativeSmokeTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    func record(_ value: String) {
+        lock.withLock {
+            if lines.count == 16 { lines.removeFirst() }
+            lines.append(String(value.prefix(512)))
+        }
+    }
+    var summary: String { lock.withLock { lines.joined(separator: "\n") } }
+}
+
+@MainActor
+private final class NativeSmokeTracingInspector: NativeHLSAssetInspecting {
+    private let driver: SystemAVPlayerDriver
+    private let base: SystemNativeHLSAssetInspector
+    private let trace: NativeSmokeTrace
+    init(driver: SystemAVPlayerDriver, trace: NativeSmokeTrace) {
+        self.driver = driver; base = SystemNativeHLSAssetInspector(driver: driver); self.trace = trace
+    }
+    func snapshot(item: AVPlayerItemInstanceIdentity, source: HLSOwnedSourcePlan) async throws -> NativeHLSSelectionSnapshot {
+        record("inspect-start", item: item)
+        do {
+            let result = try await base.snapshot(item: item, source: source)
+            record("inspect-success video=\(result.video != nil) audio=\(result.audio != nil)", item: item)
+            return result
+        } catch {
+            record("inspect-failure \(error)", item: item)
+            throw error
+        }
+    }
+    private func record(_ stage: String, item: AVPlayerItemInstanceIdentity) {
+        guard let physical = driver.nativeCurrentItem(item) else { trace.record("\(stage) physical-item=nil"); return }
+        let enabled = physical.tracks.filter(\.isEnabled)
+        let error = physical.error.map { ($0 as NSError).domain + ":" + String(($0 as NSError).code) } ?? "none"
+        func time(_ value: CMTime) -> String { "\(value.value)/\(value.timescale) epoch=\(value.epoch) flags=\(value.flags.rawValue)" }
+        trace.record("\(stage) status=\(physical.status.rawValue) error=\(error) " +
+            "tracks=\(enabled.count) missing-assets=\(enabled.filter { $0.assetTrack == nil }.count) " +
+            "size=\(physical.presentationSize) current=\(time(physical.currentTime())) " +
+            "duration=\(time(physical.duration)) end=\(time(physical.forwardPlaybackEndTime))")
     }
 }

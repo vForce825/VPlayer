@@ -260,6 +260,22 @@ class AcceptanceReaderSourceContract(unittest.TestCase):
         self.assertIn('sample.blockSize == nil',decoded)
         self.assertNotIn('sample.totalSize',decoded)
 
+    def test_video_coverage_uses_original_asset_mapping_and_raw_diagnostics(self):
+        source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        self.assertIn('struct AcceptanceVideoTimelineMapping',source)
+        mapping=source.split('struct AcceptanceVideoTimelineMapping',1)[1].split('struct AcceptanceFragmentContinuity',1)[0]
+        self.assertIn('segmentCount == 1',mapping)
+        self.assertIn('!segment.isEmpty',mapping)
+        self.assertIn('sourceDuration == targetDuration',mapping)
+        self.assertNotIn('firstPTS',mapping)
+        self.assertNotIn('nominalFrameRate',mapping)
+        self.assertIn('rawPresentationMatchesDecode',source)
+        for name in ['AcceptanceNativeControlTests.swift','PersistentHLSAcceptanceTests.swift']:
+            reader=(ROOT/'Tests/VPlayerHLSAcceptanceTests'/name).read_text()
+            self.assertIn('load(.segments)',reader)
+            self.assertIn('mapping: XCTUnwrap(mapping)',reader)
+            self.assertIn('failureDiagnostics(timescale:',reader)
+
 class AcceptanceSamplerSourceContract(unittest.TestCase):
     """Portable capture/order guard; Apple compilation and ARC remain native checks."""
     def setUp(self):

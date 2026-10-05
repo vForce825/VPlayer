@@ -351,6 +351,8 @@ final class AcceptanceCapture: @unchecked Sendable {
                         if kind == "video" {
                             do { track.initializationFormat = try AcceptanceMP4.videoConfiguration(bytes) }
                             catch { track.initializationFormat = ["diagnostic_error":ErrorDiagnosticSnapshot(error).summary] }
+                            do { track.initializationFormat["timeline"] = try AcceptanceMP4.videoTimelineMetadata(bytes) }
+                            catch { track.initializationFormat["timeline_error"] = ErrorDiagnosticSnapshot(error).summary }
                         }
                         if let format = object.publicationEvidence?.format {
                             track.initializationFormat["writer_source_subtype"] = AcceptanceReport.fourCC(format.sampleEntry)
@@ -398,7 +400,10 @@ final class AcceptanceCapture: @unchecked Sendable {
 /// Strict read-only MP4 facts, including tfhd/trex duration defaults.
 enum AcceptanceMP4 {
     struct Box { let type: String; let payload: Int; let end: Int }
-    struct Fragment { let sequence: UInt32; let time: UInt64; let duration: UInt64; let sampleCount: Int }
+    struct Fragment {
+        let sequence: UInt32; let time: UInt64; let duration: UInt64; let sampleCount: Int
+        let presentationMatchesDecode: Bool
+    }
 
     static func u32(_ bytes: Data, _ offset: Int) -> UInt32 {
         bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian }
@@ -478,6 +483,49 @@ enum AcceptanceMP4 {
         return timescale
     }
 
+    /// Diagnostic only. Preserve the actual native edit metadata without assuming
+    /// that an edit list exists or using these bytes to guess a reader offset.
+    static func videoTimelineMetadata(_ bytes: Data) throws -> [String: Any] {
+        let moov = try one("moov", boxes(bytes))
+        let movie = try boxes(bytes, moov.payload, moov.end)
+        let trak = try one("trak", movie)
+        let track = try boxes(bytes, trak.payload, trak.end)
+        let mvhd = try one("mvhd", movie)
+        guard mvhd.payload + 4 <= mvhd.end, bytes[mvhd.payload] <= 1 else {
+            throw AcceptanceError.invalid("short/unsupported diagnostic mvhd")
+        }
+        let scaleOffset = mvhd.payload + (bytes[mvhd.payload] == 0 ? 12 : 20)
+        guard scaleOffset + 4 <= mvhd.end else { throw AcceptanceError.invalid("short diagnostic movie timescale") }
+        let edits = track.filter { $0.type == "edts" }
+        guard edits.count <= 1 else { throw AcceptanceError.invalid("duplicate diagnostic edts") }
+        var result: [String: Any] = ["movie_timescale":u32(bytes, scaleOffset),
+            "media_timescale":try mediaTimescale(bytes),"edit_container_count":edits.count]
+        guard let edit = edits.first else { return result }
+        let list = try one("elst", boxes(bytes, edit.payload, edit.end))
+        guard list.payload + 8 <= list.end, bytes[list.payload] <= 1 else {
+            throw AcceptanceError.invalid("short/unsupported diagnostic elst")
+        }
+        let version = bytes[list.payload]
+        let count = u32(bytes, list.payload + 4)
+        result["edit_version"] = version
+        result["edit_count"] = count
+        let entrySize = version == 0 ? 12 : 20
+        guard count <= 8, Int(count) * entrySize == list.end - list.payload - 8 else {
+            throw AcceptanceError.invalid("diagnostic edit list bounds")
+        }
+        var entries: [[String: Any]] = []
+        for index in 0..<Int(count) {
+            let offset = list.payload + 8 + index * entrySize
+            let duration = version == 0 ? UInt64(u32(bytes, offset)) : u64(bytes, offset)
+            let mediaTime = version == 0 ? Int64(Int32(bitPattern: u32(bytes, offset + 4))) :
+                Int64(bitPattern: u64(bytes, offset + 8))
+            entries.append(["duration_movie_ticks":duration,"media_time_ticks":mediaTime,
+                "rate_16_16_bits":u32(bytes, offset + entrySize - 4)])
+        }
+        result["edits"] = entries
+        return result
+    }
+
     static func fragment(_ bytes: Data, defaultDuration: UInt32) throws -> Fragment {
         let top = try boxes(bytes)
         _ = try one("mdat", top)
@@ -508,6 +556,7 @@ enum AcceptanceMP4 {
         } else { time = UInt64(u32(bytes, tfdt.payload + 4)) }
         var duration: UInt64 = 0
         var sampleCount = 0
+        var presentationMatchesDecode = true
         let runs = track.filter { $0.type == "trun" }
         guard !runs.isEmpty else { throw AcceptanceError.invalid("missing trun") }
         for run in runs {
@@ -530,12 +579,77 @@ enum AcceptanceMP4 {
                 let sum = duration.addingReportingOverflow(UInt64(value))
                 guard !sum.overflow else { throw AcceptanceError.invalid("native duration overflow") }
                 duration = sum.partialValue
+                if flags & 0x800 != 0 {
+                    // The acceptance fixture has no reordered frames. A nonzero
+                    // composition offset makes tfdt unsuitable as a raw PTS.
+                    presentationMatchesDecode = presentationMatchesDecode && u32(bytes, position + size - 4) == 0
+                }
                 position += size
             }
         }
         let sequence = u32(bytes, mfhd.payload + 4)
         guard sequence > 0 else { throw AcceptanceError.invalid("zero mfhd") }
-        return Fragment(sequence: sequence, time: time, duration: duration, sampleCount: sampleCount)
+        return Fragment(sequence: sequence, time: time, duration: duration, sampleCount: sampleCount,
+            presentationMatchesDecode: presentationMatchesDecode)
+    }
+}
+
+/// Native metadata from the untouched captured asset, not the first decoded PTS.
+/// https://developer.apple.com/documentation/avfoundation/avpartialasyncproperty/segments
+/// https://developer.apple.com/documentation/coremedia/cmtimemapping/source
+/// Only a single nonempty unit-rate mapping is supported. All retained state is scalar.
+struct AcceptanceVideoTimelineMapping {
+    struct Segment: Sendable {
+        let source: CMTimeRange
+        let target: CMTimeRange
+        let isEmpty: Bool
+    }
+    let segmentCount: Int
+    let segment: Segment?
+
+    init(segmentCount: Int, segment: Segment?) {
+        self.segmentCount = segmentCount; self.segment = segment
+    }
+    init(segments: [AVAssetTrackSegment]) {
+        segmentCount = segments.count
+        // Retain at most one scalar snapshot, even for an unsupported edit list.
+        segment = segments.first.map {
+            Segment(source: $0.timeMapping.source, target: $0.timeMapping.target, isEmpty: $0.isEmpty)
+        }
+    }
+    func presentationTime(forMediaTime time: CMTime) throws -> CMTime {
+        guard segmentCount == 1, let segment, !segment.isEmpty else {
+            throw AcceptanceError.invalid("video requires one nonempty native timeline mapping")
+        }
+        let sourceStart = try ExactMediaTime(segment.source.start)
+        let targetStart = try ExactMediaTime(segment.target.start)
+        let sourceDuration = try ExactMediaTime(segment.source.duration)
+        let targetDuration = try ExactMediaTime(segment.target.duration)
+        guard sourceDuration.value > 0, sourceDuration == targetDuration else {
+            throw AcceptanceError.invalid("video native timeline mapping must have positive unit rate")
+        }
+        let sourceEnd = try sourceStart.adding(sourceDuration)
+        _ = try targetStart.adding(targetDuration)
+        let mediaTime = try ExactMediaTime(time)
+        // The last exclusive sample endpoint may equal sourceEnd. Never
+        // extrapolate a translation past the metadata's covered media range.
+        guard CMTimeCompare(mediaTime.cmTime, sourceStart.cmTime) >= 0,
+              CMTimeCompare(mediaTime.cmTime, sourceEnd.cmTime) <= 0 else {
+            throw AcceptanceError.invalid("raw video endpoint is outside the native mapping")
+        }
+        return try targetStart.adding(mediaTime.subtracting(sourceStart)).cmTime
+    }
+    var diagnostics: [String: Any] {
+        var result: [String: Any] = ["authority":"AVAssetTrack.segments of original captured bytes",
+            "segment_count":segmentCount]
+        if let segment {
+            result["is_empty"] = segment.isEmpty
+            result["source_start"] = AcceptanceReport.time(segment.source.start)
+            result["source_duration"] = AcceptanceReport.time(segment.source.duration)
+            result["target_start"] = AcceptanceReport.time(segment.target.start)
+            result["target_duration"] = AcceptanceReport.time(segment.target.duration)
+        }
+        return result
     }
 }
 
@@ -548,8 +662,10 @@ struct AcceptanceFragmentContinuity {
     private var lastDuration: UInt64?
     private(set) var rawSequenceContinuous = true
     private(set) var rawTimeContinuous = true
+    private(set) var rawPresentationMatchesDecode = true
     mutating func observe(_ bytes: Data, defaultDuration: UInt32) throws {
         let facts = try AcceptanceMP4.fragment(bytes, defaultDuration: defaultDuration)
+        rawPresentationMatchesDecode = rawPresentationMatchesDecode && facts.presentationMatchesDecode
         if let previous = lastSequence {
             rawSequenceContinuous = rawSequenceContinuous && UInt64(facts.sequence) == UInt64(previous) + 1
         }
@@ -566,22 +682,27 @@ struct AcceptanceFragmentContinuity {
         nextDecodeTime = end.partialValue
     }
 
-    func requireVideoCoverage(_ timing: AcceptanceVideoTiming, timescale: UInt32?) throws {
-        guard rawSequenceContinuous, rawTimeContinuous, totalSamples > 0,
+    func requireVideoCoverage(_ timing: AcceptanceVideoTiming, timescale: UInt32?,
+        mapping: AcceptanceVideoTimelineMapping) throws {
+        guard rawSequenceContinuous, rawTimeContinuous, rawPresentationMatchesDecode, totalSamples > 0,
               timing.frames == totalSamples, let first = firstDecodeTime, let end = nextDecodeTime,
               let startTicks = Int64(exactly: first), let endTicks = Int64(exactly: end),
               let timescale, let scale = Int32(exactly: timescale), scale > 0,
-              let firstPTS = timing.firstPTS, let lastEnd = timing.lastEnd,
-              CMTimeCompare(firstPTS, CMTime(value: startTicks, timescale: scale)) == 0,
-              CMTimeCompare(lastEnd, CMTime(value: endTicks, timescale: scale)) == 0 else {
+              let firstPTS = timing.firstPTS, let lastEnd = timing.lastEnd else {
             throw AcceptanceError.invalid("decoded video does not cover every raw fragment sample and endpoint")
+        }
+        let mappedFirst = try mapping.presentationTime(forMediaTime: CMTime(value: startTicks, timescale: scale))
+        let mappedEnd = try mapping.presentationTime(forMediaTime: CMTime(value: endTicks, timescale: scale))
+        guard CMTimeCompare(firstPTS, mappedFirst) == 0, CMTimeCompare(lastEnd, mappedEnd) == 0 else {
+            throw AcceptanceError.invalid("decoded video does not cover the mapped raw fragment endpoints")
         }
     }
 
-    func failureDiagnostics(timescale: UInt32?) -> [String: Any] {
+    func failureDiagnostics(timescale: UInt32?, mapping: AcceptanceVideoTimelineMapping? = nil) -> [String: Any] {
         let scale = timescale.flatMap { $0 > 0 ? Double($0) : nil }
         let endSeconds = scale.flatMap { scale in nextDecodeTime.map { Double($0) / scale } }
-        return ["raw_mfhd_continuous":rawSequenceContinuous,"raw_tfdt_continuous":rawTimeContinuous,
+        var result: [String: Any] = ["raw_mfhd_continuous":rawSequenceContinuous,"raw_tfdt_continuous":rawTimeContinuous,
+                "raw_presentation_matches_decode":rawPresentationMatchesDecode,
                 "raw_sample_count":totalSamples,
                 "first_raw_tfdt":firstDecodeTime.map { $0 as Any } ?? NSNull(),
                 "last_raw_mfhd":lastSequence.map { $0 as Any } ?? NSNull(),
@@ -590,6 +711,18 @@ struct AcceptanceFragmentContinuity {
                 "last_raw_end":nextDecodeTime.map { $0 as Any } ?? NSNull(),
                 "latest_init_timescale":timescale.map { $0 as Any } ?? NSNull(),
                 "last_raw_end_seconds":AcceptanceReport.finite(endSeconds)]
+        if let mapping {
+            result["timeline_mapping"] = mapping.diagnostics
+            if let timescale, let scale = Int32(exactly: timescale), scale > 0 {
+                for (key, value) in [("mapped_first_raw_pts", firstDecodeTime), ("mapped_last_raw_end", nextDecodeTime)] {
+                    if let value, let ticks = Int64(exactly: value),
+                       let mapped = try? mapping.presentationTime(forMediaTime: CMTime(value: ticks, timescale: scale)) {
+                        result[key] = AcceptanceReport.time(mapped)
+                    }
+                }
+            }
+        }
+        return result
     }
 }
 

@@ -855,13 +855,20 @@ final class HLSTimelineCoordinator {
             if let dolbyProducer {
                 guard frame.dolbyProof?.sourceIdentity == dolbyProducer.identity,
                       dolbyProducer.sharedControlExecutor === sharedControlExecutor,
-                      let output = dolbyProducer.outputPlanBinding else { throw DolbyAudioSourceFailure.invalidSourceProof }
+                      let output = dolbyProducer.outputPlanBinding else {
+                    throw DolbyAudioSourceFailure.invalidProof("timeline.source",
+                        "id=\(frame.id) sourceMatches=\(frame.dolbyProof?.sourceIdentity == dolbyProducer.identity) " +
+                        "executorMatches=\(dolbyProducer.sharedControlExecutor === sharedControlExecutor) " +
+                        "current=\(dolbyProducer.isCurrent) hasPlan=\(dolbyProducer.outputPlanBinding != nil)")
+                }
                 if compressedAudioOutputPlanBinding == nil {
-                    guard output.claimTimeline(compressedAudioPlanIssuer) else { throw DolbyAudioSourceFailure.invalidSourceProof }
+                    guard output.claimTimeline(compressedAudioPlanIssuer) else {
+                        throw DolbyAudioSourceFailure.invalidProof("timeline.claim")
+                    }
                     compressedAudioOutputPlanBinding = output
                     claimedCompressedAudioOutputPlanBinding = true
                 } else if compressedAudioOutputPlanBinding !== output {
-                    throw DolbyAudioSourceFailure.invalidSourceProof
+                    throw DolbyAudioSourceFailure.invalidProof("timeline.planChanged")
                 }
             }
             guard state.pendingFormatDrift == nil,
@@ -890,7 +897,7 @@ final class HLSTimelineCoordinator {
         case .decodeBreak:
             if let dolbyProducer {
                 dolbyProducer.invalidateSourceInput()
-                throw DolbyAudioSourceFailure.invalidSourceProof
+                throw DolbyAudioSourceFailure.invalidProof("timeline.decodeBreak")
             }
         }
     }

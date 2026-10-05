@@ -9,16 +9,18 @@ final class HLSProxyIOCounters: @unchecked Sendable {
     struct Snapshot: Sendable {
         var callbackBytes = 0, peakCallbackBytes = 0, largestCallback = 0
         var pendingSendAliases = 0, peakPendingSendAliases = 0, rejectedOversizedCallbacks = 0
+        var callbacks = 0, peakCallbacks = 0
     }
     private let lock = NSLock()
     private var value = Snapshot()
     var snapshot: Snapshot { lock.withLock { value } }
-    func beginCallback(_ bytes: Int) { lock.withLock {
+    func beginCallback(_ bytes: Int, limit: Int) { lock.withLock {
+        value.callbacks += 1; value.peakCallbacks = max(value.peakCallbacks, value.callbacks)
         value.callbackBytes += bytes; value.peakCallbackBytes = max(value.peakCallbackBytes, value.callbackBytes)
         value.largestCallback = max(value.largestCallback, bytes)
-        if bytes > HLSProxyBudget.transferBufferBytes { value.rejectedOversizedCallbacks += 1 }
+        if bytes > limit { value.rejectedOversizedCallbacks += 1 }
     } }
-    func endCallback(_ bytes: Int) { lock.withLock { value.callbackBytes -= bytes } }
+    func endCallback(_ bytes: Int) { lock.withLock { value.callbackBytes -= bytes; value.callbacks -= 1 } }
     func beginSend(_ bytes: Int) { lock.withLock {
         value.pendingSendAliases += bytes; value.peakPendingSendAliases = max(value.peakPendingSendAliases, value.pendingSendAliases)
     } }
@@ -168,13 +170,17 @@ final class HLSProxyConnection: @unchecked Sendable {
     }
     /// Only called by the private serial URLSession delegate queue. One callback
     /// alias stays blocked until this native send returns; there is no task queue.
-    func sendBlocking(_ bytes: Data, header: Bool = false) throws {
+    func sendBlocking(_ bytes: Data, header: Bool = false, retaining envelope: HLSProxyBudget.BodyEnvelope? = nil) throws {
         if header { try claimResponse() }
         let gate = HLSProxySendGate()
         nativeSends.enter(); io.beginSend(bytes.count)
         let count = bytes.count
-        connection.send(content: bytes, completion: .contentProcessed { [nativeSends, io] error in
-            io.endSend(count); nativeSends.leave(); gate.complete(error == nil)
+        connection.send(content: bytes, completion: .contentProcessed { [nativeSends, io, envelope] error in
+            // A timeout/cancellation may return the delegate stack first. Keep
+            // the paid body window until this physical native-send alias ends.
+            withExtendedLifetime(envelope) {
+                io.endSend(count); nativeSends.leave(); gate.complete(error == nil)
+            }
         })
         guard gate.wait() else { connection.cancel(); throw HLSSourceError.network }
         withExtendedLifetime(bytes) {}; touch()

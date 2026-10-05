@@ -15,6 +15,16 @@ enum DolbyAudioSourceFailure: Error, Sendable, Equatable {
     case sourcePoisoned
     case capacityExceeded
     case missingOutputAuthority
+
+    /// Bounded scalar diagnostics only. Keep invalid source evidence distinct
+    /// from a writer's emitted-layout compatibility rejection in every build.
+    static func invalidProof(_ stage: StaticString,
+                             _ fields: @autoclosure () -> String = "") -> Self {
+#if DEBUG
+        print("DOLBY_SOURCE_PROOF_REJECT stage=\(stage) \(fields())")
+#endif
+        return .invalidSourceProof
+    }
 }
 
 /// A native alias retains bytes and paid tails only. It must never retain the
@@ -36,7 +46,7 @@ final class DolbyAudioPayloadLifetime: @unchecked Sendable {
     static func aggregate(bytes: Data, reservation: HLSAudioCopyTail,
                           members: [DolbyAudioFrameProof]) throws -> DolbyAudioPayloadLifetime {
         guard (1...6).contains(members.count), bytes.count <= 6 * 4_096 else {
-            throw DolbyAudioSourceFailure.invalidSourceProof
+            throw DolbyAudioSourceFailure.invalidProof("aggregate", "members=\(members.count) bytes=\(bytes.count)")
         }
         return DolbyAudioPayloadLifetime(bytes: bytes, tails: [reservation],
             members: members.map(\.payloadLifetime))
@@ -69,13 +79,17 @@ fileprivate final class DolbyAudioSourceState: @unchecked Sendable {
                   start.isNumeric, duration.isNumeric, CMTimeCompare(duration, .zero) > 0,
                   nextPresentationTime.map({ CMTimeCompare(start, $0) == 0 }) ?? true else {
                 valid = false
-                throw DolbyAudioSourceFailure.invalidSourceProof
+                throw DolbyAudioSourceFailure.invalidProof("source.sequence",
+                    "id=\(id) previousID=\(lastID ?? 0) generationMatches=\(sourceGeneration == nil || sourceGeneration == generation) " +
+                    "formatMatches=\(format == nil || format == configuration) start=\(start.value)/\(start.timescale) " +
+                    "expected=\(nextPresentationTime?.value ?? 0)/\(nextPresentationTime?.timescale ?? 0) " +
+                    "duration=\(duration.value)/\(duration.timescale)")
             }
             lastID = id; sourceGeneration = generation; format = configuration
             nextPresentationTime = CMTimeAdd(start, duration)
             guard nextPresentationTime?.isNumeric == true else {
                 valid = false
-                throw DolbyAudioSourceFailure.invalidSourceProof
+                throw DolbyAudioSourceFailure.invalidProof("source.nextTimestamp")
             }
         }
     }
@@ -210,7 +224,11 @@ final class DolbyAudioSourceProducer: @unchecked Sendable {
             do {
                 guard state.isCurrent, let sourceTail = framed.hlsCopyTail,
                       !framed.containerMarkedCorrupt, (8...4_096).contains(framed.payload.count),
-                      framed.payload == inspected.payload else { throw DolbyAudioSourceFailure.invalidSourceProof }
+                      framed.payload == inspected.payload else {
+                    throw DolbyAudioSourceFailure.invalidProof("source.input",
+                        "current=\(state.isCurrent) paid=\(framed.hlsCopyTail != nil) corrupt=\(framed.containerMarkedCorrupt) " +
+                        "bytes=\(framed.payload.count) payloadMatches=\(framed.payload == inspected.payload)")
+                }
                 // Header parsing, digest validation and existing service code use
                 // bounded scratch copies. Pay their maximum overlap before any copy.
                 guard let lease = copyOwnership.compressedInput.acquire(bytes: 8 * framed.payload.count + 4_096) else {
@@ -221,7 +239,8 @@ final class DolbyAudioSourceProducer: @unchecked Sendable {
                 let actual = try profile.inspect(framed, source: source)
                 guard actual.sampleCount == inspected.sampleCount,
                       actual.systemFormat == inspected.systemFormat else {
-                    throw DolbyAudioSourceFailure.invalidSourceProof
+                    throw DolbyAudioSourceFailure.invalidProof("source.reinspection",
+                        "samples=\(actual.sampleCount)/\(inspected.sampleCount) formatMatches=\(actual.systemFormat == inspected.systemFormat)")
                 }
                 let header = try Self.headerConfiguration(framed.payload, source: source)
                 let configuration = header.configuration
@@ -266,13 +285,19 @@ final class DolbyAudioSourceProducer: @unchecked Sendable {
             let nonce = try coordinator.installValidation(for: proof.inputUnit)
             let semanticProof = try coordinator.makeProof(for: proof.inputUnit, validationNonce: nonce)
             guard semanticProof.observedSemantic == .independentMain,
-                  semanticProof.codecFacts == proof.codecFacts else { throw DolbyAudioSourceFailure.invalidSourceProof }
+                  semanticProof.codecFacts == proof.codecFacts else {
+                throw DolbyAudioSourceFailure.invalidProof("output.semantic",
+                    "main=\(semanticProof.observedSemantic == .independentMain) factsMatch=\(semanticProof.codecFacts == proof.codecFacts) " +
+                    "rate=\(semanticProof.codecFacts?.sampleRate ?? 0)/\(proof.codecFacts.sampleRate) " +
+                    "samples=\(semanticProof.codecFacts?.sampleCount ?? 0)/\(proof.codecFacts.sampleCount) " +
+                    "channels=\(semanticProof.codecFacts?.channelCount ?? 0)/\(proof.codecFacts.channelCount)")
+            }
             let lifetime = proof.payloadLifetime
             let ownership = AudioServiceInputUnitOwnership(onRelease: { withExtendedLifetime(lifetime) {} })
             switch coordinator.admit(semanticProof, ownership: ownership) {
             case let .admitted(admitted): proof.didAdmit(admitted); return admitted
             case let .failed(error): throw error
-            case .ignored: throw DolbyAudioSourceFailure.invalidSourceProof
+            case .ignored: throw DolbyAudioSourceFailure.invalidProof("output.ignored")
             }
         }
     }

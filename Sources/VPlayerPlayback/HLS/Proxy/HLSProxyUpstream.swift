@@ -22,6 +22,7 @@ final class HLSProxyUpstream: NSObject, URLSessionDataDelegate, @unchecked Senda
     private var expected: Int64?
     private var received: Int64 = 0
     private var chunked = false
+    private var bodyEnvelope: HLSProxyBudget.BodyEnvelope?
 
     init(resource: HLSProxyResourceRegistry.Resource, method: LoopbackHTTPRequest.Method, range: String?,
          connection: HLSProxyConnection, transfer: HLSProxyBudget.Lease) {
@@ -81,6 +82,7 @@ final class HLSProxyUpstream: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        guard lock.withLock({ terminal == nil }) else { completionHandler(nil); return }
         do {
             guard let url = newRequest.url, url.absoluteString.utf8.count <= 8_192, redirects.count <= 5,
                   redirects.insert(url).inserted else { throw HLSSourceError.redirectLimit }
@@ -89,6 +91,7 @@ final class HLSProxyUpstream: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                     completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        guard lock.withLock({ terminal == nil }) else { completionHandler(.cancel); return }
         do {
             guard let http = response as? HTTPURLResponse else { throw HLSSourceError.network }
             if [401, 403].contains(http.statusCode) { throw HLSSourceError.unauthorized }
@@ -108,6 +111,10 @@ final class HLSProxyUpstream: NSObject, URLSessionDataDelegate, @unchecked Senda
                       case .unsatisfied = try HTTPRange.parse(range, resourceLength: total) else { throw HLSSourceError.network }
                 rangeHeader = "Content-Range: bytes */\(total)\r\n"; expected = 0
             } else { expected = response.expectedContentLength >= 0 ? response.expectedContentLength : nil }
+            guard bodyEnvelope == nil else { throw HLSSourceError.network }
+            // Reserve the complete callback/send envelope before .allow, never
+            // after receiving (or slicing) an already-unpaid larger Data value.
+            bodyEnvelope = try transfer.reserveBodyEnvelope(responseLength: method == .head ? 0 : expected)
             chunked = expected == nil && method != .head
             let framing = expected.map { "Content-Length: \($0)\r\n" } ?? (chunked ? "Transfer-Encoding: chunked\r\n" : "")
             let mime = http.mimeType ?? "application/octet-stream"
@@ -117,20 +124,26 @@ final class HLSProxyUpstream: NSObject, URLSessionDataDelegate, @unchecked Senda
         } catch { completionHandler(.cancel); finish(.failure(error)) }
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        connection.io.beginCallback(data.count); dataTask.suspend()
+        // Invalidation joins already queued callbacks. A send timeout can leave
+        // its physical alias alive, so a late callback must not enter a second
+        // held-data/send pair under that same paid envelope.
+        guard lock.withLock({ terminal == nil }) else { return }
+        let envelope = bodyEnvelope
+        connection.io.beginCallback(data.count, limit: envelope?.maximumCallbackBytes ?? 0); dataTask.suspend()
         defer { connection.io.endCallback(data.count); if lock.withLock({ terminal == nil }) { dataTask.resume() } }
         do {
             if data.isEmpty { return }
-            guard method != .head, data.count <= HLSProxyBudget.transferBufferBytes else { throw HLSSourceError.byteLimit }
+            guard method != .head, let envelope, envelope.accepts(data.count) else { throw HLSSourceError.byteLimit }
             let next = received.addingReportingOverflow(Int64(data.count))
             guard !next.overflow, expected.map({ next.partialValue <= $0 }) ?? true else { throw HLSSourceError.network }
             if chunked { try connection.sendBlocking(Data("\(String(data.count, radix: 16))\r\n".utf8)) }
-            try connection.sendBlocking(data)
+            try connection.sendBlocking(data, retaining: envelope)
             if chunked { try connection.sendBlocking(Data("\r\n".utf8)) }
             received = next.partialValue
         } catch { finish(.failure(error)); connection.connection.cancel() }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        guard lock.withLock({ terminal == nil }) else { return }
         do {
             guard error == nil, method == .head || (expected.map({ received == $0 }) ?? true) else { throw HLSSourceError.network }
             if chunked { try connection.sendBlocking(Data("0\r\n\r\n".utf8)) }

@@ -13,7 +13,14 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
         let data: Data
         let contentType: String
         var repetitions: Int = 1
+        // Ordinary interrupted-response regression: keep the declared length,
+        // then close after this many body bytes. Nil preserves normal delivery.
+        var disconnectAfterBodyBytes: Int?
         var length: Int { data.count * repetitions }
+        var isValid: Bool {
+            !data.isEmpty && data.count <= 8 * 1_024 * 1_024 && (1...64).contains(repetitions) &&
+                (disconnectAfterBodyBytes.map { (0...length).contains($0) } ?? true)
+        }
     }
     private let listener: NWListener
     private let queue = DispatchQueue(label: "org.vplayer.tests.native-hls-origin")
@@ -32,7 +39,7 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
     var deniedCount: Int { lock.withLock { deniedCountValue } }
 
     init(resources: [String: Resource], credential: String? = nil) throws {
-        guard resources.count <= 32, resources.values.allSatisfy({ !$0.data.isEmpty && $0.data.count <= 8 * 1_024 * 1_024 && (1...64).contains($0.repetitions) }) else {
+        guard resources.count <= 32, resources.values.allSatisfy(\.isValid) else {
             throw HLSSourceError.byteLimit
         }
         self.resources = resources; self.credential = credential
@@ -62,7 +69,7 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
     }
     func url(_ path: String) -> URL { URL(string: path, relativeTo: baseURL)!.absoluteURL }
     func replace(_ path: String, resource: Resource) {
-        precondition(resource.data.count <= 8 * 1_024 * 1_024 && (1...64).contains(resource.repetitions))
+        precondition(resource.isValid)
         lock.withLock { precondition(resources[path] != nil); resources[path] = resource }
     }
     private func listenerStopped() {
@@ -125,7 +132,10 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
             connection.send(content: Data(header.utf8), completion: .contentProcessed { [self] error in
                 defer { callbacks.leave() }
                 guard error == nil, request.method != .head else { connection.cancel(); return }
-                send(resource, range: range, connection: connection)
+                let transmitted = resource.disconnectAfterBodyBytes.map {
+                    range.lowerBound..<(range.lowerBound + min($0, range.count))
+                } ?? range
+                send(resource, range: transmitted, connection: connection)
             })
         } catch { connection.cancel() }
     }

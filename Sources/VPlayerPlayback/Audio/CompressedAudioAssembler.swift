@@ -340,6 +340,15 @@ final class CompressedAudioAssembler {
         do {
             inspected = try profile.inspect(framed, source: descriptor)
         } catch {
+#if DEBUG
+            if dolbyProducer != nil {
+                print("DOLBY_SOURCE_PROOF_REJECT stage=assembler.profile codec=\(descriptor.codec.rawValue) " +
+                    "bytes=\(framed.payload.count) corrupt=\(framed.containerMarkedCorrupt) " +
+                    "rate=\(framed.parserSampleRate ?? 0)/\(descriptor.sampleRate) samples=\(framed.parserSampleCount ?? 0) " +
+                    "channels=\(framed.parserChannelLayout?.channelCount ?? 0)/\(descriptor.channelLayout.channelCount) " +
+                    "mask=\(framed.parserChannelLayout?.nativeMask ?? 0)/\(descriptor.channelLayout.nativeMask ?? 0)")
+            }
+#endif
             throw AudioUnitRejection(reason: profile.decodeBreakReason(
                 forRejected: framed,
                 source: descriptor
@@ -427,7 +436,7 @@ final class CompressedAudioAssembler {
             // A rejected final AU cannot disappear into decodeBreak and leave a
             // seemingly successful prefix that can later receive natural EOF.
             dolbyProducer.invalidateSourceInput()
-            throw DolbyAudioSourceFailure.invalidSourceProof
+            throw DolbyAudioSourceFailure.invalidProof("assembler.decodeBreak", "reason=\(reason.rawValue)")
         }
         framer?.destroy()
         framer = nil

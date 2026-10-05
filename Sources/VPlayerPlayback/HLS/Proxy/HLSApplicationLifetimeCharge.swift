@@ -25,7 +25,10 @@ final class HLSApplicationLifetimeCharge: @unchecked Sendable {
 /// This does not claim an aggregate bound on opaque URLSession/Network buffers.
 final class HLSProxyBudget: @unchecked Sendable {
     static let domainBytes = 32 * 1_024 * 1_024
-    static let transferBufferBytes = 256 * 1_024
+    // An application retention policy, not an SDK callback-size guarantee.
+    // Ordinary CFNetwork callbacks coalesce beyond 256 KiB. One admitted body
+    // window covers up to 1 MiB while the unchanged domain still caps all users.
+    static let transferBufferBytes = 1_024 * 1_024
     static let maximumTransfers = 8
     static let maximumConnections = 16
     private let charge: HLSApplicationLifetimeCharge
@@ -46,6 +49,25 @@ final class HLSProxyBudget: @unchecked Sendable {
             self.budget = budget; self.bytes = bytes; self.kind = kind
         }
         deinit { budget.release(bytes: bytes, kind: kind) }
+
+        func reserveBodyEnvelope(responseLength: Int64?) throws -> BodyEnvelope {
+            guard kind == 1, responseLength.map({ $0 >= 0 }) ?? true else { throw HLSSourceError.network }
+            let maximum = Int(min(responseLength ?? Int64(HLSProxyBudget.transferBufferBytes),
+                Int64(HLSProxyBudget.transferBufferBytes)))
+            // Pay for the complete original callback and a conservative separate
+            // native-send alias before URLSession may deliver any body callback.
+            let retention = try budget.reserve(bytes: 2 * maximum)
+            return BodyEnvelope(maximumCallbackBytes: maximum, retention: retention)
+        }
+    }
+
+    final class BodyEnvelope: @unchecked Sendable {
+        let maximumCallbackBytes: Int
+        private let retention: Lease
+        fileprivate init(maximumCallbackBytes: Int, retention: Lease) {
+            self.maximumCallbackBytes = maximumCallbackBytes; self.retention = retention
+        }
+        func accepts(_ bytes: Int) -> Bool { bytes >= 0 && bytes <= maximumCallbackBytes }
     }
 
     var usage: (bytes: Int, transfers: Int, connections: Int) {
