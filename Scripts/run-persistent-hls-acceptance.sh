@@ -4,12 +4,13 @@
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-head='' duration=300 role=candidate baseline='' output='' overlay='' controls=false
+head='' duration=300 role=candidate baseline='' ineligible='' output='' overlay='' controls=false
 while (($#)); do
   case "$1" in
     --head) head="${2:?}"; shift 2;;
     --duration-seconds) duration="${2:?}"; shift 2;;
     --baseline) baseline="${2:?}"; shift 2;;
+    --ineligible-baseline) ineligible="${2:?}"; shift 2;;
     --output) output="${2:?}"; shift 2;;
     --record-baseline) role=baseline; shift;;
     --controls-only) controls=true; shift;;
@@ -17,6 +18,8 @@ while (($#)); do
     *) echo "Unknown argument: $1" >&2; exit 64;;
   esac
 done
+[[ -z "$ineligible" || ( "$role" == candidate && "$controls" == false && -z "$baseline" ) ]] || {
+  echo 'Reviewed ineligibility is candidate-only and mutually exclusive with a measured baseline or controls.' >&2; exit 64; }
 # A shorter diagnostic is not silently relabelled five-minute acceptance.
 [[ "$duration" == 300 ]] || { echo 'FiveMinute requires 300 seconds; playback may never exceed 300.' >&2; exit 64; }
 [[ "$head" =~ ^[0-9a-f]{40}$ && "$(git rev-parse HEAD)" == "$head" ]] || { echo 'Exact checked-out --head SHA required.' >&2; exit 1; }
@@ -24,10 +27,16 @@ done
 if [[ "$role" == candidate ]]; then
   git diff --exit-code HEAD -- Sources Tests project.yml VPlayer.xcodeproj VPlayerHLSAcceptance.xctestplan Scripts
   if [[ "$controls" == false ]]; then
-    [[ -s "$baseline" ]] || { echo 'Separately measured and frozen old-writer baseline required before candidate.' >&2; exit 1; }
-    baseline_hash="$(shasum -a 256 "$baseline" | awk '{print $1}')"
+    if [[ -n "$ineligible" ]]; then
+      [[ -z "$baseline" && -s "$ineligible" ]] || { echo 'Exactly one frozen reference decision required.' >&2; exit 1; }
+      baseline_hash="$(shasum -a 256 "$ineligible" | awk '{print $1}')"
+    else
+      [[ -s "$baseline" ]] || { echo 'A valid frozen baseline or exact reviewed ineligibility is required.' >&2; exit 1; }
+      baseline_hash="$(shasum -a 256 "$baseline" | awk '{print $1}')"
+    fi
   fi
 else
+  [[ -z "$ineligible" ]] || { echo 'Baseline recording cannot use candidate-only eligibility.' >&2; exit 64; }
   [[ "$controls" == false ]] || { echo "Short controls require candidate production diagnostics." >&2; exit 64; }
   [[ "$head" == 36f9f00044db05b707e25ea470b0da3cec62682c && "$overlay" =~ ^[0-9a-f]{64}$ ]] || {
     echo 'Baseline requires approved exact old-writer head and allowlisted test overlay hash.' >&2; exit 1; }
@@ -44,6 +53,10 @@ fixture_hash="$(shasum -a 256 "$fixture" | awk '{print $1}')"
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hls-acceptance.XXXXXX")"
 # Keep bounded local diagnostic outputs on failure; no automatic artifact upload.
 echo "HLS_ACCEPTANCE_DIAGNOSTICS=$work"
+if [[ -n "$ineligible" ]]; then
+  python3 Scripts/Support/persistent_hls_acceptance.py check-ineligible "$ineligible" \
+    --head "$head" --fixture "$fixture" --output "$work/ineligible-preflight.json"
+fi
 derived="${VPLAYER_HLS_ACCEPTANCE_DERIVED_DATA:-$work/DerivedData}"
 selector=VPlayerHLSAcceptanceTests/PersistentHLSAcceptanceTests/testFiveMinuteOriginalNativePlaybackAndRetirement
 allowance=480
@@ -90,6 +103,12 @@ PYVERIFY
 git diff --exit-code HEAD -- Sources Vendor ci_scripts
 if [[ "$role" == candidate ]]; then
   git diff --exit-code HEAD -- Tests project.yml VPlayer.xcodeproj VPlayerHLSAcceptance.xctestplan Scripts
-  [[ "$(shasum -a 256 "$baseline" | awk '{print $1}')" == "$baseline_hash" ]] || { echo 'Frozen baseline changed during candidate.' >&2; exit 1; }
-  python3 Scripts/Support/persistent_hls_acceptance.py validate "$output" --baseline "$baseline" --output "$output.verdict.json"
+  if [[ -n "$ineligible" ]]; then
+    [[ "$(shasum -a 256 "$ineligible" | awk '{print $1}')" == "$baseline_hash" ]] || { echo 'Frozen ineligibility/policy changed during candidate.' >&2; exit 1; }
+    python3 Scripts/Support/persistent_hls_acceptance.py validate-absolute "$output" \
+      --baseline "$ineligible" --output "$output.verdict.json"
+  else
+    [[ "$(shasum -a 256 "$baseline" | awk '{print $1}')" == "$baseline_hash" ]] || { echo 'Frozen baseline changed during candidate.' >&2; exit 1; }
+    python3 Scripts/Support/persistent_hls_acceptance.py validate "$output" --baseline "$baseline" --output "$output.verdict.json"
+  fi
 fi

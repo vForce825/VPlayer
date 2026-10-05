@@ -1593,7 +1593,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                     "the completed transaction must release its 1024-byte evidence reservation even with a native alias")
                 XCTAssertEqual(coordinator.liveCompressedWriterSubmissionCount, retainsAlias ? 1 : 0)
                 XCTAssertEqual(coordinator.claimedCompressedWriterSubmissionCount, 1)
-                let leases = unit.aggregationProof?.orderedAggregationLeaseIdentities.values
+                let leases = try unit.aggregationProof?.orderedAggregationLeaseIdentities.values
                     ?? [try XCTUnwrap(unit.directLeaseIdentity)]
                 for lease in leases {
                     if retainsAlias { XCTAssertNotNil(coordinator.branchLeaseState(lease)) }

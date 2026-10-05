@@ -5,6 +5,7 @@
 """Rebuilt portable controls only; synthetic reports are never native evidence."""
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import unittest
@@ -23,12 +24,17 @@ def report(role='candidate'):
         samples=[dict(wall_seconds=i*5,footprint_bytes=100*1024**2,producer_eof=False,
             producer_packets=i*100,producer_packet_age_seconds=0,live_inputs=20,live_bytes=10000,evidence=40,
             callbacks=1,hard_inputs=640,hard_bytes=640000,hard_evidence=320,hard_callbacks=3,
-            accepted_inputs=100*i+20,released_inputs=100*i,segments=i) for i in range(60)],
+            accepted_inputs=100*i+20,released_inputs=100*i,segments=i,
+            application_charged_bytes=200*1024**2,resource_charged_bytes=2048,
+            store_body_bytes=100*1024**2,store_should_backpressure=False) for i in range(60)],
         renditions=[dict(kind='audio',writer_count=1,init_count=1,fragments=299,raw_mfhd_continuous=True,
             raw_tfdt_continuous=True,decoded_frames=298*48000,decoded_seconds=298,maximum_gap_seconds=0,
             interior_silent_windows=0,checked_interior_windows=59000),dict(kind='video',writer_count=1,
             init_count=1,fragments=299,raw_mfhd_continuous=True,raw_tfdt_continuous=True,
             decoded_frames=298*25,decoded_seconds=298,maximum_gap_seconds=0)],
+        ledger_policy={'application_soft_bytes':981184512,'application_hard_bytes':1266647040,
+            'store_soft_bytes':560*1024**2,'store_hard_bytes':688*1024**2,'resource_hard_bytes':128*1024,
+            'store_observation':'body_subtotal_excludes_metadata'},global_maximum_charged_bytes=200*1024**2,
         native_writer_count=2,ledger_before={'application':2048,'resource':0},
         ledger_after={'application':2048,'resource':0},final_live_inputs=0,final_live_bytes=0,
         final_evidence=0,final_callbacks=0,allocated_inputs=30000,released_inputs=30000,
@@ -44,6 +50,65 @@ class AcceptanceControls(unittest.TestCase):
         value=report();change(value)
         with self.assertRaisesRegex(ValueError,pattern):
             self.module.validate_candidate(value,self.module.freeze_baseline(report('baseline')))
+
+    def frozen_ineligible(self):
+        evidence=json.loads((ROOT/'Scripts/Support/hls-baseline-eligibility.json').read_text())
+        return self.module.freeze_ineligible(evidence,report(),1500)
+
+    def test_candidate_only_has_explicit_unavailable_comparison_and_no_process_cap(self):
+        verdict=self.module.validate_absolute(report(),self.frozen_ineligible())
+        self.assertEqual(verdict['result'],'passed_candidate_only')
+        self.assertEqual(verdict['relative_performance'],'unavailable_ineligible_baseline')
+        self.assertIsNone(verdict['process_peak_limit_bytes'])
+        self.assertEqual(verdict['observed_process_peak_bytes'],100*1024**2)
+        self.assertNotIn('route_metrics',verdict)
+
+    def test_ineligible_evidence_is_exact_and_cannot_excuse_arbitrary_failure(self):
+        frozen=self.frozen_ineligible()
+        for key in ['head','tree','reason_code','status']:
+            changed=copy.deepcopy(frozen);changed['baseline_eligibility'][key]='unreviewed'
+            with self.assertRaises(ValueError):self.module.validate_absolute(report(),changed)
+        changed=copy.deepcopy(frozen);changed['baseline_eligibility']['source_blobs']={}
+        with self.assertRaises(ValueError):self.module.validate_absolute(report(),changed)
+        for key in ['head','tree','fixture_sha256','measurement_sha256']:
+            value=report();value[key]='f'*len(value[key])
+            with self.assertRaises(ValueError):self.module.validate_absolute(value,frozen)
+        changed=copy.deepcopy(frozen);changed['frozen_unix']=2001
+        with self.assertRaisesRegex(ValueError,'before'):self.module.validate_absolute(report(),changed)
+        changed=copy.deepcopy(frozen);changed['policy']['median_growth_limit_bytes']+=1
+        with self.assertRaisesRegex(ValueError,'policy'):self.module.validate_absolute(report(),changed)
+
+    def test_candidate_only_keeps_functional_leak_and_trend_failures(self):
+        changes=[lambda r:r.update(wall_seconds=298),
+            lambda r:r.update(media_seconds=10),lambda r:r.update(final_callbacks=1),
+            lambda r:r.update(final_live_inputs=1),lambda r:r.update(native_writer_count=3),
+            lambda r:r['renditions'][0].update(raw_tfdt_continuous=False),
+            lambda r:r['renditions'][0].update(interior_silent_windows=1),
+            lambda r:r['ledger_after'].update(application=9999),
+            lambda r:r['samples'][-1].update(producer_eof=True)]
+        for change in changes:
+            value=report();change(value)
+            with self.assertRaises(ValueError):self.module.validate_absolute(value,self.frozen_ineligible())
+        value=report()
+        for sample in value['samples']:
+            if sample['wall_seconds']>=240:sample['footprint_bytes']+=33*1024**2
+        with self.assertRaisesRegex(ValueError,'median'):self.module.validate_absolute(value,self.frozen_ineligible())
+        # A flat process footprint above688MiB is not a store-ledger violation.
+        value=report()
+        for sample in value['samples']:sample['footprint_bytes']=900*1024**2
+        self.module.validate_absolute(value,self.frozen_ineligible())
+
+    def test_real_ledger_hard_caps_and_store_soft_backpressure(self):
+        for key,value in [('application_charged_bytes',1266647041),('resource_charged_bytes',128*1024+1),
+                          ('store_body_bytes',688*1024**2+1)]:
+            candidate=report();candidate['samples'][10][key]=value
+            with self.assertRaisesRegex(ValueError,'ledger|store'):self.module.validate_absolute(candidate,self.frozen_ineligible())
+        candidate=report();candidate['samples'][10]['store_body_bytes']=560*1024**2
+        with self.assertRaisesRegex(ValueError,'backpressure'):self.module.validate_absolute(candidate,self.frozen_ineligible())
+        candidate['samples'][10]['store_should_backpressure']=True
+        self.module.validate_absolute(candidate,self.frozen_ineligible())
+        candidate=report();candidate['global_maximum_charged_bytes']=1266647041
+        with self.assertRaisesRegex(ValueError,'ledger'):self.module.validate_absolute(candidate,self.frozen_ineligible())
 
     def test_valid_report_shape_and_fixed_thresholds(self):
         frozen=self.module.freeze_baseline(report('baseline'))
@@ -137,6 +202,13 @@ class AcceptanceControls(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'not observed'):self.module.validate_controls(suppressed)
         del controls['negative']['wrap']
         with self.assertRaisesRegex(ValueError,'all five'):self.module.validate_controls(controls)
+
+    def test_runner_refuses_ambiguous_or_non_candidate_ineligibility(self):
+        for options in [['--controls-only'],['--record-baseline'],['--baseline','measured.json']]:
+            result=subprocess.run([str(ROOT/'Scripts/run-persistent-hls-acceptance.sh'),
+                '--ineligible-baseline','reviewed.json',*options],capture_output=True,text=True)
+            self.assertEqual(result.returncode,64)
+            self.assertIn('candidate-only',result.stderr)
 
     def test_runner_rejects_longer_configuration_before_xcode(self):
         result=subprocess.run([str(ROOT/'Scripts/run-persistent-hls-acceptance.sh'),

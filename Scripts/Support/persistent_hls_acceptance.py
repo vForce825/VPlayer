@@ -10,9 +10,22 @@ import math
 from pathlib import Path
 import re
 import statistics
+import subprocess
+import time
 
 MIB=1024**2
 OLD_WRITER_HEAD='36f9f00044db05b707e25ea470b0da3cec62682c'
+
+OLD_WRITER_TREE='5ea82c016a2557f3b8a8507e750a02dcce7ea5f3'
+OLD_DEFECT_BLOBS={
+    'Sources/VPlayerPlayback/HLS/SystemHLSPublicationGraph.swift':'a3ce6cbf2251bf205d45a8d401e251e9a7038111',
+    'Sources/VPlayerPlayback/HLS/HLSPublicationCoordinator.swift':'88a0a938a60af69307dc13d3b0effe5e216f95b3'}
+LEDGER_POLICY=dict(application_soft_bytes=981184512,application_hard_bytes=1266647040,
+    store_soft_bytes=560*MIB,store_hard_bytes=688*MIB,resource_hard_bytes=128*1024,
+    store_observation='body_subtotal_excludes_metadata')
+ABSOLUTE_POLICY=dict(median_growth_limit_bytes=32*MIB,process_peak_limit_bytes=None,
+    process_peak_limit_status='unavailable_no_predeclared_absolute_cap',ledger=LEDGER_POLICY,
+    maximum_source_wall_seconds=300,maximum_continuous_stall_seconds=5)
 
 
 def require(condition,message):
@@ -92,6 +105,17 @@ def validate_candidate(report,frozen):
     for key in ('fixture_sha256','os','device','measurement_sha256'):
         require(report[key]==baseline[key],f'baseline {key} mismatch')
     validate_footprint(samples,frozen['peak_limit_bytes'])
+    validate_candidate_invariants(report,samples)
+    return dict(result='passed',head=report['head'],tree=report['tree'],wall_seconds=report['wall_seconds'],
+        playback_wall_seconds=report['playback_wall_seconds'],prebuffer_seconds=report['prebuffer_seconds'],
+        media_seconds=report['media_seconds'],cleanup_seconds=report['cleanup_seconds'],decode_seconds=report['decode_seconds'],
+        whole_test_seconds=report['whole_test_seconds'],baseline_head=baseline['head'],peak_limit_bytes=frozen['peak_limit_bytes'],
+        route_metrics={key:{'old_writer':baseline.get(key),'candidate':report.get(key)} for key in
+            ('playback_cpu_seconds','startup_seconds','dropped_video_frames','access_log_stalls')},
+        physical_homepod_verified=False,scope='Measured capped native observation only; no hourly stability claim')
+
+
+def validate_candidate_invariants(report,samples):
     for sample in samples:
         for value,cap in [('live_inputs','hard_inputs'),('live_bytes','hard_bytes'),
                           ('evidence','hard_evidence'),('callbacks','hard_callbacks')]:
@@ -108,13 +132,88 @@ def validate_candidate(report,frozen):
     validate_input_return(report);validate_callback_return(report)
     require(report.get('final_evidence')==0,'retained segment evidence')
     validate_media(report,stable=True)
-    return dict(result='passed',head=report['head'],tree=report['tree'],wall_seconds=report['wall_seconds'],
-        playback_wall_seconds=report['playback_wall_seconds'],prebuffer_seconds=report['prebuffer_seconds'],
-        media_seconds=report['media_seconds'],cleanup_seconds=report['cleanup_seconds'],decode_seconds=report['decode_seconds'],
-        whole_test_seconds=report['whole_test_seconds'],baseline_head=baseline['head'],peak_limit_bytes=frozen['peak_limit_bytes'],
-        route_metrics={key:{'old_writer':baseline.get(key),'candidate':report.get(key)} for key in
-            ('playback_cpu_seconds','startup_seconds','dropped_video_frames','access_log_stalls')},
-        physical_homepod_verified=False,scope='Measured capped native observation only; no hourly stability claim')
+    require(report.get('ledger_policy')==LEDGER_POLICY,'ledger cap policy mismatch')
+    require(number(report.get('global_maximum_charged_bytes')) and
+        0<=report['global_maximum_charged_bytes']<=LEDGER_POLICY['application_hard_bytes'],'global ledger maximum exceeded')
+    for sample in samples:
+        require(number(sample.get('application_charged_bytes')) and
+            sample['application_charged_bytes']<=report['global_maximum_charged_bytes'],'global ledger maximum below observed charge')
+        for key,limit in [('application_charged_bytes','application_hard_bytes'),
+                          ('resource_charged_bytes','resource_hard_bytes'),('store_body_bytes','store_hard_bytes')]:
+            require(number(sample.get(key)) and 0<=sample[key]<=LEDGER_POLICY[limit],f'{key} ledger/store hard cap')
+        require(type(sample.get('store_should_backpressure')) is bool,'missing store backpressure observation')
+        if sample['store_body_bytes']>=LEDGER_POLICY['store_soft_bytes']:
+            require(sample['store_should_backpressure'],'store soft threshold without backpressure')
+
+
+def validate_ineligibility(evidence):
+    require(evidence.get('schema')==1 and evidence.get('status')=='ineligible' and
+        evidence.get('head')==OLD_WRITER_HEAD and evidence.get('tree')==OLD_WRITER_TREE and
+        evidence.get('reason_code')=='sequence_clock_is_not_media_clock' and
+        evidence.get('source_blobs')==OLD_DEFECT_BLOBS,'unreviewed baseline ineligibility evidence')
+
+
+def verify_ineligible_source(evidence,repository):
+    validate_ineligibility(evidence)
+    refs={OLD_WRITER_HEAD+'^{tree}':OLD_WRITER_TREE,
+        **{OLD_WRITER_HEAD+':'+path:blob for path,blob in OLD_DEFECT_BLOBS.items()}}
+    for ref,expected in refs.items():
+        actual=subprocess.check_output(['git','-C',str(repository),'rev-parse','--verify',ref],text=True).strip()
+        require(actual==expected,'old-writer source/tree does not match reviewed defect')
+
+
+def freeze_ineligible(evidence,candidate,frozen_unix):
+    validate_ineligibility(evidence)
+    require(number(frozen_unix) and frozen_unix>=0,'invalid frozen time')
+    binding={key:candidate[key] for key in ('head','tree','fixture_sha256','measurement_sha256')}
+    for key,value in binding.items():
+        require(re.fullmatch('[0-9a-f]{'+str(40 if key in ('head','tree') else 64)+'}',value),f'invalid frozen {key}')
+    require(binding['head']!=OLD_WRITER_HEAD,'old writer cannot be the candidate')
+    return dict(schema=1,status='ineligible',baseline_eligibility=evidence,policy=ABSOLUTE_POLICY,
+        candidate=binding,frozen_unix=frozen_unix)
+
+
+def validate_frozen_ineligible(frozen,candidate,before):
+    validate_ineligibility(frozen['baseline_eligibility'])
+    require(frozen.get('policy')==ABSOLUTE_POLICY,'predeclared candidate policy changed')
+    require(frozen==freeze_ineligible(frozen['baseline_eligibility'],candidate,frozen['frozen_unix']),
+        'frozen candidate provenance changed')
+    require(number(before) and frozen['frozen_unix']<before,'candidate policy must freeze before observation')
+
+
+def current_candidate_binding(head,fixture):
+    actual_head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+    require(head==actual_head,'exact candidate head required')
+    require(fixture is not None,'actual fixture required')
+    digest=hashlib.sha256()
+    with fixture.open('rb') as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
+    paths=sorted(Path('Tests/VPlayerHLSAcceptanceTests').glob('*.swift'))
+    require(len(paths)==3,'expected exact acceptance measurement source inventory')
+    measurement=hashlib.sha256(b''.join(path.read_bytes() for path in paths)).hexdigest()
+    return dict(head=actual_head,tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
+        fixture_sha256=digest.hexdigest(),measurement_sha256=measurement)
+
+
+def validate_absolute(report,frozen):
+    samples=validate_measurement(report)
+    require(report.get('role')=='candidate','candidate-only mode requires the candidate')
+    validate_frozen_ineligible(frozen,report,report['started_unix'])
+    validate_footprint_trend(samples)
+    validate_candidate_invariants(report,samples)
+    return dict(result='passed_candidate_only',head=report['head'],tree=report['tree'],
+        wall_seconds=report['wall_seconds'],playback_wall_seconds=report['playback_wall_seconds'],
+        prebuffer_seconds=report['prebuffer_seconds'],media_seconds=report['media_seconds'],
+        cleanup_seconds=report['cleanup_seconds'],decode_seconds=report['decode_seconds'],
+        baseline_status='ineligible',baseline_head=OLD_WRITER_HEAD,
+        baseline_reason_code=frozen['baseline_eligibility']['reason_code'],
+        relative_performance='unavailable_ineligible_baseline',performance_improvement_claim=False,
+        observed_process_peak_bytes=max(sample['footprint_bytes'] for sample in samples),
+        process_peak_limit_bytes=None,process_peak_limit_status=ABSOLUTE_POLICY['process_peak_limit_status'],
+        median_growth_limit_bytes=32*MIB,ledger_policy=LEDGER_POLICY,
+        observed_global_maximum_charged_bytes=report['global_maximum_charged_bytes'],
+        physical_homepod_verified=False,
+        scope='Capped native candidate functionality, existing ledger limits, release and footprint trend only; no relative performance or absolute process-peak verdict')
 
 
 def validate_media(report,stable):
@@ -159,6 +258,10 @@ def validate_callback_return(value):
 
 def validate_footprint(samples,peak_limit):
     require(max(sample['footprint_bytes'] for sample in samples)<=peak_limit,'native footprint peak regression')
+    validate_footprint_trend(samples)
+
+
+def validate_footprint_trend(samples):
     first=[sample['footprint_bytes'] for sample in samples if 60<=sample['wall_seconds']<120]
     last=[sample['footprint_bytes'] for sample in samples if 240<=sample['wall_seconds']<300]
     require(len(first)>=12 and len(last)>=12,'missing post-warmup/final60 sample window')
@@ -180,8 +283,9 @@ def validate_controls(value):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=['freeze','validate','extract','controls'])
+    parser.add_argument('command',choices=['freeze','validate','extract','controls','freeze-ineligible','check-ineligible','validate-absolute'])
     parser.add_argument('input',type=Path);parser.add_argument('--baseline',type=Path)
+    parser.add_argument('--head');parser.add_argument('--fixture',type=Path)
     parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
     if args.command in ('extract','controls'):
         marker='HLS_ACCEPTANCE_CONTROLS=' if args.command=='controls' else 'HLS_ACCEPTANCE_REPORT='
@@ -193,13 +297,20 @@ def main():
     else:
         value=json.loads(args.input.read_text())
         if args.command=='freeze':value=freeze_baseline(value)
+        elif args.command in ('freeze-ineligible','check-ineligible'):
+            evidence=value if args.command=='freeze-ineligible' else value['baseline_eligibility']
+            verify_ineligible_source(evidence,Path.cwd())
+            binding=current_candidate_binding(args.head,args.fixture)
+            if args.command=='freeze-ineligible':value=freeze_ineligible(evidence,binding,time.time())
+            else:validate_frozen_ineligible(value,binding,time.time())
         else:
             require(args.baseline is not None,'frozen baseline required')
-            value=validate_candidate(value,json.loads(args.baseline.read_text()))
+            frozen=json.loads(args.baseline.read_text())
+            value=validate_absolute(value,frozen) if args.command=='validate-absolute' else validate_candidate(value,frozen)
     with args.output.open('x') as stream:json.dump(value,stream,indent=2,sort_keys=True);stream.write('\n')
-    print(json.dumps(value if args.command=='validate' else dict(output=str(args.output),
+    print(json.dumps(value if args.command in ('validate','validate-absolute') else dict(output=str(args.output),
         sha256=hashlib.sha256(args.output.read_bytes()).hexdigest()),sort_keys=True))
 
 if __name__=='__main__':
     try:main()
-    except (ValueError,KeyError,TypeError,OSError) as error:raise SystemExit(f'acceptance failed: {error}')
+    except (ValueError,KeyError,TypeError,OSError,subprocess.CalledProcessError) as error:raise SystemExit(f'acceptance failed: {error}')

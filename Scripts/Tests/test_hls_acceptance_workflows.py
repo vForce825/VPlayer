@@ -73,8 +73,21 @@ class WorkflowContracts(unittest.TestCase):
         text=(ROOT/'Scripts/run-hls-baseline-and-candidate.sh').read_text()
         self.assertIn('old=36f9f00044db05b707e25ea470b0da3cec62682c',text)
         self.assertIn('git fetch --no-write-fetch-head origin "$old"',text)
-        self.assertLess(text.index('git fetch --no-write-fetch-head origin "$old"'),text.index('git worktree add'))
+        self.assertLess(text.index('git fetch --no-write-fetch-head origin "$old"'),text.index('freeze-ineligible'))
+        self.assertNotIn('git worktree add',text)
+        self.assertNotIn('--record-baseline',text)
         self.assertIn('git rev-parse --verify "$old^{commit}"',text)
+
+    def test_ineligible_policy_is_frozen_and_checked_before_candidate_execution(self):
+        script=(ROOT/'Scripts/run-hls-baseline-and-candidate.sh').read_text()
+        self.assertLess(script.index('freeze-ineligible'),script.index('chmod a-w'))
+        self.assertLess(script.index('chmod a-w'),script.index('--ineligible-baseline'))
+        self.assertNotIn('set +e',script)
+        runner=(ROOT/'Scripts/run-persistent-hls-acceptance.sh').read_text()
+        self.assertLess(runner.index('check-ineligible'),runner.index('xcodebuild build-for-testing'))
+        self.assertIn('Frozen ineligibility/policy changed during candidate.',runner)
+        self.assertIn('validate-absolute',runner)
+        self.assertIn('validate "$output" --baseline "$baseline"',runner)
 
     def test_acceptance_path_filters_and_manual_final_dispatch(self):
         text=(ROOT/'.github/workflows/hls-acceptance.yml').read_text()
@@ -97,8 +110,8 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_short_native_controls_run_before_baseline(self):
         script=(ROOT/'Scripts/run-hls-baseline-and-candidate.sh').read_text()
-        self.assertLess(script.index('--controls-only'),script.index('git worktree add'))
-        self.assertLess(script.index('--controls-only'),script.index('--record-baseline'))
+        self.assertLess(script.index('--controls-only'),script.index('freeze-ineligible'))
+        self.assertLess(script.index('freeze-ineligible'),script.index('--ineligible-baseline'))
         runner=(ROOT/'Scripts/run-persistent-hls-acceptance.sh').read_text()
         self.assertIn('AcceptanceNativeControlTests/testNativeObservationControlsRejectFiveFaults',runner)
         self.assertIn('persistent_hls_acceptance.py controls "$work/native.log"',runner)

@@ -306,6 +306,10 @@ final class AcceptanceCapture: @unchecked Sendable {
         var inits = 0
         var fragments = 0
         var defaultDuration: UInt32 = 0
+        var latestMediaTimescale: UInt32?
+        var lastInitializationBeforeFragment = 0
+        var lastReportStart: CMTime?
+        var lastReportDuration: CMTime?
         var continuity = AcceptanceFragmentContinuity()
     }
     private let lock = NSLock()
@@ -338,6 +342,9 @@ final class AcceptanceCapture: @unchecked Sendable {
                 copiedBytes += bytes.count
                 if object.kind == .initialization {
                     track.inits += 1
+                    track.lastInitializationBeforeFragment = track.fragments
+                    // Diagnostic only: an unavailable timescale cannot change admission.
+                    track.latestMediaTimescale = try? AcceptanceMP4.mediaTimescale(bytes)
                     if track.inits == 1 {
                         track.defaultDuration = try AcceptanceMP4.defaultDuration(bytes)
                         try track.handle.write(contentsOf: bytes)
@@ -345,6 +352,8 @@ final class AcceptanceCapture: @unchecked Sendable {
                 } else {
                     try track.continuity.observe(bytes, defaultDuration: track.defaultDuration)
                     track.fragments += 1
+                    track.lastReportStart = object.report.earliestPresentationTimeStamp
+                    track.lastReportDuration = object.report.duration
                     try track.handle.write(contentsOf: bytes)
                 }
                 tracks[kind] = track
@@ -356,7 +365,14 @@ final class AcceptanceCapture: @unchecked Sendable {
         lock.withLock {
             ["copied_bytes":copiedBytes,
              "error":failure.map { ErrorDiagnosticSnapshot($0).summary } ?? "none",
-             "tracks":tracks.values.map { ["kind":$0.kind,"inits":$0.inits,"fragments":$0.fragments] as [String: Any] }]
+             "tracks":tracks.values.sorted { $0.kind < $1.kind }.map { track -> [String: Any] in
+                 ["kind":track.kind,"inits":track.inits,"fragments":track.fragments,
+                  "writer_count":track.writers.count,
+                  "last_init_before_fragment":track.lastInitializationBeforeFragment,
+                  "raw":track.continuity.failureDiagnostics(timescale: track.latestMediaTimescale),
+                  "last_report_start":track.lastReportStart.map { AcceptanceReport.time($0) as Any } ?? NSNull(),
+                  "last_report_duration":track.lastReportDuration.map { AcceptanceReport.time($0) as Any } ?? NSNull()]
+             }]
         }
     }
 
@@ -411,6 +427,21 @@ enum AcceptanceMP4 {
         guard trex.payload + 24 <= trex.end else { throw AcceptanceError.invalid("short trex") }
         return u32(bytes, trex.payload + 12)
     }
+    static func mediaTimescale(_ bytes: Data) throws -> UInt32 {
+        let moov = try one("moov", boxes(bytes))
+        let trak = try one("trak", boxes(bytes, moov.payload, moov.end))
+        let mdia = try one("mdia", boxes(bytes, trak.payload, trak.end))
+        let mdhd = try one("mdhd", boxes(bytes, mdia.payload, mdia.end))
+        guard mdhd.payload + 4 <= mdhd.end, bytes[mdhd.payload] <= 1 else {
+            throw AcceptanceError.invalid("short/unsupported mdhd")
+        }
+        let offset = mdhd.payload + (bytes[mdhd.payload] == 0 ? 12 : 20)
+        guard offset + 4 <= mdhd.end else { throw AcceptanceError.invalid("short mdhd timescale") }
+        let timescale = u32(bytes, offset)
+        guard timescale > 0 else { throw AcceptanceError.invalid("zero mdhd timescale") }
+        return timescale
+    }
+
     static func fragment(_ bytes: Data, defaultDuration: UInt32) throws -> Fragment {
         let top = try boxes(bytes)
         _ = try one("mdat", top)
@@ -471,6 +502,9 @@ enum AcceptanceMP4 {
 struct AcceptanceFragmentContinuity {
     private var lastSequence: UInt32?
     private var nextDecodeTime: UInt64?
+    private var firstDecodeTime: UInt64?
+    private var lastDecodeTime: UInt64?
+    private var lastDuration: UInt64?
     private(set) var rawSequenceContinuous = true
     private(set) var rawTimeContinuous = true
     mutating func observe(_ bytes: Data, defaultDuration: UInt32) throws {
@@ -481,8 +515,24 @@ struct AcceptanceFragmentContinuity {
         if let expected = nextDecodeTime { rawTimeContinuous = rawTimeContinuous && facts.time == expected }
         let end = facts.time.addingReportingOverflow(facts.duration)
         guard !end.overflow else { throw AcceptanceError.invalid("native decode time overflow") }
+        if firstDecodeTime == nil { firstDecodeTime = facts.time }
         lastSequence = facts.sequence
+        lastDecodeTime = facts.time
+        lastDuration = facts.duration
         nextDecodeTime = end.partialValue
+    }
+
+    func failureDiagnostics(timescale: UInt32?) -> [String: Any] {
+        let scale = timescale.flatMap { $0 > 0 ? Double($0) : nil }
+        let endSeconds = scale.flatMap { scale in nextDecodeTime.map { Double($0) / scale } }
+        return ["raw_mfhd_continuous":rawSequenceContinuous,"raw_tfdt_continuous":rawTimeContinuous,
+                "first_raw_tfdt":firstDecodeTime.map { $0 as Any } ?? NSNull(),
+                "last_raw_mfhd":lastSequence.map { $0 as Any } ?? NSNull(),
+                "last_raw_tfdt":lastDecodeTime.map { $0 as Any } ?? NSNull(),
+                "last_raw_duration":lastDuration.map { $0 as Any } ?? NSNull(),
+                "last_raw_end":nextDecodeTime.map { $0 as Any } ?? NSNull(),
+                "latest_init_timescale":timescale.map { $0 as Any } ?? NSNull(),
+                "last_raw_end_seconds":AcceptanceReport.finite(endSeconds)]
     }
 }
 
@@ -560,6 +610,21 @@ final class AcceptanceObservedGraph: HLSMediaGraphAssembler.DeliveryGraph, @unch
 
 /// Native negative controls and long observations share these reporting functions.
 enum AcceptanceReport {
+    /// Failure diagnostics must survive indefinite/invalid native times.
+    static func finite(_ value: Double?) -> Any {
+        guard let value, value.isFinite else { return NSNull() }
+        return value
+    }
+    static func time(_ value: CMTime) -> [String: Any] {
+        ["value":value.value,"timescale":value.timescale,"epoch":value.epoch,
+         "flags":value.flags.rawValue,"seconds":finite(value.seconds)]
+    }
+    static func ranges(_ values: [NSValue]) -> [String: Any] {
+        ["total_count":values.count,"ranges":values.prefix(8).map { value -> [String: Any] in
+            let range = value.timeRangeValue
+            return ["start":time(range.start),"duration":time(range.duration),"end":time(CMTimeRangeGetEnd(range))]
+        }]
+    }
     static func audio(_ value: AcceptancePCMStatistics) -> [String: Any] {
         ["decoded_frames":value.frames,"maximum_gap_seconds":value.maximumGapSamples / 48_000,
          "interior_silent_windows":value.silentShortWindows,"checked_interior_windows":value.checkedShortWindows]

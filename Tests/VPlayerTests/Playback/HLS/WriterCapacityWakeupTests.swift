@@ -11,6 +11,7 @@ final class WriterCapacityWakeupTests: XCTestCase {
         let wakeup = try WriterCapacityWakeup.make(clock: clock)
         let original = wakeup.currentRevision
         var rollback: WriterInputLifetime? = WriterInputLifetime(capacityWakeup: wakeup)
+        XCTAssertNotNil(rollback)
         rollback = nil
         XCTAssertEqual(wakeup.currentRevision, original)
         var native: WriterInputLifetime? = WriterInputLifetime(capacityWakeup: wakeup)

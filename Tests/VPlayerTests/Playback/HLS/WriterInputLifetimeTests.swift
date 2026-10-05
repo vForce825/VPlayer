@@ -37,7 +37,7 @@ final class WriterInputLifetimeTests: XCTestCase {
                 XCTUnwrap(source), lifetime: inputs.admit(bytes: bytes + 64))
             var alias: CMBlockBuffer?
             XCTAssertEqual(CMBlockBufferCreateWithBufferReference(allocator: kCFAllocatorDefault,
-                referenceBuffer: CMSampleBufferGetDataBuffer(try XCTUnwrap(wrapped)), offsetToData: 0,
+                referenceBuffer: try XCTUnwrap(CMSampleBufferGetDataBuffer(try XCTUnwrap(wrapped))), offsetToData: 0,
                 dataLength: bytes, flags: 0, blockBufferOut: &alias), noErr)
             XCTAssertEqual(ledger.chargedBytes, charge + WriterInputAdmission.metadataBytes)
             XCTAssertThrowsError(try inputs.admit(bytes: 1))

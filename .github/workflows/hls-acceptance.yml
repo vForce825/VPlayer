@@ -85,7 +85,7 @@ jobs:
           python3 Scripts/Tests/test_source_fixture_padding.py
           python3 Scripts/Tests/test_he_aac_fixture_observation.py
           python3 Scripts/Tests/test_source_fixture_manifest.py
-      - name: Run short controls, freeze old baseline, then measure candidate
+      - name: Run short controls, classify exact old reference, then measure candidate
         timeout-minutes: 45
         run: |
           udid="$(xcrun simctl list devices available -j | jq -er '

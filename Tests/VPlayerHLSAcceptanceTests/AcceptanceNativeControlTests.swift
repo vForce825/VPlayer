@@ -15,6 +15,50 @@ import XCTest
 /// Short controls run on the candidate before either capped observation. These
 /// exercise native components, not a second playback or resource-stability run.
 final class AcceptanceNativeControlTests: XCTestCase {
+    private func checkFailureDiagnosticSerialization() throws {
+        for value in [Double?.none, .some(.nan), .some(.infinity), .some(-.infinity)] {
+            XCTAssertTrue(AcceptanceReport.finite(value) is NSNull)
+        }
+        XCTAssertEqual(AcceptanceReport.finite(2.5) as? Double, 2.5)
+        let ranges = (0..<12).map { NSValue(timeRange: CMTimeRange(
+            start: CMTime(value: Int64($0), timescale: 1), duration: CMTime(value: 1, timescale: 1))) }
+        let bounded = AcceptanceReport.ranges(ranges)
+        XCTAssertEqual(bounded["total_count"] as? Int, 12)
+        XCTAssertEqual((bounded["ranges"] as? [[String: Any]])?.count, 8)
+        let payload: [String: Any] = ["indefinite":AcceptanceReport.time(.indefinite),
+            "invalid":AcceptanceReport.time(.invalid),"ranges":bounded]
+        XCTAssertTrue(JSONSerialization.isValidJSONObject(payload))
+        _ = try JSONSerialization.data(withJSONObject: payload)
+
+        func word(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+        func box(_ name: String, _ payload: Data) -> Data {
+            word(UInt32(payload.count + 8)) + Data(name.utf8) + payload
+        }
+        for version in [UInt8(0), 1] {
+            let mdhd = Data([version, 0, 0, 0]) + Data(repeating: 0, count: version == 0 ? 8 : 16) +
+                word(48_000) + Data(repeating: 0, count: version == 0 ? 8 : 12)
+            let initialization = box("moov", box("trak", box("mdia", box("mdhd", mdhd))))
+            XCTAssertEqual(try AcceptanceMP4.mediaTimescale(initialization), 48_000)
+        }
+        XCTAssertThrowsError(try AcceptanceMP4.mediaTimescale(box("moov", Data())))
+
+        var observed = AcceptanceFragmentContinuity()
+        try observed.observe(fragment(sequence: 11, time: 48_000), defaultDuration: 1_024)
+        try observed.observe(fragment(sequence: 12, time: 49_024), defaultDuration: 1_024)
+        let before = observed.failureDiagnostics(timescale: 48_000)
+        XCTAssertEqual(before["first_raw_tfdt"] as? UInt64, 48_000)
+        XCTAssertEqual(before["last_raw_mfhd"] as? UInt32, 12)
+        XCTAssertEqual(before["last_raw_end"] as? UInt64, 50_048)
+        // A real reset fragment parses successfully but fails both continuity facts.
+        try observed.observe(fragment(sequence: 1, time: 0), defaultDuration: 1_024)
+        let reset = observed.failureDiagnostics(timescale: 48_000)
+        XCTAssertEqual(reset["raw_mfhd_continuous"] as? Bool, false)
+        XCTAssertEqual(reset["raw_tfdt_continuous"] as? Bool, false)
+        XCTAssertEqual(reset["last_raw_tfdt"] as? UInt64, 0)
+        XCTAssertEqual(reset["last_raw_end"] as? UInt64, 1_024)
+        XCTAssertTrue(JSONSerialization.isValidJSONObject(reset))
+    }
+
     private func checkFirstFailureCapture() {
         let capture = AcceptanceFailureCapture()
         let first = ErrorDiagnosticSnapshot(typeName: "OriginalFailure", message: "native callback rejected")
@@ -95,6 +139,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
     }
 
     func testNativeObservationControlsRejectFiveFaults() async throws {
+        try checkFailureDiagnosticSerialization()
         checkFirstFailureCapture()
         try checkListenerReadiness()
         try await checkSourceServerFirstRequest()

@@ -89,6 +89,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                         let value = probe.snapshot
                         guard value.isComplete else { throw AcceptanceError.invalid("native diagnostic capacity exceeded") }
                         sample.merge(diagnosticFields(value)) { _, new in new }
+                        sample.merge(try ledgerSample(authority)) { _, new in new }
                         #endif
                         collector.append(sample)
                         nextSample += 5
@@ -101,6 +102,10 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         defer { sampler.cancel(); watchdog.stop() }
         var report: [String: Any] = [:]
         var stage = "await_playable_prefix"
+        var playbackBeganAt: Double?
+        var firstMediaTime: Double?
+        var lastTime = 0.0
+        var lastProgress = start
         do {
             let prefix = try await assembler.startUntilPlayablePrefix()
             stage = "await_native_item_ready"
@@ -118,8 +123,10 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             let initialMedia = player.currentTime().seconds
             let mediaStart = initialMedia.isFinite ? initialMedia : 0
             var firstProgress: Double?
-            var lastTime = mediaStart
-            var lastProgress = playbackStart
+            playbackBeganAt = playbackStart
+            firstMediaTime = mediaStart
+            lastTime = mediaStart
+            lastProgress = playbackStart
             stage = "playing"
             player.play()
             while !watchdog.hasStopped {
@@ -199,6 +206,8 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             let final = probe.snapshot
             guard final.isComplete else { throw AcceptanceError.invalid("incomplete native diagnostics") }
             report.merge(AcceptanceReport.retirement(final)) { _, new in new }
+            report["ledger_policy"] = ledgerPolicy()
+            report["global_maximum_charged_bytes"] = HLSDeliveryApplicationChargeLedger.shared.maximumChargedBytes
             #endif
         } catch {
             // Capture before cleanup cancels writers/demux and overwrites stages.
@@ -214,6 +223,12 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "producer_packets":graph.packetCount,"producer_eof":graph.hasEOF,
                 "last_demux_control":graph.lastControlDiagnostic,
                 "transport":server.failureDiagnostics,"capture":capture.failureDiagnostics,
+                "player":failurePlayerState(player),
+                "playback_wall_seconds":AcceptanceReport.finite(playbackBeganAt.map { AcceptanceClock.now - $0 }),
+                "prebuffer_seconds":AcceptanceReport.finite(playbackBeganAt.map { $0 - start }),
+                "first_media_seconds":AcceptanceReport.finite(firstMediaTime),
+                "last_advancing_media_seconds":AcceptanceReport.finite(playbackBeganAt == nil ? nil : lastTime),
+                "last_clock_progress_age_seconds":AcceptanceReport.finite(playbackBeganAt == nil ? nil : AcceptanceClock.now - lastProgress),
                 "history":acceptanceDiagnosticHistoryTail(PlaybackDiagnosticTracker.shared.recentHistory)]
             if let bytes = try? JSONSerialization.data(withJSONObject: failure, options: [.sortedKeys]) {
                 print("HLS_ACCEPTANCE_FAILURE=" + String(decoding: bytes, as: UTF8.self))
@@ -227,6 +242,29 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         }
         let bytes = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
         print("HLS_ACCEPTANCE_REPORT=" + String(decoding: bytes, as: UTF8.self))
+    }
+
+    /// Read once on failure, before pause/removal changes the actual player state.
+    private func failurePlayerState(_ player: AVPlayer) -> [String: Any] {
+        var result: [String: Any] = ["status":player.status.rawValue,
+            "time_control_status":player.timeControlStatus.rawValue,
+            "waiting_reason":player.reasonForWaitingToPlay.map { String($0.rawValue.prefix(256)) as Any } ?? NSNull(),
+            "rate":AcceptanceReport.finite(Double(player.rate)),
+            "current_time":AcceptanceReport.time(player.currentTime()),
+            "automatically_waits":player.automaticallyWaitsToMinimizeStalling,
+            "error":player.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull(),
+            "has_current_item":player.currentItem != nil]
+        if let item = player.currentItem {
+            result["item"] = ["status":item.status.rawValue,
+                "error":item.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull(),
+                "current_time":AcceptanceReport.time(item.currentTime()),
+                "duration":AcceptanceReport.time(item.duration),
+                "buffer_empty":item.isPlaybackBufferEmpty,"buffer_full":item.isPlaybackBufferFull,
+                "likely_to_keep_up":item.isPlaybackLikelyToKeepUp,
+                "loaded":AcceptanceReport.ranges(item.loadedTimeRanges),
+                "seekable":AcceptanceReport.ranges(item.seekableTimeRanges)] as [String: Any]
+        }
+        return result
     }
 
     private func ledgers() -> [String: Int] {
@@ -260,6 +298,23 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         return info.phys_footprint
     }
     #if !HLS_ACCEPTANCE_BASELINE
+    private func ledgerPolicy() -> [String: Any] {
+        let store = PlaybackCapacityEnvelope.current.sealedMediaStoreLimit
+        return ["application_soft_bytes":HLSDeliveryApplicationChargeLedger.softCapBytes,
+                "application_hard_bytes":HLSDeliveryApplicationChargeLedger.hardCapBytes,
+                "store_soft_bytes":store.softBytes,"store_hard_bytes":store.hardBytes,
+                "resource_hard_bytes":PlaybackResourceContextLedger.hardBytes,
+                "store_observation":"body_subtotal_excludes_metadata"]
+    }
+    private func ledgerSample(_ authority: SystemHLSMediaGraphAuthority) throws -> [String: Any] {
+        let publication = authority.publicationForTesting
+        // Existing graph -> store lock ordering. No object/lease escapes the read.
+        let usage = try publication.withActivePublication { publication.store?.usage }
+        return ["application_charged_bytes":HLSDeliveryApplicationChargeLedger.shared.chargedBytes,
+                "resource_charged_bytes":PlaybackResourceContextLedger.shared.chargedBytes,
+                "store_body_bytes":(usage?.residentBytes ?? 0) + (usage?.reservedBytes ?? 0),
+                "store_should_backpressure":usage?.shouldBackpressure ?? false]
+    }
     private func diagnosticFields(_ value: HLSWriterAcceptanceSnapshot) -> [String: Any] {
         ["live_inputs":value.liveInputCount,"live_bytes":value.liveInputBytes,"evidence":value.evidenceCount,
          "callbacks":value.pendingCallbacks,"hard_inputs":value.hardInputCount,"hard_bytes":value.hardInputBytes,
