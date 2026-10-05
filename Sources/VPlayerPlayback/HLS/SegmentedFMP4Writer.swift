@@ -4855,7 +4855,12 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         currentSegmentInputCount = 0
         currentPublicationBoundary = nil
         currentFrameDuration = nil
-        guard state == .started else { throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("flush.state") }
+        guard state == .started else {
+            // flush can synchronously deliver an initialization that fails the
+            // emitted-layout proof while the native call itself still succeeds.
+            // Its retained typed rejection survives concurrent native cleanup.
+            throw systemFailureIsolated("flush.state")
+        }
         if !usesExplicitOwnershipLimits {
             let live = inputAdmission.usage
             let precedingCount = live.count - (admission.inputLifetime == nil ? 0 : 1)

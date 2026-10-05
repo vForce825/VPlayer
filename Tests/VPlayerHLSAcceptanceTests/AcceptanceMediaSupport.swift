@@ -1168,6 +1168,85 @@ final class AcceptanceSampleCollector: @unchecked Sendable {
     }
 }
 
+/// Dedicated serial observations cannot inherit the player's executor. The only
+/// history is the existing 61-record collector; each callback borrows owners for
+/// one read. A delayed read remains a real delayed sample and fails the unchanged
+/// cadence validator. Timer deadlines are diagnostics, never reported timestamps.
+final class AcceptanceIndependentSampler: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "hls.acceptance.sampler", qos: .userInitiated)
+    private let timer: DispatchSourceTimer
+    private let lock = NSLock()
+    private var cancelled = false
+    private let start: Double
+    private let intervalSeconds: Double
+    private let collector: AcceptanceSampleCollector
+    private let shouldStop: @Sendable () -> Bool
+    private let onFailure: @Sendable (any Error) -> Void
+    // Serial-queue confined, including release during physical join.
+    private var observe: (@Sendable (Double) throws -> [String: Any])?
+    private var observations = 0
+
+    init(start: Double, collector: AcceptanceSampleCollector, intervalSeconds: Double = 5,
+         shouldStop: @escaping @Sendable () -> Bool,
+         observe: @escaping @Sendable (Double) throws -> [String: Any],
+         onFailure: @escaping @Sendable (any Error) -> Void) {
+        precondition(start.isFinite && intervalSeconds.isFinite && intervalSeconds > 0)
+        self.start = start
+        self.intervalSeconds = intervalSeconds
+        self.collector = collector
+        self.shouldStop = shouldStop
+        self.observe = observe
+        self.onFailure = onFailure
+        timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: intervalSeconds, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.sample() }
+        timer.resume()
+    }
+
+    private func sample() {
+        guard !lock.withLock({ cancelled }) else { return }
+        guard !shouldStop() else { cancel(); return }
+        let observedAt = AcceptanceClock.now
+        guard observedAt - start < 300 else { cancel(); return }
+        do {
+            guard observations < 61, let observe else {
+                throw AcceptanceError.invalid("independent sample capacity")
+            }
+            var value = try observe(observedAt - start)
+            value["wall_seconds"] = observedAt - start
+            value["sample_read_seconds"] = AcceptanceClock.now - observedAt
+            // Cumulative drift from the expected ordinal. Coalesced/missed timer
+            // ticks remain visible here and in actual wall gaps, never backfilled.
+            value["sample_schedule_drift_seconds"] = max(0, observedAt - start - Double(observations) * intervalSeconds)
+            collector.append(value)
+            observations += 1
+        } catch {
+            collector.fail(error)
+            cancel()
+            onFailure(error)
+        }
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+        timer.cancel()
+    }
+
+    /// Join the actual in-flight read before any caller releases graph roots.
+    /// No reader closure, borrowed owner or callback survives this queue fence.
+    func join() async {
+        cancel()
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                observe = nil
+                continuation.resume()
+            }
+        }
+    }
+
+    deinit { timer.cancel() }
+}
+
 /// Keep a valid UTF-8 tail within the fixed diagnostic byte cap.
 func acceptanceDiagnosticHistoryTail(_ text: String) -> String {
     let tail = text.utf8.suffix(8_192).drop(while: { ($0 & 0xC0) == 0x80 })

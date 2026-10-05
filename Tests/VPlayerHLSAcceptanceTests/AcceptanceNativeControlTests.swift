@@ -682,7 +682,90 @@ final class AcceptanceNativeControlTests: XCTestCase {
         XCTAssertThrowsError(try late.finish(), "A callback must finish before its deadline")
     }
 
+    @MainActor
+    private static func checkIndependentSampler() async throws {
+        let collector = AcceptanceSampleCollector()
+        let observed = DispatchSemaphore(value: 0)
+        let start = AcceptanceClock.now
+        let sampler = AcceptanceIndependentSampler(start: start, collector: collector,
+            intervalSeconds: 0.02, shouldStop: { false }, observe: { _ in
+                let value: [String: Any] = ["observed_at":AcceptanceClock.now,
+                    "ran_on_main_thread":Thread.isMainThread]
+                observed.signal()
+                return value
+            }, onFailure: { _ in observed.signal() })
+        // Ordinary three-tick control: keep this actor occupied while the real
+        // sampler must make progress on its own queue, without actor/task hops.
+        for _ in 0..<3 {
+            XCTAssertEqual(observed.wait(timeout: .now() + 1), .success)
+        }
+        sampler.cancel()
+        await sampler.join()
+        let samples = try collector.snapshot()
+        XCTAssertGreaterThanOrEqual(samples.count, 3)
+        for sample in samples {
+            let wall = try XCTUnwrap(sample["wall_seconds"] as? Double)
+            let actual = try XCTUnwrap(sample["observed_at"] as? Double)
+            let readSeconds = try XCTUnwrap(sample["sample_read_seconds"] as? Double)
+            XCTAssertGreaterThanOrEqual(actual, start + wall)
+            XCTAssertGreaterThanOrEqual(readSeconds, actual - (start + wall))
+            XCTAssertEqual(sample["ran_on_main_thread"] as? Bool, false)
+        }
+        await sampler.join()
+        XCTAssertEqual(try collector.snapshot().count, samples.count,
+            "Cancel plus a physical queue join must prevent later observations")
+
+        let heldCollector = AcceptanceSampleCollector()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let joinStarted = DispatchSemaphore(value: 0)
+        let joined = DispatchSemaphore(value: 0)
+        var token: AcceptanceSamplerControlToken? = AcceptanceSamplerControlToken()
+        weak var releasedToken = token
+        let held = AcceptanceIndependentSampler(start: AcceptanceClock.now, collector: heldCollector,
+            shouldStop: { false }, observe: { [token] _ in
+                entered.signal()
+                guard release.wait(timeout: .now() + 1) == .success else {
+                    throw AcceptanceError.invalid("held sample was not released")
+                }
+                return ["owner_present":token != nil]
+            }, onFailure: { _ in })
+        token = nil
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        held.cancel()
+        let joining = Task.detached {
+            joinStarted.signal()
+            await held.join()
+            joined.signal()
+        }
+        XCTAssertEqual(joinStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(joined.wait(timeout: .now() + 0.02), .timedOut,
+            "Queue join cannot report completion while an actual read remains held")
+        release.signal()
+        await joining.value
+        XCTAssertNil(releasedToken, "Joining must release the completed reader closure")
+        XCTAssertEqual(try heldCollector.snapshot().count, 1,
+            "An observation already in flight is retained, not discarded at cancellation")
+
+        let failed = AcceptanceSampleCollector()
+        let failure = DispatchSemaphore(value: 0)
+        let failing = AcceptanceIndependentSampler(start: AcceptanceClock.now, collector: failed,
+            shouldStop: { false }, observe: { _ in throw AcceptanceError.invalid("sampler control") },
+            onFailure: { _ in failure.signal() })
+        XCTAssertEqual(failure.wait(timeout: .now() + 1), .success)
+        failing.cancel()
+        await failing.join()
+        XCTAssertThrowsError(try failed.snapshot())
+
+        let bounded = AcceptanceSampleCollector()
+        for index in 0..<61 { bounded.append(["control_ordinal":index]) }
+        XCTAssertEqual(try bounded.snapshot().count, 61)
+        bounded.append(["control_ordinal":61])
+        XCTAssertThrowsError(try bounded.snapshot(), "Capacity exhaustion cannot discard an observation and pass")
+    }
+
     func testNativeObservationControlsRejectFiveFaults() async throws {
+        try await Self.checkIndependentSampler()
         try checkVideoReaderMarkerEvidence()
         try checkRawVideoByteEvidence()
         try checkVideoTimelineMapping()
@@ -831,6 +914,8 @@ final class AcceptanceNativeControlTests: XCTestCase {
 private final class AcceptanceControlRelayHolder: @unchecked Sendable {
     weak var relay: SegmentReportRelay?
 }
+
+private final class AcceptanceSamplerControlToken: @unchecked Sendable { }
 
 private struct WithheldInitializationFactory: SegmentedFMP4SystemWriterFactory {
     func makeWriter(configuration: SegmentedFMP4SystemConfiguration,

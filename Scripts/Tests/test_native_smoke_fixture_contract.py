@@ -13,6 +13,25 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeSmokeFixtureContract(unittest.TestCase):
+    def test_endpoint_controls_keep_the_original_source_and_join_one_player(self):
+        source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        self.assertIn('func testNativeSDKEndBoundaryControlsKeepSameSource()', source)
+        self.assertIn('case defaultEnd, beforePreroll, afterPreroll', source)
+        control = source.split('private func runEndpointControl(', 1)[1].split('private func playerDriver(', 1)[0]
+        self.assertEqual(control.count('AVPlayer()'), 1)
+        self.assertIn('player.replaceCurrentItem(with: nil)', control)
+        self.assertIn('await timeout.value', control)
+        self.assertIn('await origin.close()', control)
+        self.assertIn('NATIVE_HLS_ENDPOINT_CONTROL', control)
+        self.assertIn('diagnostic-only=true', control)
+        after_load = control.split('let loadedDuration = try await item.asset.load(.duration)', 1)[1]
+        before_preroll = after_load.split('player.preroll(atRate: 1)', 1)[0]
+        self.assertIn('try Task.checkCancellation()', before_preroll)
+        self.assertIn('guard !signal.hasFailure', before_preroll)
+        self.assertIn('current.seconds > started.seconds + 0.25', control)
+        self.assertIn('case .playing = registry.playbackStateSnapshot()', source)
+        self.assertIn('activation == registry.outputResourceContextSnapshot()?.activation', source)
+
     def test_native_master_uses_explicit_color_media_and_matching_declared_duration(self):
         source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
         resource = re.search(r'forResource: "([^"]+)"', source).group(1)

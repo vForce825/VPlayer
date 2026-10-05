@@ -34,6 +34,16 @@ class DolbyBranchNativeContractTests(unittest.TestCase):
                                body.rindex("catch"),
                                "post-hoc assertions must not be accepted as native rejection")
 
+    def test_normal_flush_regression_requires_append_rejection_at_the_first_boundary(self):
+        body = SOURCE.split('private func assertNormalNativeFlush(', 1)[1].split(
+            'func testNativeEAC3BranchPublishesValidatedSideLayoutOrRejectsMissingLayout(', 1)[0]
+        for expected in ['XCTAssertFalse(finishStarted',
+                         'XCTAssertEqual(completedSourceFrames, 33 * fixture.frames.count - 1)',
+                         'XCTAssertEqual(failed.inputCount, 32)',
+                         'XCTAssertEqual(failed.terminalReason, .failed)',
+                         'XCTAssertEqual(terminal.inputCount, 34)']:
+            self.assertTrue(expected in body, expected)
+
     def test_native_publication_requires_writer_issued_layout_evidence(self):
         factory = SOURCE.split("private final class DolbyBranchWriterFactory:", 1)[1].split(
             "private final class DolbyWeakRelay:", 1)[0]

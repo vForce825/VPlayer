@@ -10,18 +10,22 @@ import XCTest
 
 @MainActor
 final class NativeHLSMasterSmokeTests: XCTestCase {
+    func testNativeSDKEndBoundaryControlsKeepSameSource() async throws {
+        let bytes = try fixtureBytes()
+        // These sequential SDK controls isolate endpoint ordering. They do not
+        // supply Registry authority or count as native-adapter acceptance.
+        for boundary in NativeEndpointControl.allCases {
+            let result = try await runEndpointControl(boundary, bytes: bytes)
+            XCTAssertTrue(result, "Real SDK endpoint control failed: \(boundary.rawValue)")
+        }
+    }
+
     func testRealAVPlayerNativeAndManagedHLSPrepareSelectedTracksAndProgressWithoutGeneratedGraph() async throws {
-        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
         // Native admission requires explicit source color. The task22 fixture
         // intentionally omits it; this committed lavfi fixture signals BT.709.
-        let bytes = try Data(contentsOf: file)
+        let bytes = try fixtureBytes()
         for managed in [false, true] {
-            let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nmedia.m3u8\n"
-            let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n#EXT-X-ENDLIST\n"
-            let origin = try NativeHLSHTTPFixture(resources: [
-                "/master.m3u8": .init(data: Data(master.utf8), contentType: "application/vnd.apple.mpegurl"),
-                "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
-                "/part.ts": .init(data: bytes, contentType: "video/mp2t")], credential: managed ? "ordinary fixture" : nil)
+            let origin = try makeOrigin(bytes: bytes, managed: managed)
             var failure: (any Error)?
             do {
                 try await withController { controller, registry, factory in
@@ -76,6 +80,95 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         }
     }
 
+    private func fixtureBytes() throws -> Data {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        return try Data(contentsOf: file)
+    }
+    private func makeOrigin(bytes: Data, managed: Bool) throws -> NativeHLSHTTPFixture {
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nmedia.m3u8\n"
+        let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n#EXT-X-ENDLIST\n"
+        return try NativeHLSHTTPFixture(resources: [
+            "/master.m3u8": .init(data: Data(master.utf8), contentType: "application/vnd.apple.mpegurl"),
+            "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
+            "/part.ts": .init(data: bytes, contentType: "video/mp2t")], credential: managed ? "ordinary fixture" : nil)
+    }
+    private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data) async throws -> Bool {
+        let origin = try makeOrigin(bytes: bytes, managed: false)
+        let player = AVPlayer()
+        let item = AVPlayerItem(url: origin.url("master.m3u8"))
+        item.preferredForwardBufferDuration = 3
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        player.automaticallyWaitsToMinimizeStalling = true
+        let signal = NativeEndpointControlSignal()
+        let observer = NotificationCenter.default.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification,
+            object: item, queue: nil) { notification in
+                let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+                signal.fail(domain: error?.domain ?? "none", code: error?.code ?? 0)
+            }
+        let timeout = Task { @MainActor [weak player] in
+            do { try await Task.sleep(for: .seconds(20)) } catch { return }
+            signal.fail(domain: "control.deadline", code: 0)
+            player?.cancelPendingPrerolls()
+            player?.currentItem?.asset.cancelLoading()
+        }
+        var stage = "ready", progressed = false
+        do {
+            player.replaceCurrentItem(with: item)
+            while item.status != .readyToPlay {
+                if item.status == .failed || signal.hasFailure { throw HLSSourceError.incompleteEvidence }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let loadedDuration = try await item.asset.load(.duration)
+            try Task.checkCancellation()
+            guard !signal.hasFailure else { throw HLSSourceError.deadline }
+            let duration = try ExactMediaTime(loadedDuration)
+            guard duration.value > 0 else { throw HLSSourceError.incompleteEvidence }
+            for index in 0..<2 {
+                try Task.checkCancellation()
+                guard !signal.hasFailure else { throw HLSSourceError.deadline }
+                // Keep both prerolls from the real adapter. Only the placement
+                // of the same observed endpoint differs between controls.
+                if index == 1, boundary == .beforePreroll { item.forwardPlaybackEndTime = duration.cmTime }
+                stage = "preroll-\(index)"
+                let primed = await withCheckedContinuation { continuation in
+                    player.preroll(atRate: 1) { continuation.resume(returning: $0) }
+                }
+                guard primed, !signal.hasFailure else { throw HLSSourceError.incompleteEvidence }
+            }
+            try Task.checkCancellation()
+            guard !signal.hasFailure else { throw HLSSourceError.deadline }
+            stage = "endpoint"
+            if boundary == .afterPreroll { item.forwardPlaybackEndTime = duration.cmTime }
+            stage = "play"
+            let started = player.currentTime()
+            guard started.isNumeric, started.seconds.isFinite else { throw HLSSourceError.incompleteEvidence }
+            player.play()
+            while !signal.hasFailure, item.status != .failed {
+                let current = player.currentTime()
+                if current.isNumeric, current.seconds.isFinite, current.seconds > started.seconds + 0.25 {
+                    progressed = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        } catch {
+            if !signal.hasFailure { signal.fail(domain: String(reflecting: type(of: error)), code: (error as NSError).code) }
+        }
+        let failure = signal.snapshot
+        let current = item.currentTime(), end = item.forwardPlaybackEndTime
+        print("NATIVE_HLS_ENDPOINT_CONTROL diagnostic-only=true boundary=\(boundary.rawValue) stage=\(stage) progressed=\(progressed) " +
+            "failure-domain=\(failure?.0 ?? "none") failure-code=\(failure?.1 ?? 0) status=\(item.status.rawValue) " +
+            "current=\(current.value)/\(current.timescale):\(current.flags.rawValue) end=\(end.value)/\(end.timescale):\(end.flags.rawValue)")
+        timeout.cancel(); await timeout.value
+        player.cancelPendingPrerolls(); player.pause()
+        await withCheckedContinuation { continuation in player.setDisconnectedFromSystemAudio(true) { continuation.resume() } }
+        player.replaceCurrentItem(with: nil)
+        NotificationCenter.default.removeObserver(observer)
+        signal.close()
+        await origin.close()
+        return progressed && failure == nil
+    }
+
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }
     private func until(registry: ControlTaskRegistry, _ predicate: @MainActor () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(20)
@@ -109,6 +202,22 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         XCTAssertNil(registry.outputResourceContextSnapshot())
         if let failure { throw failure }
     }
+}
+
+private enum NativeEndpointControl: String, CaseIterable {
+    case defaultEnd, beforePreroll, afterPreroll
+}
+
+private final class NativeEndpointControlSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failure: (String, Int)?
+    private var closed = false
+    func fail(domain: String, code: Int) {
+        lock.withLock { if !closed, failure == nil { failure = (String(domain.prefix(96)), code) } }
+    }
+    var hasFailure: Bool { lock.withLock { failure != nil } }
+    var snapshot: (String, Int)? { lock.withLock { failure } }
+    func close() { lock.withLock { closed = true } }
 }
 
 private extension PlaybackPresentation {

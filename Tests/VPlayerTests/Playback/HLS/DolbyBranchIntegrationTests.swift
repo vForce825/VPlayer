@@ -147,6 +147,64 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         XCTAssertEqual(ledger.chargedBytes, baseline)
     }
 
+    func testNativeAC3NormalFlushPreservesEmittedSideLayoutRejection() async throws {
+        let backFixture = try await DolbyBranchFixture.ac3()
+        let sideFixture = DolbyBranchFixture(codec: .ac3, frames: backFixture.frames, channelMask: 0x60F)
+        try await assertNormalNativeFlush(fixture: sideFixture)
+    }
+
+    func testNativeEAC3NormalFlushPreservesEmittedSideLayoutRejection() async throws {
+        try await assertNormalNativeFlush(fixture: .eac3())
+    }
+
+    private func assertNormalNativeFlush(fixture: DolbyBranchFixture) async throws {
+        // Thirty-four complete AUs cross the first ordinary 32-AU boundary.
+        // The existing native tests finish a short stream or force rollover;
+        // neither exercises a successful flush that reentrantly rejects init.
+        let graph = try DolbyBranchTestGraph(fixture: fixture, accessUnits: 34,
+            retainsAliases: false, usesNativeWriter: true)
+        defer { graph.timeline.retireCompressedGeneration() }
+        let terminal: SegmentedFMP4WriterTerminalReceipt
+        var completedSourceFrames = 0
+        var finishStarted = false
+        do {
+            for frame in graph.frames {
+                try await graph.branch.append(frame)
+                completedSourceFrames += 1
+            }
+            finishStarted = true
+            terminal = try await graph.branch.finish()
+        } catch SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired {
+            await graph.branch.cancelAndAwait()
+            XCTAssertFalse(finishStarted, "A finish-only rejection does not exercise the ordinary flush guard")
+            // AC3 rejects source frame 33. EAC3 collects the first five members
+            // of AU 33, then its sixth member reaches the same normal boundary.
+            XCTAssertEqual(completedSourceFrames, 33 * fixture.frames.count - 1)
+            let failed = try XCTUnwrap(graph.branch.writer?.terminalReceipt)
+            XCTAssertEqual(failed.inputCount, 32)
+            XCTAssertEqual(failed.terminalReason, .failed)
+            // Only the real emitted codec/configuration with absent layout can
+            // satisfy this rejection. Generic failure or source corruption fails.
+            try assertMissingNativeLayoutWasRejected(graph, fixture: fixture)
+            return
+        } catch {
+            await graph.branch.cancelAndAwait()
+            throw error
+        }
+        await graph.branch.cancelAndAwait()
+        XCTAssertEqual(terminal.terminalReason, .finished)
+        XCTAssertEqual(terminal.inputCount, 34)
+        XCTAssertEqual(graph.branch.physicalWriterCount, 1)
+        XCTAssertEqual(graph.factory.continuationCount, 0)
+        try graph.factory.checkCallbackFailures()
+        XCTAssertEqual(graph.factory.initializations.count, 1)
+        XCTAssertGreaterThanOrEqual(graph.factory.mediaCount, 2)
+        let evidence = try DolbyWriterInitializationEvidence.validate(
+            XCTUnwrap(graph.factory.initializations.first),
+            configuration: XCTUnwrap(graph.branch.configuration), sourceLayout: fixture.source.channelLayout)
+        XCTAssertEqual(evidence.channelPositions, 0x60F)
+    }
+
     func testNativeEAC3BranchPublishesValidatedSideLayoutOrRejectsMissingLayout() async throws {
         let fixture = try DolbyBranchFixture.eac3()
         let graph = try DolbyBranchTestGraph(fixture: fixture, accessUnits: 4,

@@ -160,6 +160,14 @@ class AcceptanceControls(unittest.TestCase):
         self.rejected(lambda r:r.update(wall_seconds=300.001),'300')
         self.rejected(lambda r:r.update(wall_seconds=20,media_seconds=300),'wall')
 
+    def test_round15_actual_long_and_catchup_sample_gaps_remain_rejected(self):
+        value=report()
+        value['samples'][1]['wall_seconds']=5.006491958
+        value['samples'][2]['wall_seconds']=12.554566292
+        value['samples'][3]['wall_seconds']=15.002680625
+        with self.assertRaisesRegex(ValueError,'invalid native sample interval'):
+            self.module.validate_measurement(value)
+
     def test_samples_and_baseline_order_are_mandatory(self):
         self.rejected(lambda r:r.update(samples=r['samples'][::2]),'sample')
         self.rejected(lambda r:r.update(started_unix=1200),'before')
@@ -302,18 +310,33 @@ class AcceptanceSamplerSourceContract(unittest.TestCase):
         self.source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/PersistentHLSAcceptanceTests.swift').read_text()
 
     def test_sampler_captures_weak_values_instead_of_mutable_optional_boxes(self):
-        declaration=next(line.strip() for line in self.source.splitlines()
-                         if line.strip().startswith('let sampler = Task'))
-        self.assertEqual(declaration,'let sampler = Task { @MainActor [weak graph, weak authority] in')
-        self.assertTrue('guard let graph, authority != nil else {' in self.source,
+        self.assertIn('let sampler = AcceptanceIndependentSampler(',self.source)
+        self.assertIn('observe: { [weak graph, weak authority] wall in',self.source)
+        self.assertNotIn('let sampler = Task { @MainActor',self.source)
+        self.assertTrue('guard let graph, let authority else {' in self.source,
                         'Active sampling must reject unexpectedly missing graph owners')
+
+    def test_sampler_uses_real_queue_observations_with_bounded_retention(self):
+        support=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        self.assertIn('final class AcceptanceIndependentSampler:',support)
+        sampler=support.split('final class AcceptanceIndependentSampler:',1)[1].split('/// Keep a valid UTF-8 tail',1)[0]
+        for expected in ['DispatchSource.makeTimerSource(queue: queue)',
+                         'let observedAt = AcceptanceClock.now',
+                         'value["wall_seconds"] = observedAt - start',
+                         'value["sample_read_seconds"] = AcceptanceClock.now - observedAt',
+                         'guard observations < 61', 'await withCheckedContinuation',
+                         'observe = nil', 'queue.async']:
+            self.assertIn(expected,sampler)
+        self.assertNotIn('@MainActor',sampler)
+        self.assertNotIn('Task.detached',sampler)
 
     def test_sampler_is_physically_joined_before_both_root_release_paths(self):
         cleanups=self.source.split('let cleanupStart = AcceptanceClock.now')[1:]
         self.assertEqual(len(cleanups),2)
         for cleanup in cleanups:
             cancelled=cleanup.index('sampler.cancel()')
-            joined=cleanup.index('await sampler.value')
+            self.assertIn('await sampler.join()',cleanup)
+            joined=cleanup.index('await sampler.join()')
             self.assertLess(cancelled,joined)
             for root in ['assembler','graph','authority']:
                 self.assertLess(joined,cleanup.index(f'{root} = nil'))

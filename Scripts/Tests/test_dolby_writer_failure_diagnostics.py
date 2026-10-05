@@ -28,7 +28,7 @@ class DolbyWriterFailureDiagnosticTests(unittest.TestCase):
         for stage in ['callback.writerIdentity', 'callback.type', 'callback.pending',
                       'callback.provenance', 'callback.fragmentSequence',
                       'callback.publication', 'callback.discarded', 'callback.relay',
-                      'callback.seal', 'flush.state', 'compressed.sampleBuffer']:
+                      'callback.seal', 'compressed.sampleBuffer']:
             self.assertTrue(f'diagnosedSystemFailure("{stage}"' in WRITER, stage)
         callback = WRITER.split('func receiveSystemSegment(', 2)[2].split(
             'func makeAACEffectiveEndpointReceipt(', 1)[0]
@@ -36,6 +36,15 @@ class DolbyWriterFailureDiagnosticTests(unittest.TestCase):
         self.assertIn('cadenceIsValid', callback)
         self.assertIn('actual.sequence == expected.partialValue', callback)
         self.assertIn('try segmentEvidence.retireVerified(', callback)
+
+    def test_successful_flush_preserves_the_reentrant_callback_failure(self):
+        body = WRITER.split('private func flushIfRequiredIsolated(', 1)[1].split(
+            'private func discardUnusedFlushAdmissionIsolated(', 1)[0]
+        state_guard = body.split('guard state == .started else', 1)[1].split('}', 1)[0]
+        self.assertTrue('throw systemFailureIsolated("flush.state")' in state_guard,
+                        'successful native flush can still synchronously retire the outer writer')
+        self.assertNotIn('diagnosedSystemFailure', state_guard,
+                         'never overwrite an already validated layout rejection with a new generic failure')
 
     def test_first_error_priority_is_unchanged(self):
         helper = WRITER.split('private func systemFailureIsolated(', 1)[1].split('\n    }', 1)[0]

@@ -97,34 +97,27 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let cpuStart = try processCPUSeconds()
         // The one299.5-second source/player deadline starts BEFORE prebuffer.
         let watchdog = AcceptancePlaybackDeadline(player: player, server: server, start: start)
-        // Capture weak values, never the caller's mutable optional boxes. Parent
-        // roots stay alive until cancel + join; the task handle owns no graph.
-        let sampler = Task { @MainActor [weak graph, weak authority] in
-            do {
-                var nextSample = 0.0
-                while !watchdog.hasStopped && !Task.isCancelled {
-                    let wall = AcceptanceClock.now - start
-                    if wall >= nextSample && nextSample < 300 {
-                        guard let graph, authority != nil else {
-                            throw AcceptanceError.invalid("active sampler lost graph ownership")
-                        }
-                        var sample = AcceptanceReport.sample(wall: wall, footprint: try nativeFootprint(),
-                            packets: graph.packetCount, eof: graph.hasEOF,
-                            packetAge: max(0, AcceptanceClock.now - graph.lastPacketTime))
-                        #if !HLS_ACCEPTANCE_BASELINE
-                        let value = probe.snapshot
-                        guard value.isComplete else { throw AcceptanceError.invalid("native diagnostic capacity exceeded") }
-                        sample.merge(diagnosticFields(value)) { _, new in new }
-                        sample.merge(try ledgerSample(authority!)) { _, new in new }
-                        #endif
-                        collector.append(sample)
-                        nextSample += 5
-                    }
-                    try await Task.sleep(for: .milliseconds(20))
+        // Freeze weak values, not mutable optional boxes. All reads below use
+        // existing synchronized observations; no player/actor API is read here.
+        let sampler = AcceptanceIndependentSampler(start: start, collector: collector,
+            shouldStop: { watchdog.hasStopped }, observe: { [weak graph, weak authority] wall in
+                guard let graph, let authority else {
+                    throw AcceptanceError.invalid("active sampler lost graph ownership")
                 }
-            } catch is CancellationError { }
-            catch { firstFailure.record(ErrorDiagnosticSnapshot(error), origin: "sampler"); collector.fail(error); watchdog.stop() }
-        }
+                var sample = AcceptanceReport.sample(wall: wall, footprint: try Self.nativeFootprint(),
+                    packets: graph.packetCount, eof: graph.hasEOF,
+                    packetAge: max(0, AcceptanceClock.now - graph.lastPacketTime))
+                #if !HLS_ACCEPTANCE_BASELINE
+                let value = probe.snapshot
+                guard value.isComplete else { throw AcceptanceError.invalid("native diagnostic capacity exceeded") }
+                sample.merge(Self.diagnosticFields(value)) { _, new in new }
+                sample.merge(try Self.ledgerSample(authority)) { _, new in new }
+                #endif
+                return sample
+            }, onFailure: { error in
+                firstFailure.record(ErrorDiagnosticSnapshot(error), origin: "sampler")
+                watchdog.stop()
+            })
         defer { sampler.cancel(); watchdog.stop() }
         var report: [String: Any] = [:]
         var stopObservation: [String: Any] = [:]
@@ -173,6 +166,8 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(20))
             }
             stage = "post_stop_observations"
+            sampler.cancel()
+            await sampler.join()
             let samples = try collector.snapshot()
             let measured = try XCTUnwrap(watchdog.measuredSeconds)
             XCTAssertGreaterThanOrEqual(measured, 299)
@@ -199,7 +194,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             player.replaceCurrentItem(with: nil)
             item = nil
             sampler.cancel()
-            await sampler.value
+            await sampler.join()
             let retired = await assembler!.retireAndAwaitReceipt()
             XCTAssertTrue(retired)
             retiredGraphDiagnostics = graphDiagnostics(assembler: assembler, graph: graph)
@@ -293,7 +288,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             watchdog.stop()
             player.replaceCurrentItem(with: nil)
             sampler.cancel()
-            await sampler.value
+            await sampler.join()
             let retired = if let assembler { await assembler.retireAndAwaitReceipt() }
                 else { stopObservation["cleanup_joined"] as? Bool ?? false }
             assembler = nil
@@ -359,7 +354,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
             Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
     }
-    private func nativeFootprint() throws -> UInt64 {
+    private nonisolated static func nativeFootprint() throws -> UInt64 {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride)
         let result = withUnsafeMutablePointer(to: &info) { pointer in
@@ -379,7 +374,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "resource_hard_bytes":PlaybackResourceContextLedger.hardBytes,
                 "store_observation":"body_subtotal_excludes_metadata"]
     }
-    private func ledgerSample(_ authority: SystemHLSMediaGraphAuthority) throws -> [String: Any] {
+    private nonisolated static func ledgerSample(_ authority: SystemHLSMediaGraphAuthority) throws -> [String: Any] {
         let publication = authority.publicationForTesting
         // Existing graph -> store lock ordering. No object/lease escapes the read.
         let usage = try publication.withActivePublication { publication.store?.usage }
@@ -388,7 +383,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "store_body_bytes":(usage?.residentBytes ?? 0) + (usage?.reservedBytes ?? 0),
                 "store_should_backpressure":usage?.shouldBackpressure ?? false]
     }
-    private func diagnosticFields(_ value: HLSWriterAcceptanceSnapshot) -> [String: Any] {
+    private nonisolated static func diagnosticFields(_ value: HLSWriterAcceptanceSnapshot) -> [String: Any] {
         ["live_inputs":value.liveInputCount,"live_bytes":value.liveInputBytes,"evidence":value.evidenceCount,
          "callbacks":value.pendingCallbacks,"hard_inputs":value.hardInputCount,"hard_bytes":value.hardInputBytes,
          "hard_evidence":value.hardEvidenceCount,"hard_callbacks":value.hardCallbackCount,
