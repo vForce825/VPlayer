@@ -7,6 +7,7 @@ import CoreMedia
 import CryptoKit
 import Darwin
 import Foundation
+import Synchronization
 import UniformTypeIdentifiers
 import VPlayerCore
 
@@ -266,8 +267,8 @@ extension SegmentedFMP4SystemWriting {
     var failureDiagnostic: ErrorDiagnosticSnapshot? { nil }
 }
 
-/// Synchronous admission belongs only to inspection adapters. Native receivers have
-/// no readiness query; their append must suspend rather than guess or drop a sample.
+/// Synchronous admission belongs only to inspection adapters. Native admission
+/// must retain and await the same sample when the receiver declines readiness.
 protocol SegmentedFMP4SynchronousSystemWriting: SegmentedFMP4SystemWriting {
     var isReadyForMoreMediaData: Bool { get }
     func append(_ sampleBuffer: CMSampleBuffer) -> Bool
@@ -601,12 +602,79 @@ func nativeSamplePayloadDigest(_ block: CMBlockBuffer) throws -> Data {
     }
 }
 
+/// One inline gate serializes native calls; it never owns a sample, waiter, or task.
+/// Callbacks may enter the outer writer lane, so they must not acquire this gate:
+/// failure diagnostics use separate storage and callback retirement is queued.
+struct SegmentedFMP4NativeWriterCalls: ~Copyable, Sendable {
+    private enum State { case configured, writing, inputFinished, finishing, cancelled }
+    private let state = Mutex(State.configured)
+
+    init() {}
+
+    func start(_ body: () -> Bool) -> Bool {
+        state.withLock {
+            guard $0 == .configured, body() else { return false }
+            $0 = .writing
+            return true
+        }
+    }
+
+    func appendAwaitingReadiness(_ appendImmediately: () throws -> Bool) async throws {
+        while true {
+            let appended = try state.withLock {
+                try Task.checkCancellation()
+                guard $0 == .writing else { throw CancellationError() }
+                return try appendImmediately()
+            }
+            try Task.checkCancellation()
+            if appended { return }
+            // The receiver documents false as not-ready. Keep the one admitted
+            // sample on this existing task; no lock/native call spans suspension.
+            // This cancellable delay only paces retries, never proves retirement.
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+
+    func flush(_ body: () -> Bool) -> Bool {
+        state.withLock { $0 == .writing && body() }
+    }
+
+    func finishInput(_ body: () -> Void) {
+        state.withLock {
+            guard $0 == .writing else { return }
+            $0 = .inputFinished
+            body()
+        }
+    }
+
+    func finishWriting(_ body: () -> Void) -> Bool {
+        state.withLock {
+            guard $0 == .inputFinished else { return false }
+            $0 = .finishing
+            body()
+            return true
+        }
+    }
+
+    func cancel(_ body: () -> Void) {
+        state.withLock {
+            guard $0 != .cancelled else { return }
+            $0 = .cancelled
+            // The synchronous native append has returned before this can enter.
+            // No new append can cross this fence, even if its task starts late.
+            body()
+        }
+    }
+}
+
 private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting, @unchecked Sendable {
     private let writer: AVAssetWriter
     private let receiver: AVAssetWriterInput.SampleBufferReceiver
     private let segmentDelegate: AVAssetSegmentDelegate
-    private let failureLock = NSLock()
-    private var startFailureDiagnostic: ErrorDiagnosticSnapshot?
+    private let calls = SegmentedFMP4NativeWriterCalls()
+    // Both mutexes are inline; adding the native fence creates no lock owner or
+    // per-input allocation. Diagnostics never take the native-call mutex.
+    private let startFailureDiagnostic = Mutex<ErrorDiagnosticSnapshot?>(nil)
 
     init(
         configuration: SegmentedFMP4SystemConfiguration,
@@ -662,45 +730,52 @@ private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting
 
     var objectIdentity: ObjectIdentifier { ObjectIdentifier(writer) }
     var failureDiagnostic: ErrorDiagnosticSnapshot? {
-        failureLock.withLock { startFailureDiagnostic }
+        startFailureDiagnostic.withLock { $0 }
             ?? writer.error.map { PlaybackErrorDiagnostics.snapshot($0) }
     }
 
     func startWriting(at sourceTime: CMTime) -> Bool {
-        do { try writer.start() }
-        catch {
-            failureLock.withLock {
-                if startFailureDiagnostic == nil {
-                    startFailureDiagnostic = PlaybackErrorDiagnostics.snapshot(error)
+        calls.start {
+            do { try writer.start() }
+            catch {
+                startFailureDiagnostic.withLock {
+                    if $0 == nil { $0 = PlaybackErrorDiagnostics.snapshot(error) }
                 }
+                return false
             }
-            return false
+            writer.startSession(atSourceTime: sourceTime)
+            return true
         }
-        writer.startSession(atSourceTime: sourceTime)
-        return true
     }
 
     func appendAwaitingReadiness(
         _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
     ) async throws {
-        try await receiver.append(sampleBuffer)
+        // An async receiver append can still be executing after Task.cancel().
+        // cancelWriting must never overlap that native call or a late entry.
+        try await calls.appendAwaitingReadiness { try receiver.appendImmediately(sampleBuffer) }
     }
 
     func flushSegment() -> Bool {
-        writer.flushSegment()
-        return writer.status == .writing && writer.error == nil
-    }
-
-    func markInputAsFinished() { receiver.finish() }
-
-    func finishWriting(_ completion: @escaping @Sendable (Bool) -> Void) {
-        writer.finishWriting { [weak self] in
-            guard let self else { return }
-            completion(self.writer.status == .completed && self.writer.error == nil)
+        calls.flush {
+            writer.flushSegment()
+            return writer.status == .writing && writer.error == nil
         }
     }
 
-    func cancelWriting() { writer.cancelWriting() }
+    func markInputAsFinished() { calls.finishInput { receiver.finish() } }
+
+    func finishWriting(_ completion: @escaping @Sendable (Bool) -> Void) {
+        let began = calls.finishWriting {
+            writer.finishWriting { [weak self] in
+                guard let self else { return }
+                completion(self.writer.status == .completed && self.writer.error == nil)
+            }
+        }
+        if !began { completion(false) }
+    }
+
+    func cancelWriting() { calls.cancel { writer.cancelWriting() } }
 }
 
 final class FMP4InputOwnership: @unchecked Sendable {

@@ -58,7 +58,7 @@ final class HLSProxyBackpressureTests: XCTestCase {
         let transfer = try budget.admitTransfer()
         let remaining = HLSProxyBudget.domainBytes - budget.usage.bytes
         let occupied = try budget.reserve(bytes: remaining - 2 * HLSProxyBudget.transferBufferBytes + 1)
-        withExtendedLifetime((transfer, occupied)) {
+        try withExtendedLifetime((transfer, occupied)) {
             let before = budget.usage.bytes
             XCTAssertThrowsError(try transfer.reserveBodyEnvelope(responseLength: nil))
             XCTAssertEqual(budget.usage.bytes, before)

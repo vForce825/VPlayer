@@ -13,6 +13,128 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testNativeCallSerializationRetriesTheSameNotReadyAdmission() async throws {
+        let harness = Task17NativeCallHarness()
+        XCTAssertTrue(harness.calls.start { true })
+        try await harness.calls.appendAwaitingReadiness {
+            harness.record("append")
+            return harness.events.count == 2
+        }
+        XCTAssertEqual(harness.events, ["append", "append"])
+        let instants = harness.instants
+        XCTAssertEqual(instants.count, 2)
+        if instants.count == 2 {
+            XCTAssertGreaterThanOrEqual(instants[0].duration(to: instants[1]), .milliseconds(2),
+                "Not-ready retries must be paced rather than busy-spinning")
+        }
+        harness.calls.cancel { harness.record("cancel") }
+        XCTAssertEqual(harness.events, ["append", "append", "cancel"])
+    }
+
+    func testNativeCallSerializationCancellationAfterNotReadyNeverRetries() async throws {
+        let harness = Task17NativeCallHarness()
+        XCTAssertTrue(harness.calls.start { true })
+        let append = Task.detached {
+            try await harness.calls.appendAwaitingReadiness {
+                harness.record("notReady")
+                withUnsafeCurrentTask { $0?.cancel() }
+                return false
+            }
+        }
+        do { try await append.value; XCTFail("Cancellation must leave the readiness wait") }
+        catch is CancellationError {}
+        XCTAssertEqual(harness.events, ["notReady"])
+        harness.calls.cancel { harness.record("cancel") }
+        XCTAssertEqual(harness.events, ["notReady", "cancel"])
+    }
+
+    func testNativeCallSerializationNeverReadyAdmissionStopsOnExternalCancellation() async {
+        let harness = Task17NativeCallHarness()
+        XCTAssertTrue(harness.calls.start { true })
+        let retried = expectation(description: "Not-ready admission reached a paced retry")
+        let completed = expectation(description: "Externally canceled readiness operation returned")
+        let attempts = Task17LockedCounter()
+        let append = Task.detached {
+            defer { completed.fulfill() }
+            do {
+                try await harness.calls.appendAwaitingReadiness {
+                    attempts.increment()
+                    if attempts.value == 2 { retried.fulfill() }
+                    return false
+                }
+                XCTFail("Never-ready admission cannot succeed")
+            } catch is CancellationError {
+            } catch { XCTFail("Unexpected readiness failure: \(error)") }
+        }
+        await fulfillment(of: [retried], timeout: 2)
+        append.cancel()
+        // Bound the observation instead of awaiting task.value indefinitely if
+        // cancellation ever stops waking the readiness operation.
+        await fulfillment(of: [completed], timeout: 2)
+        harness.calls.cancel {}
+    }
+
+    func testNativeCallSerializationJoinsEnteredAppendBeforeCancel() async throws {
+        let harness = Task17NativeCallHarness()
+        XCTAssertTrue(harness.calls.start { true })
+        let entered = expectation(description: "Synchronous native append entered")
+        let cancellationRequested = expectation(description: "Cancellation requested while append is entered")
+        let release = DispatchSemaphore(value: 0)
+        let append = Task.detached {
+            try await harness.calls.appendAwaitingReadiness {
+                harness.record("appendEntered")
+                entered.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                harness.record("appendReturned")
+                return true
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        let cancellation = Task.detached {
+            append.cancel()
+            cancellationRequested.fulfill()
+            harness.calls.cancel { harness.record("cancel") }
+        }
+        await fulfillment(of: [cancellationRequested], timeout: 2)
+        XCTAssertEqual(harness.events, ["appendEntered"])
+        release.signal()
+        await cancellation.value
+        do { try await append.value; XCTFail("A late native success cannot restore cancellation authority") }
+        catch is CancellationError {}
+        XCTAssertEqual(harness.events, ["appendEntered", "appendReturned", "cancel"])
+    }
+
+    func testNativeCallSerializationOrdersStartFlushFinishAndClosesAdmission() async throws {
+        let harness = Task17NativeCallHarness()
+        XCTAssertTrue(harness.calls.start { harness.record("start"); return true })
+        XCTAssertFalse(harness.calls.start { XCTFail("Native start must run only once"); return true })
+        try await harness.calls.appendAwaitingReadiness { harness.record("append"); return true }
+        XCTAssertTrue(harness.calls.flush { harness.record("flush"); return true })
+        harness.calls.finishInput { harness.record("finishInput") }
+        harness.calls.finishInput { XCTFail("Input finish must run only once") }
+        XCTAssertTrue(harness.calls.finishWriting { harness.record("finishWriting") })
+        XCTAssertFalse(harness.calls.finishWriting { XCTFail("Native finish must run only once") })
+        XCTAssertFalse(harness.calls.flush { XCTFail("Finished input cannot flush"); return true })
+        do {
+            try await harness.calls.appendAwaitingReadiness { XCTFail("Finished input cannot append"); return true }
+            XCTFail("Closed native input must reject append")
+        } catch is CancellationError {}
+        harness.calls.cancel { harness.record("cancel") }
+        harness.calls.cancel { XCTFail("Native cancellation must run only once") }
+        XCTAssertEqual(harness.events, ["start", "append", "flush", "finishInput", "finishWriting", "cancel"])
+    }
+
+    func testNativeCallSerializationPreservesTheOriginalAppendError() async throws {
+        let harness = Task17NativeCallHarness()
+        let original = NSError(domain: "Writer.Native.FirstFailure", code: -207)
+        XCTAssertTrue(harness.calls.start { true })
+        do {
+            try await harness.calls.appendAwaitingReadiness { throw original }
+            XCTFail("Native failure must propagate")
+        } catch { XCTAssertEqual(error as NSError, original) }
+        harness.calls.cancel {}
+    }
+
     func testAACFixtureEpochCopiesAndSlicesPreserveRecordedOutputTiming() throws {
         let explicit = try Task17Fixtures.aacEpoch(bufferCount: 3)
         let calculated = try Task17Fixtures.aacEpoch(
@@ -5230,6 +5352,24 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             "The real successor must emit its configured sequence in untouched native bytes")
     }
 
+    func testNativeWriterRejectsAppendAfterCancellationWithoutEnteringReceiver() async throws {
+        let fixture = try Task17Fixtures.realH264Sample()
+        let sink = Task17NativeFragmentCollector()
+        let writer = try AVAssetSegmentedFMP4SystemWriterFactory().makeWriter(configuration: .init(
+            contentTypeIdentifier: UTType.mpeg4Movie.identifier,
+            outputFileTypeProfile: AVFileTypeProfile.mpeg4AppleHLS.rawValue,
+            preferredOutputSegmentInterval: .indefinite, mediaType: .video,
+            outputSettingsAreNil: true, sourceFormatHintIdentity: ObjectIdentifier(fixture.format), inputCount: 1),
+            sourceFormatHint: fixture.format, callbackSink: sink)
+        XCTAssertTrue(writer.startWriting(at: .zero))
+        writer.cancelWriting()
+        do {
+            try await writer.appendAwaitingReadiness(makeReadyWriterFixtureSample(copying: fixture.sample))
+            XCTFail("Retired native writer must reject admission before entering its receiver")
+        } catch is CancellationError {}
+        XCTAssertTrue(sink.media.isEmpty)
+    }
+
     func testNativeFlushThenFinishDoesNotEmitEmptySuccessorFragment() async throws {
         let fixture = try Task17Fixtures.realH264Sample()
         let sink = Task17NativeFragmentCollector()
@@ -8729,6 +8869,19 @@ private enum Task17SystemFailurePoint: Equatable {
     case append
     case flush
     case finish
+}
+
+/// Exercises the exact native adapter call gate without replacing writer tickets or ownership.
+private final class Task17NativeCallHarness: @unchecked Sendable {
+    let calls = SegmentedFMP4NativeWriterCalls()
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    private var recordedInstants: [ContinuousClock.Instant] = []
+    var events: [String] { lock.withLock { recorded } }
+    var instants: [ContinuousClock.Instant] { lock.withLock { recordedInstants } }
+    func record(_ event: String) {
+        lock.withLock { recorded.append(event); recordedInstants.append(.now) }
+    }
 }
 
 private enum Task17SystemCall: Equatable {

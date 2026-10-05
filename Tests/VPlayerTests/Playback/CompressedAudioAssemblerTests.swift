@@ -39,18 +39,36 @@ final class CompressedAudioAssemblerTests: XCTestCase {
 
     func testAC3WriterFixtureReleasesCoordinatorAndApplicationChargeAfterScope() throws {
         let ledger = PlaybackApplicationChargeLedger.shared
-        let baseline = ledger.chargedBytes
+        // Keep the sampled allocation identities charged while unrelated native
+        // owners from earlier tests finish. These aliases add no new charge and
+        // cannot hide a leaked allocation belonging to this fixture.
+        let baseline = try ledger.retainCurrentAllocationsForTesting()
+        defer {
+            baseline.reservations.forEach(ledger.release)
+            XCTAssertEqual(ledger.snapshot(ownedBy: baseline.reservations).registeredReservationCount, 0)
+        }
+        let retainedBaseline = ledger.snapshot(ownedBy: baseline.reservations)
+        XCTAssertTrue(retainedBaseline.allReservationsRegistered)
+        XCTAssertEqual(retainedBaseline.chargedBytes + ledger.fixedBookkeepingChargeBytes,
+                       baseline.chargedBytes)
         weak var releasedHarness: Task17AC3Harness?
         weak var releasedCoordinator: AudioServiceSemanticCoordinator?
+        weak var releasedEscrow: AudioServiceApplicationEscrow?
         do {
             let harness = try Task17AC3Harness(seed: 94_001)
             releasedHarness = harness
             releasedCoordinator = harness.coordinator
+            releasedEscrow = try XCTUnwrap(harness.coordinator.audioServiceLeaseState.applicationEscrow)
             _ = try harness.makeAccessUnit(presentationTimeStamp: .zero)
+            XCTAssertEqual(ledger.chargedBytes,
+                           baseline.chargedBytes + AudioServiceLeaseState.maximumRetainedStructureChargeBytes,
+                           "The real coordinator must own its exact prepaid application charge")
         }
         XCTAssertNil(releasedHarness, "parser 脚本不能在 fixture scope 结束后保留 harness")
         XCTAssertNil(releasedCoordinator, "scope 结束后应释放 coordinator 及其固定预付额度")
-        XCTAssertEqual(ledger.chargedBytes, baseline, "下一测试必须可以复用 application 容量")
+        XCTAssertNil(releasedEscrow, "The fixture's charged escrow must be released, not offset by another owner")
+        XCTAssertEqual(ledger.snapshot(ownedBy: baseline.reservations), retainedBaseline)
+        XCTAssertEqual(ledger.chargedBytes, baseline.chargedBytes, "下一测试必须可以复用 application 容量")
     }
 
     func testGenerationRebindDropsLateAudioParserCallbackAndRebuildsAtNextPush() throws {
