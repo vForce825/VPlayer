@@ -35,7 +35,13 @@ class FixtureToolchainContracts(unittest.TestCase):
 if [ "$1" = --prefix ]; then echo "$MOCK_ROOT/brew/$2"; else
  printf 'pkgconf2.5.1\\nx2640.164\\nx2654.1\\nnasm2.16\\n'; fi
 ''')
-        self.command('clang','#!/bin/sh\necho "mock compiler, never native proof"\n')
+        self.command('clang','''#!/usr/bin/env python3
+import os,sys
+if '--version' in sys.argv:print('mock compiler, never native proof');raise SystemExit()
+if os.environ.get('MOCK_REQUIRE_HOST_SDK'):
+ if ['-isysroot','/MockMacOS.sdk'] != sys.argv[1:3]:
+  print('synthetic host probe: ctype.h not found without macOS SDK',file=sys.stderr);raise SystemExit(1)
+''')
         self.command('xcrun','''#!/bin/sh
 case "$*" in *--find*) echo "$MOCK_ROOT/tools/clang";; *) echo /MockMacOS.sdk;; esac
 ''')
@@ -57,8 +63,22 @@ if 'install' in sys.argv:
  for tool in ('ffmpeg','ffprobe'):
   path=root/tool;path.write_text('#!/bin/sh\\nprintf "%s\\\\n" "'+tool+' version n8.1.2 fixture-contract-stub"\\n');path.chmod(0o755)
 ''')
-        configure=b'''#!/bin/sh
-for arg do case "$arg" in --prefix=*) printf '%s\\n' "${arg#--prefix=}" > prefix.txt;; esac; done
+        configure=b'''#!/usr/bin/env python3
+import os,pathlib,shlex,subprocess,sys
+args=dict(arg[2:].split('=',1) for arg in sys.argv[1:] if arg.startswith('--') and '=' in arg)
+pathlib.Path('prefix.txt').write_text(args['prefix'])
+if os.environ.get('MOCK_CONFIGURE_FAIL'):
+ if not os.environ.get('MOCK_CONFIGURE_NO_LOG'):
+  pathlib.Path('ffbuild').mkdir()
+  pathlib.Path('ffbuild/config.log').write_text('old unrelated configure entry\\n'*4000+
+   'mock-host-clang -std=c11 -isysroot /MockMacOS.sdk host-check.c\\n'+
+   'fatal error: synthetic ctype.h unavailable\\n')
+ print('Host compiler lacks C11 support',file=sys.stderr)
+ raise SystemExit(int(os.environ['MOCK_CONFIGURE_FAIL']))
+if os.environ.get('MOCK_REQUIRE_HOST_SDK'):
+ compiler=args.get('host-cc',args['cc'])
+ result=subprocess.run([compiler,*shlex.split(args.get('host-cflags','')),'-std=c11','-c','host-check.c'])
+ if result.returncode:raise SystemExit('Host compiler lacks C11 support (synthetic configure contract)')
 '''
         with tarfile.open(self.root/'source.tar','w') as archive:
             item=tarfile.TarInfo('configure');item.size=len(configure);item.mode=0o755;archive.addfile(item,io.BytesIO(configure))
@@ -85,6 +105,35 @@ for arg do case "$arg" in --prefix=*) printf '%s\\n' "${arg#--prefix=}" > prefix
         (install/'bin/ffmpeg').write_text('#!/bin/sh\necho "ffmpeg version9.0.2"\n')
         with self.assertRaisesRegex(ValueError,'binary differs'):
             MODULE.verify(install/'bin/ffmpeg',install/'bin/ffprobe',self.repo/'Vendor/FFmpeg/ffmpeg.lock.json')
+
+    def test_host_c11_probe_uses_selected_macos_clang_and_sdk(self):
+        result=self.provision(MOCK_REQUIRE_HOST_SDK='1')
+        self.assertEqual(result.returncode,0,result.stderr)
+        environment=Path(result.stdout.strip())
+        manifest=json.loads((environment.parent/'install/fixture-toolchain.json').read_text())
+        arguments=manifest['configure_args']
+        self.assertIn('--host-cc='+str(self.tools/'clang'),arguments)
+        self.assertIn('--host-cflags=-isysroot /MockMacOS.sdk',arguments)
+        self.assertIn('--host-ldflags=-isysroot /MockMacOS.sdk',arguments)
+        self.assertIn('--sysroot=/MockMacOS.sdk',arguments)
+        self.assertNotIn('--disable-c11',arguments)
+
+    def test_failed_configure_reports_bounded_tail_and_preserves_original_status(self):
+        result=self.provision(MOCK_CONFIGURE_FAIL='37')
+        self.assertEqual(result.returncode,37,result.stderr)
+        self.assertIn('FIXTURE_CONFIGURE_FAILED status=37',result.stderr)
+        self.assertIn('fatal error: synthetic ctype.h unavailable',result.stderr)
+        self.assertIn('mock-host-clang -std=c11',result.stderr)
+        self.assertLess(len(result.stderr.encode()),24*1024)
+        self.assertLess(result.stderr.count('old unrelated configure entry'),100)
+        self.assertFalse((self.root/'github.env').exists())
+        self.assertFalse(list((self.root/'runner').glob('*/tools.env')))
+
+    def test_missing_configure_log_does_not_replace_failure_status(self):
+        result=self.provision(MOCK_CONFIGURE_FAIL='39',MOCK_CONFIGURE_NO_LOG='1')
+        self.assertEqual(result.returncode,39,result.stderr)
+        self.assertIn('FIXTURE_CONFIGURE_LOG unavailable',result.stderr)
+        self.assertFalse((self.root/'github.env').exists())
 
     def test_wrong_commit_fails_before_build(self):
         result=self.provision(MOCK_BAD_SHA='1');self.assertNotEqual(result.returncode,0)

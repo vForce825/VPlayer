@@ -56,7 +56,10 @@ x265_prefix="$(brew --prefix x265)"
 export PKG_CONFIG_PATH="$x264_prefix/lib/pkgconfig:$x265_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 cc="$(xcrun --sdk macosx --find clang)"
 sysroot="$(xcrun --sdk macosx --show-sdk-path)"
-flags=(--prefix="$prefix" --cc="$cc" --sysroot="$sysroot" --disable-autodetect \
+# FFmpeg's test_host_cc does not consume target CPPFLAGS/--sysroot. Select the
+# same macOS compiler and SDK explicitly for its separate host C11/link probes.
+flags=(--prefix="$prefix" --cc="$cc" --sysroot="$sysroot" \
+  --host-cc="$cc" --host-cflags="-isysroot $sysroot" --host-ldflags="-isysroot $sysroot" --disable-autodetect \
   --disable-network --disable-shared --enable-static --enable-gpl --enable-libx264 --enable-libx265 \
   --enable-ffmpeg --enable-ffprobe --disable-ffplay --disable-doc --disable-debug --pkg-config-flags=--static)
 printf '%s\n' "${flags[@]}" > "$root/configure-arguments.txt"
@@ -65,7 +68,31 @@ brew list --versions pkgconf x264 x265 nasm > "$root/homebrew-versions.txt"
 make --version > "$root/make-version.txt"
 (
   cd "$build"
-  "$source/configure" "${flags[@]}"
+  if "$source/configure" "${flags[@]}"; then
+    :
+  else
+    configure_status=$?
+    printf 'FIXTURE_CONFIGURE_FAILED status=%s compiler=%s sdk=%s\n' "$configure_status" "$cc" "$sysroot"
+    # Bounded public compiler diagnostics only. Preserve the configure status even
+    # if the log is absent or this diagnostic reader fails; never expose tools.
+    python3 - "$build/ffbuild/config.log" <<'PYCONFIGLOG' || true
+from pathlib import Path
+import sys
+path=Path(sys.argv[1])
+try:
+ with path.open('rb') as stream:
+  stream.seek(0,2);size=stream.tell();stream.seek(max(0,size-16384))
+  raw=stream.read(16384)
+ text=raw.decode('utf-8',errors='replace').encode('utf-8')[-12288:].decode('utf-8',errors='ignore')
+ for line in text.splitlines()[-80:]:
+  # Prefix every line, including compiler messages resembling workflow commands.
+  safe=''.join(character if character=='\t' or ord(character)>=32 else '?' for character in line)
+  print('FIXTURE_CONFIGURE_LOG '+safe)
+except OSError as error:
+ print('FIXTURE_CONFIGURE_LOG unavailable: '+str(error)[:512])
+PYCONFIGLOG
+    exit "$configure_status"
+  fi
   make -j "$(sysctl -n hw.ncpu)"
   make install
 ) >&2

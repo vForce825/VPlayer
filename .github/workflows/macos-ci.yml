@@ -44,7 +44,8 @@ jobs:
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
@@ -104,7 +105,8 @@ jobs:
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
@@ -190,7 +192,8 @@ jobs:
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
@@ -262,7 +265,8 @@ jobs:
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
@@ -337,7 +341,8 @@ jobs:
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
@@ -403,7 +408,8 @@ jobs:
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Validate exact-toolchain Debug and Release control artifacts
         timeout-minutes: 5

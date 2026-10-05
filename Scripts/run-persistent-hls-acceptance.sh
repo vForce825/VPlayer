@@ -34,7 +34,8 @@ else
   git diff --exit-code HEAD -- Sources Vendor ci_scripts
 fi
 [[ "$(uname -s)" == Darwin ]] || { echo 'Native acceptance requires Apple; portable controls do not replace it.' >&2; exit 1; }
-test "$(xcodebuild -version | head -n1)" = 'Xcode 27.0'
+xcode_version="$(xcodebuild -version)"
+test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
 test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = '27.0'
 ./Scripts/bootstrap.sh --check
 fixture=Tests/Fixtures/HLSAcceptance/persistent-360s.ts

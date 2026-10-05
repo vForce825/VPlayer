@@ -60,7 +60,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
-          test "$(xcodebuild -version | head -n1)" = 'Xcode 27.0'
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = '27.0'
       - name: Provision pinned host tools and prepare exact fixture inputs
         timeout-minutes: 40

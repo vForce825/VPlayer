@@ -6,11 +6,35 @@
 from pathlib import Path
 import fnmatch
 import json
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 ROOT=Path(__file__).resolve().parents[2]
 
 class WorkflowContracts(unittest.TestCase):
+    def test_xcode_version_checks_drain_output_and_preserve_producer_failure(self):
+        paths=list((ROOT/'.github/workflows').glob('*.yml'))
+        paths.append(ROOT/'Scripts/run-persistent-hls-acceptance.sh')
+        checks=[]
+        for path in paths:
+            text=path.read_text()
+            if 'xcodebuild -version' not in text: continue
+            self.assertNotRegex(text,r'xcodebuild -version\s*\|\s*head',path.name)
+            pairs=re.findall(r'(?m)^\s*(xcode_version="\$\(xcodebuild -version\)")\n\s*(test [^\n]+)',text)
+            self.assertTrue(pairs,path.name)
+            checks.extend('\n'.join(pair) for pair in pairs)
+        with tempfile.TemporaryDirectory() as temporary:
+            tool=Path(temporary)/'xcodebuild'
+            tool.write_text('#!/bin/sh\nprintf "Xcode %s\\nBuild version 27A123\\n" "${MOCK_XCODE_VERSION:-27.0}"\nexit "${MOCK_XCODE_STATUS:-0}"\n')
+            tool.chmod(0o755)
+            env={**os.environ,'PATH':temporary+os.pathsep+os.environ['PATH']}
+            for check in checks:
+                for extra,expected in [({},0),({'MOCK_XCODE_STATUS':'7'},7),({'MOCK_XCODE_VERSION':'26.0'},1)]:
+                    result=subprocess.run(['bash','-e','-o','pipefail','-c',check],env={**env,**extra},capture_output=True,text=True)
+                    self.assertEqual(result.returncode,expected,result.stderr)
+
     def test_six_full_gates_remain_independent_and_check_true_candidate(self):
         text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
         jobs=re.findall(r'^  ([a-z][a-z-]+):$',text.split('jobs:',1)[1],re.M)

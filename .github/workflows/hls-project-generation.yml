@@ -40,7 +40,8 @@ jobs:
         timeout-minutes: 50
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(xcodebuild -version | head -n1)" = 'Xcode 27.0'
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = '27.0'
           brew install mint jq ripgrep pkgconf x264 x265 nasm
           tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
