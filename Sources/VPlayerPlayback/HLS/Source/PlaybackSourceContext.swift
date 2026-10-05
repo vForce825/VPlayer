@@ -7,6 +7,7 @@ import Foundation
 public enum HLSSourceError: Error, Sendable, Equatable {
     case invalidURL, invalidHeader, unboundOwner, staleResolution, retired
     case network, unauthorized, deadline, byteLimit, graphLimit, redirectLimit
+    case httpStatus(Int)
     case malformedManifest, unsupportedMedia, incompleteEvidence, capacity
 }
 

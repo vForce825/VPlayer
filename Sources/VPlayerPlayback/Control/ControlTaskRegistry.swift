@@ -117,6 +117,19 @@ final class ControlTaskRegistry: @unchecked Sendable {
             replacementAuthority.lifecycle
         }
 
+        var sharedControlExecutor: PlaybackControlExecutor? { replacementAuthority.registry?.executor }
+
+        /// Registry -> source -> session is the only installation lock order.
+        /// The operation must contain just the synchronous SDK installation/CAS;
+        /// observer removal, callbacks and asynchronous work stay outside it.
+        func performCurrentPreparationMutation(_ operation: () throws -> Void) throws -> Bool {
+            try replacementAuthority.performPreparationMutation(ticket: ticket, operation)
+        }
+
+        func currentPreparationRoute() -> PlaybackRouteSemanticIdentity? {
+            replacementAuthority.preparationRoute(ticket: ticket)
+        }
+
         /// Preparation may continue while paused, but never after its original
         /// work command has been revoked, replaced or handed to cleanup.
         func revalidateCurrentPreparation() -> Bool {
@@ -175,6 +188,36 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     && registry.authority.matches(record.safetySnapshot)
                     && record.groupTicket == context.reservation.workGroup
             }) == true
+        }
+
+        fileprivate func performPreparationMutation(ticket: PrepareTicket, _ operation: () throws -> Void) throws -> Bool {
+            guard let registry else { return false }
+            return try registry.transaction(operationDescriptor: .prepareAdmission) { _ in
+                guard !self.consumed,
+                      case .installed(let context, let backend) = registry.authority.resourceState,
+                      backend.lifecycle == self.lifecycle, backend.identity == ticket.backendIdentity,
+                      context.prepareTicket == ticket, context.owner == nil,
+                      !context.poisoned, !context.teardownRequested,
+                      context.disposition == .retainForSession(context.sessionIdentity),
+                      let record = registry.authority.commands.first(where: {
+                          $0?.controlTaskTicket.nonce == self.sourceTaskNonce
+                      }) ?? nil, record.slot == .prepare, record.phase == .running,
+                      !record.resultInvalidated, registry.authority.matches(record.safetySnapshot),
+                      record.groupTicket == context.reservation.workGroup else { return false }
+                try operation()
+                return true
+            }
+        }
+
+        fileprivate func preparationRoute(ticket: PrepareTicket) -> PlaybackRouteSemanticIdentity? {
+            var route: PlaybackRouteSemanticIdentity?
+            _ = try? performPreparationMutation(ticket: ticket) {
+                guard let registry, let stable = registry.authority.stableRouteCommit,
+                      stable.epoch == ticket.stableRouteCommitEpoch,
+                      stable.authority.semanticIdentity?.backend == .hlsAVPlayer else { return }
+                route = stable.authority.semanticIdentity
+            }
+            return route
         }
 
         func ownsRetainedReplacementRetirement(_ epoch: OutputLifecycleEpoch) -> Bool {
@@ -4145,7 +4188,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     let channelName = input.request.title.isEmpty ? input.request.channelID : input.request.title
                     let backend = try await input.factory.makeBackend(kind: input.kind, identity: input.identity,
                         tuning: input.tuning, channelID: channelName, url: input.request.streamURL,
-                        eventSink: { [relay = input.relay] event in relay.send(event) })
+                        sourceContext: try input.request.sourceContext, eventSink: { [relay = input.relay] event in relay.send(event) })
                     result = try completeOutputFactory(ticket, candidate: backend) ? .succeeded : .canceled
                 case .prepare:
                     let candidate: (any PlaybackBackend)? = try transaction { _ in

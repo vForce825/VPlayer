@@ -491,9 +491,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     func testLatePublicationFixtureHasFifteenSecondEligibleTimeline() throws {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let server = try Task22BundledHTTPFixtureServer(fileURL: file)
+        defer { server.stop() }
         let recorder = DemuxEventRecorder()
         let demuxer = FFmpegDemuxer()
-        try demuxer.start(url: file, sink: recorder.record)
+        try demuxer.start(url: server.sourceURL, sink: recorder.record)
         defer { demuxer.cancel() }
         let events = recorder.waitForTerminal(timeout: 10)
         XCTAssertTrue(events.contains { if case .endOfStream = $0 { true } else { false } })

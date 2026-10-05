@@ -106,6 +106,9 @@ targets:
       - path: Tests/Fixtures/Video
         type: folder
         buildPhase: resources
+      - path: Tests/Fixtures/SourcePlanning
+        type: folder
+        buildPhase: resources
       - path: Tests/Fixtures/Images
         type: folder
         buildPhase: resources
@@ -133,6 +136,24 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.release-boundary-tests
+        GENERATE_INFOPLIST_FILE: true
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
+  VPlayerHLSAcceptanceTests:
+    type: bundle.unit-test
+    platform: tvOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests/VPlayerHLSAcceptanceTests
+      - path: Tests/Fixtures/HLSAcceptance
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerCore
+      - target: VPlayerPlayback
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.hls-acceptance-tests
         GENERATE_INFOPLIST_FILE: true
         TEST_HOST: ""
         BUNDLE_LOADER: ""
@@ -207,3 +228,18 @@ schemes:
       config: Release
     archive:
       config: Release
+  VPlayerHLSAcceptance:
+    build:
+      targets:
+        VPlayerCore: all
+        VPlayerPlayback: all
+        VPlayerHLSAcceptanceTests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: false
+      testPlans:
+        - path: VPlayerHLSAcceptance.xctestplan
+          defaultPlan: true
+      targets:
+        - name: VPlayerHLSAcceptanceTests
+          parallelizable: false

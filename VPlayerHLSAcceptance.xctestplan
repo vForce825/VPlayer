@@ -1,0 +1,25 @@
+{
+  "configurations": [
+    {
+      "id": "6FBB978D-89F5-4528-B9DC-08384B1710EC",
+      "name": "FiveMinute",
+      "options": {}
+    }
+  ],
+  "defaultOptions": {
+    "testTimeoutsEnabled": true,
+    "defaultTestExecutionTimeAllowance": 480,
+    "maximumTestExecutionTimeAllowance": 480
+  },
+  "testTargets": [
+    {
+      "parallelizable": false,
+      "target": {
+        "containerPath": "container:VPlayer.xcodeproj",
+        "identifier": "REQUIRES_PINNED_XCODEGEN_READBACK",
+        "name": "VPlayerHLSAcceptanceTests"
+      }
+    }
+  ],
+  "version": 1
+}

@@ -40,9 +40,21 @@ final class PlaybackControllerTests: XCTestCase {
         let harness = BackendOwnershipTestHarness()
         harness.setRoute(.hlsAVPlayer)
         await harness.playLocal()
-        let initial = harness.registry.occupancy
-        let initialCommands = ordinaryCommandDiagnostics(harness.registry)
         do {
+            // Cold start retains a factory command that a retained-session route
+            // cycle legitimately reclaims. Compare the same lifecycle phase;
+            // keep exact slot/group equality for every subsequent cycle.
+            for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
+                harness.setRoute(kind)
+                await harness.controller.requestRouteHandoff(to: kind)
+                try await eventually {
+                    guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                    return context.owner == nil && context.prepared && context.desiredBackendKind == kind
+                        && harness.currentAudibleOutputs == 1
+                }
+            }
+            let initial = harness.registry.occupancy
+            let initialCommands = ordinaryCommandDiagnostics(harness.registry)
             for _ in 0..<36 {
                 for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
                     harness.setRoute(kind)

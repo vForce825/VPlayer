@@ -31,6 +31,10 @@ public struct HLSVideoCapability: Sendable {
               let rate = facts.frameRate, rate.num > 0, rate.den > 0, maximumFrameRate.num > 0,
               Int64(rate.num) * Int64(maximumFrameRate.den) <= Int64(maximumFrameRate.num) * Int64(rate.den),
               facts.colorPrimaries != nil, facts.colorTransfer != nil, facts.colorMatrix != nil else { return false }
-        return true
+        switch range {
+        case .sdr: return facts.colorPrimaries == .bt709 && facts.colorTransfer == .bt709 && facts.colorMatrix == .bt709
+        case .pq: return codec == .hevc && facts.bitDepth == 10 && facts.colorPrimaries == .bt2020 && facts.colorTransfer == .pq && facts.colorMatrix == .bt2020Nonconstant
+        case .hlg: return codec == .hevc && facts.bitDepth == 10 && facts.colorPrimaries == .bt2020 && facts.colorTransfer == .hlg && facts.colorMatrix == .bt2020Nonconstant
+        }
     }
 }

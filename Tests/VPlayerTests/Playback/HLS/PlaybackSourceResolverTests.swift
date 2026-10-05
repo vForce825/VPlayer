@@ -40,3 +40,42 @@ func sourceContext(url: URL = URL(string: "https://example.test/stream?sig=secre
     return try PlaybackSourceContext(requestID: request, sourceProfileID: UUID(), channelID: "stable-channel", entryURL: url, attributes: attributes)
         .bound(to: PlaybackSourceOwner(backendIdentity: PlaybackBackendIdentity(sessionIdentity: PlaybackSessionIdentity(sessionID: 1, requestID: request), backendGeneration: 1), prepareNonce: 1, outputLifecycleNonce: 1))
 }
+
+actor SourceTestTransport: HLSResourceTransport {
+    let responses: [URL: HLSResourceResponse]
+    var requests: [HLSResourceRequest] = []
+    init(responses: [URL: HLSResourceResponse]) { self.responses = responses }
+    func fetch(_ request: HLSResourceRequest) async throws -> HLSResourceResponse {
+        requests.append(request)
+        guard let response = responses[request.url] else { throw HLSSourceError.network }
+        guard response.data.count <= request.maximumBytes else { throw HLSSourceError.byteLimit }
+        return response
+    }
+}
+
+extension PlaybackSourceResolverTests {
+    func testRedirectedMasterPreservesSharedNodesAndStableContext() async throws {
+        let context = try sourceContext()
+        let root = URL(string: "https://example.test/cdn/master?sig=new")!
+        let media = URL(string: "https://example.test/cdn/media?sig=child")!
+        let text = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia?sig=child\n#EXT-X-STREAM-INF:BANDWIDTH=2\nmedia?sig=child\n"
+        let transport = SourceTestTransport(responses: [context.entryURL: .init(responseURL: root, data: Data(text.utf8)),
+            media: .init(responseURL: media, data: Data("#EXTM3U\n#EXTINF:1,\npart\n".utf8))])
+        let resolver = URLSessionPlaybackSourceResolver(transport: transport)
+        let source = try await resolver.resolve(context, reason: .initial)
+        guard case let .hls(graph) = source.topology else { return XCTFail("missing source graph") }
+        XCTAssertEqual(source.context, context); XCTAssertEqual(source.responseURL, root)
+        XCTAssertEqual(graph.documents.count, 2); XCTAssertEqual(graph.document(for: root)?.variants.count, 2)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 2)
+        await resolver.invalidate()
+        XCTAssertNil(source.withCurrentResolution(owner: try XCTUnwrap(context.owner), generation: source.generation) { true })
+    }
+    func testRawPrefixNeverAcquiresFakeHLSAndExpiryDoesNotGuessQuery() async throws {
+        let context = try sourceContext(url: URL(string: "https://example.test/raw?expires=0")!)
+        let transport = SourceTestTransport(responses: [context.entryURL: .init(responseURL: context.entryURL, data: Data([0x47, 0]), completeness: .prefix)])
+        let source = try await URLSessionPlaybackSourceResolver(transport: transport).resolve(context, reason: .initial)
+        guard case .media = source.topology else { return XCTFail("raw media became a manifest") }
+        XCTAssertEqual(source.mediaCompleteness, .prefix); XCTAssertNil(source.refreshReason())
+    }
+}

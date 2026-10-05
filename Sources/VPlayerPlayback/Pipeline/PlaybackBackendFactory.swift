@@ -13,9 +13,20 @@ protocol PlaybackBackendFactory: Sendable {
         url: URL,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) async throws -> any PlaybackBackend
+
+    func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
+                     channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
+                     eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend
 }
 
 extension PlaybackBackendFactory {
+    /// Existing injected factories keep their explicit legacy contract.
+    func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
+                     channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
+                     eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
+        try await makeBackend(kind: kind, identity: identity, tuning: tuning, channelID: channelID, url: url, eventSink: eventSink)
+    }
+
     func makeBackend(
         kind: PlaybackBackendKind,
         identity: PlaybackBackendIdentity,

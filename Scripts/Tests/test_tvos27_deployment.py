@@ -13,7 +13,15 @@ class TVOS27DeploymentTests(unittest.TestCase):
     def test_all_project_and_target_floors(self):
         spec = (ROOT / 'project.yml').read_text()
         floors = re.findall(r'(?:tvOS|deploymentTarget): "([0-9.]+)"', spec)
-        self.assertEqual(len(floors), 7)
+        target_section=spec.split('targets:',1)[1].split('schemes:',1)[0]
+        targets=re.findall(r'^  ([A-Za-z][A-Za-z0-9]+):$',target_section,re.M)
+        self.assertEqual(set(targets),{'VPlayerCore','VPlayerPlayback','VPlayer','VPlayerTests',
+            'VPlayerReleaseBoundaryTests','VPlayerUITests','VPlayerHLSAcceptanceTests'})
+        self.assertEqual(len(floors),len(targets)+1)
+        for name in targets:
+            body=re.search(r'^  '+re.escape(name)+r':\n(.*?)(?=^  \w|\Z)',target_section,re.M|re.S).group(1)
+            self.assertIn('    platform: tvOS',body)
+            self.assertIn('    deploymentTarget: "27.0"',body)
         self.assertEqual(set(floors), {'27.0'})
         project = (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text()
         generated = re.findall(r'TVOS_DEPLOYMENT_TARGET = ([0-9.]+);', project)

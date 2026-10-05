@@ -4752,6 +4752,28 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(fixture.model.presentedPlaybackRequest)
     }
 
+    func testSelectingStaleChannelCarriesHeadersFromCurrentLibrarySnapshot() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(id: "00000000-0000-0000-0000-000000000001", name: "Current", now: now)
+        let url = try XCTUnwrap(URL(string: "https://example.test/source/master"))
+        func channel(_ authorization: String) -> Channel {
+            Channel(sourceProfileID: profile.id, displayName: "Source", streamURL: url,
+                tvgID: nil, tvgName: nil, logoURL: nil, groupTitle: nil,
+                attributes: ["authorization": authorization, "user-agent": "Scoped fixture"], order: 0)
+        }
+        let stale = channel("Bearer old"), current = channel("Bearer current")
+        let repository = RepositorySpy(profiles: [profile], activeProfileID: profile.id, channels: [profile.id: [current]])
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+        let loaded = await model.reload()
+        XCTAssertTrue(loaded)
+        model.select(channel: stale)
+        let request = try XCTUnwrap(model.presentedPlaybackRequest)
+        let context = try request.sourceContext
+        XCTAssertEqual(context.headers.fields(for: url)["Authorization"], "Bearer current")
+        XCTAssertEqual(context.headers.fields(for: url)["User-Agent"], "Scoped fixture")
+        XCTAssertTrue(context.headers.fields(for: URL(string: "https://other.test/source")!).isEmpty)
+    }
+
     func testReloadCarriesPlaybackOnlyWhenLoadedChannelIdentityAndURLStillMatch() async throws {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let first = makeProfile(

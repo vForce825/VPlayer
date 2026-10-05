@@ -1,0 +1,4 @@
+Public synthetic source from Scripts/generate-hls-acceptance-fixture.py.
+Verified FFmpeg8.1.2 source and host-tool provenance required. No private media.
+Source timeline360seconds; common native source/player observation includes prebuffer and never exceeds300seconds.
+The large generated transport stream remains runner-local. Baseline and candidate must have the same SHA256.

@@ -899,6 +899,28 @@ enum PausedDecodeCoverageOrder {
 }
 
 /// 只读遍历已封口 init/fragment；保存最终固定上限的 sample 表，不复制媒体或物化 box 树。
+/// Actual emitted initialization facts. These values alone authorize nothing;
+/// the writer callback lane must compare them to its frozen producer evidence.
+enum FMP4AudioChannelLayout: Sendable, Equatable {
+    case bitmap(UInt32)
+    case tag(UInt32)
+}
+struct FMP4CompressedAudioInitialization: Sendable {
+    let sampleEntry: UInt32
+    let timescale: Int32
+    let sampleEntryChannelCount: UInt16
+    let sampleEntrySampleRate: UInt32
+    let decoderConfiguration: Data
+    let channelLayout: FMP4AudioChannelLayout?
+    let sampleEntryDigest: Data
+}
+enum FMP4CompressedAudioInspection {
+    static func initialization(_ data: Data) throws -> FMP4CompressedAudioInitialization {
+        guard data.count <= 65_536 else { throw CompletedMediaEvidenceError.capacityExceeded }
+        return try data.withUnsafeBytes { try FMP4DecodeMapParser.compressedAudioInitialization(in: $0) }
+    }
+}
+
 private enum FMP4DecodeMapParser {
     private struct Box {
         let start: Int
@@ -1115,6 +1137,149 @@ private enum FMP4DecodeMapParser {
             timescale: timescale, mode: .audio, nalLengthBytes: 0,
             decoderConfigurationDigest: Data(SHA256.hash(
                 data: Data(bytes[entry.range]))))
+    }
+
+    /// Reuses the same checked box reader as coverage. The source path requires
+    /// exactly one audio track/entry/configuration; it cannot use the ordinary
+    /// first-track parser as permission to overlook a conflicting second track.
+    static func compressedAudioInitialization(in bytes: UnsafeRawBufferPointer) throws
+        -> FMP4CompressedAudioInitialization {
+        let moov = try uniqueBox(0x6d6f6f76, in: 0..<bytes.count, bytes: bytes)
+        let trak = try uniqueBox(0x7472616b, in: moov.payload, bytes: bytes)
+        let mdia = try uniqueBox(0x6d646961, in: trak.payload, bytes: bytes)
+        let hdlr = try uniqueBox(0x68646c72, in: mdia.payload, bytes: bytes)
+        guard try handlerType(hdlr, bytes: bytes) == 0x736f756e else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let mdhd = try uniqueBox(0x6d646864, in: mdia.payload, bytes: bytes)
+        try require(mdhd.payloadStart, 4, within: mdhd.end)
+        guard bytes[mdhd.payloadStart] <= 1 else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        let scale = try mediaTimescale(mdhd, bytes: bytes)
+        let minf = try uniqueBox(0x6d696e66, in: mdia.payload, bytes: bytes)
+        let stbl = try uniqueBox(0x7374626c, in: minf.payload, bytes: bytes)
+        let stsd = try uniqueBox(0x73747364, in: stbl.payload, bytes: bytes)
+        try require(stsd.payloadStart, 8, within: stsd.end)
+        guard readUInt32(stsd.payloadStart, bytes: bytes) == 0,
+              readUInt32(stsd.payloadStart + 4, bytes: bytes) == 1 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let entry = try readBox(at: stsd.payloadStart + 8, limit: stsd.end, bytes: bytes)
+        try require(entry.payloadStart, 28, within: entry.end)
+        guard entry.end == stsd.end,
+              bytes[entry.payloadStart + 8] == 0, bytes[entry.payloadStart + 9] == 0 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let configurationType: UInt32
+        switch entry.type {
+        case 0x6d703461: configurationType = 0x65736473
+        case 0x61632d33: configurationType = 0x64616333
+        case 0x65632d33: configurationType = 0x64656333
+        default: throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let children = (entry.payloadStart + 28)..<entry.end
+        let configuration = try uniqueBox(configurationType, in: children, bytes: bytes)
+        let decoder: Data
+        if entry.type == 0x6d703461 {
+            decoder = try sourceAACDecoderConfiguration(configuration, bytes: bytes)
+        } else {
+            guard configuration.range.count <= 64 else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+            decoder = Data(bytes[configuration.range])
+        }
+        let channelLayout: FMP4AudioChannelLayout?
+        if let channel = try uniqueOptionalBox(0x6368616e, in: children, bytes: bytes) {
+            try require(channel.payloadStart, 16, within: channel.end)
+            guard channel.payload.count == 16,
+                  readUInt32(channel.payloadStart, bytes: bytes) == 0,
+                  readUInt32(channel.payloadStart + 12, bytes: bytes) == 0 else {
+                throw CompletedMediaEvidenceError.invalidDecodeMap
+            }
+            let tag = readUInt32(channel.payloadStart + 4, bytes: bytes)
+            let bitmap = readUInt32(channel.payloadStart + 8, bytes: bytes)
+            if tag == 0x00010000 {
+                guard bitmap != 0 else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+                channelLayout = .bitmap(bitmap)
+            } else {
+                guard tag != 0, bitmap == 0 else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+                channelLayout = .tag(tag)
+            }
+        } else { channelLayout = nil }
+        let channelOffset = entry.payloadStart + 16
+        return FMP4CompressedAudioInitialization(sampleEntry: entry.type, timescale: scale,
+            sampleEntryChannelCount: UInt16(bytes[channelOffset]) << 8 | UInt16(bytes[channelOffset + 1]),
+            sampleEntrySampleRate: readUInt32(entry.payloadStart + 24, bytes: bytes) >> 16,
+            decoderConfiguration: decoder, channelLayout: channelLayout,
+            sampleEntryDigest: Data(SHA256.hash(data: Data(bytes[entry.range]))))
+    }
+
+    private static func sourceAACDecoderConfiguration(_ esds: Box, bytes: UnsafeRawBufferPointer) throws -> Data {
+        try require(esds.payloadStart, 4, within: esds.end)
+        guard readUInt32(esds.payloadStart, bytes: bytes) == 0 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        var cursor = esds.payloadStart + 4
+        func descriptor(_ tag: UInt8, end: Int) throws -> Range<Int> {
+            try require(cursor, 2, within: end)
+            guard bytes[cursor] == tag else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+            cursor += 1
+            var length = 0
+            for index in 0..<4 {
+                try require(cursor, 1, within: end)
+                let byte = bytes[cursor]; cursor += 1
+                length = length << 7 | Int(byte & 0x7F)
+                if byte & 0x80 == 0 {
+                    try require(cursor, length, within: end)
+                    return cursor..<(cursor + length)
+                }
+                guard index < 3 else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+            }
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let es = try descriptor(3, end: esds.end)
+        try require(cursor, 3, within: es.upperBound)
+        guard es.upperBound == esds.end, bytes[cursor + 2] == 0 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        cursor += 3
+        let decoder = try descriptor(4, end: es.upperBound)
+        try require(cursor, 13, within: decoder.upperBound)
+        guard bytes[cursor] == 0x40, bytes[cursor + 1] == 0x14 || bytes[cursor + 1] == 0x15 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        cursor += 13
+        let asc = try descriptor(5, end: decoder.upperBound)
+        guard (2...64).contains(asc.count), asc.upperBound == decoder.upperBound else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let result = Data(bytes[asc])
+        do { _ = try AudioSpecificConfig.parse(result) }
+        catch { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        cursor = asc.upperBound
+        let sl = try descriptor(6, end: es.upperBound)
+        guard sl.count == 1, bytes[sl.lowerBound] == 2, sl.upperBound == es.upperBound else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        return result
+    }
+
+    private static func uniqueBox(_ type: UInt32, in range: Range<Int>, bytes: UnsafeRawBufferPointer) throws -> Box {
+        guard let result = try uniqueOptionalBox(type, in: range, bytes: bytes) else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        return result
+    }
+    private static func uniqueOptionalBox(_ type: UInt32, in range: Range<Int>,
+                                          bytes: UnsafeRawBufferPointer) throws -> Box? {
+        var result: Box?
+        var offset = range.lowerBound
+        while offset < range.upperBound {
+            let box = try readBox(at: offset, limit: range.upperBound, bytes: bytes)
+            if box.type == type {
+                guard result == nil else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+                result = box
+            }
+            offset = box.end
+        }
+        return result
     }
 
     private static func trackDefaults(_ tfhd: Box, moofStart: Int,

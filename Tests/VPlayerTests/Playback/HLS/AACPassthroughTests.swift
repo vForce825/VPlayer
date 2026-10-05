@@ -103,6 +103,57 @@ final class AACPassthroughTests: XCTestCase {
         XCTAssertEqual(copies.framing.usage.bytes, 0)
     }
 
+    func testSourceConfigurationPreservesZeroVersusUnsignaledAndRejectsNonzeroBeforeClaim() throws {
+        for priming: HLSSourceAudioPriming in [.notSignaledPreserveTimestamps,
+            .explicit(leadingSamples: 0, trailingSamples: 0)] {
+            let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+            _ = try timeline.consume(.tracks(Self.tracks()))
+            let unit = try Self.unit(timeline.consume(.packet(Self.packet(Data([0x21])))))
+            let configuration = try SourceAACWriterConfiguration(first: unit,
+                source: Self.facts(priming: priming), binding: Self.binding())
+            XCTAssertEqual(configuration.priming, priming)
+            XCTAssertEqual(configuration.audioSpecificConfig, Data([0x11, 0x90]))
+            XCTAssertTrue(configuration.validates(unit))
+            XCTAssertThrowsError(try SourceAACWriterConfiguration(first: unit,
+                source: Self.facts(priming: priming), binding: Self.binding()))
+        }
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        let unit = try Self.unit(timeline.consume(.packet(Self.packet(Data([0x21])))))
+        for priming: HLSSourceAudioPriming in [.unknown, .explicit(leadingSamples: 2_112, trailingSamples: 0),
+            .explicit(leadingSamples: 0, trailingSamples: 512)] {
+            XCTAssertThrowsError(try SourceAACWriterConfiguration(first: unit,
+                source: Self.facts(priming: priming), binding: Self.binding()))
+        }
+        // Failed preflight did not consume the source's one real rendition slot.
+        _ = try SourceAACWriterConfiguration(first: unit, source: Self.facts(), binding: Self.binding())
+    }
+
+    func testSourceSubmissionRejectsCopiedTimingAndReplayedClaim() throws {
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        let unit = try Self.unit(timeline.consume(.packet(Self.packet(Data([0x21])))))
+        let config = try SourceAACWriterConfiguration(first: unit, source: Self.facts(), binding: Self.binding())
+        let fabricated = HLSTimedAudioAccessUnit(source: unit.source, generation: unit.generation,
+            timing: unit.timing, boundaryDecision: unit.boundaryDecision)
+        XCTAssertThrowsError(try SourceAACAccessUnit(timed: fabricated, configuration: config, binding: Self.binding()))
+        let submission = try SourceAACAccessUnit(timed: unit, configuration: config, binding: Self.binding())
+        XCTAssertEqual(submission.payload, unit.source.payload)
+        XCTAssertTrue(submission.claimForAppend())
+        XCTAssertFalse(submission.claimForAppend())
+    }
+
+    private static func facts(priming: HLSSourceAudioPriming = .notSignaledPreserveTimestamps) -> HLSSourceAudioFacts {
+        .init(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2, channelMask: 3,
+            decoderConfiguration: Data([0x11, 0x90]), priming: priming,
+            service: .independentMain, formatValidated: true)
+    }
+    private static func binding() -> FMP4WriterBinding {
+        .init(outputLifecycleEpoch: .init(rawValue: 1), itemGeneration: .init(rawValue: 2),
+            mediaEpoch: .init(rawValue: 3), publicationParticipantID: .init(rawValue: 4),
+            renditionIdentity: .init(rawValue: 5), writerIdentity: .init(rawValue: 6))
+    }
+
     private static func copies() -> HLSAudioCopyOwnership {
         .init(maximumCompressedBytes: 1_048_576, maximumPCMBytes: 8_388_608, capacity: 64)
     }
