@@ -7,24 +7,42 @@ import Network
 
 final class HLSProxyIOCounters: @unchecked Sendable {
     struct Snapshot: Sendable {
-        var callbackBytes = 0, peakCallbackBytes = 0, largestCallback = 0
-        var pendingSendAliases = 0, peakPendingSendAliases = 0, rejectedOversizedCallbacks = 0
-        var callbacks = 0, peakCallbacks = 0
+        var readWindowBytes = 0, peakReadWindowBytes = 0
+        var pendingSendAliases = 0, peakPendingSendAliases = 0
+        var readWindows = 0, peakReadWindows = 0, suspendedReaders = 0, awaitingFirstByteReaders = 0
+        var completedSends: UInt64 = 0, bodySpans: UInt64 = 0
+        var smallestBodySpanBytes = 0, largestBodySpanBytes = 0
+        // Maximum per-transfer scalar counts, not a sum across requests.
+        var upstreamReceivedBytes: Int64 = 0, deliveredBodyBytes: Int64 = 0
     }
     private let lock = NSLock()
     private var value = Snapshot()
     var snapshot: Snapshot { lock.withLock { value } }
-    func beginCallback(_ bytes: Int, limit: Int) { lock.withLock {
-        value.callbacks += 1; value.peakCallbacks = max(value.peakCallbacks, value.callbacks)
-        value.callbackBytes += bytes; value.peakCallbackBytes = max(value.peakCallbackBytes, value.callbackBytes)
-        value.largestCallback = max(value.largestCallback, bytes)
-        if bytes > limit { value.rejectedOversizedCallbacks += 1 }
+    func beginReadWindow(_ bytes: Int) { lock.withLock {
+        value.readWindows += 1; value.peakReadWindows = max(value.peakReadWindows, value.readWindows)
+        value.readWindowBytes += bytes; value.peakReadWindowBytes = max(value.peakReadWindowBytes, value.readWindowBytes)
     } }
-    func endCallback(_ bytes: Int) { lock.withLock { value.callbackBytes -= bytes; value.callbacks -= 1 } }
+    func endReadWindow(_ bytes: Int) { lock.withLock { value.readWindowBytes -= bytes; value.readWindows -= 1 } }
+    func beginAwaitFirstByte() { lock.withLock { value.awaitingFirstByteReaders += 1 } }
+    func endAwaitFirstByte() { lock.withLock { value.awaitingFirstByteReaders -= 1 } }
+    func suspendReader() { lock.withLock { value.suspendedReaders += 1 } }
+    func resumeReader() { lock.withLock { value.suspendedReaders -= 1 } }
+    func observeBody(upstream: Int64, delivered: Int64) { lock.withLock {
+        value.upstreamReceivedBytes = max(value.upstreamReceivedBytes, upstream)
+        value.deliveredBodyBytes = max(value.deliveredBodyBytes, delivered)
+    } }
+    func deliveredSpan(_ bytes: Int) { lock.withLock {
+        value.bodySpans &+= 1
+        value.smallestBodySpanBytes = value.smallestBodySpanBytes == 0 ? bytes : min(value.smallestBodySpanBytes, bytes)
+        value.largestBodySpanBytes = max(value.largestBodySpanBytes, bytes)
+    } }
     func beginSend(_ bytes: Int) { lock.withLock {
         value.pendingSendAliases += bytes; value.peakPendingSendAliases = max(value.peakPendingSendAliases, value.pendingSendAliases)
     } }
-    func endSend(_ bytes: Int) { lock.withLock { value.pendingSendAliases -= bytes } }
+    func endSend(_ bytes: Int) { lock.withLock {
+        value.pendingSendAliases -= bytes; value.completedSends &+= 1
+    } }
+
 }
 
 final class HLSProxyConnection: @unchecked Sendable {
@@ -95,13 +113,22 @@ final class HLSProxyConnection: @unchecked Sendable {
         }
     }
     private func touch() { lock.withLock { timeout?.schedule(deadline: .now() + 30) } }
-    func sendBytes(_ bytes: Data) async throws {
+    func sendBytes(_ bytes: Data, retaining envelope: HLSProxyBudget.BodyEnvelope? = nil) async throws {
+        guard let queue else { throw HLSSourceError.network }
         nativeSends.enter(); io.beginSend(bytes.count)
         let count = bytes.count
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            connection.send(content: bytes, completion: .contentProcessed { [nativeSends, io] error in
-                io.endSend(count); nativeSends.leave()
-                if error != nil { continuation.resume(throwing: HLSSourceError.network) } else { continuation.resume() }
+            connection.send(content: bytes, completion: .contentProcessed { [nativeSends, io, envelope] error in
+                // Resume behind the physical completion callback on the same
+                // serial connection queue. The borrow deallocator is also joined
+                // before its fixed backing can be written again.
+                queue.async {
+                    withExtendedLifetime(envelope) {
+                        io.endSend(count); nativeSends.leave()
+                        if error != nil { continuation.resume(throwing: HLSSourceError.network) }
+                        else { continuation.resume() }
+                    }
+                }
             })
         }
         withExtendedLifetime(bytes) {}; touch()
@@ -168,22 +195,9 @@ final class HLSProxyConnection: @unchecked Sendable {
         guard method != .head else { return }
         try await sendSlice(body.data, interval: (selected.lowerBound - Int(admitted.offset))..<(selected.upperBound - Int(admitted.offset)))
     }
-    /// Only called by the private serial URLSession delegate queue. One callback
-    /// alias stays blocked until this native send returns; there is no task queue.
-    func sendBlocking(_ bytes: Data, header: Bool = false, retaining envelope: HLSProxyBudget.BodyEnvelope? = nil) throws {
-        if header { try claimResponse() }
-        let gate = HLSProxySendGate()
-        nativeSends.enter(); io.beginSend(bytes.count)
-        let count = bytes.count
-        connection.send(content: bytes, completion: .contentProcessed { [nativeSends, io, envelope] error in
-            // A timeout/cancellation may return the delegate stack first. Keep
-            // the paid body window until this physical native-send alias ends.
-            withExtendedLifetime(envelope) {
-                io.endSend(count); nativeSends.leave(); gate.complete(error == nil)
-            }
-        })
-        guard gate.wait() else { connection.cancel(); throw HLSSourceError.network }
-        withExtendedLifetime(bytes) {}; touch()
+    var upstreamReceivedBytes: Int64 {
+        let operation = lock.withLock { upstream }
+        return operation?.upstreamReceivedBytes ?? 0
     }
     func installUpstream(_ value: HLSProxyUpstream?) {
         let cancel = lock.withLock { () -> Bool in upstream = value; return cancelRequested }
@@ -209,15 +223,4 @@ final class HLSProxyConnection: @unchecked Sendable {
         if let queue { await withCheckedContinuation { continuation in queue.async { continuation.resume() } } }
         connection.stateUpdateHandler = nil
     }
-}
-
-private final class HLSProxySendGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private let semaphore = DispatchSemaphore(value: 0)
-    private var result: Bool?
-    func complete(_ success: Bool) {
-        let first = lock.withLock { () -> Bool in guard result == nil else { return false }; result = success; return true }
-        if first { semaphore.signal() }
-    }
-    func wait() -> Bool { semaphore.wait(timeout: .now() + 30) == .success && lock.withLock { result == true } }
 }

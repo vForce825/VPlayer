@@ -9,88 +9,96 @@ import XCTest
 
 @MainActor
 final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
-    func testActualDolbyWriterTrialEitherPublishesCompressedOrJoinsOwnedAACRetry() async throws {
-        for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
-            let bytes = try OrdinaryOwnedDolbyTS.make(codec: codec, bundle: Bundle(for: Self.self))
-            XCTAssertLessThan(bytes.count, 4 * 1_024 * 1_024)
-            let origin = try NativeHLSHTTPFixture(resources: ["/source.ts": .init(data: bytes, contentType: "video/mp2t")], credential: "dolby fixture")
-            let probe = HLSWriterAcceptanceProbe()
-            let observation = OwnedDolbyPreparationObservation()
-            let factory = OwnedDolbySmokeFactory(probe: probe, observation: observation)
-            let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
-            let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
-            let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
-            let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
-            let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
-                routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
-            var failure: (any Error)?
-            do {
-                let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "owned-dolby-\(codec.rawValue)",
-                    streamURL: origin.url("source.ts"), title: "Owned Dolby fixture", attributes: ["Authorization": "dolby fixture"])
-                await controller.play(request)
-                try await until(registry: registry) {
-                    guard let backend = factory.backend, registry.outputResourceContextSnapshot()?.prepared == true,
-                          registry.outputResourceContextSnapshot()?.interval != nil,
-                          case let .avPlayer(context)? = backend.presentation else { return false }
-                    return context.player.currentItem?.status == .readyToPlay && context.player.rate > 0
-                }
-                let backend = try XCTUnwrap(factory.backend)
-                guard case let .avPlayer(context)? = backend.presentation else { throw HLSSourceError.incompleteEvidence }
-                // Capture before potentially slow output-byte inspection; this
-                // finite 6.144-second fixture may reach its genuine endpoint.
-                let physical = try XCTUnwrap(context.player.currentItem)
-                let start = context.player.currentTime().seconds
-                guard start.isFinite else { throw HLSSourceError.incompleteEvidence }
-                let native = probe.snapshot
-                let trials = codec == .ac3 ? native.nativeAC3WriterCount : native.nativeEAC3WriterCount
-                guard native.isComplete, trials > 0 else {
-                    XCTFail("No actual codec-specific AVAssetWriter trial occurred; candidate-only or no-trial AAC cannot count as coverage")
+    func testActualAC3WriterTrialEitherPublishesCompressedOrJoinsOwnedAACRetry() async throws {
+        try await assertActualWriterTrial(codec: .ac3)
+    }
+
+    func testActualEAC3WriterTrialEitherPublishesCompressedOrJoinsOwnedAACRetry() async throws {
+        try await assertActualWriterTrial(codec: .eac3)
+    }
+
+    // Keep each codec independently executable: a failed AC3 trial must not hide
+    // the EAC3 source-proof boundary from the same combined acceptance batch.
+    private func assertActualWriterTrial(codec: VPlayerPlayback.AudioCodec) async throws {
+        let bytes = try OrdinaryOwnedDolbyTS.make(codec: codec, bundle: Bundle(for: Self.self))
+        XCTAssertLessThan(bytes.count, 4 * 1_024 * 1_024)
+        let origin = try NativeHLSHTTPFixture(resources: ["/source.ts": .init(data: bytes, contentType: "video/mp2t")], credential: "dolby fixture")
+        let probe = HLSWriterAcceptanceProbe()
+        let observation = OwnedDolbyPreparationObservation()
+        let factory = OwnedDolbySmokeFactory(probe: probe, observation: observation)
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
+        let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
+        let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
+        let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
+            routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
+        var failure: (any Error)?
+        do {
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "owned-dolby-\(codec.rawValue)",
+                streamURL: origin.url("source.ts"), title: "Owned Dolby fixture", attributes: ["Authorization": "dolby fixture"])
+            await controller.play(request)
+            try await until(registry: registry) {
+                guard let backend = factory.backend, registry.outputResourceContextSnapshot()?.prepared == true,
+                      registry.outputResourceContextSnapshot()?.interval != nil,
+                      case let .avPlayer(context)? = backend.presentation else { return false }
+                return context.player.currentItem?.status == .readyToPlay && context.player.rate > 0
+            }
+            let backend = try XCTUnwrap(factory.backend)
+            guard case let .avPlayer(context)? = backend.presentation else { throw HLSSourceError.incompleteEvidence }
+            // Capture before potentially slow output-byte inspection; this
+            // finite 6.144-second fixture may reach its genuine endpoint.
+            let physical = try XCTUnwrap(context.player.currentItem)
+            let start = context.player.currentTime().seconds
+            guard start.isFinite else { throw HLSSourceError.incompleteEvidence }
+            let native = probe.snapshot
+            let trials = codec == .ac3 ? native.nativeAC3WriterCount : native.nativeEAC3WriterCount
+            guard native.isComplete, trials > 0 else {
+                XCTFail("No actual codec-specific AVAssetWriter trial occurred; candidate-only or no-trial AAC cannot count as coverage")
+                throw HLSSourceError.incompleteEvidence
+            }
+            let audio = try await inspectPublishedAudio(XCTUnwrap(backend.generatedItemURLForTesting))
+            let source = try XCTUnwrap(backend.ownedSourceForTesting)
+            let original = try XCTUnwrap(observation.first)
+            XCTAssertEqual(original.codec, codec)
+            XCTAssertTrue(original.formatValidated)
+            XCTAssertEqual(audio.sampleRate, original.sampleRate)
+            XCTAssertEqual(audio.channelCount, original.channelCount)
+            XCTAssertEqual(origin.deniedCount, 0)
+            guard original.codec == codec, original.formatValidated, audio.sampleRate == original.sampleRate,
+                  audio.channelCount == original.channelCount, origin.deniedCount == 0 else { throw HLSSourceError.incompleteEvidence }
+            let outcome: String
+            if audio.codec == codec {
+                guard source.plan.audio == .passthrough(codec), backend.generatedBundleCallsForTesting == 1 else { throw HLSSourceError.incompleteEvidence }
+                outcome = "compressed-native-writer-output"
+            } else {
+                guard audio.codec == .aac, source.plan.audio == .compatibleAAC,
+                      backend.generatedBundleCallsForTesting == 2, observation.inspections == 1 else {
+                    XCTFail("AAC output did not come from the original owned joined retry")
                     throw HLSSourceError.incompleteEvidence
                 }
-                let audio = try await inspectPublishedAudio(XCTUnwrap(backend.generatedItemURLForTesting))
-                let source = try XCTUnwrap(backend.ownedSourceForTesting)
-                let original = try XCTUnwrap(observation.first)
-                XCTAssertEqual(original.codec, codec)
-                XCTAssertTrue(original.formatValidated)
-                XCTAssertEqual(audio.sampleRate, original.sampleRate)
-                XCTAssertEqual(audio.channelCount, original.channelCount)
-                XCTAssertEqual(origin.deniedCount, 0)
-                guard original.codec == codec, original.formatValidated, audio.sampleRate == original.sampleRate,
-                      audio.channelCount == original.channelCount, origin.deniedCount == 0 else { throw HLSSourceError.incompleteEvidence }
-                let outcome: String
-                if audio.codec == codec {
-                    guard source.plan.audio == .passthrough(codec), backend.generatedBundleCallsForTesting == 1 else { throw HLSSourceError.incompleteEvidence }
-                    outcome = "compressed-native-writer-output"
-                } else {
-                    guard audio.codec == .aac, source.plan.audio == .compatibleAAC,
-                          backend.generatedBundleCallsForTesting == 2, observation.inspections == 1 else {
-                        XCTFail("AAC output did not come from the original owned joined retry")
-                        throw HLSSourceError.incompleteEvidence
-                    }
-                    // The second makeBundle is reachable only after the rejected
-                    // first graph's actual producer retirement returned confirmed.
-                    outcome = "compressed-unavailable-owned-joined-AAC-retry"
-                }
-                try await until(registry: registry) { context.player.currentItem === physical && context.player.currentTime().seconds > start + 0.25 }
-                guard context.player.currentItem === physical, context.player.currentTime().seconds > start + 0.25,
-                      audio.formatValidated else { throw HLSSourceError.incompleteEvidence }
-                print("OWNED_DOLBY_TRIAL codec=\(codec.rawValue) nativeTrials=\(trials) outcome=\(outcome) progressed=true")
-            } catch {
-                let native = probe.snapshot
-                // Failed preparation can release this weak backend before the
-                // observer runs. Absence is not evidence of zero bundle attempts.
-                let bundles = factory.backend.map { String($0.generatedBundleCallsForTesting) } ?? "unavailable"
-                XCTFail("Owned Dolby smoke codec=\(codec.rawValue) failed: \(error); " +
-                    "inspections=\(observation.inspections) nativeTotal=\(native.nativeWriterCount) " +
-                    "AC3-trials=\(native.nativeAC3WriterCount) EAC3-trials=\(native.nativeEAC3WriterCount) bundles=\(bundles)")
-                failure = error
+                // The second makeBundle is reachable only after the rejected
+                // first graph's actual producer retirement returned confirmed.
+                outcome = "compressed-unavailable-owned-joined-AAC-retry"
             }
-            await controller.stop(); await registry.joinOwnedTerminalCleanup(); await origin.close()
-            XCTAssertNil(registry.outputResourceContextSnapshot())
-            XCTAssertEqual(probe.snapshot.liveInputCount, 0)
-            XCTAssertEqual(probe.snapshot.pendingCallbacks, 0)
-            if let failure { throw failure }
+            try await until(registry: registry) { context.player.currentItem === physical && context.player.currentTime().seconds > start + 0.25 }
+            guard context.player.currentItem === physical, context.player.currentTime().seconds > start + 0.25,
+                  audio.formatValidated else { throw HLSSourceError.incompleteEvidence }
+            print("OWNED_DOLBY_TRIAL codec=\(codec.rawValue) nativeTrials=\(trials) outcome=\(outcome) progressed=true")
+        } catch {
+            let native = probe.snapshot
+            // Failed preparation can release this weak backend before the
+            // observer runs. Absence is not evidence of zero bundle attempts.
+            let bundles = factory.backend.map { String($0.generatedBundleCallsForTesting) } ?? "unavailable"
+            XCTFail("Owned Dolby smoke codec=\(codec.rawValue) failed: \(error); " +
+                "inspections=\(observation.inspections) nativeTotal=\(native.nativeWriterCount) " +
+                "AC3-trials=\(native.nativeAC3WriterCount) EAC3-trials=\(native.nativeEAC3WriterCount) bundles=\(bundles)")
+            failure = error
         }
+        await controller.stop(); await registry.joinOwnedTerminalCleanup(); await origin.close()
+        XCTAssertNil(registry.outputResourceContextSnapshot())
+        XCTAssertEqual(probe.snapshot.liveInputCount, 0)
+        XCTAssertEqual(probe.snapshot.pendingCallbacks, 0)
+        if let failure { throw failure }
     }
     private func until(registry: ControlTaskRegistry, _ condition: @MainActor () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(30)

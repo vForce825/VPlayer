@@ -56,6 +56,16 @@ class DolbyWriterFailureDiagnosticTests(unittest.TestCase):
         self.assertLess(helper.index('return .systemError(diagnostic)'),
                         helper.index('return .diagnosedSystemFailure('))
 
+    def test_owned_codec_trials_are_independent_xctest_cases(self):
+        smoke = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeOwnedDolbyFallbackSmokeTests.swift').read_text()
+        for codec, label in [('ac3', 'AC3'), ('eac3', 'EAC3')]:
+            name = f'testActual{label}WriterTrialEitherPublishesCompressedOrJoinsOwnedAACRetry'
+            self.assertTrue(f'func {name}()' in smoke, name)
+            body = smoke.split(f'func {name}()', 1)[1].split('\n    }', 1)[0]
+            self.assertIn(f'try await assertActualWriterTrial(codec: .{codec})', body)
+        self.assertNotIn('for codec in [', smoke,
+                         'an AC3 failure must not prevent the EAC3 source proof and native trial from running')
+
     def test_smoke_does_not_report_a_released_backend_as_zero_attempts(self):
         smoke = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeOwnedDolbyFallbackSmokeTests.swift').read_text()
         self.assertIn('nativeTotal=\\(native.nativeWriterCount)', smoke)

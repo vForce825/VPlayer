@@ -62,7 +62,14 @@ final class HLSProxySession: @unchecked Sendable {
     var itemURL: URL { lock.withLock { URL(string: "http://127.0.0.1:\(port)\(root)")! } }
     var resourceCount: Int { registry.entryCount }
     var admissionUsage: (bytes: Int, transfers: Int, connections: Int) { budget.usage }
-    var observedIO: HLSProxyIOCounters.Snapshot { io.snapshot }
+    var observedIO: HLSProxyIOCounters.Snapshot {
+        var sample = io.snapshot
+        let current = lock.withLock { Array(connections.values) }
+        // Read the SDK task counter at observation time, including while the
+        // app consumer is suspended in a downstream send. No body is retained.
+        for connection in current { sample.upstreamReceivedBytes = max(sample.upstreamReceivedBytes, connection.upstreamReceivedBytes) }
+        return sample
+    }
     #if DEBUG
     private var protectedTransferGate: (@Sendable (String) async -> Void)?
     func resourceLeaseForTesting(path: String) throws -> HLSProxyResourceRegistry.Resource { try registry.lease(path: path) }

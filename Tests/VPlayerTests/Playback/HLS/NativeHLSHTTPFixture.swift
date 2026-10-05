@@ -16,10 +16,19 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
         // Ordinary interrupted-response regression: keep the declared length,
         // then close after this many body bytes. Nil preserves normal delivery.
         var disconnectAfterBodyBytes: Int?
+        var rangeErrorBody = Data()
+        var omitContentLength = false
+        var withholdResponse = false
+        var withholdBody = false
+        var chunkBytes = 32 * 1_024
+        var chunkDelay: TimeInterval = 0
+        var pauseAfterBodyBytes: Int?
         var length: Int { data.count * repetitions }
         var isValid: Bool {
             !data.isEmpty && data.count <= 8 * 1_024 * 1_024 && (1...64).contains(repetitions) &&
-                (disconnectAfterBodyBytes.map { (0...length).contains($0) } ?? true)
+                (disconnectAfterBodyBytes.map { (0...length).contains($0) } ?? true) &&
+                rangeErrorBody.count <= 64 * 1_024 && (1...32 * 1_024).contains(chunkBytes) && (0...1).contains(chunkDelay) &&
+                (pauseAfterBodyBytes.map { (1..<length).contains($0) } ?? true)
         }
     }
     private let listener: NWListener
@@ -27,14 +36,21 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
     private let lock = NSLock()
     private let connections = DispatchGroup(), callbacks = DispatchGroup()
     private var clients: [ObjectIdentifier: NWConnection] = [:]
+    private var pausedBodies: [ObjectIdentifier: @Sendable () -> Void] = [:]
     private var resources: [String: Resource]
     private let credential: String?
     private var closed = false
     private var listenerDone = false
     private var listenerWaiter: CheckedContinuation<Void, Never>?
-    private var requestCountValue = 0, authenticatedCountValue = 0, deniedCountValue = 0
+    private var requestCountValue = 0, authenticatedCountValue = 0, deniedCountValue = 0, completedHeadersValue = 0
     let baseURL: URL
     var requestCount: Int { lock.withLock { requestCountValue } }
+    var completedHeaders: Int { lock.withLock { completedHeadersValue } }
+    var pausedBodyCount: Int { lock.withLock { pausedBodies.count } }
+    func resumePausedBodies() {
+        let pending = lock.withLock { let values = Array(pausedBodies.values); pausedBodies.removeAll(); return values }
+        for operation in pending { queue.async(execute: operation) }
+    }
     var authenticatedCount: Int { lock.withLock { authenticatedCountValue } }
     var deniedCount: Int { lock.withLock { deniedCountValue } }
 
@@ -119,19 +135,27 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
         }
         guard result.1 else { sendHeader("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", connection: connection); return }
         guard let resource = result.0 else { sendHeader("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", connection: connection); return }
+        guard !resource.withholdResponse else { return }
         do {
             let parsed = try request.values(forHeader: "Range").first.map { try HTTPRange.parse($0, resourceLength: resource.length) } ?? .ignoreAndServeFull
             let range: Range<Int>, status: Int, extra: String
             switch parsed {
             case .ignoreAndServeFull: range = 0..<resource.length; status = 200; extra = ""
             case let .single(value): range = value; status = 206; extra = "Content-Range: bytes \(range.lowerBound)-\(range.upperBound - 1)/\(resource.length)\r\n"
-            case .unsatisfied: sendHeader("HTTP/1.1 416 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", connection: connection); return
+            case .unsatisfied:
+                sendHeader("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */\(resource.length)\r\n" +
+                    "Content-Length: \(resource.rangeErrorBody.count)\r\nConnection: close\r\n\r\n",
+                    connection: connection, body: request.method == .head ? Data() : resource.rangeErrorBody)
+                return
             }
-            let header = "HTTP/1.1 \(status) OK\r\nContent-Type: \(resource.contentType)\r\nContent-Length: \(range.count)\r\n\(extra)Accept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            let length = resource.omitContentLength ? "" : "Content-Length: \(range.count)\r\n"
+            let header = "HTTP/1.1 \(status) OK\r\nContent-Type: \(resource.contentType)\r\n\(length)\(extra)Accept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
             callbacks.enter()
             connection.send(content: Data(header.utf8), completion: .contentProcessed { [self] error in
                 defer { callbacks.leave() }
                 guard error == nil, request.method != .head else { connection.cancel(); return }
+                lock.withLock { completedHeadersValue += 1 }
+                guard !resource.withholdBody else { return }
                 let transmitted = resource.disconnectAfterBodyBytes.map {
                     range.lowerBound..<(range.lowerBound + min($0, range.count))
                 } ?? range
@@ -139,23 +163,38 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
             })
         } catch { connection.cancel() }
     }
-    private func sendHeader(_ header: String, connection: NWConnection) {
+    private func sendHeader(_ header: String, connection: NWConnection, body: Data = Data()) {
         callbacks.enter()
-        connection.send(content: Data(header.utf8), completion: .contentProcessed { [self] _ in callbacks.leave(); connection.cancel() })
+        connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { [self] _ in callbacks.leave(); connection.cancel() })
     }
-    private func send(_ resource: Resource, range: Range<Int>, connection: NWConnection) {
+    private func send(_ resource: Resource, range: Range<Int>, connection: NWConnection, didPause: Bool = false) {
         guard !range.isEmpty else { connection.cancel(); return }
+        if !didPause, let stop = resource.pauseAfterBodyBytes, range.lowerBound >= stop {
+            lock.withLock {
+                guard !closed else { return }
+                precondition(pausedBodies.count < 16)
+                pausedBodies[ObjectIdentifier(connection)] = { [self] in
+                    send(resource, range: range, connection: connection, didPause: true)
+                }
+            }
+            return
+        }
         let offset = range.lowerBound % resource.data.count
-        let count = min(32 * 1_024, range.count, resource.data.count - offset)
+        let untilPause = !didPause ? resource.pauseAfterBodyBytes.map { $0 - range.lowerBound } ?? range.count : range.count
+        let count = min(resource.chunkBytes, range.count, resource.data.count - offset, untilPause)
         callbacks.enter()
-        connection.send(content: resource.data.subdata(in: offset..<(offset + count)), completion: .contentProcessed { [self] error in
-            defer { callbacks.leave() }
-            guard error == nil else { connection.cancel(); return }
-            send(resource, range: (range.lowerBound + count)..<range.upperBound, connection: connection)
-        })
+        let transmit: @Sendable () -> Void = { [self] in
+            connection.send(content: resource.data.subdata(in: offset..<(offset + count)), completion: .contentProcessed { [self] error in
+                defer { callbacks.leave() }
+                guard error == nil else { connection.cancel(); return }
+                send(resource, range: (range.lowerBound + count)..<range.upperBound, connection: connection, didPause: didPause)
+            })
+        }
+        if resource.chunkDelay > 0 { queue.asyncAfter(deadline: .now() + resource.chunkDelay, execute: transmit) }
+        else { transmit() }
     }
     func close() async {
-        let current = lock.withLock { closed = true; return Array(clients.values) }
+        let current = lock.withLock { closed = true; pausedBodies.removeAll(); return Array(clients.values) }
         listener.cancel(); current.forEach { $0.cancel() }
         await withCheckedContinuation { continuation in
             let done = lock.withLock { () -> Bool in if listenerDone { return true }; listenerWaiter = continuation; return false }
