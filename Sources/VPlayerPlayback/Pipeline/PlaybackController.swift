@@ -697,7 +697,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                     let isHLS = registry.outputResourceContextSnapshot()?.desiredBackendKind == .hlsAVPlayer
                     if rebase.successorClaim == nil || isHLS {
                         if isHLS {
-                            _ = registry.completeSampleBufferReadiness(backendIdentity)
+                            // The original startup/recovery media deadline stays
+                            // live until the coordinator observes clock advance.
                             recoveryCoordinator.resetRecovery.resetFinished()
                         }
                         publish(.playing(request))

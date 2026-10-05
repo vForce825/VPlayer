@@ -386,6 +386,7 @@ extension AVPlayerPreparationEvidenceProviding {
 
 enum AVPlayerAudioParticipantCodec: Sendable, Equatable {
     case aac
+    case sourceAAC
     case explicitlyNonAAC
 }
 
@@ -394,16 +395,19 @@ struct AVPlayerAudioParticipantRequirement: @unchecked Sendable {
     let codec: AVPlayerAudioParticipantCodec
     let terminalBinding: AACWriterTerminalBinding?
     let renditionBinding: AACRenditionTerminalBinding?
+    let sourceAACBinding: SourceAACWriterTerminalBinding?
 
     init(renditionIdentity: AudioRenditionIdentity,
          codec: AVPlayerAudioParticipantCodec,
          endpointAuthority: AACEffectiveEndpointAuthority? = nil,
          terminalBinding: AACWriterTerminalBinding? = nil,
-         renditionBinding: AACRenditionTerminalBinding? = nil) {
+         renditionBinding: AACRenditionTerminalBinding? = nil,
+         sourceAACBinding: SourceAACWriterTerminalBinding? = nil) {
         self.renditionIdentity = renditionIdentity
         self.codec = codec
         self.terminalBinding = terminalBinding ?? endpointAuthority?.terminalBinding
         self.renditionBinding = renditionBinding
+        self.sourceAACBinding = sourceAACBinding
     }
 }
 
@@ -1173,6 +1177,7 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         guard let request else { return }
         for participant in request.audioParticipants {
             participant.terminalBinding?.inspectPreparationBindingAllocations(body)
+            participant.sourceAACBinding?.inspectPreparationBindingAllocations(body)
         }
         // Array是原已持有值；只借其单字storage及原element范围交叉验证，
         // 不建同型数组，不把element减header当作基址。
@@ -1618,6 +1623,7 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             throw CancellationError()
         }
         guard request?.item == item, preparationTicket == operationTicket,
+              request?.audioParticipants.allSatisfy({ $0.codec != .sourceAAC || sourceAACBindingIsCurrent($0, item: item) }) == true,
               !invalidated, state.phase == .preparing else {
             throw invalidationFailure ?? AVPlayerItemCoordinatorFailure.staleIdentity
         }
@@ -1634,12 +1640,13 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
 
     private func beginPreparation(_ request: AVPlayerItemPreparationRequest) throws -> UInt64 {
         guard request.audioParticipants.allSatisfy({ participant in
-            participant.codec == .explicitlyNonAAC
-                || participant.terminalBinding?.binding.renditionIdentity
-                    == participant.renditionIdentity
-        }) else {
-            throw AVPlayerItemCoordinatorFailure.insufficientCoverage
-        }
+            switch participant.codec {
+            case .explicitlyNonAAC: return true
+            case .aac:
+                return participant.terminalBinding?.binding.renditionIdentity == participant.renditionIdentity
+            case .sourceAAC: return sourceAACBindingIsCurrent(participant, item: request.item)
+            }
+        }) else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
         guard state.phase != .prepared else {
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
@@ -1652,6 +1659,14 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         preparationTicket = operationTicket
         state.phase = .preparing
         return operationTicket
+    }
+
+    private func sourceAACBindingIsCurrent(_ participant: AVPlayerAudioParticipantRequirement,
+                                           item: AVPlayerItemInstanceIdentity) -> Bool {
+        guard participant.codec == .sourceAAC, participant.terminalBinding == nil, participant.renditionBinding == nil,
+              let binding = participant.sourceAACBinding, binding.isCurrent else { return false }
+        let original = binding.configuration.authority.initialBinding
+        return original.outputLifecycleEpoch == item.outputLifecycleEpoch && original.renditionIdentity == participant.renditionIdentity
     }
 
     private func selectedPreparationTerminalBinding(for request: AVPlayerItemPreparationRequest)
@@ -1685,6 +1700,10 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
                 try bindCompletedPublication(for: request)
             }
             return (selectedAudio.terminalBinding, selectedAudio.renditionBinding)
+        case .sourceAAC:
+            guard sourceAACBindingIsCurrent(selectedAudio, item: request.item) else { throw AVPlayerItemCoordinatorFailure.insufficientCoverage }
+            if publicationReadiness == nil { try bindCompletedPublication(for: request) }
+            return (nil, nil)
         case .explicitlyNonAAC:
             return (nil, nil)
         }
@@ -1712,6 +1731,13 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
               timeline.renditionIdentity == nil
                 || timeline.renditionIdentity == selectedRenditions.first else {
             throw AVPlayerItemCoordinatorFailure.invalidTimeline
+        }
+        if let selected = request.audioParticipants.first(where: { $0.renditionIdentity == selectedRenditions.first }), selected.codec == .sourceAAC {
+            guard sourceAACBindingIsCurrent(selected, item: request.item), let source = selected.sourceAACBinding,
+                  timeline.sourceAACBinding === source,
+                  source.validatesTimeline(writtenPhysicalBase: timeline.writtenPhysicalBase,
+                    writtenEffectiveBase: timeline.writtenEffectiveBase,
+                    effectivePlaybackHorizon: timeline.effectivePlaybackHorizon) else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
         }
         // HomePod 使用 HLS/AVPlayer 后端，起播覆盖时长与菜单“视频缓冲”保持一致。
         let lead = AVPlayerStartupBufferPolicy.coverageDuration(
@@ -2134,8 +2160,8 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             // Registry 发起的暂停会先撤销 authorization，再调用 driver.pause；能走到
             // 这里的 paused 因而不是用户暂停。直播上游在 prepare 之后才 EOF 时，
             // AVPlayer 不一定有预先约束的终点能力，但会可靠地从 playing 转为
-            // paused。必须复用 publication replacement，不能让 UI 继续宣称播放中。
-            invalidateCurrentPublication()
+            // paused。意外停播消耗同一请求的有限恢复额度；显式选轨/发布替换仍使用原入口。
+            invalidateCurrentPublication(watchdogActivation: activation)
         }
     }
 

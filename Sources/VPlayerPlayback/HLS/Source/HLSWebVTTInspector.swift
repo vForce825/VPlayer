@@ -9,7 +9,6 @@ enum HLSWebVTTInspector {
         guard bytes.count <= HLSCompatibilityProbe.maximumBytes, let text = String(data: bytes, encoding: .utf8) else { return false }
         let lines = text.components(separatedBy: .newlines)
         guard let first = lines.first, first == "WEBVTT" || first.hasPrefix("WEBVTT ") else { return false }
-        var sawCue = false
         for line in lines.dropFirst() {
             if line.hasPrefix("X-TIMESTAMP-MAP=") {
                 let fields = line.dropFirst("X-TIMESTAMP-MAP=".count).split(separator: ",")
@@ -22,10 +21,12 @@ enum HLSWebVTTInspector {
                 guard parts.count == 2, let start = timestamp(parts[0].trimmingCharacters(in: .whitespaces)),
                       let endText = parts[1].split(whereSeparator: \.isWhitespace).first,
                       let end = timestamp(String(endText)), end > start else { return false }
-                sawCue = true
             }
         }
-        return sawCue
+        // RFC 8216 section 3.5 permits a segment with no cues when subtitles
+        // are absent during its interval. The header and any timing/map fields
+        // still need to pass the same bounded inspection above.
+        return true
     }
     private static func timestamp(_ text: String) -> UInt64? {
         let sections = text.split(separator: ":", omittingEmptySubsequences: false)

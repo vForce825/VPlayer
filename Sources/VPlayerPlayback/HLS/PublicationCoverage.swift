@@ -150,7 +150,8 @@ struct HLSCapacityDerivation: Sendable {
             bodies = try HLSChecked.add(bodies, numerator / denominator + (numerator % denominator == 0 ? 0 : 1))
         }
         let initBytes = (hard ? 160 : 144) * 65_536
-        let maps = 4 * (hard ? 48 : 42) * 16_384
+        let mapCount = try HLSChecked.multiply(4, hard ? 48 : 42)
+        let maps = try HLSChecked.multiply(mapCount, LoopbackStorageLayout.current.mediaMapReservationBytes)
         let total = try HLSChecked.add(Int(bodies), (hard ? 128 : 96) * 1_048_576 + initBytes + maps)
         return Self(requiredSegmentsPerRendition: required, videoCoverageSeconds: seconds,
             participantBitrates: bitrates, initializationBytes: initBytes, mapEvidenceBytes: maps, totalBytes: total)

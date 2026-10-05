@@ -282,15 +282,17 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
     private let resourceContextLedger: PlaybackResourceContextLedger
     private let initialWindowMinimumSeconds: Int
     private let generatedSource: (any HLSGeneratedSourceContext)?
+    private let acceptanceProbe: HLSWriterAcceptanceProbe?
 
     convenience init(sourceURL: URL,
                      startupBufferSeconds: TimeInterval = 3,
                      runtimeEventSink: @escaping RuntimeEventSink = { _ in },
+                     acceptanceProbe: HLSWriterAcceptanceProbe? = nil,
                      generatedSource: (any HLSGeneratedSourceContext)? = nil) throws {
         let minimum = AVPlayerStartupBufferPolicy.initialPublicationSeconds(configured: startupBufferSeconds)
         try self.init(sourceURL: sourceURL, applicationLedger: .shared,
             resourceContextLedger: .shared, runtimeEventSink: runtimeEventSink,
-            graphFactory: nil, productionMinimumSeconds: minimum, generatedSource: generatedSource)
+            graphFactory: nil, productionMinimumSeconds: minimum, acceptanceProbe: acceptanceProbe, generatedSource: generatedSource)
     }
 
     convenience init(validating sourceURL: URL) throws {
@@ -305,17 +307,19 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
         resourceContextLedger: PlaybackResourceContextLedger = .shared,
         runtimeEventSink: @escaping RuntimeEventSink = { _ in },
         graphFactory: @escaping GraphFactory,
+        acceptanceProbe: HLSWriterAcceptanceProbe? = nil,
         generatedSource: (any HLSGeneratedSourceContext)? = nil
     ) throws {
         try self.init(sourceURL: sourceURL, applicationLedger: applicationLedger,
             resourceContextLedger: resourceContextLedger, runtimeEventSink: runtimeEventSink,
-            graphFactory: graphFactory, productionMinimumSeconds: 3, generatedSource: generatedSource)
+            graphFactory: graphFactory, productionMinimumSeconds: 3, acceptanceProbe: acceptanceProbe, generatedSource: generatedSource)
     }
 
     private init(sourceURL: URL, applicationLedger: HLSDeliveryApplicationChargeLedger,
                  resourceContextLedger: PlaybackResourceContextLedger,
                  runtimeEventSink: @escaping RuntimeEventSink, graphFactory: GraphFactory?,
-                 productionMinimumSeconds: Int, generatedSource: (any HLSGeneratedSourceContext)?) throws {
+                 productionMinimumSeconds: Int, acceptanceProbe: HLSWriterAcceptanceProbe?,
+                 generatedSource: (any HLSGeneratedSourceContext)?) throws {
         let scheme = sourceURL.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
             throw PlaybackCoreError.unsupportedProtocol(scheme)
@@ -327,6 +331,7 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
         self.applicationLedger = applicationLedger; self.resourceContextLedger = resourceContextLedger
         self.runtimeEventSink = runtimeEventSink; self.graphFactory = graphFactory
         initialWindowMinimumSeconds = productionMinimumSeconds; self.generatedSource = generatedSource
+        self.acceptanceProbe = acceptanceProbe
     }
 
     func makeBundle(
@@ -345,9 +350,11 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
                 { diagnostic in observation.record(diagnostic) })
         } else {
             let authority = try SystemHLSMediaGraphAuthority(lifecycle: invocation.outputLifecycleEpoch,
+                acceptanceProbe: acceptanceProbe,
                 initialWindowMinimumSeconds: initialWindowMinimumSeconds,
                 failureSink: { diagnostic in observation.record(diagnostic) },
-                generatedSource: generatedSource, sourceCopyApplicationLedger: applicationLedger)
+                generatedSource: generatedSource, sourceCopyApplicationLedger: applicationLedger,
+                sharedControlExecutor: invocation.sharedControlExecutor)
             assembler = HLSMediaGraphAssembler(sourceURL: sourceURLForDiagnostics,
                 applicationLedger: applicationLedger, graph: SystemHLSDeliveryGraph(authority: authority))
         }

@@ -173,12 +173,27 @@ struct SegmentedFMP4FrozenFormat: Sendable, Equatable {
 }
 
 /// 真实系统 callback 的唯一封存点；绑定正式 committed boundary、冻结格式与准确 callback 字节。
+/// Only an actual writer constructor, after frozen-mode and continuation checks,
+/// can issue this origin. No raw Data or absent encoded evidence can create it.
+final class SourceAACWriterOrigin: @unchecked Sendable {
+    let identity = UUID()
+    let authority: SourceAACRenditionAuthority
+    let binding: FMP4WriterBinding
+    let predecessorBinding: FMP4WriterBinding?
+    fileprivate init(authority: SourceAACRenditionAuthority, binding: FMP4WriterBinding,
+                     predecessor: FMP4WriterBinding?) {
+        self.authority = authority; self.binding = binding; predecessorBinding = predecessor
+    }
+}
+
 final class SegmentedFMP4PublicationEvidence: @unchecked Sendable {
     let format: SegmentedFMP4FrozenFormat
     let boundary: SegmentCommittedBoundary?
     let session: SegmentBoundarySession
     let frameDuration: ExactMediaTime?
     let writerSource: SegmentedFMP4CallbackContext
+    fileprivate(set) var sourceAAC: SourceAACCallbackEvidence?
+    fileprivate(set) var dolbyInitialization: DolbyWriterInitializationEvidence?
     private let binding: FMP4WriterBinding
     private let callback: SegmentCallbackTicket
     private let kind: SealedMediaObjectKind
@@ -575,7 +590,7 @@ private final class AVAssetSegmentedFMP4SystemWriter: SegmentedFMP4SystemWriting
         if configuration.mediaType == .video { input.mediaTimeScale = configuration.videoMediaTimeScale }
         guard writer.canAdd(input) else {
             let codec = CMFormatDescriptionGetMediaSubType(sourceFormatHint)
-            if codec == kAudioFormatAC3 || codec == kAudioFormatEnhancedAC3 {
+            if codec == kAudioFormatAC3 || codec == kAudioFormatEnhancedAC3 || codec == kAudioFormatMPEG4AAC {
                 throw SegmentedFMP4WriterFailure.unsupportedCompressedAudioFormat
             }
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
@@ -664,6 +679,7 @@ enum SegmentedFMP4WriterFailure: Error, Sendable, Equatable {
     case rolloverRequired
     case newGenerationRequired
     case unsupportedCompressedAudioFormat
+    case compressedAudioCompatibilityRequired
     case relayCapacityExceeded
     case arithmeticOverflow
 }
@@ -713,6 +729,7 @@ final class WriterWindowContinuation: @unchecked Sendable {
     fileprivate let inputAdmission: WriterInputAdmission
     fileprivate let maximumObservedInputBytes: Int
     fileprivate let compressedBackingAdmission: HLSDataPlaneAdmission
+    fileprivate let sourceAACBinding: SourceAACWriterTerminalBinding?
     private var state: State = .issued
 
     fileprivate init(
@@ -723,8 +740,10 @@ final class WriterWindowContinuation: @unchecked Sendable {
         nextMovieFragmentSequenceNumber: Int,
         inputAdmission: WriterInputAdmission,
         maximumObservedInputBytes: Int,
-        compressedBackingAdmission: HLSDataPlaneAdmission
+        compressedBackingAdmission: HLSDataPlaneAdmission,
+        sourceAACBinding: SourceAACWriterTerminalBinding? = nil
     ) {
+        self.sourceAACBinding = sourceAACBinding
         self.inputAdmission = inputAdmission
         self.maximumObservedInputBytes = maximumObservedInputBytes
         self.compressedBackingAdmission = compressedBackingAdmission
@@ -2152,7 +2171,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private let frozenFormat: SegmentedFMP4FrozenFormat
     private let videoCadencePolicy: SegmentedFMP4VideoCadencePolicy
     private let boundarySession: SegmentBoundarySession
-    private let compressedFormatConfiguration: CompressedAudioFormatConfiguration?
+    let compressedFormatConfiguration: CompressedAudioFormatConfiguration?
     private let ownershipLimits: SegmentedFMP4WriterOwnershipLimits
     private let recordAppendFailureOrdinal: Int?
 #if DEBUG
@@ -2279,6 +2298,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private var finishContinuation: CheckedContinuation<SegmentedFMP4WriterTerminalReceipt, Error>?
     private var storedTerminalReceipt: SegmentedFMP4WriterTerminalReceipt?
     private var firstSystemFailureDiagnostic: ErrorDiagnosticSnapshot?
+    private var firstTypedCallbackFailure: SegmentedFMP4WriterFailure?
     /// endpoint receipt/authority 与 terminal binding 必须在 writer lane 内作为
     /// 一个不可分割的终态推进。成功后的并发 loser 只能被拒绝，不能再把
     /// 已封存的 binding 覆盖成 failure。
@@ -2290,6 +2310,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private var endpointResolution: AACEndpointResolution = .open
     private var timelineMappingReceipt: AACWriterTimelineMappingReceipt?
     private var rolloverPending = false
+    let compressedSourceLayout: AudioChannelLayout?
+    let sourceAACConfiguration: SourceAACWriterConfiguration?
+    let sourceAACTerminalBinding: SourceAACWriterTerminalBinding?
+    private let sourceAACOrigin: SourceAACWriterOrigin?
     let aacTerminalBinding: AACWriterTerminalBinding?
     let aacRenditionTerminalBinding: AACRenditionTerminalBinding?
     let aacWriterWindowAdmission: AACWriterWindowAdmission?
@@ -2309,11 +2333,33 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         writerWindowContinuation: WriterWindowContinuation? = nil,
         recordAppendFailureOrdinal: Int? = nil,
         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
-        acceptanceProbe: HLSWriterAcceptanceProbe? = nil
+        acceptanceProbe: HLSWriterAcceptanceProbe? = nil,
+        sourceAACConfiguration: SourceAACWriterConfiguration? = nil,
+        compressedSourceLayout: AudioChannelLayout? = nil
     ) throws {
         self.binding = binding
         self.trackKind = trackKind
         self.sourceFormatHint = sourceFormatHint
+        self.sourceAACConfiguration = sourceAACConfiguration
+        self.compressedSourceLayout = compressedSourceLayout
+        if let compressedSourceLayout {
+            guard trackKind == .ac3 || trackKind == .eac3,
+                  compressedFormatConfiguration != nil,
+                  try CompressedAudioChannelPositions.bitmap(in: sourceFormatHint)
+                    == CompressedAudioChannelPositions.bitmap(from: compressedSourceLayout) else {
+                throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+            }
+        }
+        if let sourceAACConfiguration {
+            guard trackKind == .aac, aacContinuation == nil,
+                  compressedFormatConfiguration == nil,
+                  CMFormatDescriptionEqual(sourceFormatHint, otherFormatDescription: sourceAACConfiguration.sourceFormatHint),
+                  sourceAACConfiguration.authority.stream.isCurrent else {
+                throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+            }
+        } else if writerWindowContinuation?.sourceAACBinding != nil {
+            throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+        }
         self.videoCadencePolicy = videoCadencePolicy
         guard let frozenFormat = SegmentedFMP4FrozenFormat(sourceFormatHint) else {
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
@@ -2347,7 +2393,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
         }
         if let continuation = aacContinuation {
-            guard trackKind == .aac,
+            guard trackKind == .aac, sourceAACConfiguration == nil,
                   continuation.claim(next: binding),
                   continuation.context.migrate(
                     from: continuation.receipt.binding,
@@ -2364,12 +2410,12 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 continuation: continuation, binding: binding)
         } else {
             incrementalAACFirstGlobalOrdinal = 0
-            aacRenditionTerminalBinding = trackKind == .aac
+            aacRenditionTerminalBinding = trackKind == .aac && sourceAACConfiguration == nil
                 ? AACRenditionTerminalBinding(binding) : nil
             aacWriterWindowAdmission = nil
         }
         if let continuation = writerWindowContinuation {
-            guard trackKind != .aac,
+            guard trackKind != .aac || sourceAACConfiguration != nil,
                   continuation.claim(next: binding, trackKind: trackKind,
                                      frozenFormat: frozenFormat) else {
                 throw SegmentedFMP4WriterFailure.sourceFormatMismatch
@@ -2392,7 +2438,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     nextDecodeTimeStamp: nextDecodeTimeStamp,
                     requiresExactNext: true)
             case let .compressed(duration, nextPTS):
-                guard trackKind == .ac3 || trackKind == .eac3 else {
+                guard trackKind == .ac3 || trackKind == .eac3 || sourceAACConfiguration != nil else {
                     throw SegmentedFMP4WriterFailure.sourceFormatMismatch
                 }
                 compressedCadence = .init(duration: duration, nextPTS: nextPTS)
@@ -2402,9 +2448,25 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         } else {
             writerWindowAdmission = nil
         }
+        if let sourceAACConfiguration {
+            let origin = SourceAACWriterOrigin(authority: sourceAACConfiguration.authority, binding: binding,
+                predecessor: writerWindowContinuation?.predecessorTerminal.binding)
+            sourceAACOrigin = origin
+            if let continuation = writerWindowContinuation {
+                guard let previous = continuation.sourceAACBinding,
+                      previous.configuration.authority === sourceAACConfiguration.authority else {
+                    throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+                }
+                try previous.beginWindow(origin: origin, predecessor: continuation.predecessorTerminal)
+                sourceAACTerminalBinding = previous
+            } else {
+                sourceAACTerminalBinding = try SourceAACWriterTerminalBinding(origin: origin,
+                    configuration: sourceAACConfiguration, applicationLedger: applicationLedger)
+            }
+        } else { sourceAACOrigin = nil; sourceAACTerminalBinding = nil }
         initialMovieFragmentSequenceNumber = aacContinuation?.nextMovieFragmentSequenceNumber
             ?? writerWindowContinuation?.nextMovieFragmentSequenceNumber ?? 1
-        aacTerminalBinding = trackKind == .aac
+        aacTerminalBinding = trackKind == .aac && sourceAACConfiguration == nil
             ? AACWriterTerminalBinding(binding: binding) : nil
         callbackContext = SegmentedFMP4CallbackContext(binding: binding, session: boundarySession,
             source: sourceFormatHint, relay: relay)
@@ -2464,6 +2526,15 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         withLane { storedTerminalReceipt }
     }
 
+    /// A declaration ceiling derived from the admitted decoder configuration.
+    /// This does not enlarge media/cache budgets; measured bytes still enforce it.
+    static func audioPeakEnvelope(configuration: CompressedAudioFormatConfiguration?) -> UInt64 {
+        if case let .eac3(value) = configuration {
+            return max(2_048_000, UInt64(value.maximumDataRateKbps) * 1_000 + 256_000)
+        }
+        return 2_048_000
+    }
+
     var usage: SegmentedFMP4WriterUsage {
         withLane {
             SegmentedFMP4WriterUsage(
@@ -2487,14 +2558,15 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     }
 
     var isAACWriterWindowRolloverPending: Bool {
-        withLane { trackKind == .aac && rolloverPending && state == .started }
+        withLane { trackKind == .aac && sourceAACConfiguration == nil && rolloverPending && state == .started }
     }
 
     var aacCallbackMembershipSnapshot: AACMediaMembershipSnapshot? {
         aacRenditionTerminalBinding?.callbackMembership.snapshot
     }
 
-    func start(at sourceTime: CMTime) throws {
+    func start(at requestedTime: CMTime) throws {
+        let sourceTime = sourceAACConfiguration?.firstPresentationTime.cmTime ?? requestedTime
         try withLane {
             guard sourceTime.isNumeric, sourceTime.epoch == 0, state == .idle else {
                 throw SegmentedFMP4WriterFailure.illegalState
@@ -2515,7 +2587,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 _ = signTerminalIsolated(.failed)
                 throw failure
             }
-            guard state != .terminal else { throw SegmentedFMP4WriterFailure.systemFailure }
+            guard state == .idle else { throw systemFailureIsolated() }
             state = .started
         }
     }
@@ -2678,6 +2750,52 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
 
     /// Service proofs retain raw source PTS; only the private timeline mapping
     /// translates native samples and boundary identity into the same output time.
+    func appendSourceAACAwaitingReadiness(_ unit: SourceAACAccessUnit,
+                                         boundary: SegmentBoundaryCoordinator) async throws {
+        try Task.checkCancellation()
+        guard let configuration = sourceAACConfiguration, let origin = sourceAACOrigin,
+              let terminalBinding = sourceAACTerminalBinding,
+              configuration.authority === unit.configuration.authority, unit.binding == binding,
+              boundary.session === boundarySession, terminalBinding.acceptsInput(unit, origin: origin) else {
+            throw SourceAACFailure.sourceMismatch
+        }
+        let ticket = try boundary.issueSourceAACAppend(for: unit, writerBinding: binding)
+        do {
+            let sample = try makeSourceAACSampleBuffer(unit)
+            let identity = SegmentBoundaryCoordinator.sourceAACIdentity(unit)
+            let operation = try withLane {
+                var admission = try preflightTypedIsolated(sample, ticket: ticket,
+                    sampleIdentity: identity, readinessFailurePolicy: .awaiting)
+                defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                return try beginAwaitingAppendIsolated(sample, ticket: ticket, sampleIdentity: identity,
+                    ownership: FMP4InputOwnership(), validatesSource: { _ in unit.validates() },
+                    admission: &admission, claimOwnership: {
+                        guard terminalBinding.acceptsInput(unit, origin: origin), unit.claimForAppend() else {
+                            throw SourceAACFailure.sourceAlreadyConsumed
+                        }
+                    })
+            }
+            try await completeAwaitingAppend(operation) {
+                try terminalBinding.recordInput(unit, origin: origin)
+            }
+        } catch {
+            ticket.abort(binding: binding, session: boundarySession)
+            throw error
+        }
+    }
+
+    /// Natural source drain is independent from finishWriterWindow().
+    func finishSourceAAC() async throws -> SourceAACFinalSeal {
+        guard let origin = sourceAACOrigin, let sourceAACTerminalBinding else {
+            throw SourceAACFailure.writerBindingMismatch
+        }
+        let terminal = try await finish()
+        return try withLane {
+            try sourceAACTerminalBinding.finishWindow(origin: origin, terminal: terminal)
+            return try sourceAACTerminalBinding.sealSourceEOF(origin: origin, terminal: terminal)
+        }
+    }
+
     func appendMappedCompressedAwaitingReadiness(
         _ submission: CompressedAudioWriterSubmission,
         timed: HLSTimedAudioAccessUnit,
@@ -2899,7 +3017,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ epoch: AACEncodedEpoch,
         coordinator: SegmentBoundaryCoordinator
     ) throws {
-        guard trackKind == .aac,
+        guard trackKind == .aac, sourceAACConfiguration == nil,
               !epoch.buffers.isEmpty,
               coordinator.session === boundarySession else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
@@ -2992,7 +3110,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         coordinator: SegmentBoundaryCoordinator
     ) async throws {
         try Task.checkCancellation()
-        guard trackKind == .aac, !epoch.buffers.isEmpty,
+        guard trackKind == .aac, sourceAACConfiguration == nil, !epoch.buffers.isEmpty,
               coordinator.session === boundarySession else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
@@ -3069,7 +3187,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ emission: AACIncrementalEmission,
         coordinator: SegmentBoundaryCoordinator
     ) throws -> AACIncrementalAppendResult {
-        guard trackKind == .aac,
+        guard trackKind == .aac, sourceAACConfiguration == nil,
               coordinator.session === boundarySession else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
@@ -3274,7 +3392,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         coordinator: SegmentBoundaryCoordinator
     ) async throws -> AACIncrementalAppendResult {
         try Task.checkCancellation()
-        guard trackKind == .aac, coordinator.session === boundarySession else {
+        guard trackKind == .aac, sourceAACConfiguration == nil, coordinator.session === boundarySession else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
         let admitted = try withLane { () throws -> (AwaitingAppend, AACAppendPreparation) in
@@ -3353,6 +3471,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     func finish() async throws -> SegmentedFMP4WriterTerminalReceipt {
         try await withCheckedThrowingContinuation { continuation in
             let immediate: Result<SegmentedFMP4WriterTerminalReceipt, Error>? = withLane {
+                if let firstTypedCallbackFailure { return .failure(firstTypedCallbackFailure) }
                 if let receipt = storedTerminalReceipt { return .success(receipt) }
                 guard state == .started, !finishRequested else {
                     return .failure(SegmentedFMP4WriterFailure.illegalState)
@@ -3399,7 +3518,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     /// 中间窗口真实 finish + callback/publication ownership 全部收敛后才签发接管权。
     /// 它不接收 encoder final receipt，也不封存 P/ENDLIST。
     func finishAACWriterWindow() async throws -> AACWriterWindowContinuation {
-        guard trackKind == .aac else { throw SegmentedFMP4WriterFailure.aacEndpointMismatch }
+        guard trackKind == .aac, sourceAACConfiguration == nil else { throw SegmentedFMP4WriterFailure.aacEndpointMismatch }
         let drainTask = Task { [relay, callbackContext] in
             await relay.waitForPublicationDrain(source: callbackContext)
         }
@@ -3474,7 +3593,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     /// audio branch. The continuation is signed only after system terminal and
     /// publication drain have both completed.
     func finishWriterWindow() async throws -> WriterWindowContinuation {
-        guard trackKind != .aac else {
+        guard trackKind != .aac || sourceAACConfiguration != nil else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
         let drainTask = Task { [relay, callbackContext] in
@@ -3491,6 +3610,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                   rolloverPending,
                   !windowContinuationIssued else {
                 throw SegmentedFMP4WriterFailure.illegalState
+            }
+            if let origin = sourceAACOrigin, let sourceAACTerminalBinding {
+                try sourceAACTerminalBinding.finishWindow(origin: origin, terminal: terminal)
             }
             let cadence: WriterWindowCadence?
             if let value = remuxVideoCadence {
@@ -3512,7 +3634,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 frozenFormat: frozenFormat,
                 cadence: cadence,
                 nextMovieFragmentSequenceNumber: nextFragment, inputAdmission: inputAdmission,
-                maximumObservedInputBytes: maximumObservedInputBytes, compressedBackingAdmission: compressedBackingAdmission)
+                maximumObservedInputBytes: maximumObservedInputBytes, compressedBackingAdmission: compressedBackingAdmission,
+                sourceAACBinding: sourceAACTerminalBinding)
         }
     }
 
@@ -3697,7 +3820,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                         logicalSequence: pending.logicalSequence,
                         bytes: trustedBytes,
                         report: reportReference,
-                        acceptance: acceptance
+                        acceptance: acceptance,
+                        publicationEvidence: publicationEvidence
                     )
                     if kind == .media { try segmentEvidence.retireVerified(sequence: pending.logicalSequence) }
                     guard schedulePublicationIsolated(acceptance) else {
@@ -4021,6 +4145,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             }
             try Task.checkCancellation()
             try withLane {
+                if let firstTypedCallbackFailure { throw firstTypedCallbackFailure }
                 guard state == .started, awaitingAppend?.identity == operation.identity else {
                     throw CancellationError()
                 }
@@ -4132,7 +4257,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     nextPTS: next
                 )
             }
-        } else if trackKind == .ac3 || trackKind == .eac3,
+        } else if trackKind == .ac3 || trackKind == .eac3 || sourceAACConfiguration != nil,
                   let duration = try? ExactMediaTime(CMSampleBufferGetDuration(sampleBuffer)),
                   let pts = try? ExactMediaTime(
                     CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
@@ -4243,7 +4368,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             )
             let rawDTS = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
             decode = rawDTS.isNumeric ? try ExactMediaTime(rawDTS) : presentation
-        } else if trackKind == .ac3 || trackKind == .eac3 {
+        } else if trackKind == .ac3 || trackKind == .eac3 || sourceAACConfiguration != nil {
             duration = try ExactMediaTime(CMSampleBufferGetDuration(sampleBuffer))
             presentation = try ExactMediaTime(
                 CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
@@ -4279,6 +4404,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         readinessFailurePolicy: ReadinessFailurePolicy,
         batchIdentity: UUID? = nil
     ) throws -> AppendPreflightAdmission {
+        if let firstTypedCallbackFailure { throw firstTypedCallbackFailure }
         guard state == .started, awaitingAppend == nil,
               awaitingAACBatch == batchIdentity,
               (!finishRequested || batchIdentity != nil) else {
@@ -4343,7 +4469,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 }
             }
             _ = try pts.adding(duration)
-        } else if trackKind == .ac3 || trackKind == .eac3 {
+        } else if trackKind == .ac3 || trackKind == .eac3 || sourceAACConfiguration != nil {
             guard let duration = facts.duration,
                   let pts = facts.presentationTimeStamp,
                   duration.value > 0,
@@ -4618,6 +4744,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
 
     /// 必须在 cancel/retire 前读取系统首错；这些操作可能覆盖 AVAssetWriter.error。
     private func systemFailureIsolated() -> SegmentedFMP4WriterFailure {
+        if let firstTypedCallbackFailure { return firstTypedCallbackFailure }
         if firstSystemFailureDiagnostic == nil {
             firstSystemFailureDiagnostic = systemWriter.failureDiagnostic
         }
@@ -4660,7 +4787,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         logicalSequence: UInt64,
         bytes: Data,
         report: SegmentReportReference,
-        acceptance: SegmentCallbackAcceptance
+        acceptance: SegmentCallbackAcceptance,
+        publicationEvidence: SegmentedFMP4PublicationEvidence?
     ) throws {
         let byteRange = AudioServiceByteRange(offset: 0, length: bytes.count)
         let digest = Data(SHA256.hash(data: bytes))
@@ -4685,13 +4813,34 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             ]
         )
         lastCallbackReportIdentity = report.identity
+        if let origin = sourceAACOrigin, let sourceAACTerminalBinding {
+            guard let publicationEvidence else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
+            do {
+                publicationEvidence.sourceAAC = try sourceAACTerminalBinding.acceptCallback(origin: origin,
+                    kind: kind, sequence: logicalSequence, bytes: bytes, report: report,
+                    samples: kind == .media ? segmentEvidence.samples(for: logicalSequence) : [])
+            } catch is CompressedAudioInitializationRejection {
+                firstTypedCallbackFailure = .compressedAudioCompatibilityRequired
+                throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
+            }
+        }
+        if kind == .initialization, let compressedSourceLayout, let compressedFormatConfiguration {
+            guard let publicationEvidence else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
+            do {
+                publicationEvidence.dolbyInitialization = try DolbyWriterInitializationEvidence.validate(bytes,
+                    configuration: compressedFormatConfiguration, sourceLayout: compressedSourceLayout)
+            } catch is CompressedAudioInitializationRejection {
+                firstTypedCallbackFailure = .compressedAudioCompatibilityRequired
+                throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
+            }
+        }
         switch kind {
         case .initialization:
             let next = initializationCallbackCount.addingReportingOverflow(1)
             guard !next.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
             initializationCallbackCount = next.partialValue
             initializationBackingIdentity = acceptance.backingIdentity
-            if trackKind == .aac {
+            if trackKind == .aac, sourceAACConfiguration == nil {
                 let object = AACEndpointSealedObjectEvidence(
                     key: HLSResourceKey(
                         itemGeneration: binding.itemGeneration.rawValue,
@@ -4713,7 +4862,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             let next = mediaCallbackCount.addingReportingOverflow(1)
             guard !next.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
             mediaCallbackCount = next.partialValue
-            if trackKind == .aac {
+            if trackKind == .aac, sourceAACConfiguration == nil {
                 guard let leaf = acceptance.aacMediaMembershipLeaf else {
                     throw SegmentedFMP4WriterFailure.systemFailure
                 }
@@ -4738,7 +4887,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 if firstAACMediaEvidence == nil { firstAACMediaEvidence = object }
                 terminalAACMediaEvidence = object
             }
-            if trackKind == .aac,
+            if trackKind == .aac, sourceAACConfiguration == nil,
                timelineMappingReceipt == nil,
                let inputPhysical = windowFirstPhysicalStart
                     ?? aacSnapshot?.firstPhysicalStart,
@@ -4792,7 +4941,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             lastCallbackReportIdentity: lastCallbackReportIdentity
         )
         storedTerminalReceipt = receipt
-        if reason != .finished { aacTerminalBinding?.fail(reason) }
+        if reason != .finished {
+            aacTerminalBinding?.fail(reason)
+            sourceAACTerminalBinding?.fail()
+        }
         if ownsPublicationSource { relay.closePublications() }
         let tickets = pendingCallbacks.map(\.ticket)
         if reason != .finished { inputAdmission.cancel(); compressedBackingAdmission.cancel() }
@@ -5111,6 +5263,31 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
         return scaled.value
+    }
+
+    private func makeSourceAACSampleBuffer(_ unit: SourceAACAccessUnit) throws -> CMSampleBuffer {
+        let charge = unit.payload.count.addingReportingOverflow(HLSOwnedBlockAdmission.fixedOwnerMetadataBytes)
+        guard !charge.overflow, let lease = compressedBackingAdmission.acquire(units: 1,
+            bytes: unit.payload.count, applicationBytes: charge.partialValue) else {
+            throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
+        }
+        // The producer proof/paid source backing follows the actual block alias,
+        // never physical writer completion or a copied NSData no-copy wrapper.
+        let lifetime = WriterInputLifetime { [admission = compressedBackingAdmission, lease, unit] in
+            lease.release(); withExtendedLifetime((admission, unit)) {}
+        }
+        let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(copying: unit.payload, lifetime: lifetime)
+        var timing = CMSampleTimingInfo(duration: unit.duration.cmTime,
+            presentationTimeStamp: unit.presentationStart.cmTime, decodeTimeStamp: .invalid)
+        var size = unit.payload.count
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: sourceFormatHint, sampleCount: 1, sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &size,
+            sampleBufferOut: &sample) == noErr, let sample else {
+            throw SegmentedFMP4WriterFailure.systemFailure
+        }
+        return sample
     }
 
     private func makeCompressedSampleBuffer(

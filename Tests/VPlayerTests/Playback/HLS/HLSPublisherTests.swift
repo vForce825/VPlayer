@@ -1578,6 +1578,7 @@ final class Task19Track: @unchecked Sendable {
     let epochStart: ExactMediaTime
     let plannedDurations: [ExactMediaTime]?
     let formatVariant: Task19.FormatVariant
+    private let videoFrameRate: Int32
     private var firstMedia: SealedMediaObject?
     private var formalWriter: SegmentedFMP4Writer?
     private let terminalLogicalSequence: UInt64?
@@ -1602,7 +1603,7 @@ final class Task19Track: @unchecked Sendable {
          offsets: [Int64]? = nil, plannedDurations: [ExactMediaTime]? = nil,
          bindingOverride: FMP4WriterBinding? = nil, terminalSegment: Bool = false,
          terminalLogicalSequence: UInt64? = nil,
-         formatVariant: Task19.FormatVariant = .baseline) async throws {
+         formatVariant: Task19.FormatVariant = .baseline, videoFrameRate: Int32 = 24) async throws {
         binding = try bindingOverride ?? Task19.binding(id: id, epoch: epoch,
             writer: PlaybackIdentityAllocator.shared.next(in: .nonce), item: item)
         self.mediaType = mediaType
@@ -1614,6 +1615,7 @@ final class Task19Track: @unchecked Sendable {
         epochStart = start
         self.plannedDurations = plannedDurations
         self.formatVariant = formatVariant
+        self.videoFrameRate = videoFrameRate
         self.terminalLogicalSequence = terminalSegment ? sequence : terminalLogicalSequence
         format = try XCTUnwrap(CMSampleBufferGetFormatDescription(Task19.sample(mediaType: mediaType,
             start: start.cmTime, duration: duration.cmTime, channels: channels, formatVariant: formatVariant)))
@@ -1632,7 +1634,7 @@ final class Task19Track: @unchecked Sendable {
             formalWriter = try await sink.produceFormal(mediaType: mediaType, sequence: sequence, start: start, duration: firstDuration,
                 boundary: boundary, format: format, continuing: nil,
                 terminalSegment: self.terminalLogicalSequence == sequence,
-                formatVariant: formatVariant)
+                formatVariant: formatVariant, videoFrameRate: videoFrameRate)
         } else { try await sink.produce(mediaType: mediaType, sequence: sequence, start: start, duration: duration) }
         initialization = try XCTUnwrap(sink.take(.initialization))
         firstMedia = try XCTUnwrap(sink.take(.media))
@@ -1657,7 +1659,7 @@ final class Task19Track: @unchecked Sendable {
                 formalWriter = try await sink.produceFormal(mediaType: mediaType, sequence: nextSequence, start: nextStart,
                     duration: actualDuration, boundary: boundary, format: format, continuing: formalWriter,
                     terminalSegment: terminalLogicalSequence == nextSequence,
-                    formatVariant: formatVariant)
+                    formatVariant: formatVariant, videoFrameRate: videoFrameRate)
             } else { try await sink.produce(mediaType: mediaType, sequence: nextSequence, start: nextStart, duration: duration) }
             if let extraInit = sink.take(.initialization) { XCTAssertTrue(relay.releaseForControl(extraInit)) }
             object = try XCTUnwrap(sink.take(.media))
@@ -1806,7 +1808,7 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
     func produceFormal(mediaType: FinalFMP4MediaType, sequence: UInt64, start: ExactMediaTime,
                        duration: ExactMediaTime, boundary: SegmentBoundaryCoordinator, format: CMFormatDescription,
                        continuing previous: SegmentedFMP4Writer?, terminalSegment: Bool = false,
-                       formatVariant: Task19.FormatVariant = .baseline) async throws -> SegmentedFMP4Writer {
+                       formatVariant: Task19.FormatVariant = .baseline, videoFrameRate: Int32 = 24) async throws -> SegmentedFMP4Writer {
         let relay = try XCTUnwrap(relay)
         // Use the genuine persistent per-kind live-input policy. The real native
         // writer controls backing release across flush; this fixture neither raises
@@ -1817,12 +1819,12 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
             acceptanceProbe: formalWriterProbe)
         if previous == nil { try writer.start(at: start.cmTime) }
         if mediaType == .video {
-            let count = Int(CMTimeConvertScale(duration.cmTime, timescale: 24, method: .default).value)
-            XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(count), timescale: 24), duration.cmTime), 0)
+            let count = Int(CMTimeConvertScale(duration.cmTime, timescale: videoFrameRate, method: .default).value)
+            XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(count), timescale: videoFrameRate), duration.cmTime), 0)
             for index in (previous == nil ? 0 : 1)...(terminalSegment ? count - 1 : count) {
                 let sample = try Task19.sample(mediaType: .video,
-                    start: CMTimeAdd(start.cmTime, CMTime(value: Int64(index), timescale: 24)),
-                    duration: CMTime(value: 1, timescale: 24), isSync: index == 0 || index == count,
+                    start: CMTimeAdd(start.cmTime, CMTime(value: Int64(index), timescale: videoFrameRate)),
+                    duration: CMTime(value: 1, timescale: videoFrameRate), isSync: index == 0 || index == count,
                     formatVariant: formatVariant)
                 let output = Task19.videoOutput(sample, sequence: sequence * 100 + UInt64(index))
                 try await writer.appendVideoAwaitingReadiness(output, ticket: boundary.issueVideoAppend(for: output, writerBinding: binding))
@@ -2219,7 +2221,7 @@ final class Task19Harness: @unchecked Sendable {
          terminalLogicalSequence: UInt64? = nil,
          publicationClock: HLSNaturalEndPublicationClock? = nil,
          plannedSegmentDurations: [ExactMediaTime]? = nil,
-         initialFormatVariants: [UInt64: Task19.FormatVariant] = [:]) async throws {
+         initialFormatVariants: [UInt64: Task19.FormatVariant] = [:], videoFrameRate: Int32 = 24) async throws {
         let sessionToken = loopbackSession?.value ?? token
         store = loopbackSession.map { SealedMediaStore(loopbackSession: $0, itemGeneration: 19) }
             ?? SealedMediaStore(token: sessionToken, itemGeneration: 19)
@@ -2252,7 +2254,7 @@ final class Task19Harness: @unchecked Sendable {
         if !audioOnly { tracks[1] = try await Task19Track(id: 1, mediaType: .video, duration: videoDuration,
             boundary: boundary, plannedDurations: plannedSegmentDurations ?? specialVideo,
             terminalLogicalSequence: terminalLogicalSequence,
-            formatVariant: initialFormatVariants[1] ?? .baseline) }
+            formatVariant: initialFormatVariants[1] ?? .baseline, videoFrameRate: videoFrameRate) }
         for index in 0..<audioCount { tracks[UInt64(index + 2)] = try await Task19Track(id: UInt64(index + 2), mediaType: .audio,
             duration: audioDuration, start: audioStart, item: audioOnly ? UInt64(20 + index) : 19,
             boundary: boundary, channels: [2, 6, 8][index], offsets: audioBoundaryOffsets,
@@ -2263,7 +2265,7 @@ final class Task19Harness: @unchecked Sendable {
             declaration.video!.width = Int(CMVideoFormatDescriptionGetDimensions(track.format).width)
             declaration.video!.height = Int(CMVideoFormatDescriptionGetDimensions(track.format).height)
             declaration.video!.codec = try XCTUnwrap(track.initialization.publicationEvidence).format.codec
-            declaration.video!.frameRateMilli = 24_000
+            declaration.video!.frameRateMilli = UInt64(videoFrameRate) * 1_000
         }
         for index in declaration.audio.indices {
             declaration.audio[index].codec = .aac

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 VPlayer contributors
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
-"""Public synthetic 6-second GOP / continuous tones; no private media input.
+"""Public synthetic 5-second GOP / continuous tones; no private media input.
 
 360 seconds is source media time, not a playback duration option. The player stops
 before 300 wall seconds. Generation itself has a separate 300-second wall budget.
@@ -10,6 +10,7 @@ before 300 wall seconds. Generation itself has a separate 300-second wall budget
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -29,6 +30,22 @@ def file_hash(path, deadline):
     return digest.hexdigest()
 
 
+def validate_video_packets(packets):
+    """Validate actual generated transport facts before assigning fixture provenance."""
+    if len(packets)!=9000:
+        raise ValueError('expected exactly360 seconds at25fps in the comparison source')
+    times=[float(packet['pts_time']) for packet in packets]
+    if not all(math.isfinite(value) for value in times):
+        raise ValueError('nonfinite source video packet timestamp')
+    if any(abs(right-left-.04)>1/90000 for left,right in zip(times,times[1:])):
+        raise ValueError('source video packet timeline is not continuous25fps')
+    keys=[instant for packet,instant in zip(packets,times) if 'K' in packet.get('flags','')]
+    if len(keys)!=72 or keys[0]!=times[0] or any(abs(right-left-5)>1/90000 for left,right in zip(keys,keys[1:])):
+        raise ValueError('comparison fixture must have real five-second keyframe intervals')
+    return dict(gop_seconds=5,keyframe_count=len(keys),video_packet_count=len(times),
+        observed_video_span_seconds=times[-1]-times[0]+.04)
+
+
 def generate():
     deadline=time.monotonic()+300
     def run(*args):
@@ -40,11 +57,11 @@ def generate():
     output=ROOT/'Tests/Fixtures/HLSAcceptance'
     output.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='hls-synthetic-') as directory:
-        video=str(Path(directory)/'six-second.mp4')
+        video=str(Path(directory)/'five-second.mp4')
         run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-f','lavfi','-i',
-            'testsrc2=s=1280x720:r=25:d=6','-c:v','libx264','-threads','2','-preset','ultrafast',
-            '-pix_fmt','yuv420p','-g','150','-keyint_min','150','-sc_threshold','0','-an',video)
-        run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-stream_loop','59','-i',video,
+            'testsrc2=s=1280x720:r=25:d=5','-c:v','libx264','-threads','2','-preset','ultrafast',
+            '-pix_fmt','yuv420p','-g','125','-keyint_min','125','-sc_threshold','0','-an',video)
+        run(FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-stream_loop','71','-i',video,
             '-f','lavfi','-i','aevalsrc=0.12*sin(2*PI*997*t)|0.12*sin(2*PI*1511*t):s=48000:d=360:c=stereo',
             '-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','ac3','-b:a','192k',
             '-t','360','-map_metadata','-1','-muxdelay','0','-muxrate','37000000','-f','mpegts',str(output/'persistent-360s.ts'))
@@ -54,9 +71,14 @@ def generate():
     audio_stream=next(stream for stream in probe['streams'] if stream['codec_type']=='audio')
     assert (video_stream['codec_name'],video_stream['width'],video_stream['height'],video_stream['r_frame_rate'])==('h264',1280,720,'25/1')
     assert (audio_stream['codec_name'],audio_stream['sample_rate'],audio_stream['channels'])==('ac3','48000',2)
+    packet_probe=json.loads(run(FFPROBE,'-v','error','-select_streams','v:0','-show_packets',
+        '-show_entries','packet=pts_time,flags','-of','json',str(output/'persistent-360s.ts')))
+    video_observation=validate_video_packets(packet_probe['packets'])
     manifest={'source':'public lavfi test pattern and two continuous tones; no private media',
         'ffmpeg_version':'8.1.2','ffmpeg_raw_version':version,'ffmpeg_source_commit':tool_evidence['source_commit'],
-        'source_media_seconds':360,'maximum_playback_wall_seconds':300,'ts_muxrate_bps':37000000,
+        'source_media_seconds':360,'gop_seconds':5,'video_observation':video_observation,
+        'comparison_reason':'same five-second source is admitted by unchanged old-writer256-record maps; candidate six-second coverage is separate',
+        'maximum_playback_wall_seconds':300,'ts_muxrate_bps':37000000,
         'paced_transport_bps':38000000,'transport_description':'CBR null-packet padded synthetic TS; not complex 38 Mbps video',
         'fixture_sha256':file_hash(output/'persistent-360s.ts', deadline)}
     (output/'provenance.json').write_text(json.dumps(manifest,indent=2)+'\n')

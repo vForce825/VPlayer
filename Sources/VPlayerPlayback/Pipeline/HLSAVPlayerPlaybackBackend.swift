@@ -93,6 +93,10 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     var generatedBundleCallsForTesting: Int { lock.withLock { sourceBundleCalls } }
     #if DEBUG
     var nativeCoordinatorForTesting: NativeHLSItemCoordinator? { lock.withLock { nativeAdapter?.coordinator } }
+    @MainActor var nativeSystemDriverForTesting: SystemAVPlayerDriver? {
+        let lease = lock.withLock { sessionLease }
+        return lease?.driver as? SystemAVPlayerDriver
+    }
     #endif
 
     /// legacy 注入路径在 construction 时已有 coordinator；系统路径则必须等同一 bundle

@@ -2,3 +2,6 @@ Public synthetic source from Scripts/generate-hls-acceptance-fixture.py.
 Verified FFmpeg8.1.2 source and host-tool provenance required. No private media.
 Source timeline360seconds; common native source/player observation includes prebuffer and never exceeds300seconds.
 The large generated transport stream remains runner-local. Baseline and candidate must have the same SHA256.
+Five-second GOP at25fps keeps the identical old-writer/candidate comparison inside the unchanged old256-record map limit.
+Candidate six-second50p/60p video and48k AAC admission have separate genuine native paid-map regressions.
+38Mbps is the paced transport target;37Mbps TS padding does not claim equivalent encoded-video complexity.

@@ -497,6 +497,17 @@ final class HLSTimelineCoordinator {
         }
     }
 
+    func installDolbyProducer(_ producer: DolbyAudioSourceProducer) throws {
+        guard let sharedControlExecutor, sharedControlExecutor === producer.sharedControlExecutor else {
+            throw DolbyAudioSourceFailure.missingOutputAuthority
+        }
+        try sharedControlExecutor.sync {
+            guard state == nil, !terminalDelivered, dolbyProducer == nil,
+                  compressedAudioOutputPlanBinding == nil else { throw DolbyAudioSourceFailure.missingOutputAuthority }
+            dolbyProducer = producer
+        }
+    }
+
     deinit {
         sourceAudioStream?.invalidate()
         dolbyProducer?.invalidateSourceInput()

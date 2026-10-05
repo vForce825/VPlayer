@@ -2,10 +2,79 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreMedia
 import XCTest
 @testable import VPlayerPlayback
 
 final class GeneratedAudioFailureFenceTests: XCTestCase {
+    func testSameFormatAACAndDolbyDiscontinuityUsesOneOwnedGenerationRecovery() async throws {
+        for codec: AudioCodec in [.aac, .ac3, .eac3] {
+            let context = try GeneratedAudioTestContext(codec: codec) { true }
+            let executor = PlaybackControlExecutor(allocator: PlaybackIdentityAllocator(),
+                applyIngress: { _ in .applied }, applyTerminalIngress: { _ in },
+                applyOutputControl: { _, _ in .rejected })
+            let graph = try SystemHLSMediaGraphAuthority(lifecycle: context.lifecycle,
+                generatedSource: context, sharedControlExecutor: executor)
+            let ingress = HLSDataPlaneAdmission(capacity: 3, maximumBytes: 4_096)
+            let tracks = DemuxTrackSet(selectedProgramID: nil, video: nil,
+                audio: .init(streamIndex: 1, codec: codec, timeBase: MediaRational(num: 1, den: 48_000)!,
+                    sampleRate: 48_000, channelLayout: .init(channelCount: 2, nativeMask: 3),
+                    extradata: codec == .aac ? Data([0x11, 0x90]) : Data(),
+                    metadata: .init(role: .main, service: .independentMain, dispositions: [.default])))
+            for event: DemuxEvent in [.tracks(tracks), .discontinuity(tracks, reason: .timelineReset),
+                                     .discontinuity(tracks, reason: .timelineReset)] {
+                graph.append(.init(event: event,
+                    admissionTail: DemuxAdmissionTail(lease: try XCTUnwrap(ingress.acquire(bytes: 1_024)))))
+            }
+            let deadline = Date().addingTimeInterval(2)
+            while graph.failureDiagnostic == nil && Date() < deadline { await Task.yield() }
+            XCTAssertNotNil(graph.failureDiagnostic)
+            XCTAssertEqual(context.generationCalls, 1)
+            XCTAssertEqual(context.compatibilityCalls, 0)
+            let retired = await graph.retireAllResourcesAndAwaitReceipt()
+            XCTAssertTrue(retired)
+        }
+    }
+
+    func testGeneratedSourceAACNativeTrialDoesNotCreateCompatibilityCalibration() async throws {
+        let context = try GeneratedAudioTestContext { true }
+        let probe = HLSWriterAcceptanceProbe()
+        let graph = try SystemHLSMediaGraphAuthority(lifecycle: context.lifecycle,
+            acceptanceProbe: probe, generatedSource: context)
+        let ingress = HLSDataPlaneAdmission(capacity: 2, maximumBytes: 4_096)
+        let tracks = DemuxTrackSet(selectedProgramID: nil, video: nil,
+            audio: .init(streamIndex: 1, codec: .aac, timeBase: MediaRational(num: 1, den: 48_000)!,
+                sampleRate: 48_000, channelLayout: .init(channelCount: 2, nativeMask: 3),
+                extradata: Data([0x11, 0x90])))
+        graph.append(AdmittedDemuxEvent(event: .tracks(tracks),
+            admissionTail: DemuxAdmissionTail(lease: try XCTUnwrap(ingress.acquire(bytes: 1_024)))))
+        graph.append(AdmittedDemuxEvent(event: .packet(.init(streamIndex: 1, codec: .audio(.aac),
+            data: Data([0x21, 0x10, 0x56, 0xE5]),
+            presentationTimeStamp: CMTime(value: 480_000, timescale: 48_000),
+            decodeTimeStamp: .invalid, duration: .invalid, isKey: true, isCorrupt: false)),
+            admissionTail: DemuxAdmissionTail(lease: try XCTUnwrap(ingress.acquire(bytes: 4)))))
+        let deadline = Date().addingTimeInterval(2)
+        while probe.snapshot.nativeWriterCount == 0 && graph.failureDiagnostic == nil && Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(probe.snapshot.nativeWriterCount, 1, "Actual first native format trial must run")
+        XCTAssertEqual(graph.audioCalibrationAttemptsForTesting, 0)
+        // One raw-AU trial does not prove init/media publication or decoder output.
+        // The separate genuine source publication fixture supplies that gate.
+        let retired = await graph.retireAllResourcesAndAwaitReceipt()
+        XCTAssertTrue(retired)
+        XCTAssertTrue(probe.snapshot.isComplete)
+    }
+
+    func testDeclaredEAC3EnvelopeTracksActualConfigurationWithoutChangingCaps() throws {
+        for (rate, envelope): (UInt16, UInt64) in [(4_096, 4_352_000), (6_144, 6_400_000)] {
+            let configuration = CompressedAudioFormatConfiguration.eac3(try .init(sampleRate: 48_000,
+                bsid: 16, bsmod: 0, audioCodingMode: 7, hasLFE: true, asvc: false, maximumDataRateKbps: rate))
+            XCTAssertEqual(SegmentedFMP4Writer.audioPeakEnvelope(configuration: configuration), envelope)
+        }
+        XCTAssertEqual(SegmentedFMP4Writer.audioPeakEnvelope(configuration: nil), 2_048_000)
+    }
+
     func testGeneratedVideoPlanCannotWashUnknownOrConflictingScanIntoRemux() {
         for plan: HLSPlaybackPlan.Video in [.source, .remux, .deinterlaceAndEncode, .unsupported] {
             for source: HLSScanEvidence in [.unknown, .progressive, .interlaced, .contradictory] {
@@ -94,6 +163,27 @@ final class GeneratedAudioFailureFenceTests: XCTestCase {
         XCTAssertTrue(retired)
     }
 
+    func testTypedWriterFailuresUseOnlyTheirOriginalOwnedRecovery() async throws {
+        for accepted in [false, true] {
+            for compatibility in [false, true] {
+                let context = try GeneratedAudioTestContext { accepted }
+                let sink = GeneratedAudioCounter()
+                let graph = try SystemHLSMediaGraphAuthority(lifecycle: context.lifecycle,
+                    acceptanceProbe: HLSWriterAcceptanceProbe(), failureSink: { _ in sink.increment() },
+                    generatedSource: context)
+                graph.recordFailureForTesting(compatibility
+                    ? SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
+                    : SegmentedFMP4WriterFailure.newGenerationRequired)
+                XCTAssertEqual(context.compatibilityCalls, compatibility ? 1 : 0)
+                XCTAssertEqual(context.generationCalls, compatibility ? 0 : 1)
+                XCTAssertEqual(sink.value, accepted ? 0 : 1)
+                XCTAssertNotNil(graph.failureDiagnostic)
+                let retired = await graph.retireAllResourcesAndAwaitReceipt()
+                XCTAssertTrue(retired)
+            }
+        }
+    }
+
     func testCapacityCancellationAndInternalErrorsDoNotLatchCodecRejection() async throws {
         let errors: [any Error] = [CancellationError(), AACRenditionFailure.capacityExceeded,
                                    SegmentedFMP4WriterFailure.systemFailure]
@@ -144,22 +234,30 @@ private final class GeneratedAudioTestContext: HLSGeneratedSourceContext, @unche
     let lifecycle: OutputLifecycleEpoch
     private let source: ResolvedPlaybackSource
     private let calls = GeneratedAudioCounter()
+    private let generations = GeneratedAudioCounter()
     private let callback: @Sendable () -> Bool
     var isCurrent: Bool { true }
     var compatibilityCalls: Int { calls.value }
-    init(callback: @escaping @Sendable () -> Bool) throws {
+    var generationCalls: Int { generations.value }
+    init(codec: AudioCodec = .aac, callback: @escaping @Sendable () -> Bool) throws {
         let context = try sourceContext()
         let owner = try XCTUnwrap(context.owner)
         lifecycle = .init(backendIdentity: owner.backendIdentity, outputNonce: owner.outputLifecycleNonce)
         source = .init(context: context, responseURL: context.entryURL, generation: 1, topology: .media(Data()))
         facts = .init(source: source, media: [.init(url: context.entryURL, container: .mpegTS,
-            video: nil, audio: [.init(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2,
-                channelMask: 3, decoderConfiguration: Data([0x11, 0x90]), priming: .notSignaledPreserveTimestamps,
+            video: nil, audio: [.init(codec: codec, profile: codec == .aac ? 1 : (codec == .ac3 ? 8 : 16),
+                sampleRate: 48_000, channelCount: 2,
+                channelMask: 3, decoderConfiguration: codec == .aac ? Data([0x11, 0x90]) : Data(), priming: .notSignaledPreserveTimestamps,
                 service: .independentMain, formatValidated: true)], hasUnsupportedTracks: false)],
             complete: true, inspectedBytes: 1)
         plan = .init(owner: owner, resolutionGeneration: 1, transport: .generated, video: .source,
-            audio: .passthrough(.aac), selectedServiceURL: context.entryURL, formatFingerprint: facts.formatFingerprint)
+            audio: .passthrough(codec), selectedServiceURL: context.entryURL, formatFingerprint: facts.formatFingerprint,
+            compressedAudioAdmissionCandidate: codec == .aac ? nil : .init(codec: codec,
+                profile: codec == .ac3 ? 8 : 16, sampleRate: 48_000, channelCount: 2, channelMask: 3,
+                decoderConfiguration: Data(), outputRouteIdentifier: "original-test-route",
+                requiresAACCompatibilityRendition: false))
         self.callback = callback
     }
     func requestCompatibleAudioGeneration() -> Bool { calls.increment(); return callback() }
+    func requestNewGeneration() -> Bool { generations.increment(); return callback() }
 }

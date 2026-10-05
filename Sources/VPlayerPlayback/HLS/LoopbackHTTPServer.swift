@@ -28,18 +28,37 @@ struct LoopbackStorageLayout: Sendable {
     let httpSoftTemporaryBytes = 576 * 1_024
     let httpHardTemporaryBytes = 768 * 1_024
 
-    func decodeMapAllocation(sampleCount: Int, commonSpanCount: Int) throws -> Int {
-        guard (1...256).contains(sampleCount), (0...48).contains(commonSpanCount) else {
+    //384 video records cover the admitted60p×6s boundary plus one frame.
+    //320 AAC records cover48k×6s/1024 plus one AU. The extra metadata is paid
+    //inside the unchanged store/application caps, never as extra media history.
+    let mediaMapReservationBytes = 40 * 1_024
+
+    func decodeMapAllocation(sampleCount: Int, commonSpanCount: Int,
+                             maximumSampleCount: Int = 256) throws -> Int {
+        guard [256, 320, 384].contains(maximumSampleCount),
+              (1...maximumSampleCount).contains(sampleCount), (0...48).contains(commonSpanCount) else {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
-        let samples = try HLSChecked.multiply(sampleCount, decodeSampleStride)
-        let spans = try HLSChecked.multiply(commonSpanCount, MemoryLayout<Range<Int>>.stride)
-        let raw = try HLSChecked.add(MemoryLayout<SealedDecodeCoverageMap>.stride,
-                                     try HLSChecked.add(samples, spans))
+        return try decodeMapStorageAllocation(sampleCapacity: maximumSampleCount, commonSpanCapacity: 48)
+    }
+
+    func decodeMapStorageAllocation(sampleCapacity: Int, commonSpanCapacity: Int) throws -> Int {
+        guard (1...512).contains(sampleCapacity), (0...64).contains(commonSpanCapacity) else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        // Actual Array.capacity is checked against this same allocator arithmetic
+        // after parsing; spare capacity cannot escape the prepaid envelope.
+        let samples = try HLSChecked.add(HLSChecked.multiply(sampleCapacity, decodeSampleStride), 32)
+        let spans = try HLSChecked.add(HLSChecked.multiply(commonSpanCapacity, MemoryLayout<Range<Int>>.stride), 32)
+        let raw = try HLSChecked.add(MemoryLayout<SealedDecodeCoverageMap>.stride + SealedDecodeCoverageMap.prepaymentAllocationBytes,
+            HLSChecked.add(Int(malloc_good_size(samples)), Int(malloc_good_size(spans))))
         let rounded = (try HLSChecked.add(raw, 15)) & ~15
-        guard rounded <= 32 * 1_024 else { throw CompletedMediaEvidenceError.capacityExceeded }
+        guard try HLSChecked.add(rounded, 4_096) <= mediaMapReservationBytes else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
         return rounded
     }
+
 }
 
 enum LoopbackHTTPReservationError: Error, Equatable {
@@ -788,6 +807,7 @@ struct FrozenTimelineMappingStorage: Sendable {
     let effectivePlaybackHorizon: ExactMediaTime
     let endpointAuthority: AACEffectiveEndpointAuthority?
     let prefixReceipt: AACPrefixPlaybackMappingReceipt?
+    let sourceAACBinding: SourceAACWriterTerminalBinding?
 }
 
 final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
@@ -802,11 +822,13 @@ final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
     var writtenPhysicalBase: ExactMediaTime {
         aacEndpointReceipt?.writtenPhysicalBase
             ?? storage.prefixReceipt?.mapping.writtenPhysicalBase
+            ?? sourceAACBinding?.writtenStart
             ?? visiblePhysicalOrigin
     }
     var writtenEffectiveBase: ExactMediaTime {
         aacEndpointReceipt?.writtenEffectiveBase
             ?? storage.prefixReceipt?.mapping.writtenEffectiveBase
+            ?? sourceAACBinding?.writtenStart
             ?? visiblePhysicalOrigin
     }
     var mapping: PlayerItemTimelineMapping {
@@ -827,6 +849,7 @@ final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
     private var endpointAuthority: AACEffectiveEndpointAuthority? { storage.endpointAuthority }
     var aacEndpointReceipt: AACEffectiveEndpointReceipt? { endpointAuthority?.receipt }
     var aacPrefixReceipt: AACPrefixPlaybackMappingReceipt? { storage.prefixReceipt }
+    var sourceAACBinding: SourceAACWriterTerminalBinding? { storage.sourceAACBinding }
 
     private var identity: UUID { storage.identity }
     private var authorityBinding: LoopbackPublicationAuthorityBinding { selectedCapability.authorityBinding }
@@ -881,7 +904,8 @@ final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
         publicationSequence: UInt64,
         selection: LoopbackAudioMediaSelectionCapability?
     ) -> Bool {
-        guard item.outputLifecycleEpoch == outputLifecycleEpoch,
+        guard sourceAACBinding?.isCurrent ?? true,
+              item.outputLifecycleEpoch == outputLifecycleEpoch,
               itemURL == owner.frozenPublication!.itemURL,
               item.outputLifecycleEpoch == authorityBinding.outputLifecycleEpoch,
               item.itemGeneration == itemGeneration,
@@ -898,7 +922,8 @@ final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
         to binding: LoopbackPublicationAuthorityBinding,
         selection: LoopbackAudioMediaSelectionCapability
     ) -> Bool {
-        authorityBinding == binding
+        (sourceAACBinding?.isCurrent ?? true)
+            && authorityBinding == binding
             && selectedCapability === selection
             && selection.belongs(to: binding)
     }
@@ -1353,15 +1378,18 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         /// route、direct item 与后续 authority 必须统一读取这个冻结路径。
         let playlistPath: String
         let audioCodec: HLSAudioCodec?
+        let sourceAACBinding: SourceAACWriterTerminalBinding?
         var aacTimelineMapping: AACWriterTimelineMappingReceipt? {
             if case .aac(let value) = timelineBinding { return value.timelineMappingReceipt }; return nil
         }
         init(store: SealedMediaStore, origin: LoopbackPublicationOrigin, writerBinding: FMP4WriterBinding,
              playlistPath: String, audioCodec: HLSAudioCodec?,
-             aacTimelineMapping: AACWriterTerminalBinding?) {
+             aacTimelineMapping: AACWriterTerminalBinding?,
+             sourceAACBinding: SourceAACWriterTerminalBinding?) {
             self.store = store; self.playlistPath = playlistPath
             self.origin = origin
             self.audioCodec = audioCodec
+            self.sourceAACBinding = sourceAACBinding
             timelineBinding = aacTimelineMapping.map(TimelineBinding.aac) ?? .other(.init(
                 mediaEpoch: writerBinding.mediaEpoch, participant: writerBinding.publicationParticipantID,
                 rendition: writerBinding.renditionIdentity, writer: writerBinding.writerIdentity))
@@ -1400,6 +1428,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         var playlistPath: String { definition.playlistPath }
         var audioCodec: HLSAudioCodec? { definition.audioCodec }
         var aacTimelineMapping: AACWriterTimelineMappingReceipt? { definition.aacTimelineMapping }
+        var sourceAACBinding: SourceAACWriterTerminalBinding? { definition.sourceAACBinding }
         var initializationKeys: FrozenResourceMembership {
             .init(definition: definition, sequence: playlistVersion, kind: .initialization)
         }
@@ -1729,6 +1758,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     private let frozenParticipants: FrozenParticipantTable
     private let aacTerminalBindings: [UInt64: AACWriterTerminalBinding]
     private let aacRenditionBindings: [UInt64: AACRenditionTerminalBinding]
+    private let sourceAACTerminalBindings: [UInt64: SourceAACWriterTerminalBinding]
     private let authorityBindings = FixedHistory<LoopbackPublicationAuthorityBinding>()
     private let participantsByPublication = FixedHistory<FrozenParticipantHistoryTable>()
     private var publicationEventHandler: (@Sendable (UInt64) -> Void)?
@@ -1971,7 +2001,21 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         let frozenAACParticipantIDs = Set(frozenParticipants.values.compactMap {
             $0.mediaType == .audio && $0.audioCodec == .aac ? $0.participantID : nil
         })
-        guard frozenParticipants.values.allSatisfy({
+        let frozenSourceAACIDs = Set(frozenParticipants.values.compactMap {
+            $0.audioCodec == .sourceAAC ? $0.participantID : nil
+        })
+        guard frozenSourceAACIDs == Set(publishedSnapshot.sourceAACTerminalBindings.keys),
+              publishedSnapshot.sourceAACTerminalBindings.allSatisfy({ id, binding in
+                  guard binding.isCurrent, let frozen = frozenParticipants[id] else { return false }
+                  let initial = binding.configuration.authority.initialBinding
+                  return frozen.sourceAACBinding === binding
+                    && initial.outputLifecycleEpoch == frozen.writerBinding.outputLifecycleEpoch
+                    && initial.itemGeneration == frozen.writerBinding.itemGeneration
+                    && initial.mediaEpoch == frozen.writerBinding.mediaEpoch
+                    && initial.publicationParticipantID.rawValue == id
+                    && initial.renditionIdentity == frozen.renditionIdentity
+              }),
+              frozenParticipants.values.allSatisfy({
                   $0.writerBinding.outputLifecycleEpoch == outputLifecycleEpoch
               }),
               frozenAACParticipantIDs
@@ -2015,6 +2059,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         self.frozenParticipants = frozenParticipants
         aacTerminalBindings = publishedSnapshot.aacTerminalBindings
         aacRenditionBindings = publishedSnapshot.aacRenditionBindings
+        sourceAACTerminalBindings = publishedSnapshot.sourceAACTerminalBindings
         authorityBinding = .init(origin: origin,
             publicationSequence: publishedSnapshot.publicationSequence,
             publicationSnapshotIdentity: publicationSnapshotIdentity)
@@ -2124,7 +2169,8 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 definition: .init(store: store, origin: origin, writerBinding: entry.binding,
                 playlistPath: playlistPath,
                 audioCodec: audioCodec,
-                aacTimelineMapping: snapshot.aacTerminalBindings[entry.participantID]),
+                aacTimelineMapping: snapshot.aacTerminalBindings[entry.participantID],
+                sourceAACBinding: snapshot.sourceAACTerminalBindings[entry.participantID]),
                 playlistIdentity: playlist.identity,
                 playlistVersion: playlist.version,
                 effectivePlaybackHorizon: effectivePlaybackHorizon
@@ -2571,7 +2617,8 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                   let sequence = pendingPublication.consume(
                     serverPublisherIdentity: publisherIdentity,
                     itemGeneration: declaration.itemGeneration,
-                    terminalBindings: aacTerminalBindings) else {
+                    terminalBindings: aacTerminalBindings,
+                    sourceBindings: sourceAACTerminalBindings) else {
                 throw LoopbackHTTPServerError.invalidConfiguration
             }
             return try makeAVPlayerPreparationRequestLocked(
@@ -2596,7 +2643,14 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         var onlyAudio: FrozenParticipant?
         for frozen in participants where frozen.mediaType == .audio {
             audioCount += 1; onlyAudio = frozen
-            if frozen.audioCodec == .aac {
+            if frozen.audioCodec == .sourceAAC {
+                guard let source = sourceAACTerminalBindings[frozen.participantID], source.isCurrent,
+                      source === frozen.sourceAACBinding,
+                      source.configuration.authority.initialBinding.outputLifecycleEpoch == item.outputLifecycleEpoch,
+                      source.configuration.authority.initialBinding.renditionIdentity == frozen.renditionIdentity else {
+                    throw LoopbackHTTPServerError.invalidConfiguration
+                }
+            } else if frozen.audioCodec == .aac {
                 guard let terminalBinding = aacTerminalBindings[frozen.participantID],
                       terminalBinding.binding.renditionIdentity
                         == frozen.renditionIdentity,
@@ -2656,7 +2710,9 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                   requirement.renditionIdentity == direct,
                   requirement.codec == preparationAudioRequirement(at: 0).codec,
                   requirement.terminalBinding === aacTerminalBindings[participant.participantID],
-                  requirement.renditionBinding === aacRenditionBindings[participant.participantID] else {
+                  requirement.renditionBinding === aacRenditionBindings[participant.participantID],
+                  requirement.sourceAACBinding === sourceAACTerminalBindings[participant.participantID],
+                  requirement.sourceAACBinding?.isCurrent ?? true else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
             // A terminal-only AAC request can reserve the publisher's next CAS,
@@ -2750,9 +2806,11 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         }
         let value = selected!
         return .init(renditionIdentity: value.renditionIdentity,
-            codec: value.audioCodec == .aac ? .aac : .explicitlyNonAAC,
+            codec: value.audioCodec == .sourceAAC ? .sourceAAC
+                : value.audioCodec == .aac ? .aac : .explicitlyNonAAC,
             terminalBinding: aacTerminalBindings[value.participantID],
-            renditionBinding: aacRenditionBindings[value.participantID])
+            renditionBinding: aacRenditionBindings[value.participantID],
+            sourceAACBinding: sourceAACTerminalBindings[value.participantID])
     }
 
     /// completed HTTP facts、selection capability 与 writer terminal authority 在同一
@@ -2843,6 +2901,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 receipt: AACEffectiveEndpointReceipt
             )?
             var prefixReceipt: AACPrefixPlaybackMappingReceipt?
+            var sourceAACBinding: SourceAACWriterTerminalBinding?
             switch selectedCodec {
             case .aac:
                 guard let frozenMapping = selected.aacTimelineMapping else {
@@ -2976,6 +3035,27 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 writtenEffectiveBase = frozenMapping.writtenEffectiveBase
                 effectivePlaybackHorizon = selection.selectionWindow.end
                 endpointToConsume = (endpointAuthority, receipt)
+            case .sourceAAC:
+                guard endpointAuthority == nil,
+                      let root = selected.sourceAACBinding, root.isCurrent,
+                      sourceAACTerminalBindings[selected.participantID] === root,
+                      let writtenStart = root.writtenStart,
+                      let completedParticipant = completedPublication.participants.first(where: {
+                          $0.participantID == selected.participantID
+                      }), let completedSlot = completedParticipant.completedMedia.indices.first(where: {
+                          completedParticipant.completedMedia[$0].backingIdentity == selection.backingIdentity
+                      }), let source = store.sourceAACProof(preparationSlot: completedSlot,
+                          ownerSlot: owner.slot), source.binding === root, source.isCurrent,
+                      root.validatesTimeline(writtenPhysicalBase: writtenStart,
+                          writtenEffectiveBase: writtenStart, effectivePlaybackHorizon: selection.selectionWindow.end),
+                      try HLSChecked.compare(selection.selectionWindow.end, selected.effectivePlaybackHorizon) <= 0 else {
+                    return reject("source_aac_proof")
+                }
+                endpointReceipt = nil
+                writtenPhysicalBase = writtenStart
+                writtenEffectiveBase = writtenStart
+                effectivePlaybackHorizon = selection.selectionWindow.end
+                sourceAACBinding = root
             case .ac3, .eac3:
                 guard endpointAuthority == nil else { return .invalid }
                 endpointReceipt = nil
@@ -3011,7 +3091,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 effectiveSourceOrigin: effectiveSourceOrigin,
                 effectivePlaybackHorizon: effectivePlaybackHorizon,
                 endpointAuthority: endpointReceipt == nil ? nil : endpointAuthority,
-                prefixReceipt: prefixReceipt)
+                prefixReceipt: prefixReceipt, sourceAACBinding: sourceAACBinding)
             let mappingAuthority = PlayerItemTimelineMappingAuthority(owner: owner)
             owner.timelineAuthority = mappingAuthority
             return .ready(mappingAuthority)
@@ -3189,7 +3269,15 @@ final class LoopbackHTTPServer: @unchecked Sendable {
            latest.renditionIdentity != scope.selection.renditionIdentity {
             throw AVPlayerItemCoordinatorFailure.selectionChanged
         }
-        if audio.audioCodec == .aac {
+        if audio.audioCodec == .sourceAAC {
+            guard let root = audio.sourceAACBinding, root.isCurrent,
+                  root === scope.timeline.sourceAACBinding,
+                  root.validatesTimeline(writtenPhysicalBase: scope.timeline.writtenPhysicalBase,
+                      writtenEffectiveBase: scope.timeline.writtenEffectiveBase,
+                      effectivePlaybackHorizon: scope.timeline.effectivePlaybackHorizon) else {
+                throw AVPlayerItemCoordinatorFailure.invalidTimeline
+            }
+        } else if audio.audioCodec == .aac {
             guard let mapping = audio.aacTimelineMapping,
                   mapping.writtenPhysicalBase == scope.timeline.writtenPhysicalBase,
                   mapping.writtenEffectiveBase == scope.timeline.writtenEffectiveBase,
@@ -3206,7 +3294,25 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 end = participant.effectivePlaybackHorizon
             }
         }
-        if try HLSChecked.compare(end, ordinaryEnd) < 0 {
+        if try HLSChecked.compare(end, ordinaryEnd) < 0, audio.audioCodec == .sourceAAC {
+            guard let root = audio.sourceAACBinding, root === scope.timeline.sourceAACBinding,
+                  root.isCurrent, let seal = root.finalSeal else {
+                throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+            }
+            for participant in current where participant.mediaType == .video
+                || participant.participantID == scope.selection.participantID {
+                let final = participant.mediaType == .video
+                    ? store.currentFinalVideoPublication(continuing: participant.writerBinding)
+                    : store.currentFinalPublication(matching: seal.terminal.binding)
+                guard let final, store.validatesCurrentFinalPublication(final),
+                      final.matchesSnapshot(identity: participant.playlistIdentity,
+                          publicationSequence: participant.playlistVersion),
+                      final.effectivePlaybackHorizon == participant.effectivePlaybackHorizon,
+                      participant.mediaType == .video || store.validatesSourceAACFinal(final, binding: root) else {
+                    throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+                }
+            }
+        } else if try HLSChecked.compare(end, ordinaryEnd) < 0 {
             guard audio.audioCodec == .aac, let mapping = audio.aacTimelineMapping else {
                 throw AVPlayerItemCoordinatorFailure.insufficientCoverage
             }
@@ -4571,6 +4677,10 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         _ physical: FMP4PresentationRange,
         for participant: FrozenParticipant
     ) -> FMP4PresentationRange? {
+        if participant.audioCodec == .sourceAAC {
+            guard participant.sourceAACBinding?.isCurrent == true else { return nil }
+            return physical
+        }
         guard participant.mediaType == .audio,
               participant.audioCodec == .aac else {
             return physical

@@ -9,6 +9,51 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testExactNativeFirstClockAdvanceSettlesDeadlineAndOldActivationCannotSettleSuccessor() async throws {
+        let clock = ManualPlaybackClock(100)
+        try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let original = try XCTUnwrap(fixture.driver.lastPositiveInvocation)
+            let originalItem = try XCTUnwrap(fixture.driver.currentItemIdentity)
+            XCTAssertNotNil(fixture.registry.outputResourceContextSnapshot()?.parentDeadline)
+            fixture.driver.advanceMedia(to: ExactMediaTime(value: 1, timescale: 1))
+            clock.advance(nanoseconds: 250_000_000)
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot()?.parentDeadline == nil }
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            let accepted = await backend.requestWatchdogRecovery(activation: original.activation)
+            XCTAssertTrue(accepted)
+            try await fixture.until { fixture.isPlaying && fixture.driver.currentItemIdentity != originalItem }
+            let successor = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.parentDeadline)
+            let arm = try XCTUnwrap(fixture.registry.playbackOperationDeadlineArmSnapshot())
+            XCTAssertFalse(original.completeObservedMediaProgress())
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.parentDeadline, successor)
+            XCTAssertEqual(fixture.registry.playbackOperationDeadlineArmSnapshot(), arm)
+            fixture.driver.advanceMedia(to: ExactMediaTime(value: 2, timescale: 1))
+            clock.advance(nanoseconds: 250_000_000)
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot()?.parentDeadline == nil }
+        }
+    }
+
+    func testNativeRateWithoutClockAdvanceDoesNotSettleOriginalStartupDeadline() async throws {
+        let clock = ManualPlaybackClock(100)
+        try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let parent = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.parentDeadline)
+            let budget: PlaybackProgressBudgetTicket
+            switch parent { case .coldStart(let value), .outputRecovery(let value): budget = value }
+            XCTAssertNotNil(fixture.registry.playbackOperationDeadlineArmSnapshot())
+            let remaining = try budget.remainingNanoseconds(at: clock.nowNanoseconds)
+            XCTAssertGreaterThan(remaining, 0)
+            clock.advance(nanoseconds: remaining - 1)
+            fixture.registry.executor.sync {}
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.parentDeadline, parent)
+            clock.advance(nanoseconds: 1)
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
+            XCTAssertEqual(fixture.driver.plays, 1)
+            XCTAssertEqual(fixture.driver.installs, 1)
+        }
+    }
+
     func testActualAdapterPreparesActivatesPausesResumesAndRetiresWithoutGeneratedWork() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             fixture.play()
@@ -149,6 +194,31 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testOwnedCompressedInitRejectionJoinsBeforeOneAACAttemptAndSecondFailureIsTerminal() async throws {
+        try await NativeAdapterFixture.withFixture(generated: true) { fixture in
+            let retirement = NativeFixtureGate(); fixture.gates.append(retirement)
+            fixture.factory.retry.retirementGate = retirement
+            fixture.play()
+            try await fixture.until { retirement.entered }
+            XCTAssertEqual(fixture.factory.retry.decisions, [.passthrough(.ac3)])
+            XCTAssertEqual(fixture.factory.retry.accepted, [true])
+            XCTAssertEqual(fixture.driver.installs, 0)
+            let original = try XCTUnwrap(fixture.factory.retry.firstOwner)
+            let rejection = try XCTUnwrap(original.audioRejectionRecord())
+            XCTAssertTrue(rejection.matches(try compatibleCandidate(from: original, newSignature: true)))
+            XCTAssertFalse(rejection.matches(try compatibleCandidate(from: original, differentLayout: true)))
+            XCTAssertFalse(rejection.matches(try compatibleCandidate(from: original, differentRequest: true)))
+            retirement.release()
+            try await fixture.until { fixture.factory.retry.decisions.count == 2 && fixture.registry.outputResourceContextSnapshot() == nil }
+            XCTAssertEqual(fixture.factory.retry.decisions, [.passthrough(.ac3), .compatibleAAC])
+            XCTAssertEqual(fixture.factory.retry.accepted, [true, false], "Second fallback failure cannot claim another compatible retry")
+            XCTAssertEqual(fixture.factory.retry.retired, 2)
+            XCTAssertEqual(fixture.driver.installs, 0)
+            XCTAssertFalse(original.requestCompatibleAudioGeneration(), "A retired failed attempt cannot poison its successor")
+            XCTAssertEqual(fixture.factory.backend?.generatedBundleCallsForTesting, 2)
+        }
+    }
+
     func testNativeMetadataChangesReachControllerStreamAndPauseInvalidatesSameLifecycle() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             let stream = await fixture.controller.playbackMediaInformation()
@@ -170,6 +240,32 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
             XCTAssertEqual(fixture.metadata.count, count, "Paused stale events cannot republish the prior activation")
         }
     }
+    private func compatibleCandidate(from original: HLSOwnedSourcePlan, newSignature: Bool = false,
+                                     differentLayout: Bool = false, differentRequest: Bool = false) throws -> HLSOwnedSourcePlan {
+        let previous = try original.selectedMediaFacts()
+        let request = differentRequest ? UUID() : original.source.context.requestID
+        let session = PlaybackSessionIdentity(sessionID: differentRequest ? 999 : original.plan.owner.backendIdentity.sessionIdentity.sessionID, requestID: request)
+        let backend = PlaybackBackendIdentity(sessionIdentity: session, backendGeneration: original.plan.owner.backendIdentity.backendGeneration)
+        let owner = PlaybackSourceOwner(backendIdentity: backend, prepareNonce: 2, outputLifecycleNonce: 2)
+        let url = newSignature ? URL(string: "https://native-fixture.invalid/master?signature=refreshed")! : original.source.responseURL
+        let context = try PlaybackSourceContext(requestID: request, sourceProfileID: original.source.context.sourceProfileID,
+            channelID: original.source.context.channelID, entryURL: url).bound(to: owner)
+        let source = ResolvedPlaybackSource(context: context, responseURL: url, generation: 2, topology: .media(Data([0x47])))
+        let audio = HLSSourceAudioFacts(codec: .ac3, profile: 8, sampleRate: 48_000,
+            channelCount: differentLayout ? 2 : 6, channelMask: differentLayout ? 3 : 0x3F,
+            priming: .notSignaledPreserveTimestamps, service: .independentMain, formatValidated: true)
+        let facts = HLSCompatibilityFacts(source: source, media: [.init(url: url, container: .mpegTS,
+            video: previous.video, audio: [audio], hasUnsupportedTracks: false)], complete: true, inspectedBytes: 188)
+        let candidate = HLSCompressedAudioAdmissionCandidate(codec: .ac3, profile: 8, sampleRate: audio.sampleRate,
+            channelCount: audio.channelCount, channelMask: audio.channelMask, decoderConfiguration: Data(),
+            outputRouteIdentifier: "fresh-preparation-scope", requiresAACCompatibilityRendition: false)
+        let plan = HLSPlaybackPlan(owner: owner, resolutionGeneration: 2, transport: .generated, video: .remux,
+            audio: .passthrough(.ac3), selectedServiceURL: url, formatFingerprint: facts.formatFingerprint,
+            compressedAudioAdmissionCandidate: candidate)
+        return try .init(source: source, facts: facts, plan: plan, resolver: original.resolver,
+            sourceCharge: original.sourceCharge, factsCharge: HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.factsRetention))
+    }
+
 }
 
 /// Every exit, including assertion helper timeout and a throwing test body,
@@ -187,18 +283,22 @@ private final class NativeAdapterFixture {
     var tasks: [Task<Void, Never>] = []
     var metadata: [PlaybackMediaInformation?] = []
     var cleanupCompleted = false
-    private init() throws {
-        registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+    private let manualClock: ManualPlaybackClock?
+    private init(generated: Bool, clock: ManualPlaybackClock?) throws {
+        manualClock = clock
+        registry = clock.map { ControlTaskRegistry(allocator: PlaybackIdentityAllocator(), clock: $0) } ?? ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         inspector = NativeFixtureInspector(driver: driver)
-        factory = NativeFixtureFactory(driver: driver, inspector: inspector, probe: probe)
+        probe.generated = generated
+        factory = NativeFixtureFactory(driver: driver, inspector: inspector, probe: probe, generated: generated)
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
     }
-    static func withFixture(_ body: (NativeAdapterFixture) async throws -> Void) async throws {
-        let fixture = try NativeAdapterFixture()
+    static func withFixture(generated: Bool = false, clock: ManualPlaybackClock? = nil,
+                            _ body: (NativeAdapterFixture) async throws -> Void) async throws {
+        let fixture = try NativeAdapterFixture(generated: generated, clock: clock)
         var failure: (any Error)?
         do { try await body(fixture) } catch { failure = error }
         fixture.gates.forEach { $0.release() }
@@ -216,7 +316,9 @@ private final class NativeAdapterFixture {
     }
     var isPlaying: Bool {
         let context = registry.outputResourceContextSnapshot()
-        return context?.prepared == true && context?.interval != nil && driver.rate > 0 && driver.currentItemIdentity != nil
+        guard let context, let task = context.sourceTask else { return false }
+        return context.prepared && context.interval != nil && registry.phase(of: task) == .terminal(.completed)
+            && driver.rate > 0 && driver.currentItemIdentity != nil
     }
     func spawn(_ body: @escaping @MainActor () async -> Void) { tasks.append(Task { await body() }) }
     func play() {
@@ -235,7 +337,13 @@ private final class NativeAdapterFixture {
     }
     func until(_ predicate: @MainActor () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(5)
-        while !predicate(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        while !predicate(), ContinuousClock.now < deadline {
+            if let manualClock, case .pending(let pending) = registry.outputRouteObservationSnapshot(),
+               let observation = pending.ticket, let stability = try registry.armOutputRouteStability(observation: observation) {
+                manualClock.set(max(manualClock.nowNanoseconds, stability.deadlineInstant))
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
         guard predicate() else {
             XCTFail("Native fixture timed out: \(String(describing: registry.outputResourceContextSnapshot()))")
             throw HLSSourceError.deadline
@@ -272,8 +380,10 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
     private let driver: NativeFixtureDriver
     private let inspector: NativeFixtureInspector
     private let probe: NativeFixtureProbe
-    init(driver: NativeFixtureDriver, inspector: NativeFixtureInspector, probe: NativeFixtureProbe) {
-        self.driver = driver; self.inspector = inspector; self.probe = probe
+    private let generated: Bool
+    let retry = NativeRetryRecorder()
+    init(driver: NativeFixtureDriver, inspector: NativeFixtureInspector, probe: NativeFixtureProbe, generated: Bool) {
+        self.driver = driver; self.inspector = inspector; self.probe = probe; self.generated = generated
     }
     nonisolated func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
         channelID: String, url: URL, eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
@@ -285,22 +395,33 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
         let context = try XCTUnwrap(sourceContext)
         let media = URL(string: "https://native-fixture.invalid/media")!
         let alternate = URL(string: "https://native-fixture.invalid/alternate")!
-        let transport = SourceTestTransport(responses: [url: .init(responseURL: url,
-            data: Data("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nmedia\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nalternate\n".utf8)),
+        let root = generated ? "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n" :
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nmedia\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nalternate\n"
+        let transport = SourceTestTransport(responses: [url: .init(responseURL: url, data: Data(root.utf8)),
             media: .init(responseURL: media, data: Data("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n".utf8)),
             alternate: .init(responseURL: alternate, data: Data("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n".utf8))])
         var dependencies = HLSNativeSourceDependencies(context: context)
         dependencies.makeResolver = { URLSessionPlaybackSourceResolver(transport: transport) }
         dependencies.probe = probe
         dependencies.makeInspector = { [inspector] _ in inspector }
-        dependencies.capabilities = { _, _ in NativeFixtureProbe.capabilities }
+        if generated {
+            dependencies.capabilities = { _, _ in
+                .init(videoProfiles: [.h264: [100]], compressedAudioCodecs: [.ac3],
+                    compressedAudioAdmissionCandidates: [.init(codec: .ac3, profile: 8, sampleRate: 48_000,
+                        channelCount: 6, channelMask: 0x3F, decoderConfiguration: Data(),
+                        outputRouteIdentifier: "bounded-fixture-candidate", requiresAACCompatibilityRendition: false)], supportsGenerated: true)
+            }
+        } else { dependencies.capabilities = { _, _ in NativeFixtureProbe.capabilities } }
         let lease = try HomePodAVPlayerSession(identity: identity.sessionIdentity, driver: driver).claim(backend: identity)
         let slot = ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
         let backend = HLSAVPlayerPlaybackBackend(identity: identity,
             bundleBuilder: try SystemHLSOutputItemBundleBuilder(validating: url),
             coordinatorFactory: { _ in throw HLSSourceError.unsupportedMedia }, replacementSlot: slot)
         backend.configureSourceRouting(dependencies: dependencies, sessionLease: lease,
-            builderFactory: { _, _ in throw HLSSourceError.unsupportedMedia }, eventSink: eventSink)
+            builderFactory: { [retry] _, owned in
+                guard let owned else { throw HLSSourceError.unboundOwner }
+                return NativeRetryBuilder(owned: owned, recorder: retry)
+            }, eventSink: eventSink)
         self.backend = backend
         return backend
     }
@@ -309,6 +430,8 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
 private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Sendable {
     private let lock = NSLock()
     private var gateValue: NativeFixtureGate?
+    private var generatedValue = false
+    var generated: Bool { get { lock.withLock { generatedValue } } set { lock.withLock { generatedValue = newValue } } }
     var gate: NativeFixtureGate? { get { lock.withLock { gateValue } } set { lock.withLock { gateValue = newValue } } }
     static func video(width: Int32 = 1_920) -> HLSVideoFacts {
         .init(codec: .h264, profile: 100, scan: .progressive, parameterSetsValidated: true,
@@ -328,8 +451,10 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
     func inspect(_ source: ResolvedPlaybackSource) async throws -> HLSCompatibilityFacts {
         await gate?.wait()
         guard case let .hls(graph) = source.topology else { throw HLSSourceError.unsupportedMedia }
+        let audio = generated ? HLSSourceAudioFacts(codec: .ac3, profile: 8, sampleRate: 48_000, channelCount: 6,
+            channelMask: 0x3F, priming: .notSignaledPreserveTimestamps, service: .independentMain, formatValidated: true) : Self.audio
         let media = graph.orderedDocuments.filter { $0.kind == .media }.map {
-            HLSMediaFacts(url: $0.responseURL, container: .mpegTS, video: Self.video(width: $0.responseURL.path == "/alternate" ? 1_280 : 1_920), audio: [Self.audio], hasUnsupportedTracks: false)
+            HLSMediaFacts(url: $0.responseURL, container: .mpegTS, video: Self.video(width: $0.responseURL.path == "/alternate" ? 1_280 : 1_920), audio: [audio], hasUnsupportedTracks: false)
         }
         return .init(source: source, media: media, complete: true, inspectedBytes: 188)
     }
@@ -365,7 +490,9 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var readyGate: NativeFixtureGate?, prerollGate: NativeFixtureGate?, connectionGate: NativeFixtureGate?
     var installs = 0, prerolls = 0, plays = 0, joins = 0, selectionRevision = 0
     var failReady = false
+    var lastPositiveInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
     private var clock = ExactMediaTime.zero
+    func advanceMedia(to time: ExactMediaTime) { clock = time }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws { throw HLSSourceError.unboundOwner }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws {
         guard try admission({ currentItemIdentity = identity; physical = NSObject(); installs += 1 }) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
@@ -386,6 +513,7 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {}
     func play(invocation: ControlTaskRegistry.BackendPositiveRateInvocation, item: AVPlayerItemInstanceIdentity) async throws {
         guard invocation.revalidateCurrentAuthority(), currentItemIdentity == item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        lastPositiveInvocation = invocation
         rate = 1; timeControlStatus = .playing; plays += 1
     }
     func playbackClockObservation(item: AVPlayerItemInstanceIdentity) -> AVPlayerPlaybackClockObservation { item == currentItemIdentity ? .currentItem(clock) : .staleItem }
@@ -409,4 +537,40 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     func seek(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity, playhead: PreparedPlayheadIdentity) async throws -> AVPlayerSeekReceipt { throw HLSSourceError.unsupportedMedia }
     func waitForLoadedTimeRanges(item: AVPlayerItemInstanceIdentity, playhead: PreparedPlayheadIdentity, covering requested: ExactMediaInterval) async throws -> AVPlayerLoadedRangeReceipt { throw HLSSourceError.unsupportedMedia }
     func preroll(item: AVPlayerItemInstanceIdentity, playhead: PreparedPlayheadIdentity) async throws -> AVPlayerPrerollReceipt { throw HLSSourceError.unsupportedMedia }
+}
+
+private final class NativeRetryRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var decisionsValue: [HLSAudioDecision] = [], acceptedValue: [Bool] = []
+    private var retiredValue = 0
+    private var owner: HLSOwnedSourcePlan?
+    private var gate: NativeFixtureGate?
+    var decisions: [HLSAudioDecision] { lock.withLock { decisionsValue } }
+    var accepted: [Bool] { lock.withLock { acceptedValue } }
+    var retired: Int { lock.withLock { retiredValue } }
+    var firstOwner: HLSOwnedSourcePlan? { lock.withLock { owner } }
+    var retirementGate: NativeFixtureGate? { get { lock.withLock { gate } } set { lock.withLock { gate = newValue } } }
+    func record(_ source: HLSOwnedSourcePlan) {
+        lock.withLock { precondition(decisionsValue.count < 3); decisionsValue.append(source.plan.audio); if owner == nil { owner = source } }
+    }
+    func reject(_ source: HLSOwnedSourcePlan) {
+        let accepted = source.requestCompatibleAudioGeneration()
+        lock.withLock { precondition(acceptedValue.count < 3); acceptedValue.append(accepted) }
+    }
+    func retire() async -> Bool {
+        await retirementGate?.wait()
+        lock.withLock { retiredValue += 1 }
+        return true
+    }
+}
+private struct NativeRetryBuilder: HLSOutputItemBundleBuilding {
+    let owned: HLSOwnedSourcePlan
+    let recorder: NativeRetryRecorder
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws -> HLSOutputItemBundle {
+        recorder.record(owned)
+        return HLSOutputItemBundle(startProducer: {
+            recorder.reject(owned)
+            throw HLSSourceError.unsupportedMedia
+        }, retireProducer: { await recorder.retire() })
+    }
 }

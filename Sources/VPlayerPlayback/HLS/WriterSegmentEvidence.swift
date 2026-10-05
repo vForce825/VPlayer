@@ -80,6 +80,9 @@ final class WriterSegmentEvidence {
             duration: duration, projectedBytes: projectedBytes))
     }
 
+    /// Temporary value snapshot retains the existing paid metadata leases.
+    func samples(for sequence: UInt64) -> [Sample] { sequences[sequence] ?? [] }
+
     func retireVerified(sequence: UInt64) throws {
         guard let retired = sequences.removeValue(forKey: sequence) else {
             throw SegmentedFMP4WriterFailure.boundaryMismatch

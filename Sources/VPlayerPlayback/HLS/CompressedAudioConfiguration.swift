@@ -276,3 +276,72 @@ private func dataLiteral(_ value: UInt32) -> Data {
         UInt8(value & 0xFF),
     ])
 }
+
+/// Facts read from one selected Core Audio Dolby cookie. This type cannot issue
+/// a writer, timeline, emitted-initialization or route capability.
+struct NativeDolbyAudioConfiguration: Sendable, Equatable {
+    let codec: AudioCodec
+    let profile: Int32
+    let sampleRate: Int32
+    let channelCount: Int32
+    let backChannelMask: UInt64
+    let sideChannelMask: UInt64
+    let canonicalBox: Data
+
+    static func parse(cookie: Data, codec: AudioCodec, sampleRate: Int32) throws -> Self {
+        let box = try configurationBox(cookie, codec: codec)
+        let mode: UInt8, lfe: Bool, profile: UInt8, factualRate: Int32
+        switch codec {
+        case .ac3:
+            let config = try AC3CompressedAudioConfiguration.parse(box: box, sampleRate: sampleRate)
+            guard config.bsid <= 10, config.bsmod == 0 else { throw CompressedAudioConfigurationValidationError.invalidSourceFacts }
+            mode = config.audioCodingMode; lfe = config.hasLFE; profile = config.bsid
+            factualRate = [Int32(48_000), 44_100, 32_000][Int(config.fscod)] >> max(Int(config.bsid) - 8, 0)
+        case .eac3:
+            let config = try EAC3CompressedAudioConfiguration.parse(box: box, sampleRate: sampleRate)
+            // fscod3 omits the exact half-rate in dec3. Do not invent it from
+            // the caller's ASBD; this bounded contract requires observed evidence.
+            guard config.fscod < 3, config.bsmod == 0, !config.asvc else { throw CompressedAudioConfigurationValidationError.invalidSourceFacts }
+            mode = config.audioCodingMode; lfe = config.hasLFE; profile = config.bsid
+            factualRate = [Int32(48_000), 44_100, 32_000][Int(config.fscod)]
+        default: throw CompressedAudioConfigurationValidationError.invalidSourceFacts
+        }
+        guard factualRate == sampleRate, (1...7).contains(mode) else { throw CompressedAudioConfigurationValidationError.configurationMismatch }
+        let bases: [UInt64] = [0, 0x4, 0x3, 0x7, 0x103, 0x107, 0x33, 0x37]
+        let back = bases[Int(mode)] | (lfe ? 0x8 : 0)
+        let side = mode >= 6 ? (back & ~UInt64(0x30)) | 0x600 : back
+        return .init(codec: codec, profile: Int32(profile), sampleRate: factualRate,
+            channelCount: Int32(back.nonzeroBitCount), backChannelMask: back, sideChannelMask: side, canonicalBox: box)
+    }
+    func matches(_ source: HLSSourceAudioFacts, observedChannelMask: UInt64) -> Bool {
+        guard source.formatValidated, source.service == .independentMain, source.codec == codec,
+              source.profile == profile, source.sampleRate == sampleRate, source.channelCount == channelCount,
+              source.channelMask == observedChannelMask,
+              observedChannelMask == backChannelMask || observedChannelMask == sideChannelMask else { return false }
+        if source.decoderConfiguration.isEmpty { return true }
+        return (try? Self.configurationBox(source.decoderConfiguration, codec: codec)) == canonicalBox
+    }
+    /// Supported forms are a raw dac3/dec3 payload, one full atom, or the bounded
+    /// Core Audio frma + atom cookie with its optional eight-byte terminator.
+    private static func configurationBox(_ bytes: Data, codec: AudioCodec) throws -> Data {
+        let type: [UInt8], wire: [UInt8], payloadCount: Int
+        switch codec {
+        case .ac3: type = [0x64, 0x61, 0x63, 0x33]; wire = [0x61, 0x63, 0x2D, 0x33]; payloadCount = 3
+        case .eac3: type = [0x64, 0x65, 0x63, 0x33]; wire = [0x65, 0x63, 0x2D, 0x33]; payloadCount = 5
+        default: throw CompressedAudioConfigurationValidationError.invalidSourceFacts
+        }
+        let count = payloadCount + 8
+        if bytes.count == payloadCount { return Data([0, 0, 0, UInt8(count)] + type) + bytes }
+        if bytes.count == count { return bytes }
+        guard bytes.count == 12 + count || bytes.count == 12 + count + 8,
+              bytes.prefix(12) == Data([0, 0, 0, 12, 0x66, 0x72, 0x6D, 0x61] + wire) else {
+            throw CompressedAudioConfigurationValidationError.invalidConfigurationBox
+        }
+        if bytes.count == 12 + count + 8 {
+            guard bytes.suffix(8) == Data([0, 0, 0, 8, 0, 0, 0, 0]) else {
+                throw CompressedAudioConfigurationValidationError.invalidConfigurationBox
+            }
+        }
+        return bytes.subdata(in: 12..<(12 + count))
+    }
+}

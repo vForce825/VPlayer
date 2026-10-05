@@ -643,6 +643,21 @@ final class SegmentBoundaryCoordinator {
         }
     }
 
+    func issueSourceAACAppend(for unit: SourceAACAccessUnit,
+                              writerBinding: FMP4WriterBinding) throws -> SegmentBoundaryAppendTicket {
+        guard unit.binding == writerBinding, unit.validates() else { throw SegmentBoundaryFailure.ticketMismatch }
+        let identity = Self.sourceAACIdentity(unit)
+        return try lock.withLock {
+            let decision = try decideAudio(rendition: writerBinding.renditionIdentity,
+                at: unit.presentationStart.cmTime)
+            return try makeTicket(decision, binding: writerBinding, sampleIdentity: identity)
+        }
+    }
+    static func sourceAACIdentity(_ unit: SourceAACAccessUnit) -> SegmentBoundarySampleIdentity {
+        .aac(sample: unit.inputIdentity, presentationStart: unit.presentationStart,
+            format: ObjectIdentifier(unit.configuration.sourceFormatHint), digest: unit.payloadSHA256)
+    }
+
     func issueMappedCompressedAudioAppend(_ submission: CompressedAudioWriterSubmission,
                                          timed: HLSTimedAudioAccessUnit,
                                          writerBinding: FMP4WriterBinding) throws -> SegmentBoundaryAppendTicket {

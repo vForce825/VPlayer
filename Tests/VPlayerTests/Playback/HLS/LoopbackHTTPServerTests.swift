@@ -324,7 +324,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertThrowsError(try store.pausedWindowCoverageReceipt(workspace: workspace,
             rendition: .init(rawValue: 1), requested: XCTUnwrap(map.samples.first).presentationRange))
         let baseline = PlaybackResourceContextLedger.shared.chargedBytes
-        for dimensions in [(0, 0), (129, 129), (1, 257), (128, 32_769)] {
+        for dimensions in [(0, 0), (129, 129), (1, 385), (128, 49_153)] {
             XCTAssertThrowsError(try PausedCoverageWorkspace.allocationLimits(
                 mapCount: dimensions.0, sampleCount: dimensions.1))
         }
@@ -357,7 +357,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let map = try SealedDecodeCoverageMap(mediaType: .video,
             sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8], samples: samples)
         let request = try range(0, 30)
-        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256) { storage in
+        try withUnsafeTemporaryAllocation(of: UInt16.self, capacity: 256) { storage in
             let order = UnsafeMutableBufferPointer(rebasing: storage[..<samples.count])
             try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
             let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
@@ -420,7 +420,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 sealedBodyLength: evidence.sealedBodyLength, commonByteSpans: [0..<8],
                 samples: [.init(decodeOrdinal: 0, presentationRange: sample, byteSpan: 8..<16,
                     nearestRandomAccessOrdinal: 0, isRandomAccess: true, containsInBandConfiguration: false)])
-            try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1) { order in
+            try withUnsafeTemporaryAllocation(of: UInt16.self, capacity: 1) { order in
                 try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
                 let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
                 XCTAssertEqual(try PausedDecodeCoverageOrder.intersection(map: map,
@@ -525,7 +525,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
     private func pausedFragments(_ map: SealedDecodeCoverageMap,
                                  evidence: CompletedBodyEvidenceSnapshot,
                                  requested: FMP4PresentationRange) throws -> [FMP4PresentationRange] {
-        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: map.samples.count) { order in
+        try withUnsafeTemporaryAllocation(of: UInt16.self, capacity: map.samples.count) { order in
             try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
             let eligibility = try PausedDecodeCoverageOrder.eligibility(map: map, evidence: evidence)
             var cursor = 0
@@ -731,7 +731,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 : scenario == "gaps" ? 163_840 : 32_768
             let request = try FMP4PresentationRange(start: Task19.time(0, 100),
                 duration: Task19.time(requestedTicks, 100))
-            let storage = UnsafeMutablePointer<UInt8>.allocate(capacity: 32_768)
+            let storage = UnsafeMutablePointer<UInt16>.allocate(capacity: 32_768)
             storage.initialize(repeating: 0, count: 32_768)
             defer { storage.deinitialize(count: 32_768); storage.deallocate() }
             let begin = ContinuousClock.now
@@ -804,9 +804,9 @@ final class LoopbackHTTPServerTests: XCTestCase {
         }
         let map = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
             commonByteSpans: [0..<8], samples: samples)
-        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256) { storage in
+        try withUnsafeTemporaryAllocation(of: UInt16.self, capacity: 256) { storage in
             try PausedDecodeCoverageOrder.prepare(map: map, ordinals: storage)
-            XCTAssertEqual(Array(storage), Array((0...255).reversed()).map(UInt8.init))
+            XCTAssertEqual(Array(storage), Array((0...255).reversed()).map(UInt16.init))
         }
         let overflow = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
             commonByteSpans: [0..<8], samples: [.init(decodeOrdinal: 0,
@@ -814,7 +814,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                     duration: .init(value: Int64.max / 2, timescale: 1)),
                 byteSpan: 8..<16, nearestRandomAccessOrdinal: 0,
                 isRandomAccess: true, containsInBandConfiguration: false)])
-        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1) { storage in
+        try withUnsafeTemporaryAllocation(of: UInt16.self, capacity: 1) { storage in
             try PausedDecodeCoverageOrder.prepare(map: overflow, ordinals: storage)
             XCTAssertThrowsError(try PausedDecodeCoverageOrder.videoHold(map: overflow))
         }
@@ -1086,6 +1086,107 @@ final class LoopbackHTTPServerTests: XCTestCase {
                                                         duration: Task19.time(0)))
         let range = try FMP4PresentationRange(start: Task19.time(3), duration: Task19.time(2))
         XCTAssertEqual(range.end, Task19.time(5))
+    }
+
+    func testAuthenticatedSixSecondMapsPrepayTheirCadenceBoundAndTraverseOrdinalsBeyond255() async throws {
+        for frameRate: Int32 in [50, 60] {
+            let h = try await Task19Harness(plannedSegmentDurations: Array(repeating: Task19.time(6), count: 6),
+                videoFrameRate: frameRate)
+            defer { h.publisher.close() }
+            try await h.offerBoth(count: 6)
+            let snapshot = try XCTUnwrap(h.publisher.visible)
+            for participant: UInt64 in [1, 2] {
+                let key = try XCTUnwrap(snapshot.media[participant]?.resources.first)
+                let map = try XCTUnwrap(h.store.decodeCoverageMap(for: key))
+                let maximum = participant == 1 ? 384 : 320
+                XCTAssertEqual(map.maximumSampleCount, maximum)
+                XCTAssertThrowsError(try map.claimPrepaidAllocationForStore(),
+                    "The store already owns the original map allocation; its prepaid token cannot be replayed")
+                XCTAssertGreaterThan(map.samples.count, 256)
+                XCTAssertLessThanOrEqual(map.samples.count, maximum)
+                if participant == 1 { XCTAssertEqual(map.samples.count, Int(frameRate) * 6) }
+                XCTAssertEqual(map.applicationChargeableBytes,
+                    try LoopbackStorageLayout.current.decodeMapAllocation(sampleCount: maximum, commonSpanCount: 48,
+                        maximumSampleCount: maximum))
+                XCTAssertLessThanOrEqual(map.applicationChargeableBytes + 4_096,
+                    LoopbackStorageLayout.current.mediaMapReservationBytes)
+                print("PAID_MAP_LAYOUT samples=\(map.samples.count) maximum=\(maximum) stride=\(LoopbackStorageLayout.current.decodeSampleStride) sampleCapacity=\(map.samples.capacity) spanCapacity=\(map.commonByteSpans.capacity) map=\(map.applicationChargeableBytes) total=\(map.applicationChargeableBytes + 4_096) envelope=\(LoopbackStorageLayout.current.mediaMapReservationBytes)")
+                try withUnsafeTemporaryAllocation(of: UInt16.self, capacity: map.samples.count) { order in
+                    try PausedDecodeCoverageOrder.prepare(map: map, ordinals: order)
+                    XCTAssertEqual(Set(order), Set((0..<map.samples.count).map(UInt16.init)))
+                    XCTAssertTrue(order.contains(256))
+                }
+                var eligibility = PausedDecodeCoverageEligibility()
+                eligibility.insert(maximum - 1)
+                XCTAssertTrue(eligibility.contains(maximum - 1))
+                XCTAssertFalse(eligibility.contains(maximum - 2))
+            }
+            let owner = try PausedWindowCoverageLease.reserve()
+            let audioKey = try XCTUnwrap(snapshot.media[2]?.resources.first)
+            _ = try owner.retainMetadata(in: h.store, key: audioKey)
+            let workspace = try h.store.reservePausedCoverageWorkspace(owner: owner)
+            XCTAssertGreaterThan(workspace.sampleCount, 256)
+            let actual = try XCTUnwrap(workspace.actualAllocationBytes)
+            XCTAssertLessThanOrEqual(actual.total, workspace.reservationBytes)
+            XCTAssertGreaterThanOrEqual(actual.ordinals, workspace.sampleCount * MemoryLayout<UInt16>.stride)
+        }
+    }
+
+    func testSealedMapAndIndependentCollectionAliasesStayChargedAfterCloseAndEviction() async throws {
+        for closeImmediately in [false, true] {
+            let baseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+            var harness: Task19Harness? = try await Task19Harness()
+            try await harness!.initial()
+            let store = harness!.store
+            let key = try XCTUnwrap(harness!.publisher.visible?.media[1]?.resources.first)
+            var retainedMap = store.decodeCoverageMap(for: key)
+            let paid = try XCTUnwrap(retainedMap?.applicationChargeableBytes)
+            var samples = retainedMap?.samples
+            var spans = retainedMap?.commonByteSpans
+            if closeImmediately { store.close() }
+            else {
+                store.retireParticipants([1, 2])
+                store.sweep(now: 60 * Task19.second)
+            }
+            XCTAssertEqual(store.usage.resourceCount, 0,
+                "Store bookkeeping retires while independent metadata aliases still exist")
+            harness!.publisher.close()
+            harness = nil
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while HLSDeliveryApplicationChargeLedger.shared.chargedBytes != baseline + paid,
+                  ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline + paid)
+            XCTAssertFalse(try XCTUnwrap(retainedMap?.samples.isEmpty))
+            retainedMap = nil
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline + paid,
+                "Escaped sample/span collections must carry the original storage lease")
+            XCTAssertFalse(try XCTUnwrap(samples?.isEmpty))
+            samples = nil
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline + paid)
+            XCTAssertFalse(try XCTUnwrap(spans?.isEmpty))
+            spans = nil
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline,
+                "The final original backing alias releases the one allocation charge")
+        }
+    }
+
+    func testUnsealedMapStillRejects257AndPaidLayoutsRejectTheirExactNextRecord() throws {
+        let samples = try (0..<257).map { index in
+            SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
+                presentationRange: try .init(start: Task19.time(Int64(index), 50), duration: Task19.time(1, 50)),
+                byteSpan: 8..<16, nearestRandomAccessOrdinal: 0, isRandomAccess: index == 0,
+                containsInBandConfiguration: false)
+        }
+        XCTAssertThrowsError(try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
+            commonByteSpans: [0..<8], samples: samples))
+        XCTAssertThrowsError(try LoopbackStorageLayout.current.decodeMapAllocation(sampleCount: 321,
+            commonSpanCount: 0, maximumSampleCount: 320))
+        XCTAssertThrowsError(try LoopbackStorageLayout.current.decodeMapAllocation(sampleCount: 300,
+            commonSpanCount: 0, maximumSampleCount: 720))
+        XCTAssertThrowsError(try LoopbackStorageLayout.current.decodeMapAllocation(sampleCount: 385,
+            commonSpanCount: 0, maximumSampleCount: 384))
+        XCTAssertThrowsError(try PausedCoverageWorkspace.allocationLimits(mapCount: 1, sampleCount: 385))
+        XCTAssertThrowsError(try PausedCoverageWorkspace.allocationLimits(mapCount: 128, sampleCount: 49_153))
     }
 
     func testDecodeCoverageMapRejectsEntryAndAllocationBoundariesBeforeVisibility() throws {
@@ -2322,7 +2423,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
     func testReview4BatchRetrofitRechecksEveryObjectAndStoreHardDeltaAtomically() async throws {
         let layout = LoopbackStorageLayout.current
         let evidenceBytes = SealedMediaStoreCapacityProjection.mediaEvidenceBytes
-        let maximumMapBytes = 32 * 1_024 - evidenceBytes
+        let maximumMapBytes = layout.mediaMapReservationBytes - evidenceBytes
         XCTAssertNoThrow(try SealedMediaStoreCapacityProjection.project(
             currentChargeableBytes: 688 * 1_048_576 - maximumMapBytes,
             reservedChargeableBytes: 0,
@@ -2481,7 +2582,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
                                             capacityLimits: widened)
         defer { widenedStore.close() }
         XCTAssertThrowsError(try widenedStore.reserveMedia(binding: Task19.binding(),
-            kind: .media, bodyBytes: standard - 32 * 1_024 + 1)) {
+            kind: .media, bodyBytes: standard - LoopbackStorageLayout.current.mediaMapReservationBytes + 1)) {
             XCTAssertEqual($0 as? HLSPublicationFailure, .capacityExceeded)
         }
 
@@ -2492,10 +2593,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
                                              capacityLimits: narrowed)
         defer { narrowedStore.close() }
         let exact = try narrowedStore.reserveMedia(binding: Task19.binding(), kind: .media,
-                                                    bodyBytes: narrowedBytes - 32 * 1_024)
+                                                    bodyBytes: narrowedBytes - LoopbackStorageLayout.current.mediaMapReservationBytes)
         narrowedStore.cancel(exact)
         XCTAssertThrowsError(try narrowedStore.reserveMedia(binding: Task19.binding(),
-            kind: .media, bodyBytes: narrowedBytes - 32 * 1_024 + 1)) {
+            kind: .media, bodyBytes: narrowedBytes - LoopbackStorageLayout.current.mediaMapReservationBytes + 1)) {
             XCTAssertEqual($0 as? HLSPublicationFailure, .capacityExceeded)
         }
     }

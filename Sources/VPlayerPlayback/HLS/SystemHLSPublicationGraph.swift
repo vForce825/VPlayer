@@ -344,6 +344,8 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
     private(set) var publisher: HLSPublicationCoordinator?
     #if DEBUG
     // 测试只控制真实 callback 的到达顺序，不替代 validator、offer 或来源凭据。
+    private var initialStoreCreationCount = 0
+    var initialStoreCreationCountForTesting: Int { condition.withLock { initialStoreCreationCount } }
     private var beforeReceiveForTesting: (@Sendable (SealedMediaObject) -> Void)?
     private var beforeLiveWakeForTesting: (@Sendable () -> Void)?
     private var afterLiveWakeForTesting: (@Sendable () -> Void)?
@@ -519,15 +521,45 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
         } else {
             videoDeclaration = nil
         }
+        let actualAudioCodec: HLSAudioCodec
+        if audio.writer.sourceAACConfiguration != nil {
+            guard let initialization = audio.initialization,
+                  let evidence = initialization.publicationEvidence?.sourceAAC,
+                  evidence.matches(initialization),
+                  audio.writer.sourceAACTerminalBinding?.isCurrent == true,
+                  audio.writer.sourceAACTerminalBinding?.accepts(evidence) == true else {
+                throw HLSPublicationFailure.identityMismatch
+            }
+            actualAudioCodec = .sourceAAC
+        } else {
+            switch audioFormat.codec {
+            case "mp4a.40.2": actualAudioCodec = .aac
+            case "ac-3":
+                guard audio.initialization?.publicationEvidence?.dolbyInitialization != nil else {
+                    throw HLSPublicationFailure.identityMismatch
+                }
+                actualAudioCodec = .ac3
+            case "ec-3":
+                guard audio.initialization?.publicationEvidence?.dolbyInitialization != nil else {
+                    throw HLSPublicationFailure.identityMismatch
+                }
+                actualAudioCodec = .eac3
+            default: throw HLSPublicationFailure.identityMismatch
+            }
+        }
         let declaration = HLSItemDeclaration(
             itemGeneration: itemGeneration,
             token: token.value,
             video: videoDeclaration,
             audio: [.init(
                 participantID: audio.binding.publicationParticipantID.rawValue,
-                renditionID: "main-aac", codec: .aac,
+                renditionID: "main-\(actualAudioCodec.groupPrefix)", codec: actualAudioCodec,
                 channels: audioFormat.channels, language: nil,
-                score: 100, peakEnvelope: 2_048_000)])
+                score: 100, peakEnvelope: SegmentedFMP4Writer.audioPeakEnvelope(
+                    configuration: audio.writer.compressedFormatConfiguration))])
+        #if DEBUG
+        initialStoreCreationCount += 1
+        #endif
         let store = SealedMediaStore(loopbackSession: token, itemGeneration: itemGeneration,
                                     publicationClock: publicationClock)
         let candidate: HLSAudioCandidateRegistration?
@@ -547,7 +579,8 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
                 aacTerminalBinding: window.mediaType == .audio
                     ? window.writer.aacTerminalBinding : nil,
                 aacRenditionBinding: window.mediaType == .audio
-                    ? window.writer.aacRenditionTerminalBinding : nil)
+                    ? window.writer.aacRenditionTerminalBinding : nil,
+                sourceAACTerminalBinding: window.writer.sourceAACTerminalBinding)
         }
         let publisher = try HLSPublicationCoordinator(
             store: store, participants: participants, declaration: declaration,
@@ -580,7 +613,8 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
               let successorProof = window.proof else {
             throw HLSPublicationFailure.identityMismatch
         }
-        if window.mediaType == .audio {
+        if window.mediaType == .audio, window.writer.sourceAACTerminalBinding == nil,
+           window.writer.compressedFormatConfiguration == nil {
             guard let terminal = window.writer.aacTerminalBinding,
                   let rendition = window.writer.aacRenditionTerminalBinding,
                   let admission = window.writer.aacWriterWindowAdmission else {
@@ -600,8 +634,9 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
             }
             _ = try publisher.advanceWriterWindow(
                 .init(initialization: successorInitialization, proof: successorProof,
-                      relay: window.relay, candidateTicket: nil,
-                      writerWindowAdmission: admission),
+                      relay: window.relay, candidateTicket: audioCandidate?.ticket, candidate: audioCandidate,
+                      writerWindowAdmission: admission,
+                      sourceAACTerminalBinding: window.writer.sourceAACTerminalBinding),
                 admission: admission, ticket: publisher.ticket)
         }
         window.installed = true

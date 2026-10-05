@@ -313,6 +313,7 @@ jobs:
           python3 Scripts/Tests/test_persistent_hls_acceptance.py
           python3 Scripts/Tests/test_hls_acceptance_workflows.py
           python3 Scripts/Tests/test_hls_acceptance_configurator.py
+          python3 Scripts/Tests/test_hls_acceptance_fixture.py
           python3 Scripts/Tests/test_hls_generation_readback.py
           python3 Scripts/Tests/test_hls_fixture_provisioning.py
           python3 Scripts/Tests/test_hls_fixture_preparation.py

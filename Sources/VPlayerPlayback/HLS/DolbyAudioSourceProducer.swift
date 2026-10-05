@@ -333,7 +333,7 @@ final class DolbyAudioSourceProducer: @unchecked Sendable {
         let side = codingMode >= 6 ? (back & ~UInt64(0x30)) | 0x600 : back
         guard mask == back || mask == side else { throw DolbyAudioSourceFailure.unsupportedSource }
         let bitmap = try CompressedAudioChannelPositions.bitmap(from: source.channelLayout)
-        let cookie = Data(configuration.serializedBox.dropFirst(8))
+        let cookie = configuration.serializedBox
         return (configuration, .init(profileID: source.codec == .ac3 ? .ac3 : .eac3,
             codec: source.codec, formatID: source.codec == .ac3 ? kAudioFormatAC3 : kAudioFormatEnhancedAC3,
             sampleRate: sampleRate, channelCount: channelCount, framesPerPacket: 1_536,

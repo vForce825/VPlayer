@@ -13,6 +13,59 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testSourceAACFrozenModePreservesPayloadAndDoesNotAcquireEncoderAuthority() async throws {
+        let copies = HLSAudioCopyOwnership(maximumCompressedBytes: 1_048_576,
+            maximumPCMBytes: 1_024, capacity: 64)
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
+        let tracks = DemuxTrackSet(selectedProgramID: nil, video: nil,
+            audio: .init(streamIndex: 1, codec: .aac, timeBase: MediaRational(num: 1, den: 44_100)!,
+                sampleRate: 44_100, channelLayout: .init(channelCount: 1, nativeMask: 4),
+                extradata: Data([0x12, 0x08])))
+        _ = try timeline.consume(.tracks(tracks))
+        let payload = Data([0x21, 0x10, 0x56, 0xE5])
+        let events = try timeline.consume(.packet(.init(streamIndex: 1, codec: .audio(.aac), data: payload,
+            presentationTimeStamp: CMTime(value: 441_000, timescale: 44_100), decodeTimeStamp: .invalid,
+            duration: .invalid, isKey: true, isCorrupt: false)))
+        let timed = try XCTUnwrap(events.compactMap {
+            if case let .audioSample(value) = $0 { return value }; return nil
+        }.first)
+        let binding = Task17Fixtures.binding(seed: 96_901)
+        let configuration = try SourceAACWriterConfiguration(first: timed,
+            source: .init(codec: .aac, profile: 1, sampleRate: 44_100, channelCount: 1, channelMask: 4,
+                decoderConfiguration: Data([0x12, 0x08]), priming: .explicit(leadingSamples: 0, trailingSamples: 0),
+                service: .independentMain, formatValidated: true), binding: binding)
+        let source = try SourceAACAccessUnit(timed: timed, configuration: configuration, binding: binding)
+        let boundary = try SegmentBoundaryCoordinator(mode: .audioOnly(epochStart: CMTime(value: 10, timescale: 1)))
+        try boundary.registerAudioRendition(binding.renditionIdentity, accessUnit: .aac(sampleRate: 44_100),
+            firstPhysicalStart: configuration.firstPresentationTime.cmTime,
+            firstEffectiveStart: configuration.firstPresentationTime.cmTime)
+        let factory = Task17FakeSystemWriterFactory(defersInitializationCallback: true)
+        let relay = SegmentReportRelay(binding: binding, limits: .audio, capacity: 8, objectSink: { _ in })
+        let writer = try SegmentedFMP4Writer(binding: binding, trackKind: .aac,
+            sourceFormatHint: configuration.sourceFormatHint, boundarySession: boundary.session,
+            compressedFormatConfiguration: nil, relay: relay, systemFactory: factory,
+            sourceAACConfiguration: configuration)
+        XCTAssertNil(writer.aacTerminalBinding)
+        XCTAssertNil(writer.aacRenditionTerminalBinding)
+        XCTAssertNotNil(writer.sourceAACTerminalBinding)
+        try writer.start(at: CMTime(value: 999, timescale: 1))
+        try await writer.appendSourceAACAwaitingReadiness(source, boundary: boundary)
+        let native = try XCTUnwrap(factory.lastWriter)
+        XCTAssertEqual(native.appendCount, 1)
+        var alias: CMBlockBuffer? = try native.makeInputBlockAlias(at: 0)
+        XCTAssertEqual(try nativeSamplePayloadDigest(XCTUnwrap(alias)), Data(SHA256.hash(data: payload)))
+        do { try await writer.appendSourceAACAwaitingReadiness(source, boundary: boundary); XCTFail("Replay must fail") }
+        catch { XCTAssertEqual(error as? SourceAACFailure, .sourceMismatch) }
+        _ = await writer.cancelAwaitingCompletion()
+        native.releaseInputSamples()
+        XCTAssertEqual(writer.usage.liveInputCount, 1)
+        XCTAssertNil(writer.sourceAACTerminalBinding?.finalSeal)
+        alias = nil
+        XCTAssertEqual(writer.usage.liveInputCount, 0)
+        timeline.retireCompressedGeneration()
+    }
+
+
     func testNativePayloadDigestBorrowsEveryNoncontiguousBlock() throws {
         let chunks = [Data(repeating: 0x12, count: 65_537),
                       Data([0x00, 0xFF, 0x43]), Data(repeating: 0xA5, count: 131_073)]

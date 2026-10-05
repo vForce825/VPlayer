@@ -7,9 +7,9 @@ import zlib
 
 enum HLSPlaylistKind: Sendable { case master, media }
 enum HLSAudioCodec: String, Sendable {
-    case aac, ac3, eac3
-    var groupPrefix: String { self == .eac3 ? "ec3" : rawValue }
-    var codecs: String { switch self { case .aac: "mp4a.40.2"; case .ac3: "ac-3"; case .eac3: "ec-3" } }
+    case aac, sourceAAC, ac3, eac3
+    var groupPrefix: String { switch self { case .aac, .sourceAAC: "aac"; case .ac3: "ac3"; case .eac3: "ec3" } }
+    var codecs: String { switch self { case .aac, .sourceAAC: "mp4a.40.2"; case .ac3: "ac-3"; case .eac3: "ec-3" } }
 }
 struct HLSAudioDeclaration: Sendable, Hashable {
     var participantID: UInt64

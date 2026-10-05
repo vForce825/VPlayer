@@ -4,6 +4,8 @@
 
 import Foundation
 import CryptoKit
+import Darwin
+import ObjectiveC
 
 enum CompletedMediaEvidenceError: Error, Equatable {
     case identityMismatch
@@ -273,21 +275,104 @@ struct FMP4InitializationCompatibilityFacts: Sendable, Equatable {
     let decoderConfigurationDigest: Data
 }
 
+/// One charge follows the immutable backing through all map/collection aliases.
+/// Store adoption is recorded once; it never detaches or releases this owner.
+fileprivate final class SealedDecodeMapPrepayment: @unchecked Sendable {
+    private let lock = NSLock()
+    private let owned: PlaybackApplicationChargeReservation
+    private var claimed = false
+    let bytes: Int
+    static var allocationBytes: Int {
+        Int(malloc_good_size(class_getInstanceSize(Self.self)))
+            + Int(malloc_good_size(class_getInstanceSize(NSLock.self)))
+    }
+    private init(bytes: Int, reservation: PlaybackApplicationChargeReservation) {
+        self.bytes = bytes
+        owned = reservation
+    }
+    static func reserve(bytes: Int) throws -> SealedDecodeMapPrepayment {
+        let reservation: PlaybackApplicationChargeReservation
+        do { reservation = try HLSDeliveryApplicationChargeLedger.shared.reserve(allocationIdentity: UUID(), bytes: bytes) }
+        catch is LoopbackHTTPReservationError { throw HLSPublicationFailure.capacityExceeded }
+        let value = SealedDecodeMapPrepayment(bytes: bytes, reservation: reservation)
+        let actual = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value).toOpaque()))
+            + malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value.lock).toOpaque()))
+        guard actual <= allocationBytes else { throw CompletedMediaEvidenceError.capacityExceeded }
+        return value
+    }
+    func claim() throws -> PlaybackApplicationChargeReservation {
+        try lock.withLock {
+            guard !claimed else { throw CompletedMediaEvidenceError.identityMismatch }
+            claimed = true
+            return owned
+        }
+    }
+    deinit { HLSDeliveryApplicationChargeLedger.shared.release(owned) }
+}
+
+/// Collection aliases retain the same paid backing owner. The raw Array is never
+/// returned, so copying samples or spans cannot shed the last-alias accounting.
+struct SealedDecodeMapArray<Element: Sendable>: RandomAccessCollection, Sendable {
+    typealias Index = Int
+    private let values: [Element]
+    private let storagePrepayment: SealedDecodeMapPrepayment?
+    fileprivate init(_ values: [Element], storagePrepayment: SealedDecodeMapPrepayment?) {
+        self.values = values
+        self.storagePrepayment = storagePrepayment
+    }
+    var startIndex: Int { values.startIndex }
+    var endIndex: Int { values.endIndex }
+    var capacity: Int { values.capacity }
+    subscript(position: Int) -> Element { values[position] }
+    func index(after position: Int) -> Int { values.index(after: position) }
+    func index(before position: Int) -> Int { values.index(before: position) }
+    func index(_ position: Int, offsetBy distance: Int) -> Int { values.index(position, offsetBy: distance) }
+    func distance(from start: Int, to end: Int) -> Int { values.distance(from: start, to: end) }
+}
+
+/// Source provenance is independent of encoder calibration and trim. Issuance
+/// checks both genuine native callbacks against the same current source root;
+/// consumers must still recheck currentness when they use this retained proof.
+struct SourceAACSealedMediaProof: Sendable {
+    let binding: SourceAACWriterTerminalBinding
+    let callback: SourceAACCallbackEvidence
+    private let initialization: SourceAACCallbackEvidence
+    var isCurrent: Bool {
+        binding.isCurrent && binding.accepts(callback) && binding.accepts(initialization)
+    }
+    fileprivate init(binding: SourceAACWriterTerminalBinding,
+                     media: SealedMediaObject, initialization: SealedMediaObject) throws {
+        guard binding.isCurrent, let callback = media.publicationEvidence?.sourceAAC,
+              let initial = initialization.publicationEvidence?.sourceAAC,
+              callback.matches(media), initial.matches(initialization),
+              binding.accepts(callback), binding.accepts(initial),
+              media.kind == .media, initialization.kind == .initialization,
+              callback.sampleEntryDigest == initial.sampleEntryDigest else {
+            throw CompletedMediaEvidenceError.identityMismatch
+        }
+        self.binding = binding; self.callback = callback; self.initialization = initial
+    }
+}
+
 struct SealedDecodeCoverageMap: Sendable {
+    static var prepaymentAllocationBytes: Int { SealedDecodeMapPrepayment.allocationBytes }
     enum MediaType: Sendable { case video, audio }
     enum SampleEntryMode: Sendable, Equatable { case audio, avc1, avc3, hvc1, hev1 }
     let mediaType: MediaType
     let sampleEntryMode: SampleEntryMode
     let resourceIdentity: SealedMediaBackingIdentity
     let sealedBodyLength: Int
-    let commonByteSpans: [Range<Int>]
-    let samples: [SealedDecodeSampleEntry]
+    let commonByteSpans: SealedDecodeMapArray<Range<Int>>
+    let samples: SealedDecodeMapArray<SealedDecodeSampleEntry>
+    let maximumSampleCount: Int
     let applicationChargeableBytes: Int
+    private let storagePrepayment: SealedDecodeMapPrepayment?
     let evidenceStateIdentity: UUID?
     let initializationStateIdentity: UUID?
     let epochProofIdentity: UUID?
     let segmentReceiptIdentity: UUID?
     let initializationBackingIdentity: SealedMediaBackingIdentity?
+    let sourceAACProof: SourceAACSealedMediaProof?
 
     static func initializationCompatibilityFacts(
         _ initialization: SealedMediaObject,
@@ -311,10 +396,51 @@ struct SealedDecodeCoverageMap: Sendable {
         try self.init(mediaType: mediaType,
             sampleEntryMode: mediaType == .video ? .avc3 : .audio,
             resourceIdentity: .init(rawValue: UUID()), sealedBodyLength: sealedBodyLength,
-            commonByteSpans: commonByteSpans, samples: samples,
+            commonByteSpans: commonByteSpans, samples: samples, maximumSampleCount: 256, storagePrepayment: nil,
             evidenceStateIdentity: nil, initializationStateIdentity: nil,
             epochProofIdentity: nil, segmentReceiptIdentity: nil,
             initializationBackingIdentity: nil)
+    }
+
+    /// Only the original native callback can supply this cadence/boundary proof.
+    /// Unauthenticated inspection maps retain their original256-record limit.
+    private static func admittedSampleLimit(media: SealedMediaObject, proof: EpochFormatProof,
+                                           receipt: SegmentValidationReceipt) throws
+        -> (limit: FMP4DecodeMapParser.SampleCountLimit, cadence: ExactMediaTime?) {
+        guard let evidence = media.publicationEvidence, evidence.matches(media),
+              receipt.matches(media: media, proof: proof), let boundary = evidence.boundary,
+              boundary.session === evidence.session, boundary.binding == media.binding,
+              boundary.logicalSequence == media.logicalSequence else { return (.ordinary, nil) }
+        let cadence: ExactMediaTime
+        let limit: FMP4DecodeMapParser.SampleCountLimit
+        switch proof.mediaType {
+        case .video:
+            guard let frame = evidence.frameDuration, frame.value > 0,
+                  try HLSChecked.compare(frame, .init(value: 1, timescale: 60)) >= 0 else { return (.ordinary, nil) }
+            cadence = frame
+            limit = .authenticatedVideo
+        case .audio:
+            guard evidence.format.codec == "mp4a.40.2", evidence.format.sampleRate > 0,
+                  evidence.format.sampleRate <= 48_000,
+                  let quantum = boundary.accessUnitDuration else { return (.ordinary, nil) }
+            let expected = ExactMediaTime(value: 1_024, timescale: Int32(evidence.format.sampleRate))
+            guard try HLSChecked.compare(quantum, expected) == 0 else { return (.ordinary, nil) }
+            cadence = expected
+            limit = .authenticatedAAC
+        }
+        let envelope = try HLSChecked.six.adding(cadence)
+        guard try HLSChecked.compare(receipt.presentationRange.duration, envelope) <= 0 else { return (.ordinary, nil) }
+        let ordinarySpan = ExactMediaTime(value: try HLSChecked.multiply(cadence.value, 256), timescale: cadence.timescale)
+        guard try HLSChecked.compare(receipt.presentationRange.duration, ordinarySpan) > 0 else { return (.ordinary, nil) }
+        return (limit, cadence)
+    }
+
+    private static func validateAdmittedCadence(_ samples: [SealedDecodeSampleEntry],
+                                                cadence: ExactMediaTime?) throws {
+        guard let cadence else { return }
+        guard try samples.allSatisfy({ try HLSChecked.compare($0.presentationRange.duration, cadence) == 0 }) else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
     }
 
     /// 只有 store 已持有封口对象、proof、receipt 与同 epoch init 时才走此签发入口。
@@ -323,7 +449,9 @@ struct SealedDecodeCoverageMap: Sendable {
                      initialization: SealedMediaObject,
                      evidence: CompletedMediaBodyEvidenceState,
                      initializationEvidence: CompletedInitBodyEvidenceState) throws -> Self {
-        guard media.kind == .media, initialization.kind == .initialization,
+        guard media.publicationEvidence?.sourceAAC == nil,
+              initialization.publicationEvidence?.sourceAAC == nil,
+              media.kind == .media, initialization.kind == .initialization,
               receipt.matches(media: media, proof: proof), proof.matches(initialization: initialization),
               media.backing.identity == evidence.resourceIdentity,
               initialization.backing.identity == initializationEvidence.resourceIdentity,
@@ -338,13 +466,17 @@ struct SealedDecodeCoverageMap: Sendable {
               initialization.bytes.count == initializationEvidence.sealedBodyLength else {
             throw CompletedMediaEvidenceError.identityMismatch
         }
+        let admission = try admittedSampleLimit(media: media, proof: proof, receipt: receipt)
+        let prepayment = try SealedDecodeMapPrepayment.reserve(bytes: LoopbackStorageLayout.current.decodeMapAllocation(
+            sampleCount: 1, commonSpanCount: 48, maximumSampleCount: admission.limit.value))
         let parsed = try FMP4DecodeMapParser.parse(initialization: initialization.bytes,
             media: media.bytes, mediaType: proof.mediaType,
-            expectedPresentationRange: receipt.presentationRange)
+            expectedPresentationRange: receipt.presentationRange, sampleCountLimit: admission.limit)
+        try validateAdmittedCadence(parsed.samples, cadence: admission.cadence)
         return try Self(mediaType: proof.mediaType == .video ? .video : .audio,
             sampleEntryMode: parsed.mode, resourceIdentity: media.backing.identity,
             sealedBodyLength: media.bytes.count, commonByteSpans: parsed.commonByteSpans,
-            samples: parsed.samples,
+            samples: parsed.samples, maximumSampleCount: admission.limit.value, storagePrepayment: prepayment,
             evidenceStateIdentity: evidence.stateIdentity,
             initializationStateIdentity: initializationEvidence.stateIdentity,
             epochProofIdentity: proof.identity,
@@ -365,7 +497,9 @@ struct SealedDecodeCoverageMap: Sendable {
         evidence: CompletedMediaBodyEvidenceState,
         initializationEvidence: CompletedInitBodyEvidenceState
     ) throws -> Self {
-        guard media.kind == .media, canonicalInitialization.kind == .initialization,
+        guard media.publicationEvidence?.sourceAAC == nil,
+              canonicalInitialization.publicationEvidence?.sourceAAC == nil,
+              media.kind == .media, canonicalInitialization.kind == .initialization,
               compatibility.authorizes(canonicalInitialization: canonicalInitialization,
                   canonicalProof: canonicalProof, successorProof: proof),
               receipt.matches(media: media, proof: proof),
@@ -382,13 +516,17 @@ struct SealedDecodeCoverageMap: Sendable {
               canonicalInitialization.bytes.count == initializationEvidence.sealedBodyLength else {
             throw CompletedMediaEvidenceError.identityMismatch
         }
+        let admission = try admittedSampleLimit(media: media, proof: proof, receipt: receipt)
+        let prepayment = try SealedDecodeMapPrepayment.reserve(bytes: LoopbackStorageLayout.current.decodeMapAllocation(
+            sampleCount: 1, commonSpanCount: 48, maximumSampleCount: admission.limit.value))
         let parsed = try FMP4DecodeMapParser.parse(initialization: canonicalInitialization.bytes,
             media: media.bytes, mediaType: proof.mediaType,
-            expectedPresentationRange: receipt.presentationRange)
+            expectedPresentationRange: receipt.presentationRange, sampleCountLimit: admission.limit)
+        try validateAdmittedCadence(parsed.samples, cadence: admission.cadence)
         return try Self(mediaType: proof.mediaType == .video ? .video : .audio,
             sampleEntryMode: parsed.mode, resourceIdentity: media.backing.identity,
             sealedBodyLength: media.bytes.count, commonByteSpans: parsed.commonByteSpans,
-            samples: parsed.samples,
+            samples: parsed.samples, maximumSampleCount: admission.limit.value, storagePrepayment: prepayment,
             evidenceStateIdentity: evidence.stateIdentity,
             initializationStateIdentity: initializationEvidence.stateIdentity,
             epochProofIdentity: proof.identity,
@@ -406,7 +544,9 @@ struct SealedDecodeCoverageMap: Sendable {
         evidence: CompletedMediaBodyEvidenceState,
         initializationEvidence: CompletedInitBodyEvidenceState
     ) throws -> Self {
-        guard media.kind == .media, canonicalInitialization.kind == .initialization,
+        guard media.publicationEvidence?.sourceAAC == nil,
+              canonicalInitialization.publicationEvidence?.sourceAAC == nil,
+              media.kind == .media, canonicalInitialization.kind == .initialization,
               compatibility.authorizes(
                 canonicalInitialization: canonicalInitialization,
                 canonicalProof: canonicalProof,
@@ -431,23 +571,86 @@ struct SealedDecodeCoverageMap: Sendable {
                 == initializationEvidence.sealedBodyLength else {
             throw CompletedMediaEvidenceError.identityMismatch
         }
+        let admission = try admittedSampleLimit(media: media, proof: proof, receipt: receipt)
+        let prepayment = try SealedDecodeMapPrepayment.reserve(bytes: LoopbackStorageLayout.current.decodeMapAllocation(
+            sampleCount: 1, commonSpanCount: 48, maximumSampleCount: admission.limit.value))
         let parsed = try FMP4DecodeMapParser.parse(
             initialization: canonicalInitialization.bytes,
             media: media.bytes,
             mediaType: proof.mediaType,
-            expectedPresentationRange: receipt.presentationRange)
+            expectedPresentationRange: receipt.presentationRange, sampleCountLimit: admission.limit)
+        try validateAdmittedCadence(parsed.samples, cadence: admission.cadence)
         return try Self(
             mediaType: proof.mediaType == .video ? .video : .audio,
             sampleEntryMode: parsed.mode,
             resourceIdentity: media.backing.identity,
             sealedBodyLength: media.bytes.count,
             commonByteSpans: parsed.commonByteSpans,
-            samples: parsed.samples,
+            samples: parsed.samples, maximumSampleCount: admission.limit.value, storagePrepayment: prepayment,
             evidenceStateIdentity: evidence.stateIdentity,
             initializationStateIdentity: initializationEvidence.stateIdentity,
             epochProofIdentity: proof.identity,
             segmentReceiptIdentity: receipt.identity,
             initializationBackingIdentity: canonicalInitialization.backing.identity)
+    }
+
+    static func sealSourceAAC(
+        media: SealedMediaObject, proof: EpochFormatProof,
+        receipt: SegmentValidationReceipt, initialization: SealedMediaObject,
+        initializationProof: EpochFormatProof,
+        compatibility: WriterInitializationCompatibility? = nil,
+        binding: SourceAACWriterTerminalBinding,
+        evidence: CompletedMediaBodyEvidenceState,
+        initializationEvidence: CompletedInitBodyEvidenceState
+    ) throws -> Self {
+        let source = try SourceAACSealedMediaProof(binding: binding, media: media,
+                                                 initialization: initialization)
+        guard proof.mediaType == .audio, initializationProof.mediaType == .audio,
+              receipt.matches(media: media, proof: proof),
+              initializationProof.matches(initialization: initialization),
+              proof.matches(initialization: initialization)
+                || compatibility?.authorizes(canonicalInitialization: initialization,
+                    canonicalProof: initializationProof, successorProof: proof) == true,
+              source.callback.writtenRange == receipt.presentationRange,
+              source.callback.timelineOffset == binding.timelineOffset,
+              source.callback.sampleCount > 0, source.callback.sampleCount <= 320,
+              binding.configuration.sampleRate > 0, binding.configuration.sampleRate <= 48_000,
+              media.backing.identity == evidence.resourceIdentity,
+              media.digest == evidence.sealedDigest, media.bytes.count == evidence.sealedBodyLength,
+              media.binding.itemGeneration.rawValue == evidence.itemGeneration,
+              media.binding.mediaEpoch.rawValue == evidence.mediaEpoch,
+              media.binding.renditionIdentity == evidence.renditionIdentity,
+              initialization.backing.identity == initializationEvidence.resourceIdentity,
+              initialization.digest == initializationEvidence.sealedDigest,
+              initialization.bytes.count == initializationEvidence.sealedBodyLength,
+              initialization.binding.itemGeneration.rawValue == initializationEvidence.itemGeneration,
+              initialization.binding.mediaEpoch.rawValue == initializationEvidence.mediaEpoch,
+              initialization.binding.renditionIdentity == initializationEvidence.renditionIdentity else {
+            throw CompletedMediaEvidenceError.identityMismatch
+        }
+        let quantum = ExactMediaTime(value: 1_024, timescale: binding.configuration.sampleRate)
+        guard try HLSChecked.compare(receipt.presentationRange.duration,
+                                     HLSChecked.six.adding(quantum)) <= 0 else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        let prepayment = try SealedDecodeMapPrepayment.reserve(bytes:
+            LoopbackStorageLayout.current.decodeMapAllocation(sampleCount: 1, commonSpanCount: 48,
+                                                              maximumSampleCount: 320))
+        let parsed = try FMP4DecodeMapParser.parse(initialization: initialization.bytes,
+            media: media.bytes, mediaType: .audio, expectedPresentationRange: receipt.presentationRange,
+            sampleCountLimit: .authenticatedAAC)
+        guard parsed.samples.count == source.callback.sampleCount else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        try validateAdmittedCadence(parsed.samples, cadence: quantum)
+        return try Self(mediaType: .audio, sampleEntryMode: parsed.mode,
+            resourceIdentity: media.backing.identity, sealedBodyLength: media.bytes.count,
+            commonByteSpans: parsed.commonByteSpans, samples: parsed.samples,
+            maximumSampleCount: 320, storagePrepayment: prepayment,
+            evidenceStateIdentity: evidence.stateIdentity,
+            initializationStateIdentity: initializationEvidence.stateIdentity,
+            epochProofIdentity: proof.identity, segmentReceiptIdentity: receipt.identity,
+            initializationBackingIdentity: initialization.backing.identity, sourceAACProof: source)
     }
 
     /// publication commit 只消费由上述两个 seal 入口生成的完整身份闭包；
@@ -458,7 +661,8 @@ struct SealedDecodeCoverageMap: Sendable {
                                initialization: SealedMediaObject,
                                mediaEvidence: CompletedBodyEvidenceState,
                                initializationEvidence: CompletedBodyEvidenceState) -> Bool {
-        resourceIdentity == media.backing.identity
+        (sourceAACProof?.isCurrent ?? (media.publicationEvidence?.sourceAAC == nil))
+            && resourceIdentity == media.backing.identity
             && sealedBodyLength == media.bytes.count
             && evidenceStateIdentity == mediaEvidence.stateIdentity
             && initializationStateIdentity == initializationEvidence.stateIdentity
@@ -471,17 +675,25 @@ struct SealedDecodeCoverageMap: Sendable {
     private init(mediaType: MediaType, sampleEntryMode: SampleEntryMode,
                  resourceIdentity: SealedMediaBackingIdentity,
                  sealedBodyLength: Int, commonByteSpans: [Range<Int>],
-                 samples: [SealedDecodeSampleEntry], evidenceStateIdentity: UUID?,
+                 samples: [SealedDecodeSampleEntry], maximumSampleCount: Int,
+                 storagePrepayment: SealedDecodeMapPrepayment?, evidenceStateIdentity: UUID?,
                  initializationStateIdentity: UUID?, epochProofIdentity: UUID?,
                  segmentReceiptIdentity: UUID?,
-                 initializationBackingIdentity: SealedMediaBackingIdentity?) throws {
-        guard sealedBodyLength > 0, !samples.isEmpty, samples.count <= 256 else {
+                 initializationBackingIdentity: SealedMediaBackingIdentity?,
+                 sourceAACProof: SourceAACSealedMediaProof? = nil) throws {
+        guard sealedBodyLength > 0, !samples.isEmpty, [256, 320, 384].contains(maximumSampleCount),
+              samples.count <= maximumSampleCount else {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         let charge = try LoopbackStorageLayout.current.decodeMapAllocation(
-            sampleCount: samples.count, commonSpanCount: commonByteSpans.count)
-        let allSpans = commonByteSpans + samples.map(\.byteSpan)
-        guard allSpans.allSatisfy({ $0.lowerBound >= 0 && !$0.isEmpty && $0.upperBound <= sealedBodyLength }) else {
+            sampleCount: samples.count, commonSpanCount: commonByteSpans.count, maximumSampleCount: maximumSampleCount)
+        let actualCapacityCharge = try LoopbackStorageLayout.current.decodeMapStorageAllocation(
+            sampleCapacity: samples.capacity, commonSpanCapacity: commonByteSpans.capacity)
+        guard actualCapacityCharge <= charge else { throw CompletedMediaEvidenceError.capacityExceeded }
+        func validSpan(_ span: Range<Int>) -> Bool {
+            span.lowerBound >= 0 && !span.isEmpty && span.upperBound <= sealedBodyLength
+        }
+        guard commonByteSpans.allSatisfy(validSpan), samples.allSatisfy({ validSpan($0.byteSpan) }) else {
             throw CompletedMediaEvidenceError.invalidDecodeMap
         }
         for (index, sample) in samples.enumerated() {
@@ -499,42 +711,56 @@ struct SealedDecodeCoverageMap: Sendable {
                 }
             }
         }
-        if mediaType == .audio {
-            let presentationOrdered = try samples.sorted {
-                let start = try HLSChecked.compare($0.presentationRange.start,
-                                                   $1.presentationRange.start)
-                if start != 0 { return start < 0 }
-                return try HLSChecked.compare($0.presentationRange.end,
-                                              $1.presentationRange.end) < 0
-            }
-            var presentationEnd = presentationOrdered[0].presentationRange.end
-            for sample in presentationOrdered.dropFirst() {
-                guard try HLSChecked.compare(sample.presentationRange.start,
-                                             presentationEnd) <= 0 else {
-                    throw CompletedMediaEvidenceError.invalidDecodeMap
-                }
-                if try HLSChecked.compare(sample.presentationRange.end,
-                                          presentationEnd) > 0 {
-                    presentationEnd = sample.presentationRange.end
-                }
-            }
-        }
+        if mediaType == .audio { try Self.validateAudioContinuity(samples) }
         self.mediaType = mediaType
         self.sampleEntryMode = sampleEntryMode
         self.resourceIdentity = resourceIdentity
         self.sealedBodyLength = sealedBodyLength
-        self.commonByteSpans = commonByteSpans
-        self.samples = samples
+        self.commonByteSpans = .init(commonByteSpans, storagePrepayment: storagePrepayment)
+        self.samples = .init(samples, storagePrepayment: storagePrepayment)
+        self.maximumSampleCount = maximumSampleCount
+        guard storagePrepayment == nil || storagePrepayment?.bytes == charge else {
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
+        self.storagePrepayment = storagePrepayment
         applicationChargeableBytes = charge
         self.evidenceStateIdentity = evidenceStateIdentity
         self.initializationStateIdentity = initializationStateIdentity
         self.epochProofIdentity = epochProofIdentity
         self.segmentReceiptIdentity = segmentReceiptIdentity
         self.initializationBackingIdentity = initializationBackingIdentity
+        self.sourceAACProof = sourceAACProof
+    }
+
+    func claimPrepaidAllocationForStore() throws -> PlaybackApplicationChargeReservation {
+        guard let storagePrepayment else { throw CompletedMediaEvidenceError.identityMismatch }
+        return try storagePrepayment.claim()
+    }
+
+    fileprivate static func validateAudioContinuity(_ samples: [SealedDecodeSampleEntry]) throws {
+        guard let first = samples.first else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+        var start = first.presentationRange.start
+        var end = first.presentationRange.end
+        for sample in samples {
+            if try HLSChecked.compare(sample.presentationRange.start, start) < 0 { start = sample.presentationRange.start }
+            if try HLSChecked.compare(sample.presentationRange.end, end) > 0 { end = sample.presentationRange.end }
+        }
+        var covered = start
+        for _ in samples.indices {
+            var next = covered
+            for sample in samples where try HLSChecked.compare(sample.presentationRange.start, covered) <= 0 {
+                if try HLSChecked.compare(sample.presentationRange.end, next) > 0 { next = sample.presentationRange.end }
+            }
+            if try HLSChecked.compare(next, end) >= 0 { return }
+            guard try HLSChecked.compare(next, covered) > 0 else { break }
+            covered = next
+        }
+        throw CompletedMediaEvidenceError.invalidDecodeMap
     }
 
     func isCovered(by evidence: CompletedBodyEvidenceSnapshot,
                    requested: FMP4PresentationRange) throws -> Bool {
+        guard sourceAACProof?.isCurrent ?? true else { return false }
         func reject(_ marker: String) -> Bool {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append(marker)
@@ -583,7 +809,8 @@ struct SealedDecodeCoverageMap: Sendable {
         by evidence: CompletedBodyEvidenceSnapshot,
         intersecting requested: FMP4PresentationRange
     ) throws -> [FMP4PresentationRange] {
-        guard commonByteSpans.allSatisfy(evidence.covers) else { return [] }
+        guard sourceAACProof?.isCurrent ?? true,
+              commonByteSpans.allSatisfy(evidence.covers) else { return [] }
         let videoHold: ExactMediaTime?
         if mediaType == .video,
            let maximumDuration = try samples.map(\.presentationRange.duration).max(by: {
@@ -690,7 +917,7 @@ struct ExactMediaInterval: Sendable, Hashable {
 /// Paused verification orders immutable sample ordinals in caller-owned storage.
 /// It neither constructs Array backing nor changes the startup coverage path.
 struct PausedDecodeCoverageEligibility {
-    private var bits = SIMD4<UInt64>(repeating: 0)
+    private var bits = SIMD8<UInt64>(repeating: 0)
     var videoHold: ExactMediaTime?
 
     func contains(_ ordinal: Int) -> Bool {
@@ -748,15 +975,15 @@ enum PausedCoverageTimeHeap {
 }
 
 enum PausedDecodeCoverageOrder {
-    /// O(n log n) heapsort, with constant auxiliary storage. UInt8 encodes
-    /// ordinals 0...255; counts and positions must remain wider than UInt8.
+    /// O(n log n) heapsort, with constant auxiliary storage. UInt16 encodes
+    /// authenticated sample ordinals through383; no byte truncation is allowed.
     static func prepare(map: SealedDecodeCoverageMap,
-                        ordinals: UnsafeMutableBufferPointer<UInt8>) throws {
-        guard ordinals.count == map.samples.count, (1...256).contains(ordinals.count) else {
+                        ordinals: UnsafeMutableBufferPointer<UInt16>) throws {
+        guard ordinals.count == map.samples.count, (1...map.maximumSampleCount).contains(ordinals.count) else {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
-        for index in ordinals.indices { ordinals[index] = UInt8(index) }
-        func precedes(_ left: UInt8, _ right: UInt8) throws -> Bool {
+        for index in ordinals.indices { ordinals[index] = UInt16(index) }
+        func precedes(_ left: UInt16, _ right: UInt16) throws -> Bool {
             let lhs = map.samples[Int(left)].presentationRange
             let rhs = map.samples[Int(right)].presentationRange
             let start = try HLSChecked.compare(lhs.start, rhs.start)
@@ -787,7 +1014,7 @@ enum PausedDecodeCoverageOrder {
     }
 
     static func intersection(map: SealedDecodeCoverageMap,
-                             ordinals: UnsafeBufferPointer<UInt8>,
+                             ordinals: UnsafeBufferPointer<UInt16>,
                              requested: ExactMediaInterval,
                              presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> ExactMediaInterval? {
         guard ordinals.count == map.samples.count, let first = ordinals.first,
@@ -809,7 +1036,7 @@ enum PausedDecodeCoverageOrder {
     static func canContribute(map: SealedDecodeCoverageMap,
                               requested: ExactMediaInterval,
                               presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> Bool {
-        guard let first = map.samples.first, map.samples.count <= 256 else {
+        guard let first = map.samples.first, map.samples.count <= map.maximumSampleCount else {
             throw CompletedMediaEvidenceError.invalidDecodeMap
         }
         func precedes(_ lhs: FMP4PresentationRange, _ rhs: FMP4PresentationRange) throws -> Bool {
@@ -874,7 +1101,7 @@ enum PausedDecodeCoverageOrder {
     /// Emits individual eligible clipped intervals in nondecreasing start order.
     /// A global heap may merge them without materializing per-map unions.
     static func nextRange(map: SealedDecodeCoverageMap,
-                          ordinals: UnsafeBufferPointer<UInt8>, cursor: inout Int,
+                          ordinals: UnsafeBufferPointer<UInt16>, cursor: inout Int,
                           requested: ExactMediaInterval,
                           eligibility: PausedDecodeCoverageEligibility,
                           presentationOffset: ExactMediaTime = HLSChecked.zero) throws -> ExactMediaInterval? {
@@ -967,8 +1194,14 @@ enum FMP4CompressedAudioInspection {
 
 private enum FMP4DecodeMapParser {
     enum SampleCountLimit: Equatable {
-        case ordinary, sourceAAC
-        var value: Int { self == .ordinary ? 256 : 320 }
+        case ordinary, sourceAAC, authenticatedAAC, authenticatedVideo
+        var value: Int {
+            switch self {
+            case .ordinary: return 256
+            case .sourceAAC, .authenticatedAAC: return 320
+            case .authenticatedVideo: return 384
+            }
+        }
     }
     private struct Box {
         let start: Int
@@ -1048,24 +1281,7 @@ private enum FMP4DecodeMapParser {
                     guard endCmp == 0 else {
                         throw CompletedMediaEvidenceError.invalidDecodeMap
                     }
-                    let presentationOrdered = try samples.sorted {
-                        let start = try HLSChecked.compare($0.presentationRange.start,
-                                                           $1.presentationRange.start)
-                        if start != 0 { return start < 0 }
-                        return try HLSChecked.compare($0.presentationRange.end,
-                                                      $1.presentationRange.end) < 0
-                    }
-                    var presentationEnd = presentationOrdered[0].presentationRange.end
-                    for sample in presentationOrdered.dropFirst() {
-                        guard try HLSChecked.compare(sample.presentationRange.start,
-                                                     presentationEnd) <= 0 else {
-                            throw CompletedMediaEvidenceError.invalidDecodeMap
-                        }
-                        if try HLSChecked.compare(sample.presentationRange.end,
-                                                  presentationEnd) > 0 {
-                            presentationEnd = sample.presentationRange.end
-                        }
-                    }
+                    try SealedDecodeCoverageMap.validateAudioContinuity(samples)
                 } else {
                     guard decodeTime >= initialDecodeTime else {
                         throw CompletedMediaEvidenceError.invalidDecodeMap
@@ -1940,6 +2156,7 @@ final class ServedRenditionCoverageAccumulator: @unchecked Sendable {
         let dependency: ServedRenditionCoverageDependency
         let initializationDigest: Data
         let mediaDigest: Data
+        let maximumSampleCount: Int
         var ranges: [FMP4PresentationRange]
     }
     private let lock = NSLock()
@@ -1992,6 +2209,9 @@ final class ServedRenditionCoverageAccumulator: @unchecked Sendable {
                 initializationEvidenceIdentity: initialization.stateIdentity,
                 mediaEvidenceIdentity: media.stateIdentity)
             if let index = entries.firstIndex(where: { $0.dependency == dependency }) {
+                guard entries[index].maximumSampleCount == map.maximumSampleCount else {
+                    throw CompletedMediaEvidenceError.identityMismatch
+                }
                 entries[index].ranges = try Self.union(entries[index].ranges
                     + covered)
             } else {
@@ -2000,7 +2220,7 @@ final class ServedRenditionCoverageAccumulator: @unchecked Sendable {
                 }
                 entries.append(.init(dependency: dependency,
                     initializationDigest: initialization.sealedDigest,
-                    mediaDigest: media.sealedDigest,
+                    mediaDigest: media.sealedDigest, maximumSampleCount: map.maximumSampleCount,
                     ranges: covered))
             }
             entries.sort { Self.dependencyOrder($0.dependency, $1.dependency) }
@@ -2023,6 +2243,7 @@ final class ServedRenditionCoverageAccumulator: @unchecked Sendable {
                 Self.append(dependency.mediaEvidenceIdentity, to: &canonical)
                 Self.append(item.initializationDigest, to: &canonical)
                 Self.append(item.mediaDigest, to: &canonical)
+                Self.append(UInt64(item.maximumSampleCount), to: &canonical)
                 for range in item.ranges {
                     Self.append(range.start.value, to: &canonical)
                     Self.append(UInt64(range.start.timescale), to: &canonical)

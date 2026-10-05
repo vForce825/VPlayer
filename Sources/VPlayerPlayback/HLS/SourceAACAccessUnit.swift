@@ -36,6 +36,8 @@ final class SourceAACRenditionAuthority: @unchecked Sendable {
     let initialBinding: FMP4WriterBinding
     let stream: CompressedAudioSourceStream
     private let applicationCharge: HLSCompressedAudioApplicationReservation
+    private let lock = NSLock()
+    private var currentBinding: FMP4WriterBinding?
 
     fileprivate init(binding: FMP4WriterBinding, stream: CompressedAudioSourceStream,
                      charge: HLSCompressedAudioApplicationReservation) throws {
@@ -44,6 +46,19 @@ final class SourceAACRenditionAuthority: @unchecked Sendable {
     }
     func acceptsInitialWriter(_ binding: FMP4WriterBinding) -> Bool {
         binding == initialBinding && stream.acceptsRendition(identity)
+    }
+    func acceptsWriter(_ binding: FMP4WriterBinding) -> Bool {
+        lock.withLock { binding == (currentBinding ?? initialBinding) && stream.acceptsRendition(identity) }
+    }
+    func installWriter(_ origin: SourceAACWriterOrigin) throws {
+        try lock.withLock {
+            guard origin.authority === self, stream.acceptsRendition(identity),
+                  (currentBinding == nil && origin.binding == initialBinding && origin.predecessorBinding == nil)
+                    || (currentBinding != nil && origin.predecessorBinding == currentBinding) else {
+                throw SourceAACFailure.writerBindingMismatch
+            }
+            currentBinding = origin.binding
+        }
     }
 }
 
@@ -116,7 +131,7 @@ struct SourceAACAccessUnit: Sendable {
 
     init(timed: HLSTimedAudioAccessUnit, configuration: SourceAACWriterConfiguration,
          binding: FMP4WriterBinding) throws {
-        guard configuration.authority.acceptsInitialWriter(binding) else {
+        guard configuration.authority.acceptsWriter(binding) else {
             throw SourceAACFailure.writerBindingMismatch
         }
         guard configuration.validates(timed), let proof = timed.source.sourceProof,
@@ -127,8 +142,9 @@ struct SourceAACAccessUnit: Sendable {
         sourceID = timed.source.id; self.proof = proof
     }
     func validates() -> Bool {
-        configuration.authority.acceptsInitialWriter(binding) && configuration.validates(timed)
+        configuration.authority.acceptsWriter(binding) && configuration.validates(timed)
     }
+    var inputIdentity: ObjectIdentifier { ObjectIdentifier(proof) }
     func claimForAppend() -> Bool {
         validates() && proof.claim(for: configuration.authority.identity)
     }

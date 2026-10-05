@@ -152,6 +152,68 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertNil(graph.registry.ownedResourceSnapshot(), "Join actual retirement, not a cancellation marker")
     }
 
+    func testControllerRateAdmissionWithoutGeneratedMediaClockAdvanceKeepsOriginalStartupDeadline() async throws {
+        try await withWatchdogController { controller, registry, clock, factory, _ in
+            let parent = try XCTUnwrap(registry.outputResourceContextSnapshot()?.parentDeadline)
+            let budget: PlaybackProgressBudgetTicket
+            switch parent { case .coldStart(let value), .outputRecovery(let value): budget = value }
+            XCTAssertNotNil(registry.playbackOperationDeadlineArmSnapshot(), "Rate admission cannot mint media progress")
+            let remaining = try budget.remainingNanoseconds(at: clock.nowNanoseconds)
+            XCTAssertGreaterThan(remaining, 0)
+            clock.advance(nanoseconds: remaining - 1)
+            registry.executor.sync {}
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.parentDeadline, parent)
+            XCTAssertEqual(factory.builder?.buildCount, 1)
+            clock.advance(nanoseconds: 1)
+            try await waitForWatchdogCondition {
+                let state = await controller.currentStateForTesting
+                if case .failed = state { return true }
+                return false
+            }
+            await registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(registry.ownedResourceSnapshot())
+            XCTAssertEqual(factory.builder?.buildCount, 1, "A never-progressing item must terminate its original deadline")
+        }
+    }
+
+    func testRepeatedGeneratedUnexpectedPauseExhaustsOriginalRequestRecoveryBudget() async throws {
+        try await withWatchdogController { controller, registry, _, factory, _ in
+            let builder = try XCTUnwrap(factory.builder)
+            let session = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sessionIdentity)
+            for attempt in 0..<3 {
+                let driver = try XCTUnwrap(factory.driver)
+                let oldPrepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.prepareTicket)
+                let oldActivation = try XCTUnwrap(registry.outputResourceContextSnapshot()?.activation)
+                driver.emitTimeControlStatus(.playing)
+                driver.emitTimeControlStatus(.paused)
+                if attempt < 2 {
+                    try await waitForWatchdogCondition {
+                        guard let context = registry.outputResourceContextSnapshot(), let task = context.sourceTask else { return false }
+                        return context.prepared && context.owner == nil && context.prepareTicket != oldPrepare &&
+                            context.activation != oldActivation && registry.phase(of: task) == .terminal(.completed) &&
+                            driver.playCallCount == attempt + 2
+                    }
+                    XCTAssertEqual(builder.buildCount, attempt + 2)
+                    XCTAssertEqual(builder.retirementCount, attempt + 1)
+                    XCTAssertEqual(registry.outputResourceContextSnapshot()?.sessionIdentity, session)
+                    XCTAssertNotNil(registry.playbackOperationDeadlineArmSnapshot())
+                } else {
+                    try await waitForWatchdogCondition {
+                        let state = await controller.currentStateForTesting
+                        if case .failed(let failure) = state {
+                            return failure.code == "hls.watchdog.recovery-exhausted"
+                        }
+                        return false
+                    }
+                    await registry.joinOwnedTerminalCleanup()
+                    XCTAssertEqual(builder.buildCount, 3, "Late live EOF must not build a fourth producer")
+                    XCTAssertEqual(builder.retirementCount, 3)
+                    XCTAssertNil(registry.ownedResourceSnapshot())
+                }
+            }
+        }
+    }
+
     func testObservedStallsReprepareRealHLSBackendAndExhaustRequestBudget() async throws {
         let baseline = PlaybackResourceContextLedger.shared.chargedBytes
         try await withWatchdogController { controller, registry, clock, factory, _ in
@@ -3084,6 +3146,16 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                            "The installed callback must classify the adopted publication and its selection")
             _ = try await harness.activate()
             XCTAssertEqual(harness.driver.playCallCount, 1)
+        }
+    }
+
+    func testSourceAACDeclarationCannotBorrowEncodedAACTerminalProof() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2), declaredSourceAACWithEncodedBinding: true)
+        } body: { harness in
+            await XCTAssertThrowsErrorAsync(try await harness.prepare())
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+            XCTAssertEqual(harness.driver.prerollCallCount, 0, "Missing authentic source binding must fail before SDK media waits")
         }
     }
 
@@ -8793,6 +8865,7 @@ private final class Task21Harness {
          forgedDirectAudioOnlyRendition: AudioRenditionIdentity? = nil,
          prepareMutation: Task21PrepareMutation = .none,
          requiresAACEndpointAuthority: Bool = false,
+         declaredSourceAACWithEncodedBinding: Bool = false,
          additionalUnboundAACRendition: AudioRenditionIdentity? = nil,
          completeMediaBodies: Bool = true,
          startupPrefix: Bool = false,
@@ -8866,6 +8939,14 @@ private final class Task21Harness {
                 publicationSequence: preparation.publicationSequence,
                 audioParticipants: preparation.audioParticipants.map {
                     .init(renditionIdentity: $0.renditionIdentity, codec: .aac)
+                }, directAudioOnlyRendition: preparation.directAudioOnlyRendition)
+        }
+        if declaredSourceAACWithEncodedBinding {
+            preparation = .init(itemURL: preparation.itemURL, item: preparation.item,
+                publicationSequence: preparation.publicationSequence,
+                audioParticipants: preparation.audioParticipants.map {
+                    .init(renditionIdentity: $0.renditionIdentity, codec: .sourceAAC,
+                        terminalBinding: $0.terminalBinding, renditionBinding: $0.renditionBinding)
                 }, directAudioOnlyRendition: preparation.directAudioOnlyRendition)
         }
         if let additionalUnboundAACRendition {
