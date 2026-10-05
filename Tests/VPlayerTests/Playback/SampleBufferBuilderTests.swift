@@ -106,6 +106,42 @@ final class SampleBufferBuilderTests: XCTestCase {
         }
     }
 
+    func testWriterInputPreservesRemovedAttachmentsWithCalculatedAndExplicitOutputTiming() throws {
+        for packetized in [false, true] {
+            for explicit in [false, true] {
+                let source = try makeWriterInputSource(packetized: packetized)
+                // Match the source fixture's set/copy/remove history. CoreMedia may
+                // retain an empty mode dictionary after removing its final key.
+                for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+                    let key = "VPlayer.WriterInput.Removed" as CFString
+                    CMSetAttachment(source, key: key, value: kCFBooleanTrue, attachmentMode: mode)
+                    CMRemoveAttachment(source, key: key)
+                    XCTAssertNil(CMGetAttachment(source, key: key, attachmentModeOut: nil))
+                    XCTAssertEqual(writerAttachments(source, mode: mode)?.count ?? 0, 0)
+                }
+                let outputTiming = explicit
+                    ? try WriterInputOutputTiming.settingExplicit(CMTime(value: 91, timescale: 7), on: source)
+                    : .calculated
+                let wrapped = try SampleBufferBuilder.makeWriterInputSample(source,
+                    lifetime: WriterInputLifetime(), outputTiming: outputTiming)
+                try assertWriterInputMatches(wrapped, source, packetized: packetized)
+
+                // Dictionary allocation state must not turn a calculated PTS into
+                // an override or erase the explicit creation-time intent.
+                let trim = CMTime(value: 128, timescale: 48_000)
+                for sample in [source, wrapped] {
+                    CMSetAttachment(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                        value: try XCTUnwrap(CMTimeCopyAsDictionary(trim, allocator: kCFAllocatorDefault)),
+                        attachmentMode: kCMAttachmentMode_ShouldPropagate)
+                }
+                assertExactTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped),
+                    explicit ? CMTime(value: 91, timescale: 7)
+                        : CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(source), trim))
+                try assertWriterInputMatches(wrapped, source, packetized: packetized)
+            }
+        }
+    }
+
     func testWriterInputPreservesTrimmedCalculatedOutputTimestampAndAttachmentModes() throws {
         for packetized in [false, true] {
             for reversed in [false, true] {
@@ -753,7 +789,10 @@ final class SampleBufferBuilderTests: XCTestCase {
                 file: file, line: line)
         }
         for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
-            XCTAssertTrue(writerAttachments(actual, mode: mode) == writerAttachments(expected, mode: mode),
+            // Buffer attachment facts are keyed entries. Empty dictionary storage
+            // is not transferred by CMSetAttachments, which applies each entry.
+            XCTAssertTrue((writerAttachments(actual, mode: mode) ?? NSDictionary())
+                == (writerAttachments(expected, mode: mode) ?? NSDictionary()),
                 "attachmentMode=\(mode)", file: file, line: line)
         }
         XCTAssertTrue(CMSampleBufferGetSampleAttachmentsArray(actual, createIfNecessary: false).map { $0 as NSArray }

@@ -29,6 +29,23 @@ class NativeSamplePayloadContractTests(unittest.TestCase):
         self.assertNotIn("CMBlockBufferCopyDataBytes", helper)
         self.assertNotIn("Data(count:", helper)
 
+    def test_only_top_level_buffer_dictionaries_canonicalize_absence(self):
+        self.assertTrue("static func freezeBufferDictionary(" in SOURCE,
+                      "buffer dictionary absence needs a scoped, content-preserving representation")
+        helper = SOURCE.split("static func freezeBufferDictionary(", 1)[1].split(
+            "static func freeze(_ value:", 1)[0]
+        self.assertIn("guard let dictionary else { return .dictionary([:]) }", helper)
+        self.assertIn("return try freeze(dictionary as NSDictionary)", helper,
+                      "all present keys and nested values must retain exact facts")
+        freeze = SOURCE.split("static func freeze(_ sample: CMSampleBuffer)", 1)[1].split(
+            "func nativeSamplePayloadDigest(", 1)[0]
+        self.assertIn("try sampleAttachments.map { try NativeAttachmentFacts.freeze($0) }", freeze)
+        self.assertIn("try NativeAttachmentFacts.freezeBufferDictionary(propagating)", freeze)
+        self.assertIn("try NativeAttachmentFacts.freezeBufferDictionary(privateAttachments)", freeze)
+        builder = (ROOT / "Sources/VPlayerPlayback/Media/SampleBufferBuilder.swift").read_text()
+        self.assertIn("CMSetAttachments(result, attachments: values, attachmentMode: mode)", builder)
+        self.assertIn("try outputTiming.restore(on: result)", builder)
+
     def test_validation_checkpoints_are_preserved(self):
         # Five original validation sites plus the two-sided zero-copy wrapper check.
         self.assertEqual(SOURCE.count("NativeSampleFacts.freeze("), 7)

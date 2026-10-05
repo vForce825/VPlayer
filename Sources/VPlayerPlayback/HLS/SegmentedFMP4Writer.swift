@@ -450,6 +450,17 @@ private indirect enum NativeAttachmentFacts: Sendable, Equatable {
     case number(String, String)
     case data(Data)
 
+    /// CMSetAttachments applies CMSetAttachment to each key/value; an empty
+    /// dictionary cannot recreate the source's internal dictionary allocation.
+    /// Freeze the key/value facts, not nil versus allocated-but-empty storage.
+    /// Only buffer-level dictionaries use this rule, separately for each valid
+    /// mode. A present key with an empty nested value remains a real attachment.
+    /// https://developer.apple.com/documentation/coremedia/cmsetattachments(_:attachments:attachmentmode:)
+    static func freezeBufferDictionary(_ dictionary: CFDictionary?) throws -> NativeAttachmentFacts {
+        guard let dictionary else { return .dictionary([:]) }
+        return try freeze(dictionary as NSDictionary)
+    }
+
     static func freeze(_ value: Any) throws -> NativeAttachmentFacts {
         if let dictionary = value as? NSDictionary {
             var result: [String: NativeAttachmentFacts] = [:]
@@ -547,9 +558,11 @@ private struct NativeSampleFacts: Sendable, Equatable {
             target: sample, attachmentMode: kCMAttachmentMode_ShouldPropagate)
         let privateAttachments = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
             target: sample, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
-        let attachments: [NativeAttachmentFacts?] = try [sampleAttachments,
-            propagating.map { $0 as NSDictionary }, privateAttachments.map { $0 as NSDictionary }]
-            .map { try $0.map { try NativeAttachmentFacts.freeze($0) } }
+        let attachments: [NativeAttachmentFacts?] = [
+            try sampleAttachments.map { try NativeAttachmentFacts.freeze($0) },
+            try NativeAttachmentFacts.freezeBufferDictionary(propagating),
+            try NativeAttachmentFacts.freezeBufferDictionary(privateAttachments),
+        ]
         let digest: Data?
         if let block = CMSampleBufferGetDataBuffer(sample) {
             digest = try nativeSamplePayloadDigest(block)

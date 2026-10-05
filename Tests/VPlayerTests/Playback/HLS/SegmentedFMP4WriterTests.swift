@@ -553,6 +553,109 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(native.appendCount, 0)
     }
 
+    func testAsyncAACAcceptsEmptyAttachmentsLeftByRemovingTrim() async throws {
+        let source = try Task17Fixtures.aacBuffer(pts: CMTime(value: 10, timescale: 1))
+        Task17Fixtures.setTrim(source, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart, samples: 128)
+        CMRemoveAttachment(source, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+        XCTAssertEqual(CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+            target: source, attachmentMode: kCMAttachmentMode_ShouldPropagate).map(CFDictionaryGetCount) ?? 0, 0)
+        let outputTiming = try WriterInputOutputTiming.settingExplicit(CMTime(value: 10, timescale: 1), on: source)
+        let epoch = try Task17Fixtures.aacEpoch(buffers: [source], workspace: AACCalibrationWorkspace(),
+            outputTimings: [outputTiming])
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 92_030, kind: .aac,
+            sourceFormatHint: CMSampleBufferGetFormatDescription(source), factory: factory)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
+        XCTAssertEqual(factory.lastWriter?.appendCount, 1)
+        let terminal = try await writer.finish()
+        XCTAssertEqual(terminal.inputCount, 1)
+    }
+
+    func testAsyncVideoAcceptsRemovedBufferAttachmentsInBothModes() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_031)
+        let key = "VPlayer.Native.Removed" as CFString
+        for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+            CMSetAttachment(fixture.output.sampleBuffer, key: key, value: kCFBooleanTrue, attachmentMode: mode)
+            CMRemoveAttachment(fixture.output.sampleBuffer, key: key)
+            XCTAssertNil(CMGetAttachment(fixture.output.sampleBuffer, key: key, attachmentModeOut: nil))
+        }
+        try await fixture.writer.appendVideoAwaitingReadiness(fixture.output,
+            ticket: fixture.boundary.issueVideoAppend(for: fixture.output, writerBinding: fixture.writer.binding))
+        XCTAssertEqual(fixture.factory.lastWriter?.appendCount, 1)
+        let terminal = try await fixture.writer.finish()
+        XCTAssertEqual(terminal.inputCount, 1)
+    }
+
+    func testAsyncVideoPreservesPopulatedBufferAttachmentsIncludingNestedEmptyDictionary() async throws {
+        let fixture = try makeAsyncVideoFixture(seed: 92_032)
+        let modes = [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate]
+        for (index, mode) in modes.enumerated() {
+            CMSetAttachment(fixture.output.sampleBuffer, key: "VPlayer.Native.Boolean.\(index)" as CFString,
+                value: kCFBooleanTrue, attachmentMode: mode)
+            CMSetAttachment(fixture.output.sampleBuffer, key: "VPlayer.Native.EmptyValue.\(index)" as CFString,
+                value: NSDictionary(), attachmentMode: mode)
+        }
+        try await fixture.writer.appendVideoAwaitingReadiness(fixture.output,
+            ticket: fixture.boundary.issueVideoAppend(for: fixture.output, writerBinding: fixture.writer.binding))
+        let native = try XCTUnwrap(fixture.factory.lastWriter)
+        for (index, mode) in modes.enumerated() {
+            let boolean = try native.inputAttachment(at: 0, key: "VPlayer.Native.Boolean.\(index)" as CFString)
+            XCTAssertEqual((boolean.value as? NSNumber)?.boolValue, true)
+            XCTAssertEqual(boolean.mode, mode)
+            let nested = try native.inputAttachment(at: 0, key: "VPlayer.Native.EmptyValue.\(index)" as CFString)
+            XCTAssertEqual(try XCTUnwrap(nested.value as? NSDictionary).count, 0)
+            XCTAssertEqual(nested.mode, mode, "A present key with an empty dictionary value is still an attachment")
+        }
+        let terminal = try await fixture.writer.finish()
+        XCTAssertEqual(terminal.inputCount, 1)
+    }
+
+    func testAsyncVideoRejectsBufferAttachmentChangesDuringNativeWait() async throws {
+        let modes = [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate]
+        let mutations = ["insert", "remove", "value", "mode", "removeNestedEmpty"]
+        for (modeIndex, mode) in modes.enumerated() {
+            for (mutationIndex, mutation) in mutations.enumerated() {
+                let fixture = try makeAsyncVideoFixture(seed: 92_040 + UInt64(modeIndex * mutations.count + mutationIndex))
+                let writer = fixture.writer
+                let output = fixture.output
+                let key = "VPlayer.Native.Mutation" as CFString
+                if mutation != "insert" {
+                    let value: CFTypeRef = mutation == "removeNestedEmpty" ? NSDictionary() : kCFBooleanTrue
+                    CMSetAttachment(output.sampleBuffer, key: key, value: value, attachmentMode: mode)
+                }
+                let native = try XCTUnwrap(fixture.factory.lastWriter)
+                native.setReadyForMoreMediaData(false)
+                let entered = expectation(description: "Native append suspended before attachment \(mutation)")
+                native.observeAsyncAppend(entered: { entered.fulfill() })
+                let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+                let append = Task { try await writer.appendVideoAwaitingReadiness(output, ticket: ticket) }
+                await fulfillment(of: [entered], timeout: 2)
+                switch mutation {
+                case "remove", "removeNestedEmpty":
+                    CMRemoveAttachment(output.sampleBuffer, key: key)
+                case "mode":
+                    CMSetAttachment(output.sampleBuffer, key: key, value: kCFBooleanTrue,
+                        attachmentMode: modes[1 - modeIndex])
+                default:
+                    CMSetAttachment(output.sampleBuffer, key: key,
+                        value: mutation == "value" ? kCFBooleanFalse : kCFBooleanTrue, attachmentMode: mode)
+                }
+                native.setReadyForMoreMediaData(true)
+                do {
+                    try await append.value
+                    XCTFail("Attachment \(mutation) in mode \(mode) must invalidate frozen input facts")
+                } catch {
+                    XCTAssertEqual(error as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
+                }
+                XCTAssertEqual(writer.terminalReceipt?.terminalReason, .failed)
+                XCTAssertEqual(writer.terminalReceipt?.inputCount, 0)
+                XCTAssertNil(ticket.committedBoundary)
+            }
+        }
+    }
+
     func testAsyncVideoPreservesNonpropagatingDecoderAttachment() async throws {
         let fixture = try makeAsyncVideoFixture(seed: 92_007)
         CMSetAttachment(fixture.output.sampleBuffer,
@@ -8929,6 +9032,16 @@ private final class Task17FakeSystemWriter: SegmentedFMP4SynchronousSystemWritin
     func setRetainsInputs(_ value: Bool) { lock.withLock { retainsInputs = value } }
     func setReleasesInputsOnFlush(_ value: Bool) { lock.withLock { releasesInputsOnFlush = value } }
     func releaseInputSamples() { lock.withLock { retainedInputSamples.removeAll() } }
+    func inputAttachment(at index: Int, key: CFString) throws -> (value: CFTypeRef?, mode: CMAttachmentMode) {
+        try lock.withLock {
+            guard retainedInputSamples.indices.contains(index) else {
+                throw SegmentedFMP4WriterFailure.systemFailure
+            }
+            var mode = kCMAttachmentMode_ShouldNotPropagate
+            let value = CMGetAttachment(retainedInputSamples[index], key: key, attachmentModeOut: &mode)
+            return (value, mode)
+        }
+    }
     func makeInputBlockAlias(at index: Int) throws -> CMBlockBuffer {
         try lock.withLock {
             guard retainedInputSamples.indices.contains(index),
