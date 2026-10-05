@@ -1966,16 +1966,32 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             let context = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot())
             let owner = try XCTUnwrap(harness.graph.coordinator.begin(contextNonce: context.contextNonce,
                 reason: .pause, at: harness.graph.registry.clock.nowNanoseconds))
-            // This is the original KVO delivery selected before the Registry
-            // revoked authority, arriving before the owned physical stop starts.
-            harness.coordinator.observeTimeControlStatus(.waitingToPlayAtSpecifiedRate,
-                item: harness.item, activation: activation)
+            let revoked = try XCTUnwrap(harness.backend.lastActivationInvocation)
+            let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+            // These are original KVO deliveries selected before revocation,
+            // arriving before the owned physical stop can enter MainActor.
+            let queuedStatuses: [AVPlayer.TimeControlStatus] = [.waitingToPlayAtSpecifiedRate, .playing, .paused]
+            for status in queuedStatuses {
+                harness.coordinator.observeTimeControlStatus(status,
+                    item: harness.item, activation: activation)
+            }
+            XCTAssertEqual(harness.coordinator.phase, .stopping)
+            XCTAssertEqual(harness.coordinator.publishedPlayingCount, 0)
             XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+            XCTAssertEqual(harness.driver.pauseCallCount, 0,
+                "The relay fences state; only the original registered stop may pause")
             XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.owner, owner)
+            XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, suspend)
             _ = try await harness.stop()
+            XCTAssertEqual(harness.backend.suspendCallCount, 1)
             XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
             let resumed = try await harness.resumeThroughRegistry()
             XCTAssertNotEqual(resumed, .rejected)
+            let successor = harness.graph.registry.outputResourceContextSnapshot()?.activation
+            XCTAssertFalse(revoked.requestAutomaticSuspend(item: harness.item),
+                "The old activation cannot acquire cleanup authority over its resumed successor")
+            XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.activation, successor)
+            XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
             XCTAssertEqual(harness.coordinator.invalidationCount, 0)
             XCTAssertEqual(harness.driver.installCount, 1)
         }
@@ -3842,11 +3858,20 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testStaleKVOStopReceiptAndCancelCannotAffectReplacementItem() async throws {
         let harness = try await Task21Harness()
-        _ = try await harness.prepare(); let old = try await harness.stop()
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        let revoked = try XCTUnwrap(harness.backend.lastActivationInvocation)
+        let old = try await harness.stop()
         try harness.reinstall()
         harness.coordinator.observeTimeControlStatus(.playing, item: harness.oldItem,
                                                      activation: harness.activation)
         XCTAssertFalse(harness.coordinator.accept(old))
+        let replacementPhase = harness.coordinator.phase
+        XCTAssertFalse(revoked.requestAutomaticSuspend(item: harness.oldItem))
+        XCTAssertFalse(revoked.requestAutomaticSuspend(item: harness.item),
+                       "A retired activation cannot retarget cleanup to a replacement item")
+        XCTAssertEqual(harness.coordinator.phase, replacementPhase)
+        XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
         harness.coordinator.cancel(item: harness.oldItem)
         XCTAssertEqual(harness.coordinator.currentItemIdentity, harness.item)
         XCTAssertEqual(harness.driver.pauseCallCount, 1)
@@ -5662,16 +5687,139 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         _ = try await harness.activate()
         let source = try XCTUnwrap(
             harness.graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        let invocation = try XCTUnwrap(harness.backend.lastActivationInvocation)
         XCTAssertTrue(harness.graph.registry.requestCancel(source))
+        XCTAssertFalse(invocation.revalidateCurrentAuthority())
+        let priorSuspend = harness.graph.registry.outputResourceContextSnapshot()?.suspend
+        XCTAssertFalse(invocation.requestAutomaticSuspend(
+            item: Task21Fixtures.staleGenerationItem(from: harness.item)),
+            "A mismatched item cannot use the retained activation's cleanup authority")
+        XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, priorSuspend)
+        harness.driver.holdAudioConnectionCompletion = true
+        defer {
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+        }
 
         harness.driver.emitTimeControlStatus(.playing)
-        for _ in 0..<8 { await Task.yield() }
 
+        // The callback is synchronous. No scheduler yield can stand in for
+        // the immediate fence, or for joining the separate physical stop.
         XCTAssertEqual(harness.coordinator.publishedPlayingCount, 0)
         XCTAssertEqual(harness.coordinator.phase, .stopping,
                        "playing relay 发现权威已撤销后必须失败闭合")
-        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend,
+        XCTAssertEqual(harness.driver.pauseCallCount, 0,
+                       "The relay must not perform an unowned physical pause")
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend,
                         "撤权后的 playing 不得仅静默丢弃，必须进入共享单飞 stop")
+        let stopOwner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+        XCTAssertEqual(stopOwner.reason, .pause)
+        XCTAssertEqual(suspend.priorActivation, invocation.activation)
+        harness.driver.emitTimeControlStatus(.playing)
+        XCTAssertTrue(invocation.requestAutomaticSuspend(item: harness.item))
+        XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.owner, stopOwner)
+        XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, suspend)
+        let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+        XCTAssertTrue(disconnectHeld, "The original registered stop must reach physical disconnect")
+        guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        XCTAssertEqual(harness.driver.pauseCallCount, 1)
+        XCTAssertEqual(harness.backend.suspendCallCount, 1)
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt,
+                     "A pending disconnect cannot produce a quiescence receipt")
+        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval)
+        harness.driver.holdAudioConnectionCompletion = false
+        harness.driver.releaseAudioConnection()
+        let stopped = await harness.graph.registry.joinOutputBackendOperation(suspend.task)
+        guard case .succeeded = stopped else {
+            XCTFail("The original revoked-activation stop did not complete: \(stopped)")
+            return
+        }
+        let receipt = try XCTUnwrap(harness.backend.quiescenceReceipt)
+        XCTAssertEqual(receipt.suspendTicket, suspend)
+        XCTAssertTrue(harness.coordinator.accept(receipt))
+        XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.interval)
+        XCTAssertEqual(harness.driver.rate, 0)
+        XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+        XCTAssertEqual(harness.driver.installCount, 1)
+        XCTAssertEqual(harness.backend.retireCallCount, 0,
+                       "Revoked playing must not start publication replacement")
+    }
+
+    func testRevokedPlayingArmsOwnedSuspendDeadlineBeforeHeldDisconnectCompletes() async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let harness = try await Task21Harness(progressClock: clock, ownsProgressTerminalCleanup: true)
+        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        let scheduler = try XCTUnwrap(harness.progressScheduler)
+        XCTAssertNotNil(scheduler.hlsProgressIdentitySnapshot())
+        let handlerCount = clock.deadlineTimerHandlerInstallationCount
+        let source = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(harness.graph.registry.requestCancel(source))
+        harness.driver.holdAudioConnectionCompletion = true
+        defer {
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            harness.backend.allowRetirementCompletion()
+        }
+
+        harness.driver.emitTimeControlStatus(.playing)
+
+        let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+        let deadline = suspend.anchorInstant + 1_000_000_000
+        XCTAssertEqual(harness.coordinator.phase, .stopping)
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+        XCTAssertEqual(scheduler.suspendTicketSnapshot(), suspend,
+                       "The exact stop deadline must be armed before its async runner can return")
+        XCTAssertEqual(scheduler.suspendNotAfterInstantSnapshot(), deadline)
+        XCTAssertFalse(harness.graph.registry.executor.safetyIngress.snapshot.outputPermitPresent)
+        XCTAssertFalse(harness.graph.registry.executor.safetyIngress.snapshot.readinessOpen)
+        XCTAssertEqual(clock.deadlineTimerHandlerInstallationCount, handlerCount)
+        let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+        XCTAssertTrue(disconnectHeld)
+        guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        XCTAssertEqual(harness.backend.suspendCallCount, 1)
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+
+        clock.set(nowNanoseconds: deadline - 1)
+        harness.graph.registry.executor.sync {}
+        XCTAssertFalse(harness.graph.registry.outputResourceContextSnapshot()?.suspendTimedOut == true)
+        clock.advance(nanoseconds: 1)
+        harness.graph.registry.executor.sync {}
+        let timedOut = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot())
+        XCTAssertTrue(timedOut.suspendTimedOut,
+                      "Timeout must execute while the original physical disconnect is still held")
+        XCTAssertTrue(timedOut.poisoned)
+        XCTAssertEqual(timedOut.suspend, suspend)
+        XCTAssertNotNil(timedOut.interval,
+                        "Timeout cannot manufacture physical quiescence or close the original interval")
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        XCTAssertEqual(harness.driver.pauseCallCount, 1)
+        XCTAssertEqual(harness.backend.retireCallCount, 0)
+        XCTAssertNil(scheduler.suspendTicketSnapshot())
+        let firstFailure = harness.graph.registry.playbackStateSnapshot()
+        guard case .failed = firstFailure else {
+            XCTFail("The original suspend deadline must publish its terminal failure")
+            return
+        }
+
+        harness.driver.holdAudioConnectionCompletion = false
+        harness.driver.releaseAudioConnection()
+        harness.backend.allowRetirementCompletion()
+        try await harness.joinProgressTerminalCleanup()
+        XCTAssertEqual(harness.graph.registry.playbackStateSnapshot(), firstFailure)
+        XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot())
+        XCTAssertNil(harness.driver.currentItemIdentity)
+        XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+        XCTAssertEqual(harness.backend.suspendCallCount, 1)
+        XCTAssertEqual(harness.backend.retireCallCount, 1)
     }
 
     func testReview3BackendQuiescenceReceiptRequiresExactPrivateIssuerIdentityAndSingleConsumption()
@@ -9069,7 +9217,7 @@ private final class Task21ProgressCleanupReceiver: PlaybackOwnedCleanupReceiving
 @MainActor
 private final class Task21Harness {
     let progressScheduler: PlaybackDeadlineScheduler?
-    private let progressReceiver: Task21ProgressCleanupReceiver?
+    private let progressReceiver: (any PlaybackOwnedCleanupReceiving)?
     let driver: Task21FakeDriver
     let evidence: Task21FakeEvidenceSource
     private let authorityEvents = Task21AuthorityEventSink()
@@ -9106,7 +9254,8 @@ private final class Task21Harness {
          omitInitialInitializationBodies: Bool = false,
          diagnosticPhases: Bool = false,
          coordinatorAllocator: PlaybackIdentityAllocator = .shared,
-         progressClock: ManualPlaybackClock? = nil) async throws {
+         progressClock: ManualPlaybackClock? = nil,
+         ownsProgressTerminalCleanup: Bool = false) async throws {
         self.liveEdge = Task21Fixtures.time(liveEdge)
         self.boundaries = boundaries.map(Task21Fixtures.time)
         self.directAudioOnlyRendition = directAudioOnlyRendition
@@ -9119,7 +9268,9 @@ private final class Task21Harness {
         graph = try OutputGraphFixture(clock: progressClock ?? .init(100), backendObject: backend)
         if progressClock != nil {
             let scheduler = PlaybackDeadlineScheduler(registry: graph.registry)
-            let receiver = Task21ProgressCleanupReceiver()
+            let receiver: any PlaybackOwnedCleanupReceiving = ownsProgressTerminalCleanup
+                ? Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+                : Task21ProgressCleanupReceiver()
             graph.registry.bindPlaybackRuntime(scheduler: scheduler, receiver: receiver)
             progressScheduler = scheduler
             progressReceiver = receiver
@@ -9364,6 +9515,13 @@ private final class Task21Harness {
         }
         latestReceipt = receipt
         return receipt
+    }
+
+    func joinProgressTerminalCleanup() async throws {
+        let receiver = try XCTUnwrap(progressReceiver as? Task21FinalEOSCleanupReceiver)
+        await graph.registry.joinOwnedTerminalCleanup(session: lifecycle.backendIdentity.sessionIdentity)
+        try receiver.result()
+        authorityFixture.shutdown()
     }
 
     func shutdown() async throws {

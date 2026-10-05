@@ -2161,10 +2161,16 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
                                   activation: ActivationEpoch) {
         guard request?.item == item, authorization?.activation == activation,
               state.phase != .stopping, state.phase != .quiescent else { return }
-        // Revocation can precede the owned MainActor stop. A queued callback
-        // from that exact old activation is no longer a runtime observation and
-        // must not turn intentional pause/route cleanup into a new replacement.
-        guard authorization?.revalidateCurrentAuthority() == true else { return }
+        // Revocation can precede the owned MainActor stop. Fence this exact
+        // activation immediately, but preserve its publication and authorization
+        // for the Registry's original suspend/close claim. A queued observation
+        // must neither publish playing nor turn an intentional pause into replacement.
+        guard authorization?.revalidateCurrentAuthority() == true else {
+            cancelProgressObservation()
+            state.phase = .stopping
+            _ = authorization?.requestAutomaticSuspend(item: item)
+            return
+        }
         lastPublishedTimeControlStatus = status
         if status == .waitingToPlayAtSpecifiedRate, let identity = progressObservationIdentity {
             sampleProgress(identity: identity)

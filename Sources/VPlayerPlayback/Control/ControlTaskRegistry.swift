@@ -380,9 +380,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         /// 当前播放观察发现权威失效时，仍由原 Registry 建立唯一 pause/suspend record。
-        func requestAutomaticSuspend() -> Bool {
+        func requestAutomaticSuspend(item: AVPlayerItemInstanceIdentity) -> Bool {
             capability.requestAutomaticSuspend(sourceTaskNonce: sourceTaskNonce,
-                                                activation: frozenActivation)
+                                                activation: frozenActivation, item: item)
         }
 
         func scheduleNaturalEnd(item: AVPlayerItemInstanceIdentity, identity: UUID,
@@ -480,10 +480,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         func requestAutomaticSuspend(sourceTaskNonce: UInt64,
-                                     activation: ActivationEpoch) -> Bool {
+                                     activation: ActivationEpoch,
+                                     item: AVPlayerItemInstanceIdentity) -> Bool {
             registry?.requestAutomaticSuspend(
                 sourceTaskNonce: sourceTaskNonce,
-                activation: activation) == true
+                activation: activation, item: item) == true
         }
 
         fileprivate func consumeWhileSafetyCellLocked() -> Bool {
@@ -9195,30 +9196,69 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }) ?? false
     }
 
-    /// KVO/HTTP 观察失败闭合时复用当前 lifecycle 的既有 Registry 单飞 stop。
+    /// Cleanup authority survives positive-rate revocation only for the exact
+    /// original source/interval/item. It cannot admit playback or replacement.
     private func requestAutomaticSuspend(
         sourceTaskNonce: UInt64,
-        activation: ActivationEpoch
+        activation: ActivationEpoch,
+        item: AVPlayerItemInstanceIdentity
     ) -> Bool {
-        guard let (sourceTask, interval) = positiveRateInvocationSnapshot(
-            sourceTaskNonce: sourceTaskNonce, activation: activation),
-              let context = outputResourceContextSnapshot(),
-              context.activation == interval.activation,
-              context.interval == interval,
-              context.sourceTask == sourceTask else { return false }
-        let owner: OutputTransitionOwnerTicket
-        do {
-            guard let value = try beginOutputTransition(
-                contextNonce: context.contextNonce,
-                reason: .pause,
-                anchorInstant: monotonicClock.nowNanoseconds,
-                teardown: false,
-                sourceActivation: interval.activation
-            ) else { return false }
-            owner = value
-        } catch { return false }
-        guard let stop = outputResourceContextSnapshot()?.suspend else { return false }
-        return startOutputSuspendOperation(stop.task, owner: owner)
+        // Match the public transition boundary: arm the original suspend budget
+        // after the Cell unlocks, before any held SDK completion can return.
+        defer { notifyPlaybackProgress() }
+        return executor.sync {
+            func admitSuspend(reason: OutputTransitionReason, output: inout PlaybackOutputSafetyState)
+                throws -> OutputTransitionOwnerTicket? {
+                guard case .installed(var context, let backend) = authority.resourceState,
+                      let sourceTask = context.sourceTask, sourceTask.nonce == sourceTaskNonce,
+                      let interval = context.interval, interval.activation == activation,
+                      context.activation == activation,
+                      interval.outputLifecycle == item.outputLifecycleEpoch,
+                      interval.itemGeneration == item.itemGeneration,
+                      backend.identity == interval.backendIdentity,
+                      backend.lifecycle == interval.outputLifecycle,
+                      let record = authority.commands.first(where: {
+                          $0?.controlTaskTicket == sourceTask
+                      }) ?? nil, record.slot == .activation,
+                      record.groupTicket == context.reservation.workGroup else { return nil }
+                if let owner = context.owner {
+                    guard let stop = context.suspend,
+                          stop.lifecycle == interval.outputLifecycle,
+                          stop.priorActivation == activation,
+                          context.closeClaim?.suspendTicket == stop,
+                          context.closeClaim?.intervalKey == interval else { return nil }
+                    // Preserve the existing owner, including stronger cleanup.
+                    return owner
+                }
+                return try beginOutputTransitionLocked(context: &context, reason: reason,
+                    anchorInstant: monotonicClock.nowNanoseconds, teardown: reason.releasesLease,
+                    sourceActivation: activation, output: &output)
+            }
+            // Ordinary admission must commit revoked output/readiness bits.
+            // Cleanup-only barriers restore those bits; use that path only after
+            // the Cell has already folded a safety failure and closed them.
+            let owner = try? transaction(operationDescriptor: .resourceOwnership,
+                safetyFailureFallback: { output in
+                    try admitSuspend(reason: .terminal, output: &output)
+                }) { output in
+                    try admitSuspend(reason: .pause, output: &output)
+                }
+            guard let owner, let context = outputResourceContextSnapshot(),
+                  context.owner == owner, let stop = context.suspend else { return false }
+            // Recovery/terminal owners already own their execution path. Never
+            // replace their task or consume a new publication-replacement capability.
+            if owner.reason != .pause { return true }
+            if startOutputSuspendOperation(stop.task, owner: owner) { return true }
+            // A duplicate observation joins the exact registered runner; it
+            // must not interpret an already-started stop as a failed admission.
+            return projection {
+                authority.outputContext?.owner == owner
+                    && authority.outputContext?.suspend == stop
+                    && authority.commands.contains {
+                        $0?.controlTaskTicket == stop.task && $0?.backendOperation != nil
+                    }
+            }
+        }
     }
 
     /// publication 失败与正 rate authority 独立：能力仍需精确命中签发时的
