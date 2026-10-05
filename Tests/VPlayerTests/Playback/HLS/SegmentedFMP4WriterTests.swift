@@ -1248,7 +1248,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         var first: SegmentedFMP4Writer? = try Task17Fixtures.makeWriter(seed: 80_700, kind: .video,
             writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
             boundary: fixture.boundary, factory: factory, ownershipLimits: nil, releaseTransfersImmediately: true)
-        weak var weakFirst = first
+        let weakFirst = TestWeakReference(first)
         let aliases = Task17RetainedNativeInputAliases(capacity: 720)
         defer { aliases.releaseAll() }
         try first!.observeNativeInputAliasesForTesting { aliases.retainReference(to: $0) }
@@ -1279,7 +1279,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         }
         let continuation = try await first!.finishWriterWindow()
         first = nil
-        XCTAssertNil(weakFirst)
+        XCTAssertNil(weakFirst.value)
         let nextBinding = Task17Fixtures.rolloverBinding(from: fixture.binding, writerIdentity: .init(rawValue: 80_701))
         let nextFactory = Task17FakeSystemWriterFactory()
         let next = try Task17Fixtures.makeWriter(seed: 80_701, kind: .video,
@@ -1342,7 +1342,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 kind: kind, sourceFormatHint: format, boundary: boundary,
                 compressedFormatConfiguration: firstUnit.formatConfiguration, factory: factory,
                 ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 384), releaseTransfersImmediately: true)
-            weak var weakFirst = first
+            let weakFirst = TestWeakReference(first)
             let aliases = Task17RetainedNativeInputAliases(capacity: 32)
             defer { aliases.releaseAll() }
             try first!.observeNativeInputAliasesForTesting { aliases.retainReference(to: $0) }
@@ -1366,7 +1366,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             }
             let continuation = try await first!.finishWriterWindow()
             first = nil
-            XCTAssertNil(weakFirst)
+            XCTAssertNil(weakFirst.value)
             XCTAssertEqual(semantic.liveCompressedWriterSubmissionCount, 32)
             let nextBinding = Task17Fixtures.rolloverBinding(from: binding, writerIdentity: .init(rawValue: seed + 1))
             let nextFactory = Task17FakeSystemWriterFactory()
@@ -1401,7 +1401,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             aliases.releaseAll()
             XCTAssertEqual(semantic.liveCompressedWriterSubmissionCount, 352)
             for old in oldUnits {
-                let leases = old.aggregationProof?.orderedAggregationLeaseIdentities.values
+                let leases = try old.aggregationProof?.orderedAggregationLeaseIdentities.values
                     ?? [try XCTUnwrap(old.directLeaseIdentity)]
                 XCTAssertEqual(leases.count, kind == .ac3 ? 1 : 6)
                 for lease in leases { XCTAssertNil(semantic.branchLeaseState(lease)) }

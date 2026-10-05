@@ -126,11 +126,14 @@ func makeOwnedReaderFixtureSample(
 final class AcceptanceHTTPServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "hls.acceptance.source")
-    private let lock = NSLock()
-    private var connections: [NWConnection] = []
-    private var stopped = false
+    private let connectionState = AcceptanceSourceConnections()
     private let metrics = AcceptanceTransportMetrics()
     var transportSnapshot: (bytes: Int, start: Double?) { metrics.snapshot }
+    var failureDiagnostics: [String: Any] {
+        let transport = metrics.snapshot
+        return ["delivered_bytes":transport.bytes,"feed_started":transport.start != nil,
+                "connections":connectionState.count,"source_terminal":metrics.terminal]
+    }
     let sourceURL: URL
 
     init(fileURL: URL) throws {
@@ -139,41 +142,98 @@ final class AcceptanceHTTPServer: @unchecked Sendable {
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(IPv4Address("127.0.0.1")!), port: .any)
         listener = try NWListener(using: parameters, on: .any)
-        let ready = DispatchSemaphore(value: 0)
-        listener.stateUpdateHandler = { state in
-            switch state { case .ready, .failed, .cancelled: ready.signal(); default: break }
-        }
-        listener.start(queue: queue)
-        guard ready.wait(timeout: .now() + 5) == .success, let port = listener.port,
-              let url = URL(string: "http://127.0.0.1:\(port.rawValue)/fixture.ts") else {
-            listener.cancel()
-            throw AcceptanceError.invalid("source server unavailable")
-        }
-        sourceURL = url
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else { connection.cancel(); return }
-            let accepted = self.lock.withLock {
-                guard !self.stopped, self.connections.count < 4 else { return false }
-                self.connections.append(connection)
-                return true
-            }
-            guard accepted else { connection.cancel(); return }
-            connection.start(queue: self.queue)
+        let readiness = AcceptanceListenerReadiness()
+        listener.stateUpdateHandler = { state in readiness.observe(state) }
+        // Network requires the accept handler before start, including the first
+        // connection. Capture initialized owners without capturing partial self.
+        let connectionState = self.connectionState
+        let queue = self.queue
+        let metrics = self.metrics
+        listener.newConnectionHandler = { connection in
+            guard connectionState.accept(connection) else { connection.cancel(); return }
+            connection.start(queue: queue)
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1_024) { _, _, _, error in
-                guard error == nil else { connection.cancel(); return }
+                guard error == nil else {
+                    metrics.end("request: \(String(describing: error))")
+                    connection.cancel(); return
+                }
                 do {
                     let feed = try AcceptanceSourceFeed(connection: connection, file: fileURL,
-                        queue: self.queue, metrics: self.metrics)
+                        queue: queue, metrics: metrics)
                     let header = Data(("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n" +
                         "Content-Length: \(size)\r\nConnection: close\r\n\r\n").utf8)
                     connection.send(content: header, completion: .contentProcessed { error in
-                        if error == nil { feed.sendNext() } else { feed.close() }
+                        if error == nil { feed.sendNext() }
+                        else { metrics.end("header: \(String(describing: error))"); feed.close() }
                     })
-                } catch { connection.cancel() }
+                } catch { metrics.end("open: \(error)"); connection.cancel() }
             }
+        }
+        listener.start(queue: queue)
+        do {
+            try readiness.wait(until: .now() + 5)
+            guard let port = listener.port,
+                  let url = URL(string: "http://127.0.0.1:\(port.rawValue)/fixture.ts") else {
+                throw AcceptanceError.invalid("ready source listener has no bound port")
+            }
+            sourceURL = url
+        } catch {
+            connectionState.stop()
+            listener.cancel()
+            throw error
         }
     }
 
+    func stop() {
+        metrics.end("server_stop")
+        connectionState.stop()
+        listener.cancel()
+    }
+}
+
+/// A wakeup is not readiness. Freeze the first terminal startup result.
+final class AcceptanceListenerReadiness: @unchecked Sendable {
+    private let lock = NSLock()
+    private let signal = DispatchSemaphore(value: 0)
+    private var result: Result<Void, AcceptanceError>?
+    func observe(_ state: NWListener.State) {
+        let observed: Result<Void, AcceptanceError>
+        switch state {
+        case .ready: observed = .success(())
+        case .failed(let error): observed = .failure(.invalid("source listener failed: \(ErrorDiagnosticSnapshot(error).summary)"))
+        case .cancelled: observed = .failure(.invalid("source listener cancelled before ready"))
+        default: return
+        }
+        let first = lock.withLock {
+            guard result == nil else { return false }
+            result = observed
+            return true
+        }
+        if first { signal.signal() }
+    }
+    func wait(until deadline: DispatchTime) throws {
+        guard signal.wait(timeout: deadline) == .success else {
+            throw AcceptanceError.invalid("source listener readiness timed out")
+        }
+        guard let result = lock.withLock({ result }) else {
+            throw AcceptanceError.invalid("source listener woke without a readiness result")
+        }
+        try result.get()
+    }
+}
+
+private final class AcceptanceSourceConnections: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connections: [NWConnection] = []
+    private var stopped = false
+    var count: Int { lock.withLock { connections.count } }
+    func accept(_ connection: NWConnection) -> Bool {
+        lock.withLock {
+            guard !stopped, connections.count < 4 else { return false }
+            connections.append(connection)
+            return true
+        }
+    }
     func stop() {
         let pending = lock.withLock {
             stopped = true
@@ -181,7 +241,6 @@ final class AcceptanceHTTPServer: @unchecked Sendable {
             return connections
         }
         for connection in pending { connection.cancel() }
-        listener.cancel()
     }
 }
 
@@ -204,19 +263,19 @@ private final class AcceptanceSourceFeed: @unchecked Sendable {
     func sendNext() {
         // Independent source-socket safety bound. The common watchdog closes it
         // earlier at the deadline measured from before assembler.start().
-        guard AcceptanceClock.now - started < 299.5 else { close(); return }
+        guard AcceptanceClock.now - started < 299.5 else { metrics.end("feed_deadline"); close(); return }
         do {
-            guard let bytes = try handle.read(upToCount: 188 * 100), !bytes.isEmpty else { close(); return }
+            guard let bytes = try handle.read(upToCount: 188 * 100), !bytes.isEmpty else { metrics.end("file_eof"); close(); return }
             sent += bytes.count
             connection.send(content: bytes, completion: .contentProcessed { [self] error in
-                guard error == nil else { close(); return }
+                guard error == nil else { metrics.end("send: \(String(describing: error))"); close(); return }
                 metrics.delivered(bytes.count)
                 let target = started + Double(sent) / 4_750_000
                 queue.asyncAfter(deadline: .now() + max(0, target - AcceptanceClock.now)) {
                     self.sendNext()
                 }
             })
-        } catch { close() }
+        } catch { metrics.end("read: \(error)"); close() }
     }
 
     func close() { try? handle.close(); connection.cancel() }
@@ -226,6 +285,9 @@ private final class AcceptanceTransportMetrics: @unchecked Sendable {
     private let lock = NSLock()
     private var bytes = 0
     private var start: Double?
+    private var firstTerminal: String?
+    var terminal: String { lock.withLock { firstTerminal ?? "active" } }
+    func end(_ reason: String) { lock.withLock { if firstTerminal == nil { firstTerminal = String(reason.prefix(384)) } } }
     func begin(at time: Double) { lock.withLock { if start == nil { start = time } } }
     func delivered(_ count: Int) { lock.withLock { bytes += count } }
     var snapshot: (bytes: Int, start: Double?) { lock.withLock { (bytes, start) } }
@@ -287,6 +349,14 @@ final class AcceptanceCapture: @unchecked Sendable {
                 }
                 tracks[kind] = track
             } catch { failure = error }
+        }
+    }
+
+    var failureDiagnostics: [String: Any] {
+        lock.withLock {
+            ["copied_bytes":copiedBytes,
+             "error":failure.map { ErrorDiagnosticSnapshot($0).summary } ?? "none",
+             "tracks":tracks.values.map { ["kind":$0.kind,"inits":$0.inits,"fragments":$0.fragments] as [String: Any] }]
         }
     }
 
@@ -432,14 +502,36 @@ final class AcceptanceSampleCollector: @unchecked Sendable {
     }
 }
 
+/// Keep a valid UTF-8 tail within the fixed diagnostic byte cap.
+func acceptanceDiagnosticHistoryTail(_ text: String) -> String {
+    let tail = text.utf8.suffix(8_192).drop(while: { ($0 & 0xC0) == 0x80 })
+    return String(decoding: tail, as: UTF8.self)
+}
+
+/// Freeze the earliest authority failure before retirement changes tracker stages.
+final class AcceptanceFailureCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var first: [String: String]?
+    func record(_ diagnostic: ErrorDiagnosticSnapshot, origin: String) {
+        lock.withLock {
+            guard first == nil else { return }
+            first = ["origin":origin,"error":diagnostic.summary,
+                     "history":acceptanceDiagnosticHistoryTail(PlaybackDiagnosticTracker.shared.recentHistory)]
+        }
+    }
+    var snapshot: [String: String] { lock.withLock { first ?? [:] } }
+}
+
 /// Read-only observation preserves each admitted event and its original owner.
 final class AcceptanceObservedGraph: HLSMediaGraphAssembler.DeliveryGraph, @unchecked Sendable {
     private let graph: SystemHLSDeliveryGraph
     private let lock = NSLock()
     private var packets = 0
     private var eof = false
+    private var lastControl = "none"
     private var lastPacket = AcceptanceClock.now
     init(authority: SystemHLSMediaGraphAuthority) { graph = SystemHLSDeliveryGraph(authority: authority) }
+    var lastControlDiagnostic: String { lock.withLock { lastControl } }
     var packetCount: Int { lock.withLock { packets } }
     var hasEOF: Bool { lock.withLock { eof } }
     var lastPacketTime: Double { lock.withLock { lastPacket } }
@@ -449,8 +541,11 @@ final class AcceptanceObservedGraph: HLSMediaGraphAssembler.DeliveryGraph, @unch
             lock.withLock {
                 switch borrowed {
                 case .packet: packets += 1; lastPacket = AcceptanceClock.now
-                case .endOfStream: eof = true
-                default: break
+                case .endOfStream: eof = true; lastControl = "eof"
+                case .tracks: lastControl = "tracks"
+                case .discontinuity: lastControl = "discontinuity"
+                case .cancelled: lastControl = "cancelled"
+                case .failure(let error): lastControl = ErrorDiagnosticSnapshot(error).summary
                 }
             }
         }

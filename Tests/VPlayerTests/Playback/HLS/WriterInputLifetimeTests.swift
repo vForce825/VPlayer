@@ -105,12 +105,12 @@ final class WriterInputLifetimeTests: XCTestCase {
 
     func testFreeCallbackCannotRetainWriter() throws {
         var owner: WriterInputTestOwner? = WriterInputTestOwner()
-        weak var weakOwner = owner
+        let weakOwner = TestWeakReference(owner)
         let admission = try XCTUnwrap(owner).admission
         var block: CMBlockBuffer? = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(
             copying: Data([1, 2, 3, 4]), lifetime: admission.admit(bytes: 4))
         owner = nil
-        XCTAssertNil(weakOwner)
+        XCTAssertNil(weakOwner.value)
         XCTAssertEqual(admission.usage.count, 1)
         XCTAssertNotNil(block)
         block = nil

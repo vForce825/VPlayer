@@ -58,9 +58,9 @@ final class SourceAACNativeWindowTests: XCTestCase {
         var harness: SourceAACNativeWindowHarness? = try .init(input: input, longBoundary: false,
             forcedWindows: true, retainFirstWindowAliases: true, ledger: ledger)
         let recorder = try XCTUnwrap(harness?.recorder)
-        weak var oldWriter = harness?.branch.writer
-        weak var weakTimeline = harness?.timeline
-        weak var weakBranch = harness?.branch
+        let oldWriter = TestWeakReference(harness?.branch.writer)
+        let weakTimeline = TestWeakReference(harness?.timeline)
+        let weakBranch = TestWeakReference(harness?.branch)
         for index in 0..<47 { try await harness!.branch.append(harness!.frame(index)) }
         XCTAssertEqual(harness?.branch.physicalWriterCount, 1)
         XCTAssertEqual(recorder.aliasCount, 47)
@@ -69,7 +69,7 @@ final class SourceAACNativeWindowTests: XCTestCase {
         let originalProofIdentity = proof.identity
         try await harness!.branch.append(pending)
         XCTAssertEqual(harness?.branch.physicalWriterCount, 2)
-        XCTAssertNil(oldWriter, "A real drained predecessor must not be kept alive by its native aliases")
+        XCTAssertNil(oldWriter.value, "A real drained predecessor must not be kept alive by its native aliases")
         XCTAssertGreaterThanOrEqual(harness!.branch.writer.usage.liveInputCount, 47,
             "The successor shares predecessor input occupancy even after the previous writer is gone")
         XCTAssertLessThanOrEqual(harness!.branch.writer.usage.liveInputCount, 48)
@@ -108,7 +108,7 @@ final class SourceAACNativeWindowTests: XCTestCase {
         harness!.timeline.retireCompressedGeneration()
         recorder.releaseObjects()
         harness = nil
-        XCTAssertNil(weakTimeline); XCTAssertNil(weakBranch)
+        XCTAssertNil(weakTimeline.value); XCTAssertNil(weakBranch.value)
         XCTAssertGreaterThan(ledger.chargedBytes, baseline)
         recorder.releaseFirstAliases(46)
         XCTAssertEqual(recorder.aliasCount, 1)
@@ -124,7 +124,7 @@ final class SourceAACNativeWindowTests: XCTestCase {
             forcedWindows: true, retainFirstWindowAliases: true, writerCapacity: 47)
         defer { harness.recorder.releaseAllAliases(); harness.timeline.retireCompressedGeneration() }
         for index in 0..<47 { try await harness.branch.append(harness.frame(index)) }
-        weak var predecessor = harness.branch.writer
+        let predecessor = TestWeakReference(harness.branch.writer)
         let pending = try harness.frame(47)
         let identity = try XCTUnwrap(pending.source.sourceProof).identity
         let branch = harness.branch
@@ -133,7 +133,7 @@ final class SourceAACNativeWindowTests: XCTestCase {
         while !branch.isWaitingForCapacityForTesting && Date() < deadline { await Task.yield() }
         XCTAssertTrue(branch.isWaitingForCapacityForTesting)
         XCTAssertEqual(branch.physicalWriterCount, 2)
-        XCTAssertNil(predecessor, "The awaiting successor must not pin its already-finished predecessor")
+        XCTAssertNil(predecessor.value, "The awaiting successor must not pin its already-finished predecessor")
         XCTAssertEqual(harness.recorder.aliasCount, 47)
         XCTAssertEqual(branch.writer.usage.inputAllocationCount, 47,
             "A successor must not reset live occupancy or claim the waiting source AU")

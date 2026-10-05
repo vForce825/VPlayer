@@ -50,6 +50,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let server = try AcceptanceHTTPServer(fileURL: file)
         defer { server.stop() }
         let capture = AcceptanceCapture(directory: directory)
+        let firstFailure = AcceptanceFailureCapture()
         let ledgerBefore = ledgers()
         let identity = PlaybackSessionIdentity(sessionID: 30_000,
             requestID: UUID(uuidString: "00000000-0000-0000-0000-000000030000")!)
@@ -57,10 +58,11 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             .init(sessionIdentity: identity, backendGeneration: 30_001), outputNonce: 30_002)
         #if HLS_ACCEPTANCE_BASELINE
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle,
-            publicationDeadlineNanoseconds: 300_000_000_000)
+            publicationDeadlineNanoseconds: 300_000_000_000, failureSink: { firstFailure.record($0, origin: "authority") })
         #else
         let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle,
-            publicationDeadlineNanoseconds: 300_000_000_000, acceptanceProbe: probe)
+            publicationDeadlineNanoseconds: 300_000_000_000, acceptanceProbe: probe,
+            failureSink: { firstFailure.record($0, origin: "authority") })
         #endif
         authority.publicationForTesting.installBeforeReceiveForTesting { capture.receive($0) }
         let graph = AcceptanceObservedGraph(authority: authority)
@@ -94,12 +96,14 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                     try await Task.sleep(for: .milliseconds(20))
                 }
             } catch is CancellationError { }
-            catch { collector.fail(error); watchdog.stop() }
+            catch { firstFailure.record(ErrorDiagnosticSnapshot(error), origin: "sampler"); collector.fail(error); watchdog.stop() }
         }
         defer { sampler.cancel(); watchdog.stop() }
         var report: [String: Any] = [:]
+        var stage = "await_playable_prefix"
         do {
             let prefix = try await assembler.startUntilPlayablePrefix()
+            stage = "await_native_item_ready"
             let item = AVPlayerItem(url: prefix.request.itemURL)
             player.replaceCurrentItem(with: item)
             let readyDeadline = min(start + 299.5, AcceptanceClock.now + 15)
@@ -116,6 +120,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             var firstProgress: Double?
             var lastTime = mediaStart
             var lastProgress = playbackStart
+            stage = "playing"
             player.play()
             while !watchdog.hasStopped {
                 let now = AcceptanceClock.now
@@ -128,6 +133,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 guard now - lastProgress < 5 else { throw AcceptanceError.invalid("AVPlayer clock stalled for five seconds") }
                 try await Task.sleep(for: .milliseconds(20))
             }
+            stage = "post_stop_observations"
             let samples = try collector.snapshot()
             let measured = try XCTUnwrap(watchdog.measuredSeconds)
             XCTAssertGreaterThanOrEqual(measured, 299)
@@ -144,6 +150,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 access.complete(droppedFrames: events?.reduce(0) { $0 + $1.numberOfDroppedVideoFrames },
                     stalls: events?.reduce(0) { $0 + $1.numberOfStalls }, at: AcceptanceClock.now)
             })
+            stage = "joined_retirement"
             let cleanupStart = AcceptanceClock.now
             player.replaceCurrentItem(with: nil)
             let retired = await assembler.retireAndAwaitReceipt()
@@ -162,6 +169,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             }
             let accessSnapshot = try access.finish()
             let accessWaitSeconds = AcceptanceClock.now - accessWaitStart
+            stage = "offline_decode"
             let decodeStart = AcceptanceClock.now
             var renditions: [[String: Any]] = []
             for track in tracks { renditions.append(try await decode(track)) }
@@ -193,10 +201,28 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             report.merge(AcceptanceReport.retirement(final)) { _, new in new }
             #endif
         } catch {
-            player.pause()
-            server.stop()
+            // Capture before cleanup cancels writers/demux and overwrites stages.
+            // This diagnostic is not an acceptance report or a baseline measurement.
+            let failure: [String: Any] = ["role":role,"stage":stage,
+                "error":ErrorDiagnosticSnapshot(error).summary,
+                "source_observation_seconds":AcceptanceClock.now - start,
+                "whole_test_seconds":AcceptanceClock.now - wholeTestStart,
+                "task_cancelled":Task.isCancelled,"watchdog_stopped":watchdog.hasStopped,
+                "assembler_phase":String(describing: assembler.currentPhase),
+                "first_runtime_failure":firstFailure.snapshot,
+                "authority_failure":graph.failureDiagnostic?.summary ?? "none",
+                "producer_packets":graph.packetCount,"producer_eof":graph.hasEOF,
+                "last_demux_control":graph.lastControlDiagnostic,
+                "transport":server.failureDiagnostics,"capture":capture.failureDiagnostics,
+                "history":acceptanceDiagnosticHistoryTail(PlaybackDiagnosticTracker.shared.recentHistory)]
+            if let bytes = try? JSONSerialization.data(withJSONObject: failure, options: [.sortedKeys]) {
+                print("HLS_ACCEPTANCE_FAILURE=" + String(decoding: bytes, as: UTF8.self))
+            }
+            let cleanupStart = AcceptanceClock.now
+            watchdog.stop()
             player.replaceCurrentItem(with: nil)
-            _ = await assembler.retireAndAwaitReceipt()
+            let retired = await assembler.retireAndAwaitReceipt()
+            print("HLS_ACCEPTANCE_FAILURE_CLEANUP=retired:\(retired),seconds:\(AcceptanceClock.now - cleanupStart)")
             throw error
         }
         let bytes = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])

@@ -16,7 +16,7 @@ final class HLSManifestGraphTests: XCTestCase {
         XCTAssertEqual(document.rawData, Data(text.utf8))
         XCTAssertEqual(document.renditions.first?.attributes["NAME"], "English, main")
         XCTAssertEqual(document.renditions.first?.url?.absoluteString, "https://example.test/audio?sig=child")
-        XCTAssertEqual(document.variants.first?.url?.absoluteString, "https://example.test/cdn/video")
+        XCTAssertEqual(document.variants.first?.url.absoluteString, "https://example.test/cdn/video")
         for ref in document.references { XCTAssertEqual(String(data: document.rawData[ref.byteRange], encoding: .utf8), ref.originalURI) }
     }
     func testMapRangesAndAESProtectionRemainDistinct() throws {

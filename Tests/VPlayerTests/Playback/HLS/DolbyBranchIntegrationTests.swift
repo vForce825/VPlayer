@@ -77,13 +77,13 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         let baseline = ledger.chargedBytes
         var graph: DolbyBranchTestGraph? = try DolbyBranchTestGraph(fixture: fixture,
             accessUnits: 24, retainsAliases: true, applicationLedger: ledger)
-        weak var weakGraph = graph
-        weak var weakProducer = graph?.producer
-        weak var weakTimeline = graph?.timeline
-        weak var weakBranch = graph?.branch
+        let weakGraph = TestWeakReference(graph)
+        let weakProducer = TestWeakReference(graph?.producer)
+        let weakTimeline = TestWeakReference(graph?.timeline)
+        let weakBranch = TestWeakReference(graph?.branch)
         let aliases = try XCTUnwrap(graph?.factory.aliases)
         var coordinator: AudioServiceSemanticCoordinator? = graph?.producer.coordinator
-        weak var weakCoordinator = coordinator
+        let weakCoordinator = TestWeakReference(coordinator)
         let expectedMembers = 24 * fixture.frames.count
         for frame in try XCTUnwrap(graph?.frames) { try await graph!.branch.append(frame) }
         XCTAssertEqual(aliases.count, 24)
@@ -99,10 +99,10 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         XCTAssertEqual(coordinator?.liveCompressedWriterSubmissionCount, 24,
             "Cancellation cannot counterfeit release of retained native block references")
         graph = nil
-        XCTAssertNil(weakGraph)
-        XCTAssertNil(weakProducer)
-        XCTAssertNil(weakTimeline)
-        XCTAssertNil(weakBranch)
+        XCTAssertNil(weakGraph.value)
+        XCTAssertNil(weakProducer.value)
+        XCTAssertNil(weakTimeline.value)
+        XCTAssertNil(weakBranch.value)
         XCTAssertGreaterThan(ledger.chargedBytes, baseline)
         aliases.releaseFirst(23)
         XCTAssertEqual(coordinator?.liveCompressedWriterSubmissionCount, 1)
@@ -114,7 +114,7 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         XCTAssertEqual(coordinator?.audioServiceRegistryUsage.admittedProofs, 0)
         XCTAssertEqual(writer.usage.liveInputCount, 0)
         coordinator = nil
-        XCTAssertNil(weakCoordinator)
+        XCTAssertNil(weakCoordinator.value)
         // Writer bookkeeping is still deliberately held by `writer`; the
         // separate owner-release test below checks the entire ledger baseline.
     }
@@ -180,13 +180,13 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         for frame in graph.frames.prefix(32) { try await graph.branch.append(frame) }
         XCTAssertEqual(graph.branch.physicalWriterCount, 1)
         XCTAssertEqual(graph.factory.aliases.count, 32)
-        weak var predecessor = graph.branch.writer
+        let predecessor = TestWeakReference(graph.branch.writer)
         let finalPendingProof = try XCTUnwrap(graph.frames[32].source.dolbyProof)
         let proofIdentity = finalPendingProof.identity
         try await graph.branch.append(graph.frames[32])
         XCTAssertEqual(graph.branch.physicalWriterCount, 2)
         XCTAssertEqual(graph.factory.continuationCount, 1)
-        XCTAssertNil(predecessor)
+        XCTAssertNil(predecessor.value)
         XCTAssertEqual(finalPendingProof.identity, proofIdentity)
         XCTAssertNil(finalPendingProof.admittedProof)
         XCTAssertEqual(graph.producer.coordinator.claimedCompressedWriterSubmissionCount, 33,

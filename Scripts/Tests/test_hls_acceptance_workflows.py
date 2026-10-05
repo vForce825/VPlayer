@@ -14,6 +14,14 @@ import unittest
 ROOT=Path(__file__).resolve().parents[2]
 
 class WorkflowContracts(unittest.TestCase):
+    def test_acceptance_listener_is_configured_before_start_and_smoke_is_selected(self):
+        support=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        server=support.split('final class AcceptanceHTTPServer:',1)[1].split('private final class AcceptanceSourceFeed:',1)[0]
+        self.assertLess(server.index('listener.newConnectionHandler ='),server.index('listener.start(queue:'))
+        controls=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceNativeControlTests.swift').read_text()
+        selected=controls.split('func testNativeObservationControlsRejectFiveFaults()',1)[1]
+        self.assertIn('try await checkSourceServerFirstRequest()',selected)
+
     def test_xcode_version_checks_drain_output_and_preserve_producer_failure(self):
         paths=list((ROOT/'.github/workflows').glob('*.yml'))
         paths.append(ROOT/'Scripts/run-persistent-hls-acceptance.sh')

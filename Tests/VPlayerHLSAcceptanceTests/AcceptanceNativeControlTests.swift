@@ -6,6 +6,7 @@ import AudioToolbox
 import AVFoundation
 import CoreMedia
 import Foundation
+import Network
 import XCTest
 @testable import VPlayerCore
 @testable import VPlayerPlayback
@@ -14,6 +15,59 @@ import XCTest
 /// Short controls run on the candidate before either capped observation. These
 /// exercise native components, not a second playback or resource-stability run.
 final class AcceptanceNativeControlTests: XCTestCase {
+    private func checkFirstFailureCapture() {
+        let capture = AcceptanceFailureCapture()
+        let first = ErrorDiagnosticSnapshot(typeName: "OriginalFailure", message: "native callback rejected")
+        capture.record(first, origin: "authority")
+        capture.record(ErrorDiagnosticSnapshot(CancellationError()), origin: "sampler")
+        XCTAssertEqual(capture.snapshot["error"], first.summary)
+        XCTAssertEqual(capture.snapshot["origin"], "authority")
+        XCTAssertLessThanOrEqual(capture.snapshot["history"]?.utf8.count ?? 0, 8_192)
+        let unicode = String(repeating: "🔬", count: 3_000) + "end"
+        let tail = acceptanceDiagnosticHistoryTail(unicode)
+        XCTAssertLessThanOrEqual(tail.utf8.count, 8_192)
+        XCTAssertTrue(tail.hasSuffix("end"))
+        XCTAssertTrue(unicode.hasSuffix(tail))
+        XCTAssertFalse(tail.contains("\u{FFFD}"))
+    }
+
+    private func checkListenerReadiness() throws {
+        let ready = AcceptanceListenerReadiness()
+        ready.observe(.ready)
+        try ready.wait(until: .now())
+        let cancelled = AcceptanceListenerReadiness()
+        cancelled.observe(.cancelled)
+        cancelled.observe(.ready)
+        XCTAssertThrowsError(try cancelled.wait(until: .now()))
+        let failed = AcceptanceListenerReadiness()
+        failed.observe(.failed(.posix(.EADDRINUSE)))
+        failed.observe(.ready)
+        XCTAssertThrowsError(try failed.wait(until: .now())) { error in
+            XCTAssertTrue(String(describing: error).contains("source listener failed"))
+            XCTAssertTrue(String(describing: error).contains(String(POSIXErrorCode.EADDRINUSE.rawValue)), "Preserve the actual POSIX error code")
+        }
+        let pending = AcceptanceListenerReadiness()
+        pending.observe(.setup)
+        XCTAssertThrowsError(try pending.wait(until: .now()))
+    }
+
+    private func checkSourceServerFirstRequest() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let expected = Data(repeating: 0x47, count: 188 * 100)
+        try expected.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let server = try AcceptanceHTTPServer(fileURL: file)
+        defer { server.stop() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 2
+        configuration.timeoutIntervalForResource = 3
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let (received, response) = try await session.data(from: server.sourceURL)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(received, expected, "The first accepted request must deliver the exact public test bytes")
+    }
+
     private func checkAccessLogCompletionStates() throws {
         let completed = AcceptanceAccessLogCapture(deadline: 2)
         completed.complete(droppedFrames: 3, stalls: 1, at: 1)
@@ -40,7 +94,10 @@ final class AcceptanceNativeControlTests: XCTestCase {
         XCTAssertThrowsError(try late.finish(), "A callback must finish before its deadline")
     }
 
-    func testNativeObservationControlsRejectFiveFaults() throws {
+    func testNativeObservationControlsRejectFiveFaults() async throws {
+        checkFirstFailureCapture()
+        try checkListenerReadiness()
+        try await checkSourceServerFirstRequest()
         try checkAccessLogCompletionStates()
         var positive: [String: Any] = [:]
         var negative: [String: Any] = [:]
