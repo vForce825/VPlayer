@@ -41,6 +41,7 @@ final class PlaybackControllerTests: XCTestCase {
         harness.setRoute(.hlsAVPlayer)
         await harness.playLocal()
         let initial = harness.registry.occupancy
+        let initialCommands = ordinaryCommandDiagnostics(harness.registry)
         do {
             for _ in 0..<36 {
                 for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
@@ -55,7 +56,9 @@ final class PlaybackControllerTests: XCTestCase {
                         let settled = harness.registry.occupancy
                         XCTAssertEqual(settled.groups, initial.groups,
                             "Destroyed backend relay groups cannot accumulate outside the renewable work cycle")
-                        XCTAssertEqual(settled.ordinarySlots, initial.ordinarySlots)
+                        XCTAssertEqual(settled.ordinarySlots, initial.ordinarySlots,
+                            "initial=\(initialCommands) current=\(ordinaryCommandDiagnostics(harness.registry)) "
+                                + "context=\(String(describing: harness.registry.outputResourceContextSnapshot()))")
                         let currentBackend = try XCTUnwrap(harness.factory.createdBackends.last)
                         let cycle = await harness.controller.readinessCycleForTesting
                         harness.factory.emit(.phase(.buffering, readinessCycle: cycle),
@@ -81,6 +84,37 @@ final class PlaybackControllerTests: XCTestCase {
         XCTAssertEqual(harness.currentAudibleOutputs, 0)
     }
 
+    func testPublicationReplacementRetiresExactlyOnceWhenSuspendRequiresRetirement() async throws {
+        let harness = BackendOwnershipTestHarness()
+        harness.setRoute(.hlsAVPlayer)
+        await harness.playLocal()
+        do {
+            let backend = try XCTUnwrap(harness.factory.createdBackends.first)
+            let prior = try XCTUnwrap(harness.registry.outputResourceContextSnapshot()?.prepareTicket)
+            backend.configureRetirement(required: true, result: .confirmedLocalOutputStopped)
+            XCTAssertTrue(backend.backendPublicationReplacementAuthoritySlot.requestReplacement())
+            try await eventually {
+                guard let context = harness.registry.outputResourceContextSnapshot(),
+                      let activation = context.sourceTask else { return false }
+                return context.owner == nil && context.prepared && context.prepareTicket != prior
+                    && harness.registry.phase(of: activation) == .terminal(.completed)
+                    && harness.currentAudibleOutputs == 1
+            }
+            XCTAssertEqual(backend.retirementSnapshot.count, 1,
+                "A successful suspend fallback already retired this exact lifecycle")
+            XCTAssertEqual(harness.backendCreationCount, 1)
+            XCTAssertNotEqual(harness.registry.outputResourceContextSnapshot()?.prepareTicket, prior)
+            XCTAssertEqual(harness.maximumPotentiallyAudibleOutputs, 1)
+        } catch {
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(harness.registry.ownedResourceSnapshot())
+    }
+
     func testHLSWatchdogRecoveryBudgetSurvivesFreshPrepareAndActivation() async throws {
         let harness = BackendOwnershipTestHarness()
         harness.setRoute(.hlsAVPlayer)
@@ -99,7 +133,9 @@ final class PlaybackControllerTests: XCTestCase {
                     return context.owner == nil && context.prepared && context.prepareTicket != old
                         && harness.currentAudibleOutputs == 1
                 }
-                print("WATCHDOG_REQUEST_BUDGET stage=completed-attempt attempt=\(attempt)")
+                print("WATCHDOG_REQUEST_BUDGET stage=completed-attempt attempt=\(attempt) "
+                    + "state=\(await harness.controller.currentStateForTesting) "
+                    + "context=\(String(describing: harness.registry.outputResourceContextSnapshot()))")
                 XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.sessionIdentity, session)
                 XCTAssertEqual(harness.factory.createdBackends.first?.retirementSnapshot.count, attempt)
             }
@@ -1767,6 +1803,21 @@ final class PlaybackControllerTests: XCTestCase {
             streamURL: URL(string: "https://example.invalid/stream")!,
             title: channelID
         )
+    }
+
+    private func ordinaryCommandDiagnostics(_ registry: ControlTaskRegistry) -> [String] {
+        var result: [String] = []
+        registry.executor.sync {
+            registry.executor.safetyIngress.withReadOnlyAuthorityProjection {
+                guard let authority = Mirror(reflecting: registry).children.first(where: { $0.label == "authority" })?.value,
+                      let commands = Mirror(reflecting: authority).children.first(where: { $0.label == "commands" })?.value
+                        as? [OwnedPostIngressControlCommand?] else { return }
+                result = commands.prefix(16).compactMap { record in
+                    record.map { "\($0.slot):\($0.phase):\($0.controlTaskTicket.nonce)" }
+                }
+            }
+        }
+        return result
     }
 
     private func eventually(

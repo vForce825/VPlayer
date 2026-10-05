@@ -31,6 +31,10 @@ final class TrackingPlaybackBackend: PlaybackBackend,
     private var requiresRetirement = false
     private var teardownResult: BackendTeardownResult = .confirmedLocalOutputStopped
     private var prepareCalls = 0
+    private var prepareObserver: (@Sendable (ControlTaskRegistry.BackendPrepareInvocation) -> Void)?
+    func observePreparation(_ observer: @escaping @Sendable (ControlTaskRegistry.BackendPrepareInvocation) -> Void) {
+        lock.withLock { prepareObserver = observer }
+    }
     private var activationCalls = 0
     private var lastPrepareInvocation: ControlTaskRegistry.BackendPrepareInvocation?
     var prepareInvocationForTesting: ControlTaskRegistry.BackendPrepareInvocation? {
@@ -116,7 +120,12 @@ final class TrackingPlaybackBackend: PlaybackBackend,
     }
     
     func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
-        lock.withLock { prepareCalls += 1; lastPrepareInvocation = invocation }
+        let observer = lock.withLock {
+            prepareCalls += 1; lastPrepareInvocation = invocation
+            defer { prepareObserver = nil }
+            return prepareObserver
+        }
+        observer?(invocation)
     }
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
         lock.withLock { lastPrepareInvocation = invocation }
@@ -427,6 +436,37 @@ final class BackendOwnershipTestHarness: @unchecked Sendable {
 }
 
 final class BackendOwnershipTests: XCTestCase {
+    func testRunningPrepareValidationFoldsSafetyIngressBeforeInstallation() async throws {
+        for event in [PlaybackSystemSafetyEvent.interruptionBegan, .mediaServicesReset] {
+            let harness = BackendOwnershipTestHarness()
+            harness.setRoute(.hlsAVPlayer)
+            let registry = harness.registry
+            let observed = expectation(description: "Validate the original running prepare after safety ingress")
+            harness.factory.configureBackend = { backend in
+                backend.observePreparation { invocation in
+                    registry.executor.sync {
+                        XCTAssertTrue(invocation.revalidateCurrentPreparation())
+                        let source = registry.outputResourceContextSnapshot()?.sourceTask
+                        registry.executor.safetyIngress.performSyncIngress(event)
+                        // Keep the shared executor here, so its asynchronous drain cannot
+                        // hide a validation API that reads only the old Authority projection.
+                        XCTAssertTrue(registry.executor.safetyIngress.snapshot.safetyIngressPending)
+                        XCTAssertEqual(source.flatMap { registry.phase(of: $0) }, .running)
+                        XCTAssertFalse(invocation.revalidateCurrentPreparation(),
+                            "The native post-await fence must fold the callback that already revoked preparation")
+                    }
+                    observed.fulfill()
+                }
+            }
+            await harness.playLocal()
+            await fulfillment(of: [observed], timeout: 2)
+            XCTAssertEqual(harness.currentAudibleOutputs, 0)
+            await harness.controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(registry.ownedResourceSnapshot())
+        }
+    }
+
     func testScopedFailureDuringPendingPauseUpgradesExistingOwnedCleanup() async throws {
         let harness = BackendOwnershipTestHarness()
         harness.setRoute(.hlsAVPlayer)

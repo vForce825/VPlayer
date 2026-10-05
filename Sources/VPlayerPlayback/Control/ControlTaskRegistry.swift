@@ -158,7 +158,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
         fileprivate func revalidatePreparation(ticket: PrepareTicket) -> Bool {
             guard let registry else { return false }
-            return registry.projection {
+            // A native wait can return before the queued safety drain runs. Fold
+            // synchronous ingress under the same Cell before trusting this command.
+            return (try? registry.transaction(operationDescriptor: .prepareAdmission) { _ in
                 guard !self.consumed,
                       case .installed(let context, let backend) = registry.authority.resourceState,
                       backend.lifecycle == self.lifecycle, backend.identity == ticket.backendIdentity,
@@ -169,8 +171,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                           $0?.controlTaskTicket.nonce == self.sourceTaskNonce
                       }) ?? nil else { return false }
                 return record.slot == .prepare && record.phase == .running
+                    && !record.resultInvalidated
+                    && registry.authority.matches(record.safetySnapshot)
                     && record.groupTicket == context.reservation.workGroup
-            }
+            }) == true
         }
 
         func ownsRetainedReplacementRetirement(_ epoch: OutputLifecycleEpoch) -> Bool {
@@ -4334,21 +4338,34 @@ final class ControlTaskRegistry: @unchecked Sendable {
             return
         }
         do {
-            guard let retirement = try advanceOutputCleanup(owner: pending.owner),
-                  retirement != suspendTicket,
-                  let cleanup = claimOutputBackendCleanup(retirement, owner: pending.owner),
-                  cleanup.lifecycle == pending.retiredLifecycle,
-                  cleanup.backend.identity == pending.backendIdentity else {
-                finishFailedBackendPublicationReplacement(
-                    ticket: suspendTicket, runner: suspendRunner)
-                return
+            let context = outputResourceContextSnapshot()
+            let alreadyRetired = context?.owner == pending.owner
+                && context?.suspend == pending.suspend
+                && context?.retirementConfirmed == true
+                && context?.retiredLifecycle == pending.retiredLifecycle
+            // A requiresRetirement suspend is physically retired by the owned
+            // suspend runner above. Reuse only that exact confirmed receipt; a
+            // quiescent suspend still requires its one retirement call here.
+            if !alreadyRetired {
+                guard let retirement = try advanceOutputCleanup(owner: pending.owner),
+                      retirement != suspendTicket,
+                      let cleanup = claimOutputBackendCleanup(retirement, owner: pending.owner),
+                      cleanup.lifecycle == pending.retiredLifecycle,
+                      cleanup.backend.identity == pending.backendIdentity else {
+                    finishFailedBackendPublicationReplacement(
+                        ticket: suspendTicket, runner: suspendRunner)
+                    return
+                }
+                let retirementResult = await cleanup.backend.retireOutput(
+                    epoch: pending.retiredLifecycle)
+                guard retirementResult == .confirmedLocalOutputStopped,
+                      completeOutputRetirement(retirement, lifecycle: pending.retiredLifecycle) else {
+                    finishFailedBackendPublicationReplacement(
+                        ticket: suspendTicket, runner: suspendRunner)
+                    return
+                }
             }
-            let retirementResult = await cleanup.backend.retireOutput(
-                epoch: pending.retiredLifecycle)
-            guard retirementResult == .confirmedLocalOutputStopped,
-                  completeOutputRetirement(
-                    retirement, lifecycle: pending.retiredLifecycle),
-                  let handoff = try handoffBackendPublicationReplacementToReprepare(
+            guard let handoff = try handoffBackendPublicationReplacementToReprepare(
                     pending: pending,
                     suspendTicket: suspendTicket,
                     suspendRunner: suspendRunner) else {
@@ -4481,6 +4498,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 suspendRunner.result = nil
                 return nil
             }
+
+            // This path installs a fresh lifecycle just like ordinary reprepare.
+            // A supported backend must not retain the old lifecycle's stop issuer.
+            installSampleBufferQuiescenceIssuerIfSupported(
+                resources.object, identity: resources.identity, lifecycle: lifecycle)
 
             // 从这里开始均为固定槽写入，不再分配、不再调用外部实现。
             for index in authority.commands.indices

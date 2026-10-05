@@ -488,6 +488,55 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertTrue(retired)
     }
 
+    func testLatePublicationFixtureHasFifteenSecondEligibleTimeline() throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let recorder = DemuxEventRecorder()
+        let demuxer = FFmpegDemuxer()
+        try demuxer.start(url: file, sink: recorder.record)
+        defer { demuxer.cancel() }
+        let events = recorder.waitForTerminal(timeout: 10)
+        XCTAssertTrue(events.contains { if case .endOfStream = $0 { true } else { false } })
+        let videoPackets = events.compactMap { event -> DemuxPacket? in
+            guard case .packet(let packet) = event, case .video = packet.codec else { return nil }
+            return packet
+        }
+        XCTAssertEqual(videoPackets.count, 400)
+        let first = try XCTUnwrap(videoPackets.first)
+        let sourceStart = try ExactMediaTime(first.presentationTimeStamp)
+        let idrs = videoPackets.filter { $0.isKey }
+        XCTAssertEqual(idrs.count, 16)
+        let expectedOrigin = try sourceStart.adding(.init(value: 1, timescale: 1))
+        XCTAssertEqual(try ExactMediaTime(XCTUnwrap(idrs.dropFirst().first).presentationTimeStamp), expectedOrigin)
+        // Eight progressive observations are required before origin admission.
+        // The first IDR precedes that evidence (and the first AAC format), so the
+        // next one-second GOP begins the eligible 15s interval, not a 16s interval.
+        let timeline = HLSTimelineCoordinator()
+        var origins: [MediaOriginReceipt] = []
+        var terminal: [HLSTimelineTerminal] = []
+        var videoCount = 0
+        var normalizedEnd = ExactMediaTime(value: 0, timescale: 1)
+        for event in events {
+            for emission in try timeline.consume(event) {
+                switch emission {
+                case .originEstablished(let origin): origins.append(origin)
+                case .terminal(let value): terminal.append(value)
+                case .videoSample(let sample):
+                    videoCount += 1
+                    let end = try sample.timing.presentationTimeStamp.adding(XCTUnwrap(sample.timing.duration))
+                    if try HLSChecked.compare(end, normalizedEnd) > 0 { normalizedEnd = end }
+                default: break
+                }
+            }
+        }
+        XCTAssertEqual(origins.count, 1)
+        XCTAssertEqual(origins.first?.sourceTime, expectedOrigin)
+        XCTAssertEqual(origins.first?.effectiveStart, ExactMediaTime(value: 10, timescale: 1))
+        XCTAssertEqual(videoCount, 375)
+        XCTAssertEqual(normalizedEnd, .init(value: 25, timescale: 1))
+        XCTAssertEqual(terminal, [.endOfStream])
+    }
+
     func testSelectedLiveWakeCannotFailACompletedGenuineNaturalEOF() async throws {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
@@ -505,7 +554,12 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             _ = try await assembler.startUntilPlayablePrefix()
             let publisher = try XCTUnwrap(publication.publisher)
             print("EOF_WAKE_INITIAL sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
-            for expected in UInt64(1)..<13 {
+            let video = try XCTUnwrap(publication.declaration?.video?.participantID)
+            try assertLateFixtureCoverage(try XCTUnwrap(publisher.visible), video: video,
+                logicalSequences: Array(0...2))
+            // The real timeline-origin contract above proves 15 eligible seconds:
+            // initial three segments, eleven live commits, then one EOF commit.
+            for expected in UInt64(1)..<12 {
                 let pending = try await waitForLiveTestCondition { publisher.pendingLogicalSequenceCount > 0 }
                 XCTAssertTrue(pending, "expected=\(expected) sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) failure=\(String(describing: authority.failureDiagnostic))")
                 clock.advance(nanoseconds: 1_000_000_000)
@@ -514,9 +568,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 }
                 XCTAssertTrue(published)
             }
-            XCTAssertEqual(publisher.visible?.publicationSequence, 13)
+            XCTAssertEqual(publisher.visible?.publicationSequence, 12)
+            try assertLateFixtureCoverage(try XCTUnwrap(publisher.visible), video: video,
+                logicalSequences: Array(8...13))
             XCTAssertEqual(publisher.pendingLogicalSequenceCount, 0,
-                "The genuine 16s source must leave only its unsealed final segment")
+                "The genuine source has 15 eligible seconds and leaves only its unsealed final segment")
             publication.installLiveWakeObserverForTesting(
                 before: { wake.beforeEntry() }, after: { wake.afterEntry() })
             wake.arm()
@@ -530,7 +586,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let final = try XCTUnwrap(publisher.visible)
             print("EOF_WAKE_FINAL sequence=\(final.publicationSequence) media=\(final.media.mapValues { $0.logicalSequences }) coverage=\(final.coverage)")
             XCTAssertTrue(final.media.values.allSatisfy { $0.isFinal && $0.text.contains("#EXT-X-ENDLIST") })
-            XCTAssertEqual(final.publicationSequence, 14)
+            XCTAssertEqual(final.publicationSequence, 13, "Exactly one final commit follows the twelve live publications")
+            try assertLateFixtureCoverage(final, video: video, logicalSequences: Array(9...14))
             XCTAssertNil(authority.failureDiagnostic)
             wake.release()
             let completed = await Task.detached { wake.waitUntilCompleted() }.value
@@ -590,7 +647,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let publisher = try XCTUnwrap(publication.publisher)
             print("CAPACITY_WAKE_INITIAL outcome=\(outcome) sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
             let store = try XCTUnwrap(publication.store)
-            let lastBeforeCapacity: UInt64 = outcome == .naturalEnd ? 12 : 4
+            // Logical13 is the last sealed live segment; logical14 seals only at
+            // genuine EOF. Block the former at publication11, not an absent logical15.
+            let lastBeforeCapacity: UInt64 = outcome == .naturalEnd ? 11 : 4
             callbacks.releaseThrough(lastBeforeCapacity + 2)
             for expected in UInt64(1)...lastBeforeCapacity {
                 let reached = try await waitForLiveTestCondition {
@@ -676,6 +735,12 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 print("CAPACITY_WAKE_FINAL sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
                 XCTAssertTrue(publisher.visible!.media.values.allSatisfy { $0.isFinal })
                 expectedFinal = try XCTUnwrap(publisher.visible?.publicationSequence)
+                XCTAssertTrue(publisher.visible!.media.values.allSatisfy { $0.text.contains("#EXT-X-ENDLIST") })
+                XCTAssertEqual(expectedFinal, lastBeforeCapacity + 2,
+                    "EOF consumes the blocked penultimate segment and exactly one final commit")
+                try assertLateFixtureCoverage(try XCTUnwrap(publisher.visible),
+                    video: try XCTUnwrap(publication.declaration?.video?.participantID),
+                    logicalSequences: Array(9...14))
             }
             wake.release()
             let completed = await Task.detached { wake.waitUntilCompleted() }.value
@@ -707,6 +772,24 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         server.stop()
         let retired = await assembler.retireAndAwaitReceipt()
         XCTAssertTrue(retired)
+    }
+
+    private func assertLateFixtureCoverage(_ snapshot: HLSPublishedSnapshot, video: UInt64,
+        logicalSequences: [UInt64], file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(snapshot.media.count, 2, file: file, line: line)
+        XCTAssertEqual(snapshot.coverage.logicalSequences, logicalSequences, file: file, line: line)
+        for media in snapshot.media.values {
+            XCTAssertEqual(media.logicalSequences, logicalSequences, file: file, line: line)
+        }
+        XCTAssertEqual(Set(snapshot.coverage.participants.map { $0.participantID }),
+            Set(snapshot.media.keys), file: file, line: line)
+        let videoCoverage = try XCTUnwrap(snapshot.coverage.participants.first { $0.participantID == video },
+            file: file, line: line)
+        XCTAssertEqual(videoCoverage.ranges.count, logicalSequences.count, file: file, line: line)
+        for (sequence, range) in zip(logicalSequences, videoCoverage.ranges) {
+            XCTAssertEqual(range.start, .init(value: 10 + Int64(sequence), timescale: 1), file: file, line: line)
+            XCTAssertEqual(range.duration, .init(value: 1, timescale: 1), file: file, line: line)
+        }
     }
 
     private func waitForLiveTestCondition(_ condition: () -> Bool) async throws -> Bool {

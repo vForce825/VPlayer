@@ -104,6 +104,9 @@ jobs:
             -only-testing:VPlayerTests/PlaybackControllerTests/testRepeatedHLSRouteReplacementReclaimsDestroyedRelayChildren \
             -only-testing:VPlayerTests/PlaybackControllerTests/testHLSWatchdogRecoveryRetainsCurrentRelayAndRejectsOldPrepareFailure \
             -only-testing:VPlayerTests/PlaybackControllerTests/testHLSAutomaticReplacementAuthorityWithRealRelayRepreparesAndReactivates \
+            -only-testing:VPlayerTests/BackendOwnershipTests/testRunningPrepareValidationFoldsSafetyIngressBeforeInstallation \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testPublicationReplacementRetiresExactlyOnceWhenSuspendRequiresRetirement \
+            -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testLatePublicationFixtureHasFifteenSecondEligibleTimeline \
             -only-testing:VPlayerTests/BackendDiagnosticsTests
       - name: Report bounded exact-head failures
         if: ${{ always() }}
